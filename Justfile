@@ -231,5 +231,53 @@ deploy sdl="sdl/cpu-backtest-ssh.yaml" image="":
     if [ -n "{{image}}" ]; then cmd="$cmd --image {{image}}"; fi
     eval "$cmd"
 
+# ── Akash node (personal LCD/RPC) ────────────────────
+
+# Spin up a personal Akash LCD/RPC node via cosmos-omnibus.
+# Bootstraps from the official snapshot, runs PRUNING=nothing forward so it
+# becomes archival from the snapshot's block onward. See sdl/akash-node.yaml.
+# Tags the deployment "akash-node" for reuse: `just status akash-node`.
+up-akash-node:
+    #!/bin/bash
+    set -euo pipefail
+    mkdir -p "{{log_dir}}"
+    timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
+    log_file="{{log_dir}}/up-akash-node-${timestamp}.log"
+    exec > >(tee -a "$log_file") 2>&1
+    trap 'status=$?; echo "[INFO] recipe=up-akash-node finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
+    echo "[INFO] recipe=up-akash-node started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file"
+    set -x
+    uv run just-akash deploy --sdl sdl/akash-node.yaml --bid-wait 60 --bid-wait-retry 120 | tee /tmp/.akash-node-deploy.log
+    dseq=$(sed -n 's/.*DSEQ: \([0-9]*\).*/\1/p' /tmp/.akash-node-deploy.log | head -1)
+    if [ -n "$dseq" ]; then
+        uv run just-akash tag --dseq "$dseq" --name akash-node
+        echo
+        echo "Akash node deployed. Boot takes ~15-25 min (snapshot stream + extract + sync)."
+        echo "Check progress:    just status akash-node"
+        echo "Tail node logs:    just connect akash-node lease-shell"
+        echo "Once LCD is up:    akash-wallet-audit --api-base http://<host>:1317"
+    fi
+
+# Print just the LCD URL of the running akash-node deployment.
+# Convenience helper — parses provider URIs out of `status` output.
+akash-node-lcd:
+    #!/bin/bash
+    set -euo pipefail
+    uv run just-akash status --dseq akash-node 2>/dev/null \
+      | grep -Eo 'https?://[^[:space:]]+:1317[^[:space:]]*' \
+      | head -1
+
+# Destroy the akash-node deployment.
+down-akash-node:
+    #!/bin/bash
+    set -euo pipefail
+    mkdir -p "{{log_dir}}"
+    timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
+    log_file="{{log_dir}}/down-akash-node-${timestamp}.log"
+    exec > >(tee -a "$log_file") 2>&1
+    trap 'status=$?; echo "[INFO] recipe=down-akash-node finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
+    set -x
+    uv run just-akash destroy --dseq akash-node
+
 # ── Variables ────────────────────────────────────────
 log_dir := ".logs/just"

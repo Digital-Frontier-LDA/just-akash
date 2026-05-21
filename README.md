@@ -109,6 +109,37 @@ uv run just-akash destroy --dseq 12345
 uv run just-akash tag --dseq 12345 --name my-job
 ```
 
+## Run a personal Akash LCD/RPC node
+
+`just up-akash-node` deploys a cosmos-omnibus node (chain `akashnet-2`) that
+exposes a REST/LCD endpoint on port 1317, Tendermint RPC on 26657, and gRPC on
+9090. It bootstraps from the official Akash snapshot
+(`snapshots.akash.network/akashnet-2/latest`, refreshed hourly) and runs
+`PRUNING=nothing` from there, so it's archival **going forward** from the
+snapshot's height. No publicly-hosted Akash archive snapshot exists at the
+moment — for older historical heights, an alternate LCD is still needed.
+
+```bash
+just up-akash-node              # deploy and tag "akash-node"
+just status akash-node          # see provider URIs (boot ~15-25 min)
+just akash-node-lcd             # prints the LCD URL once provisioned
+just down-akash-node            # destroy when done
+```
+
+After the LCD URL is available:
+
+```bash
+akash-wallet-audit --api-base http://<host>:1317
+```
+
+The boot timeline is roughly 3-5 min to stream the ~10 GB lz4 snapshot, 10-15
+min to extract it in-process, plus a short catch-up sync. The default SDL
+asks for 4 vCPU / 16 GiB RAM / 250 GiB beta3 persistent storage with a price
+ceiling of `100000 uact` per block — providers bid down from there.
+
+The LCD is exposed publicly with no auth (fine for read-only queries; put a
+proxy in front if this becomes a long-running node).
+
 ## Environment Variables
 
 | Variable | Required | Description |
