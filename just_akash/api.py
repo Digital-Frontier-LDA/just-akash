@@ -455,6 +455,46 @@ def _extract_ssh_info(deployment: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _extract_forwarded_ports(deployment: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return every forwarded port a lease exposes.
+
+    Each entry is ``{"internal_port", "host", "port", "service"}`` where ``port``
+    is the provider-assigned external port. Used to surface non-SSH endpoints
+    (e.g. an LCD/REST server on internal port 1317) that ``_extract_ssh_info``
+    deliberately ignores.
+    """
+    endpoints: list[dict[str, Any]] = []
+    leases = deployment.get("leases")
+    for lease in leases if isinstance(leases, list) else []:
+        if not isinstance(lease, dict):
+            continue
+        status = lease.get("status") or {}
+        if not isinstance(status, dict):
+            continue
+        fwd_ports = status.get("forwarded_ports") or {}
+        if not isinstance(fwd_ports, dict):
+            continue
+        for svc_name, ports in fwd_ports.items():
+            if not isinstance(ports, list):
+                continue
+            for p in ports:
+                if not isinstance(p, dict):
+                    continue
+                host = p.get("host")
+                external_port = p.get("externalPort")
+                internal_port = p.get("port")
+                if host is not None and external_port is not None:
+                    endpoints.append(
+                        {
+                            "internal_port": internal_port,
+                            "host": host,
+                            "port": external_port,
+                            "service": svc_name,
+                        }
+                    )
+    return endpoints
+
+
 def _extract_lease_provider(deployment: dict[str, Any]) -> str | None:
     leases = deployment.get("leases")
     for lease in leases if isinstance(leases, list) else []:

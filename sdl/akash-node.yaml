@@ -35,7 +35,11 @@ services:
       - AKASH_API_ENABLE=true
       - AKASH_API_ADDRESS=tcp://0.0.0.0:1317
       - AKASH_API_SWAGGER=true
-      - AKASH_API_ENABLED_UNSAFE_CORS=true
+      # CORS stays disabled by default: the LCD port is exposed globally and the
+      # documented consumers are CLIs (e.g. akash-wallet-audit), which don't need
+      # cross-origin browser access. Set this to true only if you serve a browser
+      # app from another origin against this endpoint.
+      - AKASH_API_ENABLED_UNSAFE_CORS=false
       # gRPC for non-LCD clients.
       - AKASH_GRPC_ENABLE=true
       - AKASH_GRPC_ADDRESS=0.0.0.0:9090

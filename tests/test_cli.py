@@ -87,6 +87,46 @@ class TestCliStatusWithDseq:
         assert "active" in captured.out
 
 
+class TestCliStatusForwardedEndpoints:
+    @patch("just_akash.api._get_tag", return_value=None)
+    @patch("just_akash.api._extract_lease_provider", return_value="akash1prov")
+    @patch("just_akash.api.AkashConsoleAPI")
+    def test_status_json_includes_lcd_endpoint(
+        self, MockAPI, mock_lease_prov, mock_tag, monkeypatch, capsys
+    ):
+        """status --json must surface forwarded non-SSH ports (e.g. LCD :1317).
+
+        Regression for the akash-node-lcd recipe: it parses status JSON for the
+        forwarded LCD endpoint, which previously was never emitted.
+        """
+        import json
+
+        monkeypatch.setenv("AKASH_API_KEY", "test-key")
+        client = MockAPI.return_value
+        client.get_deployment.return_value = {
+            "deployment": {"state": "active"},
+            "leases": [
+                {
+                    "status": {
+                        "forwarded_ports": {
+                            "node": [
+                                {"port": 1317, "host": "5.6.7.8", "externalPort": 31317},
+                                {"port": 26657, "host": "5.6.7.8", "externalPort": 32657},
+                            ]
+                        }
+                    }
+                }
+            ],
+        }
+        _run_cli(monkeypatch, ["just-akash", "status", "--json", "--dseq", "12345"])
+        captured = capsys.readouterr()
+        result = json.loads(captured.out)
+        endpoints = result["endpoints"]
+        lcd = next(e for e in endpoints if e["internal_port"] == 1317)
+        assert lcd["host"] == "5.6.7.8"
+        assert lcd["port"] == 31317
+
+
 class TestCliStatusNoDeployments:
     @patch("just_akash.api._resolve_dseq", return_value="")
     @patch("just_akash.api.AkashConsoleAPI")

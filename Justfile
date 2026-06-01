@@ -259,13 +259,24 @@ up-akash-node:
     fi
 
 # Print just the LCD URL of the running akash-node deployment.
-# Convenience helper — parses provider URIs out of `status` output.
+# Convenience helper — reads the forwarded LCD endpoint (internal port 1317)
+# from `status --json`. Prints nothing until the lease is active and the
+# provider has published its forwarded ports.
 akash-node-lcd:
     #!/bin/bash
     set -euo pipefail
-    uv run just-akash status --dseq akash-node 2>/dev/null \
-      | grep -Eo 'https?://[^[:space:]]+:1317[^[:space:]]*' \
-      | head -1
+    status_json="$(uv run just-akash status --json --dseq akash-node 2>/dev/null || true)"
+    printf '%s' "$status_json" | python3 -c '
+import sys, json
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for e in data.get("endpoints", []):
+    if e.get("internal_port") == 1317:
+        print("http://" + str(e["host"]) + ":" + str(e["port"]))
+        break
+'
 
 # Destroy the akash-node deployment.
 down-akash-node:
@@ -276,6 +287,7 @@ down-akash-node:
     log_file="{{log_dir}}/down-akash-node-${timestamp}.log"
     exec > >(tee -a "$log_file") 2>&1
     trap 'status=$?; echo "[INFO] recipe=down-akash-node finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
+    echo "[INFO] recipe=down-akash-node started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file"
     set -x
     uv run just-akash destroy --dseq akash-node
 
