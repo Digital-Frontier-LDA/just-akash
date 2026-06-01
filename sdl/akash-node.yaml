@@ -1,0 +1,97 @@
+---
+# Personal Akash LCD/RPC node (cosmos-omnibus).
+#
+# What this gives us:
+#   - REST/LCD on port 1317 — `/cosmos/bank/...`, `/cosmos/tx/v1beta1/txs`, etc.
+#   - Tendermint RPC on 26657, gRPC on 9090
+#   - Bootstrap from snapshots.akash.network (updated hourly, ~10 GB lz4)
+#   - PRUNING=nothing — every new height retained, so the node becomes
+#     archival going FORWARD from the snapshot's block. Older heights stay
+#     pruned (no public Akash archive snapshot exists as of 2026-05).
+#
+# Boot timeline: ~3–5 min download + ~10–15 min in-process lz4 extract +
+# minutes of catch-up sync. LCD is reachable once the node is past the
+# snapshot height.
+#
+# Security note: ports are exposed globally with no auth. Fine for read-only
+# bank/tx queries; if this becomes a long-running node, put it behind an
+# auth-aware proxy.
+version: "2.0"
+
+services:
+  node:
+    image: ghcr.io/akash-network/cosmos-omnibus:v1.2.43-akash-v2.0.1
+    env:
+      - MONIKER=just-akash-fwd-archive
+      - CHAIN_JSON=https://raw.githubusercontent.com/akash-network/net/main/mainnet/meta.json
+      # Bootstrap from the official Akash snapshot. The endpoint 302s to the
+      # current `akashnet-2_<height>.tar.lz4`, so we pin the FORMAT explicitly
+      # (the URL ends in `latest`, not `.tar.lz4`, so auto-detection misfires).
+      - SNAPSHOT_URL=https://snapshots.akash.network/akashnet-2/latest
+      - SNAPSHOT_FORMAT=tar.lz4
+      # Archive going forward — keep every state from snapshot height onward.
+      - PRUNING=nothing
+      # Enable the REST/LCD server. Default is enable=false in app.toml.
+      - AKASH_API_ENABLE=true
+      - AKASH_API_ADDRESS=tcp://0.0.0.0:1317
+      - AKASH_API_SWAGGER=true
+      # CORS stays disabled by default: the LCD port is exposed globally and the
+      # documented consumers are CLIs (e.g. akash-wallet-audit), which don't need
+      # cross-origin browser access. Set this to true only if you serve a browser
+      # app from another origin against this endpoint.
+      - AKASH_API_ENABLED_UNSAFE_CORS=false
+      # gRPC for non-LCD clients.
+      - AKASH_GRPC_ENABLE=true
+      - AKASH_GRPC_ADDRESS=0.0.0.0:9090
+      # Minimum gas price (relayed txs only — we don't sign anything).
+      - MINIMUM_GAS_PRICES=0.025uakt
+      # Pull live peers + addrbook from Polkachu so the catch-up sync finds
+      # peers quickly without a manual seed list.
+      - P2P_POLKACHU=1
+      - ADDRBOOK_POLKACHU=1
+    expose:
+      - port: 1317
+        as: 1317
+        to:
+          - global: true
+      - port: 26657
+        as: 26657
+        to:
+          - global: true
+      - port: 9090
+        as: 9090
+        to:
+          - global: true
+    params:
+      storage:
+        data:
+          mount: /root/.akash
+
+profiles:
+  compute:
+    node:
+      resources:
+        cpu:
+          units: 4
+        memory:
+          size: 16Gi
+        storage:
+          - size: 10Gi
+          - name: data
+            size: 250Gi
+            attributes:
+              persistent: true
+              class: beta3
+
+  placement:
+    akash:
+      pricing:
+        node:
+          denom: uact
+          amount: 100000
+
+deployment:
+  node:
+    akash:
+      profile: node
+      count: 1

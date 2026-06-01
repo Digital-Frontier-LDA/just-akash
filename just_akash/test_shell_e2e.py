@@ -118,7 +118,11 @@ def main():
 
         lease_ready = False
         provider_addr = None
-        for attempt in range(1, 6):
+        # Provider workload activation can lag well past 35s on a busy provider;
+        # poll up to ~95s before declaring a timeout to avoid flaky CI failures.
+        max_attempts = 18
+        poll_interval = 5
+        for attempt in range(1, max_attempts + 1):
             r = run(f"uv run just-akash status --dseq {dseq} --json", timeout=30)
             try:
                 status_data = json.loads(r.stdout)
@@ -128,13 +132,19 @@ def main():
                     break
             except (json.JSONDecodeError, TypeError):
                 pass
-            if attempt < 5:
-                log_info(f"Attempt {attempt}/5 — lease not ready yet, retrying in 5s...")
-                time.sleep(5)
+            if attempt < max_attempts:
+                log_info(
+                    f"Attempt {attempt}/{max_attempts} — lease not ready yet, "
+                    f"retrying in {poll_interval}s..."
+                )
+                time.sleep(poll_interval)
 
         if not lease_ready:
             failures.append("lease_timeout")
-            log_fail("Lease not active after 35 seconds")
+            # 10s initial sleep + a poll_interval sleep after every attempt but
+            # the last (the final check has no trailing sleep).
+            max_wait = 10 + (max_attempts - 1) * poll_interval
+            log_fail(f"Lease not active after {max_wait} seconds")
         else:
             log_pass("Lease is active and ready")
 

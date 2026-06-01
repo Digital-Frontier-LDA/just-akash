@@ -449,6 +449,7 @@ def main():
     elif args.command == "status":
         from .api import (
             AkashConsoleAPI,
+            _extract_forwarded_ports,
             _extract_lease_provider,
             _extract_ssh_info,
             _get_tag,
@@ -485,6 +486,9 @@ def main():
                     result["endpoint"] = f"ssh -p {ssh['port']} root@{ssh['host']}"
                     result["ssh_host"] = ssh["host"]
                     result["ssh_port"] = ssh["port"]
+                forwarded = _extract_forwarded_ports(deployment)
+                if forwarded:
+                    result["endpoints"] = forwarded
                 print(_json_output(result))
             else:
                 tag = _get_tag(dseq)
