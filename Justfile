@@ -266,17 +266,7 @@ akash-node-lcd:
     #!/bin/bash
     set -euo pipefail
     status_json="$(uv run just-akash status --json --dseq akash-node 2>/dev/null || true)"
-    printf '%s' "$status_json" | python3 -c '
-import sys, json
-try:
-    data = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-for e in data.get("endpoints", []):
-    if e.get("internal_port") == 1317:
-        print("http://" + str(e["host"]) + ":" + str(e["port"]))
-        break
-'
+    printf '%s' "$status_json" | python3 -c 'import sys, json; d = json.loads(sys.stdin.read() or "{}"); e = next((x for x in d.get("endpoints", []) if x.get("internal_port") == 1317), None); print("http://" + str(e["host"]) + ":" + str(e["port"])) if e else None'
 
 # Destroy the akash-node deployment.
 down-akash-node:
