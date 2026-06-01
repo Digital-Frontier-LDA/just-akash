@@ -127,7 +127,13 @@ jobs:
   e2e-secrets:
     name: E2E secrets injection
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    # Run after e2e-shell, never alongside it: both jobs deploy with the same
+    # AKASH_API_KEY (one Akash account). Concurrent runs collide on the same
+    # deployment and the stale-deployment recovery in deploy.py tears down the
+    # other job's live deployment — surfacing as "manifest version validation
+    # failed" (422) and "lease not active". Serializing keeps each job isolated.
+    needs: e2e-shell
+    if: always() && (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
     env:
       AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
       AKASH_PROVIDERS: ${{ secrets.AKASH_PROVIDERS }}
