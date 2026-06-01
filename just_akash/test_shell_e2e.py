@@ -141,7 +141,10 @@ def main():
 
         if not lease_ready:
             failures.append("lease_timeout")
-            log_fail(f"Lease not active after {10 + max_attempts * poll_interval} seconds")
+            # 10s initial sleep + a poll_interval sleep after every attempt but
+            # the last (the final check has no trailing sleep).
+            max_wait = 10 + (max_attempts - 1) * poll_interval
+            log_fail(f"Lease not active after {max_wait} seconds")
         else:
             log_pass("Lease is active and ready")
 

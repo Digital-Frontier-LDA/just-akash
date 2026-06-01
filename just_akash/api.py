@@ -483,7 +483,7 @@ def _extract_forwarded_ports(deployment: dict[str, Any]) -> list[dict[str, Any]]
                 host = p.get("host")
                 external_port = p.get("externalPort")
                 internal_port = p.get("port")
-                if host is not None and external_port is not None:
+                if host is not None and external_port is not None and internal_port is not None:
                     endpoints.append(
                         {
                             "internal_port": internal_port,

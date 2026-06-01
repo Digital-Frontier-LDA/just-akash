@@ -247,8 +247,10 @@ up-akash-node:
     trap 'status=$?; echo "[INFO] recipe=up-akash-node finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
     echo "[INFO] recipe=up-akash-node started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file"
     set -x
-    uv run just-akash deploy --sdl sdl/akash-node.yaml --bid-wait 60 --bid-wait-retry 120 | tee /tmp/.akash-node-deploy.log
-    dseq=$(sed -n 's/.*DSEQ: \([0-9]*\).*/\1/p' /tmp/.akash-node-deploy.log | head -1)
+    deploy_log="$(mktemp -t akash-node-deploy.XXXXXX.log)"
+    uv run just-akash deploy --sdl sdl/akash-node.yaml --bid-wait 60 --bid-wait-retry 120 | tee "$deploy_log"
+    dseq=$(sed -n 's/.*DSEQ: \([0-9]*\).*/\1/p' "$deploy_log" | head -1)
+    rm -f "$deploy_log"
     if [ -n "$dseq" ]; then
         uv run just-akash tag --dseq "$dseq" --name akash-node
         echo
