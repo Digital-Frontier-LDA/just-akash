@@ -4,6 +4,11 @@ Justfile recipes + Python CLI for deploying on [Akash Network](https://akash.net
 
 Self-contained — clone, configure `.env`, and run.
 
+> **Maintenance & ownership.** As of June 2026, `just-akash` is maintained by
+> [Digital Frontier](https://github.com/Digital-Frontier-LDA) (MIT-licensed). It's part of our
+> commitment to making Akash enterprise-ready — adding robustness to the deployment lifecycle and
+> security to post-deploy operations (no-SSH lease-shell exec, off-SDL secret injection).
+
 ## What's New in v1.6.0
 
 - **Tiered provider selection** — preferred + backup allowlists with a 3-phase bid-selection state machine (`AKASH_PROVIDERS_BACKUP` env var, `--provider` / `--backup-provider` CLI flags). See [Bid Selection](#bid-selection).
@@ -20,7 +25,7 @@ Self-contained — clone, configure `.env`, and run.
 ## Setup
 
 ```bash
-git clone https://github.com/jobordu/just-akash
+git clone https://github.com/Digital-Frontier-LDA/just-akash
 cd just-akash
 cp .env.example .env
 # Edit .env — add your API key, providers, SSH pubkey
