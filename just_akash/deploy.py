@@ -408,7 +408,7 @@ def deploy(
         if skipped_stale:
             _log(
                 logging.WARNING,
-                f"  Skipped {skipped_stale} {tier} bid(s) no longer open (expired)",
+                f"  Skipped {skipped_stale} {tier} bid(s) not in 'open' state",
             )
         return pool
 
