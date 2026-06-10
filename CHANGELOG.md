@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.6.1] — 2026-06-10
+
+### Fixed
+- **Stale-bid selection** (issue #14, PR #15): the 3-phase bid selection never checked bid *state*, so phase-3 backup fallback — which by construction fires after the phase-1+2 grace (~10 min), past the ~5-min bid TTL — always selected an expired bid and died on `POST /v1/leases` HTTP 400 "The selected bid is no longer open". Selection predicates now skip non-open bids (and log how many were skipped); bids with no `state` field are still treated as open for older API shapes.
+- **Phase-2 grace cap**: while open BACKUP bids are available, the preferred-grace wait is cut at `JUST_AKASH_BACKUP_FALLBACK_S` (default 240s) so the fallback can lease backup bids *before they expire*. Full grace preserved when there is nothing to fall back to.
+- **Lease stale-bid retry**: a 400 "no longer open" on lease creation triggers a bid re-fetch and retry with the next cheapest open bid (tier order preserved, failed providers excluded, max 3 attempts) before cleanup-and-raise. Non-stale lease errors keep the original fail-fast behavior.
+- Tests: 13 new (`tests/test_stale_bid_selection.py`); suite at 595 passing.
+
+---
+
 ## [1.6.0] — 2026-05-10
 
 ### Added

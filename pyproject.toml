@@ -1,6 +1,6 @@
 [project]
 name = "just-akash"
-version = "1.6.0"
+version = "1.6.1"
 description = "Justfile recipes + Python CLI for deploying on Akash Network via the Console API"
 readme = "README.md"
 license = "MIT"
