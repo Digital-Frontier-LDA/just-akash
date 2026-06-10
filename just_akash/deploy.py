@@ -50,6 +50,40 @@ def _fmt_price(bid) -> str:
     return f"{amount} {denom}"
 
 
+def _bid_state(b) -> str:
+    """Extract a bid's state, tolerating both flat and nested API shapes."""
+    if not isinstance(b, dict):
+        return "?"
+    nested = b.get("bid", {})
+    nested_state = nested.get("state", "?") if isinstance(nested, dict) else "?"
+    return b.get("state", nested_state)
+
+
+def _backup_fallback_grace_s() -> int:
+    """Max seconds after order creation to keep waiting for a preferred bid
+    while open BACKUP bids are available (issue #14). Akash bids expire
+    ~5 min after the order opens, so a grace longer than that guarantees the
+    fallback pool is stale by the time phase 3 runs. Override with
+    JUST_AKASH_BACKUP_FALLBACK_S.
+    """
+    try:
+        return int(os.environ.get("JUST_AKASH_BACKUP_FALLBACK_S", "240"))
+    except ValueError:
+        return 240
+
+
+def _is_open_bid(b) -> bool:
+    """Whether a bid is still leasable.
+
+    The Console API keeps returning bids after they expire (state flips away
+    from `open`), and leasing a non-open bid is a guaranteed HTTP 400
+    ("The selected bid is no longer open") — issue #14. Bids with no state
+    field at all ("?") are treated as open so older/partial API shapes keep
+    working.
+    """
+    return _bid_state(b) in ("open", "?")
+
+
 def _classify_bid(provider: str | None, preferred: list[str], backup: list[str]) -> str:
     """Tag a bid by tier. With no allowlist set, every bid is ACCEPTED.
     Accepts None (a malformed bid with no provider field) — classified as
@@ -82,8 +116,7 @@ def _log_bid_table(
             _log(logging.INFO, f"    [{i + 1}] (invalid bid entry)")
             continue
         provider = _extract_provider(b) or "unknown"
-        _nested = b.get("bid", {})
-        state = b.get("state", _nested.get("state", "?") if isinstance(_nested, dict) else "?")
+        state = _bid_state(b)
         suffix = ""
         if has_allowlist:
             suffix = f"  [{_classify_bid(provider, preferred, backup)}]"
@@ -278,17 +311,19 @@ def deploy(
     poll_count = 0
     last_bid_count = -1
 
+    def _has_open_tier_bid(current: list, tier: str) -> bool:
+        return any(
+            isinstance(b, dict)
+            and _is_open_bid(b)
+            and _classify_bid(_extract_provider(b) or "", preferred, backup) == tier
+            for b in current
+        )
+
     def _has_preferred_bid(current: list) -> bool:
-        for b in current:
-            if not isinstance(b, dict):
-                continue
-            p = _extract_provider(b) or ""
-            if _classify_bid(p, preferred, backup) == "PREFERRED":
-                return True
-        return False
+        return _has_open_tier_bid(current, "PREFERRED")
 
     def _has_any_valid_bid(current: list) -> bool:
-        return any(isinstance(b, dict) for b in current)
+        return any(isinstance(b, dict) and _is_open_bid(b) for b in current)
 
     def _do_poll() -> None:
         """Performs one poll, updates `bids`, prints progress + diff log line."""
@@ -323,9 +358,7 @@ def deploy(
                     if not isinstance(b, dict):
                         continue
                     p = _extract_provider(b) or "unknown"
-                    nested = b.get("bid", {})
-                    nested_state = nested.get("state", "?") if isinstance(nested, dict) else "?"
-                    s = b.get("state", nested_state)
+                    s = _bid_state(b)
                     tag = _classify_bid(p, preferred, backup)
                     _log(
                         logging.INFO,
@@ -360,12 +393,24 @@ def deploy(
     selection_phase = 0
 
     def _filter_tier(current: list, tier: str) -> list:
-        return [
-            b
-            for b in current
-            if isinstance(b, dict)
-            and _classify_bid(_extract_provider(b) or "", preferred, backup) == tier
-        ]
+        """Bids of a tier that are still leasable (state filter — issue #14)."""
+        pool = []
+        skipped_stale = 0
+        for b in current:
+            if not isinstance(b, dict):
+                continue
+            if _classify_bid(_extract_provider(b) or "", preferred, backup) != tier:
+                continue
+            if not _is_open_bid(b):
+                skipped_stale += 1
+                continue
+            pool.append(b)
+        if skipped_stale:
+            _log(
+                logging.WARNING,
+                f"  Skipped {skipped_stale} {tier} bid(s) no longer open (expired)",
+            )
+        return pool
 
     if has_allowlist:
         preferred_phase1 = _filter_tier(bids, "PREFERRED")
@@ -390,7 +435,35 @@ def deploy(
                 f"  Phase 2 ({label}): no preferred bid yet — "
                 f"waiting up to {bid_wait_retry}s for first preferred...",
             )
-            early_exit = _has_preferred_bid if has_allowlist else _has_any_valid_bid
+            if has_allowlist and backup:
+                # Akash bids expire ~5 min after the order opens. If the full
+                # grace outlasts that, phase 3 can only ever see stale backup
+                # bids (issue #14) — so once open backup bids exist, stop
+                # waiting for a preferred bid at the fallback safety mark.
+                fallback_after = start_time + _backup_fallback_grace_s()
+                fallback_cut = False
+
+                def _phase2_exit(current: list) -> bool:
+                    nonlocal fallback_cut
+                    if _has_preferred_bid(current):
+                        return True
+                    if time.time() >= fallback_after and _has_open_tier_bid(current, "BACKUP"):
+                        if not fallback_cut:
+                            fallback_cut = True
+                            _log(
+                                logging.WARNING,
+                                f"  Cutting preferred-grace short at "
+                                f"{int(time.time() - start_time)}s: open BACKUP bid(s) "
+                                f"available and bids expire ~5min after order creation",
+                            )
+                        return True
+                    return False
+
+                early_exit = _phase2_exit
+            elif has_allowlist:
+                early_exit = _has_preferred_bid
+            else:
+                early_exit = _has_any_valid_bid
             _poll_until(phase2_deadline, early_exit=early_exit)
             print()
 
@@ -598,23 +671,68 @@ def deploy(
         f"({phase_label[selection_phase]})",
     )
 
-    # Step 6: Create lease
+    # Step 6: Create lease (with stale-bid retry — issue #14).
+    # A bid can expire between selection and the lease POST (the Console API
+    # rejects it with 400 "no longer open"). On that specific failure,
+    # re-fetch bids and fall to the next cheapest open bid, tier order
+    # preserved (PREFERRED before BACKUP), before giving up.
+    def _next_open_bid(fresh: list, exclude: set[str]):
+        tiers = ["PREFERRED", "BACKUP"] if has_allowlist else ["ACCEPTED"]
+        for tier in tiers:
+            pool = [
+                b
+                for b in _filter_tier(fresh, tier)
+                if _extract_provider(b) and _extract_provider(b) not in exclude
+            ]
+            if pool:
+                return min(pool, key=lambda b: _extract_bid_price(b)[0])
+        return None
+
     _log(logging.INFO, "STEP 6: Creating lease...")
-    try:
-        lease_response = client.create_lease(
-            dseq=str(dseq),
-            provider=provider,
-            manifest=manifest,
-        )
-    except RuntimeError as e:
-        _log(logging.ERROR, f"Lease creation FAILED: {e}")
-        _log(logging.INFO, f"Cleaning up deployment {dseq}...")
+    max_lease_attempts = 3
+    failed_providers: set[str] = set()
+    lease_response = None
+    for attempt in range(1, max_lease_attempts + 1):
         try:
-            client.close_deployment(str(dseq))
-            _log(logging.INFO, f"Deployment {dseq} closed after lease failure")
-        except Exception as cleanup_err:
-            _log(logging.ERROR, f"Cleanup of deployment {dseq} also failed: {cleanup_err}")
-        raise RuntimeError(f"Failed to create lease: {e}") from e
+            lease_response = client.create_lease(
+                dseq=str(dseq),
+                provider=provider,
+                manifest=manifest,
+            )
+            break
+        except RuntimeError as e:
+            stale = "no longer open" in str(e).lower()
+            if stale and attempt < max_lease_attempts:
+                failed_providers.add(provider)
+                _log(
+                    logging.WARNING,
+                    f"Lease attempt {attempt}/{max_lease_attempts} hit a stale bid "
+                    f"(provider={provider}): re-fetching open bids...",
+                )
+                try:
+                    fresh_bids = client.get_bids(str(dseq))
+                except RuntimeError as poll_err:
+                    _log(logging.WARNING, f"  Bid re-fetch failed: {poll_err}")
+                    fresh_bids = []
+                next_bid = _next_open_bid(fresh_bids, failed_providers)
+                if next_bid is not None:
+                    provider = _extract_provider(next_bid) or ""
+                    price_amount, price_denom = _extract_bid_price(next_bid)
+                    _log(
+                        logging.INFO,
+                        f"  Retrying lease with next open bid: provider={provider}  "
+                        f"price={price_amount} {price_denom}",
+                    )
+                    continue
+                _log(logging.WARNING, "  No other open bid available to retry with")
+            _log(logging.ERROR, f"Lease creation FAILED: {e}")
+            _log(logging.INFO, f"Cleaning up deployment {dseq}...")
+            try:
+                client.close_deployment(str(dseq))
+                _log(logging.INFO, f"Deployment {dseq} closed after lease failure")
+            except Exception as cleanup_err:
+                _log(logging.ERROR, f"Cleanup of deployment {dseq} also failed: {cleanup_err}")
+            raise RuntimeError(f"Failed to create lease: {e}") from e
 
     _log(logging.INFO, "Lease created successfully!")
     _log(
