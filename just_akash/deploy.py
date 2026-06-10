@@ -567,6 +567,38 @@ def deploy(
             except Exception as cleanup_err:
                 _log(logging.ERROR, f"Cleanup of deployment {dseq} failed: {cleanup_err}")
             raise RuntimeError("No valid bids received — all bid entries were malformed.")
+        # Bids from our own providers exist, but every one has aged out of the
+        # 'open' state (issue #14). Without this branch the failure below would
+        # misreport it as "non-allowed providers", which misleads operators —
+        # the real cause is stale bids, not foreign ones.
+        if has_allowlist:
+            allowed_bids = [
+                b
+                for b in valid_bids
+                if _classify_bid(_extract_provider(b), preferred, backup) != "FOREIGN"
+            ]
+        else:
+            allowed_bids = valid_bids
+        if allowed_bids and not any(_is_open_bid(b) for b in allowed_bids):
+            states = sorted({_bid_state(b) for b in allowed_bids})
+            providers = [_extract_provider(b) or "unknown" for b in allowed_bids]
+            _log(
+                logging.ERROR,
+                f"All {len(allowed_bids)} bid(s) from your providers are no "
+                f"longer open (states seen: {states})",
+            )
+            _log(logging.ERROR, f"  Providers: {providers}")
+            _log(logging.INFO, f"Cleaning up deployment {dseq} (no open bids)...")
+            try:
+                client.close_deployment(str(dseq))
+                _log(logging.INFO, f"Deployment {dseq} closed after no open bids")
+            except Exception as cleanup_err:
+                _log(logging.ERROR, f"Cleanup of deployment {dseq} failed: {cleanup_err}")
+            raise RuntimeError(
+                f"Received {len(allowed_bids)} bid(s) from your providers but none "
+                f"are still open (states seen: {states}). Akash bids expire ~5 min "
+                "after the order opens — retry the deployment to solicit fresh bids."
+            )
         foreign = [_extract_provider(b) or "unknown" for b in bids]
         allowed_all = preferred + backup
         _log(logging.ERROR, f"All {len(bids)} bid(s) are from non-allowed providers")

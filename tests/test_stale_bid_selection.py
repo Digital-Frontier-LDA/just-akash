@@ -131,8 +131,26 @@ class TestSelectionSkipsStaleBids:
             _make_bid("akash1back", 10, state="closed"),
         ]
 
-        with pytest.raises(RuntimeError):
+        # The bid is from an ALLOWED provider, just stale — the failure must say
+        # "none are still open", not misattribute it to non-allowed providers.
+        with pytest.raises(RuntimeError, match="none are still open") as exc:
             deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+        assert "NONE from our providers" not in str(exc.value)
+        client.create_lease.assert_not_called()
+
+    @patch("just_akash.deploy.time")
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_all_stale_bids_no_allowlist(self, MockAPI, mock_time, tmp_path, monkeypatch):
+        """With no allowlist, an all-stale bid pool still reports 'no open bids'
+        rather than falling through to the non-allowed-providers message."""
+        client, sdl = _setup(MockAPI, mock_time, tmp_path, monkeypatch)
+        client.get_bids.return_value = [
+            _make_bid("akash1any", 10, state="closed"),
+        ]
+
+        with pytest.raises(RuntimeError, match="none are still open") as exc:
+            deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+        assert "NONE from our providers" not in str(exc.value)
         client.create_lease.assert_not_called()
 
 
