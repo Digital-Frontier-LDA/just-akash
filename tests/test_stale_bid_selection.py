@@ -255,3 +255,43 @@ class TestLeaseStaleRetry:
             deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
         assert client.create_lease.call_count == 1
         client.close_deployment.assert_called_once_with("12345")
+
+
+class TestLeaseTransientJWTRetry:
+    """Console API intermittently 400s lease creation with "JWT has invalid
+    claims" while the bid itself is healthy (observed 2026-06-11, ~50%
+    flap rate against the same provider). Retry the SAME bid after a
+    backoff — do NOT advance to the next provider."""
+
+    JWT_ERR = RuntimeError("API Error (400): JWT has invalid claims")
+
+    @patch("just_akash.deploy.time")
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_retries_same_bid_on_jwt_claims_400(self, MockAPI, mock_time, tmp_path, monkeypatch):
+        client, sdl = _setup(
+            MockAPI, mock_time, tmp_path, monkeypatch, providers="akash1a,akash1b"
+        )
+        client.get_bids.return_value = [
+            _make_bid("akash1a", 10),
+            _make_bid("akash1b", 20),
+        ]
+        client.create_lease.side_effect = [self.JWT_ERR, {"lease": "ok"}]
+
+        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+        # Same provider on the retry — the bid was never the problem.
+        assert result["provider"] == "akash1a"
+        assert client.create_lease.call_count == 2
+        client.close_deployment.assert_not_called()
+
+    @patch("just_akash.deploy.time")
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_gives_up_after_max_attempts(self, MockAPI, mock_time, tmp_path, monkeypatch):
+        client, sdl = _setup(MockAPI, mock_time, tmp_path, monkeypatch, providers="akash1a")
+        client.get_bids.return_value = [_make_bid("akash1a", 10)]
+        client.create_lease.side_effect = self.JWT_ERR
+
+        with pytest.raises(RuntimeError, match="Failed to create lease"):
+            deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+        # 3 attempts, all on the same (only) provider, then cleanup.
+        assert client.create_lease.call_count == 3
+        client.close_deployment.assert_called_once_with("12345")
