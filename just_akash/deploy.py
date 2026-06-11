@@ -733,7 +733,25 @@ def deploy(
             )
             break
         except RuntimeError as e:
-            stale = "no longer open" in str(e).lower()
+            err_str = str(e).lower()
+            stale = "no longer open" in err_str
+            # Console API intermittently rejects lease creation with
+            # 400 "JWT has invalid claims" (~35-44s latency, then the 400) —
+            # observed 2026-06-11 flapping ~50% per attempt against the same
+            # bid that leased fine minutes before/after (Blazing CI runs
+            # 27360752029/27360753233/27361360403). The bid itself is healthy,
+            # so retry the SAME provider after a short backoff instead of
+            # advancing to the next bid.
+            transient_auth = "jwt has invalid claims" in err_str
+            if transient_auth and attempt < max_lease_attempts:
+                _log(
+                    logging.WARNING,
+                    f"Lease attempt {attempt}/{max_lease_attempts} hit a transient "
+                    f"Console auth error (JWT claims) for provider={provider} — "
+                    "retrying the same bid in 15s...",
+                )
+                time.sleep(15)
+                continue
             if stale and attempt < max_lease_attempts:
                 failed_providers.add(provider)
                 _log(
