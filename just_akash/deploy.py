@@ -736,12 +736,12 @@ def deploy(
             err_str = str(e).lower()
             stale = "no longer open" in err_str
             # Console API intermittently rejects lease creation with
-            # 400 "JWT has invalid claims" (~35-44s latency, then the 400) —
-            # observed 2026-06-11 flapping ~50% per attempt against the same
-            # bid that leased fine minutes before/after (Blazing CI runs
-            # 27360752029/27360753233/27361360403). The bid itself is healthy,
-            # so retry the SAME provider after a short backoff instead of
-            # advancing to the next bid.
+            # 400 "JWT has invalid claims" while the bid itself is healthy
+            # (transient auth flap on the Console side — see issue #18).
+            # Retry the SAME provider after a short backoff instead of
+            # advancing to the next bid. Message-match is intentional: the
+            # structured fields are generic (code=bad_request,
+            # type=client_error), so the message is the only signal.
             transient_auth = "jwt has invalid claims" in err_str
             if transient_auth and attempt < max_lease_attempts:
                 _log(
