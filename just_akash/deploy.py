@@ -724,7 +724,20 @@ def deploy(
     max_lease_attempts = 3
     failed_providers: set[str] = set()
     lease_response = None
-    for attempt in range(1, max_lease_attempts + 1):
+    # issue #19: one bounded re-deploy round. By the time a backup-only
+    # market reaches lease creation, the selected bid is already
+    # ~JUST_AKASH_BACKUP_FALLBACK_S old (bids expire ~5 min after the ORDER
+    # opens), so a single Console flap (e.g. the ~35s 'JWT has invalid
+    # claims' 400 — issue #18) can age the only bid past expiry. Re-fetching
+    # bids on the SAME order then finds nothing open — every bid shares the
+    # order's clock. Only a NEW order gets fresh bids, so when the stale-bid
+    # retry runs out of open bids: close the order, re-create it, and lease
+    # the first open allowlisted bid IMMEDIATELY (no phased patience — that
+    # patience is what aged the first round past expiry).
+    redeployed = False
+    attempt = 0
+    while True:
+        attempt += 1
         try:
             lease_response = client.create_lease(
                 dseq=str(dseq),
@@ -742,15 +755,18 @@ def deploy(
             # advancing to the next bid. Message-match is intentional: the
             # structured fields are generic (code=bad_request,
             # type=client_error), so the message is the only signal.
+            # 5s backoff (was 15s): the failing request itself burns ~35s,
+            # and every second of backoff ages the bid toward its ~5-min
+            # expiry (issue #19).
             transient_auth = "jwt has invalid claims" in err_str
             if transient_auth and attempt < max_lease_attempts:
                 _log(
                     logging.WARNING,
                     f"Lease attempt {attempt}/{max_lease_attempts} hit a transient "
                     f"Console auth error (JWT claims) for provider={provider} — "
-                    "retrying the same bid in 15s...",
+                    "retrying the same bid in 5s...",
                 )
-                time.sleep(15)
+                time.sleep(5)
                 continue
             if stale and attempt < max_lease_attempts:
                 failed_providers.add(provider)
@@ -775,6 +791,86 @@ def deploy(
                     )
                     continue
                 _log(logging.WARNING, "  No other open bid available to retry with")
+            if stale and not redeployed:
+                # issue #19: every bid on this order is gone — re-create the
+                # order once and lease a fresh bid immediately.
+                redeployed = True
+                attempt = 0
+                failed_providers.clear()
+                _log(
+                    logging.WARNING,
+                    f"All bids on order {dseq} are stale — re-creating the order "
+                    "for fresh bids (1 re-deploy round)...",
+                )
+                try:
+                    client.close_deployment(str(dseq))
+                    _log(logging.INFO, f"  Stale order {dseq} closed")
+                except Exception as close_err:
+                    _log(
+                        logging.WARNING,
+                        f"  Close of stale order {dseq} failed (continuing): {close_err}",
+                    )
+                try:
+                    redeploy_response = client.create_deployment(sdl_content)
+                except RuntimeError as redeploy_err:
+                    _log(logging.ERROR, f"  Re-deploy failed: {redeploy_err}")
+                    raise RuntimeError(f"Failed to create lease: {e}") from e
+                new_dseq = redeploy_response.get("dseq")
+                _new_manifest_raw = redeploy_response.get("manifest", "")
+                if new_dseq is None:
+                    _log(logging.ERROR, "  Re-deploy returned no DSEQ")
+                    raise RuntimeError(f"Failed to create lease: {e}") from e
+                dseq = new_dseq
+                manifest = _new_manifest_raw if isinstance(_new_manifest_raw, str) else ""
+                _log(
+                    logging.INFO,
+                    f"  Re-deployed: new order DSEQ={dseq} — fast-polling for fresh bids...",
+                )
+                # Fast selection: preferred wins instantly; backup accepted
+                # after a short courtesy window. No phase-2 grace — aging the
+                # bid is exactly what killed round 1.
+                fresh_selected = None
+                _fp_start = time.time()
+                _fp_wait = 75.0
+                _fp_courtesy = 20.0
+                while time.time() - _fp_start < _fp_wait:
+                    try:
+                        current = client.get_bids(str(dseq))
+                    except RuntimeError:
+                        current = []
+                    first_tier = "PREFERRED" if has_allowlist else "ACCEPTED"
+                    pool = _filter_tier(current, first_tier)
+                    if pool:
+                        fresh_selected = min(pool, key=lambda b: _extract_bid_price(b)[0])
+                        break
+                    if has_allowlist and time.time() - _fp_start >= _fp_courtesy:
+                        backup_pool = _filter_tier(current, "BACKUP")
+                        if backup_pool:
+                            fresh_selected = min(
+                                backup_pool, key=lambda b: _extract_bid_price(b)[0]
+                            )
+                            break
+                    time.sleep(5)
+                if fresh_selected is None or not _extract_provider(fresh_selected):
+                    _log(logging.ERROR, "  No fresh open bid on the re-created order")
+                    _log(logging.INFO, f"Cleaning up deployment {dseq}...")
+                    try:
+                        client.close_deployment(str(dseq))
+                        _log(logging.INFO, f"Deployment {dseq} closed after lease failure")
+                    except Exception as cleanup_err:
+                        _log(
+                            logging.ERROR,
+                            f"Cleanup of deployment {dseq} also failed: {cleanup_err}",
+                        )
+                    raise RuntimeError(f"Failed to create lease: {e}") from e
+                provider = _extract_provider(fresh_selected) or ""
+                price_amount, price_denom = _extract_bid_price(fresh_selected)
+                _log(
+                    logging.INFO,
+                    f"  Fresh bid selected: provider={provider}  "
+                    f"price={price_amount} {price_denom} — leasing immediately",
+                )
+                continue
             _log(logging.ERROR, f"Lease creation FAILED: {e}")
             _log(logging.INFO, f"Cleaning up deployment {dseq}...")
             try:
