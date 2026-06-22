@@ -690,7 +690,11 @@ class LeaseShellTransport(Transport):
                 name = obj.get("name") or obj.get("service") or ""
                 msg = obj.get("message")
                 if msg is None:
-                    msg = obj.get("msg", "")
+                    msg = obj.get("msg")
+                if msg is None:
+                    # Structured JSON with no recognizable message field — surface
+                    # the raw payload rather than collapsing it to a blank line.
+                    return stripped
                 line = f"[{name}] {msg}" if name else str(msg)
                 return line.rstrip("\n")
         return text.rstrip("\n")

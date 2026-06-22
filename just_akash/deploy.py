@@ -196,13 +196,18 @@ def _prepare_sdl_content(
     _log(logging.INFO, "SDL validation OK")
 
     if image:
-        sdl_content = re.sub(
-            r"image:\s+[^\n]+",
-            lambda _: f"image: {image}",
+        # Anchor to the YAML `image:` key at line start (after indentation) so a
+        # comment that merely mentions "image:" can't be hijacked as the target.
+        sdl_content, n_subs = re.subn(
+            r"(?m)^(?P<indent>[ \t]*)image:[ \t]+\S[^\n]*",
+            lambda m: f"{m.group('indent')}image: {image}",
             sdl_content,
             count=1,
         )
-        _log(logging.INFO, f"Overrode image to: {image}")
+        if n_subs:
+            _log(logging.INFO, f"Overrode image to: {image}")
+        else:
+            _log(logging.WARNING, f"--image {image} set but no 'image:' key found to override")
 
     if "PLACEHOLDER_SSH_PUBKEY_B64" in sdl_content:
         import base64

@@ -57,6 +57,31 @@ class TestPrepareSdlContent:
         out = _prepare_sdl_content(str(f), env_vars=["FOO=bar"])
         assert "FOO=bar" in out
 
+    def test_image_override_does_not_target_comment_line(self, tmp_path):
+        # The override regex is `image:\s+[^\n]+` with count=1, so it replaces
+        # the FIRST occurrence of "image: " anywhere in the file. A YAML comment
+        # that mentions "image:" (e.g. "# bump the image: see notes") sits above
+        # the real `image:` key, so the comment gets rewritten and the actual
+        # container image is left untouched — the override silently no-ops.
+        sdl = """version: "2.0"
+services:
+  web:
+    # remember to bump the image: see release notes
+    image: python:3.13-slim
+    expose:
+      - port: 80
+        as: 80
+        to:
+          - global: true
+"""
+        f = tmp_path / "s.yaml"
+        f.write_text(sdl)
+        out = _prepare_sdl_content(str(f), image="myrepo/app:v9")
+        # The real container image must be overridden...
+        assert "image: python:3.13-slim" not in out
+        # ...and the comment line must NOT have been hijacked as the target.
+        assert "# remember to bump the image: see release notes" in out
+
     def test_ssh_placeholder_without_key_raises(self, tmp_path, monkeypatch):
         monkeypatch.delenv("SSH_PUBKEY", raising=False)
         f = tmp_path / "s.yaml"

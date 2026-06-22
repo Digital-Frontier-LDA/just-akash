@@ -89,6 +89,17 @@ class TestFormatLogMessage:
         raw = json.dumps({"name": "web", "message": "line"}).encode() + b"\n"
         assert LeaseShellTransport._format_log_message(raw) == "[web] line"
 
+    def test_json_dict_without_known_keys_is_not_swallowed(self):
+        # A structured JSON log line with none of name/service/message/msg
+        # (e.g. a JSON-logger emitting {"level":"info","ts":...}) is real log
+        # output. The formatter computes name="" and msg="" then renders
+        # str("") == "", so the entire entry is replaced by a blank line —
+        # silent data loss. A faithful copy must surface the original payload.
+        raw = json.dumps({"level": "info", "ts": 1716393600}).encode()
+        out = LeaseShellTransport._format_log_message(raw)
+        assert out != ""
+        assert "info" in out
+
 
 # ── event message formatter ──────────────────────────────────────────
 

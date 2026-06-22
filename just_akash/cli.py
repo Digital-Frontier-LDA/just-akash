@@ -689,7 +689,9 @@ def main():
                 if not settings:
                     print(f"Deployment {label}: auto top-up not configured (off).")
                 else:
-                    enabled = bool(settings.get("autoTopUpEnabled", False))
+                    # Only a real boolean True means enabled; a non-bool value
+                    # (e.g. the string "false") must not read as truthy "on".
+                    enabled = settings.get("autoTopUpEnabled") is True
                     print(f"Deployment {label}: auto top-up {'on' if enabled else 'off'}")
                     for key in ("estimatedTopUpAmount", "topUpFrequencyMs"):
                         if key in settings:

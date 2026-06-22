@@ -188,6 +188,23 @@ class TestCliAutoTopup:
         assert "auto top-up on" in out
         assert "topUpFrequencyMs" in out
 
+    @patch("just_akash.api._get_tag", return_value="")
+    @patch("just_akash.api.AkashConsoleAPI")
+    def test_show_does_not_lie_when_enabled_is_string_false(
+        self, MockAPI, mock_tag, monkeypatch, capsys
+    ):
+        # If the API returns autoTopUpEnabled as the *string* "false" (a real
+        # JSON-vs-bool mismatch some servers emit), the display computes
+        # bool("false") == True and prints "auto top-up on" — the opposite of
+        # the truth. The shown state must reflect the disabled value.
+        monkeypatch.setenv("AKASH_API_KEY", "k")
+        client = MockAPI.return_value
+        client.get_deployment_settings.return_value = {"autoTopUpEnabled": "false"}
+        _run_cli(monkeypatch, ["just-akash", "auto-topup", "--dseq", "12345"])
+        out = capsys.readouterr().out
+        assert "auto top-up off" in out
+        assert "auto top-up on" not in out
+
     def test_on_and_off_mutually_exclusive(self, monkeypatch):
         with pytest.raises(SystemExit) as e:
             _run_cli(
