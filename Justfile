@@ -32,10 +32,10 @@ connect dseq="" transport="":
     trap 'status=$?; echo "[INFO] recipe=connect finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
     echo "[INFO] recipe=connect started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq={{dseq}}"
     set -x
-    cmd="uv run just-akash connect"
-    if [ -n "{{dseq}}" ]; then cmd="$cmd --dseq={{dseq}}"; fi
-    if [ -n "{{transport}}" ]; then cmd="$cmd --transport {{transport}}"; fi
-    eval "$cmd"
+    args=(uv run just-akash connect)
+    if [ -n "{{dseq}}" ]; then args+=(--dseq "{{dseq}}"); fi
+    if [ -n "{{transport}}" ]; then args+=(--transport "{{transport}}"); fi
+    "${args[@]}"
 
 # Update a running instance in place with a revised SDL (no re-bid, keeps DSEQ).
 # Usage: just update SDL [dseq] [image]
@@ -114,10 +114,10 @@ inject dseq="" env-file=".env.secrets" transport="":
     trap 'status=$?; echo "[INFO] recipe=inject finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
     echo "[INFO] recipe=inject started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq={{dseq}} env_file={{env-file}}"
     set -x
-    cmd="uv run just-akash inject --env-file {{env-file}}"
-    if [ -n "{{dseq}}" ]; then cmd="$cmd --dseq={{dseq}}"; fi
-    if [ -n "{{transport}}" ]; then cmd="$cmd --transport {{transport}}"; fi
-    eval "$cmd"
+    args=(uv run just-akash inject --env-file "{{env-file}}")
+    if [ -n "{{dseq}}" ]; then args+=(--dseq "{{dseq}}"); fi
+    if [ -n "{{transport}}" ]; then args+=(--transport "{{transport}}"); fi
+    "${args[@]}"
 
 # Execute a command on a running instance via lease-shell (default) or SSH
 # Usage: just exec [dseq] [transport=lease-shell|ssh] "command"
@@ -131,10 +131,11 @@ exec dseq="" command="" transport="":
     trap 'status=$?; echo "[INFO] recipe=exec finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
     echo "[INFO] recipe=exec started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq={{dseq}} command={{command}}"
     set -x
-    cmd="uv run just-akash exec '{{command}}'"
-    if [ -n "{{dseq}}" ]; then cmd="$cmd --dseq={{dseq}}"; fi
-    if [ -n "{{transport}}" ]; then cmd="$cmd --transport {{transport}}"; fi
-    eval "$cmd"
+    args=(uv run just-akash exec)
+    if [ -n "{{dseq}}" ]; then args+=(--dseq "{{dseq}}"); fi
+    if [ -n "{{transport}}" ]; then args+=(--transport "{{transport}}"); fi
+    args+=("{{command}}")
+    "${args[@]}"
 
 # ── Info ─────────────────────────────────────────────
 
@@ -335,9 +336,9 @@ deploy sdl="sdl/cpu-backtest-ssh.yaml" image="":
     trap 'status=$?; echo "[INFO] recipe=deploy finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
     echo "[INFO] recipe=deploy started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file sdl={{sdl}} image={{image}}"
     set -x
-    cmd="uv run just-akash deploy --sdl {{sdl}}"
-    if [ -n "{{image}}" ]; then cmd="$cmd --image {{image}}"; fi
-    eval "$cmd"
+    args=(uv run just-akash deploy --sdl "{{sdl}}")
+    if [ -n "{{image}}" ]; then args+=(--image "{{image}}"); fi
+    "${args[@]}"
 
 # ── Akash node (personal LCD/RPC) ────────────────────
 

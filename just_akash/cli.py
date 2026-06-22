@@ -81,12 +81,25 @@ def _enrich_deployment_with_provider(client, deployment: dict) -> dict:
     """Inject provider hostUri into each lease so lease_shell transport can find it.
 
     The Console API /v1/deployments/{dseq} response stores the provider address as
-    lease["id"]["provider"] but omits the hostUri.  We fetch it and inject a
-    "provider" dict matching the format expected by LeaseShellTransport.
+    lease["id"]["provider"] but may omit (or leave blank) the hostUri. We resolve
+    it from the provider registry and inject a "provider" dict in the shape
+    LeaseShellTransport expects. Tolerant of unexpected API shapes.
     """
-    for lease in deployment.get("leases", []):
-        provider_addr = lease.get("id", {}).get("provider", "")
-        if provider_addr and not isinstance(lease.get("provider"), dict):
+    leases = deployment.get("leases")
+    if not isinstance(leases, list):
+        return deployment
+    for lease in leases:
+        if not isinstance(lease, dict):
+            continue
+        lease_id = lease.get("id")
+        provider_addr = lease_id.get("provider", "") if isinstance(lease_id, dict) else ""
+        if not provider_addr:
+            continue
+        provider = lease.get("provider")
+        existing_host = provider.get("hostUri") if isinstance(provider, dict) else None
+        # Backfill when the provider dict is missing OR carries a blank hostUri,
+        # so a registry-resolvable host isn't wrongly treated as "no host".
+        if not existing_host:
             info = client.get_provider(provider_addr) or {}
             lease["provider"] = {"hostUri": info.get("hostUri", "")}
     return deployment
@@ -662,7 +675,10 @@ def main():
         from .api import AkashConsoleAPI, _confirm, _get_tag
 
         try:
-            if not math.isfinite(args.deposit) or args.deposit < 0.5:
+            if not math.isfinite(args.deposit):
+                print("Error: deposit must be a finite number.", file=sys.stderr)
+                sys.exit(1)
+            if args.deposit < 0.5:
                 print("Error: minimum deposit is 0.5 USD.", file=sys.stderr)
                 sys.exit(1)
             client = AkashConsoleAPI(_require_api_key())

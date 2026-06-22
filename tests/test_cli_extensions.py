@@ -1,9 +1,11 @@
 """Tests for the v1.6 CLI subcommands: update, logs, events, add-funds, auto-topup."""
 
 import sys
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
+
+from just_akash.cli import _enrich_deployment_with_provider
 
 
 def _run_cli(monkeypatch, args):
@@ -274,3 +276,33 @@ class TestCliAutoTopup:
         assert "escrow service unavailable" in err
         # The set call was actually attempted (we're testing the set-path, not show).
         client.set_auto_top_up.assert_called_once_with("12345", True)
+
+
+class TestEnrichProviderHostUri:
+    def test_backfills_blank_hosturi_from_registry(self):
+        client = MagicMock()
+        client.get_provider.return_value = {"hostUri": "https://p.example:8443"}
+        dep = {"leases": [{"id": {"provider": "akash1p"}, "provider": {"hostUri": ""}}]}
+        out = _enrich_deployment_with_provider(client, dep)
+        assert out["leases"][0]["provider"]["hostUri"] == "https://p.example:8443"
+        client.get_provider.assert_called_once_with("akash1p")
+
+    def test_keeps_existing_nonblank_hosturi(self):
+        client = MagicMock()
+        dep = {"leases": [{"id": {"provider": "akash1p"}, "provider": {"hostUri": "https://keep"}}]}
+        out = _enrich_deployment_with_provider(client, dep)
+        assert out["leases"][0]["provider"]["hostUri"] == "https://keep"
+        client.get_provider.assert_not_called()
+
+    def test_tolerates_non_list_leases(self):
+        client = MagicMock()
+        assert _enrich_deployment_with_provider(client, {"leases": None}) == {"leases": None}
+        client.get_provider.assert_not_called()
+
+    def test_skips_non_dict_lease_entries(self):
+        client = MagicMock()
+        client.get_provider.return_value = {"hostUri": "https://p"}
+        dep = {"leases": ["weird", {"id": {"provider": "akash1p"}}]}
+        out = _enrich_deployment_with_provider(client, dep)
+        client.get_provider.assert_called_once_with("akash1p")
+        assert out["leases"][1]["provider"]["hostUri"] == "https://p"
