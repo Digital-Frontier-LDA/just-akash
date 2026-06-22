@@ -134,6 +134,22 @@ class TestFormatEventMessage:
         out = LeaseShellTransport._format_event_message(raw)
         assert out == "Normal  Pulled"
 
+    def test_numeric_message_zero_is_not_silently_dropped(self):
+        # An event whose `message` is the number 0 (a valid JSON value) must
+        # still appear in the rendered line. The formatter uses
+        # `obj.get("message") or obj.get("note") or ""`, so a falsy-but-present
+        # numeric message (0) is discarded — silent data loss.
+        raw = json.dumps(
+            {
+                "type": "Normal",
+                "reason": "Probe",
+                "involvedObject": {"kind": "Pod", "name": "p"},
+                "message": 0,
+            }
+        ).encode()
+        out = LeaseShellTransport._format_event_message(raw)
+        assert "0" in out
+
 
 # ── URL builders ─────────────────────────────────────────────────────
 
@@ -303,3 +319,23 @@ class TestStreamResilience:
         out = capsys.readouterr().out
         assert "real" in out
         assert "ping" not in out
+
+    def test_blank_log_line_between_two_lines_is_preserved(self, capsys):
+        """A genuinely empty log line (container prints a blank line) must be
+        emitted so the stream is a faithful copy. `_stream` guards with
+        `if line:`, so a frame that formats to "" is silently dropped, and the
+        two surrounding lines collapse together — losing the blank separator.
+        """
+        t = _make_transport()
+        t._provider_host_uri = "https://p.com"
+        # Middle frame is a bare newline -> formats to "" (a real blank line).
+        frames = [b"before", b"\n", b"after"]
+        with (
+            patch.object(t, "_fetch_jwt", return_value="jwt"),
+            patch("just_akash.transport.lease_shell.connect") as mock_connect,
+        ):
+            mock_connect.return_value = FakeWebSocket(frames)
+            t._stream("https://p.com/lease/123/1/1/logs?", ["logs"], t._format_log_message, 1)
+        out = capsys.readouterr().out
+        # Faithful output keeps the blank line between the two log lines.
+        assert out == "before\n\nafter\n"

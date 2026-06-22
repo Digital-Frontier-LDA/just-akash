@@ -250,8 +250,11 @@ class AkashConsoleAPI:
         try:
             response = self._request("GET", f"/v2/deployment-settings/{dseq}")
         except RuntimeError as e:
-            # No settings yet is reported as a 404 by the Console API.
-            if "404" in str(e) or "not found" in str(e).lower():
+            # No settings yet is reported as HTTP 404. Match the status code
+            # precisely (_request formats errors as "API Error (404): ...");
+            # a substring search would misclassify a 400/500 whose body merely
+            # contains "404" (e.g. dseq 40400) or the phrase "not found".
+            if str(e).startswith("API Error (404)"):
                 return {}
             raise
         if not isinstance(response, dict):

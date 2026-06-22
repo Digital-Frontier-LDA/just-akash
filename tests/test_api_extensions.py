@@ -99,6 +99,30 @@ class TestDeploymentSettings:
             client.get_deployment_settings("12345")
 
     @patch.object(AkashConsoleAPI, "_request")
+    def test_get_settings_non_404_with_404_substring_in_dseq_must_reraise(self, mock_req):
+        # A genuine HTTP 400 whose body happens to contain "404" as a substring
+        # of a dseq (e.g. 40400) must NOT be misread as "no settings yet". The
+        # 404-detection uses a naive `"404" in str(e)` substring test, so this
+        # error is silently swallowed and returned as {} instead of re-raising.
+        mock_req.side_effect = RuntimeError("API Error (400): invalid dseq 40400")
+        client = AkashConsoleAPI("key")
+        with pytest.raises(RuntimeError, match="400"):
+            client.get_deployment_settings("40400")
+
+    @patch.object(AkashConsoleAPI, "_request")
+    def test_get_settings_500_containing_not_found_phrase_must_reraise(self, mock_req):
+        # A real server error (HTTP 500) whose body contains the words
+        # "not found" (e.g. an internal lookup failure) is a hard failure that
+        # must surface, not be treated as "settings unset". The casing-insensitive
+        # "not found" substring check wrongly swallows it as {}.
+        mock_req.side_effect = RuntimeError(
+            "API Error (500): deployment record Not Found in escrow ledger"
+        )
+        client = AkashConsoleAPI("key")
+        with pytest.raises(RuntimeError, match="500"):
+            client.get_deployment_settings("12345")
+
+    @patch.object(AkashConsoleAPI, "_request")
     def test_create_settings_body(self, mock_req):
         mock_req.return_value = {"data": {"autoTopUpEnabled": True}}
         client = AkashConsoleAPI("key")

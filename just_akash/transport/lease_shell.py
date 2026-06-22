@@ -711,11 +711,16 @@ class LeaseShellTransport(Transport):
         kind = involved.get("kind", "")
         name = involved.get("name", "")
         target = f"{kind}/{name}".strip("/")
-        message = obj.get("message") or obj.get("note") or ""
+        # Resolve message/note by presence, not truthiness — a numeric 0 is a
+        # valid message and must not be dropped.
+        message = obj.get("message")
+        if message is None:
+            message = obj.get("note")
+        message = "" if message is None else str(message)
         ts = obj.get("lastTimestamp") or obj.get("firstTimestamp") or obj.get("eventTime") or ""
-        parts = [
-            str(p) for p in (ts, obj.get("type", ""), obj.get("reason", ""), target, message) if p
-        ]
+        parts = [str(p) for p in (ts, obj.get("type", ""), obj.get("reason", ""), target) if p]
+        if message != "":
+            parts.append(message)
         return "  ".join(parts) if parts else text
 
     def _stream(self, provider_url: str, scope: list[str], formatter, recv_timeout: float) -> None:
@@ -748,10 +753,13 @@ class LeaseShellTransport(Transport):
                     continue
                 if frame is None:
                     continue
+                # Every received data frame maps to one output line. Do NOT skip
+                # empty lines — a blank line is real log output and dropping it
+                # would make the stream an unfaithful copy. (ping/pong control
+                # frames already decode to None above and never reach here.)
                 line = formatter(frame)
-                if line:
-                    sys.stdout.write(line + "\n")
-                    sys.stdout.flush()
+                sys.stdout.write(line + "\n")
+                sys.stdout.flush()
 
     def stream_logs(
         self, follow: bool = False, tail: int = 100, service: str | None = None
