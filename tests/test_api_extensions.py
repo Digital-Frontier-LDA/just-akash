@@ -166,6 +166,41 @@ class TestSetAutoTopUp:
         mock_create.assert_called_once_with("12345", True)
         mock_update.assert_not_called()
 
+    @patch.object(AkashConsoleAPI, "_request")
+    def test_upsert_creates_when_settings_endpoint_returns_data_null(self, mock_req):
+        # A deployment with no settings yet can be reported as {"data": null}
+        # (the key is present, the value is None) rather than a 404 or an empty
+        # object. get_deployment_settings unwraps data=None to the *raw wrapper*
+        # {"data": None}, which is truthy, so set_auto_top_up's `if existing:`
+        # routes to PATCH (update an existing record) instead of POST (create).
+        # The PATCH targets a settings record that does not exist -> wrong verb,
+        # and on a real server a 404. The upsert must CREATE here.
+        def _route(method, endpoint, data=None):
+            if method == "GET":
+                return {"data": None}  # "no settings yet"
+            return {"data": {"autoTopUpEnabled": True}}
+
+        mock_req.side_effect = _route
+        client = AkashConsoleAPI("key")
+        client.set_auto_top_up("12345", True)
+        methods = [call.args[0] for call in mock_req.call_args_list]
+        # After the GET, the upsert must POST (create), never PATCH (update).
+        assert "PATCH" not in methods, f"upsert wrongly PATCHed non-existent settings: {methods}"
+        assert "POST" in methods
+
+    @patch.object(AkashConsoleAPI, "_request")
+    def test_settings_data_null_returns_empty_dict_not_wrapper(self, mock_req):
+        # When the settings response is {"data": null}, get_deployment_settings
+        # must return {} ("unset") so callers' truthiness checks behave. Instead
+        # it returns the raw wrapper {"data": None} because data is None (not a
+        # dict) and the fallback hands back the whole response.
+        mock_req.return_value = {"data": None}
+        client = AkashConsoleAPI("key")
+        result = client.get_deployment_settings("12345")
+        assert result == {}, f"expected {{}} for data=null, got {result!r}"
+        # And the wrapper must not leak through as a truthy "settings exist".
+        assert not result
+
 
 # ── JWT scope parameter ──────────────────────────────────────────────
 

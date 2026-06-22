@@ -80,6 +80,24 @@ class TestCliLogs:
         # Must not propagate KeyboardInterrupt.
         _run_cli(monkeypatch, ["just-akash", "logs", "--dseq", "12345"])
 
+    @patch("just_akash.cli._make_lease_shell")
+    @patch("just_akash.api.AkashConsoleAPI")
+    def test_logs_stream_runtimeerror_exits_1_not_traceback(
+        self, MockAPI, mock_make, monkeypatch, capsys
+    ):
+        # The logs handler wraps stream_logs in an inner try that only catches
+        # KeyboardInterrupt; a RuntimeError raised mid-stream (e.g. provider
+        # resolution failing after the transport is built) must fall through to
+        # the outer RuntimeError handler -> friendly message + exit 1, never an
+        # uncaught traceback.
+        monkeypatch.setenv("AKASH_API_KEY", "k")
+        transport = mock_make.return_value
+        transport.stream_logs.side_effect = RuntimeError("provider resolution failed mid-stream")
+        with pytest.raises(SystemExit) as e:
+            _run_cli(monkeypatch, ["just-akash", "logs", "--dseq", "12345"])
+        assert e.value.code == 1
+        assert "provider resolution failed mid-stream" in capsys.readouterr().err
+
 
 # ── events ───────────────────────────────────────────────────────────
 

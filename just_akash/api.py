@@ -82,6 +82,20 @@ def _json_output(data: dict[str, Any] | list[Any]) -> str:
     return json.dumps(data, indent=2)
 
 
+def _unwrap_data(response: Any) -> dict[str, Any]:
+    """Extract the dict payload from a Console API response.
+
+    Accepts both the ``{"data": {...}}`` envelope and a bare dict body. Returns
+    ``{}`` for anything without a usable dict payload — including the
+    ``{"data": null}`` shape some endpoints use for "no record", which must NOT
+    leak back to callers as a truthy wrapper.
+    """
+    if not isinstance(response, dict):
+        return {}
+    data = response.get("data", response)
+    return data if isinstance(data, dict) else {}
+
+
 class AkashConsoleAPI:
     """Client for Akash Console API (https://console-api.akash.network)"""
 
@@ -219,10 +233,7 @@ class AkashConsoleAPI:
             f"/v1/deployments/{dseq}",
             {"data": {"sdl": sdl_content}},
         )
-        if not isinstance(response, dict):
-            return {}
-        data = response.get("data", response)
-        return data if isinstance(data, dict) else response
+        return _unwrap_data(response)
 
     def deposit_deployment(self, dseq: str, deposit: float) -> dict[str, Any]:
         """Add funds to an existing deployment's escrow.
@@ -235,10 +246,7 @@ class AkashConsoleAPI:
             "/v1/deposit-deployment",
             {"data": {"dseq": str(dseq), "deposit": deposit}},
         )
-        if not isinstance(response, dict):
-            return {}
-        data = response.get("data", response)
-        return data if isinstance(data, dict) else response
+        return _unwrap_data(response)
 
     def get_deployment_settings(self, dseq: str) -> dict[str, Any]:
         """Fetch auto top-up settings for a deployment.
@@ -257,10 +265,7 @@ class AkashConsoleAPI:
             if str(e).startswith("API Error (404)"):
                 return {}
             raise
-        if not isinstance(response, dict):
-            return {}
-        data = response.get("data", response)
-        return data if isinstance(data, dict) else response
+        return _unwrap_data(response)
 
     def create_deployment_settings(self, dseq: str, auto_top_up_enabled: bool) -> dict[str, Any]:
         """Create deployment settings (first-time auto top-up config).
@@ -273,10 +278,7 @@ class AkashConsoleAPI:
             "/v2/deployment-settings",
             {"data": {"dseq": str(dseq), "autoTopUpEnabled": auto_top_up_enabled}},
         )
-        if not isinstance(response, dict):
-            return {}
-        data = response.get("data", response)
-        return data if isinstance(data, dict) else response
+        return _unwrap_data(response)
 
     def update_deployment_settings(self, dseq: str, auto_top_up_enabled: bool) -> dict[str, Any]:
         """Update existing deployment settings.
@@ -288,10 +290,7 @@ class AkashConsoleAPI:
             f"/v2/deployment-settings/{dseq}",
             {"data": {"autoTopUpEnabled": auto_top_up_enabled}},
         )
-        if not isinstance(response, dict):
-            return {}
-        data = response.get("data", response)
-        return data if isinstance(data, dict) else response
+        return _unwrap_data(response)
 
     def set_auto_top_up(self, dseq: str, enabled: bool) -> dict[str, Any]:
         """Enable or disable auto top-up, upserting settings as needed.

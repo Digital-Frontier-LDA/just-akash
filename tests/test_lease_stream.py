@@ -6,7 +6,7 @@ end-to-end against a fake WebSocket (with proxy-envelope unwrapping).
 
 import base64
 import json
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
@@ -272,6 +272,53 @@ class TestStreamEvents:
         assert mock_jwt.call_args.kwargs["scope"] == ["events"]
         connect_msg = json.loads(fake_ws.sent_messages[0])
         assert "/lease/123/1/1/kubeevents" in connect_msg["url"]
+
+
+# ── provider-scoped JWT carries the iteration's scope ────────────────
+
+
+class TestStreamProviderScopedJwt:
+    def test_logs_provider_scoped_jwt_uses_logs_scope_not_shell(self, capsys):
+        """When the lease exposes only a provider ADDRESS (id.provider) and no
+        embedded hostUri, _resolve_provider sets _provider_address and resolves
+        the hostUri via get_provider. _fetch_jwt must then route through
+        create_jwt_with_provider carrying scope=["logs"] (the streaming scope),
+        NOT the default ["shell"]. This whole branch is unexercised by the other
+        tests, which mock _fetch_jwt out entirely.
+        """
+        deployment = {
+            "leases": [
+                {
+                    "id": {"provider": "akash1prov"},
+                    "status": {"services": {"web": {"ready_replicas": 1, "total": 1}}},
+                }
+            ]
+        }
+        cfg = TransportConfig(dseq="123", api_key="key", deployment=deployment)
+        t = LeaseShellTransport(cfg)
+
+        fake_client = MagicMock()
+        fake_client.get_provider.return_value = {"hostUri": "https://p.example:8443"}
+        fake_client.create_jwt_with_provider.return_value = "jwt-prov"
+
+        with (
+            patch.object(t, "_get_api_client", return_value=fake_client),
+            patch("just_akash.transport.lease_shell.connect") as mock_connect,
+        ):
+            mock_connect.return_value = FakeWebSocket([b"line"])
+            t.stream_logs(follow=False, tail=10)
+
+        # Provider-scoped JWT path was taken (address present, no embedded hostUri).
+        assert fake_client.create_jwt_with_provider.called
+        assert not fake_client.create_jwt.called
+        _, kwargs = fake_client.create_jwt_with_provider.call_args
+        assert kwargs["scope"] == ["logs"], (
+            f"provider-scoped JWT must carry the logs scope, got {kwargs.get('scope')!r}"
+        )
+        # And the resolved hostUri (from get_provider) is embedded in the URL.
+        connect_msg = json.loads(mock_connect.return_value.sent_messages[0])
+        assert connect_msg["url"].startswith("https://p.example:8443/lease/123/1/1/logs")
+        assert connect_msg["providerAddress"] == "akash1prov"
 
 
 # ── _stream resilience ───────────────────────────────────────────────
