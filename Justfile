@@ -51,10 +51,10 @@ update sdl dseq="" image="":
     trap 'status=$?; echo "[INFO] recipe=update finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
     echo "[INFO] recipe=update started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file sdl={{sdl}} dseq={{dseq}} image={{image}}"
     set -x
-    cmd="uv run just-akash update --sdl {{sdl}}"
-    if [ -n "{{dseq}}" ]; then cmd="$cmd --dseq={{dseq}}"; fi
-    if [ -n "{{image}}" ]; then cmd="$cmd --image {{image}}"; fi
-    eval "$cmd"
+    args=(uv run just-akash update --sdl "{{sdl}}")
+    if [ -n "{{dseq}}" ]; then args+=(--dseq "{{dseq}}"); fi
+    if [ -n "{{image}}" ]; then args+=(--image "{{image}}"); fi
+    "${args[@]}"
 
 # Destroy an instance (picks interactively if no DSEQ given)
 destroy dseq="":
@@ -182,10 +182,10 @@ logs dseq="" follow="":
     trap 'status=$?; echo "[INFO] recipe=logs finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
     echo "[INFO] recipe=logs started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq={{dseq}} follow={{follow}}"
     set -x
-    cmd="uv run just-akash logs"
-    if [ -n "{{dseq}}" ]; then cmd="$cmd --dseq={{dseq}}"; fi
-    if [ -n "{{follow}}" ]; then cmd="$cmd --follow"; fi
-    eval "$cmd"
+    args=(uv run just-akash logs)
+    if [ -n "{{dseq}}" ]; then args+=(--dseq "{{dseq}}"); fi
+    if [ -n "{{follow}}" ]; then args+=(--follow); fi
+    "${args[@]}"
 
 # Stream Kubernetes events for a deployment (debug why it won't start).
 # Usage: just events [dseq]
@@ -199,9 +199,9 @@ events dseq="":
     trap 'status=$?; echo "[INFO] recipe=events finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
     echo "[INFO] recipe=events started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq={{dseq}}"
     set -x
-    cmd="uv run just-akash events"
-    if [ -n "{{dseq}}" ]; then cmd="$cmd --dseq={{dseq}}"; fi
-    eval "$cmd"
+    args=(uv run just-akash events)
+    if [ -n "{{dseq}}" ]; then args+=(--dseq "{{dseq}}"); fi
+    "${args[@]}"
 
 # ── Escrow / funding ─────────────────────────────────
 
@@ -218,9 +218,9 @@ add-funds amount dseq="":
     trap 'status=$?; echo "[INFO] recipe=add-funds finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
     echo "[INFO] recipe=add-funds started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file amount={{amount}} dseq={{dseq}}"
     set -x
-    cmd="uv run just-akash add-funds --deposit {{amount}}"
-    if [ -n "{{dseq}}" ]; then cmd="$cmd --dseq={{dseq}}"; fi
-    eval "$cmd"
+    args=(uv run just-akash add-funds --deposit "{{amount}}")
+    if [ -n "{{dseq}}" ]; then args+=(--dseq "{{dseq}}"); fi
+    "${args[@]}"
 
 # Show or toggle auto top-up for a deployment.
 # Usage: just auto-topup [dseq] [on|off]   (no toggle = show current setting)
@@ -235,11 +235,11 @@ auto-topup dseq="" toggle="":
     trap 'status=$?; echo "[INFO] recipe=auto-topup finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
     echo "[INFO] recipe=auto-topup started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq={{dseq}} toggle={{toggle}}"
     set -x
-    cmd="uv run just-akash auto-topup"
-    if [ -n "{{dseq}}" ]; then cmd="$cmd --dseq={{dseq}}"; fi
-    if [ "{{toggle}}" = "on" ]; then cmd="$cmd --on"; fi
-    if [ "{{toggle}}" = "off" ]; then cmd="$cmd --off"; fi
-    eval "$cmd"
+    args=(uv run just-akash auto-topup)
+    if [ -n "{{dseq}}" ]; then args+=(--dseq "{{dseq}}"); fi
+    if [ "{{toggle}}" = "on" ]; then args+=(--on); fi
+    if [ "{{toggle}}" = "off" ]; then args+=(--off); fi
+    "${args[@]}"
 
 # ── Testing ──────────────────────────────────────────
 
