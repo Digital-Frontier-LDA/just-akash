@@ -278,21 +278,26 @@ class TestCliAutoTopup:
         client.set_auto_top_up.assert_called_once_with("12345", True)
 
 
+def _dep_with_lease(provider):
+    """Build a deployment dict with one lease (id.provider=akash1p)."""
+    lease = {"id": {"provider": "akash1p"}, "provider": provider}
+    return {"leases": [lease]}
+
+
 class TestEnrichProviderHostUri:
     def test_backfills_blank_hosturi_from_registry(self):
         client = MagicMock()
         client.get_provider.return_value = {"hostUri": "https://p.example:8443"}
-        dep = {"leases": [{"id": {"provider": "akash1p"}, "provider": {"hostUri": ""}}]}
-        out = _enrich_deployment_with_provider(client, dep)
-        assert out["leases"][0]["provider"]["hostUri"] == "https://p.example:8443"
+        out = _enrich_deployment_with_provider(client, _dep_with_lease({"hostUri": ""}))
+        host = out["leases"][0]["provider"]["hostUri"]
+        assert host == "https://p.example:8443"
         client.get_provider.assert_called_once_with("akash1p")
 
     def test_keeps_existing_nonblank_hosturi(self):
         client = MagicMock()
-        dep = {
-            "leases": [{"id": {"provider": "akash1p"}, "provider": {"hostUri": "https://keep"}}]
-        }
-        out = _enrich_deployment_with_provider(client, dep)
+        out = _enrich_deployment_with_provider(
+            client, _dep_with_lease({"hostUri": "https://keep"})
+        )
         assert out["leases"][0]["provider"]["hostUri"] == "https://keep"
         client.get_provider.assert_not_called()
 
