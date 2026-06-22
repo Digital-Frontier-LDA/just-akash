@@ -170,7 +170,7 @@ class LeaseShellTransport(Transport):
     def _build_provider_shell_url(
         self, command: str | None = None, tty: bool = False, stdin: bool = False
     ) -> str:
-        assert self._provider_host_uri is not None
+        assert self._provider_host_uri is not None  # noqa: S101 type-narrowing
         dseq = self._config.dseq
         qs_parts = [
             "podIndex=0",
@@ -187,7 +187,7 @@ class LeaseShellTransport(Transport):
     def _build_shell_url_sh_c(
         self, shell_command: str, tty: bool = False, stdin: bool = False
     ) -> str:
-        assert self._provider_host_uri is not None
+        assert self._provider_host_uri is not None  # noqa: S101 type-narrowing
         dseq = self._config.dseq
         qs_parts = [
             "podIndex=0",
@@ -204,7 +204,7 @@ class LeaseShellTransport(Transport):
     def _build_logs_url(
         self, follow: bool = False, tail: int = 100, service: str | None = None
     ) -> str:
-        assert self._provider_host_uri is not None
+        assert self._provider_host_uri is not None  # noqa: S101 type-narrowing
         dseq = self._config.dseq
         qs_parts = [
             f"follow={'true' if follow else 'false'}",
@@ -216,7 +216,7 @@ class LeaseShellTransport(Transport):
         return f"{self._provider_host_uri}/lease/{dseq}/1/1/logs?{qs}"
 
     def _build_events_url(self) -> str:
-        assert self._provider_host_uri is not None
+        assert self._provider_host_uri is not None  # noqa: S101 type-narrowing
         dseq = self._config.dseq
         return f"{self._provider_host_uri}/lease/{dseq}/1/1/kubeevents"
 
@@ -579,7 +579,7 @@ class LeaseShellTransport(Transport):
                             }
                         )
                     )
-                except Exception:
+                except Exception:  # noqa: S110 best-effort send inside SIGINT handler; logging is unsafe here
                     pass
 
             try:
@@ -608,7 +608,7 @@ class LeaseShellTransport(Transport):
                             )
                         )
                         _last_size[0] = new_size
-                    except Exception:
+                    except Exception:  # noqa: S110 best-effort resize inside SIGWINCH handler; logging is unsafe here
                         pass
 
             original_sigint = signal.signal(signal.SIGINT, _sigint_handler)

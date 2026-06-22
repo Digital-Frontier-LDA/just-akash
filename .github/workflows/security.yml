@@ -1,0 +1,69 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly (Mon 06:00 UTC) so newly-disclosed dependency CVEs surface even
+    # without a code change.
+    - cron: '0 6 * * 1'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  semgrep:
+    name: Semgrep SAST
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # Mirrors `just semgrep`. Two rules inherent to a remote-exec CLI are
+      # excluded (documented in SECURITY.md / Justfile); subprocess-shell-true
+      # and all other rules stay active. --error fails the build on any finding.
+      - name: Semgrep scan
+        run: |
+          uvx semgrep scan \
+            --config p/python --config p/security-audit \
+            --exclude-rule python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args \
+            --exclude-rule python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected \
+            --error --metrics off just_akash/
+
+  dependency-audit:
+    name: Dependency CVE audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      # Mirrors `just audit`. Audits the synced environment against the PyPI
+      # advisory database. Fails the build on any known vulnerability.
+      - name: pip-audit
+        run: uv run --with pip-audit pip-audit

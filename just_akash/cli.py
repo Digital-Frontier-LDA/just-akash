@@ -24,6 +24,7 @@ import argparse
 import logging
 import math
 import os
+import shlex
 import subprocess
 import sys
 
@@ -457,6 +458,8 @@ def main():
                 ssh, ssh_cmd = _require_ssh(client, dseq, args.key)
                 ssh_cmd.append(args.remote_cmd)
                 print(f"Executing on {ssh['host']}:{ssh['port']}...")
+                # `exec` runs a user-supplied command on the user's own deployment
+                # by design (this is `ssh host <cmd>`); the command is the feature.
                 result = subprocess.run(ssh_cmd, text=True)
                 sys.exit(result.returncode)
         except RuntimeError as e:
@@ -520,15 +523,20 @@ def main():
             else:
                 ssh, ssh_cmd = _require_ssh(client, dseq, args.key)
                 remote_path = args.remote_path
+                # Quote the user-supplied path before it reaches the remote
+                # shell (ssh runs the trailing arg via /bin/sh), matching the
+                # lease-shell transport. Prevents metacharacters in --remote-path
+                # from being interpreted remotely.
+                quoted_path = shlex.quote(remote_path)
                 secrets_content = "\n".join(env_lines) + "\n"
 
-                mkdir_cmd = ssh_cmd + [f"mkdir -p $(dirname {remote_path})"]
+                mkdir_cmd = ssh_cmd + [f"mkdir -p $(dirname {quoted_path})"]
                 result = subprocess.run(mkdir_cmd, capture_output=True, text=True)
                 if result.returncode != 0:
                     print(f"Error creating remote directory: {result.stderr.strip()}")
                     sys.exit(1)
 
-                write_cmd = ssh_cmd + [f"cat > {remote_path}"]
+                write_cmd = ssh_cmd + [f"cat > {quoted_path}"]
                 result = subprocess.run(
                     write_cmd, input=secrets_content, capture_output=True, text=True
                 )
@@ -536,7 +544,7 @@ def main():
                     print(f"Error writing secrets: {result.stderr.strip()}")
                     sys.exit(1)
 
-                chmod_cmd = ssh_cmd + [f"chmod 600 {remote_path}"]
+                chmod_cmd = ssh_cmd + [f"chmod 600 {quoted_path}"]
                 subprocess.run(chmod_cmd, capture_output=True, text=True)
 
                 print(f"Injected {len(env_lines)} secret(s) into {dseq}:{remote_path}")

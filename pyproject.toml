@@ -25,7 +25,24 @@ target-version = "py310"
 line-length = 99
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM"]
+select = ["E", "F", "I", "UP", "B", "SIM", "S"]
+ignore = [
+    # This CLI shells out to `ssh` by design: it builds argv lists (never
+    # shell=True — S602 stays enabled to enforce that) and resolves `ssh` from
+    # PATH for portability. These three bandit rules fire on every
+    # subprocess/exec regardless of safety, so they are low-signal here.
+    "S603", # subprocess call — flagged on argv-list calls with no shell
+    "S606", # start a process without a shell (this is the *secure* choice)
+    "S607", # partial executable path (`ssh`/`git` from PATH is intentional)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Test and e2e code: assert-based tests (S101), hardcoded test creds (S105) and
+# /tmp paths (S108), and shell-based test orchestration (S602) are expected and
+# are not part of the shipped attack surface.
+"tests/**" = ["S"]
+"just_akash/test_*.py" = ["S"]
+"just_akash/_e2e.py" = ["S"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

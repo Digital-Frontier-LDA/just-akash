@@ -62,8 +62,10 @@ uv run pre-commit install   # install gitleaks + ruff hooks
 | `just tag [dseq] [name]` | `just tag 12345 my-db` | Tag a deployment with a name |
 | `just test-shell` | `just test-shell` | E2E lease-shell transport test (deploy/exec/inject/cleanup) |
 | `just test-secrets` | `just test-secrets` | E2E secrets injection test (SSH inject + lease-shell cross-check) |
-| `just lint` | `just lint` | Ruff lint + format check |
+| `just lint` | `just lint` | Ruff lint + format check (incl. bandit `S` security rules) |
 | `just secrets` | `just secrets` | Gitleaks secret scan |
+| `just semgrep` | `just semgrep` | Semgrep SAST scan |
+| `just audit` | `just audit` | Dependency CVE audit (pip-audit) |
 
 Transport: `connect`, `exec`, and `inject` default to `lease-shell`. Pass `ssh` as the last argument to force SSH: `just exec 12345 "cmd" ssh`.
 

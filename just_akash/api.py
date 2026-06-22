@@ -125,7 +125,9 @@ class AkashConsoleAPI:
 
         request_body = json.dumps(data).encode("utf-8") if data else None
 
-        req = urllib.request.Request(
+        # S310: the URL is built from base_url, which defaults to the https
+        # Console API and is operator-set (env var), not external/attacker input.
+        req = urllib.request.Request(  # noqa: S310
             url,
             data=request_body,
             headers=self.headers,
@@ -134,7 +136,7 @@ class AkashConsoleAPI:
 
         try:
             t0 = datetime.now(timezone.utc)
-            with urllib.request.urlopen(req) as response:
+            with urllib.request.urlopen(req) as response:  # noqa: S310
                 response_data = response.read().decode("utf-8")
                 elapsed_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
                 if response_data:

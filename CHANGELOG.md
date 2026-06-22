@@ -18,10 +18,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - API client: `update_deployment`, `deposit_deployment`, `get_deployment_settings`, `create_deployment_settings`, `update_deployment_settings`, `set_auto_top_up` (upsert).
 - Transport: `LeaseShellTransport.stream_logs` / `stream_events` reuse the provider-proxy plumbing; tolerant log/event message formatting (JSON `ServiceLogMessage` or raw text).
 - Tests: 69 new unit tests across `test_api_extensions.py`, `test_lease_stream.py`, `test_cli_extensions.py`, `test_update_flow.py`.
+- **Adversarial hardening** (`/nf:harden`, 6 iterations to convergence): fixed 9 edge-case bugs in the new lifecycle code (loose 404 detection, dropped/`0` log+event messages, blank-line streaming, image-override hijacking a comment, non-bool auto-topup display, `{"data": null}` wrapper leak breaking first-time auto-topup, non-finite `add-funds` deposit) — see `harden iteration` commits.
+- **Security tooling**: ruff bandit rules (`S`), a Semgrep SAST scan (`just semgrep`), and a pip-audit dependency CVE check (`just audit`), all wired into CI (`.github/workflows/security.yml`, weekly schedule for CVEs). See `SECURITY.md`.
 
 ### Changed
 - `create_jwt` / `create_jwt_with_provider` accept a `scope` parameter (defaults to `["shell"]`) so the same JWT path serves `shell`, `logs`, and `events`.
 - SDL preparation (read → validate → image/SSH/env overrides) extracted into `deploy._prepare_sdl_content`, shared by `deploy()` and `update()`.
+
+### Security
+- `inject` SSH-fallback path now `shlex.quote`s the user-supplied `--remote-path` before it reaches the remote shell, matching the lease-shell transport (prevents remote-shell metacharacter interpretation).
+- Corrected `deploy --deposit` help and log line: deposits are denominated in **USD**, not AKT (verified against the Console API source).
 
 ---
 

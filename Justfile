@@ -306,6 +306,22 @@ check:
 secrets:
     gitleaks detect --no-banner -v
 
+# ── Security (SAST + dependency CVEs) ────────────────
+
+# Static security scan with Semgrep (excludes 2 CLI-inherent rules; see SECURITY.md)
+semgrep:
+    #!/bin/bash
+    set -euo pipefail
+    uvx semgrep scan \
+      --config p/python --config p/security-audit \
+      --exclude-rule python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args \
+      --exclude-rule python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected \
+      --error --metrics off just_akash/
+
+# Dependency CVE audit (pip-audit over the synced environment).
+audit:
+    uv run --with pip-audit pip-audit
+
 # ── Advanced ─────────────────────────────────────────
 
 # Deploy with custom SDL (e.g. no SSH, different image)
