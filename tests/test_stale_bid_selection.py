@@ -310,6 +310,80 @@ class TestLeaseStaleRetry:
         assert client.create_lease.call_count == 1
         client.close_deployment.assert_called_once_with("12345")
 
+    @patch("just_akash.deploy.time")
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_redeploy_preserves_deposit(self, MockAPI, mock_time, tmp_path, monkeypatch):
+        """The re-created order must be funded with the SAME --deposit as the
+        original (issue #19 follow-up); otherwise re-deploy silently falls back
+        to the default escrow."""
+        client, sdl = _setup(MockAPI, mock_time, tmp_path, monkeypatch, providers="akash1a")
+        client.create_deployment.side_effect = [
+            {"dseq": "111", "manifest": "m1"},
+            {"dseq": "222", "manifest": "m2"},
+        ]
+        client.get_bids.return_value = [_make_bid("akash1a", 10)]
+        client.create_lease.side_effect = [self.STALE_ERR, {"lease": "ok"}]
+
+        deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5, deposit=12.0)
+
+        assert client.create_deployment.call_count == 2
+        # Both the original order and the re-deploy use the same deposit.
+        for call in client.create_deployment.call_args_list:
+            assert call.kwargs.get("deposit") == 12.0
+
+    @patch("just_akash.deploy.time")
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_redeploy_no_fresh_bid_cleans_up_and_raises(
+        self, MockAPI, mock_time, tmp_path, monkeypatch
+    ):
+        """If the re-created order never yields an open allowlisted bid, the
+        fast-poll times out → the new order is cleaned up and the failure is
+        surfaced with an accurate cause."""
+        client, sdl = _setup(MockAPI, mock_time, tmp_path, monkeypatch, providers="akash1a")
+        client.create_deployment.side_effect = [
+            {"dseq": "111", "manifest": "m1"},
+            {"dseq": "222", "manifest": "m2"},
+        ]
+        # Order 111 has a bid (drives selection + the stale lease); the
+        # re-created order 222 yields nothing.
+        client.get_bids.side_effect = lambda d: [_make_bid("akash1a", 10)] if d == "111" else []
+        client.create_lease.side_effect = self.STALE_ERR
+
+        with pytest.raises(RuntimeError, match="no fresh open bid on re-created order 222"):
+            deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+
+        assert client.create_lease.call_count == 1  # round 2 never reached
+        # Closed twice: stale order 111 at re-deploy, new order 222 on timeout.
+        assert client.close_deployment.call_count == 2
+        assert client.close_deployment.call_args_list[0].args == ("111",)
+        assert client.close_deployment.call_args_list[1].args == ("222",)
+
+    @patch("just_akash.deploy.time")
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_redeploy_proceeds_when_close_of_stale_order_fails(
+        self, MockAPI, mock_time, tmp_path, monkeypatch, capsys
+    ):
+        """If closing the stale order fails, re-deploy still proceeds (so the
+        deploy can succeed) but warns loudly with an actionable remediation —
+        the old escrow stays locked until manually closed."""
+        client, sdl = _setup(MockAPI, mock_time, tmp_path, monkeypatch, providers="akash1a")
+        client.create_deployment.side_effect = [
+            {"dseq": "111", "manifest": "m1"},
+            {"dseq": "222", "manifest": "m2"},
+        ]
+        client.get_bids.return_value = [_make_bid("akash1a", 10)]
+        client.create_lease.side_effect = [self.STALE_ERR, {"lease": "ok"}]
+        client.close_deployment.side_effect = RuntimeError("close exploded")
+
+        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+
+        assert result["dseq"] == "222"
+        # Only the stale order's close was attempted (and it failed); the new
+        # order succeeded so no cleanup-close happened.
+        client.close_deployment.assert_called_once_with("111")
+        out = capsys.readouterr().out
+        assert "just-akash destroy --dseq 111" in out
+
 
 class TestLeaseTransientJWTRetry:
     """Console API intermittently 400s lease creation with "JWT has invalid
