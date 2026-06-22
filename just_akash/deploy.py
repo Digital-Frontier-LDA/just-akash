@@ -194,6 +194,24 @@ def _resolve_tier(arg_value: list[str] | None, env_name: str) -> list[str]:
     return [a.strip() for a in raw.split(",") if a.strip()]
 
 
+def _resolve_sdl_path(sdl_path: str, gpu: bool) -> str:
+    """When ``gpu`` is set, prefer a ``<stem>-gpu<suffix>`` sibling SDL.
+
+    Returns the GPU variant path if it exists next to ``sdl_path``, otherwise
+    the original path (with a warning). This makes the ``--gpu`` flag honest:
+    "use the GPU variant SDL if available".
+    """
+    if not gpu:
+        return sdl_path
+    p = Path(sdl_path)
+    variant = p.with_name(f"{p.stem}-gpu{p.suffix}")
+    if variant.exists():
+        _log(logging.INFO, f"GPU mode: using GPU SDL variant {variant}")
+        return str(variant)
+    _log(logging.WARNING, f"--gpu set but no GPU variant found at {variant}; using {sdl_path}")
+    return sdl_path
+
+
 def _prepare_sdl_content(
     sdl_path: str,
     image: str | None = None,
@@ -248,6 +266,11 @@ def _prepare_sdl_content(
         _log(logging.INFO, "Injected SSH public key (base64) into SDL")
 
     if env_vars:
+        # Reject malformed entries before they become a broken SDL env line
+        # (mirrors the `inject` command's validation).
+        for var in env_vars:
+            if "=" not in var:
+                raise RuntimeError(f"Invalid --env {var!r}: expected KEY=VALUE")
         sdl_content = _inject_env_into_sdl(sdl_content, env_vars)
         _log(logging.INFO, f"Injected {len(env_vars)} env var(s) into SDL (provider-visible)")
 
@@ -295,7 +318,8 @@ def deploy(
     if not has_allowlist:
         _log(logging.INFO, "ALLOWED_PROVIDERS: (any — no allowlist set)")
 
-    # Step 1: Read + validate + transform SDL
+    # Step 1: Read + validate + transform SDL (resolve GPU variant first)
+    sdl_path = _resolve_sdl_path(sdl_path, gpu)
     _log(logging.INFO, "STEP 1: Preparing SDL")
     sdl_content = _prepare_sdl_content(sdl_path, image=image, env_vars=env_vars)
 
@@ -813,17 +837,30 @@ def deploy(
             f"All bids on order {dseq} are stale — re-creating the order for "
             "fresh bids (1 re-deploy round)...",
         )
-        try:
-            client.close_deployment(str(dseq))
-            _log(logging.INFO, f"  Stale order {dseq} closed")
-        except Exception as close_err:
-            # Proceed so the deploy can still succeed, but surface the leak
-            # loudly and actionably — the old escrow stays locked until closed.
-            _log(
-                logging.WARNING,
-                f"  WARNING: could not close stale order {dseq} ({close_err}). "
-                f"Its escrow stays locked until you close it: "
-                f"just-akash destroy --dseq {dseq}",
+        # Close the stale order BEFORE creating a new one — never leave two
+        # funded orders on-chain. Transient close failures (often the same
+        # Console flap that triggered the re-deploy) are retried; if the close
+        # persistently fails we abort rather than double-fund escrow.
+        closed = False
+        for close_attempt in range(1, 4):
+            try:
+                client.close_deployment(str(dseq))
+                _log(logging.INFO, f"  Stale order {dseq} closed")
+                closed = True
+                break
+            except Exception as close_err:
+                _log(
+                    logging.WARNING,
+                    f"  Close of stale order {dseq} failed "
+                    f"(attempt {close_attempt}/3): {close_err}",
+                )
+                if close_attempt < 3:
+                    time.sleep(2)
+        if not closed:
+            raise RuntimeError(
+                f"could not close stale order {dseq} after 3 attempts — not "
+                "re-deploying, to avoid double escrow. Close it manually: "
+                f"just-akash destroy --dseq {dseq}"
             )
         try:
             redeploy_response = client.create_deployment(sdl_content, deposit=deposit)

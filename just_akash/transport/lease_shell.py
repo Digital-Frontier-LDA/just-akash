@@ -283,6 +283,10 @@ class LeaseShellTransport(Transport):
         if isinstance(raw, str):
             try:
                 msg = json.loads(raw)
+                # A valid-JSON text frame need not be an object (could be an
+                # array / null / scalar); only objects carry the proxy envelope.
+                if not isinstance(msg, dict):
+                    return None
                 msg_type = msg.get("type", "")
                 if msg_type in ("ping", "pong"):
                     return None
@@ -301,7 +305,8 @@ class LeaseShellTransport(Transport):
                     return bytes(message)
                 if isinstance(msg.get("data"), str):
                     return base64.b64decode(msg["data"])
-            except (json.JSONDecodeError, TypeError):
+            # ValueError covers binascii.Error from malformed base64 payloads.
+            except (json.JSONDecodeError, TypeError, ValueError):
                 pass
         return None
 
@@ -731,39 +736,65 @@ class LeaseShellTransport(Transport):
         """Open a provider-proxy WebSocket and print each frame via ``formatter``.
 
         Runs until the server closes the stream (non-follow / snapshot) or the
-        user interrupts (Ctrl-C). Read-only: no stdin is sent. Callers must have
-        already called ``_resolve_provider`` so the proxy URL embeds the host.
+        user interrupts (Ctrl-C). For long-lived follow streams the lease JWT can
+        expire mid-stream; on an auth-expiry close we refetch the token and
+        reconnect (up to MAX_RECONNECT_ATTEMPTS) so the stream resumes instead of
+        ending silently. Any other close ends the stream. Read-only: no stdin is
+        sent. Callers must have already called ``_resolve_provider`` so the proxy
+        URL embeds the host.
         """
-        jwt = self._fetch_jwt(scope=scope)
-        proxy_url = self._get_proxy_ws_url()
-        connect_msg = self._build_proxy_connect_msg(provider_url, jwt)
-        ssl_ctx = ssl.create_default_context()
+        attempts = 0
+        while attempts < MAX_RECONNECT_ATTEMPTS:
+            jwt = self._fetch_jwt(scope=scope)
+            proxy_url = self._get_proxy_ws_url()
+            connect_msg = self._build_proxy_connect_msg(provider_url, jwt)
+            ssl_ctx = ssl.create_default_context()
+            reconnect = False
 
-        with connect(
-            proxy_url,
-            ssl=ssl_ctx,
-            compression=None,
-            open_timeout=30,
-            ping_interval=30,
-            ping_timeout=20,
-        ) as ws:
-            ws.send(connect_msg)
-            while True:
-                try:
-                    frame = self._recv_proxy_message(ws, timeout=recv_timeout)
-                except (ConnectionClosedOK, ConnectionClosedError):
-                    return
-                except TimeoutError:
-                    continue
-                if frame is None:
-                    continue
-                # Every received data frame maps to one output line. Do NOT skip
-                # empty lines — a blank line is real log output and dropping it
-                # would make the stream an unfaithful copy. (ping/pong control
-                # frames already decode to None above and never reach here.)
-                line = formatter(frame)
-                sys.stdout.write(line + "\n")
-                sys.stdout.flush()
+            try:
+                with connect(
+                    proxy_url,
+                    ssl=ssl_ctx,
+                    compression=None,
+                    open_timeout=30,
+                    ping_interval=30,
+                    ping_timeout=20,
+                ) as ws:
+                    ws.send(connect_msg)
+                    while True:
+                        try:
+                            frame = self._recv_proxy_message(ws, timeout=recv_timeout)
+                        except ConnectionClosedOK:
+                            return
+                        except ConnectionClosedError as exc:
+                            # Auth-expiry on a long follow → refetch + reconnect;
+                            # any other close means the stream simply ended.
+                            if _is_auth_expiry(exc):
+                                reconnect = True
+                                break
+                            return
+                        except TimeoutError:
+                            continue
+                        if frame is None:
+                            continue
+                        # Every received data frame maps to one output line. Do
+                        # NOT skip empty lines — a blank line is real log output
+                        # and dropping it would make the stream an unfaithful
+                        # copy. (ping/pong frames already decode to None above.)
+                        line = formatter(frame)
+                        sys.stdout.write(line + "\n")
+                        sys.stdout.flush()
+            except RuntimeError as exc:
+                # A proxy "error" frame about an expired token is recoverable;
+                # any other proxy error propagates to the caller.
+                if _is_auth_expiry_message(str(exc)):
+                    reconnect = True
+                else:
+                    raise
+
+            if not reconnect:
+                return
+            attempts += 1
 
     def stream_logs(
         self, follow: bool = False, tail: int = 100, service: str | None = None

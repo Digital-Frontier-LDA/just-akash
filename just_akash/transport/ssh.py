@@ -1,6 +1,7 @@
 """SSH transport — exact v1.4 behavior wrapped in Transport interface."""
 
 import os
+import shlex
 import subprocess
 from typing import Any
 
@@ -47,21 +48,24 @@ class SSHTransport(Transport):
         assert self._ssh_info is not None, "Call prepare() first"  # noqa: S101 type-narrowing
         assert self._key_path is not None, "Call prepare() first"  # noqa: S101 type-narrowing
         ssh_cmd = _build_ssh_cmd(self._ssh_info, self._key_path)
+        # Quote the path before it reaches the remote shell, matching the
+        # lease-shell transport and the CLI's SSH inject path.
+        quoted_path = shlex.quote(remote_path)
         # mkdir -p
         subprocess.run(
-            ssh_cmd + [f"mkdir -p $(dirname {remote_path})"],
+            ssh_cmd + [f"mkdir -p $(dirname {quoted_path})"],
             capture_output=True,
             text=True,
             check=True,
         )
         # write content
         result = subprocess.run(
-            ssh_cmd + [f"cat > {remote_path}"], input=content, capture_output=True, text=True
+            ssh_cmd + [f"cat > {quoted_path}"], input=content, capture_output=True, text=True
         )
         if result.returncode != 0:
             raise RuntimeError(f"Failed to write secrets: {result.stderr.strip()}")
         # chmod 600
-        subprocess.run(ssh_cmd + [f"chmod 600 {remote_path}"], capture_output=True, text=True)
+        subprocess.run(ssh_cmd + [f"chmod 600 {quoted_path}"], capture_output=True, text=True)
 
     def connect(self) -> None:
         """Interactive SSH shell (replaces process via os.execvp — never returns)."""

@@ -114,6 +114,34 @@ class TestSSHTransport:
             rc = t.exec("exit 42")
         assert rc == 42
 
+    def test_inject_shlex_quotes_remote_path(self):
+        """A remote path containing shell metacharacters must be shlex-quoted in
+        every command sent over SSH (mkdir/cat/chmod) — never interpolated raw."""
+        import shlex
+
+        config = TransportConfig(dseq="123", api_key="key")
+        t = SSHTransport(config)
+        t._ssh_info = {"host": "h", "port": 22}
+        t._key_path = "/key"
+        dangerous = "/tmp/x; rm -rf ~"
+        quoted = shlex.quote(dangerous)
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        with (
+            patch("just_akash.transport.ssh._build_ssh_cmd", return_value=["ssh"]),
+            patch("just_akash.transport.ssh.subprocess.run", return_value=mock_result) as mock_run,
+        ):
+            t.inject(dangerous, "secret-content")
+
+        # Every invocation's final argument is the remote command string; the
+        # raw path must never appear unquoted in any of them.
+        sent_cmds = [call.args[0][-1] for call in mock_run.call_args_list]
+        assert sent_cmds, "expected at least one SSH command"
+        for cmd in sent_cmds:
+            assert quoted in cmd
+            assert dangerous not in cmd.replace(quoted, "")
+
 
 # --- LeaseShellTransport (Phase 7+) ---
 

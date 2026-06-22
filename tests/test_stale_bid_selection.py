@@ -369,12 +369,9 @@ class TestLeaseStaleRetry:
 
     @patch("just_akash.deploy.time")
     @patch("just_akash.deploy.AkashConsoleAPI")
-    def test_redeploy_proceeds_when_close_of_stale_order_fails(
-        self, MockAPI, mock_time, tmp_path, monkeypatch, capsys
-    ):
-        """If closing the stale order fails, re-deploy still proceeds (so the
-        deploy can succeed) but warns loudly with an actionable remediation —
-        the old escrow stays locked until manually closed."""
+    def test_redeploy_retries_close_then_proceeds(self, MockAPI, mock_time, tmp_path, monkeypatch):
+        """A transient close failure is retried; once the close succeeds the
+        re-deploy proceeds normally and leases the fresh order."""
         client, sdl = _setup(MockAPI, mock_time, tmp_path, monkeypatch, providers="akash1a")
         client.create_deployment.side_effect = [
             {"dseq": "111", "manifest": "m1"},
@@ -382,16 +379,39 @@ class TestLeaseStaleRetry:
         ]
         client.get_bids.return_value = [_make_bid("akash1a", 10)]
         client.create_lease.side_effect = [self.STALE_ERR, {"lease": "ok"}]
-        client.close_deployment.side_effect = RuntimeError("close exploded")
+        # First close attempt flaps, second succeeds.
+        client.close_deployment.side_effect = [RuntimeError("transient flap"), None]
 
         result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
 
         assert result["dseq"] == "222"
-        # Only the stale order's close was attempted (and it failed); the new
-        # order succeeded so no cleanup-close happened.
-        client.close_deployment.assert_called_once_with("111")
-        out = capsys.readouterr().out
-        assert "just-akash destroy --dseq 111" in out
+        assert client.create_deployment.call_count == 2  # re-deploy happened
+        assert client.close_deployment.call_count == 2  # 1 failed + 1 success
+
+    @patch("just_akash.deploy.time")
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_redeploy_aborts_when_close_persistently_fails(
+        self, MockAPI, mock_time, tmp_path, monkeypatch
+    ):
+        """If the stale order can't be closed after retries, abort rather than
+        double-fund: do NOT create a second order, and surface the orphaned
+        dseq with an actionable remediation."""
+        client, sdl = _setup(MockAPI, mock_time, tmp_path, monkeypatch, providers="akash1a")
+        client.create_deployment.side_effect = [
+            {"dseq": "111", "manifest": "m1"},
+            {"dseq": "222", "manifest": "m2"},
+        ]
+        client.get_bids.return_value = [_make_bid("akash1a", 10)]
+        client.create_lease.side_effect = self.STALE_ERR
+        client.close_deployment.side_effect = RuntimeError("close exploded")
+
+        with pytest.raises(RuntimeError, match="just-akash destroy --dseq 111"):
+            deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+
+        # Aborted before re-deploy: only the ORIGINAL order was ever created,
+        # so no second (double-funded) order exists.
+        assert client.create_deployment.call_count == 1
+        assert client.close_deployment.call_count == 3  # 3 retries, all failed
 
 
 class TestLeaseTransientJWTRetry:
@@ -432,3 +452,38 @@ class TestLeaseTransientJWTRetry:
         # 3 attempts, all on the same (only) provider, then cleanup.
         assert client.create_lease.call_count == 3
         client.close_deployment.assert_called_once_with("12345")
+
+    @patch("just_akash.deploy.time")
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_redeploy_selects_backup_bid_on_recreated_order(
+        self, MockAPI, mock_time, tmp_path, monkeypatch
+    ):
+        """On the re-created order, when only a BACKUP bid is available, the
+        fast-poll's courtesy-window branch selects it (covers _poll_fresh_bid's
+        backup path). Courtesy=0 accepts the backup immediately."""
+        monkeypatch.setenv("JUST_AKASH_REDEPLOY_BACKUP_COURTESY_S", "0")
+        client, sdl = _setup(
+            MockAPI, mock_time, tmp_path, monkeypatch, providers="akash1pref", backup="akash1back"
+        )
+        client.create_deployment.side_effect = [
+            {"dseq": "111", "manifest": "m1"},
+            {"dseq": "222", "manifest": "m2"},
+        ]
+
+        def _bids(d):
+            # Original order: a preferred bid (drives selection). Re-created
+            # order: only a backup bid.
+            return [_make_bid("akash1pref", 10)] if d == "111" else [_make_bid("akash1back", 50)]
+
+        client.get_bids.side_effect = _bids
+        stale_err = RuntimeError(
+            "API Error (400): Failed to create lease: Cannot create lease: "
+            "The selected bid is no longer open. Please refresh and select an available bid."
+        )
+        client.create_lease.side_effect = [stale_err, {"lease": "ok"}]
+
+        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+
+        assert result["dseq"] == "222"
+        assert result["provider"] == "akash1back"  # backup tier selected post-redeploy
+        client.close_deployment.assert_called_once_with("111")
