@@ -207,6 +207,100 @@ class AkashConsoleAPI:
         data = response.get("data", response)
         return data if isinstance(data, dict) else response
 
+    def update_deployment(self, dseq: str, sdl_content: str) -> dict[str, Any]:
+        """Update an active deployment in place with a revised SDL.
+
+        PUTs to /v1/deployments/{dseq}. The on-chain deployment keeps its DSEQ
+        and existing lease — no re-bid or new lease is required. Returns the
+        full deployment object (same shape as get_deployment).
+        """
+        response = self._request(
+            "PUT",
+            f"/v1/deployments/{dseq}",
+            {"data": {"sdl": sdl_content}},
+        )
+        if not isinstance(response, dict):
+            return {}
+        data = response.get("data", response)
+        return data if isinstance(data, dict) else response
+
+    def deposit_deployment(self, dseq: str, deposit: float) -> dict[str, Any]:
+        """Add funds to an existing deployment's escrow.
+
+        POSTs to /v1/deposit-deployment. ``deposit`` is in USD (minimum 0.5 per
+        the Console API). Returns the full deployment object after top-up.
+        """
+        response = self._request(
+            "POST",
+            "/v1/deposit-deployment",
+            {"data": {"dseq": str(dseq), "deposit": deposit}},
+        )
+        if not isinstance(response, dict):
+            return {}
+        data = response.get("data", response)
+        return data if isinstance(data, dict) else response
+
+    def get_deployment_settings(self, dseq: str) -> dict[str, Any]:
+        """Fetch auto top-up settings for a deployment.
+
+        GETs /v2/deployment-settings/{dseq}. Returns the settings object, or an
+        empty dict if no settings have been created yet (some deployments 404
+        until settings are first POSTed — callers should treat {} as "unset").
+        """
+        try:
+            response = self._request("GET", f"/v2/deployment-settings/{dseq}")
+        except RuntimeError as e:
+            # No settings yet is reported as a 404 by the Console API.
+            if "404" in str(e) or "not found" in str(e).lower():
+                return {}
+            raise
+        if not isinstance(response, dict):
+            return {}
+        data = response.get("data", response)
+        return data if isinstance(data, dict) else response
+
+    def create_deployment_settings(self, dseq: str, auto_top_up_enabled: bool) -> dict[str, Any]:
+        """Create deployment settings (first-time auto top-up config).
+
+        POSTs to /v2/deployment-settings. Use update_deployment_settings to
+        change settings that already exist.
+        """
+        response = self._request(
+            "POST",
+            "/v2/deployment-settings",
+            {"data": {"dseq": str(dseq), "autoTopUpEnabled": auto_top_up_enabled}},
+        )
+        if not isinstance(response, dict):
+            return {}
+        data = response.get("data", response)
+        return data if isinstance(data, dict) else response
+
+    def update_deployment_settings(self, dseq: str, auto_top_up_enabled: bool) -> dict[str, Any]:
+        """Update existing deployment settings.
+
+        PATCHes /v2/deployment-settings/{dseq}.
+        """
+        response = self._request(
+            "PATCH",
+            f"/v2/deployment-settings/{dseq}",
+            {"data": {"autoTopUpEnabled": auto_top_up_enabled}},
+        )
+        if not isinstance(response, dict):
+            return {}
+        data = response.get("data", response)
+        return data if isinstance(data, dict) else response
+
+    def set_auto_top_up(self, dseq: str, enabled: bool) -> dict[str, Any]:
+        """Enable or disable auto top-up, upserting settings as needed.
+
+        Reads current settings: PATCHes if they already exist, otherwise POSTs
+        to create them. Returns the resulting settings object.
+        """
+        existing = self.get_deployment_settings(dseq)
+        if existing:
+            return self.update_deployment_settings(dseq, enabled)
+        return self.create_deployment_settings(dseq, enabled)
+
     def close_deployment(self, dseq: str) -> dict[str, Any]:
         response = self._request("DELETE", f"/v1/deployments/{dseq}")
         if not isinstance(response, dict):
@@ -285,8 +379,8 @@ class AkashConsoleAPI:
             return {}
         return response
 
-    def create_jwt(self, dseq: str, ttl: int = 3600) -> str:
-        """Request a short-lived JWT for lease-shell auth.
+    def create_jwt(self, dseq: str, ttl: int = 3600, scope: list[str] | None = None) -> str:
+        """Request a short-lived JWT for provider access (shell, logs, events…).
 
         POSTs to /v1/create-jwt-token with the existing api_key.
         Returns the JWT string. Raises RuntimeError on HTTP error.
@@ -295,11 +389,16 @@ class AkashConsoleAPI:
             dseq: Deployment sequence number (string).
             ttl:  Requested TTL in seconds (server default is 30s; request 3600 and
                   fall back to reconnect if server caps it — see LSHL-03 in Phase 7).
+            scope: Permission scopes to request (e.g. ["shell"], ["logs"],
+                  ["events"]). Defaults to ["shell"]. Valid values: send-manifest,
+                  get-manifest, logs, shell, events, status, restart,
+                  hostname-migrate, ip-migrate.
         """
+        scope = scope or ["shell"]
         response = self._request(
             "POST",
             "/v1/create-jwt-token",
-            {"data": {"ttl": ttl, "leases": {"access": "full", "scope": ["shell"]}}},
+            {"data": {"ttl": ttl, "leases": {"access": "full", "scope": scope}}},
         )
         # Response shape: { "data": { "token": "<JWT>" } }
         if not isinstance(response, dict):
@@ -311,11 +410,16 @@ class AkashConsoleAPI:
                 return token
         raise RuntimeError(f"JWT token not found in response: {response}")
 
-    def create_jwt_with_provider(self, dseq: str, provider: str, ttl: int = 3600) -> str:
+    def create_jwt_with_provider(
+        self, dseq: str, provider: str, ttl: int = 3600, scope: list[str] | None = None
+    ) -> str:
         """Request a short-lived JWT scoped to a specific provider.
 
-        Uses granular access with scoped permissions for shell access.
+        Uses granular access with scoped permissions. ``scope`` selects which
+        provider operations the token authorizes (defaults to ["shell"]; pass
+        ["logs"] or ["events"] for streaming).
         """
+        scope = scope or ["shell"]
         response = self._request(
             "POST",
             "/v1/create-jwt-token",
@@ -328,7 +432,7 @@ class AkashConsoleAPI:
                             {
                                 "provider": provider,
                                 "access": "scoped",
-                                "scope": ["shell"],
+                                "scope": scope,
                             }
                         ],
                     },

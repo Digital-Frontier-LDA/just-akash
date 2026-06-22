@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **Full lifecycle Console-API coverage** — five new commands close the gaps between deploy and teardown:
+  - `update` — update a running deployment in place via `PUT /v1/deployments/{dseq}`. Reuses the same SDL preparation as `deploy` (validation, `--image`, `--env`, SSH-key injection) but keeps the DSEQ and existing lease; no re-bid. CLI: `just-akash update --dseq <d> --sdl <f>`; recipe: `just update SDL [dseq] [image]`.
+  - `logs` — stream container logs from the provider via the Console provider-proxy (`--follow`, `--tail`, `--service`). CLI: `just-akash logs`; recipe: `just logs [dseq] [follow]`.
+  - `events` — stream Kubernetes events for a lease to debug startup failures (image pull, OOM, scheduling). CLI: `just-akash events`; recipe: `just events [dseq]`.
+  - `add-funds` — add USD to a deployment's escrow via `POST /v1/deposit-deployment` (minimum 0.5, confirmation prompt). CLI: `just-akash add-funds --deposit <usd>`; recipe: `just add-funds AMOUNT [dseq]`.
+  - `auto-topup` — show or toggle automatic escrow top-up via `/v2/deployment-settings` (GET/POST/PATCH upsert). CLI: `just-akash auto-topup [--on|--off]`; recipe: `just auto-topup [dseq] [on|off]`.
+- API client: `update_deployment`, `deposit_deployment`, `get_deployment_settings`, `create_deployment_settings`, `update_deployment_settings`, `set_auto_top_up` (upsert).
+- Transport: `LeaseShellTransport.stream_logs` / `stream_events` reuse the provider-proxy plumbing; tolerant log/event message formatting (JSON `ServiceLogMessage` or raw text).
+- Tests: 69 new unit tests across `test_api_extensions.py`, `test_lease_stream.py`, `test_cli_extensions.py`, `test_update_flow.py`.
+
+### Changed
+- `create_jwt` / `create_jwt_with_provider` accept a `scope` parameter (defaults to `["shell"]`) so the same JWT path serves `shell`, `logs`, and `events`.
+- SDL preparation (read → validate → image/SSH/env overrides) extracted into `deploy._prepare_sdl_content`, shared by `deploy()` and `update()`.
+
+---
+
 ## [1.6.1] — 2026-06-10
 
 ### Fixed

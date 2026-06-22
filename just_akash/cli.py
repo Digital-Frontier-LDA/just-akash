@@ -4,9 +4,14 @@ Unified CLI for just-akash.
 
 Subcommands:
   deploy      — Deploy to Akash Network
+  update      — Update a running deployment in place (no re-bid)
   connect     — SSH into a running deployment
   exec        — Execute a command on a running deployment
   inject      — Inject secrets into a running deployment via SSH
+  logs        — Stream container logs from a deployment
+  events      — Stream Kubernetes events for a deployment
+  add-funds   — Add funds (USD) to a deployment's escrow
+  auto-topup  — Show or set auto top-up for a deployment
   list        — List active deployments
   status      — Show deployment details
   destroy     — Destroy a deployment
@@ -85,6 +90,32 @@ def _enrich_deployment_with_provider(client, deployment: dict) -> dict:
     return deployment
 
 
+def _make_lease_shell(client, dseq):
+    """Build a validated lease-shell transport for read-only streaming.
+
+    Used by `logs` and `events`, which have no SSH equivalent. Returns the
+    concrete LeaseShellTransport (so its stream_logs/stream_events are visible)
+    and exits with a helpful message if the deployment has no active lease /
+    provider hostUri.
+    """
+    from .transport.base import TransportConfig
+    from .transport.lease_shell import LeaseShellTransport
+
+    deployment = _enrich_deployment_with_provider(client, client.get_deployment(dseq))
+    transport = LeaseShellTransport(
+        TransportConfig(dseq=dseq, api_key=client.api_key, deployment=deployment)
+    )
+    if not transport.validate():
+        print(
+            "Error: no active lease / provider hostUri for this deployment yet.\n"
+            "Logs and events stream from the provider, which requires an active "
+            "lease. Check 'just-akash status' and try again once it's running.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return transport
+
+
 def _require_ssh(client, dseq, key_arg):
     from .api import _build_ssh_cmd, _extract_ssh_info, _find_ssh_key
 
@@ -146,6 +177,28 @@ def main():
         default=None,
         help="Backup provider address (repeatable; overrides AKASH_PROVIDERS_BACKUP)",
     )
+    deploy_p.add_argument(
+        "--deposit",
+        type=float,
+        default=5.0,
+        help="Escrow deposit in USD (default: 5.0). Unused escrow is refunded "
+        "when the deployment closes; size it to outlast the workload.",
+    )
+
+    # ── update ─────────────────────────────────────────
+    update_p = subparsers.add_parser(
+        "update", help="Update a running deployment in place (no re-bid)"
+    )
+    update_p.add_argument("--dseq", default="")
+    update_p.add_argument("--sdl", required=True, help="Path to the revised SDL file")
+    update_p.add_argument("--image", default=None, help="Override container image")
+    update_p.add_argument(
+        "--env",
+        action="append",
+        dest="update_env_vars",
+        default=[],
+        help="KEY=VALUE env var to inject into SDL (repeatable, provider-visible)",
+    )
 
     # ── connect ────────────────────────────────────────
     connect_p = subparsers.add_parser(
@@ -204,6 +257,47 @@ def main():
         dest="transport",
         help="Transport to use: 'lease-shell' (default) or 'ssh'",
     )
+
+    # ── logs ───────────────────────────────────────────
+    logs_p = subparsers.add_parser("logs", help="Stream container logs from a deployment")
+    logs_p.add_argument("--dseq", default="")
+    logs_p.add_argument(
+        "-f", "--follow", action="store_true", help="Stream continuously (Ctrl-C to stop)"
+    )
+    logs_p.add_argument(
+        "--tail", type=int, default=100, help="Number of trailing lines to show (default: 100)"
+    )
+    logs_p.add_argument(
+        "--service", default=None, help="Filter to a single service (default: all services)"
+    )
+
+    # ── events ─────────────────────────────────────────
+    events_p = subparsers.add_parser(
+        "events", help="Stream Kubernetes events for a deployment (debug startup)"
+    )
+    events_p.add_argument("--dseq", default="")
+
+    # ── add-funds ──────────────────────────────────────
+    add_funds_p = subparsers.add_parser(
+        "add-funds", help="Add funds (USD) to a deployment's escrow"
+    )
+    add_funds_p.add_argument("--dseq", default="")
+    add_funds_p.add_argument(
+        "--deposit",
+        type=float,
+        required=True,
+        help="Amount to add in USD (minimum 0.5)",
+    )
+    add_funds_p.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompts")
+
+    # ── auto-topup ─────────────────────────────────────
+    auto_topup_p = subparsers.add_parser(
+        "auto-topup", help="Show or set auto top-up for a deployment"
+    )
+    auto_topup_p.add_argument("--dseq", default="")
+    auto_topup_group = auto_topup_p.add_mutually_exclusive_group()
+    auto_topup_group.add_argument("--on", action="store_true", help="Enable auto top-up")
+    auto_topup_group.add_argument("--off", action="store_true", help="Disable auto top-up")
 
     # ── list ───────────────────────────────────────────
     list_p = subparsers.add_parser("list", help="List active deployments")
@@ -267,6 +361,26 @@ def main():
                 env_vars=args.deploy_env_vars,
                 preferred_providers=args.preferred_providers,
                 backup_providers=args.backup_providers,
+                deposit=args.deposit,
+            )
+            sys.exit(0)
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    # ── update ─────────────────────────────────────────
+    elif args.command == "update":
+        from .api import AkashConsoleAPI
+        from .deploy import update
+
+        try:
+            client = AkashConsoleAPI(_require_api_key())
+            dseq = _resolve_deployment(client, args.dseq)
+            update(
+                dseq=dseq,
+                sdl_path=args.sdl,
+                image=args.image,
+                env_vars=args.update_env_vars,
             )
             sys.exit(0)
         except RuntimeError as e:
@@ -498,6 +612,88 @@ def main():
                 print(f"  Provider: {_extract_lease_provider(deployment) or 'no lease'}")
                 if ssh:
                     print(f"  SSH:      ssh -p {ssh['port']} root@{ssh['host']}")
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    # ── logs ───────────────────────────────────────────
+    elif args.command == "logs":
+        from .api import AkashConsoleAPI
+
+        try:
+            client = AkashConsoleAPI(_require_api_key())
+            dseq = _resolve_deployment(client, args.dseq)
+            transport = _make_lease_shell(client, dseq)
+            try:
+                transport.stream_logs(follow=args.follow, tail=args.tail, service=args.service)
+            except KeyboardInterrupt:
+                print()
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    # ── events ─────────────────────────────────────────
+    elif args.command == "events":
+        from .api import AkashConsoleAPI
+
+        try:
+            client = AkashConsoleAPI(_require_api_key())
+            dseq = _resolve_deployment(client, args.dseq)
+            transport = _make_lease_shell(client, dseq)
+            try:
+                transport.stream_events()
+            except KeyboardInterrupt:
+                print()
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    # ── add-funds ──────────────────────────────────────
+    elif args.command == "add-funds":
+        from .api import AkashConsoleAPI, _confirm, _get_tag
+
+        try:
+            if args.deposit < 0.5:
+                print("Error: minimum deposit is 0.5 USD.", file=sys.stderr)
+                sys.exit(1)
+            client = AkashConsoleAPI(_require_api_key())
+            dseq = _resolve_deployment(client, args.dseq)
+            tag = _get_tag(dseq)
+            label = f"{dseq} ({tag})" if tag else dseq
+            if _confirm(f"Add {args.deposit} USD to deployment {label}? (y/N) ", yes=args.yes):
+                client.deposit_deployment(dseq, args.deposit)
+                print(f"Added {args.deposit} USD to deployment {label}.")
+            else:
+                print("Cancelled.")
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    # ── auto-topup ─────────────────────────────────────
+    elif args.command == "auto-topup":
+        from .api import AkashConsoleAPI, _get_tag
+
+        try:
+            client = AkashConsoleAPI(_require_api_key())
+            dseq = _resolve_deployment(client, args.dseq)
+            tag = _get_tag(dseq)
+            label = f"{dseq} ({tag})" if tag else dseq
+            if args.on or args.off:
+                enabled = bool(args.on)
+                client.set_auto_top_up(dseq, enabled)
+                print(
+                    f"Auto top-up {'enabled' if enabled else 'disabled'} for deployment {label}."
+                )
+            else:
+                settings = client.get_deployment_settings(dseq)
+                if not settings:
+                    print(f"Deployment {label}: auto top-up not configured (off).")
+                else:
+                    enabled = bool(settings.get("autoTopUpEnabled", False))
+                    print(f"Deployment {label}: auto top-up {'on' if enabled else 'off'}")
+                    for key in ("estimatedTopUpAmount", "topUpFrequencyMs"):
+                        if key in settings:
+                            print(f"  {key}: {settings[key]}")
         except RuntimeError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)

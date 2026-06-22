@@ -1727,7 +1727,7 @@ services:
 
         client = AkashConsoleAPI("key")
         monkeypatch.setattr(
-            client, "create_deployment", lambda _: {"dseq": "123", "manifest": "abc"}
+            client, "create_deployment", lambda *a, **k: {"dseq": "123", "manifest": "abc"}
         )
         monkeypatch.setattr(
             client, "get_bids", lambda _: [{"id": {"provider": "p"}, "price": {"amount": 10}}]
@@ -1762,7 +1762,7 @@ services:
 
         client = AkashConsoleAPI("key")
         monkeypatch.setattr(
-            client, "create_deployment", lambda _: {"dseq": "123", "manifest": "abc"}
+            client, "create_deployment", lambda *a, **k: {"dseq": "123", "manifest": "abc"}
         )
         monkeypatch.setattr(
             client, "get_bids", lambda _: [{"id": {"provider": "p"}, "price": {"amount": 10}}]
@@ -1842,7 +1842,7 @@ services:
 
         client = AkashConsoleAPI("key")
         monkeypatch.setattr(
-            client, "create_deployment", lambda _: {"dseq": "123", "manifest": "abc"}
+            client, "create_deployment", lambda *a, **k: {"dseq": "123", "manifest": "abc"}
         )
         monkeypatch.setattr(
             client, "get_bids", lambda _: [{"id": {"provider": "p"}, "price": {"amount": 10}}]
@@ -1936,7 +1936,7 @@ class TestBidPollingZeroTimeout:
 
         client = AkashConsoleAPI("key")
         monkeypatch.setattr(
-            client, "create_deployment", lambda _: {"dseq": "123", "manifest": "abc"}
+            client, "create_deployment", lambda *a, **k: {"dseq": "123", "manifest": "abc"}
         )
         monkeypatch.setattr(client, "get_bids", lambda _: [])
 
@@ -1970,7 +1970,7 @@ services:
 
         client = AkashConsoleAPI("key")
         monkeypatch.setattr(
-            client, "create_deployment", lambda _: {"dseq": "123", "manifest": "abc"}
+            client, "create_deployment", lambda *a, **k: {"dseq": "123", "manifest": "abc"}
         )
 
         with patch("just_akash.deploy.AkashConsoleAPI", return_value=client):

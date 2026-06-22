@@ -169,43 +169,17 @@ def _resolve_tier(arg_value: list[str] | None, env_name: str) -> list[str]:
     return [a.strip() for a in raw.split(",") if a.strip()]
 
 
-def deploy(
+def _prepare_sdl_content(
     sdl_path: str,
-    gpu: bool = False,
     image: str | None = None,
-    bid_wait: int = 60,
-    bid_wait_retry: int = 120,
     env_vars: list[str] | None = None,
-    preferred_providers: list[str] | None = None,
-    backup_providers: list[str] | None = None,
-) -> dict:
-    api_key = os.environ.get("AKASH_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "AKASH_API_KEY environment variable not set. "
-            "Please set your API key: export AKASH_API_KEY='your-key'"
-        )
+) -> str:
+    """Read, validate, and apply image/SSH-key/env overrides to an SDL file.
 
-    client = AkashConsoleAPI(api_key)
-
-    preferred = _resolve_tier(preferred_providers, "AKASH_PROVIDERS")
-    backup = _resolve_tier(backup_providers, "AKASH_PROVIDERS_BACKUP")
-    has_allowlist = bool(preferred or backup)
-
-    _log(
-        logging.INFO,
-        f"CONFIG  sdl={sdl_path}  gpu={gpu}  image={image or '(default)'}  "
-        f"bid_wait={bid_wait}s  bid_wait_retry={bid_wait_retry}s",
-    )
-    if preferred:
-        _log(logging.INFO, f"PREFERRED_PROVIDERS ({len(preferred)}): {preferred}")
-    if backup:
-        _log(logging.INFO, f"BACKUP_PROVIDERS ({len(backup)}): {backup}")
-    if not has_allowlist:
-        _log(logging.INFO, "ALLOWED_PROVIDERS: (any — no allowlist set)")
-
-    # Step 1: Read SDL file
-    _log(logging.INFO, f"STEP 1: Reading SDL from {sdl_path}")
+    Shared by deploy() and update() so both paths transform the SDL identically.
+    Returns the final SDL string ready to send to the Console API.
+    """
+    _log(logging.INFO, f"Reading SDL from {sdl_path}")
     sdl_path_obj = Path(sdl_path)
     if not sdl_path_obj.exists():
         raise RuntimeError(f"SDL file not found: {sdl_path}")
@@ -247,10 +221,56 @@ def deploy(
         sdl_content = _inject_env_into_sdl(sdl_content, env_vars)
         _log(logging.INFO, f"Injected {len(env_vars)} env var(s) into SDL (provider-visible)")
 
+    return sdl_content
+
+
+def deploy(
+    sdl_path: str,
+    gpu: bool = False,
+    image: str | None = None,
+    bid_wait: int = 60,
+    bid_wait_retry: int = 120,
+    env_vars: list[str] | None = None,
+    preferred_providers: list[str] | None = None,
+    backup_providers: list[str] | None = None,
+    deposit: float = 5.0,
+) -> dict:
+    api_key = os.environ.get("AKASH_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "AKASH_API_KEY environment variable not set. "
+            "Please set your API key: export AKASH_API_KEY='your-key'"
+        )
+
+    client = AkashConsoleAPI(api_key)
+
+    preferred = _resolve_tier(preferred_providers, "AKASH_PROVIDERS")
+    backup = _resolve_tier(backup_providers, "AKASH_PROVIDERS_BACKUP")
+    has_allowlist = bool(preferred or backup)
+
+    _log(
+        logging.INFO,
+        f"CONFIG  sdl={sdl_path}  gpu={gpu}  image={image or '(default)'}  "
+        f"bid_wait={bid_wait}s  bid_wait_retry={bid_wait_retry}s",
+    )
+    if preferred:
+        _log(logging.INFO, f"PREFERRED_PROVIDERS ({len(preferred)}): {preferred}")
+    if backup:
+        _log(logging.INFO, f"BACKUP_PROVIDERS ({len(backup)}): {backup}")
+    if not has_allowlist:
+        _log(logging.INFO, "ALLOWED_PROVIDERS: (any — no allowlist set)")
+
+    # Step 1: Read + validate + transform SDL
+    _log(logging.INFO, "STEP 1: Preparing SDL")
+    sdl_content = _prepare_sdl_content(sdl_path, image=image, env_vars=env_vars)
+
     # Step 2: Create deployment (with stale-deployment recovery)
-    _log(logging.INFO, "STEP 2: Creating deployment via Console API...")
+    _log(
+        logging.INFO,
+        f"STEP 2: Creating deployment via Console API (escrow deposit: {deposit} USD)...",
+    )
     try:
-        deployment_response = client.create_deployment(sdl_content)
+        deployment_response = client.create_deployment(sdl_content, deposit=deposit)
     except RuntimeError as e:
         if "already exists" in str(e).lower():
             _log(
@@ -272,7 +292,7 @@ def deploy(
                 _log(logging.ERROR, f"Stale deployment cleanup failed: {cleanup_err}")
             # Retry once after cleanup
             try:
-                deployment_response = client.create_deployment(sdl_content)
+                deployment_response = client.create_deployment(sdl_content, deposit=deposit)
             except RuntimeError as retry_err:
                 _log(logging.ERROR, f"Create deployment FAILED after retry: {retry_err}")
                 raise RuntimeError(
@@ -803,6 +823,54 @@ def deploy(
         "price_denom": price_denom,
         "lease": lease_response,
     }
+
+
+def update(
+    dseq: str,
+    sdl_path: str,
+    image: str | None = None,
+    env_vars: list[str] | None = None,
+) -> dict:
+    """Update an active deployment in place with a revised SDL.
+
+    Reuses the same SDL preparation as deploy() (validation, image/SSH/env
+    overrides) then PUTs to the Console API. The DSEQ and existing lease are
+    preserved — no re-bid or new lease is created.
+    """
+    api_key = os.environ.get("AKASH_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "AKASH_API_KEY environment variable not set. "
+            "Please set your API key: export AKASH_API_KEY='your-key'"
+        )
+
+    client = AkashConsoleAPI(api_key)
+
+    _log(
+        logging.INFO,
+        f"UPDATE  dseq={dseq}  sdl={sdl_path}  image={image or '(default)'}",
+    )
+
+    # Step 1: Read + validate + transform SDL (identical to deploy).
+    _log(logging.INFO, "STEP 1: Preparing SDL")
+    sdl_content = _prepare_sdl_content(sdl_path, image=image, env_vars=env_vars)
+
+    # Step 2: Submit the in-place update.
+    _log(logging.INFO, f"STEP 2: Submitting in-place update for deployment {dseq}...")
+    try:
+        result = client.update_deployment(str(dseq), sdl_content)
+    except RuntimeError as e:
+        _log(logging.ERROR, f"Update FAILED: {e}")
+        raise RuntimeError(f"Failed to update deployment {dseq}: {e}") from e
+
+    _log(
+        logging.INFO,
+        f"Deployment {dseq} updated in place (DSEQ and lease preserved).",
+    )
+    print(f"\nDeployment {dseq} updated.")
+    print(f"Use 'just-akash status {dseq}' to verify the new revision is live.")
+
+    return {"dseq": str(dseq), "result": result}
 
 
 def deploy_main():

@@ -85,14 +85,21 @@ class LeaseShellTransport(Transport):
             )
         return self._api_client
 
-    def _fetch_jwt(self, ttl: int = 3600) -> str:
+    def _fetch_jwt(self, ttl: int = 3600, scope: list[str] | None = None) -> str:
         if self._provider_address:
             return self._get_api_client().create_jwt_with_provider(
-                self._config.dseq, self._provider_address, ttl=ttl
+                self._config.dseq, self._provider_address, ttl=ttl, scope=scope
             )
-        return self._get_api_client().create_jwt(self._config.dseq, ttl=ttl)
+        return self._get_api_client().create_jwt(self._config.dseq, ttl=ttl, scope=scope)
 
-    def _extract_provider_info(self) -> tuple[str, str]:
+    def _resolve_provider(self) -> str:
+        """Resolve the provider address + hostUri from lease data.
+
+        Sets ``self._provider_address`` and ``self._provider_host_uri`` and
+        returns the hostUri. Unlike ``_extract_provider_info`` this does NOT
+        require a service name — used by streaming endpoints (logs, events)
+        that operate at the lease level.
+        """
         leases = self._config.deployment.get("leases", [])
         if not leases or not isinstance(leases, list):
             raise RuntimeError(
@@ -110,7 +117,10 @@ class LeaseShellTransport(Transport):
         if provider_addr:
             self._provider_address = provider_addr
 
-        host_uri = self._resolve_host_uri(lease, provider_addr)
+        return self._resolve_host_uri(lease, provider_addr)
+
+    def _extract_provider_info(self) -> tuple[str, str]:
+        host_uri = self._resolve_provider()
 
         service = self._config.service_name or self._infer_service()
         if not service:
@@ -190,6 +200,25 @@ class LeaseShellTransport(Transport):
         ]
         qs = "&".join(qs_parts)
         return f"{self._provider_host_uri}/lease/{dseq}/1/1/shell?{qs}"
+
+    def _build_logs_url(
+        self, follow: bool = False, tail: int = 100, service: str | None = None
+    ) -> str:
+        assert self._provider_host_uri is not None
+        dseq = self._config.dseq
+        qs_parts = [
+            f"follow={'true' if follow else 'false'}",
+            f"tail={int(tail)}",
+        ]
+        if service:
+            qs_parts.append(f"service={urllib.parse.quote(service, safe='')}")
+        qs = "&".join(qs_parts)
+        return f"{self._provider_host_uri}/lease/{dseq}/1/1/logs?{qs}"
+
+    def _build_events_url(self) -> str:
+        assert self._provider_host_uri is not None
+        dseq = self._config.dseq
+        return f"{self._provider_host_uri}/lease/{dseq}/1/1/kubeevents"
 
     def _build_proxy_connect_msg(
         self, shell_path: str, jwt: str, stdin_data: str | None = None
@@ -641,6 +670,109 @@ class LeaseShellTransport(Transport):
                 return
             except TimeoutError:
                 pass
+
+    @staticmethod
+    def _format_log_message(raw: bytes) -> str:
+        """Render one streamed log frame as a single output line.
+
+        The provider streams either raw text lines or JSON ServiceLogMessages
+        (``{"name": <service>, "message": <line>}``). Handle both: JSON dicts
+        become ``[service] message``; everything else passes through verbatim.
+        """
+        text = raw.decode("utf-8", errors="replace")
+        stripped = text.strip()
+        if stripped.startswith("{"):
+            try:
+                obj = json.loads(stripped)
+            except json.JSONDecodeError:
+                obj = None
+            if isinstance(obj, dict):
+                name = obj.get("name") or obj.get("service") or ""
+                msg = obj.get("message")
+                if msg is None:
+                    msg = obj.get("msg", "")
+                line = f"[{name}] {msg}" if name else str(msg)
+                return line.rstrip("\n")
+        return text.rstrip("\n")
+
+    @staticmethod
+    def _format_event_message(raw: bytes) -> str:
+        """Render one streamed Kubernetes event frame as a single line."""
+        text = raw.decode("utf-8", errors="replace").strip()
+        try:
+            obj = json.loads(text)
+        except json.JSONDecodeError:
+            return text
+        if not isinstance(obj, dict):
+            return text
+        involved = obj.get("involvedObject") or obj.get("object") or {}
+        if not isinstance(involved, dict):
+            involved = {}
+        kind = involved.get("kind", "")
+        name = involved.get("name", "")
+        target = f"{kind}/{name}".strip("/")
+        message = obj.get("message") or obj.get("note") or ""
+        ts = obj.get("lastTimestamp") or obj.get("firstTimestamp") or obj.get("eventTime") or ""
+        parts = [
+            str(p) for p in (ts, obj.get("type", ""), obj.get("reason", ""), target, message) if p
+        ]
+        return "  ".join(parts) if parts else text
+
+    def _stream(self, provider_url: str, scope: list[str], formatter, recv_timeout: float) -> None:
+        """Open a provider-proxy WebSocket and print each frame via ``formatter``.
+
+        Runs until the server closes the stream (non-follow / snapshot) or the
+        user interrupts (Ctrl-C). Read-only: no stdin is sent. Callers must have
+        already called ``_resolve_provider`` so the proxy URL embeds the host.
+        """
+        jwt = self._fetch_jwt(scope=scope)
+        proxy_url = self._get_proxy_ws_url()
+        connect_msg = self._build_proxy_connect_msg(provider_url, jwt)
+        ssl_ctx = ssl.create_default_context()
+
+        with connect(
+            proxy_url,
+            ssl=ssl_ctx,
+            compression=None,
+            open_timeout=30,
+            ping_interval=30,
+            ping_timeout=20,
+        ) as ws:
+            ws.send(connect_msg)
+            while True:
+                try:
+                    frame = self._recv_proxy_message(ws, timeout=recv_timeout)
+                except (ConnectionClosedOK, ConnectionClosedError):
+                    return
+                except TimeoutError:
+                    continue
+                if frame is None:
+                    continue
+                line = formatter(frame)
+                if line:
+                    sys.stdout.write(line + "\n")
+                    sys.stdout.flush()
+
+    def stream_logs(
+        self, follow: bool = False, tail: int = 100, service: str | None = None
+    ) -> None:
+        """Stream container logs for the lease via the provider-proxy.
+
+        With ``follow=True`` the stream stays open until interrupted; otherwise
+        it prints the last ``tail`` lines and returns. ``service`` filters to a
+        single service (default: all services in the lease).
+        """
+        self._resolve_provider()
+        url = self._build_logs_url(follow=follow, tail=tail, service=service)
+        # Follow streams indefinitely between lines, so use a long per-recv
+        # timeout and just loop on timeout; a snapshot closes on its own.
+        self._stream(url, ["logs"], self._format_log_message, recv_timeout=300)
+
+    def stream_events(self) -> None:
+        """Stream Kubernetes events for the lease via the provider-proxy."""
+        self._resolve_provider()
+        url = self._build_events_url()
+        self._stream(url, ["events"], self._format_event_message, recv_timeout=300)
 
     def validate(self) -> bool:
         leases = self._config.deployment.get("leases", [])

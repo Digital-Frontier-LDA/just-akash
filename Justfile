@@ -37,6 +37,25 @@ connect dseq="" transport="":
     if [ -n "{{transport}}" ]; then cmd="$cmd --transport {{transport}}"; fi
     eval "$cmd"
 
+# Update a running instance in place with a revised SDL (no re-bid, keeps DSEQ).
+# Usage: just update SDL [dseq] [image]
+#   just update sdl/cpu-backtest-ssh.yaml
+#   just update sdl/cpu-backtest-ssh.yaml akash-node ghcr.io/me/app:v2
+update sdl dseq="" image="":
+    #!/bin/bash
+    set -euo pipefail
+    mkdir -p "{{log_dir}}"
+    timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
+    log_file="{{log_dir}}/update-${timestamp}.log"
+    exec > >(tee -a "$log_file") 2>&1
+    trap 'status=$?; echo "[INFO] recipe=update finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
+    echo "[INFO] recipe=update started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file sdl={{sdl}} dseq={{dseq}} image={{image}}"
+    set -x
+    cmd="uv run just-akash update --sdl {{sdl}}"
+    if [ -n "{{dseq}}" ]; then cmd="$cmd --dseq={{dseq}}"; fi
+    if [ -n "{{image}}" ]; then cmd="$cmd --image {{image}}"; fi
+    eval "$cmd"
+
 # Destroy an instance (picks interactively if no DSEQ given)
 destroy dseq="":
     #!/bin/bash
@@ -148,6 +167,79 @@ status dseq="":
     else
         uv run just-akash status
     fi
+
+# Stream container logs (picks interactively if no DSEQ given).
+# Usage: just logs [dseq] [follow]   (pass any non-empty follow arg to tail -f)
+#   just logs akash-node
+#   just logs akash-node follow
+logs dseq="" follow="":
+    #!/bin/bash
+    set -euo pipefail
+    mkdir -p "{{log_dir}}"
+    timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
+    log_file="{{log_dir}}/logs-${timestamp}.log"
+    exec > >(tee -a "$log_file") 2>&1
+    trap 'status=$?; echo "[INFO] recipe=logs finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
+    echo "[INFO] recipe=logs started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq={{dseq}} follow={{follow}}"
+    set -x
+    cmd="uv run just-akash logs"
+    if [ -n "{{dseq}}" ]; then cmd="$cmd --dseq={{dseq}}"; fi
+    if [ -n "{{follow}}" ]; then cmd="$cmd --follow"; fi
+    eval "$cmd"
+
+# Stream Kubernetes events for a deployment (debug why it won't start).
+# Usage: just events [dseq]
+events dseq="":
+    #!/bin/bash
+    set -euo pipefail
+    mkdir -p "{{log_dir}}"
+    timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
+    log_file="{{log_dir}}/events-${timestamp}.log"
+    exec > >(tee -a "$log_file") 2>&1
+    trap 'status=$?; echo "[INFO] recipe=events finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
+    echo "[INFO] recipe=events started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq={{dseq}}"
+    set -x
+    cmd="uv run just-akash events"
+    if [ -n "{{dseq}}" ]; then cmd="$cmd --dseq={{dseq}}"; fi
+    eval "$cmd"
+
+# ── Escrow / funding ─────────────────────────────────
+
+# Add funds (USD) to a deployment's escrow so it outlives its initial deposit.
+# Usage: just add-funds AMOUNT [dseq]   (AMOUNT in USD, minimum 0.5)
+#   just add-funds 5 akash-node
+add-funds amount dseq="":
+    #!/bin/bash
+    set -euo pipefail
+    mkdir -p "{{log_dir}}"
+    timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
+    log_file="{{log_dir}}/add-funds-${timestamp}.log"
+    exec > >(tee -a "$log_file") 2>&1
+    trap 'status=$?; echo "[INFO] recipe=add-funds finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
+    echo "[INFO] recipe=add-funds started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file amount={{amount}} dseq={{dseq}}"
+    set -x
+    cmd="uv run just-akash add-funds --deposit {{amount}}"
+    if [ -n "{{dseq}}" ]; then cmd="$cmd --dseq={{dseq}}"; fi
+    eval "$cmd"
+
+# Show or toggle auto top-up for a deployment.
+# Usage: just auto-topup [dseq] [on|off]   (no toggle = show current setting)
+#   just auto-topup akash-node on
+auto-topup dseq="" toggle="":
+    #!/bin/bash
+    set -euo pipefail
+    mkdir -p "{{log_dir}}"
+    timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
+    log_file="{{log_dir}}/auto-topup-${timestamp}.log"
+    exec > >(tee -a "$log_file") 2>&1
+    trap 'status=$?; echo "[INFO] recipe=auto-topup finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
+    echo "[INFO] recipe=auto-topup started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq={{dseq}} toggle={{toggle}}"
+    set -x
+    cmd="uv run just-akash auto-topup"
+    if [ -n "{{dseq}}" ]; then cmd="$cmd --dseq={{dseq}}"; fi
+    if [ "{{toggle}}" = "on" ]; then cmd="$cmd --on"; fi
+    if [ "{{toggle}}" = "off" ]; then cmd="$cmd --off"; fi
+    eval "$cmd"
 
 # ── Testing ──────────────────────────────────────────
 
