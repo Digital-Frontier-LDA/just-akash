@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
-from just_akash.deploy import _prepare_sdl_content, update
+from just_akash.deploy import _prepare_sdl_content, deploy, update
 
 SDL_YAML = """
 version: "2.0"
@@ -145,3 +145,19 @@ class TestUpdate:
         with pytest.raises(RuntimeError):
             update(dseq="123", sdl_path=str(f))
         client.update_deployment.assert_not_called()
+
+
+class TestDeployDepositGuard:
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_nan_deposit_rejected_before_api(self, MockAPI, monkeypatch):
+        monkeypatch.setenv("AKASH_API_KEY", "k")
+        with pytest.raises(RuntimeError, match="Invalid deposit"):
+            deploy(sdl_path="ignored.yaml", deposit=float("nan"))
+        MockAPI.return_value.create_deployment.assert_not_called()
+
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_non_positive_deposit_rejected(self, MockAPI, monkeypatch):
+        monkeypatch.setenv("AKASH_API_KEY", "k")
+        with pytest.raises(RuntimeError, match="Invalid deposit"):
+            deploy(sdl_path="ignored.yaml", deposit=0)
+        MockAPI.return_value.create_deployment.assert_not_called()

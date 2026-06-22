@@ -18,6 +18,7 @@ Workflow:
 
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -246,6 +247,11 @@ def deploy(
             "AKASH_API_KEY environment variable not set. "
             "Please set your API key: export AKASH_API_KEY='your-key'"
         )
+
+    # deposit is user-controlled (--deposit); reject non-finite/non-positive
+    # values before they reach json.dumps (which would emit invalid NaN/Infinity).
+    if not math.isfinite(deposit) or deposit <= 0:
+        raise RuntimeError(f"Invalid deposit {deposit!r}: must be a positive, finite USD amount.")
 
     client = AkashConsoleAPI(api_key)
 
@@ -819,7 +825,7 @@ def deploy(
     print(f"  DSEQ: {dseq}")
     print(f"  Provider: {provider}")
     print(f"  Price: {price_amount} {price_denom}")
-    print(f"\nUse 'just-akash status {dseq}' to check deployment status")
+    print(f"\nUse 'just-akash status --dseq {dseq}' to check deployment status")
 
     return {
         "dseq": dseq,
@@ -873,7 +879,7 @@ def update(
         f"Deployment {dseq} updated in place (DSEQ and lease preserved).",
     )
     print(f"\nDeployment {dseq} updated.")
-    print(f"Use 'just-akash status {dseq}' to verify the new revision is live.")
+    print(f"Use 'just-akash status --dseq {dseq}' to verify the new revision is live.")
 
     return {"dseq": str(dseq), "result": result}
 
