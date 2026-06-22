@@ -38,9 +38,11 @@ In addition to secret scanning, the repository runs:
 - **Ruff bandit rules (`S`)** — Python security SAST on every push/PR (the `lint`
   CI job). Catches `shell=True` (`S602`), unsafe temp files, weak SSL, etc.
   `assert`-based tests and shell-based e2e orchestration are scoped out via
-  per-file ignores; `S603`/`S606`/`S607` (subprocess/exec mechanics) are ignored
-  globally because invoking `ssh` is this tool's intended function — it builds
-  argv lists (never `shell=True`) and resolves `ssh` from `PATH`.
+  per-file ignores. `S603`/`S606`/`S607` (subprocess/exec mechanics) are
+  per-file-ignored only for the modules that invoke `ssh` by design
+  (`just_akash/api.py`, `cli.py`, `transport/ssh.py`) — they build argv lists
+  (never `shell=True`) and resolve `ssh` from `PATH`. Scoping them per-file
+  (rather than globally) keeps a new unsafe subprocess elsewhere failing CI.
 - **Semgrep** (`p/python` + `p/security-audit`) — the `Semgrep SAST` security job
   (`just semgrep`). Two rules are excluded because they are inherent to a
   remote-exec CLI and the underlying risk is mitigated in code:

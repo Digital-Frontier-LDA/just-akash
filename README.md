@@ -20,7 +20,7 @@ Self-contained — clone, configure `.env`, and run.
 - **Tiered provider selection** — preferred + backup allowlists with a 3-phase bid-selection state machine (`AKASH_PROVIDERS_BACKUP` env var, `--provider` / `--backup-provider` CLI flags). See [Bid Selection](#bid-selection).
 - **BME migration** — bid-price denom defaults updated from `uakt` (legacy) to `uact`.
 - **Hardened e2e cleanup** — `robust_destroy()` with retry + audit, SIGINT/SIGTERM-safe handler, no-leak guarantee on multi-deployment runs.
-- **722 tests**; `just_akash/deploy.py` and `just_akash/_e2e.py` at 100% line coverage.
+- **Extensive unit + e2e test suite**; `just_akash/deploy.py` and `just_akash/_e2e.py` at 100% line coverage.
 
 ## Prerequisites
 

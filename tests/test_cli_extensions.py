@@ -100,6 +100,16 @@ class TestCliLogs:
         assert e.value.code == 1
         assert "provider resolution failed mid-stream" in capsys.readouterr().err
 
+    @patch("just_akash.cli._make_lease_shell")
+    @patch("just_akash.api.AkashConsoleAPI")
+    def test_logs_negative_tail_exits_1(self, MockAPI, mock_make, monkeypatch, capsys):
+        monkeypatch.setenv("AKASH_API_KEY", "k")
+        with pytest.raises(SystemExit) as e:
+            _run_cli(monkeypatch, ["just-akash", "logs", "--dseq", "12345", "--tail", "-5"])
+        assert e.value.code == 1
+        assert "--tail" in capsys.readouterr().err
+        mock_make.return_value.stream_logs.assert_not_called()
+
 
 # ── events ───────────────────────────────────────────────────────────
 

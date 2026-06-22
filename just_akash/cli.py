@@ -643,6 +643,9 @@ def main():
         from .api import AkashConsoleAPI
 
         try:
+            if args.tail < 0:
+                print("Error: --tail must be >= 0.", file=sys.stderr)
+                sys.exit(1)
             client = AkashConsoleAPI(_require_api_key())
             dseq = _resolve_deployment(client, args.dseq)
             transport = _make_lease_shell(client, dseq)
