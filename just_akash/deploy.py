@@ -80,8 +80,8 @@ def _redeploy_poll_window() -> tuple[float, float, float]:
     Intentionally short — the phased patience of the normal selection path is
     exactly what aged the first round's bid past its ~5-min expiry, so the
     re-created order is leased aggressively (preferred wins instantly; backup
-    only after the courtesy window). Override via JUST_AKASH_REDEPLOY_WAIT_S /
-    _BACKUP_COURTESY_S / _POLL_INTERVAL_S.
+    only after the courtesy window). Override via JUST_AKASH_REDEPLOY_WAIT_S,
+    JUST_AKASH_REDEPLOY_BACKUP_COURTESY_S, and JUST_AKASH_REDEPLOY_POLL_INTERVAL_S.
     """
 
     def _f(name: str, default: str) -> float:

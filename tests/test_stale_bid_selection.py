@@ -232,6 +232,12 @@ class TestLeaseStaleRetry:
         (issue #19), and when the fresh order's lease is stale too → cleanup
         + raise."""
         client, sdl = _setup(MockAPI, mock_time, tmp_path, monkeypatch, providers="akash1a")
+        # Distinct dseqs for the original vs re-created order, so the close
+        # assertions are unambiguous about which order was torn down when.
+        client.create_deployment.side_effect = [
+            {"dseq": "111", "manifest": "m1"},
+            {"dseq": "222", "manifest": "m2"},
+        ]
         client.get_bids.return_value = [_make_bid("akash1a", 10)]
         client.create_lease.side_effect = self.STALE_ERR
 
@@ -239,8 +245,11 @@ class TestLeaseStaleRetry:
             deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
         # 1 lease attempt on the original order + 1 on the re-created order.
         assert client.create_lease.call_count == 2
-        # Closed twice: the stale order at re-deploy, the new order at failure.
+        # Closed twice: the stale order (111) at re-deploy, the new order (222)
+        # when its lease is stale too.
         assert client.close_deployment.call_count == 2
+        assert client.close_deployment.call_args_list[0].args == ("111",)
+        assert client.close_deployment.call_args_list[1].args == ("222",)
 
     @patch("just_akash.deploy.time")
     @patch("just_akash.deploy.AkashConsoleAPI")
