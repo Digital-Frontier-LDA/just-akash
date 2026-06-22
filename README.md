@@ -9,7 +9,7 @@ Self-contained — clone, configure `.env`, and run.
 > commitment to making Akash enterprise-ready — adding robustness to the deployment lifecycle and
 > security to post-deploy operations (no-SSH lease-shell exec, off-SDL secret injection).
 
-## What's New in v1.6.0
+## What's New
 
 - **Full lifecycle API coverage** — five new commands round out the deploy→operate→maintain loop:
   - `update` — revise a running deployment in place (`PUT /v1/deployments/{dseq}`); keeps the DSEQ and lease, no re-bid.
