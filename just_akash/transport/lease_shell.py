@@ -796,6 +796,13 @@ class LeaseShellTransport(Transport):
                 return
             attempts += 1
 
+        # Every attempt reconnected on auth-expiry and we ran out — fail loudly
+        # rather than letting `logs --follow` stop silently (mirrors _exec_loop).
+        raise RuntimeError(
+            f"Failed to re-authenticate stream after {MAX_RECONNECT_ATTEMPTS} attempts. "
+            "Check that AKASH_API_KEY is valid."
+        )
+
     def stream_logs(
         self, follow: bool = False, tail: int = 100, service: str | None = None
     ) -> None:

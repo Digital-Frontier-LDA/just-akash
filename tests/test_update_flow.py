@@ -57,6 +57,14 @@ class TestPrepareSdlContent:
         out = _prepare_sdl_content(str(f), env_vars=["FOO=bar"])
         assert "FOO=bar" in out
 
+    @pytest.mark.parametrize("bad", ["NOTAPAIR", "=value", "="])
+    def test_malformed_env_var_raises(self, tmp_path, bad):
+        # No '=' at all, or an empty key (e.g. "=value") both violate KEY=VALUE.
+        f = tmp_path / "s.yaml"
+        f.write_text(SDL_YAML)
+        with pytest.raises(RuntimeError, match="expected KEY=VALUE"):
+            _prepare_sdl_content(str(f), env_vars=[bad])
+
     def test_image_override_does_not_target_comment_line(self, tmp_path):
         # The override regex is `image:\s+[^\n]+` with count=1, so it replaces
         # the FIRST occurrence of "image: " anywhere in the file. A YAML comment

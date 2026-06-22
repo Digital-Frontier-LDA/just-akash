@@ -51,9 +51,10 @@ class SSHTransport(Transport):
         # Quote the path before it reaches the remote shell, matching the
         # lease-shell transport and the CLI's SSH inject path.
         quoted_path = shlex.quote(remote_path)
-        # mkdir -p
+        # mkdir -p — quote the command substitution too, so a dirname result
+        # containing spaces stays a single argument to mkdir.
         subprocess.run(
-            ssh_cmd + [f"mkdir -p $(dirname {quoted_path})"],
+            ssh_cmd + [f'mkdir -p "$(dirname {quoted_path})"'],
             capture_output=True,
             text=True,
             check=True,
@@ -64,8 +65,15 @@ class SSHTransport(Transport):
         )
         if result.returncode != 0:
             raise RuntimeError(f"Failed to write secrets: {result.stderr.strip()}")
-        # chmod 600
-        subprocess.run(ssh_cmd + [f"chmod 600 {quoted_path}"], capture_output=True, text=True)
+        # chmod 600 — fail closed: never report success if the secret file is
+        # left with weaker-than-intended permissions.
+        chmod_result = subprocess.run(
+            ssh_cmd + [f"chmod 600 {quoted_path}"], capture_output=True, text=True
+        )
+        if chmod_result.returncode != 0:
+            raise RuntimeError(
+                f"Failed to set secret-file permissions (chmod 600): {chmod_result.stderr.strip()}"
+            )
 
     def connect(self) -> None:
         """Interactive SSH shell (replaces process via os.execvp — never returns)."""

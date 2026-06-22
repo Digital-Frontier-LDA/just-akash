@@ -8,6 +8,7 @@ import base64
 import json
 from unittest.mock import MagicMock, patch
 
+import pytest
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 from websockets.frames import Close
 
@@ -485,3 +486,22 @@ class TestStreamReconnect:
             t.stream_logs(follow=True)
         assert "only-line" in capsys.readouterr().out
         assert mock_jwt.call_count == 1  # no reconnect on a non-auth close
+
+    def test_raises_when_auth_expiry_exhausts_reconnects(self, capsys):
+        # Every connection closes on auth-expiry; after MAX_RECONNECT_ATTEMPTS
+        # the stream must fail loudly rather than return silently.
+        from just_akash.transport.lease_shell import MAX_RECONNECT_ATTEMPTS
+
+        t = _make_transport()
+        wss = [
+            FakeWebSocket([f"line-{i}".encode()], close_exc=_auth_expiry_close())
+            for i in range(MAX_RECONNECT_ATTEMPTS)
+        ]
+        with (
+            patch.object(t, "_fetch_jwt", return_value="jwt") as mock_jwt,
+            patch("just_akash.transport.lease_shell.connect") as mock_connect,
+        ):
+            mock_connect.side_effect = wss
+            with pytest.raises(RuntimeError, match="Failed to re-authenticate stream"):
+                t.stream_logs(follow=True)
+        assert mock_jwt.call_count == MAX_RECONNECT_ATTEMPTS

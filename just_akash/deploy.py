@@ -269,7 +269,8 @@ def _prepare_sdl_content(
         # Reject malformed entries before they become a broken SDL env line
         # (mirrors the `inject` command's validation).
         for var in env_vars:
-            if "=" not in var:
+            key, sep, _ = var.partition("=")
+            if not sep or not key:
                 raise RuntimeError(f"Invalid --env {var!r}: expected KEY=VALUE")
         sdl_content = _inject_env_into_sdl(sdl_content, env_vars)
         _log(logging.INFO, f"Injected {len(env_vars)} env var(s) into SDL (provider-visible)")

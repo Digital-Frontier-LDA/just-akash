@@ -141,6 +141,31 @@ class TestSSHTransport:
         for cmd in sent_cmds:
             assert quoted in cmd
             assert dangerous not in cmd.replace(quoted, "")
+        # The mkdir command must also quote the $(dirname ...) substitution, so a
+        # directory path containing spaces stays a single argument to mkdir.
+        mkdir_cmd = sent_cmds[0]
+        assert f'"$(dirname {quoted})"' in mkdir_cmd
+
+    def test_inject_fails_closed_when_chmod_fails(self):
+        """If `chmod 600` fails, inject() must raise — never report success with
+        secret material left at weaker-than-intended permissions."""
+        config = TransportConfig(dseq="123", api_key="key")
+        t = SSHTransport(config)
+        t._ssh_info = {"host": "h", "port": 22}
+        t._key_path = "/key"
+
+        ok = MagicMock(returncode=0, stderr="")
+        chmod_fail = MagicMock(returncode=1, stderr="chmod: Operation not permitted")
+        # mkdir, cat, chmod — in order.
+        with (
+            patch("just_akash.transport.ssh._build_ssh_cmd", return_value=["ssh"]),
+            patch(
+                "just_akash.transport.ssh.subprocess.run",
+                side_effect=[ok, ok, chmod_fail],
+            ),
+            pytest.raises(RuntimeError, match="chmod 600"),
+        ):
+            t.inject("/tmp/secret", "content")
 
 
 # --- LeaseShellTransport (Phase 7+) ---
