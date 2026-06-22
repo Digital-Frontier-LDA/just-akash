@@ -57,6 +57,14 @@ class TestPrepareSdlContent:
         out = _prepare_sdl_content(str(f), env_vars=["FOO=bar"])
         assert "FOO=bar" in out
 
+    @pytest.mark.parametrize("bad", ["NOTAPAIR", "=value", "="])
+    def test_malformed_env_var_raises(self, tmp_path, bad):
+        # No '=' at all, or an empty key (e.g. "=value") both violate KEY=VALUE.
+        f = tmp_path / "s.yaml"
+        f.write_text(SDL_YAML)
+        with pytest.raises(RuntimeError, match="expected KEY=VALUE"):
+            _prepare_sdl_content(str(f), env_vars=[bad])
+
     def test_image_override_does_not_target_comment_line(self, tmp_path):
         # The override regex is `image:\s+[^\n]+` with count=1, so it replaces
         # the FIRST occurrence of "image: " anywhere in the file. A YAML comment
@@ -161,3 +169,26 @@ class TestDeployDepositGuard:
         with pytest.raises(RuntimeError, match="Invalid deposit"):
             deploy(sdl_path="ignored.yaml", deposit=0)
         MockAPI.return_value.create_deployment.assert_not_called()
+
+
+class TestResolveSdlPath:
+    def test_gpu_uses_variant_when_present(self, tmp_path):
+        from just_akash.deploy import _resolve_sdl_path
+
+        (tmp_path / "app.yaml").write_text("base")
+        (tmp_path / "app-gpu.yaml").write_text("gpu")
+        assert _resolve_sdl_path(str(tmp_path / "app.yaml"), gpu=True) == str(
+            tmp_path / "app-gpu.yaml"
+        )
+
+    def test_gpu_falls_back_when_no_variant(self, tmp_path):
+        from just_akash.deploy import _resolve_sdl_path
+
+        (tmp_path / "app.yaml").write_text("base")
+        base = str(tmp_path / "app.yaml")
+        assert _resolve_sdl_path(base, gpu=True) == base
+
+    def test_no_gpu_returns_original(self):
+        from just_akash.deploy import _resolve_sdl_path
+
+        assert _resolve_sdl_path("/x/app.yaml", gpu=False) == "/x/app.yaml"

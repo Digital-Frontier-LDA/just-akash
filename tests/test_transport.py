@@ -114,6 +114,59 @@ class TestSSHTransport:
             rc = t.exec("exit 42")
         assert rc == 42
 
+    def test_inject_shlex_quotes_remote_path(self):
+        """A remote path containing shell metacharacters must be shlex-quoted in
+        every command sent over SSH (mkdir/cat/chmod) — never interpolated raw."""
+        import shlex
+
+        config = TransportConfig(dseq="123", api_key="key")
+        t = SSHTransport(config)
+        t._ssh_info = {"host": "h", "port": 22}
+        t._key_path = "/key"
+        dangerous = "/tmp/x; rm -rf ~"
+        quoted = shlex.quote(dangerous)
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        with (
+            patch("just_akash.transport.ssh._build_ssh_cmd", return_value=["ssh"]),
+            patch("just_akash.transport.ssh.subprocess.run", return_value=mock_result) as mock_run,
+        ):
+            t.inject(dangerous, "secret-content")
+
+        # Every invocation's final argument is the remote command string; the
+        # raw path must never appear unquoted in any of them.
+        sent_cmds = [call.args[0][-1] for call in mock_run.call_args_list]
+        assert sent_cmds, "expected at least one SSH command"
+        for cmd in sent_cmds:
+            assert quoted in cmd
+            assert dangerous not in cmd.replace(quoted, "")
+        # The mkdir command must also quote the $(dirname ...) substitution, so a
+        # directory path containing spaces stays a single argument to mkdir.
+        mkdir_cmd = sent_cmds[0]
+        assert f'"$(dirname {quoted})"' in mkdir_cmd
+
+    def test_inject_fails_closed_when_chmod_fails(self):
+        """If `chmod 600` fails, inject() must raise — never report success with
+        secret material left at weaker-than-intended permissions."""
+        config = TransportConfig(dseq="123", api_key="key")
+        t = SSHTransport(config)
+        t._ssh_info = {"host": "h", "port": 22}
+        t._key_path = "/key"
+
+        ok = MagicMock(returncode=0, stderr="")
+        chmod_fail = MagicMock(returncode=1, stderr="chmod: Operation not permitted")
+        # mkdir, cat, chmod — in order.
+        with (
+            patch("just_akash.transport.ssh._build_ssh_cmd", return_value=["ssh"]),
+            patch(
+                "just_akash.transport.ssh.subprocess.run",
+                side_effect=[ok, ok, chmod_fail],
+            ),
+            pytest.raises(RuntimeError, match="chmod 600"),
+        ):
+            t.inject("/tmp/secret", "content")
+
 
 # --- LeaseShellTransport (Phase 7+) ---
 

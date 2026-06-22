@@ -8,10 +8,18 @@ import base64
 import json
 from unittest.mock import MagicMock, patch
 
+import pytest
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
+from websockets.frames import Close
 
 from just_akash.transport.base import TransportConfig
 from just_akash.transport.lease_shell import LeaseShellTransport
+
+
+def _auth_expiry_close() -> ConnectionClosedError:
+    """A close that _is_auth_expiry recognizes (provider auth code 4001)."""
+    return ConnectionClosedError(rcvd=Close(code=4001, reason="token expired"), sent=None)
+
 
 DEPLOYMENT_FIXTURE = {
     "leases": [
@@ -426,3 +434,74 @@ class TestStreamResilience:
         out = capsys.readouterr().out
         # Faithful output keeps the blank line between the two log lines.
         assert out == "before\n\nafter\n"
+
+
+# ── recv-loop robustness (uncaught-crash regression guard) ────────────
+
+
+class TestRecvProxyMessageRobustness:
+    def test_non_object_json_frames_return_none(self):
+        t = _make_transport()
+        for frame in ["[1, 2, 3]", "null", "42", '"a string"', "true"]:
+            ws = FakeWebSocket([frame])
+            # Must not raise AttributeError — non-object JSON has no envelope.
+            assert t._recv_proxy_message(ws, timeout=1) is None
+
+    def test_malformed_base64_payload_returns_none(self):
+        t = _make_transport()
+        # "abcde" is not valid base64 (length 5 → padding error / binascii.Error).
+        ws = FakeWebSocket([json.dumps({"type": "data", "message": "abcde"})])
+        assert t._recv_proxy_message(ws, timeout=1) is None
+
+
+# ── follow-stream auth-expiry reconnect ───────────────────────────────
+
+
+class TestStreamReconnect:
+    def test_logs_reconnects_on_auth_expiry(self, capsys):
+        t = _make_transport()
+        # First connection serves a line then closes with an auth-expiry code;
+        # the stream should refetch the JWT and reconnect rather than end.
+        ws1 = FakeWebSocket([b"line-before-expiry"], close_exc=_auth_expiry_close())
+        ws2 = FakeWebSocket([b"line-after-reconnect"])  # ends with a clean close
+        with (
+            patch.object(t, "_fetch_jwt", return_value="jwt") as mock_jwt,
+            patch("just_akash.transport.lease_shell.connect") as mock_connect,
+        ):
+            mock_connect.side_effect = [ws1, ws2]
+            t.stream_logs(follow=True)
+        out = capsys.readouterr().out
+        assert "line-before-expiry" in out
+        assert "line-after-reconnect" in out
+        assert mock_jwt.call_count == 2  # reconnected with a fresh token
+
+    def test_non_auth_close_ends_stream_without_reconnect(self, capsys):
+        t = _make_transport()
+        ws = FakeWebSocket([b"only-line"], close_exc=ConnectionClosedError(rcvd=None, sent=None))
+        with (
+            patch.object(t, "_fetch_jwt", return_value="jwt") as mock_jwt,
+            patch("just_akash.transport.lease_shell.connect") as mock_connect,
+        ):
+            mock_connect.return_value = ws
+            t.stream_logs(follow=True)
+        assert "only-line" in capsys.readouterr().out
+        assert mock_jwt.call_count == 1  # no reconnect on a non-auth close
+
+    def test_raises_when_auth_expiry_exhausts_reconnects(self, capsys):
+        # Every connection closes on auth-expiry; after MAX_RECONNECT_ATTEMPTS
+        # the stream must fail loudly rather than return silently.
+        from just_akash.transport.lease_shell import MAX_RECONNECT_ATTEMPTS
+
+        t = _make_transport()
+        wss = [
+            FakeWebSocket([f"line-{i}".encode()], close_exc=_auth_expiry_close())
+            for i in range(MAX_RECONNECT_ATTEMPTS)
+        ]
+        with (
+            patch.object(t, "_fetch_jwt", return_value="jwt") as mock_jwt,
+            patch("just_akash.transport.lease_shell.connect") as mock_connect,
+        ):
+            mock_connect.side_effect = wss
+            with pytest.raises(RuntimeError, match="Failed to re-authenticate stream"):
+                t.stream_logs(follow=True)
+        assert mock_jwt.call_count == MAX_RECONNECT_ATTEMPTS

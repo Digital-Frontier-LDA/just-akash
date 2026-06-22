@@ -21,6 +21,14 @@ This tool deploys compute instances on Akash Network via the Console API. The ma
 - **`AKASH_API_KEY`** — your Console API key. Read from environment, never hardcoded.
 - **`SSH_PUBKEY`** — injected into containers at deploy time. Not stored in the repo.
 - **Provider allowlist** — controls which providers can host your workloads. Keep it restricted to providers you trust.
+- **Secret injection (`inject`)** — secrets are written to the container over the
+  Console provider-proxy WebSocket (TLS-encrypted in transit). The lease-shell
+  transport sends them as a base64 argument to `base64 -d`, so the encoded
+  secret is briefly visible in the **provider host's** process table
+  (`ps` / `/proc/<pid>/cmdline`) while the command runs. This only exposes the
+  secret to an operator/co-tenant already on the provider host you've chosen to
+  trust with your workload. Use only trusted (ideally allowlisted/audited)
+  providers for sensitive secrets.
 
 ## Secret Scanning
 
