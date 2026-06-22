@@ -22,6 +22,7 @@ Subcommands:
 
 import argparse
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -653,7 +654,7 @@ def main():
         from .api import AkashConsoleAPI, _confirm, _get_tag
 
         try:
-            if args.deposit < 0.5:
+            if not math.isfinite(args.deposit) or args.deposit < 0.5:
                 print("Error: minimum deposit is 0.5 USD.", file=sys.stderr)
                 sys.exit(1)
             client = AkashConsoleAPI(_require_api_key())

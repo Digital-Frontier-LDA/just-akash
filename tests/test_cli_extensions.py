@@ -137,6 +137,29 @@ class TestCliAddFunds:
 
     @patch("just_akash.api._get_tag", return_value="")
     @patch("just_akash.api.AkashConsoleAPI")
+    def test_nan_deposit_does_not_bypass_minimum_guard(
+        self, MockAPI, mock_tag, monkeypatch, capsys
+    ):
+        # argparse `type=float` accepts "nan" -> float('nan'). The minimum-deposit
+        # guard is `if args.deposit < 0.5`, but `nan < 0.5` is False, so NaN slips
+        # past the guard and is forwarded to deposit_deployment. From there it is
+        # serialized as the bare token `NaN` in the request body
+        # ({"deposit": NaN}), which is NOT valid JSON per RFC 8259 and a strict
+        # Console API parser rejects. A NaN deposit is a nonsensical amount that
+        # the guard exists to catch; it must be rejected (exit 1) and never reach
+        # the API.
+        monkeypatch.setenv("AKASH_API_KEY", "k")
+        client = MockAPI.return_value
+        with pytest.raises(SystemExit) as e:
+            _run_cli(
+                monkeypatch,
+                ["just-akash", "add-funds", "--dseq", "12345", "--deposit", "nan", "-y"],
+            )
+        assert e.value.code == 1
+        client.deposit_deployment.assert_not_called()
+
+    @patch("just_akash.api._get_tag", return_value="")
+    @patch("just_akash.api.AkashConsoleAPI")
     def test_confirmed_deposits(self, MockAPI, mock_tag, monkeypatch, capsys):
         monkeypatch.setenv("AKASH_API_KEY", "k")
         client = MockAPI.return_value
