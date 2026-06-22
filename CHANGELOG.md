@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
-## [Unreleased]
+## [1.7.0] — 2026-06-22
 
 ### Added
 - **Full lifecycle Console-API coverage** — five new commands close the gaps between deploy and teardown:
@@ -20,13 +20,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Tests: 69 new unit tests across `test_api_extensions.py`, `test_lease_stream.py`, `test_cli_extensions.py`, `test_update_flow.py`.
 - **Adversarial hardening** (`/nf:harden`, 6 iterations to convergence): fixed 9 edge-case bugs in the new lifecycle code (loose 404 detection, dropped/`0` log+event messages, blank-line streaming, image-override hijacking a comment, non-bool auto-topup display, `{"data": null}` wrapper leak breaking first-time auto-topup, non-finite `add-funds` deposit) — see `harden iteration` commits.
 - **Security tooling**: ruff bandit rules (`S`), a Semgrep SAST scan (`just semgrep`), and a pip-audit dependency CVE check (`just audit`), all wired into CI (`.github/workflows/security.yml`, weekly schedule for CVEs). See `SECURITY.md`.
+- `deploy --gpu` now prefers a sibling `<name>-gpu<ext>` SDL variant when it exists (e.g. `app.yaml` → `app-gpu.yaml`), falling back to the named file with a warning otherwise (PR #22).
+- Tests: full suite at 779 passing (up from 668), including the new lifecycle, transport-robustness, and re-deploy coverage below.
 
 ### Changed
 - `create_jwt` / `create_jwt_with_provider` accept a `scope` parameter (defaults to `["shell"]`) so the same JWT path serves `shell`, `logs`, and `events`.
 - SDL preparation (read → validate → image/SSH/env overrides) extracted into `deploy._prepare_sdl_content`, shared by `deploy()` and `update()`.
 
+### Fixed
+- **Order re-creation when the whole bid pool is stale** (PR #20): if every open bid expires before a lease can be created and there is no other open bid to retry, the stale order is now closed and a fresh deployment is created **once**, then re-selected (preferred bids instantly, backup bids after a short courtesy window — `JUST_AKASH_REDEPLOY_*` env config) instead of failing the deploy outright. The close-then-recreate is guarded against double escrow: a failed close is retried 3×, and if it still fails the deploy aborts with the manual-cleanup command rather than risk a second funded order.
+- **Transient JWT-flap on lease creation** (PR #17, fixes #18): a Console `400 "JWT has invalid claims"` is transient, so lease creation now retries the **same** bid (distinct from the stale-bid "no longer open" retry, which advances to the next bid) before failing.
+- **Log/event stream resilience** (PR #22): `logs --follow` reconnects with a fresh JWT on auth-expiry mid-stream (mirroring the interactive shell) and fails loudly after exhausting reconnect attempts instead of stopping silently; the provider-proxy recv-loop tolerates non-object JSON and malformed base64 frames instead of crashing.
+- **`--env` validation** (PR #22): `deploy` / `update` reject malformed `--env` entries (missing `=`, or an empty key like `=value`) up front instead of emitting a broken SDL.
+- **`inject` permission hardening fails closed** (PR #22): the SSH fallback now errors if `chmod 600` on the secret file fails, rather than reporting success with weaker-than-intended permissions.
+
 ### Security
 - `inject` SSH-fallback path now `shlex.quote`s the user-supplied `--remote-path` before it reaches the remote shell, matching the lease-shell transport (prevents remote-shell metacharacter interpretation).
+- `inject` SSH fallback also quotes the `$(dirname …)` command substitution so a remote path containing spaces cannot split into multiple `mkdir` arguments (PR #22).
+- `SECURITY.md` documents the lease-shell `inject` base64-argv exposure window — the encoded secret is briefly visible in the **provider host's** process table while `base64 -d` runs; use trusted/audited providers for sensitive secrets (PR #22).
 - Corrected `deploy --deposit` help and log line: deposits are denominated in **USD**, not AKT (verified against the Console API source).
 
 ---
