@@ -289,7 +289,9 @@ class TestEnrichProviderHostUri:
 
     def test_keeps_existing_nonblank_hosturi(self):
         client = MagicMock()
-        dep = {"leases": [{"id": {"provider": "akash1p"}, "provider": {"hostUri": "https://keep"}}]}
+        dep = {
+            "leases": [{"id": {"provider": "akash1p"}, "provider": {"hostUri": "https://keep"}}]
+        }
         out = _enrich_deployment_with_provider(client, dep)
         assert out["leases"][0]["provider"]["hostUri"] == "https://keep"
         client.get_provider.assert_not_called()
