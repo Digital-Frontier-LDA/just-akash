@@ -321,6 +321,37 @@ class TestStreamProviderScopedJwt:
         assert connect_msg["providerAddress"] == "akash1prov"
 
 
+# ── _resolve_provider host-uri fallback ──────────────────────────────
+
+
+class TestResolveProviderHostUriFallback:
+    def test_blank_embedded_hosturi_falls_back_to_provider_registry(self):
+        """An empty embedded ``provider.hostUri`` must NOT be returned as a usable
+        URL; with a valid ``id.provider`` address present, _resolve_provider must
+        fall through to the provider-registry lookup (get_provider) and use that
+        hostUri instead. A blank hostUri short-circuiting here would yield a
+        proxy URL like ``/lease/...`` with no host, silently breaking the stream.
+        """
+        deployment = {
+            "leases": [{"id": {"provider": "akash1x"}, "provider": {"hostUri": ""}}]
+        }
+        cfg = TransportConfig(dseq="123", api_key="key", deployment=deployment)
+        t = LeaseShellTransport(cfg)
+
+        fake_client = MagicMock()
+        fake_client.get_provider.return_value = {"hostUri": "https://resolved.example:8443"}
+
+        with patch.object(t, "_get_api_client", return_value=fake_client):
+            host = t._resolve_provider()
+
+        # The blank embedded hostUri is rejected; the registry value wins.
+        assert host == "https://resolved.example:8443"
+        assert t._provider_host_uri == "https://resolved.example:8443"
+        # The lease's id.provider address was captured and used for the lookup.
+        assert t._provider_address == "akash1x"
+        fake_client.get_provider.assert_called_once_with("akash1x")
+
+
 # ── _stream resilience ───────────────────────────────────────────────
 
 
