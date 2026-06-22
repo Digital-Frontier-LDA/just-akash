@@ -332,9 +332,7 @@ class TestResolveProviderHostUriFallback:
         hostUri instead. A blank hostUri short-circuiting here would yield a
         proxy URL like ``/lease/...`` with no host, silently breaking the stream.
         """
-        deployment = {
-            "leases": [{"id": {"provider": "akash1x"}, "provider": {"hostUri": ""}}]
-        }
+        deployment = {"leases": [{"id": {"provider": "akash1x"}, "provider": {"hostUri": ""}}]}
         cfg = TransportConfig(dseq="123", api_key="key", deployment=deployment)
         t = LeaseShellTransport(cfg)
 

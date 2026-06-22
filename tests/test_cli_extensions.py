@@ -253,3 +253,24 @@ class TestCliAutoTopup:
                 ["just-akash", "auto-topup", "--dseq", "12345", "--on", "--off"],
             )
         assert e.value.code == 2
+
+    @patch("just_akash.api._get_tag", return_value="")
+    @patch("just_akash.api.AkashConsoleAPI")
+    def test_set_path_api_error_exits_1_cleanly(self, MockAPI, mock_tag, monkeypatch, capsys):
+        # The set-path of auto-topup (--on/--off) calls set_auto_top_up, which can
+        # raise RuntimeError on a real server failure (e.g. the upsert's PATCH/POST
+        # hits an escrow-service 500). That must surface as a friendly stderr
+        # message + exit 1, never an uncaught traceback. The existing tests only
+        # exercise the success path; this locks down the failure path.
+        monkeypatch.setenv("AKASH_API_KEY", "k")
+        client = MockAPI.return_value
+        client.set_auto_top_up.side_effect = RuntimeError(
+            "API Error (500): escrow service unavailable"
+        )
+        with pytest.raises(SystemExit) as e:
+            _run_cli(monkeypatch, ["just-akash", "auto-topup", "--dseq", "12345", "--on"])
+        assert e.value.code == 1
+        err = capsys.readouterr().err
+        assert "escrow service unavailable" in err
+        # The set call was actually attempted (we're testing the set-path, not show).
+        client.set_auto_top_up.assert_called_once_with("12345", True)
