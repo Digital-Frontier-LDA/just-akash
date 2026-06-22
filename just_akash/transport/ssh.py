@@ -35,8 +35,8 @@ class SSHTransport(Transport):
 
     def exec(self, command: str) -> int:
         """Run command via SSH subprocess; return exit code."""
-        assert self._ssh_info is not None, "Call prepare() first"
-        assert self._key_path is not None, "Call prepare() first"
+        assert self._ssh_info is not None, "Call prepare() first"  # noqa: S101 type-narrowing
+        assert self._key_path is not None, "Call prepare() first"  # noqa: S101 type-narrowing
         ssh_cmd = _build_ssh_cmd(self._ssh_info, self._key_path)
         ssh_cmd.append(command)
         result = subprocess.run(ssh_cmd, text=True)
@@ -44,8 +44,8 @@ class SSHTransport(Transport):
 
     def inject(self, remote_path: str, content: str) -> None:
         """Inject secrets via SSH (mkdir, cat, chmod)."""
-        assert self._ssh_info is not None, "Call prepare() first"
-        assert self._key_path is not None, "Call prepare() first"
+        assert self._ssh_info is not None, "Call prepare() first"  # noqa: S101 type-narrowing
+        assert self._key_path is not None, "Call prepare() first"  # noqa: S101 type-narrowing
         ssh_cmd = _build_ssh_cmd(self._ssh_info, self._key_path)
         # mkdir -p
         subprocess.run(
@@ -65,8 +65,8 @@ class SSHTransport(Transport):
 
     def connect(self) -> None:
         """Interactive SSH shell (replaces process via os.execvp — never returns)."""
-        assert self._ssh_info is not None, "Call prepare() first"
-        assert self._key_path is not None, "Call prepare() first"
+        assert self._ssh_info is not None, "Call prepare() first"  # noqa: S101 type-narrowing
+        assert self._key_path is not None, "Call prepare() first"  # noqa: S101 type-narrowing
         ssh_cmd = _build_ssh_cmd(self._ssh_info, self._key_path)
         os.execvp("ssh", ssh_cmd)
 

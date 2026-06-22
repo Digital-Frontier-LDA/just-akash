@@ -32,10 +32,29 @@ connect dseq="" transport="":
     trap 'status=$?; echo "[INFO] recipe=connect finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
     echo "[INFO] recipe=connect started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq={{dseq}}"
     set -x
-    cmd="uv run just-akash connect"
-    if [ -n "{{dseq}}" ]; then cmd="$cmd --dseq={{dseq}}"; fi
-    if [ -n "{{transport}}" ]; then cmd="$cmd --transport {{transport}}"; fi
-    eval "$cmd"
+    args=(uv run just-akash connect)
+    if [ -n "{{dseq}}" ]; then args+=(--dseq "{{dseq}}"); fi
+    if [ -n "{{transport}}" ]; then args+=(--transport "{{transport}}"); fi
+    "${args[@]}"
+
+# Update a running instance in place with a revised SDL (no re-bid, keeps DSEQ).
+# Usage: just update SDL [dseq] [image]
+#   just update sdl/cpu-backtest-ssh.yaml
+#   just update sdl/cpu-backtest-ssh.yaml akash-node ghcr.io/me/app:v2
+update sdl dseq="" image="":
+    #!/bin/bash
+    set -euo pipefail
+    mkdir -p "{{log_dir}}"
+    timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
+    log_file="{{log_dir}}/update-${timestamp}.log"
+    exec > >(tee -a "$log_file") 2>&1
+    trap 'status=$?; echo "[INFO] recipe=update finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
+    echo "[INFO] recipe=update started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file sdl={{sdl}} dseq={{dseq}} image={{image}}"
+    set -x
+    args=(uv run just-akash update --sdl "{{sdl}}")
+    if [ -n "{{dseq}}" ]; then args+=(--dseq "{{dseq}}"); fi
+    if [ -n "{{image}}" ]; then args+=(--image "{{image}}"); fi
+    "${args[@]}"
 
 # Destroy an instance (picks interactively if no DSEQ given)
 destroy dseq="":
@@ -95,10 +114,10 @@ inject dseq="" env-file=".env.secrets" transport="":
     trap 'status=$?; echo "[INFO] recipe=inject finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
     echo "[INFO] recipe=inject started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq={{dseq}} env_file={{env-file}}"
     set -x
-    cmd="uv run just-akash inject --env-file {{env-file}}"
-    if [ -n "{{dseq}}" ]; then cmd="$cmd --dseq={{dseq}}"; fi
-    if [ -n "{{transport}}" ]; then cmd="$cmd --transport {{transport}}"; fi
-    eval "$cmd"
+    args=(uv run just-akash inject --env-file "{{env-file}}")
+    if [ -n "{{dseq}}" ]; then args+=(--dseq "{{dseq}}"); fi
+    if [ -n "{{transport}}" ]; then args+=(--transport "{{transport}}"); fi
+    "${args[@]}"
 
 # Execute a command on a running instance via lease-shell (default) or SSH
 # Usage: just exec [dseq] [transport=lease-shell|ssh] "command"
@@ -112,10 +131,11 @@ exec dseq="" command="" transport="":
     trap 'status=$?; echo "[INFO] recipe=exec finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
     echo "[INFO] recipe=exec started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq={{dseq}} command={{command}}"
     set -x
-    cmd="uv run just-akash exec '{{command}}'"
-    if [ -n "{{dseq}}" ]; then cmd="$cmd --dseq={{dseq}}"; fi
-    if [ -n "{{transport}}" ]; then cmd="$cmd --transport {{transport}}"; fi
-    eval "$cmd"
+    args=(uv run just-akash exec)
+    if [ -n "{{dseq}}" ]; then args+=(--dseq "{{dseq}}"); fi
+    if [ -n "{{transport}}" ]; then args+=(--transport "{{transport}}"); fi
+    args+=("{{command}}")
+    "${args[@]}"
 
 # ── Info ─────────────────────────────────────────────
 
@@ -148,6 +168,79 @@ status dseq="":
     else
         uv run just-akash status
     fi
+
+# Stream container logs (picks interactively if no DSEQ given).
+# Usage: just logs [dseq] [follow]   (pass any non-empty follow arg to tail -f)
+#   just logs akash-node
+#   just logs akash-node follow
+logs dseq="" follow="":
+    #!/bin/bash
+    set -euo pipefail
+    mkdir -p "{{log_dir}}"
+    timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
+    log_file="{{log_dir}}/logs-${timestamp}.log"
+    exec > >(tee -a "$log_file") 2>&1
+    trap 'status=$?; echo "[INFO] recipe=logs finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
+    echo "[INFO] recipe=logs started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq={{dseq}} follow={{follow}}"
+    set -x
+    args=(uv run just-akash logs)
+    if [ -n "{{dseq}}" ]; then args+=(--dseq "{{dseq}}"); fi
+    if [ -n "{{follow}}" ]; then args+=(--follow); fi
+    "${args[@]}"
+
+# Stream Kubernetes events for a deployment (debug why it won't start).
+# Usage: just events [dseq]
+events dseq="":
+    #!/bin/bash
+    set -euo pipefail
+    mkdir -p "{{log_dir}}"
+    timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
+    log_file="{{log_dir}}/events-${timestamp}.log"
+    exec > >(tee -a "$log_file") 2>&1
+    trap 'status=$?; echo "[INFO] recipe=events finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
+    echo "[INFO] recipe=events started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq={{dseq}}"
+    set -x
+    args=(uv run just-akash events)
+    if [ -n "{{dseq}}" ]; then args+=(--dseq "{{dseq}}"); fi
+    "${args[@]}"
+
+# ── Escrow / funding ─────────────────────────────────
+
+# Add funds (USD) to a deployment's escrow so it outlives its initial deposit.
+# Usage: just add-funds AMOUNT [dseq]   (AMOUNT in USD, minimum 0.5)
+#   just add-funds 5 akash-node
+add-funds amount dseq="":
+    #!/bin/bash
+    set -euo pipefail
+    mkdir -p "{{log_dir}}"
+    timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
+    log_file="{{log_dir}}/add-funds-${timestamp}.log"
+    exec > >(tee -a "$log_file") 2>&1
+    trap 'status=$?; echo "[INFO] recipe=add-funds finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
+    echo "[INFO] recipe=add-funds started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file amount={{amount}} dseq={{dseq}}"
+    set -x
+    args=(uv run just-akash add-funds --deposit "{{amount}}")
+    if [ -n "{{dseq}}" ]; then args+=(--dseq "{{dseq}}"); fi
+    "${args[@]}"
+
+# Show or toggle auto top-up for a deployment.
+# Usage: just auto-topup [dseq] [on|off]   (no toggle = show current setting)
+#   just auto-topup akash-node on
+auto-topup dseq="" toggle="":
+    #!/bin/bash
+    set -euo pipefail
+    mkdir -p "{{log_dir}}"
+    timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
+    log_file="{{log_dir}}/auto-topup-${timestamp}.log"
+    exec > >(tee -a "$log_file") 2>&1
+    trap 'status=$?; echo "[INFO] recipe=auto-topup finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
+    echo "[INFO] recipe=auto-topup started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq={{dseq}} toggle={{toggle}}"
+    set -x
+    args=(uv run just-akash auto-topup)
+    if [ -n "{{dseq}}" ]; then args+=(--dseq "{{dseq}}"); fi
+    if [ "{{toggle}}" = "on" ]; then args+=(--on); fi
+    if [ "{{toggle}}" = "off" ]; then args+=(--off); fi
+    "${args[@]}"
 
 # ── Testing ──────────────────────────────────────────
 
@@ -214,6 +307,22 @@ check:
 secrets:
     gitleaks detect --no-banner -v
 
+# ── Security (SAST + dependency CVEs) ────────────────
+
+# Static security scan with Semgrep (excludes 2 CLI-inherent rules; see SECURITY.md)
+semgrep:
+    #!/bin/bash
+    set -euo pipefail
+    uvx semgrep scan \
+      --config p/python --config p/security-audit \
+      --exclude-rule python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args \
+      --exclude-rule python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected \
+      --error --metrics off just_akash/
+
+# Dependency CVE audit (pip-audit over the synced environment).
+audit:
+    uv run --with pip-audit pip-audit
+
 # ── Advanced ─────────────────────────────────────────
 
 # Deploy with custom SDL (e.g. no SSH, different image)
@@ -227,9 +336,9 @@ deploy sdl="sdl/cpu-backtest-ssh.yaml" image="":
     trap 'status=$?; echo "[INFO] recipe=deploy finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
     echo "[INFO] recipe=deploy started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file sdl={{sdl}} image={{image}}"
     set -x
-    cmd="uv run just-akash deploy --sdl {{sdl}}"
-    if [ -n "{{image}}" ]; then cmd="$cmd --image {{image}}"; fi
-    eval "$cmd"
+    args=(uv run just-akash deploy --sdl "{{sdl}}")
+    if [ -n "{{image}}" ]; then args+=(--image "{{image}}"); fi
+    "${args[@]}"
 
 # ── Akash node (personal LCD/RPC) ────────────────────
 

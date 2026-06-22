@@ -1,0 +1,77 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly (Mon 06:00 UTC) so newly-disclosed dependency CVEs surface even
+    # without a code change.
+    - cron: '0 6 * * 1'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: both jobs only read the checked-out code.
+permissions:
+  contents: read
+
+jobs:
+  semgrep:
+    name: Semgrep SAST
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.13'
+
+      # Mirrors `just semgrep`. Two rules inherent to a remote-exec CLI are
+      # excluded (documented in SECURITY.md / Justfile); subprocess-shell-true
+      # and all other rules stay active. --error fails the build on any finding.
+      - name: Semgrep scan
+        run: |
+          uvx semgrep scan \
+            --config p/python --config p/security-audit \
+            --exclude-rule python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args \
+            --exclude-rule python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected \
+            --error --metrics off just_akash/
+
+  dependency-audit:
+    name: Dependency CVE audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      # Mirrors `just audit`. Audits the synced environment against the PyPI
+      # advisory database. Fails the build on any known vulnerability.
+      - name: pip-audit
+        run: uv run --with pip-audit pip-audit

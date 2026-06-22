@@ -25,7 +25,22 @@ target-version = "py310"
 line-length = 99
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM"]
+select = ["E", "F", "I", "UP", "B", "SIM", "S"]
+
+[tool.ruff.lint.per-file-ignores]
+# Modules that shell out to `ssh` by design: they build argv lists (never
+# shell=True — S602 stays enabled everywhere to enforce that) and resolve `ssh`
+# from PATH for portability. Scope S603/S606/S607 to just these files so a new
+# unsafe subprocess/exec elsewhere still fails CI.
+"just_akash/api.py" = ["S603", "S606", "S607"]
+"just_akash/cli.py" = ["S603", "S606", "S607"]
+"just_akash/transport/ssh.py" = ["S603", "S606", "S607"]
+# Test and e2e code: assert-based tests (S101), hardcoded test creds (S105) and
+# /tmp paths (S108), and shell-based test orchestration (S602) are expected and
+# are not part of the shipped attack surface.
+"tests/**" = ["S"]
+"just_akash/test_*.py" = ["S"]
+"just_akash/_e2e.py" = ["S"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

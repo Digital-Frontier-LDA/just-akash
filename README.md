@@ -9,12 +9,18 @@ Self-contained — clone, configure `.env`, and run.
 > commitment to making Akash enterprise-ready — adding robustness to the deployment lifecycle and
 > security to post-deploy operations (no-SSH lease-shell exec, off-SDL secret injection).
 
-## What's New in v1.6.0
+## What's New
 
+- **Full lifecycle API coverage** — five new commands round out the deploy→operate→maintain loop:
+  - `update` — revise a running deployment in place (`PUT /v1/deployments/{dseq}`); keeps the DSEQ and lease, no re-bid.
+  - `logs` — stream container logs from the provider (`--follow`, `--tail`, `--service`).
+  - `events` — stream Kubernetes events to debug why a deployment won't start.
+  - `add-funds` — top up a deployment's escrow in USD (`POST /v1/deposit-deployment`).
+  - `auto-topup` — show or toggle automatic escrow top-up (`/v2/deployment-settings`).
 - **Tiered provider selection** — preferred + backup allowlists with a 3-phase bid-selection state machine (`AKASH_PROVIDERS_BACKUP` env var, `--provider` / `--backup-provider` CLI flags). See [Bid Selection](#bid-selection).
 - **BME migration** — bid-price denom defaults updated from `uakt` (legacy) to `uact`.
 - **Hardened e2e cleanup** — `robust_destroy()` with retry + audit, SIGINT/SIGTERM-safe handler, no-leak guarantee on multi-deployment runs.
-- **653 tests** (109 new); `just_akash/deploy.py` and `just_akash/_e2e.py` at 100% line coverage.
+- **Extensive unit + e2e test suite**; `just_akash/deploy.py` and `just_akash/_e2e.py` at 100% line coverage.
 
 ## Prerequisites
 
@@ -41,9 +47,14 @@ uv run pre-commit install   # install gitleaks + ruff hooks
 |---|---|---|
 | `just deploy [sdl] [image]` | `just deploy` | Deploy with custom SDL/image |
 | `just up [tag]` | `just up my-web-app` | Deploy SSH instance + optional tag |
+| `just update SDL [dseq] [image]` | `just update sdl/app.yaml akash-node` | Update a deployment in place (no re-bid, keeps DSEQ/lease) |
 | `just connect [dseq] [transport]` | `just connect 12345 ssh` | Connect to a running instance (lease-shell default) |
 | `just exec [dseq] "cmd" [transport]` | `just exec 12345 "ls -la"` | Execute a remote command |
 | `just inject [dseq] [env-file] [transport]` | `just inject 12345 .env.secrets` | Inject secrets (lease-shell default) |
+| `just logs [dseq] [follow]` | `just logs akash-node follow` | Stream container logs (provider-proxy) |
+| `just events [dseq]` | `just events akash-node` | Stream Kubernetes events (debug startup) |
+| `just add-funds AMOUNT [dseq]` | `just add-funds 5 akash-node` | Add USD to escrow (min 0.5) |
+| `just auto-topup [dseq] [on\|off]` | `just auto-topup akash-node on` | Show / toggle auto escrow top-up |
 | `just destroy [dseq]` | `just destroy 12345` | Destroy an instance |
 | `just destroy-all` | `just destroy-all` | Destroy all instances |
 | `just list` | `just list` | List active instances |
@@ -51,8 +62,10 @@ uv run pre-commit install   # install gitleaks + ruff hooks
 | `just tag [dseq] [name]` | `just tag 12345 my-db` | Tag a deployment with a name |
 | `just test-shell` | `just test-shell` | E2E lease-shell transport test (deploy/exec/inject/cleanup) |
 | `just test-secrets` | `just test-secrets` | E2E secrets injection test (SSH inject + lease-shell cross-check) |
-| `just lint` | `just lint` | Ruff lint + format check |
+| `just lint` | `just lint` | Ruff lint + format check (incl. bandit `S` security rules) |
 | `just secrets` | `just secrets` | Gitleaks secret scan |
+| `just semgrep` | `just semgrep` | Semgrep SAST scan |
+| `just audit` | `just audit` | Dependency CVE audit (pip-audit) |
 
 Transport: `connect`, `exec`, and `inject` default to `lease-shell`. Pass `ssh` as the last argument to force SSH: `just exec 12345 "cmd" ssh`.
 
@@ -98,6 +111,9 @@ uv run just-akash deploy --sdl sdl/cpu-backtest-ssh.yaml
 # Deploy with env vars (provider-visible)
 uv run just-akash deploy --sdl sdl/cpu-backtest-ssh.yaml --env REGION=us-east
 
+# Update an existing deployment in place (new SDL/image, same DSEQ + lease)
+uv run just-akash update --dseq 12345 --sdl sdl/cpu-backtest-ssh.yaml --image repo/app:v2
+
 # Connect / exec / inject
 uv run just-akash connect --dseq 12345
 uv run just-akash exec --dseq 12345 "echo hello"
@@ -106,6 +122,16 @@ uv run just-akash inject --dseq 12345 --env-file .env.secrets
 # Force SSH transport
 uv run just-akash exec --dseq 12345 --transport ssh "echo hello"
 uv run just-akash inject --dseq 12345 --transport ssh --env-file .env.secrets
+
+# Stream logs (snapshot or --follow) and Kubernetes events
+uv run just-akash logs --dseq 12345 --tail 200
+uv run just-akash logs --dseq 12345 --follow --service web
+uv run just-akash events --dseq 12345
+
+# Escrow: add USD funds, or toggle automatic top-up
+uv run just-akash add-funds --dseq 12345 --deposit 5
+uv run just-akash auto-topup --dseq 12345 --on
+uv run just-akash auto-topup --dseq 12345        # show current setting
 
 # List / status / destroy
 uv run just-akash list

@@ -1,0 +1,15 @@
+# Semgrep scan exclusions.
+#
+# Test and e2e orchestration legitimately uses shell=True and passes test-built
+# commands to subprocess (deploy/cleanup harnesses). It is not part of the
+# shipped attack surface, so exclude it from the security scan.
+tests/
+just_akash/test_lifecycle.py
+just_akash/test_secrets_e2e.py
+just_akash/test_shell_e2e.py
+just_akash/_e2e.py
+
+# Vendored / generated / non-source
+.venv/
+.git/
+.planning/

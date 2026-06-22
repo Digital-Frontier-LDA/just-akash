@@ -18,6 +18,7 @@ Workflow:
 
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -169,6 +170,66 @@ def _resolve_tier(arg_value: list[str] | None, env_name: str) -> list[str]:
     return [a.strip() for a in raw.split(",") if a.strip()]
 
 
+def _prepare_sdl_content(
+    sdl_path: str,
+    image: str | None = None,
+    env_vars: list[str] | None = None,
+) -> str:
+    """Read, validate, and apply image/SSH-key/env overrides to an SDL file.
+
+    Shared by deploy() and update() so both paths transform the SDL identically.
+    Returns the final SDL string ready to send to the Console API.
+    """
+    _log(logging.INFO, f"Reading SDL from {sdl_path}")
+    sdl_path_obj = Path(sdl_path)
+    if not sdl_path_obj.exists():
+        raise RuntimeError(f"SDL file not found: {sdl_path}")
+
+    with open(sdl_path_obj) as f:
+        sdl_content = f.read()
+    _log(logging.DEBUG, f"SDL content length: {len(sdl_content)} bytes")
+
+    try:
+        validate_sdl(sdl_content)
+    except SDLValidationError as e:
+        _log(logging.ERROR, str(e))
+        raise RuntimeError(str(e)) from e
+    _log(logging.INFO, "SDL validation OK")
+
+    if image:
+        # Anchor to the YAML `image:` key at line start (after indentation) so a
+        # comment that merely mentions "image:" can't be hijacked as the target.
+        sdl_content, n_subs = re.subn(
+            r"(?m)^(?P<indent>[ \t]*)image:[ \t]+\S[^\n]*",
+            lambda m: f"{m.group('indent')}image: {image}",
+            sdl_content,
+            count=1,
+        )
+        if n_subs:
+            _log(logging.INFO, f"Overrode image to: {image}")
+        else:
+            _log(logging.WARNING, f"--image {image} set but no 'image:' key found to override")
+
+    if "PLACEHOLDER_SSH_PUBKEY_B64" in sdl_content:
+        import base64
+
+        ssh_pubkey = os.environ.get("SSH_PUBKEY", "")
+        if not ssh_pubkey:
+            raise RuntimeError(
+                "SDL requires SSH_PUBKEY but it's not set. "
+                "Add your public key to .env or export SSH_PUBKEY."
+            )
+        encoded = base64.b64encode(ssh_pubkey.encode()).decode()
+        sdl_content = sdl_content.replace("PLACEHOLDER_SSH_PUBKEY_B64", encoded)
+        _log(logging.INFO, "Injected SSH public key (base64) into SDL")
+
+    if env_vars:
+        sdl_content = _inject_env_into_sdl(sdl_content, env_vars)
+        _log(logging.INFO, f"Injected {len(env_vars)} env var(s) into SDL (provider-visible)")
+
+    return sdl_content
+
+
 def deploy(
     sdl_path: str,
     gpu: bool = False,
@@ -178,6 +239,7 @@ def deploy(
     env_vars: list[str] | None = None,
     preferred_providers: list[str] | None = None,
     backup_providers: list[str] | None = None,
+    deposit: float = 5.0,
 ) -> dict:
     api_key = os.environ.get("AKASH_API_KEY")
     if not api_key:
@@ -185,6 +247,11 @@ def deploy(
             "AKASH_API_KEY environment variable not set. "
             "Please set your API key: export AKASH_API_KEY='your-key'"
         )
+
+    # deposit is user-controlled (--deposit); reject non-finite/non-positive
+    # values before they reach json.dumps (which would emit invalid NaN/Infinity).
+    if not math.isfinite(deposit) or deposit <= 0:
+        raise RuntimeError(f"Invalid deposit {deposit!r}: must be a positive, finite USD amount.")
 
     client = AkashConsoleAPI(api_key)
 
@@ -204,53 +271,17 @@ def deploy(
     if not has_allowlist:
         _log(logging.INFO, "ALLOWED_PROVIDERS: (any — no allowlist set)")
 
-    # Step 1: Read SDL file
-    _log(logging.INFO, f"STEP 1: Reading SDL from {sdl_path}")
-    sdl_path_obj = Path(sdl_path)
-    if not sdl_path_obj.exists():
-        raise RuntimeError(f"SDL file not found: {sdl_path}")
-
-    with open(sdl_path_obj) as f:
-        sdl_content = f.read()
-    _log(logging.DEBUG, f"SDL content length: {len(sdl_content)} bytes")
-
-    try:
-        validate_sdl(sdl_content)
-    except SDLValidationError as e:
-        _log(logging.ERROR, str(e))
-        raise RuntimeError(str(e)) from e
-    _log(logging.INFO, "SDL validation OK")
-
-    if image:
-        sdl_content = re.sub(
-            r"image:\s+[^\n]+",
-            lambda _: f"image: {image}",
-            sdl_content,
-            count=1,
-        )
-        _log(logging.INFO, f"Overrode image to: {image}")
-
-    if "PLACEHOLDER_SSH_PUBKEY_B64" in sdl_content:
-        import base64
-
-        ssh_pubkey = os.environ.get("SSH_PUBKEY", "")
-        if not ssh_pubkey:
-            raise RuntimeError(
-                "SDL requires SSH_PUBKEY but it's not set. "
-                "Add your public key to .env or export SSH_PUBKEY."
-            )
-        encoded = base64.b64encode(ssh_pubkey.encode()).decode()
-        sdl_content = sdl_content.replace("PLACEHOLDER_SSH_PUBKEY_B64", encoded)
-        _log(logging.INFO, "Injected SSH public key (base64) into SDL")
-
-    if env_vars:
-        sdl_content = _inject_env_into_sdl(sdl_content, env_vars)
-        _log(logging.INFO, f"Injected {len(env_vars)} env var(s) into SDL (provider-visible)")
+    # Step 1: Read + validate + transform SDL
+    _log(logging.INFO, "STEP 1: Preparing SDL")
+    sdl_content = _prepare_sdl_content(sdl_path, image=image, env_vars=env_vars)
 
     # Step 2: Create deployment (with stale-deployment recovery)
-    _log(logging.INFO, "STEP 2: Creating deployment via Console API...")
+    _log(
+        logging.INFO,
+        f"STEP 2: Creating deployment via Console API (escrow deposit: {deposit} USD)...",
+    )
     try:
-        deployment_response = client.create_deployment(sdl_content)
+        deployment_response = client.create_deployment(sdl_content, deposit=deposit)
     except RuntimeError as e:
         if "already exists" in str(e).lower():
             _log(
@@ -272,7 +303,7 @@ def deploy(
                 _log(logging.ERROR, f"Stale deployment cleanup failed: {cleanup_err}")
             # Retry once after cleanup
             try:
-                deployment_response = client.create_deployment(sdl_content)
+                deployment_response = client.create_deployment(sdl_content, deposit=deposit)
             except RuntimeError as retry_err:
                 _log(logging.ERROR, f"Create deployment FAILED after retry: {retry_err}")
                 raise RuntimeError(
@@ -794,7 +825,7 @@ def deploy(
     print(f"  DSEQ: {dseq}")
     print(f"  Provider: {provider}")
     print(f"  Price: {price_amount} {price_denom}")
-    print(f"\nUse 'just-akash status {dseq}' to check deployment status")
+    print(f"\nUse 'just-akash status --dseq {dseq}' to check deployment status")
 
     return {
         "dseq": dseq,
@@ -803,6 +834,54 @@ def deploy(
         "price_denom": price_denom,
         "lease": lease_response,
     }
+
+
+def update(
+    dseq: str,
+    sdl_path: str,
+    image: str | None = None,
+    env_vars: list[str] | None = None,
+) -> dict:
+    """Update an active deployment in place with a revised SDL.
+
+    Reuses the same SDL preparation as deploy() (validation, image/SSH/env
+    overrides) then PUTs to the Console API. The DSEQ and existing lease are
+    preserved — no re-bid or new lease is created.
+    """
+    api_key = os.environ.get("AKASH_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "AKASH_API_KEY environment variable not set. "
+            "Please set your API key: export AKASH_API_KEY='your-key'"
+        )
+
+    client = AkashConsoleAPI(api_key)
+
+    _log(
+        logging.INFO,
+        f"UPDATE  dseq={dseq}  sdl={sdl_path}  image={image or '(default)'}",
+    )
+
+    # Step 1: Read + validate + transform SDL (identical to deploy).
+    _log(logging.INFO, "STEP 1: Preparing SDL")
+    sdl_content = _prepare_sdl_content(sdl_path, image=image, env_vars=env_vars)
+
+    # Step 2: Submit the in-place update.
+    _log(logging.INFO, f"STEP 2: Submitting in-place update for deployment {dseq}...")
+    try:
+        result = client.update_deployment(str(dseq), sdl_content)
+    except RuntimeError as e:
+        _log(logging.ERROR, f"Update FAILED: {e}")
+        raise RuntimeError(f"Failed to update deployment {dseq}: {e}") from e
+
+    _log(
+        logging.INFO,
+        f"Deployment {dseq} updated in place (DSEQ and lease preserved).",
+    )
+    print(f"\nDeployment {dseq} updated.")
+    print(f"Use 'just-akash status --dseq {dseq}' to verify the new revision is live.")
+
+    return {"dseq": str(dseq), "result": result}
 
 
 def deploy_main():
