@@ -505,3 +505,78 @@ class TestStreamReconnect:
             with pytest.raises(RuntimeError, match="Failed to re-authenticate stream"):
                 t.stream_logs(follow=True)
         assert mock_jwt.call_count == MAX_RECONNECT_ATTEMPTS
+
+
+# ── bounded snapshot (--duration) ────────────────────────────────────
+
+
+class TestSnapshotDuration:
+    """``duration`` bounds a stream client-side so a provider that keeps a
+    non-follow logs/events connection open (instead of closing it after the
+    tail replay) can no longer hang the client until the 300s recv timeout.
+    """
+
+    def test_duration_returns_on_a_silent_stream(self):
+        import time as _time
+
+        t = _make_transport()
+
+        class SilentWebSocket:
+            """recv() waits out its timeout then raises TimeoutError — models a
+            provider that never sends a frame and never closes the socket."""
+
+            def __init__(self):
+                self.timeouts: list = []
+                self.sent_messages: list = []
+
+            def recv(self, timeout=None):
+                self.timeouts.append(timeout)
+                if timeout:
+                    _time.sleep(min(timeout, 0.5))
+                raise TimeoutError
+
+            def send(self, data):
+                self.sent_messages.append(data)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                pass
+
+            def close(self):
+                pass
+
+        ws = SilentWebSocket()
+        with (
+            patch.object(t, "_fetch_jwt", return_value="jwt"),
+            patch("just_akash.transport.lease_shell.connect", return_value=ws),
+        ):
+            start = _time.monotonic()
+            t.stream_events(duration=0.2)  # must RETURN, not hang
+            elapsed = _time.monotonic() - start
+
+        assert elapsed < 5.0, f"duration bound failed — stream ran {elapsed:.2f}s"
+        # Every recv was bounded by the remaining window, never the 300s default.
+        assert ws.timeouts, "recv was never called"
+        assert max(ws.timeouts) <= 0.2 + 1e-6, ws.timeouts
+
+    def test_no_duration_uses_full_recv_timeout(self):
+        """Without ``duration`` the per-recv timeout stays at the 300s default
+        and the loop relies on the server closing — legacy behavior unchanged."""
+        t = _make_transport()
+        seen: list = []
+        fake_ws = FakeWebSocket([b"one", b"two"])
+        orig_recv = fake_ws.recv
+
+        def recording_recv(timeout=None):
+            seen.append(timeout)
+            return orig_recv(timeout=timeout)
+
+        fake_ws.recv = recording_recv
+        with (
+            patch.object(t, "_fetch_jwt", return_value="jwt"),
+            patch("just_akash.transport.lease_shell.connect", return_value=fake_ws),
+        ):
+            t.stream_logs(follow=True)  # closes cleanly once frames are exhausted
+        assert seen and seen[0] == 300

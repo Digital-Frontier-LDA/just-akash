@@ -22,6 +22,7 @@ import ssl
 import struct
 import sys
 import termios
+import time
 import tty
 import urllib.parse
 
@@ -788,7 +789,14 @@ class LeaseShellTransport(Transport):
             parts.append(message)
         return "  ".join(parts) if parts else text
 
-    def _stream(self, provider_url: str, scope: list[str], formatter, recv_timeout: float) -> None:
+    def _stream(
+        self,
+        provider_url: str,
+        scope: list[str],
+        formatter,
+        recv_timeout: float,
+        duration: float | None = None,
+    ) -> None:
         """Open a provider-proxy WebSocket and print each frame via ``formatter``.
 
         Runs until the server closes the stream (non-follow / snapshot) or the
@@ -798,9 +806,21 @@ class LeaseShellTransport(Transport):
         ending silently. Any other close ends the stream. Read-only: no stdin is
         sent. Callers must have already called ``_resolve_provider`` so the proxy
         URL embeds the host.
+
+        ``duration`` bounds the whole stream client-side: after that many seconds
+        (measured on a monotonic clock, across reconnects) the method returns
+        cleanly with whatever was captured. Some providers keep a non-follow logs
+        /events connection open after replaying the tail instead of closing it,
+        so without this bound a "snapshot" blocks on ``recv`` until ``recv_timeout``
+        (default 300s). ``duration`` gives a deterministic snapshot window and
+        removes the need to wrap the CLI in an external ``timeout`` (which cannot
+        flush partial output).
         """
+        deadline = (time.monotonic() + duration) if duration is not None else None
         attempts = 0
         while attempts < MAX_RECONNECT_ATTEMPTS:
+            if deadline is not None and time.monotonic() >= deadline:
+                return
             jwt = self._fetch_jwt(scope=scope)
             proxy_url = self._get_proxy_ws_url()
             connect_msg = self._build_proxy_connect_msg(provider_url, jwt)
@@ -818,8 +838,16 @@ class LeaseShellTransport(Transport):
                 ) as ws:
                     ws.send(connect_msg)
                     while True:
+                        # Bound each recv by the remaining snapshot window so we
+                        # never overshoot ``duration`` by up to ``recv_timeout``.
+                        this_timeout = recv_timeout
+                        if deadline is not None:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                return
+                            this_timeout = min(recv_timeout, remaining)
                         try:
-                            frame = self._recv_proxy_message(ws, timeout=recv_timeout)
+                            frame = self._recv_proxy_message(ws, timeout=this_timeout)
                         except ConnectionClosedOK:
                             return
                         except ConnectionClosedError as exc:
@@ -830,6 +858,8 @@ class LeaseShellTransport(Transport):
                                 break
                             return
                         except TimeoutError:
+                            if deadline is not None and time.monotonic() >= deadline:
+                                return
                             continue
                         if frame is None:
                             continue
@@ -860,25 +890,40 @@ class LeaseShellTransport(Transport):
         )
 
     def stream_logs(
-        self, follow: bool = False, tail: int = 100, service: str | None = None
+        self,
+        follow: bool = False,
+        tail: int = 100,
+        service: str | None = None,
+        duration: float | None = None,
     ) -> None:
         """Stream container logs for the lease via the provider-proxy.
 
         With ``follow=True`` the stream stays open until interrupted; otherwise
         it prints the last ``tail`` lines and returns. ``service`` filters to a
-        single service (default: all services in the lease).
+        single service (default: all services in the lease). ``duration`` bounds
+        the stream to that many seconds and returns cleanly (useful for a
+        deterministic snapshot when the provider holds a non-follow connection
+        open instead of closing it).
         """
         self._resolve_provider()
         url = self._build_logs_url(follow=follow, tail=tail, service=service)
         # Follow streams indefinitely between lines, so use a long per-recv
-        # timeout and just loop on timeout; a snapshot closes on its own.
-        self._stream(url, ["logs"], self._format_log_message, recv_timeout=300)
+        # timeout and just loop on timeout; a snapshot closes on its own (or on
+        # the ``duration`` bound if the provider keeps the connection open).
+        self._stream(url, ["logs"], self._format_log_message, recv_timeout=300, duration=duration)
 
-    def stream_events(self) -> None:
-        """Stream Kubernetes events for the lease via the provider-proxy."""
+    def stream_events(self, duration: float | None = None) -> None:
+        """Stream Kubernetes events for the lease via the provider-proxy.
+
+        ``duration`` bounds the stream to that many seconds and returns cleanly,
+        giving a deterministic events snapshot when the provider keeps the
+        connection open instead of closing it after the initial replay.
+        """
         self._resolve_provider()
         url = self._build_events_url()
-        self._stream(url, ["events"], self._format_event_message, recv_timeout=300)
+        self._stream(
+            url, ["events"], self._format_event_message, recv_timeout=300, duration=duration
+        )
 
     def validate(self) -> bool:
         leases = self._config.deployment.get("leases", [])
