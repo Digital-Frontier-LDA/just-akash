@@ -13,6 +13,9 @@ Two fixes are pinned here:
      no longer share one message.
 """
 
+import contextlib
+import logging
+
 import pytest
 
 from just_akash.transport.base import TransportConfig
@@ -60,9 +63,83 @@ def test_no_services_reported_says_not_ready_and_points_at_the_flag():
     assert "LAZILY" in msg  # names the real trap
 
 
-def test_multiple_services_names_them_instead_of_silently_guessing():
-    t = LeaseShellTransport(_cfg(services={"api": {}, "runner": {}, "redis": {}}))
-    # inference currently returns the first key; assert the *ambiguity* message
-    # surfaces when nothing can be inferred is covered above. Here we pin that
-    # _known_services() sees them all, so the message can name them.
-    assert sorted(t._known_services()) == ["api", "redis", "runner"]
+def test_multiple_services_warns_and_still_falls_back_to_the_first(caplog):
+    """Inference picks the FIRST reported service -- an arbitrary choice on a
+    multi-service deployment. That stays (removing it would break every existing
+    single-service caller) but it must not be silent: warn, name them, and point at
+    --service. Blazing's deployment has six services; "whichever is first" is a
+    footgun, not a feature."""
+    tr = LeaseShellTransport(_cfg(services={"api": {}, "runner": {}, "redis": {}}))
+    with caplog.at_level(logging.WARNING, logger="just_akash.transport.lease_shell"):
+        _, service = tr._extract_provider_info()
+
+    assert service in {"api", "runner", "redis"}  # behaviour preserved
+    warning = " ".join(r.getMessage() for r in caplog.records)
+    assert "3 services" in warning
+    assert "api, redis, runner" in warning  # names them
+    assert "--service" in warning  # points at the escape hatch
+
+
+def test_known_services_reports_every_service_the_lease_lists():
+    tr = LeaseShellTransport(_cfg(services={"api": {}, "runner": {}, "redis": {}}))
+    assert sorted(tr._known_services()) == ["api", "redis", "runner"]
+
+
+class TestServiceFlagReachesTheTransport:
+    """The flag is worthless if it is parsed but never passed down.
+
+    The whole point of this change is that TransportConfig.service_name existed but
+    nothing on the CLI could reach it, so the tool's own advice ("pass service_name")
+    was impossible to follow. Pin the wiring, for both subcommands.
+    """
+
+    @pytest.mark.parametrize("subcommand", ["exec", "connect"])
+    def test_service_flag_is_passed_into_make_transport(self, subcommand, monkeypatch):
+        import sys
+
+        import just_akash.cli as cli
+
+        captured = {}
+
+        class _FakeTransport:
+            def validate(self):
+                return True
+
+            def prepare(self):
+                return None
+
+            def exec(self, _cmd):
+                return 0
+
+            def connect(self):
+                return 0
+
+        def _fake_make_transport(_name, **kwargs):
+            captured.update(kwargs)
+            return _FakeTransport()
+
+        monkeypatch.setattr("just_akash.transport.make_transport", _fake_make_transport)
+        monkeypatch.setattr(cli, "_require_api_key", lambda: "key")
+        monkeypatch.setattr(cli, "_resolve_deployment", lambda _c, d: d or "123")
+        monkeypatch.setattr(cli, "_enrich_deployment_with_provider", lambda _c, d: d)
+
+        class _FakeClient:
+            api_key = "key"
+
+            def get_deployment(self, _dseq):
+                return {"leases": [{}]}
+
+        monkeypatch.setattr("just_akash.api.AkashConsoleAPI", lambda _k: _FakeClient())
+
+        argv = ["just-akash", subcommand, "--dseq", "123", "--service", "runner"]
+        if subcommand == "exec":
+            argv.append("echo hi")
+        monkeypatch.setattr(sys, "argv", argv)
+
+        # exec exits with the remote return code; connect may simply return.
+        with contextlib.suppress(SystemExit):
+            cli.main()
+
+        assert captured.get("service_name") == "runner", (
+            f"--service never reached make_transport for `{subcommand}`; got {captured!r}"
+        )

@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import fcntl
 import json
+import logging
 import os
 import select
 import shlex
@@ -61,6 +62,9 @@ def _is_auth_expiry(exc: ConnectionClosedError) -> bool:
         if _is_auth_expiry_message(reason):
             return True
     return _is_auth_expiry_message(str(exc))
+
+
+_logger = logging.getLogger(__name__)
 
 
 class LeaseShellTransport(Transport):
@@ -122,18 +126,27 @@ class LeaseShellTransport(Transport):
     def _extract_provider_info(self) -> tuple[str, str]:
         host_uri = self._resolve_provider()
 
-        service = self._config.service_name or self._infer_service()
+        service = self._config.service_name
         if not service:
-            # Two very different failures used to share one message, and callers
-            # could not tell them apart: "the deployment is not up yet" and "there
-            # are several services, pick one". Say which.
+            # Inference silently returns the FIRST reported service. On a
+            # multi-service deployment that is an arbitrary choice the caller never
+            # made -- ours has six, and "exec into whichever one happens to be first"
+            # is a footgun, not a feature. Keep it (removing it would break every
+            # existing single-service caller) but make it VISIBLE, and name the
+            # escape hatch. Explicit --service skips this entirely.
             known = self._known_services()
-            if known:
-                raise RuntimeError(
-                    f"Deployment {self._config.dseq} reports {len(known)} services "
-                    f"({', '.join(sorted(known))}) and no service was chosen. "
-                    "Pass --service <name> (CLI) or service_name (TransportConfig)."
+            if len(known) > 1:
+                _logger.warning(
+                    "Deployment %s reports %d services (%s); none was chosen, so "
+                    "falling back to the first one reported. Pass --service <name> "
+                    "to choose deliberately.",
+                    self._config.dseq,
+                    len(known),
+                    ", ".join(sorted(known)),
                 )
+            service = self._infer_service()
+
+        if not service:
             raise RuntimeError(
                 f"Deployment {self._config.dseq} has not reported any service in its "
                 "lease status yet, so the target container cannot be inferred. This "
