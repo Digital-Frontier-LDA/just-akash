@@ -34,6 +34,12 @@ from .base import Transport, TransportConfig
 
 MAX_RECONNECT_ATTEMPTS = 3
 
+# Seconds of total silence from the provider-proxy before an exec gives up. A
+# command can legitimately be quiet for a long time (a slow build, a sleep), so
+# this is generous; it exists to guarantee we fail with a diagnosis rather than
+# block forever.
+PROXY_RECV_TIMEOUT = 300.0
+
 _FRAME_STDOUT = 100
 _FRAME_STDERR = 101
 _FRAME_RESULT = 102
@@ -332,39 +338,144 @@ class LeaseShellTransport(Transport):
             raise RuntimeError(f"Provider error: {msg}")
         return None
 
-    def _recv_proxy_message(self, ws, timeout: float = 300) -> bytes | None:
+    @staticmethod
+    def _is_proxy_error(msg: dict) -> bool:
+        """Does this proxy envelope report a failure?
+
+        The proxy does NOT use ``type: "error"`` for errors -- it sends an ordinary
+        ``type: "websocket"`` frame carrying an ``error`` key, e.g.
+
+            {"type": "websocket", "message": "Received error from provider websocket",
+             "error": "Received error from provider websocket"}
+
+        so the presence of ``error``, not the value of ``type``, is what identifies a
+        failure. Both are accepted here: ``type: "error"`` costs nothing to keep and
+        guards against the proxy changing its mind.
+        """
+        return msg.get("type") == "error" or "error" in msg
+
+    @staticmethod
+    def _format_proxy_error(msg: dict) -> str:
+        """Render a proxy error envelope as one actionable line.
+
+        Schema rejections arrive with a Zod-style ``errors`` list whose entries name
+        the offending field (``path``) and the reason -- that detail is the whole
+        value of the frame ("auth.token: is not a valid JWT token" tells you what to
+        fix; "Invalid message format" does not), so flatten it into the message.
+        """
+        summary = str(msg.get("message") or msg.get("error") or msg)
+        error = str(msg.get("error") or "")
+        if error and error != summary:
+            summary = f"{summary} ({error})"
+
+        details = []
+        for item in msg.get("errors") or []:
+            if not isinstance(item, dict):
+                details.append(str(item))
+                continue
+            path = item.get("path")
+            where = ".".join(str(p) for p in path) if isinstance(path, list) else ""
+            what = str(item.get("message", "")).strip()
+            detail = f"{where}: {what}" if where and what else (what or where)
+            if detail:
+                details.append(detail)
+        if details:
+            summary = f"{summary} [{'; '.join(details)}]"
+        return summary
+
+    @staticmethod
+    def _decode_payload(data: str) -> bytes | None:
+        """Strictly base64-decode one relayed payload; None if it isn't decodable.
+
+        ``validate=True`` is load-bearing. The permissive default DISCARDS characters
+        outside the base64 alphabet and only then checks the length, so a plain-English
+        string decodes to garbage bytes whenever its filtered length happens to be a
+        multiple of four -- garbage that would be written straight to stdout as if the
+        provider had sent it. Strict mode rejects it instead.
+
+        Returning None rather than raising is deliberate: one corrupt frame must not
+        tear down a long-running ``logs --follow``. Callers skip it and read on. The
+        frame that MUST NOT reach here is a proxy error frame -- _recv_proxy_message
+        raises on those first, so silence here can no longer hide a failure.
+        """
+        try:
+            return base64.b64decode(data, validate=True)
+        except (ValueError, TypeError):
+            _logger.warning(
+                "Discarding an undecodable (non-base64) frame from provider-proxy: %.120r", data
+            )
+            return None
+
+    def _recv_proxy_message(self, ws, timeout: float = PROXY_RECV_TIMEOUT) -> bytes | None:
         raw = ws.recv(timeout=timeout)
         if isinstance(raw, bytes):
             return raw
-        if isinstance(raw, str):
-            try:
-                msg = json.loads(raw)
-                # A valid-JSON text frame need not be an object (could be an
-                # array / null / scalar); only objects carry the proxy envelope.
-                if not isinstance(msg, dict):
-                    return None
-                msg_type = msg.get("type", "")
-                if msg_type in ("ping", "pong"):
-                    return None
-                if msg_type == "error":
-                    raise RuntimeError(f"Proxy error: {msg.get('message', msg)}")
-                message = msg.get("message")
-                if isinstance(message, dict) and "data" in message:
-                    data = message["data"]
-                    if isinstance(data, list):
-                        return bytes(data)
-                    if isinstance(data, str):
-                        return base64.b64decode(data)
-                if isinstance(message, str):
-                    return base64.b64decode(message)
-                if isinstance(message, (bytes, bytearray)):
-                    return bytes(message)
-                if isinstance(msg.get("data"), str):
-                    return base64.b64decode(msg["data"])
-            # ValueError covers binascii.Error from malformed base64 payloads.
-            except (json.JSONDecodeError, TypeError, ValueError):
-                pass
+        if not isinstance(raw, str):
+            return None
+        try:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        # A valid-JSON text frame need not be an object (could be an array / null /
+        # scalar); only objects carry the proxy envelope.
+        if not isinstance(msg, dict):
+            return None
+        if msg.get("type") in ("ping", "pong"):
+            return None
+        # Check this BEFORE any decoding. An error frame's `message` is human-readable
+        # prose, and the decode paths below would try to base64-decode it: the caller
+        # would then either spin on a swallowed exception until recv timed out, or
+        # dispatch garbage bytes as provider output. Callers rely on this raise --
+        # _exec_loop and _stream both catch RuntimeError to drive the auth-expiry
+        # reconnect, which is unreachable unless errors actually surface here.
+        if self._is_proxy_error(msg):
+            raise RuntimeError(f"Proxy error: {self._format_proxy_error(msg)}")
+
+        message = msg.get("message")
+        if isinstance(message, dict) and "data" in message:
+            data = message["data"]
+            if isinstance(data, list):
+                return bytes(data)
+            if isinstance(data, str):
+                return self._decode_payload(data)
+        if isinstance(message, str):
+            return self._decode_payload(message)
+        if isinstance(message, (bytes, bytearray)):
+            return bytes(message)
+        if isinstance(msg.get("data"), str):
+            return self._decode_payload(msg["data"])
         return None
+
+    def _pump_frames(self, ws, exit_code: int) -> int | None:
+        """Read frames until the remote command reports its exit code.
+
+        Returns that exit code, or None to tell the caller the JWT expired and the
+        session should be re-established. Raises on any proxy or provider error.
+        """
+        timeout = self._config.recv_timeout
+        while True:
+            try:
+                frame = self._recv_proxy_message(ws, timeout=timeout)
+            except ConnectionClosedOK:
+                return exit_code
+            except ConnectionClosedError as exc:
+                if _is_auth_expiry(exc):
+                    return None
+                raise
+            except TimeoutError as exc:
+                # Without this the caller blocks in recv() and dies to whatever outer
+                # timeout the user happens to have -- with no output and no diagnosis.
+                raise RuntimeError(
+                    f"provider-proxy sent nothing for {timeout:.0f}s. The command may "
+                    "still be running on the container, or the provider may have stopped "
+                    "responding. Raise recv_timeout in TransportConfig if the command is "
+                    "expected to stay silent for longer."
+                ) from exc
+            if frame is None:
+                continue
+            result = self._dispatch_frame(frame)
+            if result is not None:
+                return result
 
     def _exec_with_refresh(self, command: str) -> int:
         return self._exec_loop(self._build_provider_shell_url(command=command))
@@ -392,20 +503,9 @@ class LeaseShellTransport(Transport):
                     ping_timeout=20,
                 ) as ws:
                     ws.send(connect_msg)
-                    while True:
-                        try:
-                            frame = self._recv_proxy_message(ws, timeout=300)
-                        except ConnectionClosedOK:
-                            return exit_code
-                        except ConnectionClosedError as exc:
-                            if _is_auth_expiry(exc):
-                                break
-                            raise
-                        if frame is None:
-                            continue
-                        result = self._dispatch_frame(frame)
-                        if result is not None:
-                            return result
+                    result = self._pump_frames(ws, exit_code)
+                    if result is not None:
+                        return result
             except RuntimeError as exc:
                 if _is_auth_expiry_message(str(exc)):
                     pass
@@ -479,20 +579,9 @@ class LeaseShellTransport(Transport):
                         )
                     )
 
-                    while True:
-                        try:
-                            frame = self._recv_proxy_message(ws, timeout=300)
-                        except ConnectionClosedOK:
-                            return exit_code
-                        except ConnectionClosedError as exc:
-                            if _is_auth_expiry(exc):
-                                break
-                            raise
-                        if frame is None:
-                            continue
-                        result = self._dispatch_frame(frame)
-                        if result is not None:
-                            return result
+                    result = self._pump_frames(ws, exit_code)
+                    if result is not None:
+                        return result
             except RuntimeError as exc:
                 if _is_auth_expiry_message(str(exc)):
                     pass
@@ -547,20 +636,9 @@ class LeaseShellTransport(Transport):
                         )
                     )
 
-                    while True:
-                        try:
-                            frame = self._recv_proxy_message(ws, timeout=300)
-                        except ConnectionClosedOK:
-                            return exit_code
-                        except ConnectionClosedError as exc:
-                            if _is_auth_expiry(exc):
-                                break
-                            raise
-                        if frame is None:
-                            continue
-                        result = self._dispatch_frame(frame)
-                        if result is not None:
-                            return result
+                    result = self._pump_frames(ws, exit_code)
+                    if result is not None:
+                        return result
             except RuntimeError as exc:
                 if _is_auth_expiry_message(str(exc)):
                     pass
