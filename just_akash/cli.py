@@ -228,6 +228,11 @@ def main():
         dest="transport",
         help="Transport to use: 'lease-shell' (default) or 'ssh'",
     )
+    connect_p.add_argument(
+        "--service",
+        default="",
+        help="Service (container) to target. Required when the deployment has several services, or when the lease has not yet reported its service status -- inference reads lease.status.services, which the Console API populates lazily, so it can be empty even after a container is demonstrably up.",
+    )
 
     # ── exec ───────────────────────────────────────────
     exec_p = subparsers.add_parser("exec", help="Execute a command on a running deployment")
@@ -239,6 +244,11 @@ def main():
         default="lease-shell",
         dest="transport",
         help="Transport to use: 'lease-shell' (default) or 'ssh'",
+    )
+    exec_p.add_argument(
+        "--service",
+        default="",
+        help="Service (container) to target. Required when the deployment has several services, or when the lease has not yet reported its service status -- inference reads lease.status.services, which the Console API populates lazily, so it can be empty even after a container is demonstrably up.",
     )
     exec_p.add_argument("remote_cmd", help="Command to execute remotely")
 
@@ -419,6 +429,7 @@ def main():
                     dseq=dseq,
                     api_key=client.api_key,
                     deployment=deployment,
+                    service_name=args.service or None,
                 )
                 if not transport.validate():
                     print(
@@ -455,6 +466,7 @@ def main():
                     dseq=dseq,
                     api_key=client.api_key,
                     deployment=deployment,
+                    service_name=args.service or None,
                 )
                 if not transport.validate():
                     print(

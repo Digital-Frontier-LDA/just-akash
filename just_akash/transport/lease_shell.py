@@ -124,9 +124,24 @@ class LeaseShellTransport(Transport):
 
         service = self._config.service_name or self._infer_service()
         if not service:
+            # Two very different failures used to share one message, and callers
+            # could not tell them apart: "the deployment is not up yet" and "there
+            # are several services, pick one". Say which.
+            known = self._known_services()
+            if known:
+                raise RuntimeError(
+                    f"Deployment {self._config.dseq} reports {len(known)} services "
+                    f"({', '.join(sorted(known))}) and no service was chosen. "
+                    "Pass --service <name> (CLI) or service_name (TransportConfig)."
+                )
             raise RuntimeError(
-                "Cannot determine service name. Pass service_name in TransportConfig "
-                "or ensure deployment has an active service in lease status."
+                f"Deployment {self._config.dseq} has not reported any service in its "
+                "lease status yet, so the target container cannot be inferred. This "
+                "usually means the deployment is still starting -- but note the "
+                "Console API populates lease.status.services LAZILY, so it can stay "
+                "empty even after a container is demonstrably running. If you know "
+                "which container you want, pass --service <name> (CLI) or "
+                "service_name (TransportConfig) to skip inference entirely."
             )
         self._service = service
         return host_uri, service
@@ -155,6 +170,16 @@ class LeaseShellTransport(Transport):
             f"Could not resolve provider hostUri for {provider_addr}. "
             "Ensure the provider is registered and the API is accessible."
         )
+
+    def _known_services(self) -> list[str]:
+        """Service names the lease currently reports (may be empty; see _infer_service)."""
+        leases = self._config.deployment.get("leases", [])
+        if not leases:
+            return []
+        lease = leases[0] if isinstance(leases, list) else {}
+        status = lease.get("status", {}) if isinstance(lease, dict) else {}
+        services = status.get("services", {}) if isinstance(status, dict) else {}
+        return list(services) if isinstance(services, dict) else []
 
     def _infer_service(self) -> str | None:
         leases = self._config.deployment.get("leases", [])
