@@ -185,19 +185,24 @@ class LeaseShellTransport(Transport):
         )
 
     def _known_services(self) -> list[str]:
-        """Service names the lease currently reports (may be empty; see _infer_service).
+        """Service names the lease currently reports (may be empty).
 
-        Deliberately tolerant: this is a DIAGNOSTIC helper, called only from the
-        failure path in _extract_provider_info to make the error message specific.
-        Raising here would replace the caller's real, actionable error ("no service
-        chosen" / "none reported yet") with a secondary exception about the shape of
-        the payload -- strictly worse for whoever is debugging. It also mirrors the
-        tolerance _infer_service already applies to the same fields, so the two
-        cannot disagree about what the lease says.
+        Called from two places in _extract_provider_info: to decide whether to warn
+        that inference is about to pick arbitrarily among several services, and to
+        shape the error when none are reported at all.
 
-        Malformed input therefore degrades to "we can name no services", and the
-        caller still raises its own precise error. Callers that need strict payload
-        validation should do it where the payload enters, not in an error handler.
+        Deliberately tolerant of a malformed payload (returns [] rather than raising),
+        for one reason: it must never disagree with _infer_service(), which walks the
+        SAME fields (leases -> lease -> status -> services) with the SAME tolerance. If
+        this raised where _infer_service() quietly returns None, the two would tell
+        different stories about what the lease says -- a worse bug than either. So a
+        malformed payload degrades exactly like an empty one: no services are known,
+        inference yields nothing, and the caller raises its own precise, actionable
+        error ("has not reported any service ... pass --service").
+
+        Strict payload validation is a reasonable thing to want, but it belongs where
+        the payload ENTERS (the API client), applied once to both readers -- not
+        bolted onto one of two functions that must stay in agreement.
         """
         leases = self._config.deployment.get("leases", [])
         if not leases:
