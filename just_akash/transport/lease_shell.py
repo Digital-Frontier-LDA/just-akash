@@ -172,7 +172,20 @@ class LeaseShellTransport(Transport):
         )
 
     def _known_services(self) -> list[str]:
-        """Service names the lease currently reports (may be empty; see _infer_service)."""
+        """Service names the lease currently reports (may be empty; see _infer_service).
+
+        Deliberately tolerant: this is a DIAGNOSTIC helper, called only from the
+        failure path in _extract_provider_info to make the error message specific.
+        Raising here would replace the caller's real, actionable error ("no service
+        chosen" / "none reported yet") with a secondary exception about the shape of
+        the payload -- strictly worse for whoever is debugging. It also mirrors the
+        tolerance _infer_service already applies to the same fields, so the two
+        cannot disagree about what the lease says.
+
+        Malformed input therefore degrades to "we can name no services", and the
+        caller still raises its own precise error. Callers that need strict payload
+        validation should do it where the payload enters, not in an error handler.
+        """
         leases = self._config.deployment.get("leases", [])
         if not leases:
             return []
