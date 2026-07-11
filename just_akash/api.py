@@ -399,10 +399,22 @@ class AkashConsoleAPI:
                   hostname-migrate, ip-migrate.
         """
         scope = scope or ["shell"]
+        # "scoped", not "full". The Console API accepts exactly two shapes at
+        # /leases -- {"access": "scoped", "scope": [...]} or {"access": "granular",
+        # "permissions": [...]} -- and rejects everything else. The old body paired
+        # access "full" with a scope and got a 400 on every call:
+        #
+        #   Additional property "scope" is not allowed at "/leases"..
+        #   "access" at "/leases" must be scoped.. "access" at "/leases" must be granular.
+        #
+        # so this fallback (taken when a lease reports no provider address, hence no
+        # provider to scope the grant to) could never have minted a token. Per AEP-64,
+        # top-level "scoped" grants the scope across the owner's leases, which is the
+        # right grant to make when we have no provider to narrow it to.
         response = self._request(
             "POST",
             "/v1/create-jwt-token",
-            {"data": {"ttl": ttl, "leases": {"access": "full", "scope": scope}}},
+            {"data": {"ttl": ttl, "leases": {"access": "scoped", "scope": scope}}},
         )
         # Response shape: { "data": { "token": "<JWT>" } }
         if not isinstance(response, dict):

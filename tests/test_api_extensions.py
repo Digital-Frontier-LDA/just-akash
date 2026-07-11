@@ -223,6 +223,42 @@ class TestJwtScope:
         assert body["data"]["leases"]["scope"] == ["logs"]
 
     @patch.object(AkashConsoleAPI, "_request")
+    def test_create_jwt_requests_scoped_access(self, mock_req):
+        """The Console API rejects any /leases access other than scoped or granular.
+
+        This body previously paired access "full" with a scope, which the API answers
+        with a 400 ('"access" at "/leases" must be scoped') on EVERY call -- so the
+        fallback could never mint a token. The old tests missed it because they mocked
+        _request and only ever asserted `scope`, never `access`: the one field that was
+        wrong was the one nothing looked at.
+        """
+        mock_req.return_value = {"data": {"token": "jwt"}}
+        client = AkashConsoleAPI("key")
+        client.create_jwt("12345")
+        leases = mock_req.call_args[0][2]["data"]["leases"]
+        assert leases["access"] == "scoped"
+        # "scoped" carries a scope and must NOT name deployments (AEP-64 rejects that).
+        assert "deployments" not in leases
+
+    @patch.object(AkashConsoleAPI, "_request")
+    def test_create_jwt_with_provider_uses_granular_scoped_permission(self, mock_req):
+        """Provider-scoped grants are granular at the top, scoped per permission.
+
+        AEP-64 forbids a scoped permission from naming deployments, so assert we do not
+        smuggle a dseq in: that would make the token invalid, not more precise.
+        """
+        mock_req.return_value = {"data": {"token": "jwt"}}
+        client = AkashConsoleAPI("key")
+        client.create_jwt_with_provider("12345", "akash1prov", scope=["shell"])
+        leases = mock_req.call_args[0][2]["data"]["leases"]
+        assert leases["access"] == "granular"
+        (perm,) = leases["permissions"]
+        assert perm["access"] == "scoped"
+        assert perm["provider"] == "akash1prov"
+        assert perm["scope"] == ["shell"]
+        assert "deployments" not in perm
+
+    @patch.object(AkashConsoleAPI, "_request")
     def test_create_jwt_with_provider_custom_scope(self, mock_req):
         mock_req.return_value = {"data": {"token": "jwt"}}
         client = AkashConsoleAPI("key")
