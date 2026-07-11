@@ -16,6 +16,7 @@ from unittest.mock import patch
 import pytest
 
 from just_akash._e2e import (
+    _destroy_succeeded,
     _reset_signal_cleanup_for_tests,
     assert_provider_in_tiers,
     classify_provider,
@@ -259,6 +260,72 @@ class TestInstallSignalCleanup:
 #
 # These pin behaviors that, if changed silently, would let deployments leak
 # (or falsely claim a leak). Each test maps to a specific gap in _e2e.py.
+
+
+class TestDestroySuccessMatchesTheRealCLI:
+    """The matcher and the CLI's actual wording must agree.
+
+    They did not. robust_destroy looked for "closed"; the CLI prints "destroyed".
+    So every successful destroy was scored a failure, two redundant destroys fired
+    against an already-closed deployment, and each E2E run printed three red FAILs
+    while the audit quietly passed. The unit tests missed it because their fixtures
+    asserted against a hand-written "Deployment 12345 closed" that the CLI has never
+    printed -- self-consistent, and wrong about reality.
+
+    So don't hand-write the output here. Run the real CLI, capture what it really
+    says, and feed THAT to the matcher.
+    """
+
+    @patch("just_akash.api._save_tags")
+    @patch("just_akash.api._load_tags", return_value={})
+    @patch("just_akash.api._resolve_dseq", return_value="12345")
+    @patch("just_akash.api._get_tag", return_value="")
+    @patch("just_akash.api.AkashConsoleAPI")
+    def test_real_cli_success_output_is_recognized(
+        self, MockAPI, mock_tag, mock_resolve, mock_load, mock_save, monkeypatch, capsys
+    ):
+        import sys
+
+        from just_akash.cli import main
+
+        monkeypatch.setenv("AKASH_API_KEY", "test-key")
+        monkeypatch.setattr("builtins.input", lambda _: "y")
+        monkeypatch.setattr(sys, "argv", ["just-akash", "destroy", "--dseq", "12345"])
+        main()
+
+        captured = capsys.readouterr()
+        assert _destroy_succeeded(_completed(0, stdout=captured.out, stderr=captured.err)), (
+            f"robust_destroy does not recognize the CLI's own success message "
+            f"({captured.out.strip()!r}). Add the new wording to "
+            f"_DESTROY_SUCCESS_WORDS -- otherwise every successful destroy is "
+            f"scored a failure and retried against an already-closed deployment."
+        )
+
+    @patch("just_akash.api._resolve_dseq", return_value="12345")
+    @patch("just_akash.api._get_tag", return_value="")
+    @patch("just_akash.api.AkashConsoleAPI")
+    def test_real_cli_cancel_output_is_not_recognized(
+        self, MockAPI, mock_tag, mock_resolve, monkeypatch, capsys
+    ):
+        """A declined confirmation exits 0 but destroys nothing -- must not pass."""
+        import sys
+
+        from just_akash.cli import main
+
+        monkeypatch.setenv("AKASH_API_KEY", "test-key")
+        monkeypatch.setattr("builtins.input", lambda _: "n")
+        monkeypatch.setattr(sys, "argv", ["just-akash", "destroy", "--dseq", "12345"])
+        main()
+
+        captured = capsys.readouterr()
+        assert not _destroy_succeeded(_completed(0, stdout=captured.out, stderr=captured.err))
+
+    def test_silent_success_is_still_not_trusted(self):
+        """Exit 0 with no output stays a failure -- that contract is deliberate."""
+        assert not _destroy_succeeded(_completed(0, stdout="", stderr=""))
+
+    def test_nonzero_exit_is_never_success(self):
+        assert not _destroy_succeeded(_completed(1, stdout="Deployment 12345 destroyed."))
 
 
 class TestRobustDestroyAdversarial:
