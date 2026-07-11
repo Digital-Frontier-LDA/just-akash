@@ -105,6 +105,14 @@ def _enrich_deployment_with_provider(client, deployment: dict) -> dict:
     return deployment
 
 
+_SERVICE_HELP = (
+    "Service (container) to target. Needed when the deployment has several "
+    "services, or when the lease has not reported its service status yet "
+    "(the Console API populates it lazily, so it can be empty even after a "
+    "container is up). Skips inference entirely."
+)
+
+
 def _make_lease_shell(client, dseq):
     """Build a validated lease-shell transport for read-only streaming.
 
@@ -231,7 +239,7 @@ def main():
     connect_p.add_argument(
         "--service",
         default="",
-        help="Service (container) to target. Required when the deployment has several services, or when the lease has not yet reported its service status -- inference reads lease.status.services, which the Console API populates lazily, so it can be empty even after a container is demonstrably up.",
+        help=_SERVICE_HELP,
     )
 
     # ── exec ───────────────────────────────────────────
@@ -248,7 +256,7 @@ def main():
     exec_p.add_argument(
         "--service",
         default="",
-        help="Service (container) to target. Required when the deployment has several services, or when the lease has not yet reported its service status -- inference reads lease.status.services, which the Console API populates lazily, so it can be empty even after a container is demonstrably up.",
+        help=_SERVICE_HELP,
     )
     exec_p.add_argument("remote_cmd", help="Command to execute remotely")
 
