@@ -246,7 +246,10 @@ class TestProviderInfoExtraction:
         )
         transport = LeaseShellTransport(config)
 
-        with pytest.raises(RuntimeError, match="Cannot determine service name"):
+        # The message deliberately changed: "cannot determine service name" conflated
+        # "the lease reports no services yet" with "there are several, pick one", and
+        # callers could not act on it. It now says which, and names the escape hatch.
+        with pytest.raises(RuntimeError, match="has not reported any service"):
             transport._extract_provider_info()
 
     def test_extract_provider_info_with_string_id_does_not_crash(self):

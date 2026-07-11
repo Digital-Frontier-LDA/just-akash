@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import fcntl
 import json
+import logging
 import os
 import select
 import shlex
@@ -61,6 +62,9 @@ def _is_auth_expiry(exc: ConnectionClosedError) -> bool:
         if _is_auth_expiry_message(reason):
             return True
     return _is_auth_expiry_message(str(exc))
+
+
+_logger = logging.getLogger(__name__)
 
 
 class LeaseShellTransport(Transport):
@@ -122,11 +126,35 @@ class LeaseShellTransport(Transport):
     def _extract_provider_info(self) -> tuple[str, str]:
         host_uri = self._resolve_provider()
 
-        service = self._config.service_name or self._infer_service()
+        service = self._config.service_name
+        if not service:
+            # Inference silently returns the FIRST reported service. On a
+            # multi-service deployment that is an arbitrary choice the caller never
+            # made -- ours has six, and "exec into whichever one happens to be first"
+            # is a footgun, not a feature. Keep it (removing it would break every
+            # existing single-service caller) but make it VISIBLE, and name the
+            # escape hatch. Explicit --service skips this entirely.
+            known = self._known_services()
+            if len(known) > 1:
+                _logger.warning(
+                    "Deployment %s reports %d services (%s); none was chosen, so "
+                    "falling back to the first one reported. Pass --service <name> "
+                    "to choose deliberately.",
+                    self._config.dseq,
+                    len(known),
+                    ", ".join(sorted(known)),
+                )
+            service = self._infer_service()
+
         if not service:
             raise RuntimeError(
-                "Cannot determine service name. Pass service_name in TransportConfig "
-                "or ensure deployment has an active service in lease status."
+                f"Deployment {self._config.dseq} has not reported any service in its "
+                "lease status yet, so the target container cannot be inferred. This "
+                "usually means the deployment is still starting -- but note the "
+                "Console API populates lease.status.services LAZILY, so it can stay "
+                "empty even after a container is demonstrably running. If you know "
+                "which container you want, pass --service <name> (CLI) or "
+                "service_name (TransportConfig) to skip inference entirely."
             )
         self._service = service
         return host_uri, service
@@ -155,6 +183,34 @@ class LeaseShellTransport(Transport):
             f"Could not resolve provider hostUri for {provider_addr}. "
             "Ensure the provider is registered and the API is accessible."
         )
+
+    def _known_services(self) -> list[str]:
+        """Service names the lease currently reports (may be empty).
+
+        Called from two places in _extract_provider_info: to decide whether to warn
+        that inference is about to pick arbitrarily among several services, and to
+        shape the error when none are reported at all.
+
+        Deliberately tolerant of a malformed payload (returns [] rather than raising),
+        for one reason: it must never disagree with _infer_service(), which walks the
+        SAME fields (leases -> lease -> status -> services) with the SAME tolerance. If
+        this raised where _infer_service() quietly returns None, the two would tell
+        different stories about what the lease says -- a worse bug than either. So a
+        malformed payload degrades exactly like an empty one: no services are known,
+        inference yields nothing, and the caller raises its own precise, actionable
+        error ("has not reported any service ... pass --service").
+
+        Strict payload validation is a reasonable thing to want, but it belongs where
+        the payload ENTERS (the API client), applied once to both readers -- not
+        bolted onto one of two functions that must stay in agreement.
+        """
+        leases = self._config.deployment.get("leases", [])
+        if not leases:
+            return []
+        lease = leases[0] if isinstance(leases, list) else {}
+        status = lease.get("status", {}) if isinstance(lease, dict) else {}
+        services = status.get("services", {}) if isinstance(status, dict) else {}
+        return list(services) if isinstance(services, dict) else []
 
     def _infer_service(self) -> str | None:
         leases = self._config.deployment.get("leases", [])
