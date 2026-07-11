@@ -593,6 +593,13 @@ class TestBuildShellPath:
 
         assert "cmd0=" not in url, f"whitespace-only command must not emit cmd params: {url}"
 
+
+# --- exec() Happy Path Tests ---
+
+
+class TestExecHappyPath:
+    """Test exec() end-to-end with mocked WebSocket."""
+
     def test_exec_happy_path_stdout_only(self):
         config = TransportConfig(
             dseq="123",

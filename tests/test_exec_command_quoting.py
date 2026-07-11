@@ -23,8 +23,17 @@ from just_akash.transport.lease_shell import LeaseShellTransport
 
 
 def _argv_from_url(url: str) -> list[str]:
-    """Recover the cmdN argv the transport actually sent."""
-    qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    """Recover the cmdN argv the transport actually sent.
+
+    keep_blank_values=True is load-bearing, not a nicety. parse_qs defaults it to
+    False, which SILENTLY DROPS any `cmdN=` carrying an empty value -- exactly the
+    thing several of these tests exist to detect. With the default, the
+    "consecutive spaces emit no empty argv" test below would pass even if the
+    transport did emit empty argv parts: the helper would simply not see them, and
+    the test would be vacuous. It also makes a legitimately empty argument (`sh -c ""`)
+    invisible.
+    """
+    qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query, keep_blank_values=True)
     parts = [(int(k[3:]), v[0]) for k, v in qs.items() if k.startswith("cmd")]
     return [v for _, v in sorted(parts)]
 
