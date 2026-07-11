@@ -124,7 +124,7 @@ class TestServiceFlagReachesTheTransport:
         monkeypatch.setattr(cli, "_enrich_deployment_with_provider", lambda _c, d: d)
 
         class _FakeClient:
-            api_key = "key"
+            api_key = "key"  # pragma: allowlist secret  (test dummy, not a credential)
 
             def get_deployment(self, _dseq):
                 return {"leases": [{}]}
