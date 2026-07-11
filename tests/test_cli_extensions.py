@@ -63,7 +63,19 @@ class TestCliLogs:
             monkeypatch,
             ["just-akash", "logs", "--dseq", "12345", "-f", "--tail", "20", "--service", "web"],
         )
-        transport.stream_logs.assert_called_once_with(follow=True, tail=20, service="web")
+        transport.stream_logs.assert_called_once_with(
+            follow=True, tail=20, service="web", duration=None
+        )
+
+    @patch("just_akash.cli._make_lease_shell")
+    @patch("just_akash.api.AkashConsoleAPI")
+    def test_logs_forwards_duration(self, MockAPI, mock_make, monkeypatch):
+        monkeypatch.setenv("AKASH_API_KEY", "k")
+        transport = mock_make.return_value
+        _run_cli(monkeypatch, ["just-akash", "logs", "--dseq", "12345", "--duration", "5"])
+        transport.stream_logs.assert_called_once_with(
+            follow=False, tail=100, service=None, duration=5.0
+        )
 
     @patch("just_akash.cli._make_lease_shell")
     @patch("just_akash.api.AkashConsoleAPI")
@@ -71,7 +83,9 @@ class TestCliLogs:
         monkeypatch.setenv("AKASH_API_KEY", "k")
         transport = mock_make.return_value
         _run_cli(monkeypatch, ["just-akash", "logs", "--dseq", "12345"])
-        transport.stream_logs.assert_called_once_with(follow=False, tail=100, service=None)
+        transport.stream_logs.assert_called_once_with(
+            follow=False, tail=100, service=None, duration=None
+        )
 
     @patch("just_akash.cli._make_lease_shell")
     @patch("just_akash.api.AkashConsoleAPI")
@@ -121,7 +135,15 @@ class TestCliEvents:
         monkeypatch.setenv("AKASH_API_KEY", "k")
         transport = mock_make.return_value
         _run_cli(monkeypatch, ["just-akash", "events", "--dseq", "12345"])
-        transport.stream_events.assert_called_once_with()
+        transport.stream_events.assert_called_once_with(duration=None)
+
+    @patch("just_akash.cli._make_lease_shell")
+    @patch("just_akash.api.AkashConsoleAPI")
+    def test_events_forwards_duration(self, MockAPI, mock_make, monkeypatch):
+        monkeypatch.setenv("AKASH_API_KEY", "k")
+        transport = mock_make.return_value
+        _run_cli(monkeypatch, ["just-akash", "events", "--dseq", "12345", "--duration", "2.5"])
+        transport.stream_events.assert_called_once_with(duration=2.5)
 
     @patch("just_akash.cli._make_lease_shell")
     @patch("just_akash.api.AkashConsoleAPI")
