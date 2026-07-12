@@ -724,10 +724,13 @@ class LeaseShellTransport(Transport):
             ws.send(connect_msg)
             self._ws = ws
             # NOTE: the initial terminal-size frame is intentionally NOT sent here.
-            # Any data frame sent before the provider has accepted the session is
-            # rejected by the proxy ("url/providerAddress Required"), which used to
-            # kill the whole session. It is sent from the IO loop once the first
-            # provider frame confirms the shell is live (see _run_io_loop).
+            # A data frame sent immediately after the connect message -- before the
+            # provider has accepted the session -- is rejected by the proxy
+            # ("url/providerAddress Required"), which used to kill the whole session.
+            # The resize is instead sent from the IO loop once the first provider
+            # frame confirms the session is live (see _run_io_loop). Stdin frames are
+            # only produced when the user types, which in practice is well after the
+            # session is up, so they aren't gated the same way.
 
             def _sigint_handler(signum, frame):
                 try:

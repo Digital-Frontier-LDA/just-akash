@@ -110,6 +110,7 @@ class TestLeaseShellConnect:
             patch("signal.signal"),
             patch("fcntl.fcntl"),
             patch("os.get_terminal_size", return_value=os.terminal_size((80, 24))),
+            patch("sys.stdout"),  # first frame is dispatched to stdout — don't pollute test output
         ):
             mock_stdin.isatty.return_value = True
             mock_stdin.fileno.return_value = 0
