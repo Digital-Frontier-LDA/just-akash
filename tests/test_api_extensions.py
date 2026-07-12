@@ -223,6 +223,22 @@ class TestJwtScope:
         assert body["data"]["leases"]["scope"] == ["logs"]
 
     @patch.object(AkashConsoleAPI, "_request")
+    def test_empty_scope_is_not_silently_widened_to_shell(self, mock_req):
+        """An explicit empty scope must pass through, not become ["shell"].
+
+        `scope or ["shell"]` treated `[]` as falsy and substituted shell -- so a
+        caller asking for no permissions would have been handed shell access. An
+        omitted scope still defaults; an explicit `[]` does not.
+        """
+        mock_req.return_value = {"data": {"token": "jwt"}}
+        client = AkashConsoleAPI("key")
+        client.create_jwt("12345", scope=[])
+        assert mock_req.call_args[0][2]["data"]["leases"]["scope"] == []
+        client.create_jwt_with_provider("12345", "akash1prov", scope=[])
+        perm = mock_req.call_args[0][2]["data"]["leases"]["permissions"][0]
+        assert perm["scope"] == []
+
+    @patch.object(AkashConsoleAPI, "_request")
     def test_create_jwt_requests_scoped_access(self, mock_req):
         """The Console API rejects any /leases access other than scoped or granular.
 

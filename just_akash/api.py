@@ -398,7 +398,13 @@ class AkashConsoleAPI:
                   get-manifest, logs, shell, events, status, restart,
                   hostname-migrate, ip-migrate.
         """
-        scope = scope or ["shell"]
+        # `is None`, not `or`: an omitted scope defaults to ["shell"], but an
+        # explicitly empty list is passed through unchanged rather than silently
+        # widened to shell. (The API rejects an empty scope anyway -- AEP-64 requires
+        # at least one -- so this surfaces the caller's mistake instead of granting a
+        # permission they did not ask for.)
+        if scope is None:
+            scope = ["shell"]
         # "scoped", not "full". The Console API accepts exactly two shapes at
         # /leases -- {"access": "scoped", "scope": [...]} or {"access": "granular",
         # "permissions": [...]} -- and rejects everything else. The old body paired
@@ -435,7 +441,13 @@ class AkashConsoleAPI:
         provider operations the token authorizes (defaults to ["shell"]; pass
         ["logs"] or ["events"] for streaming).
         """
-        scope = scope or ["shell"]
+        # `is None`, not `or`: an omitted scope defaults to ["shell"], but an
+        # explicitly empty list is passed through unchanged rather than silently
+        # widened to shell. (The API rejects an empty scope anyway -- AEP-64 requires
+        # at least one -- so this surfaces the caller's mistake instead of granting a
+        # permission they did not ask for.)
+        if scope is None:
+            scope = ["shell"]
         response = self._request(
             "POST",
             "/v1/create-jwt-token",
