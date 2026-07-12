@@ -677,8 +677,8 @@ class TestBuildShellPath:
         url = transport._build_provider_shell_url(command=None, tty=True, stdin=True)
         assert "cmd0=" not in url
         assert "cmd1=" not in url
-        assert "tty=true" in url
-        assert "stdin=true" in url
+        assert "tty=1" in url
+        assert "stdin=1" in url
 
     def test_build_shell_path_empty_command_sends_no_cmd_params(self):
         """An empty command must send NO cmd params at all.

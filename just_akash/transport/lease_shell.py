@@ -11,6 +11,7 @@ Protocol reference: docs/PROTOCOL.md
 from __future__ import annotations
 
 import base64
+import contextlib
 import fcntl
 import json
 import logging
@@ -239,8 +240,15 @@ class LeaseShellTransport(Transport):
         qs_parts = [
             "podIndex=0",
             f"service={urllib.parse.quote(self._service or '', safe='')}",
-            f"tty={'true' if tty else 'false'}",
-            f"stdin={'true' if stdin else 'false'}",
+            # The provider parses these as "1"/"0", NOT "true"/"false": it checks for
+            # the literal "1", so "true" reads as OFF. Sending "true" meant tty=1
+            # requests never got a PTY (`tty` reports "not a tty") and stdin=1 never
+            # opened an input stream -- which is why interactive `connect` couldn't
+            # allocate a terminal or receive typed input. Confirmed against both a
+            # df provider and an upstream v0.14.2 provider: tty=1 yields /dev/pts/0,
+            # tty=true yields "not a tty".
+            f"tty={'1' if tty else '0'}",
+            f"stdin={'1' if stdin else '0'}",
         ]
         if command is not None:
             # shlex.split, not command.split(" ").
@@ -277,8 +285,9 @@ class LeaseShellTransport(Transport):
         qs_parts = [
             "podIndex=0",
             f"service={urllib.parse.quote(self._service or '', safe='')}",
-            f"tty={'true' if tty else 'false'}",
-            f"stdin={'true' if stdin else 'false'}",
+            # "1"/"0", not "true"/"false" -- see _build_provider_shell_url.
+            f"tty={'1' if tty else '0'}",
+            f"stdin={'1' if stdin else '0'}",
             "cmd0=sh",
             "cmd1=-c",
             f"cmd2={urllib.parse.quote(shell_command, safe='')}",
@@ -733,19 +742,9 @@ class LeaseShellTransport(Transport):
             # session is up, so they aren't gated the same way.
 
             def _sigint_handler(signum, frame):
-                try:
-                    stdin_frame = bytes([_FRAME_STDIN, 0x03])
-                    ws.send(
-                        json.dumps(
-                            {
-                                "type": "websocket",
-                                "data": base64.b64encode(stdin_frame).decode("ascii"),
-                                "isBase64": True,
-                            }
-                        )
-                    )
-                except Exception:  # noqa: S110 best-effort send inside SIGINT handler; logging is unsafe here
-                    pass
+                # best-effort Ctrl-C forward; logging is unsafe inside a signal handler
+                with contextlib.suppress(Exception):
+                    ws.send(self._proxy_frame_msg(shell_path, jwt, bytes([_FRAME_STDIN, 0x03])))
 
             try:
                 _initial_size = os.get_terminal_size()
@@ -758,7 +757,7 @@ class LeaseShellTransport(Transport):
                     new_size = os.get_terminal_size()
                 except OSError:
                     new_size = _last_size[0]
-                if new_size is not None and self._send_resize(ws, new_size):
+                if new_size is not None and self._send_resize(ws, shell_path, jwt, new_size):
                     _last_size[0] = new_size
 
             original_sigint = signal.signal(signal.SIGINT, _sigint_handler)
@@ -769,32 +768,44 @@ class LeaseShellTransport(Transport):
             fcntl.fcntl(fd_stdin, fcntl.F_SETFL, orig_flags | os.O_NONBLOCK)
 
             try:
-                self._run_io_loop(ws)
+                self._run_io_loop(ws, shell_path, jwt)
             finally:
                 fcntl.fcntl(fd_stdin, fcntl.F_SETFL, orig_flags)
                 signal.signal(signal.SIGINT, original_sigint)
                 signal.signal(signal.SIGWINCH, original_sigwinch)
                 self._ws = None
 
-    @staticmethod
-    def _send_resize(ws, size) -> bool:
+    def _proxy_frame_msg(self, url: str, jwt: str, frame_bytes: bytes) -> str:
+        """Wrap raw frame bytes (stdin/resize/etc) in a proxy message.
+
+        Every message sent to the provider-proxy -- not just the initial connect --
+        must carry the full envelope (url + providerAddress + auth). A bare
+        ``{type, data, isBase64}`` frame is rejected with "url/providerAddress
+        Required", so stdin keystrokes and resize frames sent that way never reached
+        the shell. This is what made interactive `connect` unusable even after the
+        session was live.
+        """
+        return json.dumps(
+            {
+                "type": "websocket",
+                "url": url,
+                "providerAddress": self._provider_address,
+                "auth": {"type": "jwt", "token": jwt},
+                "isBase64": True,
+                "data": base64.b64encode(frame_bytes).decode("ascii"),
+            }
+        )
+
+    def _send_resize(self, ws, url: str, jwt: str, size) -> bool:
         """Send one terminal-size frame. Returns False if it couldn't be sent."""
         try:
             frame = bytes([_FRAME_RESIZE]) + struct.pack(">HH", size.lines, size.columns)
-            ws.send(
-                json.dumps(
-                    {
-                        "type": "websocket",
-                        "data": base64.b64encode(frame).decode("ascii"),
-                        "isBase64": True,
-                    }
-                )
-            )
+            ws.send(self._proxy_frame_msg(url, jwt, frame))
             return True
         except Exception:  # noqa: BLE001,S110 best-effort resize; a failure just leaves the default size
             return False
 
-    def _run_io_loop(self, ws) -> None:
+    def _run_io_loop(self, ws, url: str, jwt: str) -> None:
         fd_stdin = sys.stdin.fileno()
         sized = False  # send the initial resize only once the session is confirmed live
 
@@ -806,15 +817,7 @@ class LeaseShellTransport(Transport):
                     chunk = os.read(fd_stdin, 4096)
                     if chunk:
                         stdin_frame = bytes([_FRAME_STDIN]) + chunk
-                        ws.send(
-                            json.dumps(
-                                {
-                                    "type": "websocket",
-                                    "data": base64.b64encode(stdin_frame).decode("ascii"),
-                                    "isBase64": True,
-                                }
-                            )
-                        )
+                        ws.send(self._proxy_frame_msg(url, jwt, stdin_frame))
                 except (OSError, BlockingIOError):
                     pass
 
@@ -830,7 +833,7 @@ class LeaseShellTransport(Transport):
                         except OSError:
                             _sz = None
                         if _sz is not None:
-                            self._send_resize(ws, _sz)
+                            self._send_resize(ws, url, jwt, _sz)
                     code = frame[0]
                     payload = frame[1:]
                     if code == _FRAME_STDOUT:

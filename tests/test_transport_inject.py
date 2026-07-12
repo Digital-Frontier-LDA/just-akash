@@ -73,7 +73,7 @@ class TestExecWithStdin:
         assert len(fake_ws.sent_messages) == 2
 
         connect_msg = json.loads(fake_ws.sent_messages[0])
-        assert "stdin=true" in connect_msg["url"]
+        assert "stdin=1" in connect_msg["url"]
 
         stdin_msg = json.loads(fake_ws.sent_messages[1])
         assert stdin_msg["type"] == "websocket"

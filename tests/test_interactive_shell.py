@@ -86,8 +86,9 @@ class TestLeaseShellConnect:
             first_send = ws_instance.send.call_args_list[0].args[0]
             connect_msg = json.loads(first_send)
             provider_url = connect_msg["url"]
-            assert "tty=true" in provider_url
-            assert "stdin=true" in provider_url
+            # "1"/"0", not "true"/"false" — the provider only honors the literal "1".
+            assert "tty=1" in provider_url
+            assert "stdin=1" in provider_url
             # The interactive request must carry a shell command — a shell request
             # with no cmd is rejected by the provider ("Received error from provider
             # websocket"). We exec an interactive /bin/sh.
@@ -162,11 +163,24 @@ class TestLeaseShellConnect:
             mock_ws.return_value.__exit__.return_value = False
             with pytest.raises(RuntimeError):
                 t.connect()
-            sent_frames = _decode_proxy_send(ws_instance.send.call_args_list)
+            sends = ws_instance.send.call_args_list
+            sent_frames = _decode_proxy_send(sends)
             stdin_frames = [f for f in sent_frames if f[0] == 104]
             assert any(f[1:] == stdin_data for f in stdin_frames), (
                 f"Expected frame 104 + b'hello'; got: {[f.hex() for f in stdin_frames]}"
             )
+            # The stdin message must carry the full connect envelope, not a data-only
+            # frame — the proxy rejects bare {type,data,isBase64} with
+            # "url/providerAddress Required", so keystrokes never reach the shell.
+            stdin_msg = next(
+                json.loads(c.args[0])
+                for c in sends
+                if json.loads(c.args[0]).get("data")
+                and base64.b64decode(json.loads(c.args[0])["data"])[:1] == bytes([104])
+            )
+            assert "url" in stdin_msg
+            assert "providerAddress" in stdin_msg
+            assert stdin_msg.get("auth", {}).get("type") == "jwt"
 
     def test_connect_dispatches_frame_100_to_stdout(self):
         t = _make_transport()
@@ -423,4 +437,4 @@ class TestLeaseShellConnect:
             patch("os.read", return_value=b""),
         ):
             mock_stdin.fileno.return_value = 0
-            t._run_io_loop(ws)
+            t._run_io_loop(ws, "https://p/lease/1/1/1/shell?tty=1", "jwt")
