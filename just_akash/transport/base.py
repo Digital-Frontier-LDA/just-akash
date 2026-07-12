@@ -22,6 +22,10 @@ class TransportConfig:
     provider_proxy_url: str = "https://console.akash.network/provider-proxy-mainnet"
     service_name: str | None = None
     ssh_key_path: str | None = None
+    # Seconds of silence from the provider-proxy before an exec fails with a
+    # diagnosis instead of blocking. Raise it for commands expected to stay quiet
+    # for a long time.
+    recv_timeout: float = 300.0
 
 
 class Transport(ABC):
