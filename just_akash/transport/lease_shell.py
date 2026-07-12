@@ -422,8 +422,12 @@ class LeaseShellTransport(Transport):
         try:
             return base64.b64decode(data, validate=True)
         except (ValueError, TypeError):
+            # Log only the length, not the payload: an undecodable frame is unexpected
+            # data of unknown provenance, and echoing it into logs risks leaking
+            # whatever it happens to contain. The size is enough to flag the anomaly.
             _logger.warning(
-                "Discarding an undecodable (non-base64) frame from provider-proxy: %.120r", data
+                "Discarding an undecodable (non-base64) frame from provider-proxy (%d chars)",
+                len(data),
             )
             return None
 
@@ -487,7 +491,7 @@ class LeaseShellTransport(Transport):
                 # Without this the caller blocks in recv() and dies to whatever outer
                 # timeout the user happens to have -- with no output and no diagnosis.
                 raise RuntimeError(
-                    f"provider-proxy sent nothing for {timeout:.0f}s. The command may "
+                    f"provider-proxy sent nothing for {timeout:g}s. The command may "
                     "still be running on the container, or the provider may have stopped "
                     "responding. Raise recv_timeout in TransportConfig if the command is "
                     "expected to stay silent for longer."
