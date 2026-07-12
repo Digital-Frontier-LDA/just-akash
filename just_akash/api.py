@@ -390,7 +390,12 @@ class AkashConsoleAPI:
         Returns the JWT string. Raises RuntimeError on HTTP error.
 
         Args:
-            dseq: Deployment sequence number (string).
+            dseq: Deployment sequence number. NOTE: currently unused in the request
+                  body — a top-level ``scoped`` grant is not deployment-scoped (it
+                  applies across the owner's leases), and AEP-64 forbids naming a
+                  deployment on a scoped grant. Kept in the signature for call-site
+                  compatibility and possible future granular use; do not assume the
+                  minted token is bound to this dseq.
             ttl:  Requested TTL in seconds (server default is 30s; request 3600 and
                   fall back to reconnect if server caps it — see LSHL-03 in Phase 7).
             scope: Permission scopes to request (e.g. ["shell"], ["logs"],
@@ -439,7 +444,10 @@ class AkashConsoleAPI:
 
         Uses granular access with scoped permissions. ``scope`` selects which
         provider operations the token authorizes (defaults to ["shell"]; pass
-        ["logs"] or ["events"] for streaming).
+        ["logs"] or ["events"] for streaming). The token is scoped to ``provider``,
+        NOT to a deployment: ``dseq`` is currently unused in the request body (a
+        scoped permission cannot name a deployment under AEP-64) and is kept only
+        for call-site compatibility — do not assume the token is bound to this dseq.
         """
         # `is None`, not `or`: an omitted scope defaults to ["shell"], but an
         # explicitly empty list is passed through unchanged rather than silently
