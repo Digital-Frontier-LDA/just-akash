@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.8.0] — 2026-07-12
+
+### Added
+- **Provider capability smoke test** — `just smoke-providers` (`python -m just_akash.smoke_providers`, PR #29). Deploys a throwaway probe to each configured provider and exercises every provider-facing feature — deploy, status, exec, inject, logs, events, SSH transport (exec/inject over `--transport ssh`), interactive `connect` (over SSH), HTTP ingress reachability, and in-place `update` — then destroys it and prints a provider × feature pass/fail matrix, exiting non-zero if any provider fails any feature. Catches a provider that bids and runs containers fine but has a broken shell/logs/exec/ingress path (the class of outage a normal rental never exercises). Defaults to the preferred tier (`AKASH_PROVIDERS`); `--all` adds the backup tier; `--provider` targets specific ones. Cleanup is guaranteed on Ctrl-C via the shared `robust_destroy` + signal handler.
+- **`--service` for `exec` / `connect`** (PR #25): target a specific container on a multi-service deployment instead of silently exec-ing into whichever service the lease reports first (a warning is now logged when inference picks arbitrarily). Also stops conflating "lease not ready yet" with "ambiguous service" in the error path.
+- **`--duration` for `logs` / `events`** (PR #24): a bounded, non-hanging snapshot — stream for N seconds then return cleanly, so a provider that keeps a non-follow logs/events connection open no longer blocks until the 300s recv timeout. Non-finite values (`nan`/`inf`) are rejected so the bound can't be silently disabled.
+
+### Fixed
+- **Interactive `connect` over lease-shell now works** (PRs #30, #31) — three client-side bugs kept the interactive shell from functioning, all fixed and verified end-to-end against a live provider:
+  1. the shell request carried **no command**, which the provider rejects outright — it now execs an interactive `/bin/sh -i`;
+  2. the `tty`/`stdin` query params were sent as `"true"/"false"`, but the provider only honors `"1"/"0"`, so a PTY was never allocated (`tty` reported "not a tty") and stdin was never opened — now sent as `"1"/"0"`;
+  3. every frame sent **after** the connect message (stdin keystrokes, resize, Ctrl-C) used a bare `{type,data,isBase64}` envelope that the proxy rejects with "url/providerAddress Required", so keystrokes never reached the shell — they now carry the full connect envelope (url + providerAddress + auth). The unused `exec-with-stdin` helpers were made consistent with the same fix.
+- **Lease-shell `exec` / `logs` no longer hang on a provider-side error** (PR #27): the Console provider-proxy reports failures as `type: "websocket"` frames carrying an `error` key (not `type: "error"`), which were being swallowed — so a command the provider rejected blocked for the full 300s recv timeout instead of failing. Error frames are now surfaced with the provider's message (Zod-style field detail included), a strict base64 decode stops an undecodable frame from being dispatched as output, and the recv is bounded with a clear diagnosis. Configurable via `TransportConfig.recv_timeout`.
+- **`create_jwt` requested an access level the Console API rejects** (PR #28): the no-provider JWT fallback sent `access: "full"` with a `scope`, which the API answers with a 400 on every call — so it could never mint a token. It now sends `access: "scoped"` per AEP-64. (Found while diagnosing the hang above.)
+- **`exec` shredded quoted commands** (PR #26): the remote command was split on spaces, so any `sh -c "…"` wrapper (i.e. anything running more than one thing) was broken apart and failed with an unterminated-quoted-string error. It is now parsed with `shlex`.
+- **e2e cleanup no longer misreports a successful `destroy` as a failure** (PR #27): the check looked for the word "closed" in `just destroy` output, but the CLI prints "destroyed" — so every successful destroy was scored a failure and two redundant destroy calls fired against an already-closed deployment. The matcher is now pinned to the CLI's actual output by a test that drives the real command.
+- Tests: full suite at 848 passing (up from 779).
+
+---
+
 ## [1.7.0] — 2026-06-22
 
 ### Added
