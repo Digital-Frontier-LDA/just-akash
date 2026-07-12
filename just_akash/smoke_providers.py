@@ -544,7 +544,11 @@ def main() -> int:
     rows: dict = {}
     try:
         for provider in providers:
-            rows[provider] = smoke_provider(provider, sdl_path, key_path)
+            try:
+                rows[provider] = smoke_provider(provider, sdl_path, key_path)
+            except Exception as e:  # noqa: BLE001 — one provider's hard error must not abort the run
+                print(f"  {RED}{provider} aborted: {type(e).__name__}: {e}{RESET}")
+                rows[provider] = dict.fromkeys(FEATURES, "FAIL")
     finally:
         os.unlink(sdl_path)
         # Remove the ephemeral keypair — the unencrypted private key must not be
