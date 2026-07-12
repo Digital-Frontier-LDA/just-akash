@@ -89,3 +89,83 @@ class TestStreamCheck:
     def test_stream_passes_on_clean_bounded_return(self):
         with patch.object(sp, "_run", return_value=_completed(returncode=0)):
             assert sp._check_stream("1", "events") is True
+
+
+class TestSshInfo:
+    def test_returns_host_port_when_forwarded(self):
+        with patch.object(
+            sp, "_status_json", return_value={"ssh_host": "p.example", "ssh_port": 30699}
+        ):
+            assert sp._ssh_info("1") == ("p.example", 30699)
+
+    def test_none_when_no_forwarded_ssh_port(self):
+        with patch.object(sp, "_status_json", return_value={"status": "ready"}):
+            assert sp._ssh_info("1") is None
+
+
+class TestIngressUri:
+    def test_extracts_first_service_uri(self):
+        dep = {"leases": [{"status": {"services": {"probe": {"uris": ["abc.ingress.example"]}}}}]}
+        with patch.object(sp, "_api") as api:
+            api.return_value.get_deployment.return_value = dep
+            assert sp._ingress_uri("1") == "abc.ingress.example"
+
+    def test_none_when_no_uris(self):
+        with patch.object(sp, "_api") as api:
+            api.return_value.get_deployment.return_value = {"leases": [{"status": {}}]}
+            assert sp._ingress_uri("1") is None
+
+
+class TestSshCheck:
+    def test_ssh_fails_when_exec_has_no_output(self):
+        with patch.object(sp, "_run", return_value=_completed(stdout="", returncode=0)):
+            assert sp._check_ssh("123456", "/k") is False
+
+    def test_ssh_passes_when_exec_and_inject_succeed(self):
+        # first call: ssh exec (SSH_OK); then inject + readback inside _inject_and_read
+        outs = [
+            _completed(stdout="SSH_OK\n"),  # exec
+            _completed(returncode=0),  # inject
+            _completed(stdout="SMOKE_SECRET=injected_ok\n"),  # readback
+        ]
+        with patch.object(sp, "_run", side_effect=outs):
+            assert sp._check_ssh("123456", "/k") is True
+
+
+class TestConnectCheck:
+    def test_connect_passes_when_marker_echoed(self):
+        done = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="CONNECT_123456\n", stderr=""
+        )
+        with patch.object(sp.subprocess, "run", return_value=done):
+            assert sp._check_connect("123456", "/k") is True
+
+    def test_connect_fails_on_timeout(self):
+        with patch.object(sp.subprocess, "run", side_effect=subprocess.TimeoutExpired("c", 1)):
+            assert sp._check_connect("123456", "/k") is False
+
+
+class TestIngressCheck:
+    def test_ingress_passes_when_baseline_served(self):
+        with patch.object(sp, "_fetch", return_value=sp.INGRESS_BASELINE):
+            assert sp._check_ingress("1", "uri") is True
+
+    def test_ingress_fails_when_never_served(self):
+        with (
+            patch.object(sp, "_fetch", side_effect=OSError("refused")),
+            patch.object(sp.time, "sleep"),
+        ):
+            assert sp._check_ingress("1", "uri") is False
+
+
+class TestUpdateCheck:
+    def test_update_fails_if_command_errors(self):
+        with patch.object(sp, "_run", return_value=_completed(returncode=1)):
+            assert sp._check_update("123456", "/sdl", "uri") is False
+
+    def test_update_passes_when_new_marker_appears_at_ingress(self):
+        with (
+            patch.object(sp, "_run", return_value=_completed(returncode=0)),
+            patch.object(sp, "_fetch", return_value="probe-updated-123456"),
+        ):
+            assert sp._check_update("123456", "/sdl", "uri") is True
