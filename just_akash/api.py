@@ -390,7 +390,12 @@ class AkashConsoleAPI:
         Returns the JWT string. Raises RuntimeError on HTTP error.
 
         Args:
-            dseq: Deployment sequence number (string).
+            dseq: Deployment sequence number. NOTE: currently unused in the request
+                  body — a top-level ``scoped`` grant is not deployment-scoped (it
+                  applies across the owner's leases), and AEP-64 forbids naming a
+                  deployment on a scoped grant. Kept in the signature for call-site
+                  compatibility and possible future granular use; do not assume the
+                  minted token is bound to this dseq.
             ttl:  Requested TTL in seconds (server default is 30s; request 3600 and
                   fall back to reconnect if server caps it — see LSHL-03 in Phase 7).
             scope: Permission scopes to request (e.g. ["shell"], ["logs"],
@@ -398,11 +403,29 @@ class AkashConsoleAPI:
                   get-manifest, logs, shell, events, status, restart,
                   hostname-migrate, ip-migrate.
         """
-        scope = scope or ["shell"]
+        # `is None`, not `or`: an omitted scope defaults to ["shell"], but an
+        # explicitly empty list is passed through unchanged rather than silently
+        # widened to shell. (The API rejects an empty scope anyway -- AEP-64 requires
+        # at least one -- so this surfaces the caller's mistake instead of granting a
+        # permission they did not ask for.)
+        if scope is None:
+            scope = ["shell"]
+        # "scoped", not "full". The Console API accepts exactly two shapes at
+        # /leases -- {"access": "scoped", "scope": [...]} or {"access": "granular",
+        # "permissions": [...]} -- and rejects everything else. The old body paired
+        # access "full" with a scope and got a 400 on every call:
+        #
+        #   Additional property "scope" is not allowed at "/leases"..
+        #   "access" at "/leases" must be scoped.. "access" at "/leases" must be granular.
+        #
+        # so this fallback (taken when a lease reports no provider address, hence no
+        # provider to scope the grant to) could never have minted a token. Per AEP-64,
+        # top-level "scoped" grants the scope across the owner's leases, which is the
+        # right grant to make when we have no provider to narrow it to.
         response = self._request(
             "POST",
             "/v1/create-jwt-token",
-            {"data": {"ttl": ttl, "leases": {"access": "full", "scope": scope}}},
+            {"data": {"ttl": ttl, "leases": {"access": "scoped", "scope": scope}}},
         )
         # Response shape: { "data": { "token": "<JWT>" } }
         if not isinstance(response, dict):
@@ -421,9 +444,18 @@ class AkashConsoleAPI:
 
         Uses granular access with scoped permissions. ``scope`` selects which
         provider operations the token authorizes (defaults to ["shell"]; pass
-        ["logs"] or ["events"] for streaming).
+        ["logs"] or ["events"] for streaming). The token is scoped to ``provider``,
+        NOT to a deployment: ``dseq`` is currently unused in the request body (a
+        scoped permission cannot name a deployment under AEP-64) and is kept only
+        for call-site compatibility — do not assume the token is bound to this dseq.
         """
-        scope = scope or ["shell"]
+        # `is None`, not `or`: an omitted scope defaults to ["shell"], but an
+        # explicitly empty list is passed through unchanged rather than silently
+        # widened to shell. (The API rejects an empty scope anyway -- AEP-64 requires
+        # at least one -- so this surfaces the caller's mistake instead of granting a
+        # permission they did not ask for.)
+        if scope is None:
+            scope = ["shell"]
         response = self._request(
             "POST",
             "/v1/create-jwt-token",
@@ -757,7 +789,9 @@ def api_main():
     api_key = os.environ.get("AKASH_API_KEY")
     if not api_key:
         print("Error: AKASH_API_KEY environment variable not set.")
-        print("Please set your API key: export AKASH_API_KEY='your-key'")
+        print(
+            "Please set your API key: export AKASH_API_KEY='your-key'"  # pragma: allowlist secret
+        )
         sys.exit(1)
 
     client = AkashConsoleAPI(api_key)
