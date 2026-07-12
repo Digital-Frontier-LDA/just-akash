@@ -605,15 +605,7 @@ class LeaseShellTransport(Transport):
                     ws.send(connect_msg)
 
                     stdin_frame = bytes([_FRAME_STDIN]) + stdin_data
-                    ws.send(
-                        json.dumps(
-                            {
-                                "type": "websocket",
-                                "data": base64.b64encode(stdin_frame).decode("ascii"),
-                                "isBase64": True,
-                            }
-                        )
-                    )
+                    ws.send(self._proxy_frame_msg(shell_url, jwt, stdin_frame))
 
                     result = self._pump_frames(ws, exit_code)
                     if result is not None:
@@ -652,25 +644,11 @@ class LeaseShellTransport(Transport):
                     ws.send(connect_msg)
                     time.sleep(0.5)
 
-                    stdin_frame = bytes([_FRAME_STDIN]) + stdin_data
-                    ws.send(
-                        json.dumps(
-                            {
-                                "type": "websocket",
-                                "data": base64.b64encode(stdin_frame).decode("ascii"),
-                                "isBase64": True,
-                            }
-                        )
-                    )
-                    ws.send(
-                        json.dumps(
-                            {
-                                "type": "websocket",
-                                "data": base64.b64encode(bytes([_FRAME_STDIN])).decode("ascii"),
-                                "isBase64": True,
-                            }
-                        )
-                    )
+                    # Full envelope on every post-connect frame (see _proxy_frame_msg):
+                    # the data frame + the EOF/close frame.
+                    data_frame = bytes([_FRAME_STDIN]) + stdin_data
+                    ws.send(self._proxy_frame_msg(shell_url, jwt, data_frame))
+                    ws.send(self._proxy_frame_msg(shell_url, jwt, bytes([_FRAME_STDIN])))
 
                     result = self._pump_frames(ws, exit_code)
                     if result is not None:
