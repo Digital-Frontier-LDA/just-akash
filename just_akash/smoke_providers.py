@@ -248,9 +248,12 @@ def _ingress_uri(dseq: str) -> str | None:
 
 
 def _fetch(uri: str, timeout: int = 10) -> str:
-    with urllib.request.urlopen(
-        f"http://{uri}/", timeout=timeout
-    ) as r:  # plain-http ingress endpoint
+    # `uri` is the provider-assigned ingress hostname from lease status; require it to
+    # be a bare host[:port] so a surprising value can't smuggle a scheme or path into
+    # the fetched URL. The scheme is hard-coded http://, so file:// is unreachable.
+    if not re.fullmatch(r"[A-Za-z0-9.\-:]+", uri):
+        raise ValueError(f"unexpected ingress host: {uri!r}")
+    with urllib.request.urlopen(f"http://{uri}/", timeout=timeout) as r:  # plain-http ingress
         return r.read().decode("utf-8", "replace")
 
 
@@ -372,7 +375,7 @@ def _check_connect(dseq: str, key: str) -> bool:
         )
     except subprocess.TimeoutExpired:
         return False
-    return marker in (r.stdout or "")
+    return r.returncode == 0 and marker in (r.stdout or "")
 
 
 def _check_ingress(dseq: str, uri: str) -> bool:
@@ -479,6 +482,9 @@ def smoke_provider(provider: str, sdl_path: str, key: str) -> dict:
         if dseq_ref["dseq"]:
             print(f"  cleanup: destroying {dseq_ref['dseq']}...")
             robust_destroy(dseq_ref["dseq"])
+            # Clear the ref so a later Ctrl-C's signal handler skips this already-
+            # destroyed deployment instead of re-issuing destroy against it.
+            dseq_ref["dseq"] = None
 
 
 def _print_matrix(rows: dict) -> None:
@@ -501,13 +507,19 @@ def _generate_keypair() -> str:
     (which deploy substitutes into the SDL), and return the private key path."""
     key_dir = tempfile.mkdtemp(prefix="smoke-ssh-")
     key_path = os.path.join(key_dir, "id_ed25519")
-    subprocess.run(
-        ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", key_path, "-C", "smoke-probe"],
-        check=True,
-        capture_output=True,
-    )
-    with open(f"{key_path}.pub") as f:
-        os.environ["SSH_PUBKEY"] = f.read().strip()
+    try:
+        subprocess.run(
+            ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", key_path, "-C", "smoke-probe"],
+            check=True,
+            capture_output=True,
+        )
+        with open(f"{key_path}.pub") as f:
+            os.environ["SSH_PUBKEY"] = f.read().strip()
+    except Exception:
+        # Don't leave a half-generated (unencrypted) private key on disk if keygen
+        # or the pubkey read fails partway.
+        shutil.rmtree(key_dir, ignore_errors=True)
+        raise
     return key_path
 
 

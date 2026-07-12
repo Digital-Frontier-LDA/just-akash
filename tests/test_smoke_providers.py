@@ -144,6 +144,14 @@ class TestConnectCheck:
         with patch.object(sp.subprocess, "run", side_effect=subprocess.TimeoutExpired("c", 1)):
             assert sp._check_connect("123456", "/k") is False
 
+    def test_connect_fails_when_session_errored_despite_marker(self):
+        # Marker echoed but the session exited non-zero — must not count as PASS.
+        done = subprocess.CompletedProcess(
+            args=[], returncode=255, stdout="CONNECT_123456\n", stderr="broken pipe"
+        )
+        with patch.object(sp.subprocess, "run", return_value=done):
+            assert sp._check_connect("123456", "/k") is False
+
 
 class TestIngressCheck:
     def test_ingress_passes_when_baseline_served(self):
