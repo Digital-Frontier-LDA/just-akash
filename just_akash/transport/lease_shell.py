@@ -698,9 +698,17 @@ class LeaseShellTransport(Transport):
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, original_settings)
 
+    # Command run for an interactive `connect`. The provider needs an explicit
+    # program to exec into the tty -- a shell request with no cmd is rejected
+    # outright ("Received error from provider websocket"). `-i` keeps the shell
+    # alive across the session instead of exiting on its first read.
+    _INTERACTIVE_SHELL = "/bin/sh -i"
+
     def _run_interactive_session(self) -> None:
         jwt = self._fetch_jwt()
-        shell_path = self._build_provider_shell_url(tty=True, stdin=True)
+        shell_path = self._build_provider_shell_url(
+            command=self._INTERACTIVE_SHELL, tty=True, stdin=True
+        )
         proxy_url = self._get_proxy_ws_url()
         connect_msg = self._build_proxy_connect_msg(shell_path, jwt)
         ssl_ctx = ssl.create_default_context()
@@ -715,23 +723,14 @@ class LeaseShellTransport(Transport):
         ) as ws:
             ws.send(connect_msg)
             self._ws = ws
-
-            try:
-                size = os.get_terminal_size()
-                resize_frame = bytes([_FRAME_RESIZE]) + struct.pack(
-                    ">HH", size.lines, size.columns
-                )
-                ws.send(
-                    json.dumps(
-                        {
-                            "type": "websocket",
-                            "data": base64.b64encode(resize_frame).decode("ascii"),
-                            "isBase64": True,
-                        }
-                    )
-                )
-            except OSError:
-                pass
+            # NOTE: the initial terminal-size frame is intentionally NOT sent here.
+            # A data frame sent immediately after the connect message -- before the
+            # provider has accepted the session -- is rejected by the proxy
+            # ("url/providerAddress Required"), which used to kill the whole session.
+            # The resize is instead sent from the IO loop once the first provider
+            # frame confirms the session is live (see _run_io_loop). Stdin frames are
+            # only produced when the user types, which in practice is well after the
+            # session is up, so they aren't gated the same way.
 
             def _sigint_handler(signum, frame):
                 try:
@@ -759,23 +758,8 @@ class LeaseShellTransport(Transport):
                     new_size = os.get_terminal_size()
                 except OSError:
                     new_size = _last_size[0]
-                if new_size is not None:
-                    try:
-                        resize = bytes([_FRAME_RESIZE]) + struct.pack(
-                            ">HH", new_size.lines, new_size.columns
-                        )
-                        ws.send(
-                            json.dumps(
-                                {
-                                    "type": "websocket",
-                                    "data": base64.b64encode(resize).decode("ascii"),
-                                    "isBase64": True,
-                                }
-                            )
-                        )
-                        _last_size[0] = new_size
-                    except Exception:  # noqa: S110 best-effort resize inside SIGWINCH handler; logging is unsafe here
-                        pass
+                if new_size is not None and self._send_resize(ws, new_size):
+                    _last_size[0] = new_size
 
             original_sigint = signal.signal(signal.SIGINT, _sigint_handler)
             original_sigwinch = signal.signal(signal.SIGWINCH, _sigwinch_handler)
@@ -792,8 +776,27 @@ class LeaseShellTransport(Transport):
                 signal.signal(signal.SIGWINCH, original_sigwinch)
                 self._ws = None
 
+    @staticmethod
+    def _send_resize(ws, size) -> bool:
+        """Send one terminal-size frame. Returns False if it couldn't be sent."""
+        try:
+            frame = bytes([_FRAME_RESIZE]) + struct.pack(">HH", size.lines, size.columns)
+            ws.send(
+                json.dumps(
+                    {
+                        "type": "websocket",
+                        "data": base64.b64encode(frame).decode("ascii"),
+                        "isBase64": True,
+                    }
+                )
+            )
+            return True
+        except Exception:  # noqa: BLE001,S110 best-effort resize; a failure just leaves the default size
+            return False
+
     def _run_io_loop(self, ws) -> None:
         fd_stdin = sys.stdin.fileno()
+        sized = False  # send the initial resize only once the session is confirmed live
 
         while True:
             readable, _, _ = select.select([fd_stdin], [], [], 1.0)
@@ -818,6 +821,16 @@ class LeaseShellTransport(Transport):
             try:
                 frame = self._recv_proxy_message(ws, timeout=0.05)
                 if frame is not None and len(frame) >= 1:
+                    if not sized:
+                        # First frame back means the proxy has accepted the session
+                        # and will now relay data frames; safe to send the size.
+                        sized = True
+                        try:
+                            _sz = os.get_terminal_size()
+                        except OSError:
+                            _sz = None
+                        if _sz is not None:
+                            self._send_resize(ws, _sz)
                     code = frame[0]
                     payload = frame[1:]
                     if code == _FRAME_STDOUT:

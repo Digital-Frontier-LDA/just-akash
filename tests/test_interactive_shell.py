@@ -88,8 +88,17 @@ class TestLeaseShellConnect:
             provider_url = connect_msg["url"]
             assert "tty=true" in provider_url
             assert "stdin=true" in provider_url
+            # The interactive request must carry a shell command — a shell request
+            # with no cmd is rejected by the provider ("Received error from provider
+            # websocket"). We exec an interactive /bin/sh.
+            assert "cmd0=%2Fbin%2Fsh" in provider_url  # url-encoded /bin/sh
+            assert "cmd1=-i" in provider_url
 
-    def test_connect_sends_terminal_size_on_connect(self):
+    def test_connect_sends_terminal_size_after_session_is_live(self):
+        # The resize frame must NOT be sent before the provider has accepted the
+        # session — a data frame sent that early is rejected by the proxy
+        # ("url/providerAddress Required") and kills the whole connect. It is sent
+        # once the first provider frame confirms the session is live.
         t = _make_transport()
         with (
             patch("just_akash.transport.lease_shell.connect") as mock_ws,
@@ -101,18 +110,28 @@ class TestLeaseShellConnect:
             patch("signal.signal"),
             patch("fcntl.fcntl"),
             patch("os.get_terminal_size", return_value=os.terminal_size((80, 24))),
+            patch("sys.stdout"),  # first frame is dispatched to stdout — don't pollute test output
         ):
             mock_stdin.isatty.return_value = True
             mock_stdin.fileno.return_value = 0
             ws_instance = MagicMock()
-            ws_instance.recv.side_effect = RuntimeError("stop")
+            # First a provider stdout frame (code 100), then stop the loop.
+            ws_instance.recv.side_effect = [
+                json.dumps({"type": "data", "message": {"data": [100, 120]}}),
+                RuntimeError("stop"),
+            ]
             mock_ws.return_value.__enter__.return_value = ws_instance
             mock_ws.return_value.__exit__.return_value = False
             with pytest.raises(RuntimeError):
                 t.connect()
-            sent_frames = _decode_proxy_send(ws_instance.send.call_args_list)
+
+            sends = ws_instance.send.call_args_list
+            # The connect message (index 0) must not be a resize frame.
+            connect_msg = json.loads(sends[0].args[0])
+            assert "url" in connect_msg and "providerAddress" in connect_msg
+            sent_frames = _decode_proxy_send(sends)
             resize_frames = [f for f in sent_frames if f[0] == 105]
-            assert resize_frames, "Expected at least one resize frame (code 105) sent on connect"
+            assert resize_frames, "Expected a resize frame (code 105) once the session was live"
             rows, cols = struct.unpack(">HH", resize_frames[0][1:5])
             assert rows == 24
             assert cols == 80
