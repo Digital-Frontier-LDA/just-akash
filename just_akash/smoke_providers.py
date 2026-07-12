@@ -242,7 +242,7 @@ def _ingress_uri(dseq: str) -> str | None:
         services = (lease.get("status") or {}).get("services") or {}
         for svc in services.values() if isinstance(services, dict) else []:
             uris = svc.get("uris") if isinstance(svc, dict) else None
-            if uris:
+            if isinstance(uris, list) and uris:
                 return uris[0]
     return None
 
@@ -417,7 +417,13 @@ def _check_update(dseq: str, sdl_path: str, uri: str) -> bool:
 
 
 def smoke_provider(provider: str, sdl_path: str, key: str) -> dict:
-    """Run the full feature matrix against one provider. Never raises."""
+    """Run the full feature matrix against one provider.
+
+    The ``finally`` guarantees the deployment is destroyed. A hard error in the
+    deploy/readiness helpers (e.g. a subprocess timeout) is not swallowed here — it
+    propagates to ``main()``, which records the provider as all-FAIL and moves on, so
+    one provider's failure never aborts the run.
+    """
     results = dict.fromkeys(FEATURES, "-")
     dseq_ref: dict = {"dseq": None}
     install_signal_cleanup(dseq_ref)
