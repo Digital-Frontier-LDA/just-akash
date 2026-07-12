@@ -515,6 +515,134 @@ class TestRecvProxyMessage:
         assert result is None
 
 
+# Captured verbatim from wss://console.akash.network/provider-proxy-mainnet. Note the
+# type is "websocket", NOT "error" -- the proxy reports failures on an ordinary frame
+# with an `error` key, which is exactly why these used to slip through.
+PROXY_PROVIDER_ERROR = json.dumps(
+    {
+        "type": "websocket",
+        "message": "Received error from provider websocket",
+        "error": "Received error from provider websocket",
+    }
+)
+PROXY_SCHEMA_ERROR = json.dumps(
+    {
+        "type": "websocket",
+        "message": "Message doesn't match expected schema",
+        "error": "Invalid message format",
+        "errors": [
+            {
+                "code": "custom",
+                "message": "is not a valid JWT token",
+                "path": ["auth", "token"],
+            }
+        ],
+    }
+)
+
+
+def _transport() -> LeaseShellTransport:
+    return LeaseShellTransport(
+        TransportConfig(dseq="123", api_key="key", deployment=DEPLOYMENT_FIXTURE)
+    )
+
+
+class TestProxyErrorFrames:
+    """The proxy's error frames must surface, not be swallowed into a hang.
+
+    Regression: these frames fell through to base64.b64decode() of their prose
+    `message`, which either raised (swallowed by a blanket except -> None -> the
+    caller re-blocked in recv for the full timeout) or, when the filtered length
+    happened to be a multiple of 4, decoded to garbage bytes dispatched as output.
+    """
+
+    def test_provider_error_frame_raises(self):
+        ws = MagicMock()
+        ws.recv.return_value = PROXY_PROVIDER_ERROR
+
+        with pytest.raises(RuntimeError, match="Received error from provider websocket"):
+            _transport()._recv_proxy_message(ws)
+
+    def test_schema_error_frame_names_the_offending_field(self):
+        """The `errors` detail is the whole value of the frame -- keep it."""
+        ws = MagicMock()
+        ws.recv.return_value = PROXY_SCHEMA_ERROR
+
+        with pytest.raises(RuntimeError) as exc:
+            _transport()._recv_proxy_message(ws)
+
+        assert "auth.token: is not a valid JWT token" in str(exc.value)
+
+    def test_error_frame_does_not_decode_to_garbage_output(self):
+        """A prose message whose base64-filtered length is a multiple of 4.
+
+        Under the permissive default b64decode this silently produced bytes, which
+        _dispatch_frame would have written to stdout as if the provider sent them.
+        """
+        ws = MagicMock()
+        ws.recv.return_value = json.dumps(
+            {
+                "type": "websocket",
+                "message": "Received error from provider websocketAB",
+                "error": "x",
+            }
+        )
+
+        with pytest.raises(RuntimeError):
+            _transport()._recv_proxy_message(ws)
+
+    def test_pump_raises_instead_of_looping_forever(self):
+        """The actual CI symptom: exec produced no output and hung until killed."""
+        ws = MagicMock()
+        ws.recv.return_value = PROXY_PROVIDER_ERROR
+
+        with pytest.raises(RuntimeError, match="Proxy error"):
+            _transport()._pump_frames(ws, 0)
+
+    def test_auth_expiry_error_frame_is_recoverable(self):
+        """An expired-token frame must reach the reconnect logic that was written for it."""
+        ws = MagicMock()
+        ws.recv.return_value = json.dumps(
+            {"type": "websocket", "message": "jwt expired", "error": "unauthorized"}
+        )
+
+        with pytest.raises(RuntimeError) as exc:
+            _transport()._pump_frames(ws, 0)
+
+        assert _is_auth_expiry_message(str(exc.value))
+
+    def test_valid_data_frame_still_decodes(self):
+        """The error check must not disturb the normal relay path."""
+        ws = MagicMock()
+        payload = bytes([100]) + b"hello"
+        ws.recv.return_value = json.dumps(
+            {"type": "websocket", "message": base64.b64encode(payload).decode("ascii")}
+        )
+
+        assert _transport()._recv_proxy_message(ws) == payload
+
+
+class TestExecTimeoutIsBounded:
+    def test_silence_raises_a_diagnosis_not_a_bare_timeout(self):
+        ws = MagicMock()
+        ws.recv.side_effect = TimeoutError
+
+        with pytest.raises(RuntimeError, match="sent nothing for"):
+            _transport()._pump_frames(ws, 0)
+
+    def test_recv_timeout_is_configurable(self):
+        config = TransportConfig(
+            dseq="123", api_key="key", deployment=DEPLOYMENT_FIXTURE, recv_timeout=7
+        )
+        ws = MagicMock()
+        ws.recv.side_effect = TimeoutError
+
+        with pytest.raises(RuntimeError, match="7s"):
+            LeaseShellTransport(config)._pump_frames(ws, 0)
+
+        assert ws.recv.call_args.kwargs["timeout"] == 7
+
+
 class TestBuildShellPath:
     def test_build_shell_path_url_encodes_shell_metacharacters(self):
         """Shell metacharacters (semicolons, pipes) must be URL-encoded, not passed through raw."""

@@ -109,6 +109,35 @@ def _run(
     )
 
 
+# Words that mean "the deployment is gone" in `just destroy` output.
+#
+# "destroyed" is what the CLI actually prints on success -- `print(f"Deployment
+# {label} destroyed.")` in cli.py's destroy branch. This list used to hold only
+# "closed", a word the CLI never emits, so EVERY successful destroy was misread as
+# a failure: attempt 1 really did close the deployment, the check failed to notice,
+# and two more destroys then fired against an already-closed deployment (exiting 1,
+# as they should). The audit passed, so the run stayed green -- it just printed
+# three red FAILs and burned two pointless API calls on every E2E run.
+#
+# The unit tests missed it because their fixtures asserted against a made-up
+# "Deployment 12345 closed" that no version of the CLI has ever printed. If you
+# reword the CLI's success message, add it here; a test pins the two together.
+_DESTROY_SUCCESS_WORDS = ("destroyed", "closed")
+
+
+def _destroy_succeeded(result: subprocess.CompletedProcess) -> bool:
+    """Did this `just destroy` actually close the deployment?
+
+    Silence is deliberately NOT trusted: a clean exit with no output could equally
+    mean "already gone" or "did nothing", so we require the CLI to say so. The audit
+    in robust_destroy is the backstop that keeps a false negative from failing a run.
+    """
+    if result.returncode != 0:
+        return False
+    output = ((result.stdout or "") + (result.stderr or "")).lower()
+    return any(word in output for word in _DESTROY_SUCCESS_WORDS)
+
+
 def _dseq_in_list_output(dseq: str, output: str) -> bool:
     """Word-boundary check for DSEQ in `just list` output.
 
@@ -139,7 +168,7 @@ def robust_destroy(dseq: str, *, retries: int = 2, audit: bool = True) -> bool:
     for attempt in range(1, retries + 2):
         try:
             r = _run(f"just destroy {dseq}", input_text="y\n", timeout=60)
-            if r.returncode == 0 and "closed" in (r.stdout + r.stderr).lower():
+            if _destroy_succeeded(r):
                 _pass(f"Deployment {dseq} closed (attempt {attempt})")
                 break
             last_err = (r.stderr or r.stdout).strip()
