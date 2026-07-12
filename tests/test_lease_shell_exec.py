@@ -680,13 +680,16 @@ class TestBuildShellPath:
         assert "tty=true" in url
         assert "stdin=true" in url
 
-    def test_build_shell_path_empty_string_command_produces_single_empty_cmd(self):
-        """_build_provider_shell_url(command='') produces cmd0= with empty value.
+    def test_build_shell_path_empty_command_sends_no_cmd_params(self):
+        """An empty command must send NO cmd params at all.
 
-        An empty string is not None, so the code enters the `if command is not None`
-        branch and splits '' by space, yielding [''], which produces cmd0= with an
-        empty URL-encoded value. This is a boundary case that could cause provider-side
-        errors if the provider doesn't expect an empty command argument.
+        This used to assert the opposite -- that command='' produced `cmd0=` with an
+        empty value -- and its own docstring conceded the wart: "could cause
+        provider-side errors if the provider doesn't expect an empty command
+        argument." That came from splitting '' on a space, which yields [''].
+
+        shlex.split('') yields [], so an empty command now means exactly that: no
+        command. The characterised bug is gone, so the characterisation goes with it.
         """
         config = TransportConfig(
             dseq="123",
@@ -697,19 +700,15 @@ class TestBuildShellPath:
         transport._provider_host_uri = "https://provider.com"
         transport._service = "web"
         url = transport._build_provider_shell_url(command="")
-        # '' is not None, so cmd params are generated
-        assert "cmd0=" in url
-        # But the value after cmd0= should be empty (just cmd0= followed by & or end of string)
-        import re
 
-        match = re.search(r"cmd0=([^&]*)", url)
-        assert match is not None
-        assert match.group(1) == "", (
-            f"Expected empty cmd0 value for empty command string, got {match.group(1)!r}"
-        )
+        assert "cmd0=" not in url, f"empty command must not emit an empty cmd param: {url}"
 
-    def test_build_shell_path_whitespace_only_command_produces_empty_cmd_params(self):
-        """Whitespace-only command splits into empty cmd params — edge-case URL generation."""
+    def test_build_shell_path_whitespace_only_command_sends_no_cmd_params(self):
+        """Whitespace-only is an empty command, not a command made of empty strings.
+
+        `"   ".split(" ")` produced ['', '', '', ''] -> four empty cmd params.
+        shlex.split("   ") yields [].
+        """
         config = TransportConfig(
             dseq="123",
             api_key="key",
@@ -719,9 +718,8 @@ class TestBuildShellPath:
         transport._provider_host_uri = "https://provider.com"
         transport._service = "web"
         url = transport._build_provider_shell_url(command="   ")
-        assert "cmd0=" in url
-        assert "cmd3=" in url
-        assert "/lease/123/1/1/shell?" in url
+
+        assert "cmd0=" not in url, f"whitespace-only command must not emit cmd params: {url}"
 
 
 # --- exec() Happy Path Tests ---
