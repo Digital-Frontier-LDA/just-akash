@@ -237,7 +237,28 @@ class LeaseShellTransport(Transport):
             f"stdin={'true' if stdin else 'false'}",
         ]
         if command is not None:
-            for i, part in enumerate(command.split(" ")):
+            # shlex.split, not command.split(" ").
+            #
+            # The provider shell takes the command as a list of argv parts (cmd0,
+            # cmd1, ...). Splitting naively on spaces ignores shell quoting, so any
+            # command carrying a quoted argument was silently shredded:
+            #
+            #   sh -c "df -h / && echo ok"
+            #     -> ['sh', '-c', '"df', '-h', '/', '&&', 'echo', 'ok"']
+            #
+            # and the remote shell got `"df` as one argv and died with
+            # `Syntax error: Unterminated quoted string`. That is every non-trivial
+            # command -- anything with a `sh -c '...'` wrapper, which is how you run
+            # more than one thing. shlex.split honours the quoting and yields the argv
+            # the caller actually wrote. It also drops the empty strings that
+            # consecutive spaces used to produce (which became empty cmdN params).
+            try:
+                parts = shlex.split(command)
+            except ValueError as exc:  # unbalanced quotes in the caller's command
+                raise RuntimeError(
+                    f"Could not parse the remote command (unbalanced quotes?): {exc}"
+                ) from exc
+            for i, part in enumerate(parts):
                 qs_parts.append(f"cmd{i}={urllib.parse.quote(part, safe='')}")
         qs = "&".join(qs_parts)
         return f"{self._provider_host_uri}/lease/{dseq}/1/1/shell?{qs}"
