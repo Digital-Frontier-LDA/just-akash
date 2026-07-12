@@ -789,7 +789,9 @@ def api_main():
     api_key = os.environ.get("AKASH_API_KEY")
     if not api_key:
         print("Error: AKASH_API_KEY environment variable not set.")
-        print("Please set your API key: export AKASH_API_KEY='your-key'")
+        print(
+            "Please set your API key: export AKASH_API_KEY='your-key'"  # pragma: allowlist secret
+        )
         sys.exit(1)
 
     client = AkashConsoleAPI(api_key)
