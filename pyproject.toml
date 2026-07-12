@@ -41,6 +41,7 @@ select = ["E", "F", "I", "UP", "B", "SIM", "S"]
 "tests/**" = ["S"]
 "just_akash/test_*.py" = ["S"]
 "just_akash/_e2e.py" = ["S"]
+"just_akash/smoke_providers.py" = ["S"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
