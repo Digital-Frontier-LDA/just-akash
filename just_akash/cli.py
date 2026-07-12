@@ -303,12 +303,25 @@ def main():
     logs_p.add_argument(
         "--service", default=None, help="Filter to a single service (default: all services)"
     )
+    logs_p.add_argument(
+        "--duration",
+        type=float,
+        default=None,
+        help="Stop after N seconds and return (bounded snapshot; avoids hanging "
+        "when the provider holds a non-follow connection open).",
+    )
 
     # ── events ─────────────────────────────────────────
     events_p = subparsers.add_parser(
         "events", help="Stream Kubernetes events for a deployment (debug startup)"
     )
     events_p.add_argument("--dseq", default="")
+    events_p.add_argument(
+        "--duration",
+        type=float,
+        default=None,
+        help="Stop after N seconds and return (bounded snapshot).",
+    )
 
     # ── add-funds ──────────────────────────────────────
     add_funds_p = subparsers.add_parser(
@@ -666,11 +679,21 @@ def main():
             if args.tail < 0:
                 print("Error: --tail must be >= 0.", file=sys.stderr)
                 sys.exit(1)
+            if args.duration is not None and (
+                not math.isfinite(args.duration) or args.duration <= 0
+            ):
+                print("Error: --duration must be a finite number > 0.", file=sys.stderr)
+                sys.exit(1)
             client = AkashConsoleAPI(_require_api_key())
             dseq = _resolve_deployment(client, args.dseq)
             transport = _make_lease_shell(client, dseq)
             try:
-                transport.stream_logs(follow=args.follow, tail=args.tail, service=args.service)
+                transport.stream_logs(
+                    follow=args.follow,
+                    tail=args.tail,
+                    service=args.service,
+                    duration=args.duration,
+                )
             except KeyboardInterrupt:
                 print()
         except RuntimeError as e:
@@ -682,11 +705,16 @@ def main():
         from .api import AkashConsoleAPI
 
         try:
+            if args.duration is not None and (
+                not math.isfinite(args.duration) or args.duration <= 0
+            ):
+                print("Error: --duration must be a finite number > 0.", file=sys.stderr)
+                sys.exit(1)
             client = AkashConsoleAPI(_require_api_key())
             dseq = _resolve_deployment(client, args.dseq)
             transport = _make_lease_shell(client, dseq)
             try:
-                transport.stream_events()
+                transport.stream_events(duration=args.duration)
             except KeyboardInterrupt:
                 print()
         except RuntimeError as e:
