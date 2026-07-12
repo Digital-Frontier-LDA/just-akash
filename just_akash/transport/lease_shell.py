@@ -14,6 +14,7 @@ import base64
 import fcntl
 import json
 import logging
+import math
 import os
 import select
 import shlex
@@ -816,6 +817,14 @@ class LeaseShellTransport(Transport):
         removes the need to wrap the CLI in an external ``timeout`` (which cannot
         flush partial output).
         """
+        # A non-finite duration would defeat the whole point of the bound: NaN makes
+        # every `>= deadline` comparison false (the stream never cuts off), and inf
+        # sets no real deadline at all. Both silently reintroduce the hang this
+        # parameter exists to prevent, so reject them at the API boundary. The CLI
+        # catches this earlier with a friendlier message; this guards programmatic
+        # callers of stream_logs/stream_events.
+        if duration is not None and (not math.isfinite(duration) or duration <= 0):
+            raise ValueError(f"duration must be a finite number > 0, got {duration!r}")
         deadline = (time.monotonic() + duration) if duration is not None else None
         attempts = 0
         while attempts < MAX_RECONNECT_ATTEMPTS:

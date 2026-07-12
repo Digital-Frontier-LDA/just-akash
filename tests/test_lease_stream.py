@@ -561,6 +561,24 @@ class TestSnapshotDuration:
         assert ws.timeouts, "recv was never called"
         assert max(ws.timeouts) <= 0.2 + 1e-6, ws.timeouts
 
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf"), 0.0, -1.0])
+    def test_non_finite_or_nonpositive_duration_is_rejected_before_connecting(self, bad):
+        """A non-finite duration would silently defeat the bound and reintroduce the
+        hang: NaN makes every ``>= deadline`` comparison false, inf sets no real
+        deadline. The guard must reject it fast, at the API boundary, before any
+        socket work — so a programmatic caller can't disable the cutoff by accident.
+        """
+        t = _make_transport()
+        with (
+            patch.object(t, "_fetch_jwt", return_value="jwt"),
+            patch("just_akash.transport.lease_shell.connect") as mock_connect,
+        ):
+            with pytest.raises(ValueError, match="finite number > 0"):
+                t.stream_logs(duration=bad)
+            with pytest.raises(ValueError, match="finite number > 0"):
+                t.stream_events(duration=bad)
+            mock_connect.assert_not_called()  # rejected before touching the network
+
     def test_no_duration_uses_full_recv_timeout(self):
         """Without ``duration`` the per-recv timeout stays at the 300s default
         and the loop relies on the server closing — legacy behavior unchanged."""

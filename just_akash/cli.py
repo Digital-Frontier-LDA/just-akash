@@ -679,8 +679,10 @@ def main():
             if args.tail < 0:
                 print("Error: --tail must be >= 0.", file=sys.stderr)
                 sys.exit(1)
-            if args.duration is not None and args.duration <= 0:
-                print("Error: --duration must be > 0.", file=sys.stderr)
+            if args.duration is not None and (
+                not math.isfinite(args.duration) or args.duration <= 0
+            ):
+                print("Error: --duration must be a finite number > 0.", file=sys.stderr)
                 sys.exit(1)
             client = AkashConsoleAPI(_require_api_key())
             dseq = _resolve_deployment(client, args.dseq)
@@ -703,8 +705,10 @@ def main():
         from .api import AkashConsoleAPI
 
         try:
-            if args.duration is not None and args.duration <= 0:
-                print("Error: --duration must be > 0.", file=sys.stderr)
+            if args.duration is not None and (
+                not math.isfinite(args.duration) or args.duration <= 0
+            ):
+                print("Error: --duration must be a finite number > 0.", file=sys.stderr)
                 sys.exit(1)
             client = AkashConsoleAPI(_require_api_key())
             dseq = _resolve_deployment(client, args.dseq)
