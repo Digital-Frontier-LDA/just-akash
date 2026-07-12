@@ -32,6 +32,9 @@ Costs a small amount of AKT: one minimal lease per provider, destroyed
 immediately (and on Ctrl-C). An ephemeral SSH keypair is generated per run for
 the SSH-transport checks. Providers that do not bid on the probe profile are
 reported NO-BID (cannot be tested), not failed.
+
+Run from the repository root: cleanup goes through robust_destroy(), which shells
+out to `just destroy` / `just list`, so the Justfile and `just` must be available.
 """
 
 from __future__ import annotations
@@ -40,12 +43,14 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
 import urllib.request
+from shlex import quote as q
 
 from ._e2e import (
     GREEN,
@@ -158,8 +163,8 @@ def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, s
     SDL's PLACEHOLDER so sshd trusts our ephemeral key.
     """
     r = _run(
-        f"uv run just-akash deploy --sdl {sdl_path} "
-        f"--provider {provider} --backup-provider '' "
+        f"uv run just-akash deploy --sdl {q(sdl_path)} "
+        f"--provider {q(provider)} --backup-provider '' "
         f"--bid-wait 120 --bid-wait-retry 60",
         timeout=420,
     )
@@ -174,7 +179,7 @@ def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, s
 
 
 def _status_json(dseq: str) -> dict:
-    r = _run(f"uv run just-akash status --dseq {dseq} --json", timeout=30)
+    r = _run(f"uv run just-akash status --dseq {q(dseq)} --json", timeout=30)
     try:
         data = json.loads(r.stdout)
     except (json.JSONDecodeError, TypeError):
@@ -201,12 +206,12 @@ def _wait_exec_ready(dseq: str, attempts: int = 12, interval: int = 8) -> bool:
     fails outright; (2) even once exec succeeds, the very first command against a
     freshly-started container can come back rc=0 with EMPTY stdout (the exit-code
     frame arriving ahead of the stdout frame). Verifying a round-tripped marker
-    clears both, so a healthy provider is never mis-reported as broken.
+    clears both, so a healthy provider is never misreported as broken.
     """
     marker = "exec-ready-probe"
     for _ in range(attempts):
         r = _run(
-            f"uv run just-akash exec 'echo {marker}' --dseq {dseq} --transport lease-shell",
+            f"uv run just-akash exec 'echo {marker}' --dseq {q(dseq)} --transport lease-shell",
             timeout=30,
         )
         if r.returncode == 0 and marker in (r.stdout or ""):
@@ -251,17 +256,20 @@ def _fetch(uri: str, timeout: int = 10) -> str:
 
 def _wait_ssh_ready(dseq: str, key: str, attempts: int = 15, interval: int = 8) -> bool:
     """Poll SSH exec until it works — sshd comes up only after the boot-time
-    `apk add openssh`, well after lease-shell is ready."""
-    info = _ssh_info(dseq)
-    if info is None:
-        return False
+    `apk add openssh`, well after lease-shell is ready.
+
+    The forwarded SSH port itself can also lag in lease status, so re-check for it
+    on every iteration rather than bailing out if it's absent on the first poll.
+    """
     for _ in range(attempts):
-        r = _run(
-            f"uv run just-akash exec 'echo ssh-ready' --dseq {dseq} --transport ssh --key {key}",
-            timeout=30,
-        )
-        if r.returncode == 0 and "ssh-ready" in (r.stdout or ""):
-            return True
+        if _ssh_info(dseq) is not None:
+            r = _run(
+                f"uv run just-akash exec 'echo ssh-ready' --dseq {q(dseq)} "
+                f"--transport ssh --key {q(key)}",
+                timeout=30,
+            )
+            if r.returncode == 0 and "ssh-ready" in (r.stdout or ""):
+                return True
         time.sleep(interval)
     return False
 
@@ -276,7 +284,7 @@ def _check_status(dseq: str) -> bool:
 def _check_exec(dseq: str) -> bool:
     token = f"smoke-{dseq[-6:]}-ok"
     r = _run(
-        f"uv run just-akash exec 'echo {token}' --dseq {dseq} --transport lease-shell",
+        f"uv run just-akash exec 'echo {token}' --dseq {q(dseq)} --transport lease-shell",
         timeout=45,
     )
     return r.returncode == 0 and token in (r.stdout or "")
@@ -285,20 +293,20 @@ def _check_exec(dseq: str) -> bool:
 def _inject_and_read(dseq: str, transport: str, key: str = "") -> bool:
     """Inject an env file over ``transport`` then read it back via exec."""
     remote = f"/tmp/smoke-inject-{transport}.env"  # path is inside the probe container
-    keyarg = f"--key {key}" if key else ""
+    keyarg = f"--key {q(key)}" if key else ""
     with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as f:
-        f.write("SMOKE_SECRET=injected_ok\nSECOND_VAR=hello_world\n")
+        f.write("SMOKE_SECRET=injected_ok\nSECOND_VAR=hello_world\n")  # pragma: allowlist secret
         env_file = f.name
     try:
         inj = _run(
-            f"uv run just-akash inject --dseq {dseq} --env-file {env_file} "
-            f"--remote-path {remote} --transport {transport} {keyarg}",
+            f"uv run just-akash inject --dseq {q(dseq)} --env-file {q(env_file)} "
+            f"--remote-path {q(remote)} --transport {transport} {keyarg}",
             timeout=60,
         )
         if inj.returncode != 0:
             return False
         back = _run(
-            f"uv run just-akash exec 'cat {remote}' --dseq {dseq} "
+            f"uv run just-akash exec 'cat {q(remote)}' --dseq {q(dseq)} "
             f"--transport {transport} {keyarg}",
             timeout=45,
         )
@@ -318,7 +326,7 @@ def _check_stream(dseq: str, command: str) -> bool:
     an argparse error), so the command must not include it.
     """
     start = time.monotonic()
-    r = _run(f"uv run just-akash {command} --dseq {dseq} --duration 8", timeout=40)
+    r = _run(f"uv run just-akash {command} --dseq {q(dseq)} --duration 8", timeout=40)
     elapsed = time.monotonic() - start
     return r.returncode == 0 and elapsed < 35
 
@@ -326,7 +334,7 @@ def _check_stream(dseq: str, command: str) -> bool:
 def _check_ssh(dseq: str, key: str) -> bool:
     """exec + inject over the SSH transport (provider port-forwarding)."""
     r = _run(
-        f"uv run just-akash exec 'echo SSH_OK' --dseq {dseq} --transport ssh --key {key}",
+        f"uv run just-akash exec 'echo SSH_OK' --dseq {q(dseq)} --transport ssh --key {q(key)}",
         timeout=45,
     )
     if not (r.returncode == 0 and "SSH_OK" in (r.stdout or "")):
@@ -384,7 +392,8 @@ def _check_update(dseq: str, sdl_path: str, uri: str) -> bool:
     revision goes live at the same ingress (lease preserved)."""
     token = f"probe-updated-{dseq[-6:]}"
     r = _run(
-        f"uv run just-akash update --dseq {dseq} --sdl {sdl_path} --env SMOKE_MARKER={token}",
+        f"uv run just-akash update --dseq {q(dseq)} --sdl {q(sdl_path)} "
+        f"--env SMOKE_MARKER={token}",
         timeout=120,
     )
     if r.returncode != 0:
@@ -420,7 +429,13 @@ def smoke_provider(provider: str, sdl_path: str, key: str) -> dict:
         print(f"  {GREEN}deployed{RESET} DSEQ={dseq}, waiting for lease...")
 
         if not _wait_ready(dseq):
-            print(f"  {RED}lease never became ready{RESET} — skipping feature checks")
+            # A lease that never becomes ready is a real failure, not a pass: every
+            # untested feature must read FAIL so the provider counts against the run
+            # (the overall verdict only trips on "FAIL", never on "-").
+            for feat in FEATURES:
+                if results[feat] == "-":
+                    results[feat] = "FAIL"
+            print(f"  {RED}lease never became ready{RESET} — marking untested features FAIL")
             return results
         if not _wait_exec_ready(dseq):
             print(f"  {YELLOW}container slow to accept exec{RESET} — checks may reflect that")
@@ -532,6 +547,9 @@ def main() -> int:
             rows[provider] = smoke_provider(provider, sdl_path, key_path)
     finally:
         os.unlink(sdl_path)
+        # Remove the ephemeral keypair — the unencrypted private key must not be
+        # left behind in the temp dir after the run.
+        shutil.rmtree(os.path.dirname(key_path), ignore_errors=True)
 
     _print_matrix(rows)
 

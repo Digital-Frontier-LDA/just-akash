@@ -47,7 +47,7 @@ class TestDeployClassification:
         assert dseq is None
         assert note == "no-bid"
 
-    def test_unparseable_output_is_deploy_failed(self):
+    def test_unparsable_output_is_deploy_failed(self):
         ref: dict = {"dseq": None}
         with patch.object(sp, "_run", return_value=_completed("boom", returncode=1)):
             dseq, note = sp._deploy("sdl", "p", ref)
