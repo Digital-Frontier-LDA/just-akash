@@ -115,14 +115,15 @@ class TestIngressUri:
             api.return_value.get_deployment.return_value = {"leases": [{"status": {}}]}
             assert sp._ingress_uri("1") is None
 
-    def test_survives_malformed_status(self):
-        # A non-dict lease `status` (string/list from a partial provider response)
-        # must not raise -- it just means "no ingress yet".
+    def test_survives_malformed_lease_shapes(self):
+        # Malformed provider responses must not raise -- they just mean "no
+        # ingress yet". Covers a non-dict `status` (string, then list), a
+        # non-dict lease, and a non-dict `services`.
         for dep in (
-            {"leases": [{"status": "starting"}]},
-            {"leases": [{"status": ["x"]}]},
-            {"leases": ["not-a-dict"]},
-            {"leases": [{"status": {"services": "nope"}}]},
+            {"leases": [{"status": "starting"}]},  # status is a string
+            {"leases": [{"status": ["x"]}]},  # status is a list
+            {"leases": ["not-a-dict"]},  # the lease itself is not a dict
+            {"leases": [{"status": {"services": "nope"}}]},  # services is not a dict
         ):
             with patch.object(sp, "_api") as api:
                 api.return_value.get_deployment.return_value = dep
