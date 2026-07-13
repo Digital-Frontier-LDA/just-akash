@@ -323,8 +323,10 @@ class TestOrphanProbeSweep:
         ):
             assert sp.sweep_orphan_probes() == [good]
 
-    def test_sweep_counts_only_confirmed_destroys(self):
-        # robust_destroy returning False (still listed) must NOT count as reaped.
+    def test_sweep_counts_only_confirmed_destroys(self, capsys):
+        # robust_destroy returning False (still listed) must NOT count as reaped,
+        # and must NOT be reported as "no leaked probes found": an orphan was
+        # detected but is still draining escrow, so it needs a human.
         old_probe = self._dseq_aged(7200)
         api = self._fake_api([{"dseq": old_probe}], {old_probe: self._detail(["probe"])})
         with (
@@ -333,3 +335,7 @@ class TestOrphanProbeSweep:
             patch.object(sp.time, "time", return_value=self.NOW),
         ):
             assert sp.sweep_orphan_probes() == []
+        out = capsys.readouterr().out
+        assert "no leaked probes found" not in out
+        assert "could NOT be destroyed" in out
+        assert old_probe in out

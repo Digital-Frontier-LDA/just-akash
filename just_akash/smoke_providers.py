@@ -241,7 +241,8 @@ def sweep_orphan_probes(
     except Exception as e:  # noqa: BLE001 -- sweep must never abort the run
         print(f"  {YELLOW}orphan sweep skipped: list_deployments failed: {e}{RESET}")
         return []
-    swept: list[str] = []
+    found: list[str] = []  # orphans identified
+    swept: list[str] = []  # orphans confirmed destroyed (or, in dry-run, matched)
     for dep in deployments:
         dseq = _extract_dseq(dep)
         if not dseq:
@@ -252,6 +253,7 @@ def sweep_orphan_probes(
             continue
         if not _is_orphan_probe(detail, dseq, min_age_seconds=min_age_seconds, now=now):
             continue
+        found.append(dseq)
         age = _probe_age_seconds(dseq, now)
         age_note = f"{int(age // 60)}m old" if age is not None else "age unknown"
         # In dry-run we only report; say so, so the per-probe line can't be read
@@ -263,11 +265,22 @@ def sweep_orphan_probes(
         )
         if dry_run or robust_destroy(dseq):
             swept.append(dseq)
-    if swept:
-        verb = "would reap" if dry_run else "reaped"
-        print(f"  orphan sweep: {verb} {len(swept)} leaked probe(s): {', '.join(swept)}")
-    else:
+    if not found:
         print("  orphan sweep: no leaked probes found")
+    elif dry_run:
+        print(f"  orphan sweep: would reap {len(swept)} leaked probe(s): {', '.join(swept)}")
+    else:
+        print(
+            f"  orphan sweep: reaped {len(swept)}/{len(found)} leaked probe(s): {', '.join(swept)}"
+        )
+        # A found-but-not-destroyed orphan must NOT be silently reported as clean:
+        # it is still draining escrow and needs a human. Surface it loudly.
+        stuck = [d for d in found if d not in swept]
+        if stuck:
+            print(
+                f"  {RED}orphan sweep: {len(stuck)} probe(s) could NOT be destroyed "
+                f"(manual cleanup required): {', '.join(stuck)}{RESET}"
+            )
     return swept
 
 
@@ -686,6 +699,14 @@ def main() -> int:
         sweep_orphan_probes(dry_run=args.dry_run)
         return 0
 
+    # Sweep before resolving providers, not after: the sweep scans all
+    # deployments and does not depend on the provider list, so it must run even
+    # when no providers are configured -- otherwise a no-providers run would
+    # return below without reaping, defeating the self-healing guarantee.
+    if not args.no_sweep:
+        _hdr("Reaping probes leaked by a previous hard-killed run")
+        sweep_orphan_probes(dry_run=args.dry_run)
+
     if args.providers:
         providers = args.providers
     else:
@@ -694,10 +715,6 @@ def main() -> int:
     if not providers:
         print("No providers to test (set AKASH_PROVIDERS or pass --provider).", file=sys.stderr)
         return 1
-
-    if not args.no_sweep:
-        _hdr("Reaping probes leaked by a previous hard-killed run")
-        sweep_orphan_probes(dry_run=args.dry_run)
 
     print(f"Smoke-testing {len(providers)} provider(s): one throwaway lease each.")
     key_path = _generate_keypair()
