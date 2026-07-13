@@ -304,6 +304,40 @@ class TestOrphanProbeSweep:
         with patch.object(sp, "_api", return_value=api):
             assert sp.sweep_orphan_probes() == []
 
+    def test_sweep_reports_incomplete_when_inspection_fails(self, capsys):
+        # A genuine (non-404) inspection failure must flag the sweep INCOMPLETE,
+        # never an all-clear -- a leak could hide behind the deployment we could
+        # not inspect.
+        errored = self._dseq_aged(7200)
+        api = MagicMock()
+        api.list_deployments.return_value = [{"dseq": errored}]
+        api.get_deployment.side_effect = RuntimeError("API Error (500): server boom")
+        with (
+            patch.object(sp, "_api", return_value=api),
+            patch.object(sp, "robust_destroy", return_value=True),
+            patch.object(sp.time, "time", return_value=self.NOW),
+        ):
+            assert sp.sweep_orphan_probes() == []
+        out = capsys.readouterr().out
+        assert "INCOMPLETE" in out
+        assert "no leaked probes found among inspected deployments" in out
+
+    def test_sweep_treats_404_as_gone_not_incomplete(self, capsys):
+        # A 404 means the deployment is already gone -> not a leak; the sweep is
+        # still complete and reports a clean all-clear.
+        gone = self._dseq_aged(7200)
+        api = MagicMock()
+        api.list_deployments.return_value = [{"dseq": gone}]
+        api.get_deployment.side_effect = RuntimeError("API Error (404): Deployment not found")
+        with (
+            patch.object(sp, "_api", return_value=api),
+            patch.object(sp.time, "time", return_value=self.NOW),
+        ):
+            assert sp.sweep_orphan_probes() == []
+        out = capsys.readouterr().out
+        assert "INCOMPLETE" not in out
+        assert "no leaked probes found" in out
+
     def test_sweep_skips_a_deployment_it_cannot_inspect(self):
         good = self._dseq_aged(7200)
         bad = self._dseq_aged(7300)
@@ -312,7 +346,7 @@ class TestOrphanProbeSweep:
 
         def _get(dseq):
             if dseq == bad:
-                raise RuntimeError("detail fetch failed")
+                raise RuntimeError("API Error (404): gone")
             return self._detail(["probe"])
 
         api.get_deployment.side_effect = _get

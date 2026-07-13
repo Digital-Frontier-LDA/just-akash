@@ -243,13 +243,21 @@ def sweep_orphan_probes(
         return []
     found: list[str] = []  # orphans identified
     swept: list[str] = []  # orphans confirmed destroyed (or, in dry-run, matched)
+    uninspected: list[str] = []  # listed but detail fetch genuinely failed
     for dep in deployments:
         dseq = _extract_dseq(dep)
         if not dseq:
             continue
         try:
             detail = _api().get_deployment(dseq)
-        except Exception:  # noqa: BLE001 -- skip a deployment we can't inspect
+        except Exception as e:  # noqa: BLE001 -- must not abort the sweep
+            # A 404 means the deployment is already gone -> not an active leak,
+            # safe to skip. Any OTHER error means we could not inspect it, so the
+            # sweep is INCOMPLETE and must say so rather than report an all-clear
+            # (list said it exists; we just couldn't confirm what it is).
+            if "(404)" not in str(e):
+                uninspected.append(dseq)
+                print(f"  {YELLOW}orphan sweep: could not inspect {dseq}: {str(e)[:120]}{RESET}")
             continue
         if not _is_orphan_probe(detail, dseq, min_age_seconds=min_age_seconds, now=now):
             continue
@@ -265,8 +273,17 @@ def sweep_orphan_probes(
         )
         if dry_run or robust_destroy(dseq):
             swept.append(dseq)
+    # An incomplete sweep must never masquerade as a clean all-clear: flag any
+    # deployment we could not inspect so the log reflects that a leak may have
+    # gone unseen.
+    if uninspected:
+        print(
+            f"  {YELLOW}orphan sweep INCOMPLETE: {len(uninspected)} deployment(s) "
+            f"could not be inspected: {', '.join(uninspected)}{RESET}"
+        )
     if not found:
-        print("  orphan sweep: no leaked probes found")
+        suffix = " among inspected deployments" if uninspected else ""
+        print(f"  orphan sweep: no leaked probes found{suffix}")
     elif dry_run:
         print(f"  orphan sweep: would reap {len(swept)} leaked probe(s): {', '.join(swept)}")
     else:
