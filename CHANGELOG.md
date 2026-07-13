@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
-## [1.8.1] — 2026-07-13
+## [1.9.0] — 2026-07-13
 
 ### Added
 - **Self-healing orphan-probe sweep for the smoke test** — every `smoke-providers` run now sweeps first and reaps any probe that a *hard-killed* earlier run leaked (a CI job hitting `timeout-minutes` → SIGKILL, or a runner crash, can die after creating a probe lease but before its `finally`/signal-handler cleanup runs; nothing else reaps it, so it drains escrow for days until the chain closes it). Identification is surgical and fail-safe: a deployment is reaped **only** when its sole lease service is named `probe` (the name real workloads like `runner`/`train` never use) **and** it is older than an age floor derived from its ms-epoch dseq — so a probe a *concurrent* run is still holding, and every real workload, is left untouched. Runs at the start of each daily job (making it self-healing), or standalone via `--sweep-only` (`--dry-run` to report without destroying). Validated live: the sweep correctly flags zero orphans against an account holding `train` + `runner` workloads.

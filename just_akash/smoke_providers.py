@@ -711,9 +711,15 @@ def main() -> int:
         return 1
 
     # Sweep first (unless disabled): reap any probe a hard-killed earlier run
-    # orphaned, before we deploy fresh ones. Self-healing across runs.
+    # orphaned, before we deploy fresh ones. Self-healing across runs. The header
+    # tracks dry-run so it can't read as "destruction happened" when it didn't.
+    sweep_hdr = (
+        "Scanning for probes leaked by a previous hard-killed run (dry-run)"
+        if args.dry_run
+        else "Reaping probes leaked by a previous hard-killed run"
+    )
     if args.sweep_only:
-        _hdr("Reaping probes leaked by a previous hard-killed run")
+        _hdr(sweep_hdr)
         sweep_orphan_probes(dry_run=args.dry_run)
         return 0
 
@@ -722,7 +728,7 @@ def main() -> int:
     # when no providers are configured -- otherwise a no-providers run would
     # return below without reaping, defeating the self-healing guarantee.
     if not args.no_sweep:
-        _hdr("Reaping probes leaked by a previous hard-killed run")
+        _hdr(sweep_hdr)
         sweep_orphan_probes(dry_run=args.dry_run)
 
     if args.providers:
