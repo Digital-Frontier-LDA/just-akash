@@ -684,7 +684,8 @@ def main() -> int:
     ap.add_argument(
         "--dry-run",
         action="store_true",
-        help="With --sweep-only/sweep: report leaked probes without destroying them",
+        help="With --sweep-only (or the default startup sweep): report leaked probes "
+        "without destroying them",
     )
     args = ap.parse_args()
 
