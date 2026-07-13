@@ -190,16 +190,17 @@ def _deployment_service_names(detail: dict) -> set[str]:
     return names
 
 
-def _probe_age_seconds(dseq: str, now: float | None = None) -> float | None:
+def _probe_age_seconds(dseq: str | None, now: float | None = None) -> float | None:
     """Age of a deployment in seconds, derived from its millisecond-epoch dseq.
 
     just-akash mints dseqs as ms-since-epoch timestamps, so the dseq itself is a
     reliable creation clock (the on-chain created_at is a block height, not a
-    wall time). Returns None if the dseq is not a plausible recent ms timestamp
-    (e.g. a legacy block-height dseq) so we never mis-age and reap wrongly.
+    wall time). Returns None if the dseq is missing or is not a plausible recent
+    ms timestamp (e.g. a legacy block-height dseq) so we never mis-age and reap
+    wrongly.
     """
     try:
-        created = int(dseq) / 1000.0
+        created = int(dseq) / 1000.0  # type: ignore[arg-type]  # None -> TypeError, handled below
     except (TypeError, ValueError):
         return None
     now = time.time() if now is None else now
