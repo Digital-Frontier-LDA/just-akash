@@ -405,7 +405,10 @@ def _ingress_uri(dseq: str) -> str | None:
     for lease in dep.get("leases") or []:
         if not isinstance(lease, dict):
             continue
-        services = (lease.get("status") or {}).get("services") or {}
+        # Guard the status hop: a non-dict `status` (string/list from a malformed
+        # or partial provider response) would make `.get("services")` raise.
+        status = lease.get("status")
+        services = status.get("services") if isinstance(status, dict) else None
         for svc in services.values() if isinstance(services, dict) else []:
             uris = svc.get("uris") if isinstance(svc, dict) else None
             if isinstance(uris, list) and uris:
