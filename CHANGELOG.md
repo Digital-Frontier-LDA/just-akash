@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.9.1] — 2026-07-13
+
+### Fixed
+- **`_ingress_uri` no longer crashes on a malformed lease `status`** — like the sweep's `_deployment_service_names` hardened in 1.9.0, the ingress-URI resolver read `(lease.get("status") or {}).get("services")`, which raises `AttributeError` when a provider returns a non-dict `status` (a bare string/list from a partial or malformed response). The status hop is now `isinstance`-guarded and treats anything unexpected as "no ingress yet". Impact was bounded (the smoke test's `run_check` wrapper caught it as an ingress FAIL rather than aborting the run), but it is now a clean skip. Regression test covers string/list/`services`-not-a-dict shapes.
+
+---
+
 ## [1.9.0] — 2026-07-13
 
 ### Added

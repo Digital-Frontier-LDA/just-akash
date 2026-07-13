@@ -115,6 +115,19 @@ class TestIngressUri:
             api.return_value.get_deployment.return_value = {"leases": [{"status": {}}]}
             assert sp._ingress_uri("1") is None
 
+    def test_survives_malformed_status(self):
+        # A non-dict lease `status` (string/list from a partial provider response)
+        # must not raise -- it just means "no ingress yet".
+        for dep in (
+            {"leases": [{"status": "starting"}]},
+            {"leases": [{"status": ["x"]}]},
+            {"leases": ["not-a-dict"]},
+            {"leases": [{"status": {"services": "nope"}}]},
+        ):
+            with patch.object(sp, "_api") as api:
+                api.return_value.get_deployment.return_value = dep
+                assert sp._ingress_uri("1") is None
+
 
 class TestSshCheck:
     def test_ssh_fails_when_exec_has_no_output(self):
