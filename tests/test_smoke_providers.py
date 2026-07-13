@@ -206,6 +206,22 @@ class TestOrphanProbeSweep:
         assert sp._deployment_service_names({"leases": [{"status": {}}]}) == set()
         assert sp._deployment_service_names({}) == set()
 
+    def test_service_names_survives_malformed_status(self):
+        # A non-dict status/lease must not raise (it would abort the best-effort
+        # sweep); it reads as "no services".
+        assert sp._deployment_service_names({"leases": [{"status": "starting"}]}) == set()
+        assert sp._deployment_service_names({"leases": [{"status": ["x"]}]}) == set()
+        assert sp._deployment_service_names({"leases": ["not-a-dict"]}) == set()
+        assert (
+            sp._deployment_service_names({"leases": [{"status": {"services": "nope"}}]}) == set()
+        )
+
+    def test_not_found_error_matches_only_the_404_prefix(self):
+        assert sp._is_not_found_error(RuntimeError("API Error (404): Deployment not found"))
+        # A non-404 error whose body merely mentions (404) must NOT be "gone".
+        assert not sp._is_not_found_error(RuntimeError("API Error (500): see ticket (404)"))
+        assert not sp._is_not_found_error(RuntimeError("Connection error: timed out"))
+
     # ── age derived from the ms-epoch dseq ───────────────────────────
     def test_age_from_ms_dseq(self):
         assert sp._probe_age_seconds(self._dseq_aged(3600), now=self.NOW) == 3600

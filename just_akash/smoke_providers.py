@@ -184,7 +184,11 @@ def _deployment_service_names(detail: dict) -> set[str]:
     for lease in detail.get("leases") or []:
         if not isinstance(lease, dict):
             continue
-        services = ((lease.get("status") or {}).get("services")) or {}
+        # Guard every hop: a non-dict `status` (string/list from a malformed or
+        # partial provider response) would make `.get` raise and abort the
+        # best-effort sweep. Treat anything unexpected as "no services".
+        status = lease.get("status")
+        services = status.get("services") if isinstance(status, dict) else None
         if isinstance(services, dict):
             names.update(str(k) for k in services)
     return names
@@ -204,8 +208,9 @@ def _probe_age_seconds(dseq: str | None, now: float | None = None) -> float | No
     except (TypeError, ValueError):
         return None
     now = time.time() if now is None else now
-    # A real ms-epoch dseq lands in a sane window: after 2020 and not in the
-    # future. Anything else (tiny block height, garbage) -> unknown age.
+    # A real ms-epoch dseq lands in a sane window: after 2020 and not implausibly
+    # far in the future (allow ~1 day of clock skew between us and the chain).
+    # Anything outside it (tiny block height, garbage) -> unknown age.
     if created < 1_577_836_800 or created > now + 86_400:  # 2020-01-01 .. now+1d
         return None
     return now - created
@@ -225,6 +230,17 @@ def _is_orphan_probe(
     age = _probe_age_seconds(dseq, now)
     # Unknown age -> do not reap (fail safe). Known-but-young -> spare it.
     return age is not None and age >= min_age_seconds
+
+
+def _is_not_found_error(exc: Exception) -> bool:
+    """True only for a 404 (deployment already gone), not any other API error.
+
+    The API client raises RuntimeError("API Error (404): ...") with the status
+    code as a fixed prefix, so match that prefix -- a bare "(404)" substring
+    could spuriously match a non-404 error whose body merely mentions "(404)"
+    and wrongly treat an uninspected deployment as gone, hiding a leak.
+    """
+    return str(exc).startswith("API Error (404)")
 
 
 def sweep_orphan_probes(
@@ -255,7 +271,7 @@ def sweep_orphan_probes(
             # safe to skip. Any OTHER error means we could not inspect it, so the
             # sweep is INCOMPLETE and must say so rather than report an all-clear
             # (list said it exists; we just couldn't confirm what it is).
-            if "(404)" not in str(e):
+            if not _is_not_found_error(e):
                 uninspected.append(dseq)
                 print(f"  {YELLOW}orphan sweep: could not inspect {dseq}: {str(e)[:120]}{RESET}")
             continue
