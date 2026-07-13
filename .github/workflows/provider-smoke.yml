@@ -1,0 +1,65 @@
+name: Provider smoke test
+
+# Daily drift detector between just-akash and the configured providers. Deploys a
+# throwaway probe to each preferred provider and exercises every provider-facing
+# feature (deploy, status, exec, inject, logs, events, SSH transport, connect,
+# HTTP ingress, in-place update), then destroys it. Fails if any provider fails
+# any feature -- so a provider build that quietly breaks lease-shell/ingress (the
+# way v0.14.2-df.1 returned HTTP 500 on lease-shell) is caught the next morning,
+# not only when a PR happens to run the E2E jobs.
+
+on:
+  schedule:
+    - cron: "0 7 * * *" # 07:00 UTC daily
+  workflow_dispatch:
+    inputs:
+      all:
+        description: "Also test the backup provider tier (AKASH_PROVIDERS_BACKUP)"
+        type: boolean
+        default: false
+
+# Serialize runs and NEVER cancel one mid-flight: a run holds live probe leases it
+# must destroy in its cleanup, and a hard cancel would leak them. Queue instead.
+concurrency:
+  group: provider-smoke
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Provider capability smoke test
+    runs-on: ubuntu-latest
+    # The SSH-enabled probe installs openssh + busybox-extras and runs the full
+    # matrix (incl. an update-restart) per provider; give three providers room.
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      # Cleanup (robust_destroy) shells out to `just destroy` / `just list`.
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: Run provider smoke test
+        env:
+          AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
+          AKASH_PROVIDERS: ${{ secrets.AKASH_PROVIDERS }}
+          AKASH_PROVIDERS_BACKUP: ${{ secrets.AKASH_PROVIDERS_BACKUP }}
+        run: uv run python -m just_akash.smoke_providers ${{ inputs.all && '--all' || '' }}
