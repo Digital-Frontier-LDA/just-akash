@@ -8,7 +8,7 @@ classified, and how each feature check reads a subprocess result.
 from __future__ import annotations
 
 import subprocess
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from just_akash import smoke_providers as sp
 
@@ -177,3 +177,155 @@ class TestUpdateCheck:
             patch.object(sp, "_fetch", return_value="probe-updated-123456"),
         ):
             assert sp._check_update("123456", "/sdl", "uri") is True
+
+
+class TestOrphanProbeSweep:
+    """The startup sweep that reaps probes leaked by a hard-killed prior run.
+
+    Because a real live account holds the user's own workloads (runner/train),
+    the sweep must reap ONLY unambiguous probes and must never mis-identify a
+    concurrent run's live probe or a real workload. These pin that contract.
+    """
+
+    NOW = 1_783_930_000.0  # a fixed "now" (~mid-2026, ms-epoch dseq era)
+
+    def _detail(self, service_names):
+        """A get_deployment() detail whose lease reports these service names."""
+        return {"leases": [{"status": {"services": {n: {"name": n} for n in service_names}}}]}
+
+    def _dseq_aged(self, seconds_old: float) -> str:
+        """A ms-epoch dseq for a deployment created `seconds_old` before NOW."""
+        return str(int((self.NOW - seconds_old) * 1000))
+
+    # ── service-name extraction ──────────────────────────────────────
+    def test_service_names_from_lease_status(self):
+        assert sp._deployment_service_names(self._detail(["probe"])) == {"probe"}
+
+    def test_service_names_empty_when_provider_reports_none(self):
+        # Provider down / not yet reporting -> empty, must read as "unknown".
+        assert sp._deployment_service_names({"leases": [{"status": {}}]}) == set()
+        assert sp._deployment_service_names({}) == set()
+
+    # ── age derived from the ms-epoch dseq ───────────────────────────
+    def test_age_from_ms_dseq(self):
+        assert sp._probe_age_seconds(self._dseq_aged(3600), now=self.NOW) == 3600
+
+    def test_age_rejects_block_height_dseq(self):
+        # A legacy block-height dseq must not be mis-read as a 1970s timestamp.
+        assert sp._probe_age_seconds("27695426", now=self.NOW) is None
+
+    def test_age_rejects_garbage(self):
+        assert sp._probe_age_seconds("not-a-number", now=self.NOW) is None
+        assert sp._probe_age_seconds(None, now=self.NOW) is None
+
+    def test_age_rejects_future_dseq(self):
+        future = str(int((self.NOW + 2 * 86_400) * 1000))
+        assert sp._probe_age_seconds(future, now=self.NOW) is None
+
+    # ── orphan classification (the safety-critical predicate) ────────
+    def test_old_probe_only_service_is_an_orphan(self):
+        assert sp._is_orphan_probe(
+            self._detail(["probe"]), self._dseq_aged(7200), min_age_seconds=3600, now=self.NOW
+        )
+
+    def test_runner_workload_is_never_an_orphan(self):
+        assert not sp._is_orphan_probe(
+            self._detail(["runner"]), self._dseq_aged(7200), min_age_seconds=3600, now=self.NOW
+        )
+
+    def test_probe_plus_another_service_is_not_reaped(self):
+        # Exactly {probe} required -- anything extra means "not our probe".
+        assert not sp._is_orphan_probe(
+            self._detail(["probe", "web"]),
+            self._dseq_aged(7200),
+            min_age_seconds=3600,
+            now=self.NOW,
+        )
+
+    def test_young_probe_is_spared(self):
+        # Could belong to a concurrent run -- must not be clobbered.
+        assert not sp._is_orphan_probe(
+            self._detail(["probe"]), self._dseq_aged(60), min_age_seconds=3600, now=self.NOW
+        )
+
+    def test_probe_with_unknown_age_is_spared(self):
+        # probe service but un-datable dseq -> fail safe, do not reap.
+        assert not sp._is_orphan_probe(
+            self._detail(["probe"]), "27695426", min_age_seconds=3600, now=self.NOW
+        )
+
+    # ── the sweep itself ─────────────────────────────────────────────
+    def _fake_api(self, deployments, details):
+        api = MagicMock()
+        api.list_deployments.return_value = deployments
+        api.get_deployment.side_effect = lambda dseq: details[dseq]
+        return api
+
+    def test_sweep_reaps_only_the_old_probe(self):
+        old_probe = self._dseq_aged(7200)  # reap
+        young_probe = self._dseq_aged(60)  # spare (concurrent run)
+        runner = self._dseq_aged(9000)  # spare (real workload)
+        api = self._fake_api(
+            [{"dseq": old_probe}, {"dseq": young_probe}, {"dseq": runner}],
+            {
+                old_probe: self._detail(["probe"]),
+                young_probe: self._detail(["probe"]),
+                runner: self._detail(["runner"]),
+            },
+        )
+        with (
+            patch.object(sp, "_api", return_value=api),
+            patch.object(sp, "robust_destroy", return_value=True) as rd,
+            patch.object(sp.time, "time", return_value=self.NOW),
+        ):
+            swept = sp.sweep_orphan_probes()
+        assert swept == [old_probe]
+        rd.assert_called_once_with(old_probe)
+
+    def test_sweep_dry_run_destroys_nothing(self):
+        old_probe = self._dseq_aged(7200)
+        api = self._fake_api([{"dseq": old_probe}], {old_probe: self._detail(["probe"])})
+        with (
+            patch.object(sp, "_api", return_value=api),
+            patch.object(sp, "robust_destroy", return_value=True) as rd,
+            patch.object(sp.time, "time", return_value=self.NOW),
+        ):
+            swept = sp.sweep_orphan_probes(dry_run=True)
+        assert swept == [old_probe]
+        rd.assert_not_called()
+
+    def test_sweep_survives_a_list_failure(self):
+        api = MagicMock()
+        api.list_deployments.side_effect = RuntimeError("api down")
+        with patch.object(sp, "_api", return_value=api):
+            assert sp.sweep_orphan_probes() == []
+
+    def test_sweep_skips_a_deployment_it_cannot_inspect(self):
+        good = self._dseq_aged(7200)
+        bad = self._dseq_aged(7300)
+        api = MagicMock()
+        api.list_deployments.return_value = [{"dseq": bad}, {"dseq": good}]
+
+        def _get(dseq):
+            if dseq == bad:
+                raise RuntimeError("detail fetch failed")
+            return self._detail(["probe"])
+
+        api.get_deployment.side_effect = _get
+        with (
+            patch.object(sp, "_api", return_value=api),
+            patch.object(sp, "robust_destroy", return_value=True),
+            patch.object(sp.time, "time", return_value=self.NOW),
+        ):
+            assert sp.sweep_orphan_probes() == [good]
+
+    def test_sweep_counts_only_confirmed_destroys(self):
+        # robust_destroy returning False (still listed) must NOT count as reaped.
+        old_probe = self._dseq_aged(7200)
+        api = self._fake_api([{"dseq": old_probe}], {old_probe: self._detail(["probe"])})
+        with (
+            patch.object(sp, "_api", return_value=api),
+            patch.object(sp, "robust_destroy", return_value=False),
+            patch.object(sp.time, "time", return_value=self.NOW),
+        ):
+            assert sp.sweep_orphan_probes() == []
