@@ -254,9 +254,12 @@ def sweep_orphan_probes(
             continue
         age = _probe_age_seconds(dseq, now)
         age_note = f"{int(age // 60)}m old" if age is not None else "age unknown"
+        # In dry-run we only report; say so, so the per-probe line can't be read
+        # as "this was destroyed" for a safety-critical cleanup that did nothing.
+        action = "would reap (dry-run)" if dry_run else "reaping"
         print(
             f"  {YELLOW}orphaned probe {dseq} ({age_note}) — leaked by an earlier "
-            f"run; reaping{RESET}"
+            f"run; {action}{RESET}"
         )
         if dry_run or robust_destroy(dseq):
             swept.append(dseq)

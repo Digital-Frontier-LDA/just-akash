@@ -282,7 +282,7 @@ class TestOrphanProbeSweep:
         assert swept == [old_probe]
         rd.assert_called_once_with(old_probe)
 
-    def test_sweep_dry_run_destroys_nothing(self):
+    def test_sweep_dry_run_destroys_nothing(self, capsys):
         old_probe = self._dseq_aged(7200)
         api = self._fake_api([{"dseq": old_probe}], {old_probe: self._detail(["probe"])})
         with (
@@ -293,6 +293,10 @@ class TestOrphanProbeSweep:
             swept = sp.sweep_orphan_probes(dry_run=True)
         assert swept == [old_probe]
         rd.assert_not_called()
+        # Dry-run output must not claim a probe was reaped when nothing ran.
+        out = capsys.readouterr().out
+        assert "dry-run" in out
+        assert "; reaping" not in out  # the past/active-tense form is destroy-only
 
     def test_sweep_survives_a_list_failure(self):
         api = MagicMock()
