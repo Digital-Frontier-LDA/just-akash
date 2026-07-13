@@ -283,6 +283,22 @@ test-shell:
     set -x
     uv run python -m just_akash.test_shell_e2e
 
+# Provider capability smoke test: deploy a throwaway probe to each configured
+# provider, exercise every provider-facing feature (exec, inject, logs, events,
+# SSH transport, connect, HTTP ingress, in-place update), destroy, and print a
+# pass/fail matrix. Pass args through, e.g. `just smoke-providers --all`.
+smoke-providers *args:
+    #!/bin/bash
+    set -euo pipefail
+    mkdir -p "{{log_dir}}"
+    timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
+    log_file="{{log_dir}}/smoke-providers-${timestamp}.log"
+    exec > >(tee -a "$log_file") 2>&1
+    trap 'status=$?; echo "[INFO] recipe=smoke-providers finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
+    echo "[INFO] recipe=smoke-providers started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file"
+    set -x
+    uv run python -m just_akash.smoke_providers {{args}}
+
 # ── Lint & Quality ───────────────────────────────────
 
 # Run ruff lint + format check

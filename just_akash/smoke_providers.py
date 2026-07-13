@@ -62,7 +62,7 @@ from ._e2e import (
     resolve_tiers,
     robust_destroy,
 )
-from .api import AkashConsoleAPI
+from .api import AkashConsoleAPI, _extract_dseq
 
 # The baseline HTTP marker the probe serves; the update check changes it and
 # re-reads it through the ingress to prove a new revision went live.
@@ -149,6 +149,172 @@ def _api() -> AkashConsoleAPI:
 
 def _hdr(msg: str) -> None:
     print(f"\n{YELLOW}== {msg} =={RESET}", flush=True)
+
+
+# ── orphaned-probe sweep ─────────────────────────────────────────────
+#
+# A run that is hard-killed (CI job timeout -> SIGKILL, runner crash) can die
+# after creating a probe lease but before its finally / signal-handler cleanup
+# destroys it. Nothing else reaps that probe, so it drains escrow for days until
+# the chain closes it. So every run sweeps FIRST: it reaps any deployment whose
+# only service is the probe service, before deploying fresh probes -- making the
+# daily job self-healing. Identification is surgical (the probe SDL names its one
+# service `probe`, which real workloads like runner/train never use) and
+# fail-safe (a deployment we cannot positively identify is left alone). An age
+# floor spares a probe that a *concurrent* run is still holding.
+
+# The probe SDL's sole service name. A deployment whose service set is exactly
+# {PROBE_SERVICE} is unambiguously a leaked smoke probe, never a user workload.
+PROBE_SERVICE = "probe"
+
+# Don't reap a probe younger than this: a concurrent smoke run could still be
+# using it (a run holds one probe for up to the whole matrix, ~tens of minutes).
+# A genuine orphan is seen by the next daily run (~24h later), far past this.
+MIN_ORPHAN_AGE_SECONDS = 3600  # 1 hour
+
+
+def _deployment_service_names(detail: dict) -> set[str]:
+    """Service names an active deployment is running, from its lease status.
+
+    Reads leases[].status.services.<name>; the provider populates this from the
+    live manifest. Empty when the provider reported no services (down / still
+    starting) -- callers must treat "empty" as "cannot classify", not "probe".
+    """
+    names: set[str] = set()
+    for lease in detail.get("leases") or []:
+        if not isinstance(lease, dict):
+            continue
+        # Guard every hop: a non-dict `status` (string/list from a malformed or
+        # partial provider response) would make `.get` raise and abort the
+        # best-effort sweep. Treat anything unexpected as "no services".
+        status = lease.get("status")
+        services = status.get("services") if isinstance(status, dict) else None
+        if isinstance(services, dict):
+            names.update(str(k) for k in services)
+    return names
+
+
+def _probe_age_seconds(dseq: str | None, now: float | None = None) -> float | None:
+    """Age of a deployment in seconds, derived from its millisecond-epoch dseq.
+
+    just-akash mints dseqs as ms-since-epoch timestamps, so the dseq itself is a
+    reliable creation clock (the on-chain created_at is a block height, not a
+    wall time). Returns None if the dseq is missing or is not a plausible recent
+    ms timestamp (e.g. a legacy block-height dseq) so we never mis-age and reap
+    wrongly.
+    """
+    try:
+        created = int(dseq) / 1000.0  # type: ignore[arg-type]  # None -> TypeError, handled below
+    except (TypeError, ValueError):
+        return None
+    now = time.time() if now is None else now
+    # A real ms-epoch dseq lands in a sane window: after 2020 and not implausibly
+    # far in the future (allow ~1 day of clock skew between us and the chain).
+    # Anything outside it (tiny block height, garbage) -> unknown age.
+    if created < 1_577_836_800 or created > now + 86_400:  # 2020-01-01 .. now+1d
+        return None
+    return now - created
+
+
+def _is_orphan_probe(
+    detail: dict, dseq: str, *, min_age_seconds: float, now: float | None = None
+) -> bool:
+    """True only if `detail` is unambiguously a reapable leaked probe.
+
+    Requires BOTH: the service set is exactly {PROBE_SERVICE}, and the
+    deployment is at least `min_age_seconds` old (so a concurrent run's live
+    probe is spared). Anything we cannot positively identify is left alone.
+    """
+    if _deployment_service_names(detail) != {PROBE_SERVICE}:
+        return False
+    age = _probe_age_seconds(dseq, now)
+    # Unknown age -> do not reap (fail safe). Known-but-young -> spare it.
+    return age is not None and age >= min_age_seconds
+
+
+def _is_not_found_error(exc: Exception) -> bool:
+    """True only for a 404 (deployment already gone), not any other API error.
+
+    The API client raises RuntimeError("API Error (404): ...") with the status
+    code as a fixed prefix, so match that prefix -- a bare "(404)" substring
+    could spuriously match a non-404 error whose body merely mentions "(404)"
+    and wrongly treat an uninspected deployment as gone, hiding a leak.
+    """
+    return str(exc).startswith("API Error (404)")
+
+
+def sweep_orphan_probes(
+    *, dry_run: bool = False, min_age_seconds: float = MIN_ORPHAN_AGE_SECONDS
+) -> list[str]:
+    """Reap probe deployments leaked by a hard-killed earlier run.
+
+    Returns the dseqs destroyed (or, in dry_run, the ones that would be).
+    Best-effort: never raises -- a sweep failure must not block the smoke run.
+    """
+    now = time.time()
+    try:
+        deployments = _api().list_deployments(active_only=True)
+    except Exception as e:  # noqa: BLE001 -- sweep must never abort the run
+        print(f"  {YELLOW}orphan sweep skipped: list_deployments failed: {e}{RESET}")
+        return []
+    found: list[str] = []  # orphans identified
+    swept: list[str] = []  # orphans confirmed destroyed (or, in dry-run, matched)
+    uninspected: list[str] = []  # listed but detail fetch genuinely failed
+    for dep in deployments:
+        dseq = _extract_dseq(dep)
+        if not dseq:
+            continue
+        try:
+            detail = _api().get_deployment(dseq)
+        except Exception as e:  # noqa: BLE001 -- must not abort the sweep
+            # A 404 means the deployment is already gone -> not an active leak,
+            # safe to skip. Any OTHER error means we could not inspect it, so the
+            # sweep is INCOMPLETE and must say so rather than report an all-clear
+            # (list said it exists; we just couldn't confirm what it is).
+            if not _is_not_found_error(e):
+                uninspected.append(dseq)
+                print(f"  {YELLOW}orphan sweep: could not inspect {dseq}: {str(e)[:120]}{RESET}")
+            continue
+        if not _is_orphan_probe(detail, dseq, min_age_seconds=min_age_seconds, now=now):
+            continue
+        found.append(dseq)
+        age = _probe_age_seconds(dseq, now)
+        age_note = f"{int(age // 60)}m old" if age is not None else "age unknown"
+        # In dry-run we only report; say so, so the per-probe line can't be read
+        # as "this was destroyed" for a safety-critical cleanup that did nothing.
+        action = "would reap (dry-run)" if dry_run else "reaping"
+        print(
+            f"  {YELLOW}orphaned probe {dseq} ({age_note}) — leaked by an earlier "
+            f"run; {action}{RESET}"
+        )
+        if dry_run or robust_destroy(dseq):
+            swept.append(dseq)
+    # An incomplete sweep must never masquerade as a clean all-clear: flag any
+    # deployment we could not inspect so the log reflects that a leak may have
+    # gone unseen.
+    if uninspected:
+        print(
+            f"  {YELLOW}orphan sweep INCOMPLETE: {len(uninspected)} deployment(s) "
+            f"could not be inspected: {', '.join(uninspected)}{RESET}"
+        )
+    if not found:
+        suffix = " among inspected deployments" if uninspected else ""
+        print(f"  orphan sweep: no leaked probes found{suffix}")
+    elif dry_run:
+        print(f"  orphan sweep: would reap {len(swept)} leaked probe(s): {', '.join(swept)}")
+    else:
+        print(
+            f"  orphan sweep: reaped {len(swept)}/{len(found)} leaked probe(s): {', '.join(swept)}"
+        )
+        # A found-but-not-destroyed orphan must NOT be silently reported as clean:
+        # it is still draining escrow and needs a human. Surface it loudly.
+        stuck = [d for d in found if d not in swept]
+        if stuck:
+            print(
+                f"  {RED}orphan sweep: {len(stuck)} probe(s) could NOT be destroyed "
+                f"(manual cleanup required): {', '.join(stuck)}{RESET}"
+            )
+    return swept
 
 
 # ── readiness + resolution helpers ───────────────────────────────────
@@ -538,11 +704,48 @@ def main() -> int:
         dest="providers",
         help="Test only this provider (repeatable)",
     )
+    ap.add_argument(
+        "--no-sweep",
+        action="store_true",
+        help="Skip the startup sweep for probes leaked by a hard-killed prior run",
+    )
+    ap.add_argument(
+        "--sweep-only",
+        action="store_true",
+        help="Only reap leaked probes (no deploy), then exit",
+    )
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="With --sweep-only (or the default startup sweep): report leaked probes "
+        "without destroying them",
+    )
     args = ap.parse_args()
 
     if not os.environ.get("AKASH_API_KEY"):
         print("Error: AKASH_API_KEY not set.", file=sys.stderr)
         return 1
+
+    # Sweep first (unless disabled): reap any probe a hard-killed earlier run
+    # orphaned, before we deploy fresh ones. Self-healing across runs. The header
+    # tracks dry-run so it can't read as "destruction happened" when it didn't.
+    sweep_hdr = (
+        "Scanning for probes leaked by a previous hard-killed run (dry-run)"
+        if args.dry_run
+        else "Reaping probes leaked by a previous hard-killed run"
+    )
+    if args.sweep_only:
+        _hdr(sweep_hdr)
+        sweep_orphan_probes(dry_run=args.dry_run)
+        return 0
+
+    # Sweep before resolving providers, not after: the sweep scans all
+    # deployments and does not depend on the provider list, so it must run even
+    # when no providers are configured -- otherwise a no-providers run would
+    # return below without reaping, defeating the self-healing guarantee.
+    if not args.no_sweep:
+        _hdr(sweep_hdr)
+        sweep_orphan_probes(dry_run=args.dry_run)
 
     if args.providers:
         providers = args.providers
