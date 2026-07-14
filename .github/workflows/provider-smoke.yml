@@ -10,7 +10,12 @@ name: Provider smoke test
 
 on:
   schedule:
-    - cron: "0 7 * * *" # 07:00 UTC daily
+    # TEMPORARY accumulation window (started 2026-07-14): every 3h to build a
+    # stable latency dataset over ~2-3 days for percentile/SLO thresholds. Each
+    # run is fully leak-guarded (in-job reap + startup sweep). REVERT to the
+    # daily line below on/after 2026-07-17 to limit Actions minutes and cost.
+    - cron: "0 */3 * * *" # every 3 hours (accumulation burst)
+    # - cron: "0 7 * * *" # 07:00 UTC daily (normal cadence — restore after the burst)
   workflow_dispatch:
     inputs:
       all:
