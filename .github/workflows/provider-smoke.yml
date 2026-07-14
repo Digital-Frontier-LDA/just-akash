@@ -135,9 +135,10 @@ jobs:
 
   # Track the metrics in CI: aggregate the ACCRUED data (all runs) into
   # per-(provider,feature) success rate + p50/p95/p99 and print it every run, and
-  # gate on it. Checks out main (which has the analyzer; the telemetry branch is
-  # data-only) and reads the accrued JSONL via `git show`. The analyzer is pure
-  # stdlib, so no dependency install is needed.
+  # gate on it. Checks out the repo (which has the analyzer — for the scheduled
+  # runs that is the default branch; the telemetry branch is data-only) and reads
+  # the accrued JSONL via `git show`. The analyzer is pure stdlib, so no
+  # dependency install is needed.
   report:
     name: Telemetry report + SLO gate
     needs: accrue

@@ -200,7 +200,12 @@ def parse_thresholds(spec: str) -> dict[str, float]:
         feat, sep, ms = part.partition("=")
         if not sep or not feat.strip():
             raise ValueError(f"bad --max-p95 entry {part!r} (expected feature=ms)")
-        out[feat.strip()] = float(ms)
+        try:
+            out[feat.strip()] = float(ms)
+        except ValueError:
+            raise ValueError(
+                f"bad --max-p95 entry {part!r}: {ms.strip()!r} is not a number of ms"
+            ) from None
     return out
 
 
@@ -231,7 +236,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--check",
         action="store_true",
-        help="Exit non-zero if any feature with >= --min-samples is below --slo",
+        help="Exit non-zero on a reliability breach (pass rate < --slo) or, when "
+        "--max-p95 is set, a latency breach — for any feature with >= --min-samples.",
     )
     ap.add_argument(
         "--min-samples", type=int, default=20, help="Min samples before --check judges"
