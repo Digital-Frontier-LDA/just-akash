@@ -51,6 +51,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from shlex import quote as q
 
 from ._e2e import (
@@ -153,6 +154,56 @@ FEATURES = [
     "ingress",
     "update",
 ]
+
+# Telemetry rows = every feature plus "ready" (time-to-serving — not a matrix
+# column, but the leading latency signal for the readiness-lag we chase).
+_TELEMETRY_FEATURES = [*FEATURES, "ready"]
+
+
+def _pkg_version() -> str:
+    try:
+        from importlib.metadata import version
+
+        return version("just-akash")
+    except Exception:  # noqa: BLE001 — telemetry must never break the run
+        return "unknown"
+
+
+def _provider_records(
+    provider: str, dseq: str | None, results: dict, latencies: dict
+) -> list[dict]:
+    """One telemetry record per feature: outcome + how long it took (ms).
+
+    latency_ms is None for a feature that was never reached (e.g. everything
+    after a no-bid). Pass/fail is the lagging binary; latency is the leading
+    signal that lets us later set percentile timeouts and spot regressions.
+    """
+    return [
+        {
+            "provider": provider,
+            "feature": feat,
+            "outcome": results.get(feat, "-"),
+            "latency_ms": latencies.get(feat),
+            "dseq": dseq,
+        }
+        for feat in _TELEMETRY_FEATURES
+    ]
+
+
+def _write_telemetry(path: str, run_ts: str, version: str, records: list[dict]) -> None:
+    """Append one JSON line per record. Best-effort: a telemetry failure must
+    never fail the smoke run."""
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            for rec in records:
+                f.write(json.dumps({"ts": run_ts, "version": version, **rec}) + "\n")
+        print(f"  telemetry: wrote {len(records)} record(s) to {path}")
+    except OSError as e:
+        print(f"  {YELLOW}telemetry write failed: {e}{RESET}")
+
 
 _API: AkashConsoleAPI | None = None
 
@@ -715,20 +766,24 @@ def _check_update(dseq: str, sdl_path: str, uri: str) -> bool:
 # ── orchestration ────────────────────────────────────────────────────
 
 
-def smoke_provider(provider: str, sdl_path: str, key: str) -> dict:
+def smoke_provider(provider: str, sdl_path: str, key: str, records: list | None = None) -> dict:
     """Run the full feature matrix against one provider.
 
-    The ``finally`` guarantees the deployment is destroyed. A hard error in the
-    deploy/readiness helpers (e.g. a subprocess timeout) is not swallowed here — it
-    propagates to ``main()``, which records the provider as all-FAIL and moves on, so
-    one provider's failure never aborts the run.
+    The ``finally`` guarantees the deployment is destroyed and (when ``records``
+    is provided) appends one telemetry record per feature — outcome + latency.
+    A hard error in the deploy/readiness helpers (e.g. a subprocess timeout) is
+    not swallowed here — it propagates to ``main()``, which records the provider
+    as all-FAIL and moves on, so one provider's failure never aborts the run.
     """
     results = dict.fromkeys(FEATURES, "-")
+    latencies: dict[str, float] = {}
     dseq_ref: dict = {"dseq": None}
     install_signal_cleanup(dseq_ref)
     _hdr(f"provider {provider}")
     try:
+        _t0 = time.monotonic()
         dseq, note = _deploy(sdl_path, provider, dseq_ref)
+        latencies["deploy"] = round((time.monotonic() - _t0) * 1000)
         if not dseq:
             results["deploy"] = "NO-BID" if note == "no-bid" else "FAIL"
             print(f"  {RED}{note}{RESET} — cannot test remaining features")
@@ -736,7 +791,11 @@ def smoke_provider(provider: str, sdl_path: str, key: str) -> dict:
         results["deploy"] = "PASS"
         print(f"  {GREEN}deployed{RESET} DSEQ={dseq}, waiting for lease...")
 
-        if not _wait_ready(dseq):
+        _t0 = time.monotonic()
+        ready = _wait_ready(dseq)
+        latencies["ready"] = round((time.monotonic() - _t0) * 1000)
+        results["ready"] = "PASS" if ready else "FAIL"
+        if not ready:
             # A lease that never becomes ready is a real failure, not a pass: every
             # untested feature must read FAIL so the provider counts against the run
             # (the overall verdict only trips on "FAIL", never on "-").
@@ -749,11 +808,13 @@ def smoke_provider(provider: str, sdl_path: str, key: str) -> dict:
             print(f"  {YELLOW}container slow to accept exec{RESET} — checks may reflect that")
 
         def run_check(name: str, fn) -> None:
+            _t = time.monotonic()
             try:
                 ok = fn()
             except Exception as e:  # noqa: BLE001 — a broken feature must not abort the run
                 ok = False
                 print(f"  {name}: raised {type(e).__name__}: {e}")
+            latencies[name] = round((time.monotonic() - _t) * 1000)
             results[name] = "PASS" if ok else "FAIL"
             print(f"  {GREEN if ok else RED}{name}: {results[name]}{RESET}")
 
@@ -784,12 +845,19 @@ def smoke_provider(provider: str, sdl_path: str, key: str) -> dict:
 
         return results
     finally:
-        if dseq_ref["dseq"]:
-            print(f"  cleanup: destroying {dseq_ref['dseq']}...")
-            robust_destroy(dseq_ref["dseq"])
+        # Capture the dseq before cleanup clears the ref, so telemetry keeps it.
+        _dseq = dseq_ref["dseq"]
+        if _dseq:
+            print(f"  cleanup: destroying {_dseq}...")
+            robust_destroy(_dseq)
             # Clear the ref so a later Ctrl-C's signal handler skips this already-
             # destroyed deployment instead of re-issuing destroy against it.
             dseq_ref["dseq"] = None
+        # Emit telemetry even on an early return or a propagating error (the
+        # finally runs in all cases), so a no-bid / never-ready / crashed provider
+        # is still recorded with whatever was measured.
+        if records is not None:
+            records.extend(_provider_records(provider, _dseq, results, latencies))
 
 
 def _print_matrix(rows: dict) -> None:
@@ -862,6 +930,14 @@ def main() -> int:
         "end-of-job cleanup that reaps this run's own fresh leak -- safe only when "
         "no other run is concurrent (CI serializes runs).",
     )
+    ap.add_argument(
+        "--telemetry-file",
+        metavar="PATH",
+        default=os.environ.get("SMOKE_TELEMETRY_FILE"),
+        help="Append one JSON line per (provider, feature) with outcome + latency "
+        "(also settable via SMOKE_TELEMETRY_FILE). Foundation for percentile "
+        "timeouts and latency-regression detection.",
+    )
     args = ap.parse_args()
 
     if not os.environ.get("AKASH_API_KEY"):
@@ -908,11 +984,15 @@ def main() -> int:
         f.write(PROBE_SDL)
         sdl_path = f.name
 
+    # One timestamp for the whole run so every record shares a run key.
+    run_ts = datetime.now(timezone.utc).isoformat()
+    records: list | None = [] if args.telemetry_file else None
+
     rows: dict = {}
     try:
         for provider in providers:
             try:
-                rows[provider] = smoke_provider(provider, sdl_path, key_path)
+                rows[provider] = smoke_provider(provider, sdl_path, key_path, records=records)
             except Exception as e:  # noqa: BLE001 — one provider's hard error must not abort the run
                 print(f"  {RED}{provider} aborted: {type(e).__name__}: {e}{RESET}")
                 rows[provider] = dict.fromkeys(FEATURES, "FAIL")
@@ -921,6 +1001,8 @@ def main() -> int:
         # Remove the ephemeral keypair — the unencrypted private key must not be
         # left behind in the temp dir after the run.
         shutil.rmtree(os.path.dirname(key_path), ignore_errors=True)
+        if args.telemetry_file and records:
+            _write_telemetry(args.telemetry_file, run_ts, _pkg_version(), records)
 
     _print_matrix(rows)
 
