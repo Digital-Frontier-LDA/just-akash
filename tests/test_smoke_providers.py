@@ -81,6 +81,142 @@ class TestExecReadyGate:
             assert sp._wait_exec_ready("1", attempts=2, interval=0) is True
 
 
+class _FakeClock:
+    """time.monotonic() stub that advances a fixed step on each call.
+
+    First call returns 0, then step, 2*step, ... so a loop bounded on a small
+    cap_s terminates deterministically without real sleeping.
+    """
+
+    def __init__(self, step: float):
+        self.t = -step
+        self.step = step
+
+    def __call__(self) -> float:
+        self.t += self.step
+        return self.t
+
+
+class TestServiceReadinessSignal:
+    """The core fix: gate on the service actually SERVING, not lease 'ready'."""
+
+    def _dep(self, services: dict, dep_state="active", lease_state="active"):
+        return {
+            "deployment": {"state": dep_state},
+            "leases": [{"state": lease_state, "status": {"services": services}}],
+        }
+
+    # ── _service_availability ────────────────────────────────────────
+    def test_availability_reads_ready_replicas(self):
+        dep = self._dep({"app": {"ready_replicas": 1, "available": 0}})
+        with patch.object(sp, "_api") as api:
+            api.return_value.get_deployment.return_value = dep
+            assert sp._service_availability("1") == (1, 1)
+
+    def test_availability_zero_when_not_serving(self):
+        dep = self._dep({"app": {"available": 0, "ready_replicas": 0}})
+        with patch.object(sp, "_api") as api:
+            api.return_value.get_deployment.return_value = dep
+            assert sp._service_availability("1") == (0, 1)
+
+    def test_availability_none_when_no_service_reported(self):
+        # provider hasn't reported services yet -> "keep waiting", never "ready".
+        with patch.object(sp, "_api") as api:
+            api.return_value.get_deployment.return_value = {"leases": [{"status": {}}]}
+            assert sp._service_availability("1") is None
+
+    def test_availability_survives_malformed_status(self):
+        with patch.object(sp, "_api") as api:
+            api.return_value.get_deployment.return_value = {"leases": [{"status": "starting"}]}
+            assert sp._service_availability("1") is None
+
+    # ── _deployment_dead ─────────────────────────────────────────────
+    def test_dead_true_for_closed_lease(self):
+        with patch.object(sp, "_api") as api:
+            api.return_value.get_deployment.return_value = self._dep({}, lease_state="closed")
+            assert sp._deployment_dead("1") is True
+
+    def test_dead_false_for_active(self):
+        with patch.object(sp, "_api") as api:
+            api.return_value.get_deployment.return_value = self._dep({"app": {"available": 0}})
+            assert sp._deployment_dead("1") is False
+
+    def test_dead_false_on_read_error(self):
+        # A transient API error is not "dead" -> we keep waiting, don't fail fast.
+        with patch.object(sp, "_api") as api:
+            api.return_value.get_deployment.side_effect = RuntimeError("boom")
+            assert sp._deployment_dead("1") is False
+
+    # ── _wait_ready ──────────────────────────────────────────────────
+    def test_wait_ready_true_when_service_available(self):
+        with (
+            patch.object(sp, "_deployment_dead", return_value=False),
+            patch.object(sp, "_service_availability", return_value=(1, 1)),
+            patch.object(sp.time, "sleep"),
+            patch.object(sp.time, "monotonic", _FakeClock(1)),
+        ):
+            assert sp._wait_ready("1", cap_s=60) is True
+
+    def test_wait_ready_fails_fast_on_terminal_state(self):
+        with (
+            patch.object(sp, "_deployment_dead", return_value=True),
+            patch.object(sp, "_service_availability", return_value=None),
+            patch.object(sp.time, "sleep"),
+            patch.object(sp.time, "monotonic", _FakeClock(1)),
+        ):
+            assert sp._wait_ready("1", cap_s=600) is False
+
+    def test_wait_ready_exec_fallback_when_availability_unreported(self):
+        # Provider never populates availability, but a lease-shell exec works ->
+        # the container IS running, so we must call it ready.
+        with (
+            patch.object(sp, "_deployment_dead", return_value=False),
+            patch.object(sp, "_service_availability", return_value=None),
+            patch.object(sp, "_run", return_value=_completed(stdout="ready\n")) as run,
+            patch.object(sp.time, "sleep"),
+            patch.object(sp.time, "monotonic", _FakeClock(30)),
+        ):
+            assert sp._wait_ready("1", cap_s=100) is True
+            assert run.called  # the exec fallback fired
+
+    def test_wait_ready_false_after_cap_when_never_serving(self):
+        with (
+            patch.object(sp, "_deployment_dead", return_value=False),
+            patch.object(sp, "_service_availability", return_value=(0, 1)),
+            patch.object(sp, "_run", return_value=_completed(stdout="", returncode=1)),
+            patch.object(sp.time, "sleep"),
+            patch.object(sp.time, "monotonic", _FakeClock(30)),
+        ):
+            assert sp._wait_ready("1", cap_s=100) is False
+
+
+class TestIngressCap:
+    def test_ingress_passes_when_marker_served(self):
+        with (
+            patch.object(sp, "_fetch", return_value=f"x{sp.INGRESS_BASELINE}y"),
+            patch.object(sp.time, "sleep"),
+            patch.object(sp.time, "monotonic", _FakeClock(1)),
+        ):
+            assert sp._check_ingress("1", "uri", cap_s=60) is True
+
+    def test_ingress_fails_after_cap_on_503(self):
+        # Route live but backend unregistered (503/404) -> not reachable within cap.
+        with (
+            patch.object(sp, "_fetch", return_value="503 Service Temporarily Unavailable"),
+            patch.object(sp.time, "sleep"),
+            patch.object(sp.time, "monotonic", _FakeClock(20)),
+        ):
+            assert sp._check_ingress("1", "uri", cap_s=100) is False
+
+    def test_ingress_fails_after_cap_on_connection_error(self):
+        with (
+            patch.object(sp, "_fetch", side_effect=OSError("refused")),
+            patch.object(sp.time, "sleep"),
+            patch.object(sp.time, "monotonic", _FakeClock(20)),
+        ):
+            assert sp._check_ingress("1", "uri", cap_s=100) is False
+
+
 class TestStreamCheck:
     def test_stream_fails_on_nonzero_exit(self):
         with patch.object(sp, "_run", return_value=_completed(returncode=2)):
@@ -176,8 +312,11 @@ class TestIngressCheck:
         with (
             patch.object(sp, "_fetch", side_effect=OSError("refused")),
             patch.object(sp.time, "sleep"),
+            # Control the clock so the generous cap is reached in a few iterations
+            # instead of busy-spinning for the real INGRESS_CAP_S seconds.
+            patch.object(sp.time, "monotonic", _FakeClock(20)),
         ):
-            assert sp._check_ingress("1", "uri") is False
+            assert sp._check_ingress("1", "uri", cap_s=100) is False
 
 
 class TestUpdateCheck:

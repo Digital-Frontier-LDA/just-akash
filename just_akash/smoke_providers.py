@@ -69,6 +69,15 @@ from .api import AkashConsoleAPI, _extract_dseq
 # re-reads it through the ingress to prove a new revision went live.
 INGRESS_BASELINE = "probe-baseline"
 
+# Readiness caps (seconds). These are *ceilings*, not fixed waits — a healthy
+# provider returns in well under a minute; the cap only bites on a slow or truly
+# broken one. Generous on purpose: the failures we chase are readiness LAG
+# (service available / ingress route propagation) crossing a short fixed timeout,
+# which made a fine provider look broken. Env-tunable so the ceiling can later be
+# set from observed p99 latency without a code change.
+READY_CAP_S = float(os.environ.get("SMOKE_READY_CAP_S", "240"))
+INGRESS_CAP_S = float(os.environ.get("SMOKE_INGRESS_CAP_S", "180"))
+
 # A single richer probe drives every check: alpine that runs sshd on 22 (SSH
 # transport + connect), serves the marker over HTTP on 80 (ingress + update), and
 # idles. openssh + busybox-extras (for httpd) are installed at boot -- the stock
@@ -97,15 +106,22 @@ services:
       - -c
       - |
         set -e
-        apk add --no-cache openssh busybox-extras >/dev/null 2>&1
-        mkdir -p /run/sshd /root/.ssh /www
+        # HTTP first: it only needs busybox-extras, so the ingress backend starts
+        # serving ASAP -- decoupled from the slower openssh install that used to
+        # gate it and inflate ingress readiness latency + variance.
+        apk add --no-cache busybox-extras >/dev/null 2>&1
+        mkdir -p /www
+        printf '%s' "$SMOKE_MARKER" > /www/index.html
+        busybox-extras httpd -p 80 -h /www
+        echo probe-http-up
+        # Then SSH (a separate, later install; sshd readiness is checked on its own).
+        apk add --no-cache openssh >/dev/null 2>&1
+        mkdir -p /run/sshd /root/.ssh
         echo "$SSH_PUBKEY_B64" | base64 -d > /root/.ssh/authorized_keys
         chmod 700 /root/.ssh; chmod 600 /root/.ssh/authorized_keys
         ssh-keygen -A
         sed -i 's/#\\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
         /usr/sbin/sshd
-        printf '%s' "$SMOKE_MARKER" > /www/index.html
-        busybox-extras httpd -p 80 -h /www
         echo probe-container-up
         sleep infinity
 profiles:
@@ -354,14 +370,104 @@ def _status_json(dseq: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _wait_ready(dseq: str) -> bool:
-    """Poll status until the lease reports ready."""
-    time.sleep(8)
-    for _ in range(18):
-        data = _status_json(dseq)
-        if data.get("status") == "ready" or data.get("ssh_host"):
+def _service_availability(dseq: str) -> tuple[int, int] | None:
+    """(available_replicas, service_count) from the provider's lease status.
+
+    Reads leases[].status.services[*].available / ready_replicas — the field that
+    reflects whether the container is actually SERVING, which the lease-level
+    ``status: ready`` does not (that flips the moment a manifest is accepted, long
+    before the pod is up). Returns None when no service was reported yet (can't
+    classify — keep waiting), so callers never read "unreported" as "available".
+    """
+    try:
+        dep = _api().get_deployment(dseq)
+    except Exception:  # noqa: BLE001 — a transient read error just means "keep waiting"
+        return None
+    available = 0
+    count = 0
+    saw_service = False
+    for lease in dep.get("leases") or []:
+        if not isinstance(lease, dict):
+            continue
+        status = lease.get("status")
+        services = status.get("services") if isinstance(status, dict) else None
+        if not isinstance(services, dict):
+            continue
+        for info in services.values():
+            if not isinstance(info, dict):
+                continue
+            saw_service = True
+            count += 1
+            # Providers populate one or both; take the larger as "serving replicas".
+            a = info.get("available")
+            rr = info.get("ready_replicas")
+            serving = max(
+                a if isinstance(a, (int, float)) else 0,
+                rr if isinstance(rr, (int, float)) else 0,
+            )
+            available += int(serving)
+    return (available, count) if saw_service else None
+
+
+def _deployment_dead(dseq: str) -> bool:
+    """True only if the deployment/lease is in a terminal state it can't recover
+    from (closed, or escrow exhausted) — so readiness waits fail FAST instead of
+    burning the whole cap. A transient read error is NOT treated as dead."""
+    try:
+        dep = _api().get_deployment(dseq)
+    except Exception:  # noqa: BLE001
+        return False
+    states: list = []
+    d = dep.get("deployment") if isinstance(dep, dict) else None
+    if isinstance(d, dict):
+        states.append(d.get("state"))
+    for lease in dep.get("leases") or []:
+        if isinstance(lease, dict):
+            states.append(lease.get("state"))
+    dead = {"closed", "insufficient_funds", "insufficientfunds"}
+    return any(isinstance(s, str) and s.lower() in dead for s in states)
+
+
+def _wait_ready(dseq: str, cap_s: float = READY_CAP_S) -> bool:
+    """Wait until the container is genuinely SERVING, not just lease-'ready'.
+
+    The lease flips to ``status: ready`` the moment the provider accepts a
+    manifest — well before the pod is scheduled and serving — so gating on that
+    is exactly why a healthy provider looked "ready" and then failed every
+    downstream check. We instead gate on the service's reported availability
+    (ready_replicas/available >= 1), with a lease-shell exec as a fallback for
+    providers that don't populate availability (a working exec proves the
+    container is running). Fails FAST on a terminal deployment state, and waits
+    up to a generous cap otherwise so readiness LAG isn't misread as failure.
+    """
+    start = time.monotonic()
+    time.sleep(6)
+    last_exec_probe = 0.0
+    while time.monotonic() - start < cap_s:
+        elapsed = int(time.monotonic() - start)
+        if _deployment_dead(dseq):
+            print(f"  {RED}deployment reached a terminal state{RESET} after {elapsed}s")
+            return False
+        avail = _service_availability(dseq)
+        if avail is not None and avail[0] >= 1:
+            print(f"  service available ({avail[0]}/{avail[1]}) after {elapsed}s")
             return True
-        time.sleep(5)
+        # Fallback ~every 30s: a working lease-shell exec proves the container is
+        # up even when the provider never populates availability.
+        now = time.monotonic()
+        if now - last_exec_probe >= 30:
+            last_exec_probe = now
+            r = _run(
+                f"uv run just-akash exec 'echo ready' --dseq {q(dseq)} --transport lease-shell",
+                timeout=25,
+            )
+            if r.returncode == 0 and "ready" in (r.stdout or ""):
+                print(
+                    f"  container exec-ready after {int(now - start)}s (availability unreported)"
+                )
+                return True
+        time.sleep(6)
+    print(f"  {RED}not serving within {int(cap_s)}s{RESET}")
     return False
 
 
@@ -548,15 +654,27 @@ def _check_connect(dseq: str, key: str) -> bool:
     return r.returncode == 0 and marker in (r.stdout or "")
 
 
-def _check_ingress(dseq: str, uri: str) -> bool:
-    """The provider routes the exposed HTTP port to the container's httpd."""
-    for _ in range(15):
+def _check_ingress(dseq: str, uri: str, cap_s: float = INGRESS_CAP_S) -> bool:
+    """The provider routes the exposed HTTP port to the container's httpd.
+
+    Polls the ingress for the marker up to a generous cap. Route propagation
+    (the ingress controller registering the container as a healthy backend) lags
+    behind the service becoming available, and returns 404/503 in the meantime —
+    a short fixed budget here is a top cause of false ingress FAILs.
+    """
+    start = time.monotonic()
+    last = ""
+    while time.monotonic() - start < cap_s:
         try:
-            if INGRESS_BASELINE in _fetch(uri):
+            body = _fetch(uri)
+            if INGRESS_BASELINE in body:
+                print(f"  ingress reachable after {int(time.monotonic() - start)}s")
                 return True
-        except (urllib.error.URLError, OSError):
-            pass
-        time.sleep(8)
+            last = body[:60].replace("\n", " ")
+        except (urllib.error.URLError, OSError) as e:
+            last = str(e)[:60]
+        time.sleep(6)
+    print(f"  {RED}ingress not reachable within {int(cap_s)}s{RESET} (last: {last!r})")
     return False
 
 
@@ -571,15 +689,18 @@ def _check_update(dseq: str, sdl_path: str, uri: str) -> bool:
     )
     if r.returncode != 0:
         return False
-    # The container restarts (and reinstalls openssh/busybox-extras), so give it
-    # room before the new marker appears at the ingress.
-    for _ in range(20):
+    # The container restarts (and reinstalls its packages), so give it room —
+    # same generous cap as the initial ingress check — before the new marker
+    # appears at the ingress.
+    start = time.monotonic()
+    while time.monotonic() - start < INGRESS_CAP_S:
         try:
             if token in _fetch(uri):
+                print(f"  update live at ingress after {int(time.monotonic() - start)}s")
                 return True
         except (urllib.error.URLError, OSError):
             pass
-        time.sleep(8)
+        time.sleep(6)
     return False
 
 

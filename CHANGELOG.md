@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.11.0] — 2026-07-14
+
+### Fixed
+- **Smoke test no longer false-FAILs on provider readiness lag** (the "flaky provider" mystery). Investigating intermittent per-provider failures showed the cause was *our own impatience against fixed timeouts*, not broken providers: the failing provider hopped between runs and every failure was a readiness/timing check. Root causes, all fixed:
+  - **Gate on real availability, not lease `status: ready`.** The lease flips to `ready` the moment a manifest is accepted — long before the container serves — so downstream checks ran against a not-yet-serving service. `_wait_ready` now gates on the service's reported availability (`ready_replicas`/`available` ≥ 1), with a working lease-shell exec as a fallback for providers that don't populate it, and **fails fast** on a terminal deployment state (closed / out of escrow) instead of burning the whole cap.
+  - **Generous, env-tunable caps** replace short fixed poll counts: `SMOKE_READY_CAP_S` (default 240s) and `SMOKE_INGRESS_CAP_S` (default 180s). These are *ceilings* — a healthy provider still returns in seconds. Proven live: a provider whose ingress route took **129s** to propagate — 9s past the old 120s cap — now PASSES instead of failing ingress and cascading to update.
+  - **The probe brings up its HTTP server before the openssh install**, so ingress readiness is decoupled from (and no longer inflated by) the slower `apk add openssh`.
+  - Every readiness/ingress/update check now logs how long it actually took (`service available after Ns`, `ingress reachable after Ns`) — the first step toward latency telemetry and data-driven (percentile) timeouts.
+- Tests: 884 passing (+16) — availability parsing (incl. malformed responses), terminal-state fail-fast, the exec fallback, cap exhaustion, and the ingress cap; also fixed a test-only busy-spin the new time-based loops introduced.
+
+---
+
 ## [1.10.0] — 2026-07-13
 
 ### Added
