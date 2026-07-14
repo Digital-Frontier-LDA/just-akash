@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.10.0] — 2026-07-13
+
+### Added
+- **In-job leak safety net for the daily smoke workflow** — the CI job could still leak an Akash deployment on a hard-kill: its `timeout-minutes` was on the **job**, so a job timeout cancelled everything and no cleanup could run, leaving a live probe until the next day's startup sweep (~24h escrow drain). Now the timeout is on the **smoke step**, and an `if: always()` **"Reap any leaked probe"** step runs after it — even on failure or cancellation — so a probe left behind (step timeout, crash, or a kill after create-on-chain but before the dseq was recorded) is destroyed **in the same run, within seconds** instead of ~24h. Only a runner-infra death (rare) still falls through to the daily startup sweep.
+- **`--min-age SECONDS` on `smoke-providers`** (default 3600) — lets the end-of-job cleanup pass `--min-age 0` to reap *this* run's own fresh probe, which the 1h age floor (there to spare a concurrent run's live probe) would otherwise skip. Safe because the workflow's `concurrency` serializes runs, so no other run is ever in flight. Non-negative/finite-validated; still reaps only service-`probe` deployments, never real workloads (validated live against an account holding `train` + `runner`).
+- Tests: 45 sweep tests (+1) covering the `--min-age 0` fresh-probe path (and confirming a fresh `runner` is still never reaped).
+
+---
+
 ## [1.9.1] — 2026-07-13
 
 ### Fixed
