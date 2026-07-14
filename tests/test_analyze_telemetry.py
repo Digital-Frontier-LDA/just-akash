@@ -29,7 +29,9 @@ class TestPercentile:
 class TestMedianMad:
     def test_median_and_mad(self):
         # values 1,2,4,8 -> median 3.0; abs devs 2,1,1,5 -> MAD median 1.5
-        med, mad = at._median_and_mad([1, 2, 4, 8])
+        result = at._median_and_mad([1, 2, 4, 8])
+        assert result is not None
+        med, mad = result
         assert med == 3.0
         assert mad == 1.5
 
