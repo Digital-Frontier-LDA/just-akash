@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.12.0] — 2026-07-14
+
+### Added
+- **Latency telemetry for the smoke test** — `--telemetry-file PATH` (or `SMOKE_TELEMETRY_FILE`) appends one JSON line per (provider, feature): `{ts, version, provider, feature, outcome, latency_ms, dseq}`, plus a `ready` row (time-to-serving). Pass/fail is the lagging binary; **latency is the leading signal**. The daily workflow now emits this and uploads it as a 90-day artifact — kept even when the run fails, since a red run's latencies are exactly what you want to inspect. This is the foundation for setting timeouts from observed **p99** and detecting regressions with robust stats (median ± k·MAD / success-rate SLO), rather than a fixed cliff or a Gaussian `avg+3σ` that does not fit heavy-tailed latency. One real run already shows why: `ingress` measured **0.4s on one provider and 129s on another** — a ~300× spread that only percentiles/robust limits handle correctly. Best-effort: a telemetry write failure never fails the run.
+- Tests: 894 passing (+4) — record shape (incl. unreached-feature `None` latency), JSONL append + parent-dir creation, best-effort on an unwritable path, and end-to-end record emission from `smoke_provider`.
+
+---
+
 ## [1.11.1] — 2026-07-14
 
 ### Fixed

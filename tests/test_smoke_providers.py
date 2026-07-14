@@ -341,6 +341,70 @@ class TestUpdateCheck:
             assert sp._check_update("123456", "/sdl", "uri") is True
 
 
+class TestTelemetry:
+    def test_provider_records_one_per_feature(self):
+        results = {"deploy": "PASS", "status": "PASS", "ready": "PASS"}
+        latencies = {"deploy": 4200, "status": 120, "ready": 41000}
+        recs = sp._provider_records("prov", "123", results, latencies)
+        assert len(recs) == len(sp._TELEMETRY_FEATURES)
+        by = {r["feature"]: r for r in recs}
+        assert by["deploy"] == {
+            "provider": "prov",
+            "feature": "deploy",
+            "outcome": "PASS",
+            "latency_ms": 4200,
+            "dseq": "123",
+        }
+        assert by["ready"]["latency_ms"] == 41000
+        # a feature never reached -> outcome "-" and latency None
+        assert by["ingress"]["outcome"] == "-"
+        assert by["ingress"]["latency_ms"] is None
+
+    def test_write_telemetry_appends_jsonl_and_creates_parent(self, tmp_path):
+        import json as j
+
+        target = tmp_path / "sub" / "telemetry.jsonl"  # parent dir created
+        path = str(target)
+        rec = {
+            "provider": "p",
+            "feature": "deploy",
+            "outcome": "PASS",
+            "latency_ms": 10,
+            "dseq": "1",
+        }
+        sp._write_telemetry(path, "2026-07-14T00:00:00+00:00", "9.9.9", [rec])
+        sp._write_telemetry(path, "2026-07-14T01:00:00+00:00", "9.9.9", [rec])  # append
+        lines = target.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) == 2  # appended, not overwritten
+        assert j.loads(lines[0]) == {
+            "ts": "2026-07-14T00:00:00+00:00",
+            "version": "9.9.9",
+            **rec,
+        }
+
+    def test_write_telemetry_best_effort_on_error(self, tmp_path, capsys):
+        # An unwritable path must NOT raise — telemetry can never break the run.
+        blocker = tmp_path / "blocker"
+        blocker.write_text("i am a file, not a dir")
+        sp._write_telemetry(str(blocker / "telemetry.jsonl"), "t", "v", [{"a": 1}])
+        assert "telemetry write failed" in capsys.readouterr().out
+
+    def test_smoke_provider_emits_records_on_nobid(self):
+        records: list = []
+        with (
+            patch.object(sp, "_deploy", return_value=(None, "no-bid")),
+            patch.object(sp, "install_signal_cleanup"),
+            patch.object(sp, "robust_destroy"),
+        ):
+            sp.smoke_provider("prov", "/sdl", "/key", records=records)
+        by = {r["feature"]: r for r in records}
+        assert len(records) == len(sp._TELEMETRY_FEATURES)
+        assert by["deploy"]["outcome"] == "NO-BID"
+        assert by["deploy"]["latency_ms"] is not None  # deploy was timed
+        assert by["status"]["outcome"] == "-"  # never reached
+        assert by["status"]["latency_ms"] is None
+
+
 class TestOrphanProbeSweep:
     """The startup sweep that reaps probes leaked by a hard-killed prior run.
 

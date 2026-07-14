@@ -70,7 +70,22 @@ jobs:
           AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
           AKASH_PROVIDERS: ${{ secrets.AKASH_PROVIDERS }}
           AKASH_PROVIDERS_BACKUP: ${{ secrets.AKASH_PROVIDERS_BACKUP }}
+          # Per-(provider,feature) outcome + latency, one JSON line each. Uploaded
+          # as an artifact below; aggregate across runs to set percentile timeouts
+          # and detect latency/success-rate regressions.
+          SMOKE_TELEMETRY_FILE: ${{ github.workspace }}/smoke-telemetry.jsonl
         run: uv run python -m just_akash.smoke_providers ${{ inputs.all && '--all' || '' }}
+
+      # Keep the run's latency/outcome telemetry even when the smoke step fails
+      # (a red run's latencies are exactly what we want to inspect).
+      - name: Upload smoke telemetry
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-telemetry-${{ github.run_id }}
+          path: ${{ github.workspace }}/smoke-telemetry.jsonl
+          if-no-files-found: ignore
+          retention-days: 90
 
       # Safety net: reap any probe the smoke step leaked (step timeout, crash, or
       # a kill after create-on-chain but before the dseq was recorded, so the
