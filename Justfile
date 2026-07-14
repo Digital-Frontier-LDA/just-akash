@@ -310,10 +310,10 @@ smoke-telemetry-report file="":
         uv run python -m just_akash.analyze_telemetry "{{file}}"
     else
         tmp="$(mktemp)"
-        git fetch origin telemetry >/dev/null 2>&1 || { echo "no telemetry branch yet"; exit 0; }
+        trap 'rm -f "$tmp"' EXIT   # clean up on every exit path, not just success
+        if ! git fetch origin telemetry >/dev/null 2>&1; then echo "no telemetry branch yet"; exit 0; fi
         git show origin/telemetry:smoke-latency.jsonl > "$tmp"
         uv run python -m just_akash.analyze_telemetry "$tmp"
-        rm -f "$tmp"
     fi
 
 # ── Lint & Quality ───────────────────────────────────

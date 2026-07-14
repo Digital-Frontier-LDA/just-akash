@@ -77,13 +77,35 @@ class TestAggregate:
         assert g["other"] == 1
         assert g["p99"] is None
 
+    def test_pass_rate_excludes_nobid_and_unreached(self):
+        # NO-BID and "-" are not failures -> excluded from the rate denominator.
+        recs = [
+            self._rec("p", "ingress", "PASS", 100),
+            self._rec("p", "ingress", "-", None),  # never reached (deploy no-bid)
+            self._rec("p", "ingress", "NO-BID", None),
+        ]
+        g = at.aggregate(recs)[("p", "ingress")]
+        assert g["attempts"] == 1  # only the PASS is a real attempt
+        assert g["pass_rate"] == 1.0  # 1/1, not 1/3
+
+    def test_pass_rate_none_with_zero_attempts(self):
+        g = at.aggregate([self._rec("p", "ingress", "NO-BID", None)])[("p", "ingress")]
+        assert g["attempts"] == 0
+        assert g["pass_rate"] is None
+
 
 class TestSloBreaches:
-    def _g(self, count, passes):
-        return {"count": count, "pass": passes, "pass_rate": passes / count}
+    def _g(self, attempts, passes):
+        fails = attempts - passes
+        return {
+            "attempts": attempts,
+            "pass": passes,
+            "fail": fails,
+            "pass_rate": (passes / attempts) if attempts else None,
+        }
 
     def test_respects_min_samples(self):
-        groups = {("p", "ingress"): self._g(3, 1)}  # 33% but only 3 samples
+        groups = {("p", "ingress"): self._g(3, 1)}  # 33% but only 3 attempts
         assert at.slo_breaches(groups, min_samples=20, slo=0.95) == []
 
     def test_flags_below_slo_with_enough_samples(self):
@@ -94,6 +116,11 @@ class TestSloBreaches:
     def test_ok_above_slo(self):
         groups = {("p", "ingress"): self._g(20, 20)}
         assert at.slo_breaches(groups, min_samples=20, slo=0.95) == []
+
+    def test_zero_attempts_never_breaches(self):
+        # NO-BID-only feature (attempts=0, pass_rate None) must not trip --check.
+        groups = {("p", "ingress"): self._g(0, 0)}
+        assert at.slo_breaches(groups, min_samples=1, slo=0.95) == []
 
 
 class TestReportAndMain:

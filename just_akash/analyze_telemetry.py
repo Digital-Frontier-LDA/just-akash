@@ -124,7 +124,12 @@ def aggregate(records: list[dict]) -> dict[tuple[str, str], dict]:
             g["other"] += 1
     for key, g in groups.items():
         lats = g["latencies"]
-        g["pass_rate"] = (g["pass"] / g["count"]) if g["count"] else 0.0
+        # Success rate is over ATTEMPTS (pass + fail), not total records: NO-BID
+        # and "-" (feature never reached) are explicitly not failures in
+        # smoke_providers, so counting them in the denominator would understate a
+        # provider that simply didn't bid. None when there were no real attempts.
+        g["attempts"] = g["pass"] + g["fail"]
+        g["pass_rate"] = (g["pass"] / g["attempts"]) if g["attempts"] else None
         g["p50"] = _percentile(lats, 50)
         g["p95"] = _percentile(lats, 95)
         g["p99"] = _percentile(lats, 99)
@@ -144,21 +149,23 @@ def _fmt_ms(v: float | None) -> str:
 def format_report(groups: dict[tuple[str, str], dict]) -> str:
     """A human-readable table, sorted by provider then feature."""
     lines = [
-        f"{'provider':<14} {'feature':<9} {'N':>3} {'pass%':>6} "
+        "(att = pass+fail attempts; NO-BID / '-' excluded from the rate)",
+        f"{'provider':<14} {'feature':<9} {'att':>3} {'pass%':>6} "
         f"{'p50':>8} {'p95':>8} {'p99':>8} {'max':>8}  flags",
         "-" * 82,
     ]
     for (provider, feature), g in sorted(groups.items()):
         flags = []
-        if g["count"] and g["pass_rate"] < DEFAULT_SLO:
-            flags.append(f"LOW-PASS({g['pass']}/{g['count']})")
+        pr = g["pass_rate"]
+        if g["attempts"] and pr is not None and pr < DEFAULT_SLO:
+            flags.append(f"LOW-PASS({g['pass']}/{g['attempts']})")
         cap = g.get("cap_ms")
         p99 = g.get("p99")
         if cap and p99 is not None and p99 > _CAP_TIGHT_FRACTION * cap:
             flags.append(f"p99>{int(_CAP_TIGHT_FRACTION * 100)}%-of-cap({_fmt_ms(cap)})")
+        pass_str = f"{pr * 100:>5.0f}%" if pr is not None else "  n/a"
         lines.append(
-            f"{provider[:14]:<14} {feature:<9} {g['count']:>3} "
-            f"{g['pass_rate'] * 100:>5.0f}% "
+            f"{provider[:14]:<14} {feature:<9} {g['attempts']:>3} {pass_str} "
             f"{_fmt_ms(g['p50']):>8} {_fmt_ms(g['p95']):>8} "
             f"{_fmt_ms(g['p99']):>8} {_fmt_ms(g['max']):>8}  {' '.join(flags)}"
         )
@@ -168,13 +175,15 @@ def format_report(groups: dict[tuple[str, str], dict]) -> str:
 def slo_breaches(
     groups: dict[tuple[str, str], dict], min_samples: int, slo: float
 ) -> list[tuple[str, str, float, int]]:
-    """(provider, feature, pass_rate, count) for groups that have ENOUGH samples
-    and a pass rate below the SLO. The min_samples gate stops a 1/2 blip on a
-    tiny sample from tripping — you cannot judge reliability from noise."""
+    """(provider, feature, pass_rate, attempts) for groups with ENOUGH real
+    attempts (pass+fail, so NO-BID/- never trip it) and a pass rate below the
+    SLO. The min_samples gate stops a small-sample blip from tripping — you
+    cannot judge reliability from noise."""
     out = []
     for (provider, feature), g in sorted(groups.items()):
-        if g["count"] >= min_samples and g["pass_rate"] < slo:
-            out.append((provider, feature, g["pass_rate"], g["count"]))
+        pr = g["pass_rate"]
+        if g["attempts"] >= min_samples and pr is not None and pr < slo:
+            out.append((provider, feature, pr, g["attempts"]))
     return out
 
 
