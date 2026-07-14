@@ -132,3 +132,35 @@ jobs:
           SRC: dl/smoke-telemetry.jsonl
           RUN_ID: ${{ github.run_id }}
         run: bash .github/scripts/accrue-telemetry.sh
+
+  # Track the metrics in CI: aggregate the ACCRUED data (all runs) into
+  # per-(provider,feature) success rate + p50/p95/p99 and print it every run, and
+  # gate on it. Checks out main (which has the analyzer; the telemetry branch is
+  # data-only) and reads the accrued JSONL via `git show`. The analyzer is pure
+  # stdlib, so no dependency install is needed.
+  report:
+    name: Telemetry report + SLO gate
+    needs: accrue
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Aggregate + SLO gate
+        # Currently INFORMATIONAL (continue-on-error): it prints the table and any
+        # reliability/latency breaches but does not fail the run. Once ~2-3 days
+        # have accrued and p99s are stable: set SMOKE_LATENCY_SLO_P95 (e.g.
+        # "ready=45000,ingress=15000" from the observed p99 + margin) and REMOVE
+        # `continue-on-error` to actually fail a provider that's too slow / too
+        # unreliable — the "fail slow providers" gate.
+        continue-on-error: true
+        env:
+          SMOKE_LATENCY_SLO_P95: "" # empty = latency gate off until thresholds set
+          SMOKE_SLO_MIN_SAMPLES: "20"
+        run: |
+          if ! git fetch origin telemetry >/dev/null 2>&1; then
+            echo "no telemetry branch yet — nothing to report"; exit 0
+          fi
+          git show origin/telemetry:smoke-latency.jsonl > accrued.jsonl
+          python3 -m just_akash.analyze_telemetry accrued.jsonl \
+            --check --min-samples "$SMOKE_SLO_MIN_SAMPLES" --slo 0.95 \
+            --max-p95 "$SMOKE_LATENCY_SLO_P95"
