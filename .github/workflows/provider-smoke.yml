@@ -146,6 +146,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5 # pin the interpreter (module uses 3.10+ typing)
+        with:
+          python-version: "3.13"
       - name: Aggregate + SLO gate
         # Currently INFORMATIONAL (continue-on-error): it prints the table and any
         # reliability/latency breaches but does not fail the run. Once ~2-3 days

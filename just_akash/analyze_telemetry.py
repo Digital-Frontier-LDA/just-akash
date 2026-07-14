@@ -237,7 +237,9 @@ def main(argv: list[str] | None = None) -> int:
         "--check",
         action="store_true",
         help="Exit non-zero on a reliability breach (pass rate < --slo) or, when "
-        "--max-p95 is set, a latency breach — for any feature with >= --min-samples.",
+        "--max-p95 is set, a latency breach. --min-samples gates each with the "
+        "relevant count: attempts (pass+fail) for reliability, PASS-latency "
+        "samples for the p95 ceiling.",
     )
     ap.add_argument(
         "--min-samples", type=int, default=20, help="Min samples before --check judges"
@@ -274,7 +276,7 @@ def main(argv: list[str] | None = None) -> int:
         breaches = slo_breaches(groups, args.min_samples, args.slo)
         if breaches:
             failed = True
-            print(f"\nRELIABILITY breach (>= {args.min_samples} samples, < {args.slo:.0%} pass):")
+            print(f"\nRELIABILITY breach (>= {args.min_samples} attempts, < {args.slo:.0%} pass):")
             for provider, feature, rate, count in breaches:
                 print(f"  {provider} {feature}: {rate:.0%} over {count} runs")
 
