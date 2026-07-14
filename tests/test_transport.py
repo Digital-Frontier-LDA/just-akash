@@ -218,6 +218,7 @@ class TestLeaseShellTransportStub:
         with (
             patch.object(t, "exec", side_effect=[0, 0]),
             patch.object(t, "_exec_shell_command", return_value=0),
+            patch.object(t, "_exec_with_stdin_command", return_value=0),
         ):
             t.inject("/tmp/x", "content")
 

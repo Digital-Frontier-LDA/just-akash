@@ -995,6 +995,7 @@ class TestNotImplementedMethods:
         with (
             patch.object(transport, "exec", side_effect=[0, 0]),
             patch.object(transport, "_exec_shell_command", return_value=0),
+            patch.object(transport, "_exec_with_stdin_command", return_value=0),
         ):
             transport.inject("/tmp/file", "content")
 

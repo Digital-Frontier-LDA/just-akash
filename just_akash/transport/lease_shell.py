@@ -713,9 +713,15 @@ class LeaseShellTransport(Transport):
             if rc != 0:
                 raise RuntimeError(f"Failed to create directory for {remote_path}: exit {rc}")
 
-        encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
-        shell_cmd = f"echo {encoded} | base64 -d > {shlex.quote(remote_path)}"
-        rc = self._exec_shell_command(shell_cmd)
+        # Stream the payload over stdin (a 104 stdin data frame) instead of
+        # embedding it in the shell command. The command carried in the URL
+        # (`cmd2=`) is provider-proxy-logged, so an `echo <base64> | base64 -d`
+        # write would leak the (trivially reversible) secret into those logs.
+        # `cat > path` keeps the URL secret-free; the content rides the stdin
+        # frame, which is not part of the URL/argv.
+        rc = self._exec_with_stdin_command(
+            f"cat > {shlex.quote(remote_path)}", content.encode("utf-8")
+        )
         if rc != 0:
             raise RuntimeError(f"Failed to write {remote_path}: exit {rc}")
 
