@@ -189,6 +189,12 @@ class TestLatencySlo:
         with pytest.raises(ValueError):
             at.parse_thresholds("ready")  # missing '=ms'
 
+    def test_parse_thresholds_rejects_non_finite_or_nonpositive(self):
+        # NaN would silently disable the gate (p95 > nan is always False).
+        for bad in ("ready=nan", "ready=inf", "ready=0", "ready=-5"):
+            with pytest.raises(ValueError):
+                at.parse_thresholds(bad)
+
     def _g(self, p95, n_lat):
         return {"p95": p95, "n_lat": n_lat, "attempts": n_lat}
 

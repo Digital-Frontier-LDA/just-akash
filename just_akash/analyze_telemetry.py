@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 
 # Feature -> the configured cap (ms) it is bounded by, so the report can flag a
@@ -201,11 +202,16 @@ def parse_thresholds(spec: str) -> dict[str, float]:
         if not sep or not feat.strip():
             raise ValueError(f"bad --max-p95 entry {part!r} (expected feature=ms)")
         try:
-            out[feat.strip()] = float(ms)
+            val = float(ms)
         except ValueError:
             raise ValueError(
                 f"bad --max-p95 entry {part!r}: {ms.strip()!r} is not a number of ms"
             ) from None
+        # Reject NaN/inf/<=0: a non-finite ceiling silently disables the gate
+        # (p95 > nan is always False), which is the opposite of what was asked.
+        if not math.isfinite(val) or val <= 0:
+            raise ValueError(f"bad --max-p95 entry {part!r}: ceiling must be a positive, finite ms")
+        out[feat.strip()] = val
     return out
 
 
@@ -225,7 +231,8 @@ def latency_breaches(
     for (provider, feature), g in sorted(groups.items()):
         thr = thresholds_ms.get(feature)
         p95 = g.get("p95")
-        if thr is not None and p95 is not None and g["n_lat"] >= min_samples and p95 > thr:
+        n_lat = g.get("n_lat", 0)
+        if thr is not None and p95 is not None and n_lat >= min_samples and p95 > thr:
             out.append((provider, feature, p95, thr))
     return out
 
