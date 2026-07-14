@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.14.0] — 2026-07-14
+
+### Added
+- **Latency SLO gate — "fail providers that are too slow", not just broken.** `analyze_telemetry` gains `--max-p95 "ready=45000,ingress=15000"`: with `--check`, a provider whose p95 for a feature exceeds the ceiling (over enough accrued runs) fails — distinct from a functional failure. It keys off the **p95 percentile over the accrued dataset** — a provider is "too slow" when it's *consistently* slow, not on one unlucky run — so noise can't trip it (NO-BID/`-` rows carry no latency and never enter the percentile). The reliability check is renamed `RELIABILITY breach`, and the two gates combine under one `--check`.
+- **CI tracks *and* gates the metrics.** A new `report` job aggregates the accrued telemetry every run and prints the per-(provider, feature) percentile table in the workflow log, then runs the SLO gate. Kept **informational** (`continue-on-error`) during the accumulation window; once ~2-3 days of data has stabilized, set `SMOKE_LATENCY_SLO_P95` from the observed p99 + margin and drop `continue-on-error` to actually fail a too-slow provider.
+- Tests: 923 passing (+12) — threshold parsing (incl. malformed input), latency-breach detection with the min-sample gate, and the combined `--check` (reliability + latency) exit codes. Demonstrated live: a provider with `ready` p95 40s fails a 30s ceiling while a 7s provider passes.
+
+---
+
 ## [1.13.0] — 2026-07-14
 
 ### Added

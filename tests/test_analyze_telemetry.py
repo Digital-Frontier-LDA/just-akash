@@ -149,7 +149,72 @@ class TestReportAndMain:
         f.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
         rc = at.main([str(f), "--check", "--min-samples", "20"])
         assert rc == 1
-        assert "SLO breach" in capsys.readouterr().out
+        assert "RELIABILITY breach" in capsys.readouterr().out
+
+    def test_main_check_fails_on_slow_p95(self, tmp_path, capsys):
+        # 20 PASS ingress at 50s -> p95 ~50s, over a 10s ceiling -> too slow.
+        rows = [
+            {"provider": "p", "feature": "ingress", "outcome": "PASS", "latency_ms": 50000}
+            for _ in range(20)
+        ]
+        f = tmp_path / "t.jsonl"
+        f.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+        rc = at.main([str(f), "--check", "--min-samples", "20", "--max-p95", "ingress=10000"])
+        assert rc == 1
+        assert "TOO SLOW" in capsys.readouterr().out
+
+    def test_main_check_ok_when_within_ceiling(self, tmp_path):
+        rows = [
+            {"provider": "p", "feature": "ingress", "outcome": "PASS", "latency_ms": 400}
+            for _ in range(20)
+        ]
+        f = tmp_path / "t.jsonl"
+        f.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+        assert (
+            at.main([str(f), "--check", "--min-samples", "20", "--max-p95", "ingress=10000"]) == 0
+        )
+
+
+class TestLatencySlo:
+    def test_parse_thresholds(self):
+        assert at.parse_thresholds("ready=45000, ingress=15000") == {
+            "ready": 45000.0,
+            "ingress": 15000.0,
+        }
+
+    def test_parse_thresholds_empty(self):
+        assert at.parse_thresholds("") == {}
+
+    def test_parse_thresholds_malformed_raises(self):
+        with pytest.raises(ValueError):
+            at.parse_thresholds("ready")  # missing '=ms'
+
+    def test_parse_thresholds_rejects_non_finite_or_nonpositive(self):
+        # NaN would silently disable the gate (p95 > nan is always False).
+        for bad in ("ready=nan", "ready=inf", "ready=0", "ready=-5"):
+            with pytest.raises(ValueError):
+                at.parse_thresholds(bad)
+
+    def _g(self, p95, n_lat):
+        return {"p95": p95, "n_lat": n_lat, "attempts": n_lat}
+
+    def test_flags_slow_p95_with_enough_samples(self):
+        groups = {("p", "ready"): self._g(50000, 20)}
+        assert at.latency_breaches(groups, {"ready": 30000}, min_samples=20) == [
+            ("p", "ready", 50000, 30000)
+        ]
+
+    def test_respects_min_samples(self):
+        groups = {("p", "ready"): self._g(50000, 5)}  # slow but only 5 samples
+        assert at.latency_breaches(groups, {"ready": 30000}, min_samples=20) == []
+
+    def test_feature_without_threshold_never_flagged(self):
+        groups = {("p", "exec"): self._g(50000, 20)}
+        assert at.latency_breaches(groups, {"ready": 30000}, min_samples=20) == []
+
+    def test_within_ceiling_ok(self):
+        groups = {("p", "ready"): self._g(20000, 20)}
+        assert at.latency_breaches(groups, {"ready": 30000}, min_samples=20) == []
 
     def test_main_no_records_is_ok(self, tmp_path):
         f = tmp_path / "empty.jsonl"

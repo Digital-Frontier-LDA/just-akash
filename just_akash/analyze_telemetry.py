@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 
 # Feature -> the configured cap (ms) it is bounded by, so the report can flag a
@@ -130,6 +131,7 @@ def aggregate(records: list[dict]) -> dict[tuple[str, str], dict]:
         # provider that simply didn't bid. None when there were no real attempts.
         g["attempts"] = g["pass"] + g["fail"]
         g["pass_rate"] = (g["pass"] / g["attempts"]) if g["attempts"] else None
+        g["n_lat"] = len(lats)  # latency-sample count (PASS with a number)
         g["p50"] = _percentile(lats, 50)
         g["p95"] = _percentile(lats, 95)
         g["p99"] = _percentile(lats, 99)
@@ -187,18 +189,79 @@ def slo_breaches(
     return out
 
 
+def parse_thresholds(spec: str) -> dict[str, float]:
+    """Parse ``"ready=30000,ingress=10000"`` into ``{feature: max_ms}``. Raises
+    ValueError on a malformed entry so a typo in CI config fails loudly rather
+    than silently disabling the latency gate."""
+    out: dict[str, float] = {}
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        feat, sep, ms = part.partition("=")
+        if not sep or not feat.strip():
+            raise ValueError(f"bad --max-p95 entry {part!r} (expected feature=ms)")
+        try:
+            val = float(ms)
+        except ValueError:
+            raise ValueError(
+                f"bad --max-p95 entry {part!r}: {ms.strip()!r} is not a number of ms"
+            ) from None
+        # Reject NaN/inf/<=0: a non-finite ceiling silently disables the gate
+        # (p95 > nan is always False), which is the opposite of what was asked.
+        if not math.isfinite(val) or val <= 0:
+            raise ValueError(
+                f"bad --max-p95 entry {part!r}: ceiling must be a positive, finite ms"
+            )
+        out[feat.strip()] = val
+    return out
+
+
+def latency_breaches(
+    groups: dict[tuple[str, str], dict],
+    thresholds_ms: dict[str, float],
+    min_samples: int,
+) -> list[tuple[str, str, float, float]]:
+    """(provider, feature, p95_ms, threshold_ms) for groups whose p95 latency
+    exceeds the per-feature threshold, with enough latency samples.
+
+    Keys off the p95 percentile over accrued runs — a provider is "too slow"
+    when it is CONSISTENTLY slow, not on a single unlucky run — so this must run
+    against the accrued dataset, not one run. NO-BID/- rows carry no latency and
+    never enter the percentile, so they can't trip it."""
+    out = []
+    for (provider, feature), g in sorted(groups.items()):
+        thr = thresholds_ms.get(feature)
+        p95 = g.get("p95")
+        n_lat = g.get("n_lat", 0)
+        if thr is not None and p95 is not None and n_lat >= min_samples and p95 > thr:
+            out.append((provider, feature, p95, thr))
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Aggregate smoke-test latency telemetry.")
     ap.add_argument("path", help="Path to the telemetry JSONL file")
     ap.add_argument(
         "--check",
         action="store_true",
-        help="Exit non-zero if any feature with >= --min-samples is below --slo",
+        help="Exit non-zero on a reliability breach (pass rate < --slo) or, when "
+        "--max-p95 is set, a latency breach. --min-samples gates each with the "
+        "relevant count: attempts (pass+fail) for reliability, PASS-latency "
+        "samples for the p95 ceiling.",
     )
     ap.add_argument(
         "--min-samples", type=int, default=20, help="Min samples before --check judges"
     )
     ap.add_argument("--slo", type=float, default=DEFAULT_SLO, help="Success-rate floor (0-1)")
+    ap.add_argument(
+        "--max-p95",
+        metavar="SPEC",
+        default="",
+        help='Per-feature p95 latency ceiling in ms, e.g. "ready=45000,ingress=15000". '
+        "With --check, a provider whose p95 for a feature exceeds it (over enough "
+        "runs) fails -- the 'too slow, not broken' gate. Set from accrued p99+margin.",
+    )
     args = ap.parse_args(argv)
 
     try:
@@ -218,13 +281,30 @@ def main(argv: list[str] | None = None) -> int:
     print(format_report(groups))
 
     if args.check:
+        failed = False
         breaches = slo_breaches(groups, args.min_samples, args.slo)
         if breaches:
-            print(f"\nSLO breach (>= {args.min_samples} samples, < {args.slo:.0%}):")
+            failed = True
+            print(f"\nRELIABILITY breach (>= {args.min_samples} attempts, < {args.slo:.0%} pass):")
             for provider, feature, rate, count in breaches:
-                print(f"  {provider} {feature}: {rate:.0%} over {count} runs")
+                print(f"  {provider} {feature}: {rate:.0%} over {count} attempts")
+
+        try:
+            thresholds = parse_thresholds(args.max_p95)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 2
+        if thresholds:
+            slow = latency_breaches(groups, thresholds, args.min_samples)
+            if slow:
+                failed = True
+                print(f"\nTOO SLOW — p95 over ceiling (>= {args.min_samples} latency samples):")
+                for provider, feature, p95, thr in slow:
+                    print(f"  {provider} {feature}: p95 {_fmt_ms(p95)} > {_fmt_ms(thr)}")
+
+        if failed:
             return 1
-        print(f"\nSLO OK (no feature below {args.slo:.0%} with >= {args.min_samples} samples).")
+        print(f"\nCHECK OK (pass rate >= {args.slo:.0%}; p95 within ceilings where set).")
     return 0
 
 

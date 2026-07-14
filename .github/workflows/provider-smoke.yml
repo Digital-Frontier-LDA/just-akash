@@ -132,3 +132,50 @@ jobs:
           SRC: dl/smoke-telemetry.jsonl
           RUN_ID: ${{ github.run_id }}
         run: bash .github/scripts/accrue-telemetry.sh
+
+  # Track the metrics in CI: aggregate the ACCRUED data (all runs) into
+  # per-(provider,feature) success rate + p50/p95/p99 and print it every run, and
+  # gate on it. Checks out the repo (which has the analyzer — for the scheduled
+  # runs that is the default branch; the telemetry branch is data-only) and reads
+  # the accrued JSONL via `git show`. The analyzer is pure stdlib, so no
+  # dependency install is needed.
+  report:
+    name: Telemetry report + SLO gate
+    needs: accrue
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5 # pin the interpreter (module uses 3.10+ typing)
+        with:
+          python-version: "3.13"
+      - name: Aggregate + SLO gate
+        # Currently INFORMATIONAL (continue-on-error): it prints the table and any
+        # reliability/latency breaches but does not fail the run. Once ~2-3 days
+        # have accrued and p99s are stable: set SMOKE_LATENCY_SLO_P95 (e.g.
+        # "ready=45000,ingress=15000" from the observed p99 + margin) and REMOVE
+        # `continue-on-error` to actually fail a provider that's too slow / too
+        # unreliable — the "fail slow providers" gate.
+        continue-on-error: true
+        env:
+          SMOKE_LATENCY_SLO_P95: "" # empty = latency gate off until thresholds set
+          SMOKE_SLO_MIN_SAMPLES: "20"
+        run: |
+          # Distinguish "branch doesn't exist yet" (a clean no-op) from a real
+          # network/auth failure (which must NOT be silently reported as "no
+          # branch"). This step is continue-on-error, so surfacing the failure
+          # shows a red step without failing the workflow.
+          if ! branches=$(git ls-remote --heads origin telemetry 2>&1); then
+            echo "ERROR: could not reach remote to check telemetry branch:"
+            echo "$branches"; exit 1
+          fi
+          if ! echo "$branches" | grep -q refs/heads/telemetry; then
+            echo "no telemetry branch yet — nothing to report"; exit 0
+          fi
+          # Shallow: this job only reads the tip's data file; the telemetry
+          # branch grows every run, so a full fetch would slow down over time.
+          git fetch --depth 1 origin telemetry
+          git show origin/telemetry:smoke-latency.jsonl > accrued.jsonl
+          python3 -m just_akash.analyze_telemetry accrued.jsonl \
+            --check --min-samples "$SMOKE_SLO_MIN_SAMPLES" --slo 0.95 \
+            --max-p95 "$SMOKE_LATENCY_SLO_P95"
