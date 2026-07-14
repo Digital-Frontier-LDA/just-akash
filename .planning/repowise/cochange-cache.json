@@ -1,0 +1,1214 @@
+{
+  "pairs": [
+    {
+      "file1": "CHANGELOG.md",
+      "file2": "pyproject.toml",
+      "shared_commits": 7,
+      "coupling_degree": 1
+    },
+    {
+      "file1": ".secrets.baseline",
+      "file2": "SECURITY.md",
+      "shared_commits": 3,
+      "coupling_degree": 1
+    },
+    {
+      "file1": "just_akash/deploy.py",
+      "file2": "tests/test_stale_bid_selection.py",
+      "shared_commits": 4,
+      "coupling_degree": 1
+    },
+    {
+      "file1": "just_akash/cli.py",
+      "file2": "tests/test_cli.py",
+      "shared_commits": 8,
+      "coupling_degree": 1
+    },
+    {
+      "file1": "Justfile",
+      "file2": "sdl/akash-node.yaml",
+      "shared_commits": 3,
+      "coupling_degree": 1
+    },
+    {
+      "file1": "just_akash/cli.py",
+      "file2": "just_akash/test_lifecycle.py",
+      "shared_commits": 5,
+      "coupling_degree": 1
+    },
+    {
+      "file1": "just_akash/cli.py",
+      "file2": "tests/test_deploy.py",
+      "shared_commits": 5,
+      "coupling_degree": 1
+    },
+    {
+      "file1": "just_akash/deploy.py",
+      "file2": "tests/test_e2e_cleanup.py",
+      "shared_commits": 3,
+      "coupling_degree": 1
+    },
+    {
+      "file1": "pyproject.toml",
+      "file2": "tests/test_deploy.py",
+      "shared_commits": 5,
+      "coupling_degree": 1
+    },
+    {
+      "file1": "tests/test_deploy.py",
+      "file2": "uv.lock",
+      "shared_commits": 5,
+      "coupling_degree": 1
+    },
+    {
+      "file1": "tests/test_lease_shell_exec.py",
+      "file2": "tests/test_transport_errors.py",
+      "shared_commits": 7,
+      "coupling_degree": 1
+    },
+    {
+      "file1": "tests/test_transport_errors.py",
+      "file2": "tests/test_transport_inject.py",
+      "shared_commits": 7,
+      "coupling_degree": 1
+    },
+    {
+      "file1": ".github/workflows/ci.yml",
+      "file2": ".gitleaks.toml",
+      "shared_commits": 4,
+      "coupling_degree": 1
+    },
+    {
+      "file1": "just_akash/transport/__init__.py",
+      "file2": "just_akash/transport/ssh.py",
+      "shared_commits": 3,
+      "coupling_degree": 1
+    },
+    {
+      "file1": "just_akash/transport/base.py",
+      "file2": "just_akash/transport/lease_shell.py",
+      "shared_commits": 4,
+      "coupling_degree": 1
+    },
+    {
+      "file1": "Justfile",
+      "file2": "tests/test_extra_coverage.py",
+      "shared_commits": 3,
+      "coupling_degree": 1
+    },
+    {
+      "file1": "just_akash/cli.py",
+      "file2": "tests/test_extra_coverage.py",
+      "shared_commits": 3,
+      "coupling_degree": 1
+    },
+    {
+      "file1": "pyproject.toml",
+      "file2": "tests/test_extra_coverage.py",
+      "shared_commits": 3,
+      "coupling_degree": 1
+    },
+    {
+      "file1": "tests/test_cli.py",
+      "file2": "tests/test_extra_coverage.py",
+      "shared_commits": 3,
+      "coupling_degree": 1
+    },
+    {
+      "file1": "tests/test_extra_coverage.py",
+      "file2": "uv.lock",
+      "shared_commits": 3,
+      "coupling_degree": 1
+    },
+    {
+      "file1": "pyproject.toml",
+      "file2": "uv.lock",
+      "shared_commits": 9,
+      "coupling_degree": 0.9
+    },
+    {
+      "file1": "just_akash/api.py",
+      "file2": "tests/test_cli.py",
+      "shared_commits": 7,
+      "coupling_degree": 0.875
+    },
+    {
+      "file1": "CHANGELOG.md",
+      "file2": "uv.lock",
+      "shared_commits": 6,
+      "coupling_degree": 0.857
+    },
+    {
+      "file1": "just_akash/api.py",
+      "file2": "tests/test_adversarial.py",
+      "shared_commits": 6,
+      "coupling_degree": 0.857
+    },
+    {
+      "file1": "just_akash/cli.py",
+      "file2": "tests/test_adversarial.py",
+      "shared_commits": 6,
+      "coupling_degree": 0.857
+    },
+    {
+      "file1": "tests/test_adversarial.py",
+      "file2": "uv.lock",
+      "shared_commits": 6,
+      "coupling_degree": 0.857
+    },
+    {
+      "file1": ".github/workflows/ci.yml",
+      "file2": ".github/workflows/secrets.yml",
+      "shared_commits": 6,
+      "coupling_degree": 0.857
+    },
+    {
+      "file1": "just_akash/transport/lease_shell.py",
+      "file2": "tests/test_transport_errors.py",
+      "shared_commits": 6,
+      "coupling_degree": 0.857
+    },
+    {
+      "file1": "just_akash/transport/lease_shell.py",
+      "file2": "just_akash/transport/ssh.py",
+      "shared_commits": 5,
+      "coupling_degree": 0.833
+    },
+    {
+      "file1": "just_akash/api.py",
+      "file2": "just_akash/cli.py",
+      "shared_commits": 10,
+      "coupling_degree": 0.833
+    },
+    {
+      "file1": "just_akash/cli.py",
+      "file2": "uv.lock",
+      "shared_commits": 10,
+      "coupling_degree": 0.833
+    },
+    {
+      "file1": "just_akash/cli.py",
+      "file2": "tests/test_api.py",
+      "shared_commits": 5,
+      "coupling_degree": 0.833
+    },
+    {
+      "file1": "pyproject.toml",
+      "file2": "tests/test_api.py",
+      "shared_commits": 5,
+      "coupling_degree": 0.833
+    },
+    {
+      "file1": "tests/test_api.py",
+      "file2": "uv.lock",
+      "shared_commits": 5,
+      "coupling_degree": 0.833
+    },
+    {
+      "file1": "README.md",
+      "file2": "just_akash/cli.py",
+      "shared_commits": 8,
+      "coupling_degree": 0.8
+    },
+    {
+      "file1": "just_akash/cli.py",
+      "file2": "pyproject.toml",
+      "shared_commits": 8,
+      "coupling_degree": 0.8
+    },
+    {
+      "file1": ".env.example",
+      "file2": "README.md",
+      "shared_commits": 4,
+      "coupling_degree": 0.8
+    },
+    {
+      "file1": "CHANGELOG.md",
+      "file2": "tests/test_deploy.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.8
+    },
+    {
+      "file1": "README.md",
+      "file2": "just_akash/test_lifecycle.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.8
+    },
+    {
+      "file1": "README.md",
+      "file2": "sdl/cpu-backtest-ssh.yaml",
+      "shared_commits": 4,
+      "coupling_degree": 0.8
+    },
+    {
+      "file1": "just_akash/api.py",
+      "file2": "just_akash/test_lifecycle.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.8
+    },
+    {
+      "file1": "just_akash/api.py",
+      "file2": "sdl/cpu-backtest-ssh.yaml",
+      "shared_commits": 4,
+      "coupling_degree": 0.8
+    },
+    {
+      "file1": "just_akash/cli.py",
+      "file2": "sdl/cpu-backtest-ssh.yaml",
+      "shared_commits": 4,
+      "coupling_degree": 0.8
+    },
+    {
+      "file1": "just_akash/test_lifecycle.py",
+      "file2": "just_akash/test_secrets_e2e.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.8
+    },
+    {
+      "file1": "just_akash/test_lifecycle.py",
+      "file2": "pyproject.toml",
+      "shared_commits": 4,
+      "coupling_degree": 0.8
+    },
+    {
+      "file1": "just_akash/test_lifecycle.py",
+      "file2": "tests/test_cli.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.8
+    },
+    {
+      "file1": "just_akash/test_lifecycle.py",
+      "file2": "uv.lock",
+      "shared_commits": 4,
+      "coupling_degree": 0.8
+    },
+    {
+      "file1": "sdl/cpu-backtest-ssh.yaml",
+      "file2": "uv.lock",
+      "shared_commits": 4,
+      "coupling_degree": 0.8
+    },
+    {
+      "file1": "tests/test_api.py",
+      "file2": "tests/test_deploy.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.8
+    },
+    {
+      "file1": "tests/test_cli.py",
+      "file2": "tests/test_deploy.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.8
+    },
+    {
+      "file1": "tests/test_lease_shell_exec.py",
+      "file2": "tests/test_transport.py",
+      "shared_commits": 7,
+      "coupling_degree": 0.778
+    },
+    {
+      "file1": "tests/test_transport.py",
+      "file2": "tests/test_transport_cli_integration.py",
+      "shared_commits": 7,
+      "coupling_degree": 0.778
+    },
+    {
+      "file1": ".secrets.baseline",
+      "file2": "tests/test_stale_bid_selection.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.75
+    },
+    {
+      "file1": "Justfile",
+      "file2": "tests/test_cli.py",
+      "shared_commits": 6,
+      "coupling_degree": 0.75
+    },
+    {
+      "file1": "README.md",
+      "file2": "tests/test_cli.py",
+      "shared_commits": 6,
+      "coupling_degree": 0.75
+    },
+    {
+      "file1": "pyproject.toml",
+      "file2": "tests/test_cli.py",
+      "shared_commits": 6,
+      "coupling_degree": 0.75
+    },
+    {
+      "file1": "tests/test_cli.py",
+      "file2": "uv.lock",
+      "shared_commits": 6,
+      "coupling_degree": 0.75
+    },
+    {
+      "file1": "tests/test_lease_shell_exec.py",
+      "file2": "tests/test_transport_inject.py",
+      "shared_commits": 9,
+      "coupling_degree": 0.75
+    },
+    {
+      "file1": ".github/workflows/ci.yml",
+      "file2": "just_akash/transport/base.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.75
+    },
+    {
+      "file1": ".github/workflows/secrets.yml",
+      "file2": ".gitleaks.toml",
+      "shared_commits": 3,
+      "coupling_degree": 0.75
+    },
+    {
+      "file1": ".gitleaks.toml",
+      "file2": ".secrets.baseline",
+      "shared_commits": 3,
+      "coupling_degree": 0.75
+    },
+    {
+      "file1": ".gitleaks.toml",
+      "file2": "tests/test_api.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.75
+    },
+    {
+      "file1": "just_akash/transport/base.py",
+      "file2": "tests/test_lease_shell_exec.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.75
+    },
+    {
+      "file1": "just_akash/transport/lease_shell.py",
+      "file2": "tests/test_lease_shell_exec.py",
+      "shared_commits": 11,
+      "coupling_degree": 0.733
+    },
+    {
+      "file1": "CHANGELOG.md",
+      "file2": "just_akash/cli.py",
+      "shared_commits": 5,
+      "coupling_degree": 0.714
+    },
+    {
+      "file1": "CHANGELOG.md",
+      "file2": "tests/test_cli.py",
+      "shared_commits": 5,
+      "coupling_degree": 0.714
+    },
+    {
+      "file1": "README.md",
+      "file2": "tests/test_adversarial.py",
+      "shared_commits": 5,
+      "coupling_degree": 0.714
+    },
+    {
+      "file1": "just_akash/deploy.py",
+      "file2": "tests/test_adversarial.py",
+      "shared_commits": 5,
+      "coupling_degree": 0.714
+    },
+    {
+      "file1": "pyproject.toml",
+      "file2": "tests/test_adversarial.py",
+      "shared_commits": 5,
+      "coupling_degree": 0.714
+    },
+    {
+      "file1": "README.md",
+      "file2": "just_akash/test_secrets_e2e.py",
+      "shared_commits": 5,
+      "coupling_degree": 0.714
+    },
+    {
+      "file1": "just_akash/cli.py",
+      "file2": "just_akash/test_secrets_e2e.py",
+      "shared_commits": 5,
+      "coupling_degree": 0.714
+    },
+    {
+      "file1": "tests/test_transport_cli_integration.py",
+      "file2": "tests/test_transport_errors.py",
+      "shared_commits": 5,
+      "coupling_degree": 0.714
+    },
+    {
+      "file1": "Justfile",
+      "file2": "README.md",
+      "shared_commits": 7,
+      "coupling_degree": 0.7
+    },
+    {
+      "file1": "just_akash/api.py",
+      "file2": "uv.lock",
+      "shared_commits": 8,
+      "coupling_degree": 0.667
+    },
+    {
+      "file1": ".secrets.baseline",
+      "file2": "tests/test_api.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.667
+    },
+    {
+      "file1": "CHANGELOG.md",
+      "file2": "tests/test_api.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.667
+    },
+    {
+      "file1": "README.md",
+      "file2": "tests/test_api.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.667
+    },
+    {
+      "file1": "just_akash/api.py",
+      "file2": "tests/test_api.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.667
+    },
+    {
+      "file1": "tests/test_adversarial.py",
+      "file2": "tests/test_api.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.667
+    },
+    {
+      "file1": "tests/test_api.py",
+      "file2": "tests/test_cli.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.667
+    },
+    {
+      "file1": "just_akash/transport/lease_shell.py",
+      "file2": "tests/test_transport_inject.py",
+      "shared_commits": 8,
+      "coupling_degree": 0.667
+    },
+    {
+      "file1": ".github/workflows/ci.yml",
+      "file2": "tests/test_api.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.667
+    },
+    {
+      "file1": "just_akash/transport/lease_shell.py",
+      "file2": "tests/test_interactive_shell.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.667
+    },
+    {
+      "file1": "tests/test_interactive_shell.py",
+      "file2": "tests/test_lease_shell_exec.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.667
+    },
+    {
+      "file1": "tests/test_interactive_shell.py",
+      "file2": "tests/test_transport.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.667
+    },
+    {
+      "file1": "tests/test_interactive_shell.py",
+      "file2": "tests/test_transport_cli_integration.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.667
+    },
+    {
+      "file1": "tests/test_interactive_shell.py",
+      "file2": "tests/test_transport_errors.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.667
+    },
+    {
+      "file1": "tests/test_interactive_shell.py",
+      "file2": "tests/test_transport_inject.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.667
+    },
+    {
+      "file1": "tests/test_transport.py",
+      "file2": "tests/test_transport_inject.py",
+      "shared_commits": 6,
+      "coupling_degree": 0.667
+    },
+    {
+      "file1": "just_akash/api.py",
+      "file2": "just_akash/test_shell_e2e.py",
+      "shared_commits": 5,
+      "coupling_degree": 0.625
+    },
+    {
+      "file1": ".secrets.baseline",
+      "file2": "just_akash/deploy.py",
+      "shared_commits": 8,
+      "coupling_degree": 0.615
+    },
+    {
+      "file1": "tests/test_lease_shell_exec.py",
+      "file2": "tests/test_transport_cli_integration.py",
+      "shared_commits": 8,
+      "coupling_degree": 0.615
+    },
+    {
+      "file1": "README.md",
+      "file2": "just_akash/api.py",
+      "shared_commits": 6,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": "README.md",
+      "file2": "pyproject.toml",
+      "shared_commits": 6,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": "README.md",
+      "file2": "uv.lock",
+      "shared_commits": 6,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": "just_akash/api.py",
+      "file2": "pyproject.toml",
+      "shared_commits": 6,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": ".env.example",
+      "file2": "just_akash/api.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": ".env.example",
+      "file2": "just_akash/cli.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": ".env.example",
+      "file2": "just_akash/deploy.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": ".env.example",
+      "file2": "just_akash/test_lifecycle.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": ".env.example",
+      "file2": "just_akash/test_secrets_e2e.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": ".env.example",
+      "file2": "pyproject.toml",
+      "shared_commits": 3,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": ".env.example",
+      "file2": "sdl/cpu-backtest-ssh.yaml",
+      "shared_commits": 3,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": ".env.example",
+      "file2": "tests/test_adversarial.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": ".env.example",
+      "file2": "tests/test_cli.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": ".env.example",
+      "file2": "uv.lock",
+      "shared_commits": 3,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": ".secrets.baseline",
+      "file2": "tests/test_deploy.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": "CHANGELOG.md",
+      "file2": "just_akash/test_lifecycle.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": "README.md",
+      "file2": "tests/test_deploy.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": "just_akash/api.py",
+      "file2": "tests/test_deploy.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": "just_akash/deploy.py",
+      "file2": "just_akash/test_lifecycle.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": "just_akash/deploy.py",
+      "file2": "tests/test_deploy.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": "just_akash/test_lifecycle.py",
+      "file2": "tests/test_adversarial.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": "just_akash/test_lifecycle.py",
+      "file2": "tests/test_api.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": "just_akash/test_lifecycle.py",
+      "file2": "tests/test_deploy.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": "just_akash/test_secrets_e2e.py",
+      "file2": "sdl/cpu-backtest-ssh.yaml",
+      "shared_commits": 3,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": "just_akash/test_shell_e2e.py",
+      "file2": "sdl/cpu-backtest-ssh.yaml",
+      "shared_commits": 3,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": "pyproject.toml",
+      "file2": "sdl/cpu-backtest-ssh.yaml",
+      "shared_commits": 3,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": "sdl/cpu-backtest-ssh.yaml",
+      "file2": "tests/test_adversarial.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": "sdl/cpu-backtest-ssh.yaml",
+      "file2": "tests/test_api.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": ".env.example",
+      "file2": "Justfile",
+      "shared_commits": 3,
+      "coupling_degree": 0.6
+    },
+    {
+      "file1": "Justfile",
+      "file2": "just_akash/api.py",
+      "shared_commits": 7,
+      "coupling_degree": 0.583
+    },
+    {
+      "file1": "tests/test_transport_cli_integration.py",
+      "file2": "tests/test_transport_inject.py",
+      "shared_commits": 7,
+      "coupling_degree": 0.583
+    },
+    {
+      "file1": ".secrets.baseline",
+      "file2": "tests/test_adversarial.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.571
+    },
+    {
+      "file1": "CHANGELOG.md",
+      "file2": "README.md",
+      "shared_commits": 4,
+      "coupling_degree": 0.571
+    },
+    {
+      "file1": "CHANGELOG.md",
+      "file2": "just_akash/api.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.571
+    },
+    {
+      "file1": "tests/test_adversarial.py",
+      "file2": "tests/test_cli.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.571
+    },
+    {
+      "file1": ".github/workflows/secrets.yml",
+      "file2": "Justfile",
+      "shared_commits": 4,
+      "coupling_degree": 0.571
+    },
+    {
+      "file1": ".github/workflows/secrets.yml",
+      "file2": "just_akash/test_shell_e2e.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.571
+    },
+    {
+      "file1": "just_akash/api.py",
+      "file2": "just_akash/test_secrets_e2e.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.571
+    },
+    {
+      "file1": "just_akash/test_secrets_e2e.py",
+      "file2": "just_akash/test_shell_e2e.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.571
+    },
+    {
+      "file1": "just_akash/test_secrets_e2e.py",
+      "file2": "pyproject.toml",
+      "shared_commits": 4,
+      "coupling_degree": 0.571
+    },
+    {
+      "file1": "just_akash/test_secrets_e2e.py",
+      "file2": "tests/test_adversarial.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.571
+    },
+    {
+      "file1": "just_akash/test_secrets_e2e.py",
+      "file2": "uv.lock",
+      "shared_commits": 4,
+      "coupling_degree": 0.571
+    },
+    {
+      "file1": "tests/test_transport.py",
+      "file2": "tests/test_transport_errors.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.571
+    },
+    {
+      "file1": "just_akash/transport/lease_shell.py",
+      "file2": "tests/test_transport.py",
+      "shared_commits": 5,
+      "coupling_degree": 0.556
+    },
+    {
+      "file1": "Justfile",
+      "file2": "just_akash/cli.py",
+      "shared_commits": 7,
+      "coupling_degree": 0.538
+    },
+    {
+      "file1": ".secrets.baseline",
+      "file2": "just_akash/transport/ssh.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.5
+    },
+    {
+      "file1": ".secrets.baseline",
+      "file2": "README.md",
+      "shared_commits": 5,
+      "coupling_degree": 0.5
+    },
+    {
+      "file1": ".secrets.baseline",
+      "file2": "pyproject.toml",
+      "shared_commits": 5,
+      "coupling_degree": 0.5
+    },
+    {
+      "file1": ".secrets.baseline",
+      "file2": "tests/test_cli.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.5
+    },
+    {
+      "file1": "Justfile",
+      "file2": "pyproject.toml",
+      "shared_commits": 5,
+      "coupling_degree": 0.5
+    },
+    {
+      "file1": "just_akash/cli.py",
+      "file2": "just_akash/transport/ssh.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.5
+    },
+    {
+      "file1": "just_akash/deploy.py",
+      "file2": "pyproject.toml",
+      "shared_commits": 5,
+      "coupling_degree": 0.5
+    },
+    {
+      "file1": "just_akash/deploy.py",
+      "file2": "tests/test_cli.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.5
+    },
+    {
+      "file1": "just_akash/deploy.py",
+      "file2": "uv.lock",
+      "shared_commits": 6,
+      "coupling_degree": 0.5
+    },
+    {
+      "file1": ".github/workflows/ci.yml",
+      "file2": ".secrets.baseline",
+      "shared_commits": 5,
+      "coupling_degree": 0.5
+    },
+    {
+      "file1": ".github/workflows/ci.yml",
+      "file2": "just_akash/cli.py",
+      "shared_commits": 5,
+      "coupling_degree": 0.5
+    },
+    {
+      "file1": "Justfile",
+      "file2": "just_akash/test_shell_e2e.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.5
+    },
+    {
+      "file1": "README.md",
+      "file2": "just_akash/test_shell_e2e.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.5
+    },
+    {
+      "file1": "just_akash/cli.py",
+      "file2": "just_akash/test_shell_e2e.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.5
+    },
+    {
+      "file1": "just_akash/test_secrets_e2e.py",
+      "file2": "tests/test_api.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.5
+    },
+    {
+      "file1": "just_akash/test_shell_e2e.py",
+      "file2": "tests/test_api.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.5
+    },
+    {
+      "file1": ".coverage",
+      "file2": ".gitignore",
+      "shared_commits": 3,
+      "coupling_degree": 0.5
+    },
+    {
+      "file1": ".github/workflows/ci.yml",
+      "file2": "tests/test_interactive_shell.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.5
+    },
+    {
+      "file1": ".gitignore",
+      "file2": "Justfile",
+      "shared_commits": 3,
+      "coupling_degree": 0.5
+    },
+    {
+      "file1": ".gitignore",
+      "file2": "README.md",
+      "shared_commits": 3,
+      "coupling_degree": 0.5
+    },
+    {
+      "file1": ".gitignore",
+      "file2": "uv.lock",
+      "shared_commits": 3,
+      "coupling_degree": 0.5
+    },
+    {
+      "file1": "Justfile",
+      "file2": "tests/test_api.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.5
+    },
+    {
+      "file1": "just_akash/cli.py",
+      "file2": "just_akash/deploy.py",
+      "shared_commits": 6,
+      "coupling_degree": 0.462
+    },
+    {
+      "file1": ".secrets.baseline",
+      "file2": "CHANGELOG.md",
+      "shared_commits": 3,
+      "coupling_degree": 0.429
+    },
+    {
+      "file1": "CHANGELOG.md",
+      "file2": "Justfile",
+      "shared_commits": 3,
+      "coupling_degree": 0.429
+    },
+    {
+      "file1": "CHANGELOG.md",
+      "file2": "just_akash/deploy.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.429
+    },
+    {
+      "file1": "CHANGELOG.md",
+      "file2": "tests/test_adversarial.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.429
+    },
+    {
+      "file1": "Justfile",
+      "file2": "tests/test_adversarial.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.429
+    },
+    {
+      "file1": ".github/workflows/secrets.yml",
+      "file2": ".secrets.baseline",
+      "shared_commits": 3,
+      "coupling_degree": 0.429
+    },
+    {
+      "file1": ".github/workflows/secrets.yml",
+      "file2": "README.md",
+      "shared_commits": 3,
+      "coupling_degree": 0.429
+    },
+    {
+      "file1": ".github/workflows/secrets.yml",
+      "file2": "just_akash/api.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.429
+    },
+    {
+      "file1": ".github/workflows/secrets.yml",
+      "file2": "just_akash/cli.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.429
+    },
+    {
+      "file1": "just_akash/deploy.py",
+      "file2": "just_akash/test_secrets_e2e.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.429
+    },
+    {
+      "file1": "just_akash/test_secrets_e2e.py",
+      "file2": "tests/test_cli.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.429
+    },
+    {
+      "file1": "just_akash/test_shell_e2e.py",
+      "file2": "tests/test_adversarial.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.429
+    },
+    {
+      "file1": ".secrets.baseline",
+      "file2": "tests/test_transport_errors.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.429
+    },
+    {
+      "file1": ".coverage",
+      "file2": "just_akash/cli.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.429
+    },
+    {
+      "file1": ".coverage",
+      "file2": "tests/test_transport_cli_integration.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.429
+    },
+    {
+      "file1": "Justfile",
+      "file2": "just_akash/test_secrets_e2e.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.429
+    },
+    {
+      "file1": ".secrets.baseline",
+      "file2": "uv.lock",
+      "shared_commits": 5,
+      "coupling_degree": 0.417
+    },
+    {
+      "file1": "Justfile",
+      "file2": "uv.lock",
+      "shared_commits": 5,
+      "coupling_degree": 0.417
+    },
+    {
+      "file1": "just_akash/api.py",
+      "file2": "just_akash/deploy.py",
+      "shared_commits": 5,
+      "coupling_degree": 0.417
+    },
+    {
+      "file1": ".secrets.baseline",
+      "file2": "just_akash/cli.py",
+      "shared_commits": 6,
+      "coupling_degree": 0.4
+    },
+    {
+      "file1": "README.md",
+      "file2": "just_akash/deploy.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.4
+    },
+    {
+      "file1": ".github/workflows/ci.yml",
+      "file2": "Justfile",
+      "shared_commits": 4,
+      "coupling_degree": 0.4
+    },
+    {
+      "file1": ".github/workflows/ci.yml",
+      "file2": "just_akash/api.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.4
+    },
+    {
+      "file1": ".github/workflows/ci.yml",
+      "file2": "uv.lock",
+      "shared_commits": 4,
+      "coupling_degree": 0.4
+    },
+    {
+      "file1": ".secrets.baseline",
+      "file2": "Justfile",
+      "shared_commits": 5,
+      "coupling_degree": 0.385
+    },
+    {
+      "file1": "just_akash/transport/lease_shell.py",
+      "file2": "tests/test_transport_cli_integration.py",
+      "shared_commits": 5,
+      "coupling_degree": 0.385
+    },
+    {
+      "file1": ".github/workflows/ci.yml",
+      "file2": "just_akash/test_shell_e2e.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.375
+    },
+    {
+      "file1": ".github/workflows/ci.yml",
+      "file2": "tests/test_cli.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.375
+    },
+    {
+      "file1": ".secrets.baseline",
+      "file2": "just_akash/test_shell_e2e.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.375
+    },
+    {
+      "file1": "just_akash/test_shell_e2e.py",
+      "file2": "tests/test_cli.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.375
+    },
+    {
+      "file1": "just_akash/test_shell_e2e.py",
+      "file2": "pyproject.toml",
+      "shared_commits": 3,
+      "coupling_degree": 0.375
+    },
+    {
+      "file1": "just_akash/test_shell_e2e.py",
+      "file2": "uv.lock",
+      "shared_commits": 3,
+      "coupling_degree": 0.375
+    },
+    {
+      "file1": ".secrets.baseline",
+      "file2": "just_akash/api.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.333
+    },
+    {
+      "file1": "just_akash/api.py",
+      "file2": "just_akash/transport/lease_shell.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.333
+    },
+    {
+      "file1": ".secrets.baseline",
+      "file2": "tests/test_transport_inject.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.333
+    },
+    {
+      "file1": "just_akash/cli.py",
+      "file2": "tests/test_transport_cli_integration.py",
+      "shared_commits": 4,
+      "coupling_degree": 0.308
+    },
+    {
+      "file1": ".github/workflows/ci.yml",
+      "file2": "README.md",
+      "shared_commits": 3,
+      "coupling_degree": 0.3
+    },
+    {
+      "file1": ".github/workflows/ci.yml",
+      "file2": "just_akash/transport/lease_shell.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.3
+    },
+    {
+      "file1": ".github/workflows/ci.yml",
+      "file2": "pyproject.toml",
+      "shared_commits": 3,
+      "coupling_degree": 0.3
+    },
+    {
+      "file1": ".github/workflows/ci.yml",
+      "file2": "tests/test_lease_shell_exec.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.3
+    },
+    {
+      "file1": ".github/workflows/ci.yml",
+      "file2": "tests/test_transport_cli_integration.py",
+      "shared_commits": 3,
+      "coupling_degree": 0.3
+    }
+  ],
+  "summary": {
+    "total_pairs": 201,
+    "strong_coupling_count": 159
+  }
+}

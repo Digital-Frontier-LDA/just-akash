@@ -1,16 +1,30 @@
 [
   {
     "slot": "gemini-1",
-    "error_type": "UNKNOWN",
-    "pattern": "Error authenticating: IneligibleTierError: This client is no longer supported for Gemini Code Assist for individuals. To continue using Gemini, please migrate to the Antigravity suite of products: htt",
+    "error_type": "SPAWN_ERROR",
+    "pattern": "[spawn error: The \"file\" argument must be of type string. Received null]",
     "count": 1,
-    "last_seen": "2026-07-04T14:00:26.091Z"
+    "last_seen": "2026-04-19T11:23:40.541Z"
   },
   {
     "slot": "opencode-1",
-    "error_type": "RATE_LIMITED",
-    "pattern": "RATE_LIMITED after 2 consecutive rate-limit errors (killed early)",
+    "error_type": "SPAWN_ERROR",
+    "pattern": "[spawn error: The \"file\" argument must be of type string. Received null]",
     "count": 1,
-    "last_seen": "2026-07-04T14:01:43.800Z"
+    "last_seen": "2026-04-19T11:23:41.035Z"
+  },
+  {
+    "slot": "copilot-1",
+    "error_type": "SPAWN_ERROR",
+    "pattern": "[spawn error: The \"file\" argument must be of type string. Received null]",
+    "count": 1,
+    "last_seen": "2026-04-19T11:23:41.460Z"
+  },
+  {
+    "slot": "codex-1",
+    "error_type": "SPAWN_ERROR",
+    "pattern": "[spawn error: The \"file\" argument must be of type string. Received null]",
+    "count": 1,
+    "last_seen": "2026-04-19T11:23:41.963Z"
   }
 ]
