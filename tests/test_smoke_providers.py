@@ -219,12 +219,21 @@ class TestIngressCap:
 
 class TestStreamCheck:
     def test_stream_fails_on_nonzero_exit(self):
-        with patch.object(sp, "_run", return_value=_completed(returncode=2)):
+        with patch.object(sp, "_run", return_value=_completed(stdout="line\n", returncode=2)):
             assert sp._check_stream("1", "logs") is False
 
-    def test_stream_passes_on_clean_bounded_return(self):
-        with patch.object(sp, "_run", return_value=_completed(returncode=0)):
+    def test_stream_passes_when_output_is_readable(self):
+        # exit-0 AND real output — the whole point after the JSON-frame fix.
+        with patch.object(
+            sp, "_run", return_value=_completed(stdout="[svc] hello\n2 events\n", returncode=0)
+        ):
             assert sp._check_stream("1", "events") is True
+
+    def test_stream_fails_when_output_is_empty(self):
+        # Clean exit but NO readable lines == a blind stream (frames discarded);
+        # must not read as PASS.
+        with patch.object(sp, "_run", return_value=_completed(stdout="   \n\n", returncode=0)):
+            assert sp._check_stream("1", "logs") is False
 
 
 class TestSshInfo:

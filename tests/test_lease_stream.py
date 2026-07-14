@@ -70,6 +70,12 @@ def _proxy_envelope(payload: bytes) -> str:
     )
 
 
+def _proxy_envelope_text(text: str) -> str:
+    """Envelope whose ``message`` is a plain (non-base64) JSON/text string — the
+    shape Digital Frontier providers use to stream logs/events."""
+    return json.dumps({"type": "data", "message": text})
+
+
 # ── log message formatter ────────────────────────────────────────────
 
 
@@ -251,6 +257,56 @@ class TestStreamLogs:
             t.stream_logs(follow=True, tail=5)
         connect_msg = json.loads(fake_ws.sent_messages[0])
         assert "follow=true" in connect_msg["url"]
+
+
+class TestJsonTextFrameFallback:
+    """DF providers stream logs/events as JSON *text*, not base64. Those frames
+    must be surfaced (text_fallback), not discarded as 'undecodable' — while exec
+    (base64 binary stdout) must still reject a non-base64 frame."""
+
+    def test_decode_payload_text_fallback_returns_raw(self):
+        assert LeaseShellTransport._decode_payload('{"a":1}') is None
+        assert LeaseShellTransport._decode_payload('{"a":1}', text_fallback=True) == b'{"a":1}'
+
+    def test_decode_payload_base64_wins_regardless_of_flag(self):
+        enc = base64.b64encode(b"hello").decode()
+        assert LeaseShellTransport._decode_payload(enc) == b"hello"
+        assert LeaseShellTransport._decode_payload(enc, text_fallback=True) == b"hello"
+
+    def test_stream_logs_surfaces_json_text_frame(self, capsys):
+        # The exact shape captured live from a DF provider.
+        t = _make_transport()
+        frames = [_proxy_envelope_text('{"name":"diag","message":"diag-http-up"}')]
+        with (
+            patch.object(t, "_fetch_jwt", return_value="jwt"),
+            patch("just_akash.transport.lease_shell.connect") as mock_connect,
+        ):
+            mock_connect.return_value = FakeWebSocket(frames)
+            t.stream_logs()
+        assert "[diag] diag-http-up" in capsys.readouterr().out
+
+    def test_stream_events_surfaces_json_text_frame(self, capsys):
+        t = _make_transport()
+        ev = (
+            '{"type":"Normal","reason":"Started","note":"Started container diag",'
+            '"object":{"kind":"Pod","name":"diag-x"}}'
+        )
+        with (
+            patch.object(t, "_fetch_jwt", return_value="jwt"),
+            patch("just_akash.transport.lease_shell.connect") as mock_connect,
+        ):
+            mock_connect.return_value = FakeWebSocket([_proxy_envelope_text(ev)])
+            t.stream_events()
+        out = capsys.readouterr().out
+        assert "Started" in out and "diag" in out
+
+    def test_exec_recv_still_discards_non_base64(self):
+        # exec keeps text_fallback=False: a non-base64 frame must not be dispatched
+        # as text (it would corrupt binary stdout) — _recv_proxy_message drops it.
+        t = _make_transport()
+        ws = MagicMock()
+        ws.recv.return_value = _proxy_envelope_text("this is not base64")
+        assert t._recv_proxy_message(ws) is None
 
 
 # ── stream_events end-to-end ─────────────────────────────────────────
