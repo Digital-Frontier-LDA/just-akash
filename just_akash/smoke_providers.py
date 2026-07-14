@@ -599,7 +599,14 @@ def _check_inject(dseq: str) -> bool:
 
 
 def _check_stream(dseq: str, command: str) -> bool:
-    """logs/events must return within the bounded --duration window (no hang).
+    """logs/events must return within the bounded --duration window (no hang)
+    AND produce readable output.
+
+    Exit-0 alone is not enough: providers that stream each frame as a JSON
+    log/event object (rather than base64) used to exit cleanly while every line
+    was silently discarded as "undecodable", so a "PASS" masked a blind stream.
+    Require at least one non-empty output line — the CLI writes only the streamed
+    lines to stdout (errors go to stderr), so any content means real output.
 
     logs/events are lease-shell-only and take no --transport flag (passing one is
     an argparse error), so the command must not include it.
@@ -607,7 +614,8 @@ def _check_stream(dseq: str, command: str) -> bool:
     start = time.monotonic()
     r = _run(f"uv run just-akash {command} --dseq {q(dseq)} --duration 8", timeout=40)
     elapsed = time.monotonic() - start
-    return r.returncode == 0 and elapsed < 35
+    got_output = any(line.strip() for line in (r.stdout or "").splitlines())
+    return r.returncode == 0 and elapsed < 35 and got_output
 
 
 def _check_ssh(dseq: str, key: str) -> bool:

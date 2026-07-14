@@ -416,7 +416,7 @@ class LeaseShellTransport(Transport):
         return summary
 
     @staticmethod
-    def _decode_payload(data: str) -> bytes | None:
+    def _decode_payload(data: str, *, text_fallback: bool = False) -> bytes | None:
         """Strictly base64-decode one relayed payload; None if it isn't decodable.
 
         ``validate=True`` is load-bearing. The permissive default DISCARDS characters
@@ -424,6 +424,15 @@ class LeaseShellTransport(Transport):
         string decodes to garbage bytes whenever its filtered length happens to be a
         multiple of four -- garbage that would be written straight to stdout as if the
         provider had sent it. Strict mode rejects it instead.
+
+        ``text_fallback`` is set ONLY by the logs/events stream. There the provider
+        sends each frame as a JSON ServiceLogMessage / Kubernetes-event object in
+        plain text (not base64), so strict decode correctly rejects it -- and we
+        must then surface it as raw UTF-8 for the log/event formatter to render,
+        not silently drop real output (which blinded `logs`/`events` on providers
+        that stream JSON). exec keeps ``text_fallback=False``: its frames are
+        genuinely base64 stdout, so a non-base64 frame there is corruption that
+        must not be dispatched as text.
 
         Returning None rather than raising is deliberate: one corrupt frame must not
         tear down a long-running ``logs --follow``. Callers skip it and read on. The
@@ -433,6 +442,10 @@ class LeaseShellTransport(Transport):
         try:
             return base64.b64decode(data, validate=True)
         except (ValueError, TypeError):
+            if text_fallback:
+                # Non-base64 on the logs/events path == the provider streamed the
+                # JSON/text content directly; hand it to the formatter verbatim.
+                return data.encode("utf-8", "replace")
             # Log only the length, not the payload: an undecodable frame is unexpected
             # data of unknown provenance, and echoing it into logs risks leaking
             # whatever it happens to contain. The size is enough to flag the anomaly.
@@ -442,7 +455,9 @@ class LeaseShellTransport(Transport):
             )
             return None
 
-    def _recv_proxy_message(self, ws, timeout: float = PROXY_RECV_TIMEOUT) -> bytes | None:
+    def _recv_proxy_message(
+        self, ws, timeout: float = PROXY_RECV_TIMEOUT, *, text_fallback: bool = False
+    ) -> bytes | None:
         raw = ws.recv(timeout=timeout)
         if isinstance(raw, bytes):
             return raw
@@ -473,13 +488,13 @@ class LeaseShellTransport(Transport):
             if isinstance(data, list):
                 return bytes(data)
             if isinstance(data, str):
-                return self._decode_payload(data)
+                return self._decode_payload(data, text_fallback=text_fallback)
         if isinstance(message, str):
-            return self._decode_payload(message)
+            return self._decode_payload(message, text_fallback=text_fallback)
         if isinstance(message, (bytes, bytearray)):
             return bytes(message)
         if isinstance(msg.get("data"), str):
-            return self._decode_payload(msg["data"])
+            return self._decode_payload(msg["data"], text_fallback=text_fallback)
         return None
 
     def _pump_frames(self, ws, exit_code: int) -> int | None:
@@ -953,7 +968,11 @@ class LeaseShellTransport(Transport):
                                 return
                             this_timeout = min(recv_timeout, remaining)
                         try:
-                            frame = self._recv_proxy_message(ws, timeout=this_timeout)
+                            # Logs/events frames arrive as JSON/text, not base64 —
+                            # surface them for the formatter instead of discarding.
+                            frame = self._recv_proxy_message(
+                                ws, timeout=this_timeout, text_fallback=True
+                            )
                         except ConnectionClosedOK:
                             return
                         except ConnectionClosedError as exc:

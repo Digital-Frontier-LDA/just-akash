@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.11.1] — 2026-07-14
+
+### Fixed
+- **`logs` and `events` now show provider output that was being silently discarded.** Providers that stream each frame as a JSON `ServiceLogMessage` / Kubernetes-event object (plain text — not the base64 that `exec` uses) had every line dropped as "undecodable (non-base64)", so `just-akash logs`/`events` printed nothing useful against them. Worse, the smoke test's `logs`/`events` checks still PASSED (they only verified the stream exited cleanly), masking the blind stream. The logs/events path now falls back to surfacing the raw text for the existing log/event formatter to render — real kube events (`Scheduled`/`Pulled`/`Created`/`Started`/`ScalingReplicaSet`) and `[service] message` log lines. Scoped strictly to logs/events: **`exec` still rejects a non-base64 frame** (its stdout is genuinely base64 binary, and surfacing a corrupt frame as text would corrupt output). The smoke `logs`/`events` checks now also require readable output, so a blind stream can no longer read as PASS. Validated live against a provider that streams JSON frames.
+- Tests: 890 passing (+6) — the text fallback, base64-still-wins, `exec` still discarding non-base64, end-to-end stream surfacing of the exact JSON shapes captured from a live provider, and the stricter smoke content check.
+
+---
+
 ## [1.11.0] — 2026-07-14
 
 ### Fixed
