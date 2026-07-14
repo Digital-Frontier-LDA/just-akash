@@ -287,7 +287,7 @@ def main(argv: list[str] | None = None) -> int:
             failed = True
             print(f"\nRELIABILITY breach (>= {args.min_samples} attempts, < {args.slo:.0%} pass):")
             for provider, feature, rate, count in breaches:
-                print(f"  {provider} {feature}: {rate:.0%} over {count} runs")
+                print(f"  {provider} {feature}: {rate:.0%} over {count} attempts")
 
         try:
             thresholds = parse_thresholds(args.max_p95)
