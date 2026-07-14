@@ -35,7 +35,10 @@ jobs:
     # NOT the job: a *job* timeout cancels the whole job, so the always()-cleanup
     # step below would never run and a live probe would leak until the next day's
     # startup sweep. A *step* timeout fails only that step and lets cleanup run.
-    timeout-minutes: 55
+    # Keep this comfortably above setup + smoke (40m) + reap (10m) so the job
+    # backstop can never fire *during* the cleanup step and cancel it: worst case
+    # is ~5m setup + 40m + 10m = 55m, so 70m leaves clear headroom.
+    timeout-minutes: 70
     steps:
       - name: Checkout
         uses: actions/checkout@v4
