@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.13.0] — 2026-07-14
+
+### Added
+- **Durable telemetry accrual + analysis** — the smoke telemetry (v1.12.0) now *accumulates* into a queryable dataset instead of scattering into per-run artifacts. A new isolated CI `accrue` job (`contents: write`, `needs: smoke`, `if: always()`) appends each run's JSONL to a dedicated long-lived **`telemetry` branch** — `main` is branch-protected so CI can't push to it, and keeping the data off `main` also keeps its history clean. So percentiles can be computed over weeks of runs, not a single day.
+- **`analyze_telemetry`** (`uv run python -m just_akash.analyze_telemetry`, or `just smoke-telemetry-report`) aggregates the accrued data into per-(provider, feature) **success rate + p50/p95/p99 latency**, using the right tools for heavy-tailed latency (percentiles, and outlier-robust median ± k·MAD) rather than a Gaussian `avg+3σ`. It flags any feature whose p99 is creeping toward the configured cap, and — with `--check --min-samples N` — can gate on a success-rate SLO once enough data exists (the min-samples gate stops a small-sample blip from tripping). Example: ingress samples of 0.4s and 129s report p99≈128s and flag `p99>70%-of-cap`.
+- Tests: 911 passing (+17) — percentile interpolation, robust median/MAD, aggregation (latency only from PASS samples), SLO min-sample gating, report flags, and JSONL parsing.
+
+---
+
 ## [1.12.0] — 2026-07-14
 
 ### Added

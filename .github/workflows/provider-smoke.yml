@@ -101,3 +101,29 @@ jobs:
         env:
           AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
         run: uv run python -m just_akash.smoke_providers --sweep-only --min-age 0
+
+  # Accrue this run's telemetry onto the long-lived `telemetry` branch so the data
+  # accumulates across runs (main is branch-protected; the telemetry branch is
+  # not, and keeping data off main keeps its history clean). Isolated from the
+  # smoke job so the privileged `contents: write` token never runs alongside the
+  # deploy code. Runs even when the smoke job failed — a red run's latencies are
+  # exactly what we want to keep.
+  accrue:
+    name: Accrue telemetry
+    needs: smoke
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        continue-on-error: true # a crashed smoke run may have produced no artifact
+        with:
+          name: smoke-telemetry-${{ github.run_id }}
+          path: dl
+      - name: Append to telemetry branch
+        env:
+          SRC: dl/smoke-telemetry.jsonl
+          RUN_ID: ${{ github.run_id }}
+        run: bash .github/scripts/accrue-telemetry.sh

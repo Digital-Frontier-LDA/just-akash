@@ -299,6 +299,23 @@ smoke-providers *args:
     set -x
     uv run python -m just_akash.smoke_providers {{args}}
 
+# Aggregate accrued smoke telemetry into per-(provider,feature) latency
+# percentiles + success rate. With no FILE, pulls the live `telemetry` branch.
+#   just smoke-telemetry-report                 # analyze the accrued CI data
+#   just smoke-telemetry-report path.jsonl       # analyze a local file
+smoke-telemetry-report file="":
+    #!/bin/bash
+    set -euo pipefail
+    if [ -n "{{file}}" ]; then
+        uv run python -m just_akash.analyze_telemetry "{{file}}"
+    else
+        tmp="$(mktemp)"
+        git fetch origin telemetry >/dev/null 2>&1 || { echo "no telemetry branch yet"; exit 0; }
+        git show origin/telemetry:smoke-latency.jsonl > "$tmp"
+        uv run python -m just_akash.analyze_telemetry "$tmp"
+        rm -f "$tmp"
+    fi
+
 # ── Lint & Quality ───────────────────────────────────
 
 # Run ruff lint + format check
