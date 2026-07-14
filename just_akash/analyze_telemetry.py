@@ -210,7 +210,9 @@ def parse_thresholds(spec: str) -> dict[str, float]:
         # Reject NaN/inf/<=0: a non-finite ceiling silently disables the gate
         # (p95 > nan is always False), which is the opposite of what was asked.
         if not math.isfinite(val) or val <= 0:
-            raise ValueError(f"bad --max-p95 entry {part!r}: ceiling must be a positive, finite ms")
+            raise ValueError(
+                f"bad --max-p95 entry {part!r}: ceiling must be a positive, finite ms"
+            )
         out[feat.strip()] = val
     return out
 

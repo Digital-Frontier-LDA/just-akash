@@ -28,3 +28,8 @@
 {"ts":"2026-04-19T12:10:20.644Z","session_id":"29b851aa-97b3-4b71-baff-1d6884c566d9","agent_id":"a1703cb12fd7e3d71","slot":"ccr-1","input_tokens":6,"output_tokens":271,"cache_creation_input_tokens":9358,"cache_read_input_tokens":0}
 {"ts":"2026-04-19T12:16:06.103Z","session_id":"29b851aa-97b3-4b71-baff-1d6884c566d9","agent_id":"a6a154c866ccdcf25","slot":"ccr-1","input_tokens":69,"output_tokens":5393,"cache_creation_input_tokens":52085,"cache_read_input_tokens":356137}
 {"ts":"2026-04-19T12:17:07.365Z","session_id":"29b851aa-97b3-4b71-baff-1d6884c566d9","agent_id":"a9c3ae0a41f234da2","slot":"ccr-2","input_tokens":68,"output_tokens":4443,"cache_creation_input_tokens":47532,"cache_read_input_tokens":237528}
+{"ts":"2026-07-04T13:59:53.852Z","session_id":null,"agent_id":null,"slot":"codex-1","input_tokens":null,"output_tokens":null,"cache_creation_input_tokens":null,"cache_read_input_tokens":null}
+{"ts":"2026-07-04T14:00:26.128Z","session_id":null,"agent_id":null,"slot":"gemini-1","input_tokens":null,"output_tokens":null,"cache_creation_input_tokens":null,"cache_read_input_tokens":null}
+{"ts":"2026-07-04T14:01:43.905Z","session_id":null,"agent_id":null,"slot":"opencode-1","input_tokens":null,"output_tokens":null,"cache_creation_input_tokens":null,"cache_read_input_tokens":null}
+{"ts":"2026-07-04T14:02:11.130Z","session_id":null,"agent_id":null,"slot":"copilot-1","input_tokens":null,"output_tokens":null,"cache_creation_input_tokens":null,"cache_read_input_tokens":null}
+{"ts":"2026-07-04T14:02:42.790Z","session_id":null,"agent_id":null,"slot":"claude-1","input_tokens":null,"output_tokens":null,"cache_creation_input_tokens":null,"cache_read_input_tokens":null}
