@@ -278,6 +278,18 @@ class TestOrphanProbeSweep:
             self._detail(["probe"]), self._dseq_aged(60), min_age_seconds=3600, now=self.NOW
         )
 
+    def test_min_age_zero_reaps_a_fresh_probe(self):
+        # The end-of-job cleanup (--min-age 0) must reap THIS run's own fresh
+        # probe, which the default 1h floor would spare. Safe because CI
+        # serializes runs, so no concurrent probe exists to clobber.
+        assert sp._is_orphan_probe(
+            self._detail(["probe"]), self._dseq_aged(5), min_age_seconds=0, now=self.NOW
+        )
+        # ...but still only a probe -- a fresh runner workload is never reaped.
+        assert not sp._is_orphan_probe(
+            self._detail(["runner"]), self._dseq_aged(5), min_age_seconds=0, now=self.NOW
+        )
+
     def test_probe_with_unknown_age_is_spared(self):
         # probe service but un-datable dseq -> fail safe, do not reap.
         assert not sp._is_orphan_probe(

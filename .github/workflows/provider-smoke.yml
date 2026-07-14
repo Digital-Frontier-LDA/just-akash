@@ -31,9 +31,11 @@ jobs:
   smoke:
     name: Provider capability smoke test
     runs-on: ubuntu-latest
-    # The SSH-enabled probe installs openssh + busybox-extras and runs the full
-    # matrix (incl. an update-restart) per provider; give three providers room.
-    timeout-minutes: 45
+    # Ultimate backstop only. The real per-step bound is on the smoke step below,
+    # NOT the job: a *job* timeout cancels the whole job, so the always()-cleanup
+    # step below would never run and a live probe would leak until the next day's
+    # startup sweep. A *step* timeout fails only that step and lets cleanup run.
+    timeout-minutes: 55
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -58,8 +60,26 @@ jobs:
           tool: just
 
       - name: Run provider smoke test
+        # Step-level timeout (not job-level) so a hang fails THIS step and still
+        # lets the always()-cleanup step below reap any probe left behind.
+        timeout-minutes: 40
         env:
           AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
           AKASH_PROVIDERS: ${{ secrets.AKASH_PROVIDERS }}
           AKASH_PROVIDERS_BACKUP: ${{ secrets.AKASH_PROVIDERS_BACKUP }}
         run: uv run python -m just_akash.smoke_providers ${{ inputs.all && '--all' || '' }}
+
+      # Safety net: reap any probe the smoke step leaked (step timeout, crash, or
+      # a kill after create-on-chain but before the dseq was recorded, so the
+      # step's own finally/signal cleanup could not fire). Runs even on failure
+      # or cancellation. --min-age 0 reaps this run's *fresh* probe too, which the
+      # default 1h age floor would spare; safe here because concurrency
+      # (cancel-in-progress: false) guarantees no other run is in flight. This
+      # shrinks a leaked-probe's lifetime from ~24h (next day's sweep) to seconds.
+      # Only a runner-infra death (rare) still falls through to the daily sweep.
+      - name: Reap any leaked probe
+        if: always()
+        timeout-minutes: 10
+        env:
+          AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
+        run: uv run python -m just_akash.smoke_providers --sweep-only --min-age 0

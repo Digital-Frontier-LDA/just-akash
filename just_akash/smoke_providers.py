@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -723,10 +724,23 @@ def main() -> int:
         help="With --sweep-only (or the default startup sweep): report leaked probes "
         "without destroying them",
     )
+    ap.add_argument(
+        "--min-age",
+        type=float,
+        default=MIN_ORPHAN_AGE_SECONDS,
+        metavar="SECONDS",
+        help="Only reap probes at least this old (default 3600s). Pass 0 for an "
+        "end-of-job cleanup that reaps this run's own fresh leak -- safe only when "
+        "no other run is concurrent (CI serializes runs).",
+    )
     args = ap.parse_args()
 
     if not os.environ.get("AKASH_API_KEY"):
         print("Error: AKASH_API_KEY not set.", file=sys.stderr)
+        return 1
+
+    if not math.isfinite(args.min_age) or args.min_age < 0:
+        print("Error: --min-age must be a non-negative number of seconds.", file=sys.stderr)
         return 1
 
     # Sweep first (unless disabled): reap any probe a hard-killed earlier run
@@ -739,7 +753,7 @@ def main() -> int:
     )
     if args.sweep_only:
         _hdr(sweep_hdr)
-        sweep_orphan_probes(dry_run=args.dry_run)
+        sweep_orphan_probes(dry_run=args.dry_run, min_age_seconds=args.min_age)
         return 0
 
     # Sweep before resolving providers, not after: the sweep scans all
@@ -748,7 +762,7 @@ def main() -> int:
     # return below without reaping, defeating the self-healing guarantee.
     if not args.no_sweep:
         _hdr(sweep_hdr)
-        sweep_orphan_probes(dry_run=args.dry_run)
+        sweep_orphan_probes(dry_run=args.dry_run, min_age_seconds=args.min_age)
 
     if args.providers:
         providers = args.providers
