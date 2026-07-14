@@ -158,9 +158,18 @@ jobs:
           SMOKE_LATENCY_SLO_P95: "" # empty = latency gate off until thresholds set
           SMOKE_SLO_MIN_SAMPLES: "20"
         run: |
-          if ! git fetch origin telemetry >/dev/null 2>&1; then
+          # Distinguish "branch doesn't exist yet" (a clean no-op) from a real
+          # network/auth failure (which must NOT be silently reported as "no
+          # branch"). This step is continue-on-error, so surfacing the failure
+          # shows a red step without failing the workflow.
+          if ! branches=$(git ls-remote --heads origin telemetry 2>&1); then
+            echo "ERROR: could not reach remote to check telemetry branch:"
+            echo "$branches"; exit 1
+          fi
+          if ! echo "$branches" | grep -q refs/heads/telemetry; then
             echo "no telemetry branch yet — nothing to report"; exit 0
           fi
+          git fetch origin telemetry
           git show origin/telemetry:smoke-latency.jsonl > accrued.jsonl
           python3 -m just_akash.analyze_telemetry accrued.jsonl \
             --check --min-samples "$SMOKE_SLO_MIN_SAMPLES" --slo 0.95 \
