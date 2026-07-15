@@ -461,9 +461,8 @@ class TestUpdateDiagnostics:
         ):
             sp._observe_after_cap(lambda: False, window_s=3)
         assert slept  # it polled at least once
-        assert all(s <= 6.0 for s in slept)
-        # the last sleep is clamped to the remaining window, never a full 6s past it
-        assert max(slept) <= 6.0
+        # every poll is clamped to [0, 6] — never negative, never over the window
+        assert all(0.0 <= s <= 6.0 for s in slept)
 
     def test_check_update_timeout_records_diag_and_stays_fail(self):
         diag: dict = {}

@@ -891,15 +891,16 @@ def _observe_after_cap(probe, window_s: float = POST_CAP_OBSERVE_S) -> tuple[str
     if window_s <= 0:
         return ("never", None)
     start = time.monotonic()
-    while (elapsed := time.monotonic() - start) < window_s:
+    while time.monotonic() - start < window_s:
         try:
             if probe():
                 return ("arrived", int(time.monotonic() - start))
         except Exception:  # noqa: BLE001 — a diagnostic probe must never raise
             pass
-        # Cap the poll to the time left so a short configured window is respected
-        # instead of being overshot by a full poll interval.
-        time.sleep(min(6.0, window_s - elapsed))
+        # Recompute the remaining time AFTER probe() (which may itself be slow) and
+        # clamp to [0, 6]: never overshoot a short window by a full poll interval,
+        # and never pass a negative duration to sleep() if the probe outlasts it.
+        time.sleep(max(0.0, min(6.0, window_s - (time.monotonic() - start))))
     return ("never", None)
 
 
