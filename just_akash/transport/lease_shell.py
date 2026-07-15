@@ -508,20 +508,33 @@ class LeaseShellTransport(Transport):
         arrives (issue #12, the "cold-stdout race"), which is why an exec that
         actually succeeded can come back with rc=0 and EMPTY stdout. Returning the
         instant the exit code lands would drop that trailing output for *every*
-        exec caller, so once the exit code is in hand we keep draining for at most
-        ``result_grace_s`` -- returning early the moment the socket closes (the
-        normal terminator) so a well-behaved command is not delayed, and treating a
-        quiet grace window as "no trailing frame is coming" rather than a hang.
+        exec caller, so once the exit code is in hand we keep draining until the
+        socket closes (the normal terminator, returned on immediately so a
+        well-behaved command is not delayed) OR a total ``result_grace_s`` budget
+        elapses -- whichever comes first. The budget bounds the *whole* post-result
+        drain, not just per-frame silence, so a proxy that keeps dribbling frames
+        after the result cannot stretch it. A quiet window is treated as "no
+        trailing frame is coming" rather than a hang.
         """
         timeout = self._config.recv_timeout
-        # Set once the result frame arrives; from then on a close or a quiet grace
-        # window is a normal terminator, not an error.
+        # Set once the result frame arrives; from then on a close or an exhausted
+        # grace budget is a normal terminator, not an error.
         pending_exit: int | None = None
+        # Absolute monotonic deadline for the post-result drain, set when the exit
+        # code lands. Bounds the TOTAL drain (not merely per-recv silence).
+        drain_deadline: float | None = None
         # Bytes of stdout drained AFTER the result frame -- i.e. the cold-stdout race
         # firing and being caught. Reported on exit so the race stays observable even
         # though the user-facing symptom (empty stdout) is now fixed.
         recovered = 0
         while True:
+            if drain_deadline is not None:
+                remaining = drain_deadline - time.monotonic()
+                if remaining <= 0:
+                    # Whole grace budget spent -- stop draining and return.
+                    self._report_race_recovery(recovered)
+                    return pending_exit
+                timeout = min(self._config.result_grace_s, remaining)
             try:
                 frame = self._recv_proxy_message(ws, timeout=timeout)
             except ConnectionClosedOK:
@@ -555,10 +568,11 @@ class LeaseShellTransport(Transport):
             result = self._dispatch_frame(frame)
             if result is not None:
                 # Exit code in hand -- but don't return yet. Keep draining any
-                # trailing stdout/stderr frame still in flight, bounded by the short
-                # ``result_grace_s`` window (subsequent stdout frames dispatch as a
+                # trailing stdout/stderr frame still in flight, bounded by the total
+                # ``result_grace_s`` budget (subsequent stdout frames dispatch as a
                 # side effect and yield None, so the loop keeps reading).
                 pending_exit = result
+                drain_deadline = time.monotonic() + self._config.result_grace_s
                 timeout = self._config.result_grace_s
 
     @staticmethod

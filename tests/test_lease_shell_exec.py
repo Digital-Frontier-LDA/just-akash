@@ -1341,6 +1341,33 @@ class TestColdStdoutRace:
             dseq="123", api_key="key", deployment=DEPLOYMENT_FIXTURE, result_grace_s=0.05
         )
         LeaseShellTransport(cfg)._pump_frames(ws, 0)
-        # First recv uses recv_timeout (pre-result); after RESULT it drops to grace.
+        # First recv uses recv_timeout (pre-result); after RESULT it drops to the
+        # grace budget (min(result_grace_s, remaining) -> at or just under 0.05).
         assert seen_timeouts[0] == 300.0
-        assert seen_timeouts[1] == 0.05
+        assert 0 < seen_timeouts[1] <= 0.05
+
+    def test_total_drain_budget_bounds_dribbling_proxy(self):
+        """A proxy that keeps sending ignored frames after the result must not
+        stretch the drain past the total result_grace_s budget (per-recv silence
+        alone would never trip). The monotonic deadline cuts it off."""
+        result_frame = bytes([102]) + json.dumps({"exit_code": 3}).encode()
+        filler = bytes([255]) + b"x"  # unknown code -> _dispatch_frame yields None
+
+        class DribblingWS:
+            """Never closes, never goes silent -- only the deadline can stop it."""
+
+            def __init__(self):
+                self.calls = 0
+
+            def recv(self, timeout=None):
+                self.calls += 1
+                return result_frame if self.calls == 1 else filler
+
+        # monotonic: base when the result lands, then advance past deadline (+0.05).
+        clock = iter([100.0, 100.0, 100.02, 100.04, 100.06, 100.08, 100.10])
+        cfg = TransportConfig(
+            dseq="123", api_key="key", deployment=DEPLOYMENT_FIXTURE, result_grace_s=0.05
+        )
+        with patch("just_akash.transport.lease_shell.time.monotonic", lambda: next(clock)):
+            code = LeaseShellTransport(cfg)._pump_frames(DribblingWS(), 0)
+        assert code == 3
