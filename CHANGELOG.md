@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.15.0] — 2026-07-15
+
+### Added
+- **Preflight guards so low credit or a full provider can't score a FALSE failure.** Two checks before/around the deploy:
+  - **Room (proactive):** before deploying, the provider's published capacity (`get_provider().stats` — available cpu/memory/storage + `isOnline`) is checked against the probe's needs. A provider that's offline or too full is skipped as **NO-ROOM** — no wasted deploy + bid-wait, and not a failure. Fails **open**: if capacity can't be read, it proceeds and lets the bid decide, so a stats hiccup never skips a healthy provider.
+  - **Credit (authoritative):** a deploy that returns HTTP **402** (insufficient Console credit — *nothing* is created on-chain, so it's free to probe) is surfaced as **NO-CREDIT**, and since that's account-wide the run stops and exits **clean (0)** as `SMOKE TEST SKIPPED`, rather than churning 402s and scoring every provider FAIL. (The Console API exposes no balance endpoint and the 402 is USD-credit-denominated, so the deploy response is the correct signal — not an on-chain AKT query.)
+  - `NO-ROOM` / `NO-CREDIT` join `NO-BID` as "couldn't test" statuses (yellow, never counted as FAIL).
+- Tests: 935 passing (+12) — capacity sufficiency, offline, fail-open on missing stats / registry miss / API error; 402→NO-CREDIT; NO-ROOM skips without deploying; skips never counted as failures. Room check validated live against all three providers.
+
+---
+
 ## [1.14.0] — 2026-07-14
 
 ### Added

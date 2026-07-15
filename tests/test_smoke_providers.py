@@ -627,3 +627,94 @@ class TestOrphanProbeSweep:
         assert "no leaked probes found" not in out
         assert "could NOT be destroyed" in out
         assert old_probe in out
+
+
+class TestProviderRoomPreflight:
+    """Pre-deploy capacity check: skip an offline/full provider (NO-ROOM), and
+    fail OPEN so a stats hiccup never skips a healthy one."""
+
+    def _prov(self, cpu=2_000_000, mem=10**13, sto=10**14, online=True):
+        return {
+            "isOnline": online,
+            "stats": {
+                "cpu": {"available": cpu},
+                "memory": {"available": mem},
+                "storage": {"ephemeral": {"available": sto}},
+            },
+        }
+
+    def test_room_ok_with_capacity(self):
+        with patch.object(sp, "_api") as api:
+            api.return_value.get_provider.return_value = self._prov()
+            assert sp._provider_room("p")[0] is True
+
+    def test_no_room_when_offline(self):
+        with patch.object(sp, "_api") as api:
+            api.return_value.get_provider.return_value = self._prov(online=False)
+            ok, reason = sp._provider_room("p")
+            assert ok is False and "offline" in reason
+
+    def test_no_room_insufficient_cpu(self):
+        with patch.object(sp, "_api") as api:
+            api.return_value.get_provider.return_value = self._prov(cpu=500)  # < 1000 milli
+            ok, reason = sp._provider_room("p")
+            assert ok is False and "cpu" in reason
+
+    def test_no_room_insufficient_memory(self):
+        with patch.object(sp, "_api") as api:
+            api.return_value.get_provider.return_value = self._prov(mem=1000)
+            ok, reason = sp._provider_room("p")
+            assert ok is False and "memory" in reason
+
+    def test_fail_open_when_no_stats(self):
+        with patch.object(sp, "_api") as api:
+            api.return_value.get_provider.return_value = {"isOnline": True}
+            assert sp._provider_room("p")[0] is True
+
+    def test_fail_open_when_not_in_registry(self):
+        with patch.object(sp, "_api") as api:
+            api.return_value.get_provider.return_value = None
+            assert sp._provider_room("p")[0] is True
+
+    def test_fail_open_on_api_error(self):
+        with patch.object(sp, "_api") as api:
+            api.return_value.get_provider.side_effect = RuntimeError("boom")
+            assert sp._provider_room("p")[0] is True
+
+
+class TestDeployCreditAndSkip:
+    def test_deploy_402_is_no_credit(self):
+        ref: dict = {"dseq": None}
+        with patch.object(
+            sp, "_run", return_value=_completed(stdout="API Error (402): Insufficient balance")
+        ):
+            dseq, note = sp._deploy("sdl", "p", ref)
+        assert dseq is None and note == "no-credit"
+
+    def test_smoke_provider_no_room_skips_without_deploying(self):
+        with (
+            patch.object(sp, "_provider_room", return_value=(False, "provider reports offline")),
+            patch.object(sp, "install_signal_cleanup"),
+            patch.object(sp, "robust_destroy"),
+            patch.object(sp, "_deploy") as dep,
+        ):
+            res = sp.smoke_provider("p", "/sdl", "/key")
+        assert res["deploy"] == "NO-ROOM"
+        dep.assert_not_called()  # never spent a deploy on a full provider
+
+    def test_smoke_provider_no_credit(self):
+        with (
+            patch.object(sp, "_provider_room", return_value=(True, "ok")),
+            patch.object(sp, "_deploy", return_value=(None, "no-credit")),
+            patch.object(sp, "install_signal_cleanup"),
+            patch.object(sp, "robust_destroy"),
+        ):
+            res = sp.smoke_provider("p", "/sdl", "/key")
+        assert res["deploy"] == "NO-CREDIT"
+
+    def test_no_room_and_no_credit_are_not_failures(self):
+        # The overall verdict trips only on "FAIL"; these skips must not.
+        for status in ("NO-ROOM", "NO-CREDIT", "NO-BID"):
+            row = dict.fromkeys(sp.FEATURES, "-")
+            row["deploy"] = status
+            assert not any(v == "FAIL" for v in row.values())
