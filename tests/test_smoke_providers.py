@@ -822,3 +822,49 @@ class TestFailureDiagnostics:
         ):
             sp.smoke_provider("p", "/sdl", "/key")
         cap.assert_called_once()  # first FAIL only
+
+    def test_diagnostics_on_ssh_never_ready(self):
+        with (
+            patch.object(sp, "_provider_room", return_value=(True, "ok")),
+            patch.object(sp, "_deploy", return_value=("123", "ok")),
+            patch.object(sp, "_wait_ready", return_value=True),
+            patch.object(sp, "_wait_exec_ready", return_value=True),
+            patch.object(sp, "_check_status", return_value=True),
+            patch.object(sp, "_check_exec", return_value=True),
+            patch.object(sp, "_check_inject", return_value=True),
+            patch.object(sp, "_check_stream", return_value=True),
+            patch.object(sp, "_wait_ssh_ready", return_value=False),  # sshd never up
+            patch.object(sp, "_ingress_uri", return_value="u"),
+            patch.object(sp, "_check_ingress", return_value=True),
+            patch.object(sp, "_check_update", return_value=True),
+            patch.object(sp, "_capture_diagnostics") as cap,
+            patch.object(sp, "install_signal_cleanup"),
+            patch.object(sp, "robust_destroy"),
+        ):
+            res = sp.smoke_provider("p", "/sdl", "/key")
+        assert res["ssh"] == "FAIL"
+        cap.assert_called_once()
+        assert "ssh" in cap.call_args.args[1].lower()
+
+    def test_diagnostics_on_no_ingress_uri(self):
+        with (
+            patch.object(sp, "_provider_room", return_value=(True, "ok")),
+            patch.object(sp, "_deploy", return_value=("123", "ok")),
+            patch.object(sp, "_wait_ready", return_value=True),
+            patch.object(sp, "_wait_exec_ready", return_value=True),
+            patch.object(sp, "_check_status", return_value=True),
+            patch.object(sp, "_check_exec", return_value=True),
+            patch.object(sp, "_check_inject", return_value=True),
+            patch.object(sp, "_check_stream", return_value=True),
+            patch.object(sp, "_wait_ssh_ready", return_value=True),
+            patch.object(sp, "_check_ssh", return_value=True),
+            patch.object(sp, "_check_connect", return_value=True),
+            patch.object(sp, "_ingress_uri", return_value=None),  # no ingress URI
+            patch.object(sp, "_capture_diagnostics") as cap,
+            patch.object(sp, "install_signal_cleanup"),
+            patch.object(sp, "robust_destroy"),
+        ):
+            res = sp.smoke_provider("p", "/sdl", "/key")
+        assert res["ingress"] == "FAIL"
+        cap.assert_called_once()
+        assert "ingress" in cap.call_args.args[1].lower()
