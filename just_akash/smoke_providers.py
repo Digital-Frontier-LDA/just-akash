@@ -216,7 +216,13 @@ def _provider_records(
             "outcome": results.get(feat, "-"),
             "latency_ms": latencies.get(feat),
             "dseq": dseq,
-            **({"diag": diagnostics[feat]} if diagnostics.get(feat) else {}),
+            # diag is failure evidence — attach it only to a FAIL, matching the
+            # docstring, so a PASS can never carry a stale/partial diag payload.
+            **(
+                {"diag": diagnostics[feat]}
+                if results.get(feat) == "FAIL" and diagnostics.get(feat)
+                else {}
+            ),
         }
         for feat in _TELEMETRY_FEATURES
     ]
@@ -879,7 +885,13 @@ def _probe_in_pod_marker(dseq: str, expected_token: str) -> str:
         return "unreachable"
     if r.returncode != 0:
         return "unreachable"
-    return "new" if expected_token in (r.stdout or "") else "old"
+    out = (r.stdout or "").strip()
+    if not out:
+        # rc=0 with empty stdout is the exec cold-stdout race (fixed in v1.17.0, but
+        # still possible on an un-upgraded path) — a flaky read, NOT proof the env is
+        # old. Never let it masquerade as a real 'old'/stale-update signal.
+        return "unreachable"
+    return "new" if expected_token in out else "old"
 
 
 def _observe_after_cap(probe, window_s: float = POST_CAP_OBSERVE_S) -> tuple[str, int | None]:
@@ -973,7 +985,9 @@ def _check_update(dseq: str, sdl_path: str, uri: str, diag: dict | None = None) 
             if token in last:
                 print(f"  update live at ingress after {int(time.monotonic() - start)}s")
                 return True
-        except (urllib.error.URLError, OSError):
+        except (urllib.error.URLError, OSError, ValueError):
+            # ValueError covers a malformed provider-reported URI — treat as a
+            # transient unreachable and keep polling; the timeout path classifies it.
             last = None
         time.sleep(6)
     # Cap exceeded → FAIL. Classify slow-vs-stuck WITHOUT changing that verdict.

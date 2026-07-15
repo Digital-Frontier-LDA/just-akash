@@ -376,6 +376,11 @@ class TestUpdateDiagnostics:
         with patch.object(sp, "_run", side_effect=RuntimeError("boom")):
             assert sp._probe_in_pod_marker("123456", "tok") == "unreachable"
 
+    def test_in_pod_marker_unreachable_on_empty_stdout(self):
+        """rc=0 with empty/whitespace stdout is the cold-stdout race, not real 'old'."""
+        with patch.object(sp, "_run", return_value=_completed(stdout="  \n")):
+            assert sp._probe_in_pod_marker("123456", "tok") == "unreachable"
+
     def test_observe_after_cap_arrived(self):
         calls = {"n": 0}
 
@@ -496,6 +501,27 @@ class TestUpdateDiagnostics:
         recs = sp._provider_records("prov", "123", {"update": "PASS"}, {}, {"update": {}})
         by = {r["feature"]: r for r in recs}
         assert "diag" not in by["update"]
+
+    def test_provider_records_omits_diag_when_not_failed(self):
+        """diag is failure evidence — never attach it to a non-FAIL, even if populated."""
+        results = {"update": "PASS"}
+        diagnostics = {"update": {"eventual": "arrived"}}  # non-empty but PASS
+        recs = sp._provider_records("prov", "123", results, {}, diagnostics)
+        by = {r["feature"]: r for r in recs}
+        assert "diag" not in by["update"]
+
+    def test_check_update_tolerates_fetch_valueerror(self):
+        """A malformed URI raising ValueError must not abort — keep polling to timeout."""
+        with (
+            patch.object(sp, "_run", return_value=_completed(returncode=0)),
+            patch.object(sp, "_fetch", side_effect=ValueError("bad uri")),
+            patch.object(sp.time, "monotonic", _FakeClock(100)),  # one poll, then cap
+            patch.object(sp.time, "sleep"),
+            patch.object(sp, "_record_update_timeout") as rec,
+        ):
+            ok = sp._check_update("123456", "/sdl", "uri", diag={})
+        assert ok is False
+        rec.assert_called_once()  # reached the timeout classifier, didn't propagate
 
 
 class TestTelemetry:
