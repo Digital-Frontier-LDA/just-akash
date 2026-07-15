@@ -85,13 +85,14 @@ INGRESS_BASELINE = "probe-baseline"
 READY_CAP_S = float(os.environ.get("SMOKE_READY_CAP_S", "240"))
 INGRESS_CAP_S = float(os.environ.get("SMOKE_INGRESS_CAP_S", "180"))
 
-# After a readiness/ingress/update cap expires (verdict already FAIL), keep probing
-# for at most this long to classify the failure as SLOW (resource eventually
-# appears → the cap was too tight) vs STUCK (never appears → a genuine provider
-# defect). Diagnostic-only: this NEVER changes the PASS/FAIL verdict — it only
-# records evidence so cap-widening is data-driven instead of blind. Paid only on an
-# already-failing run, so it costs nothing on the happy path; hard-bounded so a
-# truly-stuck provider cannot hang the run. (Quorum-designed; see CHANGELOG 1.18.0.)
+# After a check's cap expires (verdict already FAIL) — currently the update-cutover
+# check; readiness/ingress get the same treatment in a follow-up — keep probing for
+# at most this long to classify the failure as SLOW (resource eventually appears →
+# the cap was too tight) vs STUCK (never appears → a genuine provider defect).
+# Diagnostic-only: this NEVER changes the PASS/FAIL verdict — it only records
+# evidence so cap-widening is data-driven instead of blind. Paid only on an already-
+# failing run, so it costs nothing on the happy path; hard-bounded so a truly-stuck
+# provider cannot hang the run. (Quorum-designed; see CHANGELOG 1.18.0.)
 POST_CAP_OBSERVE_S = float(os.environ.get("SMOKE_POST_CAP_OBSERVE_S", "90"))
 
 # Probe resource needs, matching PROBE_SDL below. Used by the pre-deploy room
@@ -890,13 +891,15 @@ def _observe_after_cap(probe, window_s: float = POST_CAP_OBSERVE_S) -> tuple[str
     if window_s <= 0:
         return ("never", None)
     start = time.monotonic()
-    while time.monotonic() - start < window_s:
+    while (elapsed := time.monotonic() - start) < window_s:
         try:
             if probe():
                 return ("arrived", int(time.monotonic() - start))
         except Exception:  # noqa: BLE001 — a diagnostic probe must never raise
             pass
-        time.sleep(6)
+        # Cap the poll to the time left so a short configured window is respected
+        # instead of being overshot by a full poll interval.
+        time.sleep(min(6.0, window_s - elapsed))
     return ("never", None)
 
 
@@ -909,7 +912,10 @@ def _record_update_timeout(
     => ingress routing STUCK; eventual=never + in_pod_marker=old => update never reached
     the pod (STUCK, deeper). Never flips the verdict."""
     served = _classify_served(last_body, token)
-    avail = _service_availability(dseq)
+    try:
+        avail = _service_availability(dseq)
+    except Exception:  # noqa: BLE001 — one failing probe must not abort the classification
+        avail = None
     service = f"{avail[0]}/{avail[1]}" if avail else None
     in_pod = _probe_in_pod_marker(dseq, token)
     eventual, after_s = _observe_after_cap(lambda: token in _fetch(uri))

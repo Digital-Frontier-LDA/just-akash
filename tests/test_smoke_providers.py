@@ -438,6 +438,33 @@ class TestUpdateDiagnostics:
         assert diag["body_at_timeout"] == "unreachable"
         assert diag["service_at_timeout"] is None
 
+    def test_record_update_timeout_isolates_raising_service_probe(self):
+        """A raising _service_availability must NOT abort the rest of the
+        classification — the pod + eventual-ingress evidence is still recorded."""
+        diag: dict = {}
+        with (
+            patch.object(sp, "_service_availability", side_effect=RuntimeError("boom")),
+            patch.object(sp, "_probe_in_pod_marker", return_value="new"),
+            patch.object(sp, "_observe_after_cap", return_value=("arrived", 10)),
+        ):
+            sp._record_update_timeout("123456", "uri", "tok", "body", diag)
+        assert diag["service_at_timeout"] is None  # probe raised -> recorded as unknown
+        assert diag["in_pod_marker"] == "new"  # but the rest still captured
+        assert diag["eventual"] == "arrived"
+
+    def test_observe_after_cap_sleep_bounded_to_window(self):
+        """The poll sleep must never overshoot a short window by a full interval."""
+        slept: list = []
+        with (
+            patch.object(sp.time, "monotonic", _FakeClock(1)),
+            patch.object(sp.time, "sleep", side_effect=lambda s: slept.append(s)),
+        ):
+            sp._observe_after_cap(lambda: False, window_s=3)
+        assert slept  # it polled at least once
+        assert all(s <= 6.0 for s in slept)
+        # the last sleep is clamped to the remaining window, never a full 6s past it
+        assert max(slept) <= 6.0
+
     def test_check_update_timeout_records_diag_and_stays_fail(self):
         diag: dict = {}
         with (
