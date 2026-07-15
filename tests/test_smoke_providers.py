@@ -150,7 +150,7 @@ class TestServiceReadinessSignal:
     # ── _wait_ready ──────────────────────────────────────────────────
     def test_wait_ready_true_when_service_available(self):
         with (
-            patch.object(sp, "_deployment_dead", return_value=False),
+            patch.object(sp, "_dead_state", return_value=None),
             patch.object(sp, "_service_availability", return_value=(1, 1)),
             patch.object(sp.time, "sleep"),
             patch.object(sp.time, "monotonic", _FakeClock(1)),
@@ -159,7 +159,7 @@ class TestServiceReadinessSignal:
 
     def test_wait_ready_fails_fast_on_terminal_state(self):
         with (
-            patch.object(sp, "_deployment_dead", return_value=True),
+            patch.object(sp, "_dead_state", return_value="failed"),
             patch.object(sp, "_service_availability", return_value=None),
             patch.object(sp.time, "sleep"),
             patch.object(sp.time, "monotonic", _FakeClock(1)),
@@ -170,7 +170,7 @@ class TestServiceReadinessSignal:
         # Provider never populates availability, but a lease-shell exec works ->
         # the container IS running, so we must call it ready.
         with (
-            patch.object(sp, "_deployment_dead", return_value=False),
+            patch.object(sp, "_dead_state", return_value=None),
             patch.object(sp, "_service_availability", return_value=None),
             patch.object(sp, "_run", return_value=_completed(stdout="ready\n")) as run,
             patch.object(sp.time, "sleep"),
@@ -181,7 +181,7 @@ class TestServiceReadinessSignal:
 
     def test_wait_ready_false_after_cap_when_never_serving(self):
         with (
-            patch.object(sp, "_deployment_dead", return_value=False),
+            patch.object(sp, "_dead_state", return_value=None),
             patch.object(sp, "_service_availability", return_value=(0, 1)),
             patch.object(sp, "_run", return_value=_completed(stdout="", returncode=1)),
             patch.object(sp.time, "sleep"),
@@ -618,7 +618,7 @@ class TestUpdateDiagnostics:
         with (
             patch.object(sp.time, "monotonic", _FakeClock(40)),
             patch.object(sp.time, "sleep"),
-            patch.object(sp, "_deployment_dead", return_value=False),
+            patch.object(sp, "_dead_state", return_value=None),
             patch.object(sp, "_service_availability", return_value=None),
             patch.object(sp, "_run", side_effect=subprocess.TimeoutExpired("cmd", 25)),
             patch.object(sp, "_record_ready_timeout"),
@@ -1235,10 +1235,23 @@ class TestLeaseDown:
         with (
             patch.object(sp.time, "monotonic", _FakeClock(1)),
             patch.object(sp.time, "sleep"),
-            patch.object(sp, "_deployment_dead", return_value=True),
+            patch.object(sp, "_dead_state", return_value="failed"),
         ):
             assert sp._wait_ready("1", cap_s=100, diag=diag) is False
         assert diag.get("fail_kind") == "lease-down"
+        assert diag.get("terminal_state") == "failed"
+
+    def test_wait_ready_insufficient_funds_is_not_lease_down(self):
+        """Escrow exhaustion is OUR funding issue — dead, but NOT a LEASE-DOWN."""
+        diag: dict = {}
+        with (
+            patch.object(sp.time, "monotonic", _FakeClock(1)),
+            patch.object(sp.time, "sleep"),
+            patch.object(sp, "_dead_state", return_value="insufficient_funds"),
+        ):
+            assert sp._wait_ready("1", cap_s=100, diag=diag) is False
+        assert diag.get("terminal_state") == "insufficient_funds"
+        assert diag.get("fail_kind") != "lease-down"
 
     def test_smoke_provider_lease_down_marks_cells_distinctly(self):
         def fake_wait_ready(*a, **kw):

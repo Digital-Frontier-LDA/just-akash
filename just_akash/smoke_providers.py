@@ -213,8 +213,9 @@ def _provider_records(
     latency_ms is None for a feature that was never reached (e.g. everything
     after a no-bid). Pass/fail is the lagging binary; latency is the leading
     signal that lets us later set percentile timeouts and spot regressions. A
-    feature that timed out also carries a ``diag`` slow-vs-stuck classification
-    (only present on such a failure), so a FAIL says WHY without turning green.
+    feature with a failing outcome (FAIL or LEASE-DOWN) also carries a ``diag``
+    classification (slow-vs-stuck, or the lease-down terminal state), so a failure
+    says WHY without turning green.
     """
     diagnostics = diagnostics or {}
     return [
@@ -224,8 +225,8 @@ def _provider_records(
             "outcome": results.get(feat, "-"),
             "latency_ms": latencies.get(feat),
             "dseq": dseq,
-            # diag is failure evidence — attach it only to a FAIL, matching the
-            # docstring, so a PASS can never carry a stale/partial diag payload.
+            # diag is failure evidence — attach it only to a failing outcome (FAIL or
+            # LEASE-DOWN), so a PASS/skip can never carry a stale/partial diag payload.
             **(
                 {"diag": diagnostics[feat]}
                 if results.get(feat) in _FAILING_OUTCOMES and diagnostics.get(feat)
@@ -587,14 +588,23 @@ def _service_availability(dseq: str) -> tuple[int, int] | None:
     return (available, count) if saw_service else None
 
 
-def _deployment_dead(dseq: str) -> bool:
-    """True only if the deployment/lease is in a terminal state it can't recover
-    from (closed, or escrow exhausted) — so readiness waits fail FAST instead of
-    burning the whole cap. A transient read error is NOT treated as dead."""
+# Terminal on-chain states readiness can't recover from. "failed"/"closed" are the
+# provider mapping of Console status "down" (api.py canopy_status) — the provider
+# accepted the bid then the lease died = a LEASE-DOWN fulfillment failure. Escrow
+# exhaustion is OUR funding issue, not a provider fault, so it is dead but NOT
+# lease-down. "failed" was originally missing here — that omission is why a failed
+# lease wasn't fast-failed and readiness burned the whole cap.
+_DEAD_STATES = {"closed", "failed", "insufficient_funds", "insufficientfunds"}
+_LEASE_DOWN_STATES = {"failed", "closed"}
+
+
+def _dead_state(dseq: str) -> str | None:
+    """The specific terminal state the deployment/lease is stuck in, or None if it is
+    still live (or unreadable — a transient read error is NOT treated as dead)."""
     try:
         dep = _api().get_deployment(dseq)
     except Exception:  # noqa: BLE001
-        return False
+        return None
     states: list = []
     d = dep.get("deployment") if isinstance(dep, dict) else None
     if isinstance(d, dict):
@@ -602,11 +612,16 @@ def _deployment_dead(dseq: str) -> bool:
     for lease in dep.get("leases") or []:
         if isinstance(lease, dict):
             states.append(lease.get("state"))
-    # "failed" is a terminal on-chain state the Console API maps to status "down"
-    # (api.py canopy_status). Its omission here is why a lease that FAILED after the
-    # bid was accepted wasn't fast-failed — readiness burned the full cap instead.
-    dead = {"closed", "failed", "insufficient_funds", "insufficientfunds"}
-    return any(isinstance(s, str) and s.lower() in dead for s in states)
+    for s in states:
+        if isinstance(s, str) and s.lower() in _DEAD_STATES:
+            return s.lower()
+    return None
+
+
+def _deployment_dead(dseq: str) -> bool:
+    """True if the deployment/lease is in a terminal state it can't recover from,
+    so readiness waits fail FAST instead of burning the whole cap."""
+    return _dead_state(dseq) is not None
 
 
 def _wait_ready(dseq: str, cap_s: float = READY_CAP_S, diag: dict | None = None) -> bool:
@@ -626,16 +641,18 @@ def _wait_ready(dseq: str, cap_s: float = READY_CAP_S, diag: dict | None = None)
     last_exec_probe = 0.0
     while time.monotonic() - start < cap_s:
         elapsed = int(time.monotonic() - start)
-        if _deployment_dead(dseq):
+        dead_state = _dead_state(dseq)
+        if dead_state is not None:
             print(
-                f"  {RED}deployment reached a terminal state (down/failed){RESET} "
-                f"after {elapsed}s"
+                f"  {RED}deployment reached terminal state '{dead_state}'{RESET} after {elapsed}s"
             )
-            # Tell the caller this is a LEASE-DOWN (provider accepted the bid, the
-            # lease then died on-chain) vs a plain readiness timeout — without a
-            # second _deployment_dead query at the outer layer.
             if diag is not None:
-                diag["fail_kind"] = "lease-down"
+                diag["terminal_state"] = dead_state
+                # LEASE-DOWN only for a provider-fulfillment terminal state (the lease
+                # failed/closed after the bid was accepted). Escrow exhaustion
+                # (insufficient_funds) is our funding issue → a plain readiness FAIL.
+                if dead_state in _LEASE_DOWN_STATES:
+                    diag["fail_kind"] = "lease-down"
             return False
         avail = _service_availability(dseq)
         if avail is not None and avail[0] >= 1:
@@ -1430,9 +1447,7 @@ def main() -> int:
     # NO-BID / NO-ROOM / NO-CREDIT are pre-commitment skips (provider offered no
     # capacity, or we couldn't afford to test), never failures. LEASE-DOWN IS a
     # failure — the provider accepted the bid and the lease then died on-chain.
-    failed = {
-        p: r for p, r in rows.items() if any(v in _FAILING_OUTCOMES for v in r.values())
-    }
+    failed = {p: r for p, r in rows.items() if any(v in _FAILING_OUTCOMES for v in r.values())}
     if failed:
         print(f"{RED}SMOKE TEST FAILED{RESET}: {len(failed)} provider(s) with broken features:")
         for p in failed:

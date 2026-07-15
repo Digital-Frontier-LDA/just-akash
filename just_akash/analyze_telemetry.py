@@ -119,7 +119,9 @@ def aggregate(records: list[dict]) -> dict[tuple[str, str], dict]:
             lat = r.get("latency_ms")
             if isinstance(lat, (int, float)):
                 g["latencies"].append(float(lat))
-        elif outcome == "FAIL":
+        elif outcome in ("FAIL", "LEASE-DOWN"):
+            # LEASE-DOWN (provider accepted the bid then the lease died on-chain) is a
+            # genuine failure, unlike the pre-commitment NO-BID/"-" skips — count it.
             g["fail"] += 1
         else:
             g["other"] += 1
