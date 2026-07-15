@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.19.0] — 2026-07-15
+
+### Added
+- **Slow-vs-stuck diagnostics extended to `_wait_ready` and `_check_ingress`** — completing the readiness/ingress/update instrumentation the quorum called for (v1.18.0 did update). The one whole-deployment cascade in the accrued data (deploy OK but the lease never became ready → all 10 features failed at once) returned a bare `False`, so we couldn't tell whether the container was SLOW (would serve with a bigger cap → widen it) or STUCK (a dead lease / unschedulable pod / a container that never serves → a genuine defect). Now, on a readiness or initial-ingress timeout, the check records into the run log **and** telemetry (`diag`), without ever flipping the FAIL: `service_at_timeout` (lease ready/total), `dead_at_timeout` (terminal lease state), `exec_at_timeout` (a one-shot lease-shell exec — and an rc=0-but-empty-stdout is treated as **not** working, so the cold-stdout race can't fake a live container), `last_at_timeout` (ingress last error), and the bounded post-cap observation (`eventual`/`eventual_after_s`/`fail_cap_s`). Every probe is exception-isolated so one failing probe can't abort the classification. The next hgulk6 cascade will say exactly whether the container was slow or never came up.
+- Tests: 985 passing (+12) — availability/exec probes (incl. empty-stdout → not-working), the ready recorder classifies slow / exec-up-but-availability-unreported / all-probes-raising, `_wait_ready` + `_check_ingress` invoke their recorders on timeout, and the ingress recorder captures service + last-error.
+
+---
+
 ## [1.18.0] — 2026-07-15
 
 ### Added

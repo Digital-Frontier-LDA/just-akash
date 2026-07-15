@@ -510,6 +510,155 @@ class TestUpdateDiagnostics:
         by = {r["feature"]: r for r in recs}
         assert "diag" not in by["update"]
 
+    # --- readiness + ingress timeout diagnostics (Phase 1b) ---
+
+    def test_availability_ready_true(self):
+        with patch.object(sp, "_service_availability", return_value=(1, 1)):
+            assert sp._availability_ready("123456") is True
+
+    def test_availability_ready_false_when_zero(self):
+        with patch.object(sp, "_service_availability", return_value=(0, 1)):
+            assert sp._availability_ready("123456") is False
+
+    def test_availability_ready_false_on_raise(self):
+        with patch.object(sp, "_service_availability", side_effect=RuntimeError("x")):
+            assert sp._availability_ready("123456") is False
+
+    def test_exec_works_true(self):
+        with patch.object(sp, "_run", return_value=_completed(stdout="ready\n")):
+            assert sp._exec_works("123456") is True
+
+    def test_exec_works_false_on_empty_stdout(self):
+        # rc=0 but empty stdout is the cold-stdout race, not a live container
+        with patch.object(sp, "_run", return_value=_completed(stdout="  \n")):
+            assert sp._exec_works("123456") is False
+
+    def test_exec_works_false_on_raise(self):
+        with patch.object(sp, "_run", side_effect=RuntimeError("x")):
+            assert sp._exec_works("123456") is False
+
+    def test_record_ready_timeout_slow(self):
+        diag: dict = {}
+        with (
+            patch.object(sp, "_deployment_dead", return_value=False),
+            patch.object(sp, "_service_availability", return_value=(0, 1)),
+            patch.object(sp, "_exec_works", return_value=False),
+            patch.object(sp, "_observe_after_cap", return_value=("arrived", 30)),
+        ):
+            sp._record_ready_timeout("123456", diag)
+        assert diag["eventual"] == "arrived"
+        assert diag["eventual_after_s"] == 30
+        assert diag["dead_at_timeout"] is False
+        assert diag["service_at_timeout"] == "0/1"
+        assert diag["exec_at_timeout"] == "unreachable"
+        assert diag["fail_cap_s"] == int(sp.READY_CAP_S)
+
+    def test_record_ready_timeout_exec_up_but_availability_unreported(self):
+        """No availability, but exec works => container IS up; record eventual=arrived."""
+        diag: dict = {}
+        with (
+            patch.object(sp, "_deployment_dead", return_value=False),
+            patch.object(sp, "_service_availability", return_value=None),
+            patch.object(sp, "_exec_works", return_value=True),
+            patch.object(sp, "_observe_after_cap", return_value=("never", None)),
+        ):
+            sp._record_ready_timeout("123456", diag)
+        assert diag["exec_at_timeout"] == "ok"
+        assert diag["eventual"] == "arrived"  # exec proves it came up
+
+    def test_record_ready_timeout_reports_passed_cap(self):
+        """fail_cap_s must reflect the cap the check actually ran with, not the default."""
+        diag: dict = {}
+        with (
+            patch.object(sp, "_deployment_dead", return_value=False),
+            patch.object(sp, "_service_availability", return_value=(0, 1)),
+            patch.object(sp, "_exec_works", return_value=False),
+            patch.object(sp, "_observe_after_cap", return_value=("never", None)),
+        ):
+            sp._record_ready_timeout("123456", diag, cap_s=42)
+        assert diag["fail_cap_s"] == 42
+
+    def test_record_ingress_timeout_reports_passed_cap(self):
+        diag: dict = {}
+        with (
+            patch.object(sp, "_service_availability", return_value=(1, 1)),
+            patch.object(sp, "_observe_after_cap", return_value=("never", None)),
+        ):
+            sp._record_ingress_timeout("123456", "uri", "err", diag, cap_s=55)
+        assert diag["fail_cap_s"] == 55
+
+    def test_record_ready_timeout_isolates_raising_probes(self):
+        diag: dict = {}
+        with (
+            patch.object(sp, "_deployment_dead", side_effect=RuntimeError("x")),
+            patch.object(sp, "_service_availability", side_effect=RuntimeError("x")),
+            patch.object(sp, "_exec_works", return_value=False),
+            patch.object(sp, "_observe_after_cap", return_value=("never", None)),
+        ):
+            sp._record_ready_timeout("123456", diag)  # must not raise
+        assert diag["dead_at_timeout"] is False
+        assert diag["service_at_timeout"] is None
+        assert diag["eventual"] == "never"
+
+    def test_wait_ready_timeout_records_diag(self):
+        diag: dict = {}
+        with (
+            patch.object(sp.time, "monotonic", _FakeClock(300)),  # blow past READY_CAP
+            patch.object(sp.time, "sleep"),
+            patch.object(sp, "_deployment_dead", return_value=False),
+            patch.object(sp, "_service_availability", return_value=None),
+            patch.object(sp, "_record_ready_timeout") as rec,
+        ):
+            assert sp._wait_ready("123456", diag=diag) is False
+        rec.assert_called_once()
+
+    def test_wait_ready_exec_probe_raise_does_not_abort(self):
+        """A subprocess timeout/OSError in the exec fallback must be swallowed (via
+        _exec_works), not abort the readiness wait + its diagnostics."""
+        with (
+            patch.object(sp.time, "monotonic", _FakeClock(40)),
+            patch.object(sp.time, "sleep"),
+            patch.object(sp, "_deployment_dead", return_value=False),
+            patch.object(sp, "_service_availability", return_value=None),
+            patch.object(sp, "_run", side_effect=subprocess.TimeoutExpired("cmd", 25)),
+            patch.object(sp, "_record_ready_timeout"),
+        ):
+            assert sp._wait_ready("1", cap_s=100) is False  # must not raise
+
+    def test_record_ingress_timeout_stuck(self):
+        diag: dict = {}
+        with (
+            patch.object(sp, "_service_availability", return_value=(1, 1)),
+            patch.object(sp, "_observe_after_cap", return_value=("never", None)),
+        ):
+            sp._record_ingress_timeout("123456", "uri", "404 Not Found", diag)
+        assert diag["eventual"] == "never"
+        assert diag["service_at_timeout"] == "1/1"
+        assert diag["last_at_timeout"] == "404 Not Found"
+        assert diag["fail_cap_s"] == int(sp.INGRESS_CAP_S)
+
+    def test_check_ingress_timeout_records_diag(self):
+        diag: dict = {}
+        with (
+            patch.object(sp, "_fetch", return_value="wrong-content"),
+            patch.object(sp.time, "monotonic", _FakeClock(200)),
+            patch.object(sp.time, "sleep"),
+            patch.object(sp, "_record_ingress_timeout") as rec,
+        ):
+            assert sp._check_ingress("123456", "uri", diag=diag) is False
+        rec.assert_called_once()
+
+    def test_check_ingress_tolerates_fetch_valueerror(self):
+        """A malformed URI raising ValueError in-loop must not abort — poll to timeout."""
+        with (
+            patch.object(sp, "_fetch", side_effect=ValueError("bad uri")),
+            patch.object(sp.time, "monotonic", _FakeClock(100)),  # one poll, then cap
+            patch.object(sp.time, "sleep"),
+            patch.object(sp, "_record_ingress_timeout") as rec,
+        ):
+            assert sp._check_ingress("123456", "uri", diag={}) is False
+        rec.assert_called_once()  # reached the classifier, didn't propagate
+
     def test_check_update_tolerates_fetch_valueerror(self):
         """A malformed URI raising ValueError must not abort — keep polling to timeout."""
         with (
