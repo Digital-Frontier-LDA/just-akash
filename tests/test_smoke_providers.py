@@ -1410,3 +1410,59 @@ class TestQuarantine:
         row["deploy"] = "PASS"
         failed = sp._gating_providers({prov: row}, [], set())  # not quarantined
         assert prov in failed  # non-quarantined LEASE-DOWN gates
+
+
+class TestQuarantineMainGate:
+    """End-to-end main(): the gate is GREEN when a quarantined provider's reliability
+    fails (shown, not masked) and RED when a real tooling regression does — the
+    definitive 'the CI gate no longer flakes on hgulk6' behavior."""
+
+    def _fake_smoke(self, hgulk6, tooling=False):
+        def _f(provider, sdl, key, records=None):
+            if provider == hgulk6 and not tooling:
+                row = {**dict.fromkeys(sp.FEATURES, sp.LEASE_DOWN), "deploy": "PASS"}
+                diag = {"fail_kind": "lease-down"}
+            elif provider == hgulk6 and tooling:
+                row = {**dict.fromkeys(sp.FEATURES, "PASS"), "exec": "FAIL"}
+                diag = None
+            else:
+                row = dict.fromkeys(sp.FEATURES, "PASS")
+                diag = None
+            if records is not None:
+                for f in sp._TELEMETRY_FEATURES:
+                    rec = {"provider": provider, "feature": f, "outcome": row.get(f, "-")}
+                    if row.get(f) in sp._FAILING_OUTCOMES and diag:
+                        rec["diag"] = diag
+                    records.append(rec)
+            return row
+
+        return _f
+
+    def _run_main(self, hgulk6, aaul, tooling=False):
+        argv = ["smoke", "--provider", hgulk6, "--provider", aaul, "--no-sweep"]
+        with (
+            patch.object(sp.sys, "argv", argv),
+            patch.dict(
+                "os.environ",
+                {"AKASH_API_KEY": "k", "SMOKE_QUARANTINE_PROVIDERS": hgulk6},
+            ),
+            patch.object(sp, "smoke_provider", side_effect=self._fake_smoke(hgulk6, tooling)),
+            patch.object(sp, "_generate_keypair", return_value="/tmp/smoke-k/id"),
+            patch.object(sp, "install_signal_cleanup"),
+            patch.object(sp.shutil, "rmtree"),
+        ):
+            return sp.main()
+
+    def test_main_green_when_quarantined_lease_down(self, capsys):
+        code = self._run_main("akash1hgulk6demo", "akash1aauldemo")
+        out = capsys.readouterr().out
+        assert code == 0  # GREEN — a quarantined provider's LEASE-DOWN did not gate
+        assert "SMOKE TEST PASSED" in out
+        assert "[QUARANTINED]" in out  # shown, not masked
+        assert "SMOKE TEST FAILED" not in out
+
+    def test_main_red_when_quarantined_tooling_regression(self, capsys):
+        code = self._run_main("akash1hgulk6demo", "akash1aauldemo", tooling=True)
+        out = capsys.readouterr().out
+        assert code == 1  # RED — a real tooling bug on a quarantined provider still gates
+        assert "SMOKE TEST FAILED" in out
