@@ -586,10 +586,13 @@ class LeaseShellTransport(Transport):
         symptom is fixed. See ``TransportConfig.result_grace_s`` / issue #12.
         """
         if recovered > 0:
+            # flush=True to match the _dispatch_frame stderr path and guarantee the
+            # marker reaches the captured stream even if the process exits promptly.
             print(
                 f"[lease-shell] flaky-pass: drained {recovered} byte(s) of trailing "
                 "stdout after the result frame (issue #12 cold-stdout race caught)",
                 file=sys.stderr,
+                flush=True,
             )
 
     def _exec_with_refresh(self, command: str) -> int:
