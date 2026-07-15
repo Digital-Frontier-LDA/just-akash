@@ -183,6 +183,14 @@ FEATURES = [
 # column, but the leading latency signal for the readiness-lag we chase).
 _TELEMETRY_FEATURES = [*FEATURES, "ready"]
 
+# Outcomes that count as a provider FAILURE (trip the run + carry diagnostics).
+# LEASE-DOWN is distinct from FAIL — the provider ACCEPTED the bid and the lease
+# then terminated on-chain (state failed/closed), a fulfillment failure rather than
+# a broken feature — but it is still a genuine reliability failure, unlike the
+# pre-commitment NO-BID / NO-ROOM / NO-CREDIT skips. (Quorum-designed, unanimous.)
+LEASE_DOWN = "LEASE-DOWN"
+_FAILING_OUTCOMES = ("FAIL", LEASE_DOWN)
+
 
 def _pkg_version() -> str:
     try:
@@ -220,7 +228,7 @@ def _provider_records(
             # docstring, so a PASS can never carry a stale/partial diag payload.
             **(
                 {"diag": diagnostics[feat]}
-                if results.get(feat) == "FAIL" and diagnostics.get(feat)
+                if results.get(feat) in _FAILING_OUTCOMES and diagnostics.get(feat)
                 else {}
             ),
         }
@@ -594,7 +602,10 @@ def _deployment_dead(dseq: str) -> bool:
     for lease in dep.get("leases") or []:
         if isinstance(lease, dict):
             states.append(lease.get("state"))
-    dead = {"closed", "insufficient_funds", "insufficientfunds"}
+    # "failed" is a terminal on-chain state the Console API maps to status "down"
+    # (api.py canopy_status). Its omission here is why a lease that FAILED after the
+    # bid was accepted wasn't fast-failed — readiness burned the full cap instead.
+    dead = {"closed", "failed", "insufficient_funds", "insufficientfunds"}
     return any(isinstance(s, str) and s.lower() in dead for s in states)
 
 
@@ -616,7 +627,15 @@ def _wait_ready(dseq: str, cap_s: float = READY_CAP_S, diag: dict | None = None)
     while time.monotonic() - start < cap_s:
         elapsed = int(time.monotonic() - start)
         if _deployment_dead(dseq):
-            print(f"  {RED}deployment reached a terminal state{RESET} after {elapsed}s")
+            print(
+                f"  {RED}deployment reached a terminal state (down/failed){RESET} "
+                f"after {elapsed}s"
+            )
+            # Tell the caller this is a LEASE-DOWN (provider accepted the bid, the
+            # lease then died on-chain) vs a plain readiness timeout — without a
+            # second _deployment_dead query at the outer layer.
+            if diag is not None:
+                diag["fail_kind"] = "lease-down"
             return False
         avail = _service_availability(dseq)
         if avail is not None and avail[0] >= 1:
@@ -1154,17 +1173,28 @@ def smoke_provider(provider: str, sdl_path: str, key: str, records: list | None 
         _t0 = time.monotonic()
         ready = _wait_ready(dseq, diag=diagnostics.setdefault("ready", {}))
         latencies["ready"] = round((time.monotonic() - _t0) * 1000)
-        results["ready"] = "PASS" if ready else "FAIL"
         if not ready:
-            # A lease that never becomes ready is a real failure, not a pass: every
-            # untested feature must read FAIL so the provider counts against the run
-            # (the overall verdict only trips on "FAIL", never on "-").
-            print(f"  {RED}lease never became ready{RESET} — marking untested features FAIL")
-            _diag_once("lease never became ready")  # the intermittent-reliability case
+            # A lease that never serves is a real failure, not a pass: every untested
+            # feature reads a failing outcome so the provider counts against the run.
+            # Distinguish LEASE-DOWN (provider accepted the bid, the lease then died
+            # on-chain — a fulfillment failure) from a plain readiness FAIL (container
+            # slow/never-served). Both trip the run; LEASE-DOWN is labelled distinctly
+            # so it isn't mistaken for a broken-feature regression.
+            lease_down = diagnostics.get("ready", {}).get("fail_kind") == "lease-down"
+            outcome = LEASE_DOWN if lease_down else "FAIL"
+            results["ready"] = outcome
+            label = (
+                "lease went down (terminal on-chain state)"
+                if lease_down
+                else "lease never became ready"
+            )
+            print(f"  {RED}{label}{RESET} — marking untested features {outcome}")
+            _diag_once(label)
             for feat in FEATURES:
                 if results[feat] == "-":
-                    results[feat] = "FAIL"
+                    results[feat] = outcome
             return results
+        results["ready"] = "PASS"
         if not _wait_exec_ready(dseq):
             print(f"  {YELLOW}container slow to accept exec{RESET} — checks may reflect that")
 
@@ -1396,15 +1426,20 @@ def main() -> int:
         print(f"{YELLOW}SMOKE TEST SKIPPED{RESET}: insufficient Console credit to deploy probes.")
         return 0
 
-    # A provider fails the smoke test if any testable feature is FAIL. NO-BID /
-    # NO-ROOM / NO-CREDIT are skips (provider offered no capacity, or we couldn't
-    # afford to test), never failures.
-    failed = {p: r for p, r in rows.items() if any(v == "FAIL" for v in r.values())}
+    # A provider fails the smoke test if any testable feature is FAIL or LEASE-DOWN.
+    # NO-BID / NO-ROOM / NO-CREDIT are pre-commitment skips (provider offered no
+    # capacity, or we couldn't afford to test), never failures. LEASE-DOWN IS a
+    # failure — the provider accepted the bid and the lease then died on-chain.
+    failed = {
+        p: r for p, r in rows.items() if any(v in _FAILING_OUTCOMES for v in r.values())
+    }
     if failed:
         print(f"{RED}SMOKE TEST FAILED{RESET}: {len(failed)} provider(s) with broken features:")
         for p in failed:
-            broken = [f for f in FEATURES if rows[p].get(f) == "FAIL"]
-            print(f"  {p}: {', '.join(broken)}")
+            broken = [f for f in FEATURES if rows[p].get(f) in _FAILING_OUTCOMES]
+            down = any(rows[p].get(f) == LEASE_DOWN for f in FEATURES)
+            tag = " [LEASE-DOWN: provider accepted the bid then the lease died]" if down else ""
+            print(f"  {p}: {', '.join(broken)}{tag}")
         return 1
     print(f"{GREEN}SMOKE TEST PASSED{RESET}: all testable providers support every feature.")
     return 0

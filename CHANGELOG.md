@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.20.0] — 2026-07-15
+
+### Fixed
+- **`_deployment_dead` now recognizes the terminal `failed` state — fixing a 240s readiness waste + a mis-classified hgulk6 cascade.** A hgulk6 whole-deployment cascade (all 10 features FAIL) was root-caused: the deployment's on-chain state went to **`failed`** (the Console API maps `state ∈ {closed, failed}` → `status: down`), but the dead-state set was `{closed, insufficient_funds}` — **missing `failed`** — so readiness never fast-failed and burned the full 240s cap before cascading. Adding `failed` (a terminal on-chain state, zero false-failure risk — it is derived from on-chain state, not a flappable provider-health field, so no persistence polling is needed) makes it fail fast. No leak occurred — the `robust_destroy` audit safety-net confirmed closure.
+
+### Added
+- **Distinct `LEASE-DOWN` outcome** — a provider that *accepted the bid* and then let the lease die on-chain is a genuine reliability failure, but categorically different from a broken feature. When readiness fails on a terminal deployment state, cells now read `LEASE-DOWN` instead of 10 generic `FAIL`s (`_wait_ready` flags `diag["fail_kind"]` so the caller labels it without a second query). It **fails the run** — `_FAILING_OUTCOMES = ("FAIL", "LEASE-DOWN")` — because unlike the *pre-commitment* NO-BID / NO-ROOM / NO-CREDIT skips, the provider made and broke a fulfillment commitment; hiding hgulk6's ~8% lease-failure rate as a skip would defeat the smoke test. The verdict line tags it `[LEASE-DOWN: provider accepted the bid then the lease died]`. (Design reached by a full 3-model quorum, 2 rounds, unanimous — a verified reading of `api.py`'s status mapping flipped the one dissent.)
+- Tests: 997 passing (+8) — `_deployment_dead` recognizes failed/closed, `_wait_ready` flags lease-down, `smoke_provider` marks cells `LEASE-DOWN` distinctly (vs a plain readiness FAIL), it is a failing (not skip) outcome, and its diag reaches telemetry.
+
+---
+
 ## [1.19.0] — 2026-07-15
 
 ### Added

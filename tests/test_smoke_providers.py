@@ -1200,3 +1200,89 @@ class TestFailureDiagnostics:
         assert res["ingress"] == "FAIL"
         cap.assert_called_once()
         assert "ingress" in cap.call_args.args[1].lower()
+
+
+class TestLeaseDown:
+    """LEASE-DOWN: a provider that accepted the bid but the lease then died on-chain
+    (terminal state failed/closed). Fast-fail + a distinct FAILING outcome (quorum)."""
+
+    def test_deployment_dead_recognizes_failed(self):
+        with patch.object(sp, "_api") as api:
+            api.return_value.get_deployment.return_value = {
+                "deployment": {"state": "failed"},
+                "leases": [],
+            }
+            assert sp._deployment_dead("123") is True
+
+    def test_deployment_dead_recognizes_closed(self):
+        with patch.object(sp, "_api") as api:
+            api.return_value.get_deployment.return_value = {
+                "deployment": {"state": "closed"},
+                "leases": [],
+            }
+            assert sp._deployment_dead("123") is True
+
+    def test_deployment_dead_false_when_active(self):
+        with patch.object(sp, "_api") as api:
+            api.return_value.get_deployment.return_value = {
+                "deployment": {"state": "active"},
+                "leases": [{"state": "active"}],
+            }
+            assert sp._deployment_dead("123") is False
+
+    def test_wait_ready_flags_lease_down_on_terminal_state(self):
+        diag: dict = {}
+        with (
+            patch.object(sp.time, "monotonic", _FakeClock(1)),
+            patch.object(sp.time, "sleep"),
+            patch.object(sp, "_deployment_dead", return_value=True),
+        ):
+            assert sp._wait_ready("1", cap_s=100, diag=diag) is False
+        assert diag.get("fail_kind") == "lease-down"
+
+    def test_smoke_provider_lease_down_marks_cells_distinctly(self):
+        def fake_wait_ready(*a, **kw):
+            d = kw.get("diag")
+            if d is not None:
+                d["fail_kind"] = "lease-down"
+            return False
+
+        with (
+            patch.object(sp, "_provider_room", return_value=(True, "ok")),
+            patch.object(sp, "_deploy", return_value=("123", "ok")),
+            patch.object(sp, "_wait_ready", side_effect=fake_wait_ready),
+            patch.object(sp, "_capture_diagnostics"),
+            patch.object(sp, "install_signal_cleanup"),
+            patch.object(sp, "robust_destroy"),
+        ):
+            res = sp.smoke_provider("p", "/sdl", "/key")
+        assert res["ready"] == sp.LEASE_DOWN
+        assert res["deploy"] == "PASS"
+        assert all(res[f] == sp.LEASE_DOWN for f in sp.FEATURES if f != "deploy")
+
+    def test_smoke_provider_plain_ready_fail_stays_fail(self):
+        """A readiness timeout with no terminal state is a plain FAIL, not LEASE-DOWN."""
+        with (
+            patch.object(sp, "_provider_room", return_value=(True, "ok")),
+            patch.object(sp, "_deploy", return_value=("123", "ok")),
+            patch.object(sp, "_wait_ready", return_value=False),  # no fail_kind set
+            patch.object(sp, "_capture_diagnostics"),
+            patch.object(sp, "install_signal_cleanup"),
+            patch.object(sp, "robust_destroy"),
+        ):
+            res = sp.smoke_provider("p", "/sdl", "/key")
+        assert res["ready"] == "FAIL"
+        assert res["exec"] == "FAIL"
+        assert sp.LEASE_DOWN not in res.values()
+
+    def test_lease_down_is_a_failing_outcome_not_a_skip(self):
+        assert sp.LEASE_DOWN in sp._FAILING_OUTCOMES
+        assert sp.LEASE_DOWN not in ("-", "NO-BID", "NO-ROOM", "NO-CREDIT")
+
+    def test_lease_down_diag_attaches_to_telemetry(self):
+        # a LEASE-DOWN cell with diag must carry it (gate is _FAILING_OUTCOMES now)
+        recs = sp._provider_records(
+            "prov", "123", {"ready": sp.LEASE_DOWN}, {}, {"ready": {"fail_kind": "lease-down"}}
+        )
+        by = {r["feature"]: r for r in recs}
+        assert by["ready"]["diag"] == {"fail_kind": "lease-down"}
