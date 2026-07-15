@@ -1299,3 +1299,114 @@ class TestLeaseDown:
         )
         by = {r["feature"]: r for r in recs}
         assert by["ready"]["diag"] == {"fail_kind": "lease-down"}
+
+
+class TestQuarantine:
+    """A quarantined provider's PROVIDER-RELIABILITY failures (LEASE-DOWN, proven
+    ingress-stall) don't gate CI, but its TOOLING regressions still do (quorum)."""
+
+    def test_quarantined_providers_parses_env(self):
+        with patch.dict("os.environ", {"SMOKE_QUARANTINE_PROVIDERS": " p1 , p2 ,"}):
+            assert sp._quarantined_providers() == {"p1", "p2"}
+
+    def test_quarantined_providers_empty_by_default(self):
+        with patch.dict("os.environ", {}, clear=True):
+            assert sp._quarantined_providers() == set()
+
+    def test_service_ready(self):
+        assert sp._service_ready("1/1") is True
+        assert sp._service_ready("2/3") is True
+        assert sp._service_ready("0/1") is False
+        assert sp._service_ready(None) is False
+        assert sp._service_ready("bad") is False
+
+    # --- _is_reliability_failure taxonomy ---
+    def test_lease_down_is_reliability(self):
+        assert sp._is_reliability_failure("ready", sp.LEASE_DOWN, None) is True
+
+    def test_update_command_failure_is_tooling(self):
+        diag = {"fail_mode": "update_command"}
+        assert sp._is_reliability_failure("update", "FAIL", diag) is False
+
+    def test_update_eventual_arrived_is_reliability(self):
+        diag = {"eventual": "arrived", "eventual_after_s": 30}
+        assert sp._is_reliability_failure("update", "FAIL", diag) is True
+
+    def test_update_stale_pod_is_tooling(self):
+        # in_pod_marker=old => the update never reached the pod = genuine-bug signature
+        diag = {"eventual": "never", "in_pod_marker": "old", "service_at_timeout": "1/1"}
+        assert sp._is_reliability_failure("update", "FAIL", diag) is False
+
+    def test_update_new_pod_ingress_stall_is_reliability(self):
+        diag = {"eventual": "never", "in_pod_marker": "new"}
+        assert sp._is_reliability_failure("update", "FAIL", diag) is True
+
+    def test_update_unreachable_with_healthy_service_is_reliability(self):
+        diag = {"eventual": "never", "in_pod_marker": "unreachable", "service_at_timeout": "1/1"}
+        assert sp._is_reliability_failure("update", "FAIL", diag) is True
+
+    def test_update_unreachable_without_healthy_service_is_tooling(self):
+        diag = {"eventual": "never", "in_pod_marker": "unreachable", "service_at_timeout": "0/1"}
+        assert sp._is_reliability_failure("update", "FAIL", diag) is False
+
+    def test_plain_feature_fail_is_tooling(self):
+        # a feature breaking on a healthy lease is always a tooling regression
+        assert sp._is_reliability_failure("exec", "FAIL", None) is False
+
+    # --- _gating_providers gate integration ---
+
+    def test_gate_demotes_quarantined_lease_down(self):
+        prov = "akash1hgulk6"
+        row = dict.fromkeys(sp.FEATURES, sp.LEASE_DOWN)
+        row["deploy"] = "PASS"
+        records = [
+            {
+                "provider": prov,
+                "feature": f,
+                "outcome": row[f],
+                "diag": {"fail_kind": "lease-down"},
+            }
+            for f in sp.FEATURES
+        ]
+        failed = sp._gating_providers({prov: row}, records, {prov})
+        assert failed == {}  # all LEASE-DOWN cells demoted -> provider does not gate
+
+    def test_gate_still_fails_quarantined_tooling_regression(self):
+        prov = "akash1hgulk6"
+        row = dict.fromkeys(sp.FEATURES, "PASS")
+        row["exec"] = "FAIL"  # a feature broke on a healthy lease = tooling regression
+        records = [{"provider": prov, "feature": "exec", "outcome": "FAIL"}]
+        failed = sp._gating_providers({prov: row}, records, {prov})
+        assert failed == {prov: ["exec"]}  # tooling regression still gates
+
+    def test_gate_demotes_quarantined_update_ingress_stall_but_gates_stale_update(self):
+        prov = "akash1hgulk6"
+        # update stall: new pod healthy, ingress never routed -> demoted
+        row_stall = dict.fromkeys(sp.FEATURES, "PASS")
+        row_stall["update"] = "FAIL"
+        recs_stall = [
+            {
+                "provider": prov,
+                "feature": "update",
+                "outcome": "FAIL",
+                "diag": {"eventual": "never", "in_pod_marker": "new"},
+            }
+        ]
+        assert sp._gating_providers({prov: row_stall}, recs_stall, {prov}) == {}
+        # stale update: pod on OLD env -> genuine-bug signature -> still gates
+        recs_stale = [
+            {
+                "provider": prov,
+                "feature": "update",
+                "outcome": "FAIL",
+                "diag": {"eventual": "never", "in_pod_marker": "old", "service_at_timeout": "1/1"},
+            }
+        ]
+        assert sp._gating_providers({prov: row_stall}, recs_stale, {prov}) == {prov: ["update"]}
+
+    def test_gate_non_quarantined_lease_down_still_gates(self):
+        prov = "akash1aaul"
+        row = dict.fromkeys(sp.FEATURES, sp.LEASE_DOWN)
+        row["deploy"] = "PASS"
+        failed = sp._gating_providers({prov: row}, [], set())  # not quarantined
+        assert prov in failed  # non-quarantined LEASE-DOWN gates
