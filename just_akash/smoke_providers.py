@@ -85,10 +85,10 @@ INGRESS_BASELINE = "probe-baseline"
 READY_CAP_S = float(os.environ.get("SMOKE_READY_CAP_S", "240"))
 INGRESS_CAP_S = float(os.environ.get("SMOKE_INGRESS_CAP_S", "180"))
 
-# After a check's cap expires (verdict already FAIL) — currently the update-cutover
-# check; readiness/ingress get the same treatment in a follow-up — keep probing for
-# at most this long to classify the failure as SLOW (resource eventually appears →
-# the cap was too tight) vs STUCK (never appears → a genuine provider defect).
+# After a check's cap expires (verdict already FAIL) — readiness, initial-ingress,
+# and update-cutover — keep probing for at most this long to classify the failure as
+# SLOW (resource eventually appears → the cap was too tight) vs STUCK (never appears
+# → a genuine provider defect).
 # Diagnostic-only: this NEVER changes the PASS/FAIL verdict — it only records
 # evidence so cap-widening is data-driven instead of blind. Paid only on an already-
 # failing run, so it costs nothing on the happy path; hard-bounded so a truly-stuck
@@ -598,7 +598,7 @@ def _deployment_dead(dseq: str) -> bool:
     return any(isinstance(s, str) and s.lower() in dead for s in states)
 
 
-def _wait_ready(dseq: str, cap_s: float = READY_CAP_S) -> bool:
+def _wait_ready(dseq: str, cap_s: float = READY_CAP_S, diag: dict | None = None) -> bool:
     """Wait until the container is genuinely SERVING, not just lease-'ready'.
 
     The lease flips to ``status: ready`` the moment the provider accepts a
@@ -638,6 +638,8 @@ def _wait_ready(dseq: str, cap_s: float = READY_CAP_S) -> bool:
                 return True
         time.sleep(6)
     print(f"  {RED}not serving within {int(cap_s)}s{RESET}")
+    # Cap exceeded → FAIL. Classify slow-vs-stuck WITHOUT changing that verdict.
+    _record_ready_timeout(dseq, diag)
     return False
 
 
@@ -832,7 +834,9 @@ def _check_connect(dseq: str, key: str) -> bool:
     return r.returncode == 0 and marker in (r.stdout or "")
 
 
-def _check_ingress(dseq: str, uri: str, cap_s: float = INGRESS_CAP_S) -> bool:
+def _check_ingress(
+    dseq: str, uri: str, cap_s: float = INGRESS_CAP_S, diag: dict | None = None
+) -> bool:
     """The provider routes the exposed HTTP port to the container's httpd.
 
     Polls the ingress for the marker up to a generous cap. Route propagation
@@ -853,6 +857,8 @@ def _check_ingress(dseq: str, uri: str, cap_s: float = INGRESS_CAP_S) -> bool:
             last = str(e)[:60]
         time.sleep(6)
     print(f"  {RED}ingress not reachable within {int(cap_s)}s{RESET} (last: {last!r})")
+    # Cap exceeded → FAIL. Classify slow-vs-stuck WITHOUT changing that verdict.
+    _record_ingress_timeout(dseq, uri, last, diag)
     return False
 
 
@@ -954,6 +960,104 @@ def _record_update_timeout(
     )
 
 
+def _post_cap_tail(after_s: int | None) -> str:
+    """One-line suffix noting when (if) the resource arrived in the post-cap window."""
+    if after_s is None:
+        return ""
+    return f" (arrived {after_s}s into the {int(POST_CAP_OBSERVE_S)}s post-cap window)"
+
+
+def _availability_ready(dseq: str) -> bool:
+    """Exception-safe: is the lease service reporting >=1 ready replica right now?"""
+    try:
+        a = _service_availability(dseq)
+    except Exception:  # noqa: BLE001 — a diagnostic probe must never raise
+        return False
+    return a is not None and a[0] >= 1
+
+
+def _exec_works(dseq: str) -> bool:
+    """Exception-safe one-shot: does a lease-shell exec round-trip a marker? Treats an
+    rc=0-but-empty-stdout (the cold-stdout race) as NOT working, so a flaky read is
+    never mistaken for a live container."""
+    try:
+        r = _run(
+            f"uv run just-akash exec 'echo ready' --dseq {q(dseq)} --transport lease-shell",
+            timeout=25,
+        )
+    except Exception:  # noqa: BLE001 — a diagnostic probe must never raise
+        return False
+    return r.returncode == 0 and "ready" in (r.stdout or "").strip()
+
+
+def _record_ready_timeout(dseq: str, diag: dict | None) -> None:
+    """Classify a readiness timeout (verdict already FAIL): SLOW (the container becomes
+    ready within the post-cap window → the cap was too tight) vs STUCK (never → a
+    genuine defect: a dead lease, an unschedulable pod, or a container that never
+    serves). Every probe is exception-isolated; the verdict never changes."""
+    try:
+        dead = _deployment_dead(dseq)
+    except Exception:  # noqa: BLE001 — one failing probe must not abort the classification
+        dead = False
+    avail = None
+    try:
+        avail = _service_availability(dseq)
+    except Exception:  # noqa: BLE001
+        avail = None
+    service = f"{avail[0]}/{avail[1]}" if avail else None
+    exec_state = "ok" if _exec_works(dseq) else "unreachable"
+    # Cheap eventual-probe: availability only (an exec every 6s would overlap its own
+    # 25s timeout). The one-shot exec above already snapshots the exec path.
+    eventual, after_s = _observe_after_cap(lambda: _availability_ready(dseq))
+    if eventual == "never" and exec_state == "ok":
+        # Availability never populated but exec works => the container IS up; the
+        # readiness signal, not the container, was the laggard. Record it as arrived.
+        eventual, after_s = "arrived", 0
+    if diag is not None:
+        diag.update(
+            {
+                "fail_cap_s": int(READY_CAP_S),
+                "service_at_timeout": service,
+                "dead_at_timeout": dead,
+                "exec_at_timeout": exec_state,
+                "eventual": eventual,
+                "eventual_after_s": after_s,
+            }
+        )
+    print(
+        f"  ready slow-vs-stuck: service={service or 'unknown'} dead={dead} "
+        f"exec={exec_state} eventual={eventual}{_post_cap_tail(after_s)}"
+    )
+
+
+def _record_ingress_timeout(dseq: str, uri: str, last: str, diag: dict | None) -> None:
+    """Classify an initial-ingress timeout (verdict already FAIL): SLOW (the marker
+    routes within the post-cap window → route propagation was just slow) vs STUCK
+    (never). Records the lease service state + last error so a genuine backend failure
+    is distinguishable from pure routing lag. Never flips the verdict."""
+    avail = None
+    try:
+        avail = _service_availability(dseq)
+    except Exception:  # noqa: BLE001
+        avail = None
+    service = f"{avail[0]}/{avail[1]}" if avail else None
+    eventual, after_s = _observe_after_cap(lambda: INGRESS_BASELINE in _fetch(uri))
+    if diag is not None:
+        diag.update(
+            {
+                "fail_cap_s": int(INGRESS_CAP_S),
+                "service_at_timeout": service,
+                "last_at_timeout": last or None,
+                "eventual": eventual,
+                "eventual_after_s": after_s,
+            }
+        )
+    print(
+        f"  ingress slow-vs-stuck: service={service or 'unknown'} "
+        f"eventual={eventual}{_post_cap_tail(after_s)}"
+    )
+
+
 def _check_update(dseq: str, sdl_path: str, uri: str, diag: dict | None = None) -> bool:
     """In-place manifest update: change the served marker and confirm the new
     revision goes live at the same ingress (lease preserved).
@@ -1051,7 +1155,7 @@ def smoke_provider(provider: str, sdl_path: str, key: str, records: list | None 
                 _capture_diagnostics(dseq, reason)
 
         _t0 = time.monotonic()
-        ready = _wait_ready(dseq)
+        ready = _wait_ready(dseq, diag=diagnostics.setdefault("ready", {}))
         latencies["ready"] = round((time.monotonic() - _t0) * 1000)
         results["ready"] = "PASS" if ready else "FAIL"
         if not ready:
@@ -1099,7 +1203,10 @@ def smoke_provider(provider: str, sdl_path: str, key: str, records: list | None 
         # ingress + update (need the exposed HTTP endpoint serving)
         uri = _ingress_uri(dseq)
         if uri:
-            run_check("ingress", lambda: _check_ingress(dseq, uri))
+            run_check(
+                "ingress",
+                lambda: _check_ingress(dseq, uri, diag=diagnostics.setdefault("ingress", {})),
+            )
             # update restarts the container, so it runs last, after every other check
             run_check(
                 "update",
