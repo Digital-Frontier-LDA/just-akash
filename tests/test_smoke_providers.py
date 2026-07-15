@@ -718,3 +718,153 @@ class TestDeployCreditAndSkip:
             row = dict.fromkeys(sp.FEATURES, "-")
             row["deploy"] = status
             assert not any(v == "FAIL" for v in row.values())
+
+
+class TestFailureDiagnostics:
+    """On a failure, the run must auto-dump events/logs so an intermittent
+    problem (hgulk6's occasional 'lease never ready') self-documents."""
+
+    def test_capture_dumps_status_events_logs(self, capsys):
+        with (
+            patch.object(sp, "_status_json", return_value={"status": "ready"}),
+            patch.object(sp, "_service_availability", return_value=(0, 1)),
+            patch.object(
+                sp,
+                "_run",
+                return_value=_completed(
+                    stdout="Normal Scheduled ...\nWarning FailedScheduling ...\n"
+                ),
+            ),
+        ):
+            sp._capture_diagnostics("123", "lease never became ready")
+        out = capsys.readouterr().out
+        assert "diagnostics: lease never became ready" in out
+        assert "FailedScheduling" in out  # the kube events (the payoff) are shown
+
+    def test_capture_never_raises_on_stream_error(self, capsys):
+        with (
+            patch.object(sp, "_status_json", side_effect=RuntimeError("x")),
+            patch.object(sp, "_run", side_effect=RuntimeError("stream down")),
+            patch.object(sp, "_service_availability", return_value=None),
+        ):
+            sp._capture_diagnostics("123", "reason")  # must not raise
+        assert "capture failed" in capsys.readouterr().out
+
+    def test_capture_surfaces_stderr_on_nonzero_stream(self, capsys):
+        # A stream command that errors (rc!=0, detail on stderr) must show WHY,
+        # not a bare "(no output)" that hides the failure.
+        with (
+            patch.object(sp, "_status_json", return_value={"status": "x"}),
+            patch.object(sp, "_service_availability", return_value=None),
+            patch.object(
+                sp,
+                "_run",
+                return_value=_completed(
+                    stdout="", stderr="Error: provider unreachable", returncode=1
+                ),
+            ),
+        ):
+            sp._capture_diagnostics("123", "reason")
+        out = capsys.readouterr().out
+        assert "stream errored: rc=1" in out and "provider unreachable" in out
+
+    def test_capture_surfaces_error_even_with_partial_stdout(self, capsys):
+        # Some lines AND a non-zero exit -> BOTH the lines and the error show.
+        with (
+            patch.object(sp, "_status_json", return_value={"status": "x"}),
+            patch.object(sp, "_service_availability", return_value=None),
+            patch.object(
+                sp,
+                "_run",
+                return_value=_completed(
+                    stdout="Normal Scheduled ...\n", stderr="boom", returncode=1
+                ),
+            ),
+        ):
+            sp._capture_diagnostics("123", "reason")
+        out = capsys.readouterr().out
+        assert "Scheduled" in out and "stream errored: rc=1" in out and "boom" in out
+
+    def test_readiness_failure_captures_diagnostics(self):
+        with (
+            patch.object(sp, "_provider_room", return_value=(True, "ok")),
+            patch.object(sp, "_deploy", return_value=("123", "ok")),
+            patch.object(sp, "_wait_ready", return_value=False),
+            patch.object(sp, "_capture_diagnostics") as cap,
+            patch.object(sp, "install_signal_cleanup"),
+            patch.object(sp, "robust_destroy"),
+        ):
+            res = sp.smoke_provider("p", "/sdl", "/key")
+        assert res["deploy"] == "PASS" and res["status"] == "FAIL"  # readiness cascade
+        cap.assert_called_once()
+        assert "never became ready" in cap.call_args.args[1]
+
+    def test_diagnostics_captured_only_once_across_feature_fails(self):
+        # Multiple feature FAILs must still dump diagnostics only once.
+        with (
+            patch.object(sp, "_provider_room", return_value=(True, "ok")),
+            patch.object(sp, "_deploy", return_value=("123", "ok")),
+            patch.object(sp, "_wait_ready", return_value=True),
+            patch.object(sp, "_wait_exec_ready", return_value=True),
+            patch.object(sp, "_wait_ssh_ready", return_value=True),
+            patch.object(sp, "_ingress_uri", return_value="u"),
+            patch.object(sp, "_check_status", return_value=False),  # FAIL
+            patch.object(sp, "_check_exec", return_value=False),  # FAIL
+            patch.object(sp, "_check_inject", return_value=True),
+            patch.object(sp, "_check_stream", return_value=True),
+            patch.object(sp, "_check_ssh", return_value=True),
+            patch.object(sp, "_check_connect", return_value=True),
+            patch.object(sp, "_check_ingress", return_value=True),
+            patch.object(sp, "_check_update", return_value=True),
+            patch.object(sp, "_capture_diagnostics") as cap,
+            patch.object(sp, "install_signal_cleanup"),
+            patch.object(sp, "robust_destroy"),
+        ):
+            sp.smoke_provider("p", "/sdl", "/key")
+        cap.assert_called_once()  # first FAIL only
+
+    def test_diagnostics_on_ssh_never_ready(self):
+        with (
+            patch.object(sp, "_provider_room", return_value=(True, "ok")),
+            patch.object(sp, "_deploy", return_value=("123", "ok")),
+            patch.object(sp, "_wait_ready", return_value=True),
+            patch.object(sp, "_wait_exec_ready", return_value=True),
+            patch.object(sp, "_check_status", return_value=True),
+            patch.object(sp, "_check_exec", return_value=True),
+            patch.object(sp, "_check_inject", return_value=True),
+            patch.object(sp, "_check_stream", return_value=True),
+            patch.object(sp, "_wait_ssh_ready", return_value=False),  # sshd never up
+            patch.object(sp, "_ingress_uri", return_value="u"),
+            patch.object(sp, "_check_ingress", return_value=True),
+            patch.object(sp, "_check_update", return_value=True),
+            patch.object(sp, "_capture_diagnostics") as cap,
+            patch.object(sp, "install_signal_cleanup"),
+            patch.object(sp, "robust_destroy"),
+        ):
+            res = sp.smoke_provider("p", "/sdl", "/key")
+        assert res["ssh"] == "FAIL"
+        cap.assert_called_once()
+        assert "ssh" in cap.call_args.args[1].lower()
+
+    def test_diagnostics_on_no_ingress_uri(self):
+        with (
+            patch.object(sp, "_provider_room", return_value=(True, "ok")),
+            patch.object(sp, "_deploy", return_value=("123", "ok")),
+            patch.object(sp, "_wait_ready", return_value=True),
+            patch.object(sp, "_wait_exec_ready", return_value=True),
+            patch.object(sp, "_check_status", return_value=True),
+            patch.object(sp, "_check_exec", return_value=True),
+            patch.object(sp, "_check_inject", return_value=True),
+            patch.object(sp, "_check_stream", return_value=True),
+            patch.object(sp, "_wait_ssh_ready", return_value=True),
+            patch.object(sp, "_check_ssh", return_value=True),
+            patch.object(sp, "_check_connect", return_value=True),
+            patch.object(sp, "_ingress_uri", return_value=None),  # no ingress URI
+            patch.object(sp, "_capture_diagnostics") as cap,
+            patch.object(sp, "install_signal_cleanup"),
+            patch.object(sp, "robust_destroy"),
+        ):
+            res = sp.smoke_provider("p", "/sdl", "/key")
+        assert res["ingress"] == "FAIL"
+        cap.assert_called_once()
+        assert "ingress" in cap.call_args.args[1].lower()

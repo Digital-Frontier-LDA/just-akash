@@ -402,6 +402,43 @@ def sweep_orphan_probes(
 # ── readiness + resolution helpers ───────────────────────────────────
 
 
+def _capture_diagnostics(dseq: str, reason: str) -> None:
+    """On a failure, dump the provider's lease status + kube events + container
+    logs, so an INTERMITTENT problem (e.g. an occasional 'lease never ready')
+    self-documents in the run log instead of needing a live catch. The kube
+    events are the payoff — they say WHY a pod didn't come up (FailedScheduling,
+    Insufficient cpu/memory, ImagePullBackOff, OOMKilled, …). Best-effort: never
+    raises, and bounded by each stream's --duration."""
+    print(f"  {YELLOW}── diagnostics: {reason} (dseq {dseq}) ──{RESET}")
+    try:
+        st = _status_json(dseq)
+        avail = _service_availability(dseq)
+        state = st.get("status") if isinstance(st, dict) else st
+        print(f"    lease status={state} availability={avail}")
+    except Exception as e:  # noqa: BLE001 — diagnostics must never break the run
+        print(f"    status capture failed: {type(e).__name__}: {e}")
+    for kind, dur in (("events", 12), ("logs", 8)):
+        try:
+            r = _run(
+                f"uv run just-akash {kind} --dseq {q(dseq)} --duration {dur}", timeout=dur + 25
+            )
+            lines = [ln for ln in (r.stdout or "").splitlines() if ln.strip()]
+            print(f"    --- {kind} ({len(lines)} line(s)) ---")
+            for ln in lines[:15]:
+                print(f"      {ln}")
+            # Surface a stream failure (non-zero exit / stderr) in ALL cases, even
+            # when it also produced some stdout — a partial/errored stream is
+            # itself diagnostic, and a bare "(no output)" would hide it. Collapse
+            # stderr to one line so a multi-line message can't break indentation.
+            err = " ".join((r.stderr or "").split())
+            if r.returncode != 0 or err:
+                print(f"      ({kind} stream errored: rc={r.returncode} {err[:200]})")
+            elif not lines:
+                print(f"      (no {kind} returned — nothing to show)")
+        except Exception as e:  # noqa: BLE001
+            print(f"    {kind} capture failed: {type(e).__name__}: {e}")
+
+
 def _provider_room(provider: str) -> tuple[bool, str]:
     """(has_room, reason) from the provider's published capacity stats.
 
@@ -862,6 +899,17 @@ def smoke_provider(provider: str, sdl_path: str, key: str, records: list | None 
         results["deploy"] = "PASS"
         print(f"  {GREEN}deployed{RESET} DSEQ={dseq}, waiting for lease...")
 
+        # Capture diagnostics on the FIRST failure only (a readiness failure
+        # cascades to every feature; one events/logs dump is enough to root-cause
+        # it, and avoids 10x captures).
+        diag_captured = False
+
+        def _diag_once(reason: str) -> None:
+            nonlocal diag_captured
+            if not diag_captured:
+                diag_captured = True
+                _capture_diagnostics(dseq, reason)
+
         _t0 = time.monotonic()
         ready = _wait_ready(dseq)
         latencies["ready"] = round((time.monotonic() - _t0) * 1000)
@@ -870,10 +918,11 @@ def smoke_provider(provider: str, sdl_path: str, key: str, records: list | None 
             # A lease that never becomes ready is a real failure, not a pass: every
             # untested feature must read FAIL so the provider counts against the run
             # (the overall verdict only trips on "FAIL", never on "-").
+            print(f"  {RED}lease never became ready{RESET} — marking untested features FAIL")
+            _diag_once("lease never became ready")  # the intermittent-reliability case
             for feat in FEATURES:
                 if results[feat] == "-":
                     results[feat] = "FAIL"
-            print(f"  {RED}lease never became ready{RESET} — marking untested features FAIL")
             return results
         if not _wait_exec_ready(dseq):
             print(f"  {YELLOW}container slow to accept exec{RESET} — checks may reflect that")
@@ -888,6 +937,8 @@ def smoke_provider(provider: str, sdl_path: str, key: str, records: list | None 
             latencies[name] = round((time.monotonic() - _t) * 1000)
             results[name] = "PASS" if ok else "FAIL"
             print(f"  {GREEN if ok else RED}{name}: {results[name]}{RESET}")
+            if not ok:
+                _diag_once(f"{name} check failed")
 
         # lease-shell features (container is exec-ready)
         run_check("status", lambda: _check_status(dseq))
@@ -903,6 +954,7 @@ def smoke_provider(provider: str, sdl_path: str, key: str, records: list | None 
         else:
             results["ssh"] = results["connect"] = "FAIL"
             print(f"  {RED}ssh: FAIL{RESET} (no forwarded SSH port / sshd never came up)")
+            _diag_once("no forwarded SSH port / sshd never came up")
 
         # ingress + update (need the exposed HTTP endpoint serving)
         uri = _ingress_uri(dseq)
@@ -913,6 +965,7 @@ def smoke_provider(provider: str, sdl_path: str, key: str, records: list | None 
         else:
             results["ingress"] = results["update"] = "FAIL"
             print(f"  {RED}ingress: FAIL{RESET} (no ingress URI assigned)")
+            _diag_once("no ingress URI assigned")
 
         return results
     finally:
