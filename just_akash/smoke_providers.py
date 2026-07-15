@@ -428,8 +428,9 @@ def _capture_diagnostics(dseq: str, reason: str) -> None:
                 print(f"      {ln}")
             # Surface a stream failure (non-zero exit / stderr) in ALL cases, even
             # when it also produced some stdout — a partial/errored stream is
-            # itself diagnostic, and a bare "(no output)" would hide it.
-            err = (r.stderr or "").strip()
+            # itself diagnostic, and a bare "(no output)" would hide it. Collapse
+            # stderr to one line so a multi-line message can't break indentation.
+            err = " ".join((r.stderr or "").split())
             if r.returncode != 0 or err:
                 print(f"      ({kind} stream errored: rc={r.returncode} {err[:200]})")
             elif not lines:
@@ -901,11 +902,12 @@ def smoke_provider(provider: str, sdl_path: str, key: str, records: list | None 
         # Capture diagnostics on the FIRST failure only (a readiness failure
         # cascades to every feature; one events/logs dump is enough to root-cause
         # it, and avoids 10x captures).
-        diag_done = {"v": False}
+        diag_captured = False
 
         def _diag_once(reason: str) -> None:
-            if not diag_done["v"]:
-                diag_done["v"] = True
+            nonlocal diag_captured
+            if not diag_captured:
+                diag_captured = True
                 _capture_diagnostics(dseq, reason)
 
         _t0 = time.monotonic()
