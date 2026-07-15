@@ -341,6 +341,137 @@ class TestUpdateCheck:
             assert sp._check_update("123456", "/sdl", "uri") is True
 
 
+class TestUpdateDiagnostics:
+    """Slow-vs-stuck classification on an update-cutover timeout (quorum-designed).
+
+    The verdict stays FAIL; these only add evidence so the failure self-explains and
+    a later cap change is data-driven — never turning a genuine defect green.
+    """
+
+    def test_classify_served_new(self):
+        assert sp._classify_served("x probe-updated-abc y", "probe-updated-abc") == "new"
+
+    def test_classify_served_old(self):
+        assert sp._classify_served("stale content", "probe-updated-abc") == "old"
+
+    def test_classify_served_none(self):
+        assert sp._classify_served("   ", "tok") == "none"
+
+    def test_classify_served_unreachable(self):
+        assert sp._classify_served(None, "tok") == "unreachable"
+
+    def test_in_pod_marker_new(self):
+        with patch.object(sp, "_run", return_value=_completed(stdout="probe-updated-xyz\n")):
+            assert sp._probe_in_pod_marker("123456", "probe-updated-xyz") == "new"
+
+    def test_in_pod_marker_old(self):
+        with patch.object(sp, "_run", return_value=_completed(stdout="probe-initial\n")):
+            assert sp._probe_in_pod_marker("123456", "probe-updated-xyz") == "old"
+
+    def test_in_pod_marker_unreachable_on_rc(self):
+        with patch.object(sp, "_run", return_value=_completed(returncode=1)):
+            assert sp._probe_in_pod_marker("123456", "tok") == "unreachable"
+
+    def test_in_pod_marker_unreachable_on_raise(self):
+        with patch.object(sp, "_run", side_effect=RuntimeError("boom")):
+            assert sp._probe_in_pod_marker("123456", "tok") == "unreachable"
+
+    def test_observe_after_cap_arrived(self):
+        calls = {"n": 0}
+
+        def probe():
+            calls["n"] += 1
+            return calls["n"] >= 2  # arrives on the 2nd poll
+
+        with (
+            patch.object(sp.time, "monotonic", _FakeClock(1)),
+            patch.object(sp.time, "sleep"),
+        ):
+            eventual, after = sp._observe_after_cap(probe, window_s=60)
+        assert eventual == "arrived"
+        assert after is not None
+
+    def test_observe_after_cap_never(self):
+        with (
+            patch.object(sp.time, "monotonic", _FakeClock(20)),
+            patch.object(sp.time, "sleep"),
+        ):
+            assert sp._observe_after_cap(lambda: False, window_s=30) == ("never", None)
+
+    def test_observe_after_cap_zero_window(self):
+        assert sp._observe_after_cap(lambda: True, window_s=0) == ("never", None)
+
+    def test_observe_after_cap_swallows_raising_probe(self):
+        def boom():
+            raise OSError("unreachable")
+
+        with (
+            patch.object(sp.time, "monotonic", _FakeClock(20)),
+            patch.object(sp.time, "sleep"),
+        ):
+            assert sp._observe_after_cap(boom, window_s=30) == ("never", None)
+
+    def test_record_update_timeout_slow(self):
+        diag: dict = {}
+        with (
+            patch.object(sp, "_service_availability", return_value=(1, 1)),
+            patch.object(sp, "_probe_in_pod_marker", return_value="new"),
+            patch.object(sp, "_observe_after_cap", return_value=("arrived", 42)),
+        ):
+            sp._record_update_timeout("123456", "uri", "tok", "stale body", diag)
+        assert diag["eventual"] == "arrived"
+        assert diag["eventual_after_s"] == 42
+        assert diag["in_pod_marker"] == "new"
+        assert diag["body_at_timeout"] == "old"
+        assert diag["service_at_timeout"] == "1/1"
+        assert diag["fail_cap_s"] == int(sp.INGRESS_CAP_S)
+
+    def test_record_update_timeout_stuck(self):
+        diag: dict = {}
+        with (
+            patch.object(sp, "_service_availability", return_value=None),
+            patch.object(sp, "_probe_in_pod_marker", return_value="new"),
+            patch.object(sp, "_observe_after_cap", return_value=("never", None)),
+        ):
+            sp._record_update_timeout("123456", "uri", "tok", None, diag)
+        assert diag["eventual"] == "never"
+        assert diag["body_at_timeout"] == "unreachable"
+        assert diag["service_at_timeout"] is None
+
+    def test_check_update_timeout_records_diag_and_stays_fail(self):
+        diag: dict = {}
+        with (
+            patch.object(sp, "_run", return_value=_completed(returncode=0)),
+            patch.object(sp, "_fetch", return_value="no-token-here"),
+            patch.object(sp.time, "monotonic", _FakeClock(200)),  # blow past INGRESS_CAP
+            patch.object(sp.time, "sleep"),
+            patch.object(sp, "_record_update_timeout") as rec,
+        ):
+            ok = sp._check_update("123456", "/sdl", "uri", diag=diag)
+        assert ok is False
+        rec.assert_called_once()
+        assert rec.call_args.args[4] is diag  # diag threaded to the recorder
+
+    def test_check_update_command_fail_sets_fail_mode(self):
+        diag: dict = {}
+        with patch.object(sp, "_run", return_value=_completed(returncode=1, stderr="nope")):
+            assert sp._check_update("123456", "/sdl", "uri", diag=diag) is False
+        assert diag["fail_mode"] == "update_command"
+
+    def test_provider_records_includes_diag_on_fail(self):
+        results = {"update": "FAIL", "ready": "PASS"}
+        diagnostics = {"update": {"eventual": "never", "in_pod_marker": "new"}}
+        recs = sp._provider_records("prov", "123", results, {}, diagnostics)
+        by = {r["feature"]: r for r in recs}
+        assert by["update"]["diag"] == {"eventual": "never", "in_pod_marker": "new"}
+        assert "diag" not in by["ready"]  # a passing feature carries no diag
+
+    def test_provider_records_omits_empty_diag(self):
+        recs = sp._provider_records("prov", "123", {"update": "PASS"}, {}, {"update": {}})
+        by = {r["feature"]: r for r in recs}
+        assert "diag" not in by["update"]
+
+
 class TestTelemetry:
     def test_provider_records_one_per_feature(self):
         results = {"deploy": "PASS", "status": "PASS", "ready": "PASS"}

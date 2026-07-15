@@ -85,6 +85,15 @@ INGRESS_BASELINE = "probe-baseline"
 READY_CAP_S = float(os.environ.get("SMOKE_READY_CAP_S", "240"))
 INGRESS_CAP_S = float(os.environ.get("SMOKE_INGRESS_CAP_S", "180"))
 
+# After a readiness/ingress/update cap expires (verdict already FAIL), keep probing
+# for at most this long to classify the failure as SLOW (resource eventually
+# appears → the cap was too tight) vs STUCK (never appears → a genuine provider
+# defect). Diagnostic-only: this NEVER changes the PASS/FAIL verdict — it only
+# records evidence so cap-widening is data-driven instead of blind. Paid only on an
+# already-failing run, so it costs nothing on the happy path; hard-bounded so a
+# truly-stuck provider cannot hang the run. (Quorum-designed; see CHANGELOG 1.18.0.)
+POST_CAP_OBSERVE_S = float(os.environ.get("SMOKE_POST_CAP_OBSERVE_S", "90"))
+
 # Probe resource needs, matching PROBE_SDL below. Used by the pre-deploy room
 # check so we skip an offline/full provider (NO-ROOM) instead of wasting a deploy
 # + bid-wait on it and then mis-reading the result. CPU is in milli-units (Akash
@@ -184,14 +193,21 @@ def _pkg_version() -> str:
 
 
 def _provider_records(
-    provider: str, dseq: str | None, results: dict, latencies: dict
+    provider: str,
+    dseq: str | None,
+    results: dict,
+    latencies: dict,
+    diagnostics: dict | None = None,
 ) -> list[dict]:
     """One telemetry record per feature: outcome + how long it took (ms).
 
     latency_ms is None for a feature that was never reached (e.g. everything
     after a no-bid). Pass/fail is the lagging binary; latency is the leading
-    signal that lets us later set percentile timeouts and spot regressions.
+    signal that lets us later set percentile timeouts and spot regressions. A
+    feature that timed out also carries a ``diag`` slow-vs-stuck classification
+    (only present on such a failure), so a FAIL says WHY without turning green.
     """
+    diagnostics = diagnostics or {}
     return [
         {
             "provider": provider,
@@ -199,6 +215,7 @@ def _provider_records(
             "outcome": results.get(feat, "-"),
             "latency_ms": latencies.get(feat),
             "dseq": dseq,
+            **({"diag": diagnostics[feat]} if diagnostics.get(feat) else {}),
         }
         for feat in _TELEMETRY_FEATURES
     ]
@@ -832,9 +849,100 @@ def _check_ingress(dseq: str, uri: str, cap_s: float = INGRESS_CAP_S) -> bool:
     return False
 
 
-def _check_update(dseq: str, sdl_path: str, uri: str) -> bool:
+def _classify_served(body: str | None, new_token: str) -> str:
+    """What the ingress was serving at the timeout instant: 'new' (the update is
+    live — a race we lost), 'old' (serving prior content, cutover pending), 'none'
+    (empty body) or 'unreachable' (fetch raised)."""
+    if body is None:
+        return "unreachable"
+    if new_token in body:
+        return "new"
+    if not body.strip():
+        return "none"
+    return "old"
+
+
+def _probe_in_pod_marker(dseq: str, expected_token: str) -> str:
+    """Best-effort: exec into the container and read the SMOKE_MARKER env the update
+    set. This is the ONE signal that splits the two look-alike update-timeout causes:
+    'new' => the new revision reached the pod, so a still-stale ingress is a routing
+    lag; 'old' => the update never propagated to the container; 'unreachable' => exec
+    failed (a flaky exec must never be mistaken for a real signal). Diagnostic-only."""
+    try:
+        r = _run(
+            f"uv run just-akash exec 'printenv SMOKE_MARKER' "
+            f"--dseq {q(dseq)} --transport lease-shell",
+            timeout=45,
+        )
+    except Exception:  # noqa: BLE001 — a diagnostic probe must never raise
+        return "unreachable"
+    if r.returncode != 0:
+        return "unreachable"
+    return "new" if expected_token in (r.stdout or "") else "old"
+
+
+def _observe_after_cap(probe, window_s: float = POST_CAP_OBSERVE_S) -> tuple[str, int | None]:
+    """After a check's cap has expired (verdict is already FAIL), keep polling for up
+    to ``window_s`` to classify SLOW vs STUCK. Returns ('arrived', <seconds into the
+    post-cap window>) the moment ``probe()`` is truthy, else ('never', None). Bounded
+    and diagnostic-only — it never changes the caller's verdict, and a raising probe
+    is swallowed so the classification itself can never fail the run."""
+    if window_s <= 0:
+        return ("never", None)
+    start = time.monotonic()
+    while time.monotonic() - start < window_s:
+        try:
+            if probe():
+                return ("arrived", int(time.monotonic() - start))
+        except Exception:  # noqa: BLE001 — a diagnostic probe must never raise
+            pass
+        time.sleep(6)
+    return ("never", None)
+
+
+def _record_update_timeout(
+    dseq: str, uri: str, token: str, last_body: str | None, diag: dict | None
+) -> None:
+    """Classify + report an update-cutover timeout (verdict already FAIL). Populates
+    ``diag`` for telemetry and prints one self-explaining line. Read it as:
+    eventual=arrived => SLOW (cap too tight, widen); eventual=never + in_pod_marker=new
+    => ingress routing STUCK; eventual=never + in_pod_marker=old => update never reached
+    the pod (STUCK, deeper). Never flips the verdict."""
+    served = _classify_served(last_body, token)
+    avail = _service_availability(dseq)
+    service = f"{avail[0]}/{avail[1]}" if avail else None
+    in_pod = _probe_in_pod_marker(dseq, token)
+    eventual, after_s = _observe_after_cap(lambda: token in _fetch(uri))
+    if diag is not None:
+        diag.update(
+            {
+                "fail_cap_s": int(INGRESS_CAP_S),
+                "body_at_timeout": served,
+                "service_at_timeout": service,
+                "in_pod_marker": in_pod,
+                "eventual": eventual,
+                "eventual_after_s": after_s,
+            }
+        )
+    tail = (
+        f" (arrived {after_s}s into the {int(POST_CAP_OBSERVE_S)}s post-cap window)"
+        if after_s is not None
+        else ""
+    )
+    print(
+        f"  update slow-vs-stuck: served={served} service={service or 'unknown'} "
+        f"in_pod_marker={in_pod} eventual={eventual}{tail}"
+    )
+
+
+def _check_update(dseq: str, sdl_path: str, uri: str, diag: dict | None = None) -> bool:
     """In-place manifest update: change the served marker and confirm the new
-    revision goes live at the same ingress (lease preserved)."""
+    revision goes live at the same ingress (lease preserved).
+
+    On a timeout the verdict stays FAIL, but before returning we classify WHY —
+    slow-vs-stuck, and routing-lag-vs-stale-update — so the failure self-explains in
+    the run log + telemetry and any later cap change is data-driven, not a guess. The
+    diagnostics never flip the verdict: a genuine provider defect must stay visible."""
     token = f"probe-updated-{dseq[-6:]}"
     r = _run(
         f"uv run just-akash update --dseq {q(dseq)} --sdl {q(sdl_path)} "
@@ -842,19 +950,27 @@ def _check_update(dseq: str, sdl_path: str, uri: str) -> bool:
         timeout=120,
     )
     if r.returncode != 0:
+        err = " ".join((r.stderr or r.stdout or "").split())
+        print(f"  update command failed (rc={r.returncode}): {err[:200]}")
+        if diag is not None:
+            diag["fail_mode"] = "update_command"
         return False
     # The container restarts (and reinstalls its packages), so give it room —
     # same generous cap as the initial ingress check — before the new marker
     # appears at the ingress.
     start = time.monotonic()
+    last: str | None = None
     while time.monotonic() - start < INGRESS_CAP_S:
         try:
-            if token in _fetch(uri):
+            last = _fetch(uri)
+            if token in last:
                 print(f"  update live at ingress after {int(time.monotonic() - start)}s")
                 return True
         except (urllib.error.URLError, OSError):
-            pass
+            last = None
         time.sleep(6)
+    # Cap exceeded → FAIL. Classify slow-vs-stuck WITHOUT changing that verdict.
+    _record_update_timeout(dseq, uri, token, last, diag)
     return False
 
 
@@ -872,6 +988,9 @@ def smoke_provider(provider: str, sdl_path: str, key: str, records: list | None 
     """
     results = dict.fromkeys(FEATURES, "-")
     latencies: dict[str, float] = {}
+    # Per-feature slow-vs-stuck evidence captured on a timeout (see _check_update).
+    # Defined before the try so the finally can always attach it to telemetry.
+    diagnostics: dict[str, dict] = {}
     dseq_ref: dict = {"dseq": None}
     install_signal_cleanup(dseq_ref)
     _hdr(f"provider {provider}")
@@ -961,7 +1080,12 @@ def smoke_provider(provider: str, sdl_path: str, key: str, records: list | None 
         if uri:
             run_check("ingress", lambda: _check_ingress(dseq, uri))
             # update restarts the container, so it runs last, after every other check
-            run_check("update", lambda: _check_update(dseq, sdl_path, uri))
+            run_check(
+                "update",
+                lambda: _check_update(
+                    dseq, sdl_path, uri, diag=diagnostics.setdefault("update", {})
+                ),
+            )
         else:
             results["ingress"] = results["update"] = "FAIL"
             print(f"  {RED}ingress: FAIL{RESET} (no ingress URI assigned)")
@@ -981,7 +1105,7 @@ def smoke_provider(provider: str, sdl_path: str, key: str, records: list | None 
         # finally runs in all cases), so a no-bid / never-ready / crashed provider
         # is still recorded with whatever was measured.
         if records is not None:
-            records.extend(_provider_records(provider, _dseq, results, latencies))
+            records.extend(_provider_records(provider, _dseq, results, latencies, diagnostics))
 
 
 def _print_matrix(rows: dict) -> None:
