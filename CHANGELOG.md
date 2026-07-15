@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.18.0] — 2026-07-15
+
+### Added
+- **Slow-vs-stuck diagnostics on an update-cutover timeout — so an `update` FAIL self-explains instead of being a bare `False`.** Telemetry showed hgulk6's `update` at ~87% while it passes normally in ~24s (max 32s), so its failures aren't near-cap timeouts — they're hard stalls where a fresh, healthy pod comes up but the updated marker never routes to the ingress within the 180s cap. The check now classifies WHY without ever flipping the verdict (a genuine provider defect must stay visible — the same principle as the v1.17.0 exec fix). On an update timeout it records, into the run log **and** telemetry (`diag` field): `body_at_timeout` (what the ingress served: new/old/none/unreachable), `service_at_timeout` (lease service ready/total), **`in_pod_marker`** (best-effort exec of `printenv SMOKE_MARKER` — the one signal that splits *ingress routing lag* [pod has the new env] from *stale update* [pod still on the old env]), and a bounded **post-cap observation window** (`SMOKE_POST_CAP_OBSERVE_S`, default 90s, paid only on an already-failing run) yielding `eventual` (arrived/never) + `eventual_after_s` + `fail_cap_s`. Read it as: `eventual=arrived` → SLOW (widen the cap); `eventual=never` + `in_pod_marker=new` → ingress routing STUCK; `+ in_pod_marker=old` → the update never reached the pod. This makes cap-widening data-driven instead of blind — the next hgulk6 stall will say exactly which it is. (Design reached by a full 3-model quorum, 2 unanimous rounds.)
+- Tests: 968 passing (+18) — body/in-pod/observe classifiers, the timeout recorder populates `diag` without changing the FAIL, a command-failure sets `fail_mode`, and telemetry carries `diag` only on a real failure.
+
+---
+
 ## [1.17.0] — 2026-07-15
 
 ### Fixed
