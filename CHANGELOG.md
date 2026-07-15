@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.16.0] — 2026-07-15
+
+### Added
+- **Auto-capture diagnostics on failure** — when a provider fails (lease never becomes ready, a feature FAILs, sshd never comes up, or no ingress URI), the run now automatically dumps the provider's lease status + **kube events** + container logs (readable since v1.11.1), so an *intermittent* problem self-documents in the run log instead of needing a live catch. The kube events are the payoff — they say WHY a pod didn't come up (`FailedScheduling`, `Insufficient cpu/memory`, `ImagePullBackOff`, `OOMKilled`, …). Captured at most once per provider (a readiness failure cascades to every feature, so one dump suffices) and best-effort (never raises, bounded by each stream's `--duration`). This turns the every-3h accumulation into a **self-diagnosing** monitor: the next occurrence of hgulk6's intermittent "lease never ready" arrives with its root-cause events attached. Validated live — a bad-image probe surfaced `Failed to pull image … not found → ErrImagePull → ImagePullBackOff`.
+- Tests: 79 smoke tests (+4) — the capture dumps status/events/logs, never raises on a stream error, fires on a readiness failure, and captures at most once across multiple feature fails.
+
+---
+
 ## [1.15.0] — 2026-07-15
 
 ### Added
