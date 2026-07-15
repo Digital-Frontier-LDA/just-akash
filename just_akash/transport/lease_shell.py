@@ -502,20 +502,44 @@ class LeaseShellTransport(Transport):
 
         Returns that exit code, or None to tell the caller the JWT expired and the
         session should be re-established. Raises on any proxy or provider error.
+
+        The provider-proxy does not guarantee the result (exit-code) frame is the
+        last one on the wire: a stdout frame can still be in flight when the result
+        arrives (issue #12, the "cold-stdout race"), which is why an exec that
+        actually succeeded can come back with rc=0 and EMPTY stdout. Returning the
+        instant the exit code lands would drop that trailing output for *every*
+        exec caller, so once the exit code is in hand we keep draining for at most
+        ``result_grace_s`` -- returning early the moment the socket closes (the
+        normal terminator) so a well-behaved command is not delayed, and treating a
+        quiet grace window as "no trailing frame is coming" rather than a hang.
         """
         timeout = self._config.recv_timeout
+        # Set once the result frame arrives; from then on a close or a quiet grace
+        # window is a normal terminator, not an error.
+        pending_exit: int | None = None
+        # Bytes of stdout drained AFTER the result frame -- i.e. the cold-stdout race
+        # firing and being caught. Reported on exit so the race stays observable even
+        # though the user-facing symptom (empty stdout) is now fixed.
+        recovered = 0
         while True:
             try:
                 frame = self._recv_proxy_message(ws, timeout=timeout)
             except ConnectionClosedOK:
-                return exit_code
+                self._report_race_recovery(recovered)
+                return pending_exit if pending_exit is not None else exit_code
             except ConnectionClosedError as exc:
                 if _is_auth_expiry(exc):
                     return None
                 raise
             except TimeoutError as exc:
-                # Without this the caller blocks in recv() and dies to whatever outer
-                # timeout the user happens to have -- with no output and no diagnosis.
+                # After the exit code is in hand, a silent ``result_grace_s`` window
+                # just means no trailing stdout frame is coming -- return normally.
+                if pending_exit is not None:
+                    self._report_race_recovery(recovered)
+                    return pending_exit
+                # Before completion, silence means the command hung: surface it,
+                # rather than blocking in recv() until some outer timeout kills us
+                # with no output and no diagnosis.
                 raise RuntimeError(
                     f"provider-proxy sent nothing for {timeout:g}s. The command may "
                     "still be running on the container, or the provider may have stopped "
@@ -524,9 +548,35 @@ class LeaseShellTransport(Transport):
                 ) from exc
             if frame is None:
                 continue
+            # A stdout frame arriving after the exit code IS the issue-#12 race being
+            # caught -- count it so the drain that saved us stays visible in the logs.
+            if pending_exit is not None and len(frame) >= 1 and frame[0] == _FRAME_STDOUT:
+                recovered += len(frame) - 1
             result = self._dispatch_frame(frame)
             if result is not None:
-                return result
+                # Exit code in hand -- but don't return yet. Keep draining any
+                # trailing stdout/stderr frame still in flight, bounded by the short
+                # ``result_grace_s`` window (subsequent stdout frames dispatch as a
+                # side effect and yield None, so the loop keeps reading).
+                pending_exit = result
+                timeout = self._config.result_grace_s
+
+    @staticmethod
+    def _report_race_recovery(recovered: int) -> None:
+        """Emit a one-line ``flaky-pass`` marker when the cold-stdout race was caught.
+
+        Fires only when a stdout frame actually arrived after the result frame (the
+        race, ~5% of execs on some providers). It goes to stderr so it never pollutes
+        the command's stdout, and it crosses the subprocess boundary the smoke test
+        runs exec across -- the one place the race rate stays observable now that the
+        symptom is fixed. See ``TransportConfig.result_grace_s`` / issue #12.
+        """
+        if recovered > 0:
+            print(
+                f"[lease-shell] flaky-pass: drained {recovered} byte(s) of trailing "
+                "stdout after the result frame (issue #12 cold-stdout race caught)",
+                file=sys.stderr,
+            )
 
     def _exec_with_refresh(self, command: str) -> int:
         return self._exec_loop(self._build_provider_shell_url(command=command))
