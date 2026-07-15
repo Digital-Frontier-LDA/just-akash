@@ -30,8 +30,14 @@ Usage:
 
 Costs a small amount of AKT: one minimal lease per provider, destroyed
 immediately (and on Ctrl-C). An ephemeral SSH keypair is generated per run for
-the SSH-transport checks. Providers that do not bid on the probe profile are
-reported NO-BID (cannot be tested), not failed.
+the SSH-transport checks.
+
+Preflight guards (so a low balance or a full provider doesn't score a FALSE
+failure): before deploying, a provider whose published capacity can't fit the
+probe (or that reports offline) is skipped as NO-ROOM; a deploy that returns
+HTTP 402 (insufficient Console credit — nothing is created on-chain) skips the
+whole run as NO-CREDIT. Along with NO-BID, these are "couldn't test", never
+"failed".
 
 Run from the repository root: cleanup goes through robust_destroy(), which shells
 out to `just destroy` / `just list`, so the Justfile and `just` must be available.
@@ -78,6 +84,14 @@ INGRESS_BASELINE = "probe-baseline"
 # set from observed p99 latency without a code change.
 READY_CAP_S = float(os.environ.get("SMOKE_READY_CAP_S", "240"))
 INGRESS_CAP_S = float(os.environ.get("SMOKE_INGRESS_CAP_S", "180"))
+
+# Probe resource needs, matching PROBE_SDL below. Used by the pre-deploy room
+# check so we skip an offline/full provider (NO-ROOM) instead of wasting a deploy
+# + bid-wait on it and then mis-reading the result. CPU is in milli-units (Akash
+# stats report available cpu as milli-cpu: 1000 = 1 core).
+_PROBE_CPU_MILLI = 1000  # 1 cpu
+_PROBE_MEM_BYTES = 1 * 1024**3  # 1Gi
+_PROBE_STORAGE_BYTES = 5 * 1024**3  # 5Gi
 
 # A single richer probe drives every check: alpine that runs sshd on 22 (SSH
 # transport + connect), serves the marker over HTTP on 80 (ingress + update), and
@@ -388,6 +402,43 @@ def sweep_orphan_probes(
 # ── readiness + resolution helpers ───────────────────────────────────
 
 
+def _provider_room(provider: str) -> tuple[bool, str]:
+    """(has_room, reason) from the provider's published capacity stats.
+
+    A proactive pre-deploy check: skip an offline or full provider instead of
+    spending a deploy + bid-wait on it. FAIL-OPEN — if capacity can't be read
+    (registry miss, stats absent, API error), return True and let the bid decide,
+    so a stats hiccup never skips a healthy provider.
+    """
+    try:
+        p = _api().get_provider(provider)
+    except Exception as e:  # noqa: BLE001 — capacity check must never abort the run
+        return True, f"capacity unknown ({type(e).__name__}); proceeding"
+    if not isinstance(p, dict):
+        return True, "provider not in registry; proceeding"
+    if p.get("isOnline") is False:
+        return False, "provider reports offline"
+    stats = p.get("stats")
+    if not isinstance(stats, dict):
+        return True, "no capacity stats; proceeding"
+
+    def _avail(*keys) -> float | None:
+        node = stats
+        for k in keys:
+            node = node.get(k) if isinstance(node, dict) else None
+        return node.get("available") if isinstance(node, dict) else None
+
+    checks = (
+        ("cpu", _avail("cpu"), _PROBE_CPU_MILLI),
+        ("memory", _avail("memory"), _PROBE_MEM_BYTES),
+        ("storage", _avail("storage", "ephemeral"), _PROBE_STORAGE_BYTES),
+    )
+    for name, avail, need in checks:
+        if isinstance(avail, (int, float)) and avail < need:
+            return False, f"insufficient {name} (available {avail} < {need} needed)"
+    return True, "ok"
+
+
 def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, str]:
     """Deploy the probe pinned to ``provider``. Returns (dseq, note).
 
@@ -407,6 +458,13 @@ def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, s
     if m:
         dseq_ref["dseq"] = m.group(1)
         return m.group(1), "ok"
+    # Insufficient Console credit is account-wide, not a provider fault: the
+    # deployment create returns HTTP 402 and NOTHING is created on-chain. Surface
+    # it as its own note so the run skips cleanly instead of scoring the provider
+    # FAIL. (This is the authoritative credit check — the Console API exposes no
+    # balance endpoint, and a 402 probe commits no resources.)
+    if re.search(r"\(402\)|PaymentRequired|[Ii]nsufficient balance", out):
+        return None, "no-credit"
     if re.search(r"NO BID|no bid|NONE from our providers|foreign bids", out):
         return None, "no-bid"
     return None, "deploy-failed"
@@ -781,12 +839,25 @@ def smoke_provider(provider: str, sdl_path: str, key: str, records: list | None 
     install_signal_cleanup(dseq_ref)
     _hdr(f"provider {provider}")
     try:
+        # Pre-deploy room check: don't spend a deploy on an offline/full provider.
+        room_ok, room_reason = _provider_room(provider)
+        if not room_ok:
+            results["deploy"] = "NO-ROOM"
+            print(f"  {YELLOW}NO-ROOM{RESET}: {room_reason} — skipping (not a failure)")
+            return results
+
         _t0 = time.monotonic()
         dseq, note = _deploy(sdl_path, provider, dseq_ref)
         latencies["deploy"] = round((time.monotonic() - _t0) * 1000)
         if not dseq:
-            results["deploy"] = "NO-BID" if note == "no-bid" else "FAIL"
-            print(f"  {RED}{note}{RESET} — cannot test remaining features")
+            # NO-BID (no capacity/interest) and NO-CREDIT (account-wide, nothing
+            # created on-chain) are skips, not provider failures.
+            results["deploy"] = {
+                "no-bid": "NO-BID",
+                "no-credit": "NO-CREDIT",
+            }.get(note, "FAIL")
+            colour = RED if results["deploy"] == "FAIL" else YELLOW
+            print(f"  {colour}{note}{RESET} — cannot test remaining features")
             return results
         results["deploy"] = "PASS"
         print(f"  {GREEN}deployed{RESET} DSEQ={dseq}, waiting for lease...")
@@ -870,7 +941,8 @@ def _print_matrix(rows: dict) -> None:
         cells = []
         for f in FEATURES:
             v = res.get(f, "-")
-            color = GREEN if v == "PASS" else (YELLOW if v in ("-", "NO-BID") else RED)
+            skips = ("-", "NO-BID", "NO-ROOM", "NO-CREDIT")
+            color = GREEN if v == "PASS" else (YELLOW if v in skips else RED)
             cells.append(f"{color}{v.ljust(8)}{RESET}")
         print(f"{prov.ljust(wp)}  " + " ".join(cells))
 
@@ -989,6 +1061,7 @@ def main() -> int:
     records: list | None = [] if args.telemetry_file else None
 
     rows: dict = {}
+    credit_exhausted = False
     try:
         for provider in providers:
             try:
@@ -996,6 +1069,14 @@ def main() -> int:
             except Exception as e:  # noqa: BLE001 — one provider's hard error must not abort the run
                 print(f"  {RED}{provider} aborted: {type(e).__name__}: {e}{RESET}")
                 rows[provider] = dict.fromkeys(FEATURES, "FAIL")
+            # Insufficient credit is account-wide — every other provider would 402
+            # too. Stop here and skip the run cleanly rather than churn 402s.
+            if rows[provider].get("deploy") == "NO-CREDIT":
+                credit_exhausted = True
+                print(
+                    f"  {YELLOW}insufficient Console credit — skipping remaining providers{RESET}"
+                )
+                break
     finally:
         os.unlink(sdl_path)
         # Remove the ephemeral keypair — the unencrypted private key must not be
@@ -1005,11 +1086,18 @@ def main() -> int:
             _write_telemetry(args.telemetry_file, run_ts, _pkg_version(), records)
 
     _print_matrix(rows)
-
-    # A provider fails the smoke test if any testable feature is FAIL. NO-BID is
-    # not a failure (the provider offered no capacity for the probe profile).
-    failed = {p: r for p, r in rows.items() if any(v == "FAIL" for v in r.values())}
     print()
+
+    # Insufficient credit is not a provider verdict at all — nothing was tested.
+    # Exit clean (0) so the scheduled run is a no-op, not a red failure.
+    if credit_exhausted:
+        print(f"{YELLOW}SMOKE TEST SKIPPED{RESET}: insufficient Console credit to deploy probes.")
+        return 0
+
+    # A provider fails the smoke test if any testable feature is FAIL. NO-BID /
+    # NO-ROOM / NO-CREDIT are skips (provider offered no capacity, or we couldn't
+    # afford to test), never failures.
+    failed = {p: r for p, r in rows.items() if any(v == "FAIL" for v in r.values())}
     if failed:
         print(f"{RED}SMOKE TEST FAILED{RESET}: {len(failed)} provider(s) with broken features:")
         for p in failed:
