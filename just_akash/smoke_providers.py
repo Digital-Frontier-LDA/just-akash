@@ -639,7 +639,7 @@ def _wait_ready(dseq: str, cap_s: float = READY_CAP_S, diag: dict | None = None)
         time.sleep(6)
     print(f"  {RED}not serving within {int(cap_s)}s{RESET}")
     # Cap exceeded → FAIL. Classify slow-vs-stuck WITHOUT changing that verdict.
-    _record_ready_timeout(dseq, diag)
+    _record_ready_timeout(dseq, diag, cap_s)
     return False
 
 
@@ -858,7 +858,7 @@ def _check_ingress(
         time.sleep(6)
     print(f"  {RED}ingress not reachable within {int(cap_s)}s{RESET} (last: {last!r})")
     # Cap exceeded → FAIL. Classify slow-vs-stuck WITHOUT changing that verdict.
-    _record_ingress_timeout(dseq, uri, last, diag)
+    _record_ingress_timeout(dseq, uri, last, diag, cap_s)
     return False
 
 
@@ -949,14 +949,9 @@ def _record_update_timeout(
                 "eventual_after_s": after_s,
             }
         )
-    tail = (
-        f" (arrived {after_s}s into the {int(POST_CAP_OBSERVE_S)}s post-cap window)"
-        if after_s is not None
-        else ""
-    )
     print(
         f"  update slow-vs-stuck: served={served} service={service or 'unknown'} "
-        f"in_pod_marker={in_pod} eventual={eventual}{tail}"
+        f"in_pod_marker={in_pod} eventual={eventual}{_post_cap_tail(after_s)}"
     )
 
 
@@ -990,7 +985,7 @@ def _exec_works(dseq: str) -> bool:
     return r.returncode == 0 and "ready" in (r.stdout or "").strip()
 
 
-def _record_ready_timeout(dseq: str, diag: dict | None) -> None:
+def _record_ready_timeout(dseq: str, diag: dict | None, cap_s: float = READY_CAP_S) -> None:
     """Classify a readiness timeout (verdict already FAIL): SLOW (the container becomes
     ready within the post-cap window → the cap was too tight) vs STUCK (never → a
     genuine defect: a dead lease, an unschedulable pod, or a container that never
@@ -1016,7 +1011,7 @@ def _record_ready_timeout(dseq: str, diag: dict | None) -> None:
     if diag is not None:
         diag.update(
             {
-                "fail_cap_s": int(READY_CAP_S),
+                "fail_cap_s": int(cap_s),
                 "service_at_timeout": service,
                 "dead_at_timeout": dead,
                 "exec_at_timeout": exec_state,
@@ -1030,7 +1025,9 @@ def _record_ready_timeout(dseq: str, diag: dict | None) -> None:
     )
 
 
-def _record_ingress_timeout(dseq: str, uri: str, last: str, diag: dict | None) -> None:
+def _record_ingress_timeout(
+    dseq: str, uri: str, last: str, diag: dict | None, cap_s: float = INGRESS_CAP_S
+) -> None:
     """Classify an initial-ingress timeout (verdict already FAIL): SLOW (the marker
     routes within the post-cap window → route propagation was just slow) vs STUCK
     (never). Records the lease service state + last error so a genuine backend failure
@@ -1045,7 +1042,7 @@ def _record_ingress_timeout(dseq: str, uri: str, last: str, diag: dict | None) -
     if diag is not None:
         diag.update(
             {
-                "fail_cap_s": int(INGRESS_CAP_S),
+                "fail_cap_s": int(cap_s),
                 "service_at_timeout": service,
                 "last_at_timeout": last or None,
                 "eventual": eventual,

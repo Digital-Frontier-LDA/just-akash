@@ -566,6 +566,27 @@ class TestUpdateDiagnostics:
         assert diag["exec_at_timeout"] == "ok"
         assert diag["eventual"] == "arrived"  # exec proves it came up
 
+    def test_record_ready_timeout_reports_passed_cap(self):
+        """fail_cap_s must reflect the cap the check actually ran with, not the default."""
+        diag: dict = {}
+        with (
+            patch.object(sp, "_deployment_dead", return_value=False),
+            patch.object(sp, "_service_availability", return_value=(0, 1)),
+            patch.object(sp, "_exec_works", return_value=False),
+            patch.object(sp, "_observe_after_cap", return_value=("never", None)),
+        ):
+            sp._record_ready_timeout("123456", diag, cap_s=42)
+        assert diag["fail_cap_s"] == 42
+
+    def test_record_ingress_timeout_reports_passed_cap(self):
+        diag: dict = {}
+        with (
+            patch.object(sp, "_service_availability", return_value=(1, 1)),
+            patch.object(sp, "_observe_after_cap", return_value=("never", None)),
+        ):
+            sp._record_ingress_timeout("123456", "uri", "err", diag, cap_s=55)
+        assert diag["fail_cap_s"] == 55
+
     def test_record_ready_timeout_isolates_raising_probes(self):
         diag: dict = {}
         with (
