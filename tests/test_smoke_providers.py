@@ -612,6 +612,19 @@ class TestUpdateDiagnostics:
             assert sp._wait_ready("123456", diag=diag) is False
         rec.assert_called_once()
 
+    def test_wait_ready_exec_probe_raise_does_not_abort(self):
+        """A subprocess timeout/OSError in the exec fallback must be swallowed (via
+        _exec_works), not abort the readiness wait + its diagnostics."""
+        with (
+            patch.object(sp.time, "monotonic", _FakeClock(40)),
+            patch.object(sp.time, "sleep"),
+            patch.object(sp, "_deployment_dead", return_value=False),
+            patch.object(sp, "_service_availability", return_value=None),
+            patch.object(sp, "_run", side_effect=subprocess.TimeoutExpired("cmd", 25)),
+            patch.object(sp, "_record_ready_timeout"),
+        ):
+            assert sp._wait_ready("1", cap_s=100) is False  # must not raise
+
     def test_record_ingress_timeout_stuck(self):
         diag: dict = {}
         with (

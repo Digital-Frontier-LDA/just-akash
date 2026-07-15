@@ -623,15 +623,13 @@ def _wait_ready(dseq: str, cap_s: float = READY_CAP_S, diag: dict | None = None)
             print(f"  service available ({avail[0]}/{avail[1]}) after {elapsed}s")
             return True
         # Fallback ~every 30s: a working lease-shell exec proves the container is
-        # up even when the provider never populates availability.
+        # up even when the provider never populates availability. _exec_works is
+        # exception-isolated, so a subprocess timeout/OSError from the probe can't
+        # escape and abort the readiness wait (and its slow-vs-stuck diagnostics).
         now = time.monotonic()
         if now - last_exec_probe >= 30:
             last_exec_probe = now
-            r = _run(
-                f"uv run just-akash exec 'echo ready' --dseq {q(dseq)} --transport lease-shell",
-                timeout=25,
-            )
-            if r.returncode == 0 and "ready" in (r.stdout or ""):
+            if _exec_works(dseq):
                 print(
                     f"  container exec-ready after {int(now - start)}s (availability unreported)"
                 )
