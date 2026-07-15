@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.17.0] — 2026-07-15
+
+### Fixed
+- **Exec cold-stdout race (issue #12) — fixed at the root, in the transport layer.** The provider-proxy does not guarantee the result (exit-code) frame is the last one on the wire: a stdout frame can still be in flight when the result arrives. `_pump_frames` returned the instant the exit code landed, so that trailing stdout was **dropped** — a successful exec came back `rc=0` with **empty stdout** ~5% of the time on some providers (aaul, hgulk6 in the accrued telemetry; z9nr clean). This hit **every** `exec()`/`inject()` caller, not just the smoke test's `_check_exec`. The fix keeps draining after the exit code is in hand for a short bounded window, returning early the instant the socket closes (the normal terminator), so a well-behaved command is never delayed and the trailing frame is never lost.
+  - New `TransportConfig.result_grace_s` (default **0.25s**) bounds the **total** post-result drain (a monotonic deadline, not just per-recv silence, so a proxy that keeps dribbling frames can't stretch it) — chosen because the drain returns on close, so a longer window would only delay diagnosis in the pathological no-close case for zero normal-case benefit. Tunable if telemetry ever shows later frames.
+  - **`flaky-pass` marker:** when the race actually fires and is caught, a one-line note goes to **stderr** (`[lease-shell] flaky-pass: drained N byte(s) … issue #12 cold-stdout race caught`) — it crosses the subprocess boundary the smoke test runs exec across, so the underlying race rate stays observable even though the symptom is gone.
+  - Rejected the alternative of retrying inside `_check_exec`: that drives the *test* pass-rate to ~p³ while real users keep hitting the raw ~5% rate — masking, not fixing. (Design reached by full multi-model quorum consensus — transport-layer drain over a smoke-test retry.)
+- Tests: 950 passing (+7) — trailing stdout after the result frame is emitted, the flaky-pass marker reports recovered bytes, normal ordering emits no false marker, a silent grace window after the result returns cleanly, silence *before* the result still raises the hang diagnosis, the drain switches to `result_grace_s`, and a dribbling proxy is cut off by the total grace budget.
+
+---
+
 ## [1.16.0] — 2026-07-15
 
 ### Added

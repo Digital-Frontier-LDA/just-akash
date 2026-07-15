@@ -26,6 +26,14 @@ class TransportConfig:
     # diagnosis instead of blocking. Raise it for commands expected to stay quiet
     # for a long time.
     recv_timeout: float = 300.0
+    # Once the command's exit-code (result) frame arrives, the provider-proxy can
+    # still have a stdout frame in flight -- it does not guarantee the result frame
+    # is last (issue #12, the "cold-stdout race"). After the exit code is in hand
+    # we keep draining for at most this many seconds so that trailing output is not
+    # dropped, returning early the instant the socket closes so a well-behaved
+    # command is never delayed. The drain returns on close, so this only bounds the
+    # pathological slow/no-close case; raise it only if telemetry shows late frames.
+    result_grace_s: float = 0.25
 
 
 class Transport(ABC):

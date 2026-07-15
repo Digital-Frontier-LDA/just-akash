@@ -1257,3 +1257,117 @@ class TestTokenRefresh:
         result = LeaseShellTransport._dispatch_frame(frame)
         # null exit_code must be treated as 0
         assert result == 0
+
+
+class TestColdStdoutRace:
+    """Issue #12 -- the provider-proxy can deliver a stdout frame AFTER the result
+    (exit-code) frame, so returning the instant the exit code lands drops that
+    trailing output (rc=0 with EMPTY stdout, ~5% of execs on some providers).
+
+    _pump_frames must keep draining for a short bounded grace window once the exit
+    code is in hand, so every exec caller -- not just the smoke test -- gets the
+    trailing output, and must surface a flaky-pass marker so the race stays visible.
+    """
+
+    def _pump(self, ws):
+        buf = io.BytesIO()
+        with patch("sys.stdout") as mock_stdout:
+            mock_stdout.buffer = buf
+            code = _transport()._pump_frames(ws, 0)
+        return code, buf.getvalue()
+
+    def test_trailing_stdout_after_result_is_not_dropped(self):
+        """The core regression: STDOUT arriving after RESULT must still be emitted."""
+        frames = [
+            bytes([102]) + json.dumps({"exit_code": 0}).encode(),  # RESULT first
+            bytes([100]) + b"MARKER-OUTPUT",  # stdout in flight, arrives late
+        ]
+        code, out = self._pump(FakeWebSocket(frames))
+        assert code == 0
+        assert b"MARKER-OUTPUT" in out
+
+    def test_flaky_pass_marker_reports_recovered_bytes(self, capsys):
+        """When the race is caught, a one-line flaky-pass marker hits stderr."""
+        frames = [
+            bytes([102]) + json.dumps({"exit_code": 0}).encode(),
+            bytes([100]) + b"twelve-bytes",  # 12 bytes recovered
+        ]
+        self._pump(FakeWebSocket(frames))
+        err = capsys.readouterr().err
+        assert "flaky-pass" in err
+        assert "12 byte" in err
+        assert "issue #12" in err
+
+    def test_no_marker_on_normal_frame_ordering(self, capsys):
+        """Normal order (STDOUT then RESULT) must NOT emit a false flaky-pass."""
+        frames = [
+            bytes([100]) + b"normal-output",  # stdout BEFORE result -- not the race
+            bytes([102]) + json.dumps({"exit_code": 0}).encode(),
+        ]
+        code, out = self._pump(FakeWebSocket(frames))
+        assert code == 0
+        assert b"normal-output" in out
+        assert "flaky-pass" not in capsys.readouterr().err
+
+    def test_grace_timeout_after_result_returns_cleanly(self):
+        """A silent grace window after the exit code returns it -- not a hang error."""
+        ws = MagicMock()
+        ws.recv.side_effect = [
+            bytes([102]) + json.dumps({"exit_code": 7}).encode(),
+            TimeoutError(),  # no trailing frame, no close within the grace window
+        ]
+        assert _transport()._pump_frames(ws, 0) == 7
+
+    def test_silence_before_result_still_raises_hang_diagnosis(self):
+        """Before any result frame, silence is a hang and must still be surfaced."""
+        ws = MagicMock()
+        ws.recv.side_effect = TimeoutError()
+        with pytest.raises(RuntimeError, match="sent nothing"):
+            _transport()._pump_frames(ws, 0)
+
+    def test_grace_window_uses_config_result_grace_s(self):
+        """After the result frame, recv switches to the short result_grace_s timeout."""
+        seen_timeouts = []
+
+        def _recv(timeout=None):
+            seen_timeouts.append(timeout)
+            if len(seen_timeouts) == 1:
+                return bytes([102]) + json.dumps({"exit_code": 0}).encode()
+            raise ConnectionClosedOK(None, None)
+
+        ws = MagicMock()
+        ws.recv.side_effect = _recv
+        cfg = TransportConfig(
+            dseq="123", api_key="key", deployment=DEPLOYMENT_FIXTURE, result_grace_s=0.05
+        )
+        LeaseShellTransport(cfg)._pump_frames(ws, 0)
+        # First recv uses recv_timeout (pre-result); after RESULT it drops to the
+        # grace budget (min(result_grace_s, remaining) -> at or just under 0.05).
+        assert seen_timeouts[0] == 300.0
+        assert 0 < seen_timeouts[1] <= 0.05
+
+    def test_total_drain_budget_bounds_dribbling_proxy(self):
+        """A proxy that keeps sending ignored frames after the result must not
+        stretch the drain past the total result_grace_s budget (per-recv silence
+        alone would never trip). The monotonic deadline cuts it off."""
+        result_frame = bytes([102]) + json.dumps({"exit_code": 3}).encode()
+        filler = bytes([255]) + b"x"  # unknown code -> _dispatch_frame yields None
+
+        class DribblingWS:
+            """Never closes, never goes silent -- only the deadline can stop it."""
+
+            def __init__(self):
+                self.calls = 0
+
+            def recv(self, timeout=None):
+                self.calls += 1
+                return result_frame if self.calls == 1 else filler
+
+        # monotonic: base when the result lands, then advance past deadline (+0.05).
+        clock = iter([100.0, 100.0, 100.02, 100.04, 100.06, 100.08, 100.10])
+        cfg = TransportConfig(
+            dseq="123", api_key="key", deployment=DEPLOYMENT_FIXTURE, result_grace_s=0.05
+        )
+        with patch("just_akash.transport.lease_shell.time.monotonic", lambda: next(clock)):
+            code = LeaseShellTransport(cfg)._pump_frames(DribblingWS(), 0)
+        assert code == 3
