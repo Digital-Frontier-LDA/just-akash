@@ -427,7 +427,14 @@ def _capture_diagnostics(dseq: str, reason: str) -> None:
             for ln in lines[:15]:
                 print(f"      {ln}")
             if not lines:
-                print(f"      (no {kind} returned — provider unreachable on this path)")
+                # No stdout: surface WHY (stderr / non-zero exit) rather than a
+                # bare "(no output)" that would hide a real stream error — the
+                # inability to even fetch events/logs is itself diagnostic.
+                err = (r.stderr or "").strip()
+                if r.returncode != 0 or err:
+                    print(f"      ({kind} unavailable: rc={r.returncode} {err[:200]})")
+                else:
+                    print(f"      (no {kind} returned — nothing to show)")
         except Exception as e:  # noqa: BLE001
             print(f"    {kind} capture failed: {type(e).__name__}: {e}")
 
@@ -930,7 +937,7 @@ def smoke_provider(provider: str, sdl_path: str, key: str, records: list | None 
             results[name] = "PASS" if ok else "FAIL"
             print(f"  {GREEN if ok else RED}{name}: {results[name]}{RESET}")
             if not ok:
-                _diag_once(f"{name} FAILed")
+                _diag_once(f"{name} check failed")
 
         # lease-shell features (container is exec-ready)
         run_check("status", lambda: _check_status(dseq))

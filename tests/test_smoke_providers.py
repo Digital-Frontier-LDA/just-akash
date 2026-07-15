@@ -750,6 +750,24 @@ class TestFailureDiagnostics:
             sp._capture_diagnostics("123", "reason")  # must not raise
         assert "capture failed" in capsys.readouterr().out
 
+    def test_capture_surfaces_stderr_on_nonzero_stream(self, capsys):
+        # A stream command that errors (rc!=0, detail on stderr) must show WHY,
+        # not a bare "(no output)" that hides the failure.
+        with (
+            patch.object(sp, "_status_json", return_value={"status": "x"}),
+            patch.object(sp, "_service_availability", return_value=None),
+            patch.object(
+                sp,
+                "_run",
+                return_value=_completed(
+                    stdout="", stderr="Error: provider unreachable", returncode=1
+                ),
+            ),
+        ):
+            sp._capture_diagnostics("123", "reason")
+        out = capsys.readouterr().out
+        assert "unavailable: rc=1" in out and "provider unreachable" in out
+
     def test_readiness_failure_captures_diagnostics(self):
         with (
             patch.object(sp, "_provider_room", return_value=(True, "ok")),
