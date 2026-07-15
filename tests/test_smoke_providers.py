@@ -766,7 +766,24 @@ class TestFailureDiagnostics:
         ):
             sp._capture_diagnostics("123", "reason")
         out = capsys.readouterr().out
-        assert "unavailable: rc=1" in out and "provider unreachable" in out
+        assert "stream errored: rc=1" in out and "provider unreachable" in out
+
+    def test_capture_surfaces_error_even_with_partial_stdout(self, capsys):
+        # Some lines AND a non-zero exit -> BOTH the lines and the error show.
+        with (
+            patch.object(sp, "_status_json", return_value={"status": "x"}),
+            patch.object(sp, "_service_availability", return_value=None),
+            patch.object(
+                sp,
+                "_run",
+                return_value=_completed(
+                    stdout="Normal Scheduled ...\n", stderr="boom", returncode=1
+                ),
+            ),
+        ):
+            sp._capture_diagnostics("123", "reason")
+        out = capsys.readouterr().out
+        assert "Scheduled" in out and "stream errored: rc=1" in out and "boom" in out
 
     def test_readiness_failure_captures_diagnostics(self):
         with (

@@ -426,15 +426,14 @@ def _capture_diagnostics(dseq: str, reason: str) -> None:
             print(f"    --- {kind} ({len(lines)} line(s)) ---")
             for ln in lines[:15]:
                 print(f"      {ln}")
-            if not lines:
-                # No stdout: surface WHY (stderr / non-zero exit) rather than a
-                # bare "(no output)" that would hide a real stream error — the
-                # inability to even fetch events/logs is itself diagnostic.
-                err = (r.stderr or "").strip()
-                if r.returncode != 0 or err:
-                    print(f"      ({kind} unavailable: rc={r.returncode} {err[:200]})")
-                else:
-                    print(f"      (no {kind} returned — nothing to show)")
+            # Surface a stream failure (non-zero exit / stderr) in ALL cases, even
+            # when it also produced some stdout — a partial/errored stream is
+            # itself diagnostic, and a bare "(no output)" would hide it.
+            err = (r.stderr or "").strip()
+            if r.returncode != 0 or err:
+                print(f"      ({kind} stream errored: rc={r.returncode} {err[:200]})")
+            elif not lines:
+                print(f"      (no {kind} returned — nothing to show)")
         except Exception as e:  # noqa: BLE001
             print(f"    {kind} capture failed: {type(e).__name__}: {e}")
 
