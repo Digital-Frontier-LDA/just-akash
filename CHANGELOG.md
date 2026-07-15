@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.21.0] — 2026-07-16
+
+### Added
+- **Quarantine tier — a genuinely-unreliable provider can be monitored without its infra flakiness reddening CI.** The accrued data pins all remaining flakiness to one provider (hgulk6: ~8–33% lease-down + occasional update-cutover stalls — genuine hgulk6 *infrastructure* failures, unfixable from just-akash; aaul/z9nr are 100%). The smoke test conflated two purposes: catching just-akash **tooling** regressions (a feature breaking on a healthy lease — its original job) and provider **reliability** monitoring. `SMOKE_QUARANTINE_PROVIDERS` (comma-separated) now separates them: a quarantined provider is still deployed, tested, shown in the matrix, and recorded in telemetry (`quarantined: true`) — but its **provider-reliability** failures (`LEASE-DOWN`, or an update stall the diagnostics *prove* is an ingress-routing failure: new pod healthy, marker never routes) **do not gate the run**, while a **tooling regression** on it (any feature FAIL on a healthy lease, an update whose command failed, or a stale-update where `in_pod_marker=old`) **still gates**. So the CI gate stops flaking on hgulk6's genuine infra failures **without masking** — a real just-akash bug is deterministic across providers and still caught, and hgulk6's reliability stays fully visible in the matrix + SLO telemetry. (Design: full 3-model quorum, 2 unanimous rounds — a code-verified reading of the update diagnostics corrected the demote predicate so a stale-update stays gating.)
+- Reliability-vs-tooling classifier `_is_reliability_failure` + the gate helper `_gating_providers`; records are now always collected in-memory (only *written* when a telemetry file is set) so the gate can read the diag.
+- Tests: 1013 passing (+15) — the classifier taxonomy (LEASE-DOWN / command-fail / stale-update / ingress-stall / slow / plain-feature), and the gate demoting a quarantined provider's reliability failures while still gating its tooling regressions and every non-quarantined failure.
+
+---
+
 ## [1.20.0] — 2026-07-15
 
 ### Fixed

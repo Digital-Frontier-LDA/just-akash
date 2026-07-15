@@ -192,6 +192,80 @@ LEASE_DOWN = "LEASE-DOWN"
 _FAILING_OUTCOMES = ("FAIL", LEASE_DOWN)
 
 
+def _quarantined_providers() -> set[str]:
+    """Providers explicitly quarantined as genuinely-unreliable (env
+    SMOKE_QUARANTINE_PROVIDERS, comma-separated). Their PROVIDER-RELIABILITY failures
+    (LEASE-DOWN, or a proven ingress-routing stall) are still deployed, tested, shown
+    and recorded — but do NOT gate CI. A TOOLING regression on them (a feature breaking
+    on a HEALTHY lease) STILL gates. Lets a known-bad provider stay monitored without
+    its infra flakiness reddening the run. (Quorum-designed, unanimous.)"""
+    raw = os.environ.get("SMOKE_QUARANTINE_PROVIDERS", "")
+    return {p.strip() for p in raw.split(",") if p.strip()}
+
+
+def _service_ready(service_at_timeout: object) -> bool:
+    """Parse a 'ready/total' snapshot string; True if >=1 replica was ready."""
+    if not isinstance(service_at_timeout, str) or "/" not in service_at_timeout:
+        return False
+    try:
+        return int(service_at_timeout.split("/", 1)[0]) >= 1
+    except ValueError:
+        return False
+
+
+def _is_reliability_failure(feature: str, outcome: str, diag: dict | None) -> bool:
+    """Does this failing cell reflect PROVIDER infra (demote for a quarantined provider)
+    vs a just-akash TOOLING bug (always gate)?
+
+    LEASE-DOWN always qualifies (the lease died on-chain). An update-cutover stall
+    qualifies ONLY when the diagnostics prove the new pod was healthy but the ingress
+    never routed, or the marker eventually served (merely slow) — NOT when the update
+    command itself failed (``fail_mode``) or the update never reached the pod
+    (``in_pod_marker == 'old'``, the genuine-bug signature that must stay gating).
+    A real just-akash regression is deterministic across providers, so the multi-
+    provider matrix still catches it. (Quorum-designed, 2 unanimous rounds.)"""
+    if outcome == LEASE_DOWN:
+        return True
+    if outcome == "FAIL" and feature == "update" and isinstance(diag, dict):
+        if diag.get("fail_mode") == "update_command":
+            return False  # the update command itself failed = tooling bug → gate
+        eventual = diag.get("eventual")
+        if eventual == "arrived":
+            return True  # the marker eventually served = provider was slow, not a bug
+        if eventual == "never":
+            in_pod = diag.get("in_pod_marker")
+            if in_pod == "new":
+                return True  # new pod HAS the env, ingress never routed = provider infra
+            if in_pod == "unreachable" and _service_ready(diag.get("service_at_timeout")):
+                return True  # exec flaky but service healthy = the unreliability we quarantined
+    return False
+
+
+def _gating_providers(rows: dict, records: list, quarantined: set) -> dict:
+    """Providers whose failures GATE the run → ``{provider: [gating features]}``.
+
+    A quarantined provider's PROVIDER-RELIABILITY failures (LEASE-DOWN, a proven
+    ingress-routing stall — classified from the telemetry ``diag``) are demoted, so
+    they don't gate; its TOOLING regressions (a feature broken on a healthy lease)
+    still gate, as do all failures on a non-quarantined provider."""
+    diag_by = {(r.get("provider"), r.get("feature")): r.get("diag") for r in records}
+    out: dict = {}
+    for provider, row in rows.items():
+        gating = []
+        for f in FEATURES:
+            v = row.get(f)
+            if v not in _FAILING_OUTCOMES:
+                continue
+            if provider in quarantined and _is_reliability_failure(
+                f, v, diag_by.get((provider, f))
+            ):
+                continue  # demoted: a quarantined provider's reliability failure
+            gating.append(f)
+        if gating:
+            out[provider] = gating
+    return out
+
+
 def _pkg_version() -> str:
     try:
         from importlib.metadata import version
@@ -1407,7 +1481,10 @@ def main() -> int:
 
     # One timestamp for the whole run so every record shares a run key.
     run_ts = datetime.now(timezone.utc).isoformat()
-    records: list | None = [] if args.telemetry_file else None
+    # Always collect records in memory (the gate reads their diag to demote a
+    # quarantined provider's reliability failures); only WRITE them if asked.
+    records: list = []
+    quarantined = _quarantined_providers()
 
     rows: dict = {}
     credit_exhausted = False
@@ -1431,6 +1508,11 @@ def main() -> int:
         # Remove the ephemeral keypair — the unencrypted private key must not be
         # left behind in the temp dir after the run.
         shutil.rmtree(os.path.dirname(key_path), ignore_errors=True)
+        # Tag a quarantined provider's rows so the telemetry/SLO report can track its
+        # reliability trend (and flag when it recovers → drop from the quarantine set).
+        for rec in records:
+            if rec.get("provider") in quarantined:
+                rec["quarantined"] = True
         if args.telemetry_file and records:
             _write_telemetry(args.telemetry_file, run_ts, _pkg_version(), records)
 
@@ -1443,16 +1525,27 @@ def main() -> int:
         print(f"{YELLOW}SMOKE TEST SKIPPED{RESET}: insufficient Console credit to deploy probes.")
         return 0
 
-    # A provider fails the smoke test if any testable feature is FAIL or LEASE-DOWN.
-    # NO-BID / NO-ROOM / NO-CREDIT are pre-commitment skips (provider offered no
-    # capacity, or we couldn't afford to test), never failures. LEASE-DOWN IS a
-    # failure — the provider accepted the bid and the lease then died on-chain.
-    failed = {p: r for p, r in rows.items() if any(v in _FAILING_OUTCOMES for v in r.values())}
+    # A provider fails the smoke test if any testable feature FAILs (or LEASE-DOWNs).
+    # NO-BID / NO-ROOM / NO-CREDIT are pre-commitment skips, never failures. For a
+    # QUARANTINED provider, PROVIDER-RELIABILITY failures (LEASE-DOWN, a proven ingress
+    # stall) are demoted — shown + recorded but non-gating — while a TOOLING regression
+    # (a feature broken on a healthy lease) still gates.
+    failed = _gating_providers(rows, records, quarantined)
+    # Show any quarantined provider whose reliability failures were demoted, so a
+    # non-gating red row is self-documenting rather than a silent mystery.
+    for p in sorted(quarantined):
+        r = rows.get(p, {})
+        gating = failed.get(p, [])
+        demoted = [f for f in FEATURES if r.get(f) in _FAILING_OUTCOMES and f not in gating]
+        if demoted:
+            print(
+                f"{YELLOW}[QUARANTINED]{RESET} {p}: {', '.join(demoted)} — "
+                "provider-reliability failure, tracked but NOT gating"
+            )
     if failed:
         print(f"{RED}SMOKE TEST FAILED{RESET}: {len(failed)} provider(s) with broken features:")
-        for p in failed:
-            broken = [f for f in FEATURES if rows[p].get(f) in _FAILING_OUTCOMES]
-            down = any(rows[p].get(f) == LEASE_DOWN for f in FEATURES)
+        for p, broken in failed.items():
+            down = any(rows[p].get(f) == LEASE_DOWN for f in broken)
             tag = " [LEASE-DOWN: provider accepted the bid then the lease died]" if down else ""
             print(f"  {p}: {', '.join(broken)}{tag}")
         return 1

@@ -75,6 +75,12 @@ jobs:
           AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
           AKASH_PROVIDERS: ${{ secrets.AKASH_PROVIDERS }}
           AKASH_PROVIDERS_BACKUP: ${{ secrets.AKASH_PROVIDERS_BACKUP }}
+          # Comma-separated providers quarantined as genuinely-unreliable: they are
+          # still deployed, tested, shown + recorded, but their PROVIDER-RELIABILITY
+          # failures (LEASE-DOWN / proven ingress stall) do NOT gate the run — a
+          # TOOLING regression on them still does. Keeps a known-bad provider
+          # monitored without its infra flakiness reddening CI. Empty = none quarantined.
+          SMOKE_QUARANTINE_PROVIDERS: ${{ secrets.SMOKE_QUARANTINE_PROVIDERS }}
           # Per-(provider,feature) outcome + latency, one JSON line each. Uploaded
           # as an artifact below; aggregate across runs to set percentile timeouts
           # and detect latency/success-rate regressions.
