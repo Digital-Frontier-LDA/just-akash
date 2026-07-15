@@ -635,6 +635,17 @@ class TestUpdateDiagnostics:
             assert sp._check_ingress("123456", "uri", diag=diag) is False
         rec.assert_called_once()
 
+    def test_check_ingress_tolerates_fetch_valueerror(self):
+        """A malformed URI raising ValueError in-loop must not abort — poll to timeout."""
+        with (
+            patch.object(sp, "_fetch", side_effect=ValueError("bad uri")),
+            patch.object(sp.time, "monotonic", _FakeClock(100)),  # one poll, then cap
+            patch.object(sp.time, "sleep"),
+            patch.object(sp, "_record_ingress_timeout") as rec,
+        ):
+            assert sp._check_ingress("123456", "uri", diag={}) is False
+        rec.assert_called_once()  # reached the classifier, didn't propagate
+
     def test_check_update_tolerates_fetch_valueerror(self):
         """A malformed URI raising ValueError must not abort — keep polling to timeout."""
         with (

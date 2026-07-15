@@ -853,7 +853,9 @@ def _check_ingress(
                 print(f"  ingress reachable after {int(time.monotonic() - start)}s")
                 return True
             last = body[:60].replace("\n", " ")
-        except (urllib.error.URLError, OSError) as e:
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            # ValueError covers a malformed provider-reported URI — record it and keep
+            # polling; the timeout path classifies it, rather than aborting the check.
             last = str(e)[:60]
         time.sleep(6)
     print(f"  {RED}ingress not reachable within {int(cap_s)}s{RESET} (last: {last!r})")
