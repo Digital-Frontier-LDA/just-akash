@@ -208,8 +208,10 @@ deployment:
     # the operator sets SMOKE_BEACON_URL in the smoke's environment (a collector on
     # their infra). Empty by default -> the in-probe `[ -z "$BEACON_URL" ]` guard
     # no-ops it, so nothing is POSTed and no curl is installed.
+    # .strip() so a pasted trailing newline/space in the secret can't inject a broken
+    # line or a spurious extra env entry into the SDL YAML.
     "__BEACON_URL__",
-    os.environ.get("SMOKE_BEACON_URL", ""),
+    os.environ.get("SMOKE_BEACON_URL", "").strip(),
 )
 
 # Ordered feature columns for the report.
@@ -603,8 +605,13 @@ def _death_cause(log_lines: list[str], lease_down: bool) -> str | None:
     live container) heartbeats are just liveness, not a death — return None so we
     never mislabel a healthy-lease failure as a kill. Also None when uninstrumented.
     """
-    dying_idx = max((i for i, ln in enumerate(log_lines) if "PROBE-DYING" in ln), default=-1)
-    hb_idx = max((i for i, ln in enumerate(log_lines) if "PROBE-HB" in ln), default=-1)
+    # Token membership (not substring) so an unrelated line mentioning the marker in
+    # prose can't false-match; the log line is "[pod] PROBE-HB …" so the marker is its
+    # own whitespace-delimited token.
+    dying_idx = max(
+        (i for i, ln in enumerate(log_lines) if "PROBE-DYING" in ln.split()), default=-1
+    )
+    hb_idx = max((i for i, ln in enumerate(log_lines) if "PROBE-HB" in ln.split()), default=-1)
     # A dying line AFTER the last heartbeat = a termination signal was the final thing
     # the probe emitted (a stale one before newer heartbeats would be a restart).
     if dying_idx > hb_idx:
@@ -667,11 +674,10 @@ def _capture_diagnostics(dseq: str, reason: str) -> None:
     # unknown (None, e.g. lazily-unreported). Diagnostic only; the raw events tail
     # still shows an OOMKilled/Killing event even if this stays silent.
     # Classify a death only when the lease is terminally down via a PROVIDER-fulfillment
-    # state (_LEASE_DOWN_STATES = failed/closed) — NOT insufficient_funds (a funding
-    # close, not a provider kill) which _dead_state also covers. avail==0 alone
-    # false-positives on a live-but-not-yet-serving lease (readiness lag). Fall back to
-    # the reason string ("lease never became ready") when the on-chain state is
-    # unreadable. Diagnostic only; the events tail still shows OOMKilled/Killing anyway.
+    # state (_LEASE_DOWN_STATES = failed/closed) — not insufficient_funds (a funding
+    # close, not a provider kill). Fall back to the reason string ("lease never became
+    # ready") only when the on-chain state is unreadable. Diagnostic only; the events
+    # tail still shows OOMKilled/Killing even when this stays silent.
     lease_down = _dead_state(dseq) in _LEASE_DOWN_STATES or "lease" in reason.lower()
     cause = _death_cause(log_lines, lease_down=lease_down)
     if cause:
