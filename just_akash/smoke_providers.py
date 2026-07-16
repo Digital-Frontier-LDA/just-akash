@@ -656,10 +656,7 @@ def _capture_diagnostics(dseq: str, reason: str) -> None:
     # still classified — falling back to the reason string only when availability is
     # unknown (None, e.g. lazily-unreported). Diagnostic only; the raw events tail
     # still shows an OOMKilled/Killing event even if this stays silent.
-    if isinstance(avail, tuple):
-        lease_down = avail[0] == 0
-    else:
-        lease_down = "lease" in reason.lower()
+    lease_down = avail[0] == 0 if isinstance(avail, tuple) else "lease" in reason.lower()
     cause = _death_cause(log_lines, lease_down=lease_down)
     if cause:
         print(f"    {YELLOW}{cause}{RESET}")
