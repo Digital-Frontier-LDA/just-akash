@@ -534,6 +534,45 @@ class TestUpdateDiagnostics:
         # a line that merely CONTAINS the token but lacks the stable prefix must NOT match
         assert sp._frame_trace_line("a wrapper mentions FRAME-TRACE loosely") is None
 
+    def test_death_cause_graceful_on_dying_line(self):
+        logs = [
+            "PROBE-HB ts=100 up=5 mem=1/2 mpsi=avg10=0.0 cpsi=avg10=0.0 thr=0",
+            "PROBE-DYING signal=TERM ts=105",  # the LAST thing the probe emitted
+        ]
+        out = sp._death_cause(logs, lease_down=True)
+        assert out is not None and "GRACEFUL" in out and "signal=TERM" in out
+
+    def test_death_cause_hard_kill_when_lease_down_and_only_heartbeats(self):
+        logs = [
+            "PROBE-HB ts=100 up=5 mem=1/2 mpsi=avg10=0.0",
+            "PROBE-HB ts=105 up=10 mem=2/2 mpsi=avg10=42.0",  # pressure climbing
+        ]
+        out = sp._death_cause(logs, lease_down=True)
+        assert out is not None
+        assert "NO termination signal" in out and "hard kill" in out
+        assert "ts=105" in out  # pins to the LAST heartbeat
+
+    def test_death_cause_none_when_lease_up_feature_flake(self):
+        """Heartbeats on a LIVE container (lease not down) are liveness, not a kill."""
+        logs = ["PROBE-HB ts=100 up=5 mem=1/2", "PROBE-HB ts=105 up=10 mem=1/2"]
+        assert sp._death_cause(logs, lease_down=False) is None
+
+    def test_death_cause_graceful_wins_even_if_lease_up(self):
+        """A dying line is unambiguous death evidence regardless of the down flag."""
+        logs = ["PROBE-HB ts=100 up=5", "PROBE-DYING signal=TERM ts=106"]
+        assert "GRACEFUL" in (sp._death_cause(logs, lease_down=False) or "")
+
+    def test_death_cause_stale_dying_before_newer_heartbeats_is_not_graceful(self):
+        """A PROBE-DYING followed by newer heartbeats = a restart, not the final state."""
+        logs = ["PROBE-DYING signal=TERM ts=100", "PROBE-HB ts=110 up=2"]
+        # lease up -> None (alive); lease down -> hard-kill on the newer heartbeat
+        assert sp._death_cause(logs, lease_down=False) is None
+        assert "hard kill" in (sp._death_cause(logs, lease_down=True) or "")
+
+    def test_death_cause_none_when_uninstrumented(self):
+        assert sp._death_cause(["probe-http-up", "probe-container-up"], lease_down=True) is None
+        assert sp._death_cause([], lease_down=True) is None
+
     # --- readiness + ingress timeout diagnostics (Phase 1b) ---
 
     def test_availability_ready_true(self):

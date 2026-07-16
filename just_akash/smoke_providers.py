@@ -108,7 +108,7 @@ _PROBE_STORAGE_BYTES = 5 * 1024**3  # 5Gi
 # idles. openssh + busybox-extras (for httpd) are installed at boot -- the stock
 # busybox has no httpd applet. Nothing about this workload can explain a provider
 # feature failing, so a failure is unambiguously the provider's.
-PROBE_SDL = f"""\
+PROBE_SDL = """\
 ---
 version: "2.0"
 services:
@@ -116,7 +116,8 @@ services:
     image: alpine:3.20
     env:
       - SSH_PUBKEY_B64=PLACEHOLDER_SSH_PUBKEY_B64
-      - SMOKE_MARKER={INGRESS_BASELINE}
+      - SMOKE_MARKER=__SMOKE_MARKER__
+      - BEACON_URL=__BEACON_URL__
     expose:
       - port: 22
         as: 22
@@ -148,22 +149,70 @@ services:
         sed -i 's/#\\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
         /usr/sbin/sshd
         echo probe-container-up
-        sleep infinity
+        # --- instrumentation: heartbeat + death-cause capture (issue #646) --------
+        # Keep the container alive AND make a lease-down self-diagnosing. Each
+        # heartbeat pins liveness + the memory/PSI pressure at that instant; the
+        # signal trap names a GRACEFUL termination (the provider deleting the pod).
+        # A hard kill (OOM / eviction / node loss) is un-trappable -- it just stops
+        # the heartbeats, so the gap + the last pressure reading is the tell.
+        # PSI (/proc/pressure) + cgroup throttling are the right in-container health
+        # signals (CPU steal is hypervisor-level and ~0 on bare-metal k8s).
+        # BEACON_URL (optional, unset by default): POST each heartbeat + the dying
+        # line to a user-run collector so the evidence survives the lease teardown
+        # (provider logs can go empty the moment the lease closes). Needs curl, which
+        # busybox wget can't POST -- installed only when the beacon is enabled.
+        if [ -n "$BEACON_URL" ]; then apk add --no-cache curl >/dev/null 2>&1 || true; fi
+        beacon() {
+          [ -z "$BEACON_URL" ] && return 0
+          command -v curl >/dev/null 2>&1 || return 0
+          curl -sf -m 3 -o /dev/null --data-urlencode "probe=$1" "$BEACON_URL" || true
+        }
+        die() {
+          M="PROBE-DYING signal=$1 ts=$(date +%s)"
+          echo "$M"; beacon "$M"; exit 0
+        }
+        set +e  # this monitor loop is deliberately failure-tolerant
+        HB_START=$(date +%s)
+        trap 'die TERM' TERM
+        trap 'die INT' INT
+        trap 'die QUIT' QUIT
+        while true; do
+          NOW=$(date +%s)
+          MEM=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || echo -1)
+          MMAX=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo -1)
+          MPSI=$(grep '^some' /proc/pressure/memory 2>/dev/null | cut -d' ' -f2)
+          CPSI=$(grep '^some' /proc/pressure/cpu 2>/dev/null | cut -d' ' -f2)
+          THR=$(grep nr_throttled /sys/fs/cgroup/cpu.stat 2>/dev/null | cut -d' ' -f2)
+          HB="PROBE-HB ts=$NOW up=$((NOW-HB_START)) mem=$MEM/$MMAX mpsi=$MPSI cpsi=$CPSI thr=$THR"
+          echo "$HB"
+          beacon "$HB"
+          sleep 5 &
+          wait "$!"
+        done
 profiles:
   compute:
     probe:
       resources:
-        cpu: {{ units: 1 }}
-        memory: {{ size: 1Gi }}
-        storage: [{{ size: 5Gi }}]
+        cpu: { units: 1 }
+        memory: { size: 1Gi }
+        storage: [{ size: 5Gi }]
   placement:
     akash:
       pricing:
-        probe: {{ denom: uact, amount: 10000 }}
+        probe: { denom: uact, amount: 10000 }
 deployment:
   probe:
-    akash: {{ profile: probe, count: 1 }}
-"""
+    akash: { profile: probe, count: 1 }
+""".replace("__SMOKE_MARKER__", INGRESS_BASELINE).replace(
+    # The death-cause beacon ships DARK: BEACON_URL reaches the container only when
+    # the operator sets SMOKE_BEACON_URL in the smoke's environment (a collector on
+    # their infra). Empty by default -> the in-probe `[ -z "$BEACON_URL" ]` guard
+    # no-ops it, so nothing is POSTed and no curl is installed.
+    # .strip() so a pasted trailing newline/space in the secret can't inject a broken
+    # line or a spurious extra env entry into the SDL YAML.
+    "__BEACON_URL__",
+    os.environ.get("SMOKE_BEACON_URL", "").strip(),
+)
 
 # Ordered feature columns for the report.
 FEATURES = [
@@ -543,6 +592,38 @@ def sweep_orphan_probes(
 # ── readiness + resolution helpers ───────────────────────────────────
 
 
+def _death_cause(log_lines: list[str], lease_down: bool) -> str | None:
+    """Summarize HOW the container died, from instrumented-probe logs (issue #646).
+
+    A ``PROBE-DYING`` line after the probe's last heartbeat (i.e. not followed by a
+    restart's newer heartbeats) means it caught a termination signal — the provider
+    deleted the pod, i.e. a graceful, deliberate close. If the
+    lease is down but the probe only left heartbeats (no dying line), it vanished
+    without a signal: a hard kill (OOM / eviction / node loss); the last heartbeat
+    pins the death instant + the memory/PSI pressure then, separating an OOM (pressure
+    climbing) from a clean close. When the lease is NOT down (a feature flaked on a
+    live container) heartbeats are just liveness, not a death — return None so we
+    never mislabel a healthy-lease failure as a kill. Also None when uninstrumented.
+    """
+    # Token membership (not substring) so an unrelated line mentioning the marker in
+    # prose can't false-match; the log line is "[pod] PROBE-HB …" so the marker is its
+    # own whitespace-delimited token.
+    dying_idx = max(
+        (i for i, ln in enumerate(log_lines) if "PROBE-DYING" in ln.split()), default=-1
+    )
+    hb_idx = max((i for i, ln in enumerate(log_lines) if "PROBE-HB" in ln.split()), default=-1)
+    # A dying line AFTER the last heartbeat = a termination signal was the final thing
+    # the probe emitted (a stale one before newer heartbeats would be a restart).
+    if dying_idx > hb_idx:
+        return f"death-cause: GRACEFUL termination — {log_lines[dying_idx].strip()}"
+    if lease_down and hb_idx >= 0:
+        return (
+            "death-cause: NO termination signal (hard kill / OOM / eviction) — "
+            f"last heartbeat: {log_lines[hb_idx].strip()}"
+        )
+    return None
+
+
 def _capture_diagnostics(dseq: str, reason: str) -> None:
     """On a failure, dump the provider's lease status + kube events + container
     logs, so an INTERMITTENT problem (e.g. an occasional 'lease never ready')
@@ -551,6 +632,7 @@ def _capture_diagnostics(dseq: str, reason: str) -> None:
     Insufficient cpu/memory, ImagePullBackOff, OOMKilled, …). Best-effort: never
     raises, and bounded by each stream's --duration."""
     print(f"  {YELLOW}── diagnostics: {reason} (dseq {dseq}) ──{RESET}")
+    avail: tuple[int, int] | None = None
     try:
         st = _status_json(dseq)
         avail = _service_availability(dseq)
@@ -558,14 +640,21 @@ def _capture_diagnostics(dseq: str, reason: str) -> None:
         print(f"    lease status={state} availability={avail}")
     except Exception as e:  # noqa: BLE001 — diagnostics must never break the run
         print(f"    status capture failed: {type(e).__name__}: {e}")
+    log_lines: list[str] = []
     for kind, dur in (("events", 12), ("logs", 8)):
         try:
             r = _run(
                 f"uv run just-akash {kind} --dseq {q(dseq)} --duration {dur}", timeout=dur + 25
             )
             lines = [ln for ln in (r.stdout or "").splitlines() if ln.strip()]
-            print(f"    --- {kind} ({len(lines)} line(s)) ---")
-            for ln in lines[:15]:
+            if kind == "logs":
+                log_lines = lines
+            # Show the TAIL, not the head: the death signal (PROBE-DYING), the most
+            # recent heartbeats, and the terminating kube events (Killing/OOMKilled)
+            # all live at the END of the stream -- the head is just startup noise.
+            trunc = f" (last 20 of {len(lines)})" if len(lines) > 20 else ""
+            print(f"    --- {kind} ({len(lines)} line(s)){trunc} ---")
+            for ln in lines[-20:]:
                 print(f"      {ln}")
             # Surface a stream failure (non-zero exit / stderr) in ALL cases, even
             # when it also produced some stdout — a partial/errored stream is
@@ -578,6 +667,21 @@ def _capture_diagnostics(dseq: str, reason: str) -> None:
                 print(f"      (no {kind} returned — nothing to show)")
         except Exception as e:  # noqa: BLE001
             print(f"    {kind} capture failed: {type(e).__name__}: {e}")
+    # Is the lease actually down? Trust the availability check (0 serving replicas)
+    # as the primary, reason-independent signal, so a real lease-down that surfaced
+    # first as a feature failure (reason "status check failed", not "lease …") is
+    # still classified — falling back to the reason string only when availability is
+    # unknown (None, e.g. lazily-unreported). Diagnostic only; the raw events tail
+    # still shows an OOMKilled/Killing event even if this stays silent.
+    # Classify a death only when the lease is terminally down via a PROVIDER-fulfillment
+    # state (_LEASE_DOWN_STATES = failed/closed) — not insufficient_funds (a funding
+    # close, not a provider kill). Fall back to the reason string ("lease never became
+    # ready") only when the on-chain state is unreadable. Diagnostic only; the events
+    # tail still shows OOMKilled/Killing even when this stays silent.
+    lease_down = _dead_state(dseq) in _LEASE_DOWN_STATES or "lease" in reason.lower()
+    cause = _death_cause(log_lines, lease_down=lease_down)
+    if cause:
+        print(f"    {YELLOW}{cause}{RESET}")
 
 
 def _provider_room(provider: str) -> tuple[bool, str]:
