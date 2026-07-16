@@ -510,6 +510,30 @@ class TestUpdateDiagnostics:
         by = {r["feature"]: r for r in recs}
         assert "diag" not in by["update"]
 
+    def test_provider_records_frame_shape_rides_exec_record(self):
+        """frame_shape rides the exec record (pass or fail) and nowhere else."""
+        results = {"exec": "PASS", "status": "PASS"}
+        recs = sp._provider_records("prov", "123", results, {}, frame_shape="stdout,result")
+        by = {r["feature"]: r for r in recs}
+        assert by["exec"]["frame_shape"] == "stdout,result"
+        assert "frame_shape" not in by["status"]  # never on a non-exec feature
+
+    def test_provider_records_omits_frame_shape_when_absent(self):
+        recs = sp._provider_records("prov", "123", {"exec": "PASS"}, {})
+        assert "frame_shape" not in {r["feature"]: r for r in recs}["exec"]
+
+    def test_frame_shape_parses_trace_line(self):
+        line = (
+            "[lease-shell] FRAME-TRACE shape=[result] stdout_bytes=0 "
+            "recovered=0 t_result=0.042s frames=[(102, 16, 0.042)]"
+        )
+        assert sp._frame_trace_line("noise\n" + line + "\nmore") == line
+        assert sp._frame_shape(line) == "result"
+        assert sp._frame_shape(None) is None
+        assert sp._frame_trace_line("no trace here") is None
+        # a line that merely CONTAINS the token but lacks the stable prefix must NOT match
+        assert sp._frame_trace_line("a wrapper mentions FRAME-TRACE loosely") is None
+
     # --- readiness + ingress timeout diagnostics (Phase 1b) ---
 
     def test_availability_ready_true(self):

@@ -527,18 +527,31 @@ class LeaseShellTransport(Transport):
         # firing and being caught. Reported on exit so the race stays observable even
         # though the user-facing symptom (empty stdout) is now fixed.
         recovered = 0
+        # Opt-in per-frame trace (env JUST_AKASH_TRACE_FRAMES). Records (code, len,
+        # rel_time) per received frame so a rare empty-stdout exec can be shown to be a
+        # genuine upstream DROP (no stdout(100) frame at all) rather than a drained
+        # reorder. The list is allocated only when the flag is set, and only plain
+        # appends happen in the recv loop -- the human-readable line is formatted after
+        # the loop returns, so the instrumentation cannot perturb the teardown-race
+        # timing it measures (the residual drop is an upstream event that happens before
+        # any client code runs).
+        _trace: list[tuple[int, int, float]] | None = (
+            [] if os.environ.get("JUST_AKASH_TRACE_FRAMES") not in (None, "", "0") else None
+        )
+        _t0 = time.monotonic()
+        t_result: float | None = None
         while True:
             if drain_deadline is not None:
                 remaining = drain_deadline - time.monotonic()
                 if remaining <= 0:
                     # Whole grace budget spent -- stop draining and return.
-                    self._report_race_recovery(recovered)
+                    self._report_exec_trace(recovered, _trace, t_result)
                     return pending_exit
                 timeout = min(self._config.result_grace_s, remaining)
             try:
                 frame = self._recv_proxy_message(ws, timeout=timeout)
             except ConnectionClosedOK:
-                self._report_race_recovery(recovered)
+                self._report_exec_trace(recovered, _trace, t_result)
                 return pending_exit if pending_exit is not None else exit_code
             except ConnectionClosedError as exc:
                 if _is_auth_expiry(exc):
@@ -548,7 +561,7 @@ class LeaseShellTransport(Transport):
                 # After the exit code is in hand, a silent ``result_grace_s`` window
                 # just means no trailing stdout frame is coming -- return normally.
                 if pending_exit is not None:
-                    self._report_race_recovery(recovered)
+                    self._report_exec_trace(recovered, _trace, t_result)
                     return pending_exit
                 # Before completion, silence means the command hung: surface it,
                 # rather than blocking in recv() until some outer timeout kills us
@@ -561,6 +574,10 @@ class LeaseShellTransport(Transport):
                 ) from exc
             if frame is None:
                 continue
+            if _trace is not None and len(frame) >= 1:
+                _trace.append((frame[0], len(frame) - 1, round(time.monotonic() - _t0, 4)))
+                if frame[0] == _FRAME_RESULT and t_result is None:
+                    t_result = round(time.monotonic() - _t0, 4)
             # A stdout frame arriving after the exit code IS the issue-#12 race being
             # caught -- count it so the drain that saved us stays visible in the logs.
             if pending_exit is not None and len(frame) >= 1 and frame[0] == _FRAME_STDOUT:
@@ -594,6 +611,44 @@ class LeaseShellTransport(Transport):
                 file=sys.stderr,
                 flush=True,
             )
+
+    def _report_exec_trace(
+        self,
+        recovered: int,
+        trace: list[tuple[int, int, float]] | None,
+        t_result: float | None,
+    ) -> None:
+        """Emit exec observability on exit -- one stderr source of truth.
+
+        With no trace flag set this is just the ``flaky-pass`` marker (unchanged). When
+        ``JUST_AKASH_TRACE_FRAMES`` is set it emits the full per-frame ``FRAME-TRACE``
+        instead (subsuming the flaky-pass line), recording the frame SHAPE, the drained
+        post-result stdout (``recovered``), and the time-to-result. This lets a rare
+        empty-stdout exec be classified from CI logs: ``shape=[result]`` with no
+        stdout(100) frame is a genuine upstream DROP (SPDY/CRI teardown), whereas a
+        stdout frame after the result is a reorder the drain already caught; ``t_result``
+        lets a ``[result]``-only trace be checked against whether the ``result_grace_s``
+        drain window (not a never-sent frame) was the binding constraint. Only frame
+        codes and lengths are recorded -- never payload bytes.
+        """
+        if trace is None:
+            self._report_race_recovery(recovered)
+            return
+        names = {
+            _FRAME_STDOUT: "stdout",
+            _FRAME_STDERR: "stderr",
+            _FRAME_RESULT: "result",
+            _FRAME_FAILURE: "failure",
+        }
+        shape = ",".join(names.get(c, str(c)) for c, _, _ in trace)
+        stdout_bytes = sum(ln for c, ln, _ in trace if c == _FRAME_STDOUT)
+        tr = f"{t_result:.3f}s" if t_result is not None else "none"
+        print(
+            f"[lease-shell] FRAME-TRACE shape=[{shape}] stdout_bytes={stdout_bytes} "
+            f"recovered={recovered} t_result={tr} frames={trace}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     def _exec_with_refresh(self, command: str) -> int:
         return self._exec_loop(self._build_provider_shell_url(command=command))

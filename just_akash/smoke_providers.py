@@ -311,6 +311,7 @@ def _provider_records(
     results: dict,
     latencies: dict,
     diagnostics: dict | None = None,
+    frame_shape: str | None = None,
 ) -> list[dict]:
     """One telemetry record per feature: outcome + how long it took (ms).
 
@@ -329,6 +330,9 @@ def _provider_records(
             "outcome": results.get(feat, "-"),
             "latency_ms": latencies.get(feat),
             "dseq": dseq,
+            # frame_shape rides on the exec record for EVERY exec (pass or fail) so the
+            # DROP-vs-drained-reorder rate is quantifiable over time (issue #3438).
+            **({"frame_shape": frame_shape} if feat == "exec" and frame_shape else {}),
             # diag is failure evidence — attach it only to a failing outcome (FAIL or
             # LEASE-DOWN), so a PASS/skip can never carry a stale/partial diag payload.
             **(
@@ -870,13 +874,62 @@ def _check_status(dseq: str) -> bool:
     return bool(_status_json(dseq).get("provider"))
 
 
+# exec frame-shape captured from the transport's FRAME-TRACE stderr line, keyed by
+# dseq, for telemetry enrichment (issue #3438: quantify a true DROP vs a drained
+# reorder over time without mining CI logs).
+_EXEC_FRAME_SHAPES: dict[str, str] = {}
+
+
+def _frame_trace_line(stderr: str) -> str | None:
+    """The transport's one-line FRAME-TRACE from captured stderr, if present.
+
+    Anchor on the stable ``[lease-shell] FRAME-TRACE`` prefix so unrelated stderr that
+    merely contains the token (a wrapper, a dependency, a future command) can't be
+    mistaken for the trace and fed to the shape parser.
+    """
+    for line in (stderr or "").splitlines():
+        if line.lstrip().startswith("[lease-shell] FRAME-TRACE"):
+            return line.strip()
+    return None
+
+
+def _frame_shape(trace_line: str | None) -> str | None:
+    """Ordered frame shape (e.g. 'stdout,result') parsed from a FRAME-TRACE line."""
+    if not trace_line:
+        return None
+    m = re.search(r"shape=\[([^\]]*)\]", trace_line)
+    return m.group(1) if m else None
+
+
 def _check_exec(dseq: str) -> bool:
     token = f"smoke-{dseq[-6:]}-ok"
+    # Default the shape to "unavailable" BEFORE running the subprocess, so an exec that
+    # dies via exception (e.g. subprocess.TimeoutExpired, which run_check catches and
+    # still records as an exec FAIL) keeps a frame_shape on its telemetry record. It is
+    # overwritten below with the real shape when a FRAME-TRACE is parsed. Recording a
+    # shape for EVERY exec that ran is the point (issue #3438 quantification); an absent
+    # field then unambiguously means the exec never ran (no-bid / never-ready).
+    _EXEC_FRAME_SHAPES[dseq] = "unavailable"
+    # JUST_AKASH_TRACE_FRAMES makes the transport emit a FRAME-TRACE line to stderr.
+    # Prefixing it into the shell command scopes it to THIS subprocess only -- an
+    # inherited env var would leak the trace into every other check that runs exec.
+    # On an empty-stdout FAIL the trace is the frame-level evidence for issue #3438
+    # (a genuine DROP shows shape=[result] with no stdout frame).
     r = _run(
-        f"uv run just-akash exec 'echo {token}' --dseq {q(dseq)} --transport lease-shell",
+        f"JUST_AKASH_TRACE_FRAMES=1 uv run just-akash exec 'echo {token}' "
+        f"--dseq {q(dseq)} --transport lease-shell",
         timeout=45,
     )
-    return r.returncode == 0 and token in (r.stdout or "")
+    ok = r.returncode == 0 and token in (r.stdout or "")
+    trace = _frame_trace_line(r.stderr or "")
+    shape = _frame_shape(trace)
+    if shape:
+        _EXEC_FRAME_SHAPES[dseq] = shape
+    if not ok and trace:
+        # Surface the frame evidence inline so it lands in the CI log at the failure
+        # point, next to the kube-event/log diagnostics captured by run_check.
+        print(f"    {YELLOW}exec {trace}{RESET}")
+    return ok
 
 
 def _inject_and_read(dseq: str, transport: str, key: str = "") -> bool:
@@ -1381,7 +1434,19 @@ def smoke_provider(provider: str, sdl_path: str, key: str, records: list | None 
         # finally runs in all cases), so a no-bid / never-ready / crashed provider
         # is still recorded with whatever was measured.
         if records is not None:
-            records.extend(_provider_records(provider, _dseq, results, latencies, diagnostics))
+            records.extend(
+                _provider_records(
+                    provider,
+                    _dseq,
+                    results,
+                    latencies,
+                    diagnostics,
+                    # pop (not get): telemetry emission is the sole consumer, so drop
+                    # the entry here to keep the process-global cache from growing and
+                    # to prevent any stale-state reuse if a dseq ever recurs.
+                    frame_shape=_EXEC_FRAME_SHAPES.pop(_dseq, None),
+                )
+            )
 
 
 def _print_matrix(rows: dict) -> None:
