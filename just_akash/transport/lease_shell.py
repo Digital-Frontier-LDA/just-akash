@@ -575,9 +575,13 @@ class LeaseShellTransport(Transport):
             if frame is None:
                 continue
             if _trace is not None and len(frame) >= 1:
-                _trace.append((frame[0], len(frame) - 1, round(time.monotonic() - _t0, 4)))
+                # One monotonic read per frame -- reused for both the tuple and
+                # t_result so the result frame's two timestamps can't disagree, and
+                # the recv hot path stays as light as possible.
+                rel = round(time.monotonic() - _t0, 4)
+                _trace.append((frame[0], len(frame) - 1, rel))
                 if frame[0] == _FRAME_RESULT and t_result is None:
-                    t_result = round(time.monotonic() - _t0, 4)
+                    t_result = rel
             # A stdout frame arriving after the exit code IS the issue-#12 race being
             # caught -- count it so the drain that saved us stays visible in the logs.
             if pending_exit is not None and len(frame) >= 1 and frame[0] == _FRAME_STDOUT:
