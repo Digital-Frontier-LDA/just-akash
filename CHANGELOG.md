@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.22.0] — 2026-07-16
+
+### Changed
+- **`LEASE-DOWN` is now non-gating fleet-wide — because it's *always* provider infra, never a just-akash bug.** New evidence overturned the earlier "LEASE-DOWN gates" call: after quarantining hgulk6, a run went red because **aaul** (previously 100%) lease-downed — telemetry shows LEASE-DOWN on *both* providers, so a lease dying after the bid is accepted is a **fleet-wide** provider-fulfillment phenomenon, not one bad provider. Since just-akash deployed correctly and the *provider's* lease died on-chain, gating on it just flakes CI on any provider hiccup. So a `LEASE-DOWN` no longer fails the run for **any** provider (it stays fully visible — matrix, a `[NON-GATING]` verdict line, and telemetry — nothing masked). A **tooling regression** (a feature broken on a *healthy* lease) still gates everywhere.
+  - **Safety valve (`_mass_lease_down`):** if ≥2 providers got a lease and **every** one of them LEASE-DOWNed in the *same* run, that's deterministic across the fleet — the tell-tale of a just-akash manifest/deploy bug (a malformed SDL every provider accepts then fails) rather than coincident hiccups — so it **re-gates** (exit 1, `mass_lease_down: true` in telemetry, a distinct verdict line). The ≥2 floor stops a single-provider run from degenerating back to "gate on any LEASE-DOWN". This is exactly the scenario that made CI flaky — an isolated aaul/hgulk6 lease death — now green, while a real manifest bug (all providers fail deterministically) still goes red.
+  - `SMOKE_QUARANTINE_PROVIDERS` is **kept** — universal LEASE-DOWN-non-gating doesn't subsume it: the quarantine tier still owns the *update-ingress-stall* demotion, whose `in_pod_marker`/`eventual` evidence is less unambiguous than a terminal on-chain state and rightly stays opt-in. (Design: full 3-model quorum, unanimous — opencode-1 caught the ≥2-provider guard + the deterministic-manifest-bug path.)
+- Tests: 1019 passing (+6) — a single/partial-fleet LEASE-DOWN is non-gating (even unquarantined), a fleet-wide simultaneous LEASE-DOWN gates, the ≥2 floor, and NO-BID providers don't count toward "all".
+
+---
+
 ## [1.21.0] — 2026-07-16
 
 ### Added
