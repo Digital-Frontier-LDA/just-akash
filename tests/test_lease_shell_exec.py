@@ -1309,6 +1309,51 @@ class TestColdStdoutRace:
         assert b"normal-output" in out
         assert "flaky-pass" not in capsys.readouterr().err
 
+    def test_frame_trace_emitted_when_env_set(self, capsys, monkeypatch):
+        """With JUST_AKASH_TRACE_FRAMES set, a FRAME-TRACE line records the shape."""
+        monkeypatch.setenv("JUST_AKASH_TRACE_FRAMES", "1")
+        frames = [
+            bytes([100]) + b"hello",
+            bytes([102]) + json.dumps({"exit_code": 0}).encode(),
+        ]
+        self._pump(FakeWebSocket(frames))
+        err = capsys.readouterr().err
+        assert "FRAME-TRACE" in err
+        assert "shape=[stdout,result]" in err
+        assert "flaky-pass" not in err  # the trace subsumes the flaky-pass line
+
+    def test_frame_trace_shows_drop_shape(self, capsys, monkeypatch):
+        """A result frame with NO preceding stdout is the DROP signature (issue #3438)."""
+        monkeypatch.setenv("JUST_AKASH_TRACE_FRAMES", "1")
+        frames = [bytes([102]) + json.dumps({"exit_code": 0}).encode()]
+        self._pump(FakeWebSocket(frames))
+        err = capsys.readouterr().err
+        assert "shape=[result]" in err
+        assert "stdout_bytes=0" in err
+
+    def test_frame_trace_subsumes_flaky_pass_on_recovered(self, capsys, monkeypatch):
+        """A drained reorder rides the trace line (recovered=N), not a separate marker."""
+        monkeypatch.setenv("JUST_AKASH_TRACE_FRAMES", "1")
+        frames = [
+            bytes([102]) + json.dumps({"exit_code": 0}).encode(),
+            bytes([100]) + b"late",  # 4 bytes recovered after the result
+        ]
+        self._pump(FakeWebSocket(frames))
+        err = capsys.readouterr().err
+        assert "FRAME-TRACE" in err
+        assert "recovered=4" in err
+        assert "flaky-pass" not in err
+
+    def test_no_frame_trace_without_env(self, capsys, monkeypatch):
+        """Default (flag unset): no FRAME-TRACE line -- behaviour is unchanged."""
+        monkeypatch.delenv("JUST_AKASH_TRACE_FRAMES", raising=False)
+        frames = [
+            bytes([100]) + b"hi",
+            bytes([102]) + json.dumps({"exit_code": 0}).encode(),
+        ]
+        self._pump(FakeWebSocket(frames))
+        assert "FRAME-TRACE" not in capsys.readouterr().err
+
     def test_grace_timeout_after_result_returns_cleanly(self):
         """A silent grace window after the exit code returns it -- not a hang error."""
         ws = MagicMock()
