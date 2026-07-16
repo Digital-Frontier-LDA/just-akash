@@ -1495,3 +1495,58 @@ class TestQuarantineMainGate:
         out = capsys.readouterr().out
         assert code == 1  # RED — a real tooling bug on a quarantined provider still gates
         assert "SMOKE TEST FAILED" in out
+
+    def _run_main_rows(self, provider_rows, quarantine=""):
+        """Drive main() with an explicit {provider: row} map and quarantine env."""
+
+        def fake_smoke(provider, sdl, key, records=None):
+            row = provider_rows[provider]
+            if records is not None:
+                for f in sp._TELEMETRY_FEATURES:
+                    records.append(
+                        {"provider": provider, "feature": f, "outcome": row.get(f, "-")}
+                    )
+            return row
+
+        argv = ["smoke"]
+        for p in provider_rows:
+            argv += ["--provider", p]
+        argv += ["--no-sweep"]
+        with (
+            patch.object(sp.sys, "argv", argv),
+            patch.dict(
+                "os.environ",
+                {"AKASH_API_KEY": "k", "SMOKE_QUARANTINE_PROVIDERS": quarantine},
+            ),
+            patch.object(sp, "smoke_provider", side_effect=fake_smoke),
+            patch.object(sp, "_generate_keypair", return_value="/tmp/smoke-k/id"),
+            patch.object(sp, "install_signal_cleanup"),
+            patch.object(sp.shutil, "rmtree"),
+        ):
+            return sp.main()
+
+    def test_main_green_on_single_lease_down_unquarantined(self, capsys):
+        """The exact scenario that flaked CI: aaul (unquarantined) lease-downs, z9nr
+        healthy → GREEN. LEASE-DOWN is provider infra, never gates a single provider."""
+        rows = {
+            "akash1aauldemo": {**dict.fromkeys(sp.FEATURES, sp.LEASE_DOWN), "deploy": "PASS"},
+            "akash1z9nrdemo": dict.fromkeys(sp.FEATURES, "PASS"),
+        }
+        code = self._run_main_rows(rows)  # no quarantine at all
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "SMOKE TEST PASSED" in out
+        assert "[NON-GATING]" in out  # shown, not masked
+        assert "SMOKE TEST FAILED" not in out
+
+    def test_main_red_on_mass_lease_down(self, capsys):
+        """Every provider LEASE-DOWNs in one run = deterministic = likely OUR manifest
+        bug → RED with the distinct mass-lease-down verdict line."""
+        rows = {
+            "akash1aauldemo": {**dict.fromkeys(sp.FEATURES, sp.LEASE_DOWN), "deploy": "PASS"},
+            "akash1z9nrdemo": {**dict.fromkeys(sp.FEATURES, sp.LEASE_DOWN), "deploy": "PASS"},
+        }
+        code = self._run_main_rows(rows)
+        out = capsys.readouterr().out
+        assert code == 1
+        assert "fleet-wide simultaneous LEASE-DOWN" in out

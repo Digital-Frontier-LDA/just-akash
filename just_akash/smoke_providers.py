@@ -282,10 +282,17 @@ def _gating_providers(rows: dict, records: list, quarantined: set) -> dict:
         if gating:
             out[provider] = gating
     # Safety valve: a simultaneous fleet-wide lease death is likely OUR manifest bug.
+    # MERGE the LEASE-DOWN features into any existing gating list (don't setdefault —
+    # a provider could already be gating on a tooling FAIL, and its LEASE-DOWN features
+    # must still be added, not dropped), preserving feature order.
     if _mass_lease_down(rows):
         for p, r in rows.items():
-            if r.get("deploy") == "PASS":
-                out.setdefault(p, [f for f in FEATURES if r.get(f) == LEASE_DOWN])
+            if r.get("deploy") != "PASS":
+                continue
+            existing = set(out.get(p, []))
+            merged = [f for f in FEATURES if f in existing or r.get(f) == LEASE_DOWN]
+            if merged:
+                out[p] = merged
     return out
 
 
