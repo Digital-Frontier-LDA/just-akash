@@ -634,7 +634,12 @@ class LeaseShellTransport(Transport):
         if trace is None:
             self._report_race_recovery(recovered)
             return
-        names = {100: "stdout", 101: "stderr", 102: "result", 103: "failure"}
+        names = {
+            _FRAME_STDOUT: "stdout",
+            _FRAME_STDERR: "stderr",
+            _FRAME_RESULT: "result",
+            _FRAME_FAILURE: "failure",
+        }
         shape = ",".join(names.get(c, str(c)) for c, _, _ in trace)
         stdout_bytes = sum(ln for c, ln, _ in trace if c == _FRAME_STDOUT)
         tr = f"{t_result:.3f}s" if t_result is not None else "none"

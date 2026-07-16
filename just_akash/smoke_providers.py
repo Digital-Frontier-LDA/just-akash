@@ -910,9 +910,11 @@ def _check_exec(dseq: str) -> bool:
     )
     ok = r.returncode == 0 and token in (r.stdout or "")
     trace = _frame_trace_line(r.stderr or "")
-    shape = _frame_shape(trace)
-    if shape:
-        _EXEC_FRAME_SHAPES[dseq] = shape
+    # Record a shape for EVERY exec that ran (issue #3438 quantification). Fall back to
+    # "unavailable" when the transport emitted no parseable FRAME-TRACE, so the field is
+    # always present on an exec record -- absence then unambiguously means the exec
+    # never ran for that record (no-bid / never-ready), not a lost trace.
+    _EXEC_FRAME_SHAPES[dseq] = _frame_shape(trace) or "unavailable"
     if not ok and trace:
         # Surface the frame evidence inline so it lands in the CI log at the failure
         # point, next to the kube-event/log diagnostics captured by run_check.
@@ -1429,7 +1431,10 @@ def smoke_provider(provider: str, sdl_path: str, key: str, records: list | None 
                     results,
                     latencies,
                     diagnostics,
-                    frame_shape=_EXEC_FRAME_SHAPES.get(_dseq),
+                    # pop (not get): telemetry emission is the sole consumer, so drop
+                    # the entry here to keep the process-global cache from growing and
+                    # to prevent any stale-state reuse if a dseq ever recurs.
+                    frame_shape=_EXEC_FRAME_SHAPES.pop(_dseq, None),
                 )
             )
 
