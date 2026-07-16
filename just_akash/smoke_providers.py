@@ -164,6 +164,7 @@ services:
         if [ -n "$BEACON_URL" ]; then apk add --no-cache curl >/dev/null 2>&1 || true; fi
         beacon() {
           [ -z "$BEACON_URL" ] && return 0
+          command -v curl >/dev/null 2>&1 || return 0
           curl -sf -m 3 -o /dev/null --data-urlencode "probe=$1" "$BEACON_URL" || true
         }
         die() {
