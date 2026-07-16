@@ -531,6 +531,8 @@ class TestUpdateDiagnostics:
         assert sp._frame_shape(line) == "result"
         assert sp._frame_shape(None) is None
         assert sp._frame_trace_line("no trace here") is None
+        # a line that merely CONTAINS the token but lacks the stable prefix must NOT match
+        assert sp._frame_trace_line("a wrapper mentions FRAME-TRACE loosely") is None
 
     # --- readiness + ingress timeout diagnostics (Phase 1b) ---
 

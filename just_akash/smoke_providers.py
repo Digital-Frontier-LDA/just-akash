@@ -881,9 +881,14 @@ _EXEC_FRAME_SHAPES: dict[str, str] = {}
 
 
 def _frame_trace_line(stderr: str) -> str | None:
-    """The transport's one-line FRAME-TRACE from captured stderr, if present."""
+    """The transport's one-line FRAME-TRACE from captured stderr, if present.
+
+    Anchor on the stable ``[lease-shell] FRAME-TRACE`` prefix so unrelated stderr that
+    merely contains the token (a wrapper, a dependency, a future command) can't be
+    mistaken for the trace and fed to the shape parser.
+    """
     for line in (stderr or "").splitlines():
-        if "FRAME-TRACE" in line:
+        if line.lstrip().startswith("[lease-shell] FRAME-TRACE"):
             return line.strip()
     return None
 
@@ -898,6 +903,13 @@ def _frame_shape(trace_line: str | None) -> str | None:
 
 def _check_exec(dseq: str) -> bool:
     token = f"smoke-{dseq[-6:]}-ok"
+    # Default the shape to "unavailable" BEFORE running the subprocess, so an exec that
+    # dies via exception (e.g. subprocess.TimeoutExpired, which run_check catches and
+    # still records as an exec FAIL) keeps a frame_shape on its telemetry record. It is
+    # overwritten below with the real shape when a FRAME-TRACE is parsed. Recording a
+    # shape for EVERY exec that ran is the point (issue #3438 quantification); an absent
+    # field then unambiguously means the exec never ran (no-bid / never-ready).
+    _EXEC_FRAME_SHAPES[dseq] = "unavailable"
     # JUST_AKASH_TRACE_FRAMES makes the transport emit a FRAME-TRACE line to stderr.
     # Prefixing it into the shell command scopes it to THIS subprocess only -- an
     # inherited env var would leak the trace into every other check that runs exec.
@@ -910,11 +922,9 @@ def _check_exec(dseq: str) -> bool:
     )
     ok = r.returncode == 0 and token in (r.stdout or "")
     trace = _frame_trace_line(r.stderr or "")
-    # Record a shape for EVERY exec that ran (issue #3438 quantification). Fall back to
-    # "unavailable" when the transport emitted no parseable FRAME-TRACE, so the field is
-    # always present on an exec record -- absence then unambiguously means the exec
-    # never ran for that record (no-bid / never-ready), not a lost trace.
-    _EXEC_FRAME_SHAPES[dseq] = _frame_shape(trace) or "unavailable"
+    shape = _frame_shape(trace)
+    if shape:
+        _EXEC_FRAME_SHAPES[dseq] = shape
     if not ok and trace:
         # Surface the frame evidence inline so it lands in the CI log at the failure
         # point, next to the kube-event/log diagnostics captured by run_check.
