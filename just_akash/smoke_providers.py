@@ -241,13 +241,29 @@ def _is_reliability_failure(feature: str, outcome: str, diag: dict | None) -> bo
     return False
 
 
+def _mass_lease_down(rows: dict) -> bool:
+    """True when EVERY provider that got a lease (deploy PASS) LEASE-DOWNed in this
+    run AND at least 2 did. A LEASE-DOWN is normally independent per-provider infra,
+    but a fleet-wide SIMULTANEOUS one is deterministic — the tell-tale of a just-akash
+    manifest/deploy bug (a malformed SDL every provider accepts then fails) rather than
+    coincident hiccups. The >=2 floor stops a single-provider run from degenerating to
+    'gate on any LEASE-DOWN', which is the exact flakiness we're removing."""
+    leased = [p for p, r in rows.items() if r.get("deploy") == "PASS"]
+    if len(leased) < 2:
+        return False
+    return all(any(rows[p].get(f) == LEASE_DOWN for f in FEATURES) for p in leased)
+
+
 def _gating_providers(rows: dict, records: list, quarantined: set) -> dict:
     """Providers whose failures GATE the run → ``{provider: [gating features]}``.
 
-    A quarantined provider's PROVIDER-RELIABILITY failures (LEASE-DOWN, a proven
-    ingress-routing stall — classified from the telemetry ``diag``) are demoted, so
-    they don't gate; its TOOLING regressions (a feature broken on a healthy lease)
-    still gate, as do all failures on a non-quarantined provider."""
+    LEASE-DOWN is a fleet-wide PROVIDER-INFRA outcome (the provider accepted the bid
+    then the lease died on-chain) — never a just-akash tooling bug — so it is
+    NON-GATING for every provider, and stays visible in the matrix + telemetry. The
+    one exception is the mass-lease-down safety valve (see ``_mass_lease_down``): a
+    simultaneous fleet-wide lease death is re-gated as a likely just-akash manifest
+    bug. A TOOLING regression (a feature broken on a healthy lease) always gates; a
+    quarantined provider's proven update-ingress stall is additionally demoted."""
     diag_by = {(r.get("provider"), r.get("feature")): r.get("diag") for r in records}
     out: dict = {}
     for provider, row in rows.items():
@@ -256,13 +272,27 @@ def _gating_providers(rows: dict, records: list, quarantined: set) -> dict:
             v = row.get(f)
             if v not in _FAILING_OUTCOMES:
                 continue
+            if v == LEASE_DOWN:
+                continue  # provider infra, non-gating (mass check below re-gates a fleet-wide one)
             if provider in quarantined and _is_reliability_failure(
                 f, v, diag_by.get((provider, f))
             ):
-                continue  # demoted: a quarantined provider's reliability failure
+                continue  # a quarantined provider's proven update-ingress stall
             gating.append(f)
         if gating:
             out[provider] = gating
+    # Safety valve: a simultaneous fleet-wide lease death is likely OUR manifest bug.
+    # MERGE the LEASE-DOWN features into any existing gating list (don't setdefault —
+    # a provider could already be gating on a tooling FAIL, and its LEASE-DOWN features
+    # must still be added, not dropped), preserving feature order.
+    if _mass_lease_down(rows):
+        for p, r in rows.items():
+            if r.get("deploy") != "PASS":
+                continue
+            existing = set(out.get(p, []))
+            merged = [f for f in FEATURES if f in existing or r.get(f) == LEASE_DOWN]
+            if merged:
+                out[p] = merged
     return out
 
 
@@ -1508,11 +1538,14 @@ def main() -> int:
         # Remove the ephemeral keypair — the unencrypted private key must not be
         # left behind in the temp dir after the run.
         shutil.rmtree(os.path.dirname(key_path), ignore_errors=True)
-        # Tag a quarantined provider's rows so the telemetry/SLO report can track its
-        # reliability trend (and flag when it recovers → drop from the quarantine set).
+        # Tag telemetry so the SLO report can track reliability: quarantined rows, and
+        # a fleet-wide simultaneous lease death (the mass-lease-down manifest-bug tell).
+        mass_ld = _mass_lease_down(rows)
         for rec in records:
             if rec.get("provider") in quarantined:
                 rec["quarantined"] = True
+            if mass_ld and rec.get("outcome") == LEASE_DOWN:
+                rec["mass_lease_down"] = True
         if args.telemetry_file and records:
             _write_telemetry(args.telemetry_file, run_ts, _pkg_version(), records)
 
@@ -1525,29 +1558,32 @@ def main() -> int:
         print(f"{YELLOW}SMOKE TEST SKIPPED{RESET}: insufficient Console credit to deploy probes.")
         return 0
 
-    # A provider fails the smoke test if any testable feature FAILs (or LEASE-DOWNs).
-    # NO-BID / NO-ROOM / NO-CREDIT are pre-commitment skips, never failures. For a
-    # QUARANTINED provider, PROVIDER-RELIABILITY failures (LEASE-DOWN, a proven ingress
-    # stall) are demoted — shown + recorded but non-gating — while a TOOLING regression
-    # (a feature broken on a healthy lease) still gates.
+    # The gate trips only on a TOOLING regression (a feature broken on a healthy lease)
+    # or the mass-lease-down safety valve. LEASE-DOWN is fleet-wide provider infra and
+    # is NON-GATING (a quarantined provider's proven update stall is demoted too) — but
+    # stays visible below + in telemetry. NO-BID / NO-ROOM / NO-CREDIT are skips.
     failed = _gating_providers(rows, records, quarantined)
-    # Show any quarantined provider whose reliability failures were demoted, so a
-    # non-gating red row is self-documenting rather than a silent mystery.
-    for p in sorted(quarantined):
+    mass_ld = _mass_lease_down(rows)
+    # Self-document every demoted (non-gating) reliability failure so a red matrix row
+    # that didn't fail the run is never a silent mystery.
+    for p in sorted(rows):
         r = rows.get(p, {})
         gating = failed.get(p, [])
         demoted = [f for f in FEATURES if r.get(f) in _FAILING_OUTCOMES and f not in gating]
         if demoted:
             print(
-                f"{YELLOW}[QUARANTINED]{RESET} {p}: {', '.join(demoted)} — "
-                "provider-reliability failure, tracked but NOT gating"
+                f"{YELLOW}[NON-GATING]{RESET} {p}: {', '.join(demoted)} — provider-"
+                "reliability failure (lease-down / quarantined stall), tracked but NOT gating"
             )
     if failed:
-        print(f"{RED}SMOKE TEST FAILED{RESET}: {len(failed)} provider(s) with broken features:")
+        reason = (
+            "fleet-wide simultaneous LEASE-DOWN — likely a just-akash manifest/deploy bug"
+            if mass_ld
+            else "broken features"
+        )
+        print(f"{RED}SMOKE TEST FAILED{RESET}: {len(failed)} provider(s) — {reason}:")
         for p, broken in failed.items():
-            down = any(rows[p].get(f) == LEASE_DOWN for f in broken)
-            tag = " [LEASE-DOWN: provider accepted the bid then the lease died]" if down else ""
-            print(f"  {p}: {', '.join(broken)}{tag}")
+            print(f"  {p}: {', '.join(broken)}")
         return 1
     print(f"{GREEN}SMOKE TEST PASSED{RESET}: all testable providers support every feature.")
     return 0
