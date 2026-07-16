@@ -117,6 +117,7 @@ services:
     env:
       - SSH_PUBKEY_B64=PLACEHOLDER_SSH_PUBKEY_B64
       - SMOKE_MARKER=__SMOKE_MARKER__
+      - BEACON_URL=__BEACON_URL__
     expose:
       - port: 22
         as: 22
@@ -201,7 +202,14 @@ profiles:
 deployment:
   probe:
     akash: { profile: probe, count: 1 }
-""".replace("__SMOKE_MARKER__", INGRESS_BASELINE)
+""".replace("__SMOKE_MARKER__", INGRESS_BASELINE).replace(
+    # The death-cause beacon ships DARK: BEACON_URL reaches the container only when
+    # the operator sets SMOKE_BEACON_URL in the smoke's environment (a collector on
+    # their infra). Empty by default -> the in-probe `[ -z "$BEACON_URL" ]` guard
+    # no-ops it, so nothing is POSTed and no curl is installed.
+    "__BEACON_URL__",
+    os.environ.get("SMOKE_BEACON_URL", ""),
+)
 
 # Ordered feature columns for the report.
 FEATURES = [
@@ -656,7 +664,12 @@ def _capture_diagnostics(dseq: str, reason: str) -> None:
     # still classified — falling back to the reason string only when availability is
     # unknown (None, e.g. lazily-unreported). Diagnostic only; the raw events tail
     # still shows an OOMKilled/Killing event even if this stays silent.
-    lease_down = avail[0] == 0 if isinstance(avail, tuple) else "lease" in reason.lower()
+    # Classify a death only when the lease is TERMINALLY down on-chain (_dead_state):
+    # avail==0 alone false-positives on a live-but-not-yet-serving lease (readiness
+    # lag / transient reporting). Fall back to the reason string ("lease never became
+    # ready") when the on-chain state is unreadable. Diagnostic only; the events tail
+    # still shows an OOMKilled/Killing event even when this stays silent.
+    lease_down = _dead_state(dseq) is not None or "lease" in reason.lower()
     cause = _death_cause(log_lines, lease_down=lease_down)
     if cause:
         print(f"    {YELLOW}{cause}{RESET}")
