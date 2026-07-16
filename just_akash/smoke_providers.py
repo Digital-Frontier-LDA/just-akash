@@ -615,6 +615,7 @@ def _capture_diagnostics(dseq: str, reason: str) -> None:
     Insufficient cpu/memory, ImagePullBackOff, OOMKilled, …). Best-effort: never
     raises, and bounded by each stream's --duration."""
     print(f"  {YELLOW}── diagnostics: {reason} (dseq {dseq}) ──{RESET}")
+    avail: tuple[int, int] | None = None
     try:
         st = _status_json(dseq)
         avail = _service_availability(dseq)
@@ -649,9 +650,17 @@ def _capture_diagnostics(dseq: str, reason: str) -> None:
                 print(f"      (no {kind} returned — nothing to show)")
         except Exception as e:  # noqa: BLE001
             print(f"    {kind} capture failed: {type(e).__name__}: {e}")
-    # "lease" in the reason marks a lease-down / never-ready capture (vs a feature
-    # failure on a live container) — only then is a missing termination signal a kill.
-    cause = _death_cause(log_lines, lease_down="lease" in reason.lower())
+    # Is the lease actually down? Trust the availability check (0 serving replicas)
+    # as the primary, reason-independent signal, so a real lease-down that surfaced
+    # first as a feature failure (reason "status check failed", not "lease …") is
+    # still classified — falling back to the reason string only when availability is
+    # unknown (None, e.g. lazily-unreported). Diagnostic only; the raw events tail
+    # still shows an OOMKilled/Killing event even if this stays silent.
+    if isinstance(avail, tuple):
+        lease_down = avail[0] == 0
+    else:
+        lease_down = "lease" in reason.lower()
+    cause = _death_cause(log_lines, lease_down=lease_down)
     if cause:
         print(f"    {YELLOW}{cause}{RESET}")
 
