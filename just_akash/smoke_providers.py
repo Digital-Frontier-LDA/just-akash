@@ -593,8 +593,9 @@ def sweep_orphan_probes(
 def _death_cause(log_lines: list[str], lease_down: bool) -> str | None:
     """Summarize HOW the container died, from instrumented-probe logs (issue #646).
 
-    A ``PROBE-DYING`` line as the probe's LAST output means it caught a termination
-    signal — the provider deleted the pod, i.e. a graceful, deliberate close. If the
+    A ``PROBE-DYING`` line after the probe's last heartbeat (i.e. not followed by a
+    restart's newer heartbeats) means it caught a termination signal — the provider
+    deleted the pod, i.e. a graceful, deliberate close. If the
     lease is down but the probe only left heartbeats (no dying line), it vanished
     without a signal: a hard kill (OOM / eviction / node loss); the last heartbeat
     pins the death instant + the memory/PSI pressure then, separating an OOM (pressure
@@ -665,12 +666,13 @@ def _capture_diagnostics(dseq: str, reason: str) -> None:
     # still classified — falling back to the reason string only when availability is
     # unknown (None, e.g. lazily-unreported). Diagnostic only; the raw events tail
     # still shows an OOMKilled/Killing event even if this stays silent.
-    # Classify a death only when the lease is TERMINALLY down on-chain (_dead_state):
-    # avail==0 alone false-positives on a live-but-not-yet-serving lease (readiness
-    # lag / transient reporting). Fall back to the reason string ("lease never became
-    # ready") when the on-chain state is unreadable. Diagnostic only; the events tail
-    # still shows an OOMKilled/Killing event even when this stays silent.
-    lease_down = _dead_state(dseq) is not None or "lease" in reason.lower()
+    # Classify a death only when the lease is terminally down via a PROVIDER-fulfillment
+    # state (_LEASE_DOWN_STATES = failed/closed) — NOT insufficient_funds (a funding
+    # close, not a provider kill) which _dead_state also covers. avail==0 alone
+    # false-positives on a live-but-not-yet-serving lease (readiness lag). Fall back to
+    # the reason string ("lease never became ready") when the on-chain state is
+    # unreadable. Diagnostic only; the events tail still shows OOMKilled/Killing anyway.
+    lease_down = _dead_state(dseq) in _LEASE_DOWN_STATES or "lease" in reason.lower()
     cause = _death_cause(log_lines, lease_down=lease_down)
     if cause:
         print(f"    {YELLOW}{cause}{RESET}")
