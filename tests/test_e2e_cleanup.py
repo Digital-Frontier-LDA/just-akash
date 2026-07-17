@@ -1529,3 +1529,72 @@ class TestUnknownStateIsNotAClaimOfLife:
         result, out = self._run_audit('{"dseq": "12345"}', capsys)
         assert result is False
         assert "could not confirm" in out.lower()
+
+
+class TestAuditPollsBecauseCloseIsNotInstant:
+    """The per-deployment record is authoritative but NOT instantaneous: a close
+    takes ~6-12s to reflect, so a just-destroyed deployment keeps reading `active`.
+
+    Reading once and calling that "STILL ACTIVE" fails a perfectly clean destroy.
+    That is not hypothetical — it broke the lease-shell E2E on this branch:
+
+        [7/7] Cleanup: destroy DSEQ=1784294163119
+          PASS Deployment 1784294163119 closed (attempt 1)
+          FAIL Audit: deployment 1784294163119 STILL ACTIVE after destroy
+
+    So `active` inside the window means "not settled YET"; only `active` that
+    PERSISTS through the whole window is a real leak.
+    """
+
+    def test_active_then_closed_is_a_clean_destroy_not_a_leak(self):
+        """The exact E2E regression: destroy works, the close has not reflected yet."""
+        with (
+            patch("just_akash._e2e.subprocess.run") as mock_run,
+            patch("just_akash._e2e.time.sleep"),
+        ):
+            mock_run.side_effect = [
+                _completed(0, stdout="closed"),  # destroy
+                _completed(0, stdout='{"state": "active"}'),  # close not reflected yet
+                _completed(0, stdout='{"state": "active"}'),  # ...still lagging
+                _completed(0, stdout='{"state": "closed"}'),  # settles
+            ]
+            assert robust_destroy("1784294163119") is True
+
+    def test_persistently_active_is_still_reported_as_a_leak(self, capsys):
+        """The poll must not become a way to wish a real leak away."""
+        with (
+            patch("just_akash._e2e.subprocess.run") as mock_run,
+            patch("just_akash._e2e.time.sleep"),
+        ):
+            mock_run.side_effect = [_completed(0, stdout="closed")] + [
+                _completed(0, stdout='{"state": "active"}') for _ in range(8)
+            ]
+            assert robust_destroy("12345") is False
+            assert "STILL ACTIVE" in capsys.readouterr().out
+
+    def test_a_settled_read_returns_immediately_without_burning_the_window(self):
+        """The common case (already settled) must not pay the full poll."""
+        with (
+            patch("just_akash._e2e.subprocess.run") as mock_run,
+            patch("just_akash._e2e.time.sleep"),
+        ):
+            mock_run.side_effect = [
+                _completed(0, stdout="closed"),
+                _completed(0, stdout='{"state": "closed"}'),
+            ]
+            assert robust_destroy("12345") is True
+            assert mock_run.call_count == 2, "settled on the first probe = 1 destroy + 1 probe"
+
+    def test_blips_then_settled_still_passes(self):
+        """A transient API failure mid-poll must not end the window early."""
+        with (
+            patch("just_akash._e2e.subprocess.run") as mock_run,
+            patch("just_akash._e2e.time.sleep"),
+        ):
+            mock_run.side_effect = [
+                _completed(0, stdout="closed"),
+                _completed(1, stderr="503"),
+                _completed(0, stdout="not json at all"),
+                _completed(0, stdout='{"state": "closed"}'),
+            ]
+            assert robust_destroy("12345") is True

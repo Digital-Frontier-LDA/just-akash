@@ -166,11 +166,11 @@ _SETTLED_STATES = ("closed", "failed", "insufficient_funds", "insufficientfunds"
 _OPEN_STATES = ("active", "open")
 
 
-def _confirm_settled(dseq: str, *, attempts: int = 3) -> bool | None:
+def _confirm_settled(dseq: str, *, attempts: int = 8, interval_s: int = 3) -> bool | None:
     """Authoritative per-deployment read: is ``dseq`` settled (holding no escrow)?
 
-    Returns True (confirmed settled), False (confirmed still open), or None (could
-    not tell after ``attempts``).
+    Returns True (confirmed settled), False (still open at the end of the window), or
+    None (never got a readable answer).
 
     Deliberately NOT `just list`: the collection endpoint serves STALE state — it
     reported a deployment as active minutes after that deployment's own record read
@@ -179,24 +179,37 @@ def _confirm_settled(dseq: str, *, attempts: int = 3) -> bool | None:
     while its escrow is still open, which is a silent leak the audit exists to catch.
     Only the per-deployment record decides whether funds are held, so ask it.
 
-    Retries because the caller fails CLOSED on None: without retries a single
-    transient API blip would report a leak that isn't one.
+    POLLS, because the per-deployment record is authoritative but NOT instantaneous:
+    a close takes ~6-12s to reflect, so a just-destroyed deployment keeps reading
+    `active` for a while. Reading once and calling that "STILL ACTIVE" fails a
+    perfectly clean destroy — measured: it broke the lease-shell E2E, whose destroy
+    reported "closed (attempt 1)" and was then declared a leak 2s later. So `active`
+    inside the window means "not settled YET", not "still open"; only `active` that
+    PERSISTS through the whole window is a real leak.
+
+    Polling also covers transient blips, which matters because the caller fails
+    CLOSED: without it a single API hiccup would report a leak that isn't one.
     """
+    last_state = ""
     for attempt in range(1, attempts + 1):
         try:
-            r = _run(f"uv run just-akash status --dseq {shlex.quote(dseq)} --json", timeout=30)
+            cmd = f"uv run just-akash status --dseq {shlex.quote(str(dseq))} --json"
+            r = _run(cmd, timeout=30)
             if r.returncode == 0 and r.stdout:
                 state = str(json.loads(r.stdout).get("state", "")).strip().lower()
                 if state in _SETTLED_STATES:
                     return True
-                if state in _OPEN_STATES:
-                    return False
-                # An unrecognised state answers nothing — fall through to a retry and
-                # ultimately None, rather than assert either "settled" or "active".
+                # Anything else — `active` (not settled yet) or an unrecognised value
+                # (which is UNKNOWN, never proof of life) — keeps the poll going.
+                last_state = state
         except Exception:  # noqa: BLE001 — a probe failure must never raise from cleanup
             pass
         if attempt < attempts:
-            time.sleep(2)
+            time.sleep(interval_s)
+    # Window exhausted. Only a state we positively recognise as open lets us claim
+    # "STILL ACTIVE"; anything else is an honest "could not confirm".
+    if last_state in _OPEN_STATES:
+        return False
     return None
 
 
@@ -253,7 +266,7 @@ def robust_destroy(dseq: str, *, retries: int = 2, audit: bool = True) -> bool:
         return False
     _fail(
         f"Audit: could not confirm {dseq} is settled — treating as a possible leak. "
-        f"Verify with: uv run just-akash status --dseq {shlex.quote(dseq)} --json"
+        f"Verify with: uv run just-akash status --dseq {shlex.quote(str(dseq))} --json"
     )
     return False
 
