@@ -110,6 +110,9 @@ class TestBenchScript:
         assert bm._DISK_MB <= 256
         assert "--threads=1" in bm.BENCH_SH  # never peg all cores
         assert f"--memory-total-size={bm._MEM_MB}M" in bm.BENCH_SH
+        # Bind the caps to the actual script: the bounds above still pass if BENCH_SH
+        # later hardcodes a larger dd count than the constant. (CodeRabbit, PR #61.)
+        assert f"count={bm._DISK_MB}" in bm.BENCH_SH
 
     def test_emits_done_last_so_truncation_is_detectable(self):
         assert bm.BENCH_SH.strip().endswith("say done 1")
@@ -120,8 +123,10 @@ class TestBenchScript:
 
     def test_a_killed_probe_still_cleans_up_via_trap(self):
         """The explicit rm only runs on the happy path; a trap covers a mid-run kill
-        so no 256M artifact survives an interrupted probe. (CodeRabbit, PR #61.)"""
-        assert "trap " in bm.BENCH_SH and "EXIT" in bm.BENCH_SH
+        so no 256M artifact survives an interrupted probe. Check every signal, not
+        just EXIT, so an INT/TERM regression can't hide. (CodeRabbit, PR #61.)"""
+        assert "trap " in bm.BENCH_SH
+        assert all(sig in bm.BENCH_SH for sig in ("EXIT", "INT", "TERM"))
 
     def test_disk_paths_are_pid_unique(self):
         """PID-scoped paths so nothing collides even if the assumption of one probe
@@ -130,28 +135,20 @@ class TestBenchScript:
 
 
 class TestBenchmarkJsonTrustsLocalMetadata:
-    """The benchmark's --json output merges REMOTE probe output (results) with
-    LOCAL, trusted metadata (dseq/provider/complete). A hostile or buggy probe
-    emitting `BENCH-provider=` / `BENCH-dseq=` / `BENCH-complete=` must not be able
-    to shadow the values we actually know. (CodeRabbit, PR #61.)
+    """build_json_record merges REMOTE probe output (results) with LOCAL, trusted
+    metadata (dseq/provider/complete). A hostile or buggy probe emitting
+    `BENCH-provider=` / `BENCH-dseq=` / `BENCH-complete=` must not be able to shadow
+    the values we actually know. (CodeRabbit + Copilot, PR #61.)
     """
 
-    def test_dict_merge_lets_trusted_fields_win(self):
-        """Pins the semantics the cli output relies on: trusted keys spread LAST."""
+    def test_hostile_probe_keys_cannot_shadow_trusted_metadata(self):
         results = {"provider": "EVIL", "dseq": "0", "complete": True, "cpu_eps": "900"}
-        merged = {**results, "dseq": "1784", "provider": "akash1real", "complete": False}
-        assert merged["provider"] == "akash1real"
-        assert merged["dseq"] == "1784"
-        assert merged["complete"] is False
-        assert merged["cpu_eps"] == "900"  # genuine metrics still pass through
+        rec = bm.build_json_record("1784", "akash1real", results)
+        assert rec["provider"] == "akash1real"  # not EVIL
+        assert rec["dseq"] == "1784"  # not 0
+        assert rec["complete"] is False  # our is_complete(), not the probe's claim
+        assert rec["cpu_eps"] == "900"  # genuine metrics still pass through
 
-    def test_cli_source_spreads_results_before_the_trusted_keys(self):
-        """Regression guard: if someone reorders the json literal so `**results` comes
-        after the trusted keys, remote output could overwrite them again."""
-        import pathlib
-
-        src = pathlib.Path(bm.__file__).with_name("cli.py").read_text()
-        i_results = src.find("**results")
-        # the trusted-field block immediately follows **results in the json.dumps call
-        i_dseq = src.find('"dseq": dseq,\n                            "provider": provider')
-        assert 0 < i_results < i_dseq, "**results must be spread BEFORE the trusted fields"
+    def test_complete_reflects_the_done_marker_not_a_probe_claim(self):
+        assert bm.build_json_record("1", "p", {"done": "1"})["complete"] is True
+        assert bm.build_json_record("1", "p", {"cpu_eps": "900"})["complete"] is False

@@ -539,8 +539,14 @@ def main():
         import io
         import json as _json
 
-        from .api import AkashConsoleAPI
-        from .benchmark import BENCH_SH, format_results, is_complete, parse_results
+        from .api import AkashConsoleAPI, _extract_lease_provider
+        from .benchmark import (
+            BENCH_SH,
+            build_json_record,
+            format_results,
+            is_complete,
+            parse_results,
+        )
 
         try:
             client = AkashConsoleAPI(_require_api_key())
@@ -583,28 +589,13 @@ def main():
             finally:
                 sys.stdout = real_stdout
             results = parse_results(cap.getvalue().decode("utf-8", errors="replace"))
-            provider = ""
-            for lease in deployment.get("leases") or []:
-                if isinstance(lease, dict):
-                    lid = lease.get("id")
-                    if isinstance(lid, dict) and lid.get("provider"):
-                        provider = lid["provider"]
-                        break
+            # Reuse the shared, edge-case-tested lease-provider extractor rather than
+            # re-parsing the lease shape here (avoids drift on odd Console payloads).
+            provider = _extract_lease_provider(deployment) or ""
             if args.as_json:
-                # Trusted, deployment-derived fields go LAST so a hostile or buggy
-                # probe can't shadow them: results comes from remote BENCH- output, so
-                # a `BENCH-provider=` / `BENCH-dseq=` / `BENCH-complete=` line would
-                # otherwise overwrite the values we actually know.
-                print(
-                    _json.dumps(
-                        {
-                            **results,
-                            "dseq": dseq,
-                            "provider": provider,
-                            "complete": is_complete(results),
-                        }
-                    )
-                )
+                # build_json_record spreads the trusted fields last so a hostile probe
+                # can't shadow dseq/provider/complete (unit-tested in test_benchmark).
+                print(_json.dumps(build_json_record(dseq, provider, results)))
             else:
                 print(format_results(provider or f"dseq {dseq}", results))
             # A partial sample must not be graded as if it were a full one.

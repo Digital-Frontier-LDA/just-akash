@@ -146,6 +146,18 @@ def is_complete(results: dict[str, str]) -> bool:
     return results.get("done") == "1"
 
 
+def build_json_record(dseq: str, provider: str, results: dict[str, str]) -> dict:
+    """Merge the remote probe's metrics with locally-known, trusted metadata.
+
+    ``results`` comes from remote ``BENCH-`` output, so the trusted fields
+    (``dseq`` / ``provider`` / ``complete``) are spread LAST: a hostile or buggy
+    probe emitting ``BENCH-provider=`` / ``BENCH-dseq=`` / ``BENCH-complete=`` must
+    not be able to shadow the values we actually know. Extracted from the CLI so
+    this invariant is unit-testable without driving the whole deploy/exec flow.
+    """
+    return {**results, "dseq": dseq, "provider": provider, "complete": is_complete(results)}
+
+
 def format_results(provider: str, results: dict[str, str]) -> str:
     """A compact human-readable block, grouped by dimension."""
     if not results:
