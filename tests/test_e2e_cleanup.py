@@ -162,8 +162,10 @@ class TestRobustDestroy:
                 _completed(1, stderr="fail 1"),
                 _completed(1, stderr="fail 2"),
                 _completed(1, stderr="fail 3"),
-                # audit still runs after retries exhausted
-                _completed(0, stdout='{"state": "active"}'),
+                # audit still runs after retries exhausted; supply the full poll
+                # window so persistent-active is proven, not reached via a swallowed
+                # StopIteration from an exhausted mock.
+                *[_completed(0, stdout='{"state": "active"}') for _ in range(8)],
             ]
             assert robust_destroy("12345", retries=2) is False
 
@@ -1027,7 +1029,9 @@ class TestRobustDestroyAuditFalseTrustsDestroyResult:
         ):
             mock_run.side_effect = [
                 _completed(1, stderr="destroy failed"),  # 1 attempt (clamped)
-                _completed(0, stdout='{"state": "active"}'),  # audit: still here
+                # audit: still here through the whole poll window (supplied in full so
+                # the leak is proven, not reached via a swallowed StopIteration).
+                *[_completed(0, stdout='{"state": "active"}') for _ in range(8)],
             ]
             assert robust_destroy("12345", retries=-1, audit=True) is False, (
                 "When the destroy fails AND the audit shows the DSEQ is "
@@ -1415,13 +1419,16 @@ class TestAuditReadsTheAuthoritativeRecordNotTheList:
             assert robust_destroy("12345") is True
 
     def test_still_active_is_reported_as_a_leak(self):
+        # `active` must PERSIST through the whole poll window to count as a leak — a
+        # single read just means the close has not reflected yet. Supply the full
+        # window explicitly: relying on StopIteration from an exhausted mock (swallowed
+        # by _confirm_settled's except) would pass via an unintended path.
         with (
             patch("just_akash._e2e.subprocess.run") as mock_run,
             patch("just_akash._e2e.time.sleep"),
         ):
-            mock_run.side_effect = [
-                _completed(0, stdout="closed"),
-                _completed(0, stdout='{"state": "active"}'),
+            mock_run.side_effect = [_completed(0, stdout="closed")] + [
+                _completed(0, stdout='{"state": "active"}') for _ in range(8)
             ]
             assert robust_destroy("12345") is False
 

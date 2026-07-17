@@ -216,8 +216,12 @@ def _confirm_settled(dseq: str, *, attempts: int = 8, interval_s: int = 3) -> bo
 def robust_destroy(dseq: str, *, retries: int = 2, audit: bool = True) -> bool:
     """Destroy a deployment with retry-on-fail and post-destroy audit.
 
-    Returns True if the deployment is confirmed gone, False otherwise.  Safe to
-    call from a signal handler or a finally block — never raises.
+    Returns True if the deployment is confirmed gone, False otherwise. Safe to call
+    from a signal handler or a finally block: it swallows every ``Exception`` (a
+    failed destroy or audit becomes a logged False, never a raise). The one thing it
+    lets through is ``KeyboardInterrupt`` — a ``BaseException``, not an ``Exception``
+    — so a user Ctrl-C'ing out of cleanup is never trapped. "Never raises" means
+    never on a *program* error, not never on a deliberate interrupt.
     """
     if not dseq:
         return True
@@ -246,7 +250,7 @@ def robust_destroy(dseq: str, *, retries: int = 2, audit: bool = True) -> bool:
     # _confirm_settled). Fails closed: only a positive "settled" reading clears the
     # audit, because the whole point is to catch escrow we failed to release.
     #
-    # Wrapped because robust_destroy's contract is that it never raises: it runs from
+    # Wrapped because robust_destroy swallows every Exception: it runs from
     # a finally block and from the signal handler, so an exception escaping here
     # would abort cleanup — the exact failure the audit exists to prevent. Scope is
     # Exception, matching the destroy loop above: KeyboardInterrupt deliberately
