@@ -15,6 +15,11 @@ from just_akash.transport.lease_shell import (
     _is_auth_expiry,
     _is_auth_expiry_message,
 )
+from tests._creds import fake_api_key
+
+# One throwaway key for every config here — a call, not a literal, so detect-secrets
+# has nothing to anchor on and this file stays out of .secrets.baseline (issue #38).
+_KEY = fake_api_key()
 
 # --- FakeWebSocket helper ---
 
@@ -73,7 +78,7 @@ class TestJWTFetch:
         """Test _fetch_jwt() calls create_jwt and returns token string."""
         config = TransportConfig(
             dseq="123456",
-            api_key="test-key",
+            api_key=_KEY,
             deployment=DEPLOYMENT_FIXTURE,
         )
         transport = LeaseShellTransport(config)
@@ -92,7 +97,7 @@ class TestJWTFetch:
         """Test _fetch_jwt() uses default TTL of 3600."""
         config = TransportConfig(
             dseq="789",
-            api_key="key",
+            api_key=_KEY,
             deployment=DEPLOYMENT_FIXTURE,
         )
         transport = LeaseShellTransport(config)
@@ -110,7 +115,7 @@ class TestJWTFetch:
         """Test _fetch_jwt() propagates RuntimeError from create_jwt."""
         config = TransportConfig(
             dseq="bad",
-            api_key="key",
+            api_key=_KEY,
             deployment=DEPLOYMENT_FIXTURE,
         )
         transport = LeaseShellTransport(config)
@@ -133,7 +138,7 @@ class TestProviderInfoExtraction:
     def test_extract_provider_info_happy_path(self):
         config = TransportConfig(
             dseq="999",
-            api_key="key",
+            api_key=_KEY,
             deployment=DEPLOYMENT_FIXTURE,
             service_name="web",
         )
@@ -147,7 +152,7 @@ class TestProviderInfoExtraction:
     def test_extract_provider_info_https_preserved(self):
         config = TransportConfig(
             dseq="1",
-            api_key="k",
+            api_key=_KEY,
             deployment={
                 "leases": [
                     {
@@ -166,7 +171,7 @@ class TestProviderInfoExtraction:
     def test_extract_provider_info_http_preserved(self):
         config = TransportConfig(
             dseq="2",
-            api_key="k",
+            api_key=_KEY,
             deployment={
                 "leases": [
                     {
@@ -185,7 +190,7 @@ class TestProviderInfoExtraction:
     def test_extract_provider_info_no_leases(self):
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment={"leases": []},
         )
         transport = LeaseShellTransport(config)
@@ -196,7 +201,7 @@ class TestProviderInfoExtraction:
     def test_extract_provider_info_missing_hostUri(self):
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment={
                 "leases": [
                     {
@@ -214,7 +219,7 @@ class TestProviderInfoExtraction:
     def test_extract_provider_info_host_uri_snake_case_fallback(self):
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment={
                 "leases": [
                     {
@@ -233,7 +238,7 @@ class TestProviderInfoExtraction:
     def test_extract_provider_info_missing_service_name(self):
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment={
                 "leases": [
                     {
@@ -256,7 +261,7 @@ class TestProviderInfoExtraction:
         """Lease 'id' as non-dict must raise RuntimeError, not AttributeError."""
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment={
                 "leases": [
                     {
@@ -279,7 +284,7 @@ class TestProviderInfoExtraction:
         """
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment={
                 "leases": [
                     {
@@ -400,7 +405,7 @@ class TestInferService:
         """_infer_service() must return None when services is a list, not a dict."""
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment={
                 "leases": [
                     {
@@ -418,7 +423,7 @@ class TestInferService:
         """_infer_service() must return None when lease status is a string."""
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment={
                 "leases": [
                     {
@@ -438,7 +443,7 @@ class TestBuildProxyConnectMsg:
         """_build_proxy_connect_msg must produce valid JSON even if _provider_address is None."""
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment=DEPLOYMENT_FIXTURE,
         )
         transport = LeaseShellTransport(config)
@@ -454,7 +459,7 @@ class TestBuildProxyConnectMsg:
         """_build_proxy_connect_msg must produce valid JSON with empty string JWT."""
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment=DEPLOYMENT_FIXTURE,
         )
         transport = LeaseShellTransport(config)
@@ -469,7 +474,7 @@ class TestBuildProxyConnectMsg:
         """_build_proxy_connect_msg must handle stdin_data containing null bytes."""
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment=DEPLOYMENT_FIXTURE,
         )
         transport = LeaseShellTransport(config)
@@ -488,7 +493,7 @@ class TestRecvProxyMessage:
         """_recv_proxy_message must return None when message.data is an integer, not crash."""
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment=DEPLOYMENT_FIXTURE,
         )
         transport = LeaseShellTransport(config)
@@ -503,7 +508,7 @@ class TestRecvProxyMessage:
         """_recv_proxy_message must return None when top-level msg['data'] is a list."""
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment=DEPLOYMENT_FIXTURE,
         )
         transport = LeaseShellTransport(config)
@@ -543,7 +548,7 @@ PROXY_SCHEMA_ERROR = json.dumps(
 
 def _transport() -> LeaseShellTransport:
     return LeaseShellTransport(
-        TransportConfig(dseq="123", api_key="key", deployment=DEPLOYMENT_FIXTURE)
+        TransportConfig(dseq="123", api_key=_KEY, deployment=DEPLOYMENT_FIXTURE)
     )
 
 
@@ -632,7 +637,7 @@ class TestExecTimeoutIsBounded:
 
     def test_recv_timeout_is_configurable(self):
         config = TransportConfig(
-            dseq="123", api_key="key", deployment=DEPLOYMENT_FIXTURE, recv_timeout=7
+            dseq="123", api_key=_KEY, deployment=DEPLOYMENT_FIXTURE, recv_timeout=7
         )
         ws = MagicMock()
         ws.recv.side_effect = TimeoutError
@@ -648,7 +653,7 @@ class TestBuildShellPath:
         """Shell metacharacters (semicolons, pipes) must be URL-encoded, not passed through raw."""
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment=DEPLOYMENT_FIXTURE,
         )
         transport = LeaseShellTransport(config)
@@ -668,7 +673,7 @@ class TestBuildShellPath:
         """
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment=DEPLOYMENT_FIXTURE,
         )
         transport = LeaseShellTransport(config)
@@ -693,7 +698,7 @@ class TestBuildShellPath:
         """
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment=DEPLOYMENT_FIXTURE,
         )
         transport = LeaseShellTransport(config)
@@ -711,7 +716,7 @@ class TestBuildShellPath:
         """
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment=DEPLOYMENT_FIXTURE,
         )
         transport = LeaseShellTransport(config)
@@ -731,7 +736,7 @@ class TestExecHappyPath:
     def test_exec_happy_path_stdout_only(self):
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment=DEPLOYMENT_FIXTURE,
         )
         transport = LeaseShellTransport(config)
@@ -758,7 +763,7 @@ class TestExecHappyPath:
     def test_exec_captures_stderr(self):
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment=DEPLOYMENT_FIXTURE,
         )
         transport = LeaseShellTransport(config)
@@ -781,7 +786,7 @@ class TestExecHappyPath:
     def test_exec_non_zero_exit_code(self):
         config = TransportConfig(
             dseq="456",
-            api_key="key",
+            api_key=_KEY,
             deployment=DEPLOYMENT_FIXTURE,
         )
         transport = LeaseShellTransport(config)
@@ -803,7 +808,7 @@ class TestExecHappyPath:
     def test_exec_jwt_sent_in_connect_message(self):
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment=DEPLOYMENT_FIXTURE,
         )
         transport = LeaseShellTransport(config)
@@ -827,7 +832,7 @@ class TestExecHappyPath:
     def test_exec_compression_disabled(self):
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment=DEPLOYMENT_FIXTURE,
         )
         transport = LeaseShellTransport(config)
@@ -851,7 +856,7 @@ class TestExecHappyPath:
     def test_exec_auto_prepare(self):
         config = TransportConfig(
             dseq="999",
-            api_key="key",
+            api_key=_KEY,
             deployment=DEPLOYMENT_FIXTURE,
         )
         transport = LeaseShellTransport(config)
@@ -887,7 +892,7 @@ class TestValidate:
         """Test validate() returns True when deployment has hostUri."""
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment=DEPLOYMENT_FIXTURE,
         )
         transport = LeaseShellTransport(config)
@@ -898,7 +903,7 @@ class TestValidate:
         """Test validate() returns True with host_uri (snake_case)."""
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment={
                 "leases": [
                     {
@@ -915,7 +920,7 @@ class TestValidate:
         """Test validate() returns False with empty leases."""
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment={"leases": []},
         )
         transport = LeaseShellTransport(config)
@@ -926,7 +931,7 @@ class TestValidate:
         """Test validate() returns False when hostUri missing."""
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment={
                 "leases": [
                     {
@@ -943,7 +948,7 @@ class TestValidate:
         """Test validate() returns False when provider is not a dict."""
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment={
                 "leases": [
                     {
@@ -960,7 +965,7 @@ class TestValidate:
         """validate() must return False when leases is a dict, not a list."""
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment={"leases": {"0": {"provider": {"hostUri": "https://provider.com"}}}},
         )
         transport = LeaseShellTransport(config)
@@ -977,7 +982,7 @@ class TestNotImplementedMethods:
     def test_inject_implemented_phase_8(self):
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment={
                 "leases": [
                     {
@@ -1002,7 +1007,7 @@ class TestNotImplementedMethods:
     def test_connect_does_not_raise_not_implemented(self):
         from unittest.mock import patch as _patch
 
-        config = TransportConfig(dseq="123", api_key="key")
+        config = TransportConfig(dseq="123", api_key=_KEY)
         transport = LeaseShellTransport(config)
         transport._provider_host_uri = "https://provider.example.com"
         transport._service = "web"
@@ -1029,7 +1034,7 @@ class TestTokenRefresh:
     def test_exec_reconnects_on_token_expiry(self):
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment=DEPLOYMENT_FIXTURE,
         )
         transport = LeaseShellTransport(config)
@@ -1071,7 +1076,7 @@ class TestTokenRefresh:
     def test_exec_reconnects_on_expired_message(self):
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment=DEPLOYMENT_FIXTURE,
         )
         transport = LeaseShellTransport(config)
@@ -1111,7 +1116,7 @@ class TestTokenRefresh:
     def test_exec_raises_after_max_reconnect_attempts(self):
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment=DEPLOYMENT_FIXTURE,
         )
         transport = LeaseShellTransport(config)
@@ -1147,7 +1152,7 @@ class TestTokenRefresh:
     def test_exec_non_auth_close_propagates(self):
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment=DEPLOYMENT_FIXTURE,
         )
         transport = LeaseShellTransport(config)
@@ -1384,7 +1389,7 @@ class TestColdStdoutRace:
         ws = MagicMock()
         ws.recv.side_effect = _recv
         cfg = TransportConfig(
-            dseq="123", api_key="key", deployment=DEPLOYMENT_FIXTURE, result_grace_s=0.05
+            dseq="123", api_key=_KEY, deployment=DEPLOYMENT_FIXTURE, result_grace_s=0.05
         )
         LeaseShellTransport(cfg)._pump_frames(ws, 0)
         # First recv uses recv_timeout (pre-result); after RESULT it drops to the
@@ -1412,7 +1417,7 @@ class TestColdStdoutRace:
         # monotonic: base when the result lands, then advance past deadline (+0.05).
         clock = iter([100.0, 100.0, 100.02, 100.04, 100.06, 100.08, 100.10])
         cfg = TransportConfig(
-            dseq="123", api_key="key", deployment=DEPLOYMENT_FIXTURE, result_grace_s=0.05
+            dseq="123", api_key=_KEY, deployment=DEPLOYMENT_FIXTURE, result_grace_s=0.05
         )
         with patch("just_akash.transport.lease_shell.time.monotonic", lambda: next(clock)):
             code = LeaseShellTransport(cfg)._pump_frames(DribblingWS(), 0)

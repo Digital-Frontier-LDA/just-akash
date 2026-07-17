@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from just_akash.transport.lease_shell import LeaseShellTransport
+from tests._creds import fake_api_key
 
 
 def _make_transport():
@@ -28,7 +29,7 @@ def _make_transport():
     t._api_client = mock_api
     mock_config = MagicMock()
     mock_config.dseq = "1"
-    mock_config.api_key = "test-key"
+    mock_config.api_key = fake_api_key()
     mock_config.provider_proxy_url = "https://provider-proxy.akash.network"
     t._config = mock_config
     return t

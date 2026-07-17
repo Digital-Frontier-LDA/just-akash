@@ -11,6 +11,11 @@ from just_akash.transport import (
     TransportConfig,
     make_transport,
 )
+from tests._creds import fake_api_key
+
+# One throwaway key — a call, not a literal, so detect-secrets stays quiet and this
+# file leaves .secrets.baseline (issue #38 item 3).
+_KEY = fake_api_key()
 
 # --- Transport ABC ---
 
@@ -22,9 +27,9 @@ class TestTransportABC:
             Transport()  # type: ignore[abstract]
 
     def test_transport_config_dataclass(self):
-        config = TransportConfig(dseq="123456", api_key="key-abc")
+        config = TransportConfig(dseq="123456", api_key=_KEY)
         assert config.dseq == "123456"
-        assert config.api_key == "key-abc"
+        assert config.api_key == _KEY
         assert config.console_url == "https://console-api.akash.network"
         assert config.service_name is None
         assert config.ssh_key_path is None
@@ -56,24 +61,24 @@ class TestSSHTransport:
 
     def test_validate_returns_true_when_ssh_port_present(self):
         dep = self._make_deployment_with_ssh()
-        config = TransportConfig(dseq="123", api_key="key", deployment=dep)
+        config = TransportConfig(dseq="123", api_key=_KEY, deployment=dep)
         t = SSHTransport(config)
         assert t.validate() is True
 
     def test_validate_returns_false_when_no_ssh(self):
-        config = TransportConfig(dseq="123", api_key="key", deployment={})
+        config = TransportConfig(dseq="123", api_key=_KEY, deployment={})
         t = SSHTransport(config)
         assert t.validate() is False
 
     def test_prepare_raises_when_no_ssh_port(self):
-        config = TransportConfig(dseq="123", api_key="key", deployment={})
+        config = TransportConfig(dseq="123", api_key=_KEY, deployment={})
         t = SSHTransport(config)
         with pytest.raises(RuntimeError):
             t.prepare()
 
     def test_prepare_raises_when_no_ssh_key(self):
         dep = self._make_deployment_with_ssh()
-        config = TransportConfig(dseq="123", api_key="key", deployment=dep)
+        config = TransportConfig(dseq="123", api_key=_KEY, deployment=dep)
         t = SSHTransport(config)
         with (
             patch("just_akash.transport.ssh._find_ssh_key", return_value=None),
@@ -83,7 +88,7 @@ class TestSSHTransport:
 
     def test_exec_runs_command_and_returns_exit_code(self):
         dep = self._make_deployment_with_ssh()
-        config = TransportConfig(dseq="123", api_key="key", deployment=dep)
+        config = TransportConfig(dseq="123", api_key=_KEY, deployment=dep)
         t = SSHTransport(config)
         mock_ssh_info = {"host": "provider.akash.network", "port": 32022}
         t._ssh_info = mock_ssh_info
@@ -100,7 +105,7 @@ class TestSSHTransport:
         assert rc == 0
 
     def test_exec_propagates_nonzero_exit_code(self):
-        config = TransportConfig(dseq="123", api_key="key")
+        config = TransportConfig(dseq="123", api_key=_KEY)
         t = SSHTransport(config)
         t._ssh_info = {"host": "h", "port": 22}
         t._key_path = "/key"
@@ -119,7 +124,7 @@ class TestSSHTransport:
         every command sent over SSH (mkdir/cat/chmod) — never interpolated raw."""
         import shlex
 
-        config = TransportConfig(dseq="123", api_key="key")
+        config = TransportConfig(dseq="123", api_key=_KEY)
         t = SSHTransport(config)
         t._ssh_info = {"host": "h", "port": 22}
         t._key_path = "/key"
@@ -149,7 +154,7 @@ class TestSSHTransport:
     def test_inject_fails_closed_when_chmod_fails(self):
         """If `chmod 600` fails, inject() must raise — never report success with
         secret material left at weaker-than-intended permissions."""
-        config = TransportConfig(dseq="123", api_key="key")
+        config = TransportConfig(dseq="123", api_key=_KEY)
         t = SSHTransport(config)
         t._ssh_info = {"host": "h", "port": 22}
         t._key_path = "/key"
@@ -174,14 +179,14 @@ class TestSSHTransport:
 class TestLeaseShellTransportStub:
     def _stub_no_deployment(self):
         """Lease shell transport without deployment data."""
-        config = TransportConfig(dseq="123", api_key="key")
+        config = TransportConfig(dseq="123", api_key=_KEY)
         return LeaseShellTransport(config)
 
     def _stub_with_deployment(self):
         """Lease shell transport with minimal valid deployment data."""
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             deployment={
                 "leases": [
                     {
@@ -254,7 +259,7 @@ class TestLeaseShellTransportStub:
         """_get_proxy_ws_url must only replace scheme, not 'http://' in path."""
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key=_KEY,
             provider_proxy_url="https://proxy.example.com/relay/http://backend",
         )
         t = LeaseShellTransport(config)
@@ -265,7 +270,7 @@ class TestLeaseShellTransportStub:
     def test_get_proxy_ws_url_accepts_a_wss_override(self):
         """A wss:// override is a TLS scheme and must be preserved as-is."""
         config = TransportConfig(
-            dseq="123", api_key="key", provider_proxy_url="wss://proxy.example.com/relay"
+            dseq="123", api_key=_KEY, provider_proxy_url="wss://proxy.example.com/relay"
         )
         assert LeaseShellTransport(config)._get_proxy_ws_url().startswith("wss://")
 
@@ -276,7 +281,7 @@ class TestLeaseShellTransportStub:
         back to an unencrypted socket. (Hardening from review, PR #64.)"""
         for scheme in ("http", "ws"):
             config = TransportConfig(
-                dseq="123", api_key="key", provider_proxy_url=f"{scheme}://proxy.example.com/relay"
+                dseq="123", api_key=_KEY, provider_proxy_url=f"{scheme}://proxy.example.com/relay"
             )
             with pytest.raises(RuntimeError, match="TLS scheme"):
                 LeaseShellTransport(config)._get_proxy_ws_url()
@@ -287,13 +292,13 @@ class TestLeaseShellTransportStub:
 
 class TestMakeTransport:
     def test_makes_ssh_transport(self):
-        t = make_transport("ssh", dseq="123", api_key="key")
+        t = make_transport("ssh", dseq="123", api_key=_KEY)
         assert isinstance(t, SSHTransport)
 
     def test_makes_lease_shell_transport(self):
-        t = make_transport("lease-shell", dseq="123", api_key="key")
+        t = make_transport("lease-shell", dseq="123", api_key=_KEY)
         assert isinstance(t, LeaseShellTransport)
 
     def test_raises_for_unknown_transport(self):
         with pytest.raises(ValueError, match="Unknown transport"):
-            make_transport("ftp", dseq="123", api_key="key")
+            make_transport("ftp", dseq="123", api_key=_KEY)
