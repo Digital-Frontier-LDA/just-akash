@@ -153,10 +153,17 @@ def _dseq_in_list_output(dseq: str, output: str) -> bool:
     return re.search(rf"(?<!\d){re.escape(dseq)}(?!\d)", output) is not None
 
 
-# Terminal on-chain states. Reaching either means the deployment is settled and
-# holds no escrow — measured: a `closed` deployment reads escrow.state=closed with
-# funds=0. Anything else (active/open/unknown) may still be holding a deposit.
-_SETTLED_STATES = ("closed", "failed")
+# Terminal on-chain states: the deployment is settled and holds no escrow —
+# measured: a `closed` deployment reads escrow.state=closed with funds=0.
+# insufficient_funds is settled by definition (the escrow is what ran out) and is
+# already treated as terminal by smoke_providers._DEAD_STATES; kept in sync with it.
+_SETTLED_STATES = ("closed", "failed", "insufficient_funds", "insufficientfunds")
+# States that positively mean the deployment is still up (and so may hold escrow).
+# Deliberately an ALLOWLIST, not "everything that isn't settled": a state we do not
+# recognise is UNKNOWN, not proof of life, and saying "STILL ACTIVE" about it would
+# be a claim we cannot support. Unknown falls through to "could not confirm", which
+# fails closed just the same but tells the operator the truth.
+_OPEN_STATES = ("active", "open")
 
 
 def _confirm_settled(dseq: str, *, attempts: int = 3) -> bool | None:
@@ -180,8 +187,12 @@ def _confirm_settled(dseq: str, *, attempts: int = 3) -> bool | None:
             r = _run(f"uv run just-akash status --dseq {shlex.quote(dseq)} --json", timeout=30)
             if r.returncode == 0 and r.stdout:
                 state = str(json.loads(r.stdout).get("state", "")).strip().lower()
-                if state:
-                    return state in _SETTLED_STATES
+                if state in _SETTLED_STATES:
+                    return True
+                if state in _OPEN_STATES:
+                    return False
+                # An unrecognised state answers nothing — fall through to a retry and
+                # ultimately None, rather than assert either "settled" or "active".
         except Exception:  # noqa: BLE001 — a probe failure must never raise from cleanup
             pass
         if attempt < attempts:

@@ -1486,3 +1486,46 @@ class TestAuditNeverRaisesFromCleanup:
             ]
             robust_destroy("123; rm -rf /tmp/x")
             assert "'123; rm -rf /tmp/x'" in capsys.readouterr().out
+
+
+class TestUnknownStateIsNotAClaimOfLife:
+    """Caught in review (Copilot, PR #63): _confirm_settled returned False for ANY
+    non-settled state, so an unrecognised value made the audit print "STILL ACTIVE
+    after destroy" — a claim we cannot support. The fail-closed OUTCOME was right;
+    the message was a lie. Open states are now an allowlist, and anything unknown
+    reports "could not confirm" instead.
+    """
+
+    def _run_audit(self, state_json: str, capsys):
+        with (
+            patch("just_akash._e2e.subprocess.run") as mock_run,
+            patch("just_akash._e2e.time.sleep"),
+        ):
+            mock_run.side_effect = [_completed(0, stdout="closed")] + [
+                _completed(0, stdout=state_json) for _ in range(3)
+            ]
+            result = robust_destroy("12345")
+        return result, capsys.readouterr().out
+
+    def test_unknown_state_says_could_not_confirm_not_still_active(self, capsys):
+        result, out = self._run_audit('{"state": "some_new_state"}', capsys)
+        assert result is False, "must still fail closed"
+        assert "could not confirm" in out.lower()
+        assert "STILL ACTIVE" not in out, "we cannot claim it is active — we don't know"
+
+    def test_active_still_positively_reports_still_active(self, capsys):
+        result, out = self._run_audit('{"state": "active"}', capsys)
+        assert result is False
+        assert "STILL ACTIVE" in out
+
+    def test_insufficient_funds_is_settled(self, capsys):
+        """The escrow is what ran out — there is nothing left to leak. Terminal in
+        smoke_providers._DEAD_STATES too; kept in sync."""
+        result, out = self._run_audit('{"state": "insufficient_funds"}', capsys)
+        assert result is True
+        assert "settled" in out.lower()
+
+    def test_missing_state_field_is_unknown_not_settled(self, capsys):
+        result, out = self._run_audit('{"dseq": "12345"}', capsys)
+        assert result is False
+        assert "could not confirm" in out.lower()
