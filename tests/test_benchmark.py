@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
+
+import pytest
 
 from just_akash import benchmark as bm
 
@@ -31,8 +34,13 @@ class TestParseResults:
         assert "cpu_model" not in r
         assert r["ncpu"] == "1"
 
-    def test_na_is_kept_as_an_explicit_unavailable_marker(self):
-        assert bm.parse_results("BENCH-cpu_eps=na\n")["cpu_eps"] == "na"
+    def test_na_is_dropped_like_an_empty_value(self):
+        """The contract (module docstring) is that an unavailable metric is ABSENT,
+        however the probe spelled it. `na` must not leak into results/JSON as if it
+        were a measurement. (Contract clarified in review — CodeRabbit, PR #61.)"""
+        r = bm.parse_results("BENCH-cpu_eps=na\nBENCH-ncpu=4\n")
+        assert "cpu_eps" not in r
+        assert r["ncpu"] == "4"
 
     def test_empty_input(self):
         assert bm.parse_results("") == {}
@@ -72,6 +80,28 @@ class TestBenchScript:
         f.write_text(bm.BENCH_SH)
         assert subprocess.run(["sh", "-n", str(f)], capture_output=True).returncode == 0
 
+    def test_is_valid_under_dash_when_available(self, tmp_path):
+        """dash is the strict POSIX yardstick — closer to busybox ash than bash is.
+        Guarded by which() so the suite still runs where dash isn't installed."""
+        dash = shutil.which("dash")
+        if not dash:
+            pytest.skip("dash not installed")
+        f = tmp_path / "b.sh"
+        f.write_text(bm.BENCH_SH)
+        assert subprocess.run([dash, "-n", str(f)], capture_output=True).returncode == 0
+
+    def test_rtt_parse_takes_avg_not_max(self):
+        """The RTT summary is min/avg/max[/mdev]; the parse must select AVG. A
+        positional cut on the whole line grabs max/mdev and skews grading — regressed
+        once (Copilot, PR #61), so pin the numeric-triple + field-2 approach."""
+        assert "grep -oE '[0-9.]+/[0-9.]+/[0-9.]+'" in bm.BENCH_SH
+        assert "cut -d/ -f2" in bm.BENCH_SH
+
+    def test_disk_read_bypasses_the_page_cache(self):
+        """conv=fdatasync flushes the write but leaves the pages cached, so the read
+        must use iflag=direct or it measures RAM, not the disk."""
+        assert "iflag=direct" in bm.BENCH_SH
+
     def test_stays_within_the_lease_limits(self):
         """The probe must never approach the probe SDL's 1Gi/5Gi: a benchmark that
         OOM-kills its own container would self-inflict the lease death this suite
@@ -86,4 +116,42 @@ class TestBenchScript:
 
     def test_cleans_up_its_disk_artifacts(self):
         """A 256M file left behind would eat the lease's storage."""
-        assert "rm -f /tmp/.bench" in bm.BENCH_SH
+        assert 'rm -f "$BENCH_TMP"' in bm.BENCH_SH
+
+    def test_a_killed_probe_still_cleans_up_via_trap(self):
+        """The explicit rm only runs on the happy path; a trap covers a mid-run kill
+        so no 256M artifact survives an interrupted probe. (CodeRabbit, PR #61.)"""
+        assert "trap " in bm.BENCH_SH and "EXIT" in bm.BENCH_SH
+
+    def test_disk_paths_are_pid_unique(self):
+        """PID-scoped paths so nothing collides even if the assumption of one probe
+        per container ever breaks."""
+        assert "/tmp/.bench.$$" in bm.BENCH_SH
+
+
+class TestBenchmarkJsonTrustsLocalMetadata:
+    """The benchmark's --json output merges REMOTE probe output (results) with
+    LOCAL, trusted metadata (dseq/provider/complete). A hostile or buggy probe
+    emitting `BENCH-provider=` / `BENCH-dseq=` / `BENCH-complete=` must not be able
+    to shadow the values we actually know. (CodeRabbit, PR #61.)
+    """
+
+    def test_dict_merge_lets_trusted_fields_win(self):
+        """Pins the semantics the cli output relies on: trusted keys spread LAST."""
+        results = {"provider": "EVIL", "dseq": "0", "complete": True, "cpu_eps": "900"}
+        merged = {**results, "dseq": "1784", "provider": "akash1real", "complete": False}
+        assert merged["provider"] == "akash1real"
+        assert merged["dseq"] == "1784"
+        assert merged["complete"] is False
+        assert merged["cpu_eps"] == "900"  # genuine metrics still pass through
+
+    def test_cli_source_spreads_results_before_the_trusted_keys(self):
+        """Regression guard: if someone reorders the json literal so `**results` comes
+        after the trusted keys, remote output could overwrite them again."""
+        import pathlib
+
+        src = pathlib.Path(bm.__file__).with_name("cli.py").read_text()
+        i_results = src.find("**results")
+        # the trusted-field block immediately follows **results in the json.dumps call
+        i_dseq = src.find('"dseq": dseq,\n                            "provider": provider')
+        assert 0 < i_results < i_dseq, "**results must be spread BEFORE the trusted fields"

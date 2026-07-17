@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.26.0] — 2026-07-17
+
+### Added
+- **`benchmark` command — grade what a provider ACTUALLY delivered** (vCPU throughput, RAM bandwidth, disk I/O, WAN RTT, contention), separate from the pass/fail smoke. Bounded well under the lease's cgroup (256M / 1 thread) so it never OOM-kills its own container, and never runs in the every-run smoke. Every metric degrades to *absent* rather than erroring, so a minimal image still yields the cheap signals.
+
+### Fixed (from review — Copilot + CodeRabbit, PR #61)
+- **WAN RTT reported the max, not the average.** The summary line is `min/avg/max[/mdev]`, and a positional `cut -f5` landed on max (busybox) or mdev (iputils) — skewing the grade. Now greps the numeric triple and takes field 2 (avg), robust across ping builds.
+- **`disk_read` measured the page cache, not the disk.** `conv=fdatasync` flushes the write but leaves the pages resident, so the immediate read was served from RAM. Now uses `iflag=direct`; where the fs can't do O_DIRECT it honestly reports `na` instead of a cache-inflated number.
+- **Remote probe output could overwrite trusted JSON metadata.** `--json` spread `**results` (from remote `BENCH-` lines) last, so a `BENCH-provider=` / `BENCH-dseq=` line could shadow the deployment-derived values. Trusted fields are now applied last.
+- **`na` leaked into results as if it were a measurement.** The parser kept the `na` sentinel, contradicting the module's own contract that an unavailable metric is *absent*. Now dropped like an empty value.
+- Disk artifacts use PID-unique paths plus an `EXIT`/`INT`/`TERM` trap, so a killed probe leaves no 256M file behind.
+
 ## [1.25.0] — 2026-07-17
 
 ### Changed

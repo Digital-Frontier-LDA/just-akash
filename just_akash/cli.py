@@ -534,7 +534,7 @@ def main():
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
 
-    # ── inject ─────────────────────────────────────────
+    # ── benchmark ──────────────────────────────────────
     elif args.command == "benchmark":
         import io
         import json as _json
@@ -591,13 +591,17 @@ def main():
                         provider = lid["provider"]
                         break
             if args.as_json:
+                # Trusted, deployment-derived fields go LAST so a hostile or buggy
+                # probe can't shadow them: results comes from remote BENCH- output, so
+                # a `BENCH-provider=` / `BENCH-dseq=` / `BENCH-complete=` line would
+                # otherwise overwrite the values we actually know.
                 print(
                     _json.dumps(
                         {
+                            **results,
                             "dseq": dseq,
                             "provider": provider,
                             "complete": is_complete(results),
-                            **results,
                         }
                     )
                 )

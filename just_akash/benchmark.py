@@ -66,16 +66,30 @@ say throttled "$(grep nr_throttled /sys/fs/cgroup/cpu.stat 2>/dev/null | cut -d'
 
 # --- network: RTT to two anycast anchors (cheap, no payload) ---
 for host in 1.1.1.1 8.8.8.8; do
-  rtt=$(ping -c 3 -W 2 "$host" 2>/dev/null | tail -1 | cut -d'/' -f5)
+  # The summary reports min/avg/max[/mdev]; we want AVG (2nd field). Grep the
+  # numeric triple and cut field 2, rather than a positional cut on the whole
+  # line: the field index differs by ping build (busybox "1/2/3 ms" vs iputils
+  # "1/2/3/4 ms"), so a fixed `cut -f5` grabs max/mdev, not avg.
+  rtt=$(ping -c 3 -W 2 "$host" 2>/dev/null \
+        | grep -oE '[0-9.]+/[0-9.]+/[0-9.]+' | head -1 | cut -d/ -f2)
   say "rtt_$host" "${{rtt:-na}}"
 done
 
 # --- disk: bounded sequential write/read ---
-dd if=/dev/zero of=/tmp/.bench bs=1M count={_DISK_MB} conv=fdatasync 2>/tmp/.dd_w >/dev/null
-say disk_write "$(grep -oE '[0-9.]+ [MG]B/s' /tmp/.dd_w 2>/dev/null | tail -1 || echo na)"
-dd if=/tmp/.bench of=/dev/null bs=1M 2>/tmp/.dd_r >/dev/null
-say disk_read "$(grep -oE '[0-9.]+ [MG]B/s' /tmp/.dd_r 2>/dev/null | tail -1 || echo na)"
-rm -f /tmp/.bench /tmp/.dd_w /tmp/.dd_r
+# PID-unique paths + a trap: each probe already runs in its own lease/container so
+# these are never shared BETWEEN probes, but the trap still guarantees a killed
+# probe leaves no artifact behind inside its container.
+BENCH_TMP="/tmp/.bench.$$"
+trap 'rm -f "$BENCH_TMP" "$BENCH_TMP.w" "$BENCH_TMP.r"' EXIT INT TERM
+dd if=/dev/zero of="$BENCH_TMP" bs=1M count={_DISK_MB} conv=fdatasync 2>"$BENCH_TMP.w" >/dev/null
+say disk_write "$(grep -oE '[0-9.]+ [MG]B/s' "$BENCH_TMP.w" 2>/dev/null | tail -1 || echo na)"
+# iflag=direct bypasses the page cache, so this measures the DEVICE rather than the
+# pages the write just populated (conv=fdatasync flushes but does NOT evict them).
+# If the fs can't do O_DIRECT (overlayfs/tmpfs), dd errors and disk_read is honestly
+# `na` — better than a cache-inflated number that would skew provider grading.
+dd if="$BENCH_TMP" of=/dev/null bs=1M iflag=direct 2>"$BENCH_TMP.r" >/dev/null
+say disk_read "$(grep -oE '[0-9.]+ [MG]B/s' "$BENCH_TMP.r" 2>/dev/null | tail -1 || echo na)"
+rm -f "$BENCH_TMP" "$BENCH_TMP.w" "$BENCH_TMP.r"
 
 # --- cpu + ram via sysbench (best-effort install; `na` if unavailable) ---
 apk add --no-cache sysbench >/dev/null 2>&1
@@ -116,7 +130,11 @@ def parse_results(stdout: str) -> dict[str, str]:
         m = _LINE.match(line)
         if m:
             key, value = m.group(1), m.group(2).strip()
-            if value:
+            # Drop both empties AND the explicit "na" sentinel: the contract (module
+            # docstring) is that an unavailable metric is simply ABSENT, however the
+            # probe spelled it. Letting "na" through would leak a non-measurement into
+            # formatted output and JSON as if it were a value.
+            if value and value != "na":
                 out[key] = value
     return out
 
