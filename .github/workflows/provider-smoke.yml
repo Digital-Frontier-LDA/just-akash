@@ -155,22 +155,40 @@ jobs:
       - uses: actions/setup-python@v5 # pin the interpreter (module uses 3.10+ typing)
         with:
           python-version: "3.13"
-      - name: Aggregate + SLO gate
-        # Currently INFORMATIONAL (continue-on-error): it prints the table and any
-        # reliability/latency breaches but does not fail the run. Once ~2-3 days
-        # have accrued and p99s are stable: set SMOKE_LATENCY_SLO_P95 (e.g.
-        # "ready=45000,ingress=15000" from the observed p99 + margin) and REMOVE
-        # `continue-on-error` to actually fail a provider that's too slow / too
-        # unreliable — the "fail slow providers" gate.
-        continue-on-error: true
+      - name: Aggregate + latency gate
+        # LIVE (no continue-on-error) — the close-out of the 2026-07-14..17 burst.
+        # It gates on LATENCY ONLY: "this provider got too slow" is the one thing
+        # this accrued view can both see (a per-run check can't spot a trend) and
+        # classify. RELIABILITY here is INFORMATIONAL by design, not config: the
+        # telemetry carries no fail_mode/in_pod_marker/eventual, so this view cannot
+        # tell a tooling regression on a HEALTHY lease (which SHOULD gate — and the
+        # smoke job above already gates it, with the full diag context) from provider
+        # infra the project deliberately demoted (LEASE-DOWN fleet-wide in v1.22.0;
+        # quarantined providers in v1.21.0). Gating it here would red CI on exactly
+        # that infra. (3-model quorum, unanimous after 3 rounds.)
+        #
+        # Ceilings are ~1.4-2x the worst observed p95 over 1243 accrued rows: a
+        # gross-blowout guard, deliberately NOT a tight drift detector — a per-feature
+        # ceiling must fit the slowest provider, so it cannot catch a fast provider
+        # degrading. --min-samples 20 is the anti-flake floor (p95 over the ACCRUED
+        # set, so one slow run can't trip it); do NOT raise it to 30 — the fleet only
+        # has 24-28 latency samples per (provider,feature), so 30 would judge nothing.
         env:
-          SMOKE_LATENCY_SLO_P95: "" # empty = latency gate off until thresholds set
+          # From the accrued p95 + margin. ready/update are sized for the slowest
+          # provider seen (z9nr: ready p95 41.9s, update p95 58.2s).
+          SMOKE_LATENCY_SLO_P95: "ready=60000,update=90000,ingress=5000,deploy=180000,exec=10000,ssh=30000,inject=30000"
           SMOKE_SLO_MIN_SAMPLES: "20"
+          # Pre-v1.17.0 exec failures were the cold-stdout race, fixed in v1.17.0 —
+          # they cannot recur, so counting them understates the fleet (exec reads 96%
+          # across all versions, 100% since the fix).
+          SMOKE_MIN_VERSION: "1.17.0"
+          # Same list the smoke job uses: a quarantined provider is measured and
+          # printed, never gating (its failures are infra we can't fix).
+          SMOKE_QUARANTINE_PROVIDERS: ${{ secrets.SMOKE_QUARANTINE_PROVIDERS }}
         run: |
           # Distinguish "branch doesn't exist yet" (a clean no-op) from a real
           # network/auth failure (which must NOT be silently reported as "no
-          # branch"). This step is continue-on-error, so surfacing the failure
-          # shows a red step without failing the workflow.
+          # branch"). This step now gates, so a genuine failure must surface.
           if ! branches=$(git ls-remote --heads origin telemetry 2>&1); then
             echo "ERROR: could not reach remote to check telemetry branch:"
             echo "$branches"; exit 1
@@ -184,4 +202,6 @@ jobs:
           git show origin/telemetry:smoke-latency.jsonl > accrued.jsonl
           python3 -m just_akash.analyze_telemetry accrued.jsonl \
             --check --min-samples "$SMOKE_SLO_MIN_SAMPLES" --slo 0.95 \
+            --min-version "$SMOKE_MIN_VERSION" \
+            --quarantine "$SMOKE_QUARANTINE_PROVIDERS" \
             --max-p95 "$SMOKE_LATENCY_SLO_P95"

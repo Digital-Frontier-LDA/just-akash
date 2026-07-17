@@ -140,7 +140,11 @@ class TestReportAndMain:
         recs = at.load_records(str(f))
         assert len(recs) == 1
 
-    def test_main_check_returns_1_on_breach(self, tmp_path, capsys):
+    def test_main_check_reliability_breach_is_informational_not_gating(self, tmp_path, capsys):
+        """Reliability must PRINT but never gate: this accrued view can't tell a
+        tooling regression on a healthy lease (the smoke run gates that, with the
+        diag context) from provider infra the project demoted (LEASE-DOWN /
+        quarantined). Gating here would red CI on exactly the latter."""
         rows = [
             {"provider": "p", "feature": "ingress", "outcome": "FAIL", "latency_ms": None}
             for _ in range(20)
@@ -148,8 +152,108 @@ class TestReportAndMain:
         f = tmp_path / "t.jsonl"
         f.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
         rc = at.main([str(f), "--check", "--min-samples", "20"])
-        assert rc == 1
-        assert "RELIABILITY breach" in capsys.readouterr().out
+        assert rc == 0  # informational — NOT a gate
+        out = capsys.readouterr().out
+        assert "informational, NOT gating" in out
+        assert "0% over 20 attempts" in out  # still fully visible
+
+    def test_lease_down_never_gates_and_is_not_a_fail(self, tmp_path, capsys):
+        """v1.22.0: LEASE-DOWN is provider infra, non-gating FLEET-WIDE. It must not
+        count as a fail (it deflated the reported rate) nor affect the exit code."""
+        rows = [
+            {"provider": "p", "feature": "exec", "outcome": "LEASE-DOWN", "latency_ms": None}
+            for _ in range(10)
+        ] + [
+            {"provider": "p", "feature": "exec", "outcome": "PASS", "latency_ms": 1000}
+            for _ in range(20)
+        ]
+        f = tmp_path / "t.jsonl"
+        f.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+        rc = at.main([str(f), "--check", "--min-samples", "20", "--max-p95", "exec=10000"])
+        assert rc == 0
+        g = at.aggregate(rows)[("p", "exec")]
+        assert g["lease_down"] == 10
+        assert g["fail"] == 0
+        assert g["attempts"] == 20  # lease-downs stay OUT of the denominator
+        assert g["pass_rate"] == 1.0  # 20/20, not 20/30
+
+    def test_quarantined_provider_latency_breach_does_not_gate(self, tmp_path, capsys):
+        """A quarantined provider being slow is the same known infra we already
+        decided not to gate on — measured and printed, never failing."""
+        rows = [
+            {"provider": "bad", "feature": "ingress", "outcome": "PASS", "latency_ms": 50000}
+            for _ in range(20)
+        ]
+        f = tmp_path / "t.jsonl"
+        f.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+        rc = at.main(
+            [
+                str(f),
+                "--check",
+                "--min-samples",
+                "20",
+                "--max-p95",
+                "ingress=10000",
+                "--quarantine",
+                "bad",
+            ]
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "TOO SLOW" in out and "quarantined" in out  # visible, just not gating
+
+    def test_unquarantined_provider_latency_breach_still_gates(self, tmp_path):
+        rows = [
+            {"provider": "good", "feature": "ingress", "outcome": "PASS", "latency_ms": 50000}
+            for _ in range(20)
+        ]
+        f = tmp_path / "t.jsonl"
+        f.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+        rc = at.main(
+            [
+                str(f),
+                "--check",
+                "--min-samples",
+                "20",
+                "--max-p95",
+                "ingress=10000",
+                "--quarantine",
+                "other",
+            ]
+        )
+        assert rc == 1  # the latency gate is real for a non-quarantined provider
+
+    def test_min_version_drops_old_and_unversioned_records(self, tmp_path, capsys):
+        """A fixed bug's old failures can't recur, so they must not dilute the rate."""
+        rows = (
+            [
+                {
+                    "provider": "p",
+                    "feature": "exec",
+                    "outcome": "FAIL",
+                    "latency_ms": None,
+                    "version": "1.13.0",
+                }
+                for _ in range(10)
+            ]
+            + [{"provider": "p", "feature": "exec", "outcome": "FAIL", "latency_ms": None}]
+            + [
+                {
+                    "provider": "p",
+                    "feature": "exec",
+                    "outcome": "PASS",
+                    "latency_ms": 1000,
+                    "version": "1.17.0",
+                }
+                for _ in range(20)
+            ]
+        )
+        f = tmp_path / "t.jsonl"
+        f.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+        rc = at.main([str(f), "--check", "--min-samples", "20", "--min-version", "1.17.0"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "kept 20 of 31" in out  # 10 old + 1 unversioned dropped
 
     def test_main_check_fails_on_slow_p95(self, tmp_path, capsys):
         # 20 PASS ingress at 50s -> p95 ~50s, over a 10s ceiling -> too slow.

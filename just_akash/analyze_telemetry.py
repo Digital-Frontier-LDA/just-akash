@@ -111,7 +111,10 @@ def aggregate(records: list[dict]) -> dict[tuple[str, str], dict]:
         if not provider or not feature:
             continue
         key = (provider, feature)
-        g = groups.setdefault(key, {"count": 0, "pass": 0, "fail": 0, "other": 0, "latencies": []})
+        g = groups.setdefault(
+            key,
+            {"count": 0, "pass": 0, "fail": 0, "lease_down": 0, "other": 0, "latencies": []},
+        )
         g["count"] += 1
         outcome = r.get("outcome")
         if outcome == "PASS":
@@ -119,9 +122,16 @@ def aggregate(records: list[dict]) -> dict[tuple[str, str], dict]:
             lat = r.get("latency_ms")
             if isinstance(lat, (int, float)):
                 g["latencies"].append(float(lat))
-        elif outcome in ("FAIL", "LEASE-DOWN"):
-            # LEASE-DOWN (provider accepted the bid then the lease died on-chain) is a
-            # genuine failure, unlike the pre-commitment NO-BID/"-" skips — count it.
+        elif outcome == "LEASE-DOWN":
+            # The provider accepted the bid, then the lease died on-chain. v1.22.0
+            # decided this is NON-GATING **fleet-wide** — it is always provider infra,
+            # never a just-akash bug (smoke_providers skips it in the gate). Counting
+            # it as a `fail` here CONTRADICTED that decision and deflated the reported
+            # pass rate, so it gets its own counter and stays OUT of the pass/fail
+            # denominator. The rate then answers the question that's actually
+            # actionable: "when the lease was up, did the feature work?"
+            g["lease_down"] += 1
+        elif outcome == "FAIL":
             g["fail"] += 1
         else:
             g["other"] += 1
@@ -241,16 +251,46 @@ def latency_breaches(
     return out
 
 
+def _version_key(v: object) -> tuple[int, ...]:
+    """Sortable key for a semver-ish string. Unparseable/missing sorts LOWEST so an
+    unversioned legacy record is dropped by any --min-version floor rather than
+    silently kept."""
+    parts: list[int] = []
+    for chunk in str(v or "").split("."):
+        digits = "".join(c for c in chunk if c.isdigit())
+        if not digits:
+            return (-1,)
+        parts.append(int(digits))
+    return tuple(parts) if parts else (-1,)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Aggregate smoke-test latency telemetry.")
     ap.add_argument("path", help="Path to the telemetry JSONL file")
     ap.add_argument(
         "--check",
         action="store_true",
-        help="Exit non-zero on a reliability breach (pass rate < --slo) or, when "
-        "--max-p95 is set, a latency breach. --min-samples gates each with the "
-        "relevant count: attempts (pass+fail) for reliability, PASS-latency "
-        "samples for the p95 ceiling.",
+        help="Exit non-zero ONLY on a latency breach (p95 over a --max-p95 ceiling, "
+        "over >= --min-samples PASS-latency samples). Reliability breaches are "
+        "PRINTED but never gate: this accrued view cannot classify them (it has no "
+        "fail_mode/in_pod_marker/eventual), and the per-run smoke gate already owns "
+        "that decision with the full diagnostic context.",
+    )
+    ap.add_argument(
+        "--min-version",
+        metavar="VER",
+        default="",
+        help='Ignore records older than this just-akash version, e.g. "1.17.0". A fixed '
+        "bug's old failures cannot recur, so leaving them in understates a provider "
+        "(e.g. exec reads 96%% across all versions but 100%% since the v1.17.0 fix).",
+    )
+    ap.add_argument(
+        "--quarantine",
+        metavar="PROVIDERS",
+        default="",
+        help="Comma-separated providers whose breaches must not gate — their failures "
+        "are known provider infra (mirrors SMOKE_QUARANTINE_PROVIDERS in the smoke "
+        "job). They are still measured and printed, just never fail the check.",
     )
     ap.add_argument(
         "--min-samples", type=int, default=20, help="Min samples before --check judges"
@@ -275,6 +315,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"No telemetry records in {args.path} yet.")
         return 0
 
+    if args.min_version:
+        floor = _version_key(args.min_version)
+        kept = [r for r in records if _version_key(r.get("version")) >= floor]
+        print(
+            f"version filter >= {args.min_version}: kept {len(kept)} of {len(records)} record(s)."
+        )
+        records = kept
+        if not records:
+            print("No records at or above that version yet.")
+            return 0
+
+    quarantined = {p.strip() for p in args.quarantine.split(",") if p.strip()}
+    if quarantined:
+        print(f"quarantined (measured, never gating): {', '.join(sorted(quarantined))}")
+
     groups = aggregate(records)
     runs = len({r.get("ts") for r in records})
     print(
@@ -284,10 +339,20 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check:
         failed = False
+        # Reliability is INFORMATIONAL here and must never gate. This accrued view
+        # keys only on `outcome` -- it has none of the fail_mode/in_pod_marker/
+        # eventual context that smoke_providers._is_reliability_failure needs, so it
+        # cannot tell a tooling regression on a HEALTHY lease (which SHOULD gate, and
+        # which the per-run smoke gate already catches) from provider infra the
+        # project deliberately demoted (LEASE-DOWN fleet-wide in v1.22.0, quarantined
+        # providers in v1.21.0). Gating on it here would red CI on exactly those.
+        # Structural, not config: there is no flag that turns this into a gate.
         breaches = slo_breaches(groups, args.min_samples, args.slo)
         if breaches:
-            failed = True
-            print(f"\nRELIABILITY breach (>= {args.min_samples} attempts, < {args.slo:.0%} pass):")
+            print(
+                f"\nRELIABILITY below {args.slo:.0%} (>= {args.min_samples} attempts) "
+                "— informational, NOT gating (the smoke run owns reliability):"
+            )
             for provider, feature, rate, count in breaches:
                 print(f"  {provider} {feature}: {rate:.0%} over {count} attempts")
 
@@ -298,15 +363,19 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if thresholds:
             slow = latency_breaches(groups, thresholds, args.min_samples)
+            # A quarantined provider being slow is the same known infra we already
+            # decided not to gate on -- measure and print it, never fail on it.
+            gating = [b for b in slow if b[0] not in quarantined]
             if slow:
-                failed = True
                 print(f"\nTOO SLOW — p95 over ceiling (>= {args.min_samples} latency samples):")
                 for provider, feature, p95, thr in slow:
-                    print(f"  {provider} {feature}: p95 {_fmt_ms(p95)} > {_fmt_ms(thr)}")
+                    tag = "  (quarantined — not gating)" if provider in quarantined else ""
+                    print(f"  {provider} {feature}: p95 {_fmt_ms(p95)} > {_fmt_ms(thr)}{tag}")
+            failed = bool(gating)
 
         if failed:
             return 1
-        print(f"\nCHECK OK (pass rate >= {args.slo:.0%}; p95 within ceilings where set).")
+        print("\nCHECK OK (p95 within ceilings where set; reliability is informational).")
     return 0
 
 
