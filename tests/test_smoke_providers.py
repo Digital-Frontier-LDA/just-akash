@@ -55,6 +55,79 @@ class TestDeployClassification:
         assert note == "deploy-failed"
 
 
+class TestDeployMisreportsRegressions:
+    """Two proven bugs, both of which made a HEALTHY provider look broken.
+
+    Fixtures are transcripts of real measured runs, not paraphrases.
+    """
+
+    # Abridged from an actual `just-akash deploy` pinned to a non-bidding provider:
+    # exit 1, but the DSEQ is printed at create time, long before bidding.
+    REAL_NO_BID = (
+        "[2026-07-17T11:56:29Z] Deployment created  DSEQ=1784289527633  manifest_len=812\n"
+        "[2026-07-17T11:56:31Z] STEP 3: Polling for bids...\n"
+        "[2026-07-17T11:59:11Z] NO BID FROM 1 allowlisted provider(s):\n"
+        "[2026-07-17T11:59:12Z] Cleaning up deployment 1784289527633 (foreign bids only)...\n"
+        "[2026-07-17T11:59:13Z] Deployment 1784289527633 closed after no bids received\n"
+    )
+
+    def test_no_bid_that_printed_a_dseq_is_no_bid_not_ok(self):
+        """The bug: the DSEQ regex short-circuited every note below it, so a no-bid
+        returned "ok". The smoke then polled a deployment deploy had already closed,
+        read state=closed, and reported a provider LEASE-DOWN that never happened."""
+        ref: dict = {"dseq": None}
+        with patch.object(sp, "_run", return_value=_completed(self.REAL_NO_BID, returncode=1)):
+            dseq, note = sp._deploy("sdl", "p", ref)
+        assert note == "no-bid"
+        assert dseq is None, "a closed no-bid deployment must never be handed back as a lease"
+
+    def test_no_bid_still_records_the_dseq_for_cleanup(self):
+        """deploy's own close is best-effort and can fail, so cleanup must still be
+        able to reach the deployment even though the deploy failed."""
+        ref: dict = {"dseq": None}
+        with patch.object(sp, "_run", return_value=_completed(self.REAL_NO_BID, returncode=1)):
+            sp._deploy("sdl", "p", ref)
+        assert ref["dseq"] == "1784289527633"
+
+    def test_exit_code_is_what_decides_success_not_the_printed_dseq(self):
+        """Same output, only the exit code differs — that alone must flip the note."""
+        ref: dict = {"dseq": None}
+        with patch.object(sp, "_run", return_value=_completed(self.REAL_NO_BID, returncode=0)):
+            _, ok_note = sp._deploy("sdl", "p", ref)
+        with patch.object(sp, "_run", return_value=_completed(self.REAL_NO_BID, returncode=1)):
+            _, bad_note = sp._deploy("sdl", "p", ref)
+        assert (ok_note, bad_note) == ("ok", "no-bid")
+
+    # The issue-#19 stale-bid path: deploy CLOSES the original order and re-creates a
+    # new one, so the transcript carries two dseqs. The last is the live lease.
+    REDEPLOY = (
+        "[12:00:00Z] Deployment created  DSEQ=1111111111111  manifest_len=812\n"
+        "[12:02:10Z] Lease attempt 1/3 hit a stale bid: re-fetching open bids...\n"
+        "[12:02:11Z]   Stale order 1111111111111 closed\n"
+        "[12:02:12Z]   Re-deployed: new order DSEQ=2222222222222 — fast-polling...\n"
+        "[12:03:01Z] Lease created successfully!\n"
+        "[12:03:01Z] DEPLOYMENT SUMMARY  DSEQ=2222222222222  provider=akashX price=10 uakt\n"
+        "Deployment Summary:\n  DSEQ: 2222222222222\n"
+    )
+
+    def test_redeploy_returns_the_live_dseq_not_the_closed_original(self):
+        """The bug: re.search took the FIRST dseq — the one deploy had just closed.
+        The smoke then tested a dead deployment (every feature LEASE-DOWN) while the
+        real lease ran on unattended, draining escrow."""
+        ref: dict = {"dseq": None}
+        with patch.object(sp, "_run", return_value=_completed(self.REDEPLOY, returncode=0)):
+            dseq, note = sp._deploy("sdl", "p", ref)
+        assert note == "ok"
+        assert dseq == "2222222222222", "must return the LIVE lease, not the closed original"
+
+    def test_redeploy_points_cleanup_at_the_live_lease(self):
+        """The escrow-safety half: cleanup must target the dseq that is actually up."""
+        ref: dict = {"dseq": None}
+        with patch.object(sp, "_run", return_value=_completed(self.REDEPLOY, returncode=0)):
+            sp._deploy("sdl", "p", ref)
+        assert ref["dseq"] == "2222222222222", "cleanup aimed at the closed dseq leaks escrow"
+
+
 class TestExecCheck:
     def test_exec_requires_both_zero_rc_and_token_in_stdout(self):
         # The whole reason this check exists: a cold container can return rc=0 with
@@ -1613,3 +1686,47 @@ class TestQuarantineMainGate:
         out = capsys.readouterr().out
         assert code == 1
         assert "fleet-wide simultaneous LEASE-DOWN" in out
+
+
+class TestNoBidPhrasingCoverage:
+    """Every no-bid message deploy can actually emit must classify as no-bid.
+
+    Caught in review (Copilot, PR #62): the regex was case-sensitive "NO BID|no bid",
+    so "No bids received within Ns" — deploy's message when NOTHING bid at all —
+    matched neither and fell through to deploy-failed, scoring a pure market
+    condition as a provider FAIL. It classified correctly only by accident, via the
+    co-occurring "(no bids)" cleanup log line.
+    """
+
+    def _note(self, out: str) -> str:
+        with patch.object(sp, "_run", return_value=_completed(out, returncode=1)):
+            return sp._deploy("sdl", "p", {"dseq": None})[1]
+
+    def test_no_bids_received_at_all(self):
+        """deploy.py: raise RuntimeError("No bids received within {n}s. ...")"""
+        assert (
+            self._note("No bids received within 180s. Your SDL may be unsatisfiable.") == "no-bid"
+        )
+
+    def test_no_bid_from_allowlisted_provider(self):
+        assert self._note("NO BID FROM 1 allowlisted provider(s):") == "no-bid"
+
+    def test_none_from_our_providers(self):
+        assert self._note("Received 6 bid(s) but NONE from our providers.") == "no-bid"
+
+    def test_foreign_bids_only(self):
+        assert self._note("Cleaning up deployment 1 (foreign bids only)...") == "no-bid"
+
+    def test_classification_does_not_depend_on_the_cleanup_log_line(self):
+        """The raise message ALONE must be enough. Previously the verdict hung on
+        deploy's incidental "Cleaning up deployment N (no bids)" log; reword that
+        log and a market no-bid would silently become a provider FAIL."""
+        assert self._note("No bids received within 180s.") == "no-bid"
+
+    def test_malformed_bids_stay_deploy_failed(self):
+        """ "No VALID bids ... all bid entries were malformed" is a data/API error,
+        not a market condition — it must NOT be excused as a no-bid skip."""
+        assert (
+            self._note("No valid bids received — all bid entries were malformed.")
+            == "deploy-failed"
+        )
