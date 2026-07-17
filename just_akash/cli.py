@@ -260,6 +260,28 @@ def main():
     )
     exec_p.add_argument("remote_cmd", help="Command to execute remotely")
 
+    # ── benchmark ──────────────────────────────────────
+    bench_p = subparsers.add_parser(
+        "benchmark",
+        help="Benchmark what a provider actually delivered (vCPU/RAM/disk/WAN)",
+        description=(
+            "Measure the hardware behind a lease: vCPU throughput, RAM bandwidth, disk "
+            "I/O, WAN RTT, plus contention (PSI / cgroup throttling). The smoke test "
+            "says whether a provider WORKS; this says whether it's any GOOD. Bounded "
+            "well under the lease's limits (256M mem / 256M disk / 1 thread) so it can "
+            "never OOM the container it is measuring. Run it on demand — not in the "
+            "smoke path, where its load would make a feature failure unattributable."
+        ),
+    )
+    bench_p.add_argument("--dseq", default="")
+    bench_p.add_argument("--service", default="", help=_SERVICE_HELP)
+    bench_p.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit one JSON object (for accruing/grading) instead of the table",
+    )
+
     # ── inject ─────────────────────────────────────────
     inject_p = subparsers.add_parser("inject", help="Inject secrets into a running deployment")
     inject_p.add_argument("--dseq", default="")
@@ -512,7 +534,76 @@ def main():
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
 
-    # ── inject ─────────────────────────────────────────
+    # ── benchmark ──────────────────────────────────────
+    elif args.command == "benchmark":
+        import io
+        import json as _json
+
+        from .api import AkashConsoleAPI, _extract_lease_provider
+        from .benchmark import (
+            BENCH_SH,
+            build_json_record,
+            format_results,
+            is_complete,
+            parse_results,
+        )
+
+        try:
+            client = AkashConsoleAPI(_require_api_key())
+            dseq = _resolve_deployment(client, args.dseq)
+            from .transport import make_transport
+
+            deployment = _enrich_deployment_with_provider(client, client.get_deployment(dseq))
+            transport = make_transport(
+                "lease-shell",
+                dseq=dseq,
+                api_key=client.api_key,
+                deployment=deployment,
+                service_name=args.service or None,
+            )
+            if not transport.validate():
+                print(
+                    "Error: lease-shell is not available for this deployment (no active "
+                    "lease or provider hostUri missing) — cannot benchmark.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            transport.prepare()
+            # The probe writes its BENCH- lines to the command's stdout, which the
+            # transport streams straight to ours; capture it instead so we can parse.
+            cap = io.BytesIO()
+
+            class _Capture:
+                buffer = cap
+
+                def write(self, *_a):
+                    pass
+
+                def flush(self):
+                    pass
+
+            real_stdout = sys.stdout
+            sys.stdout = _Capture()  # type: ignore[assignment]
+            try:
+                transport.exec(BENCH_SH)
+            finally:
+                sys.stdout = real_stdout
+            results = parse_results(cap.getvalue().decode("utf-8", errors="replace"))
+            # Reuse the shared, edge-case-tested lease-provider extractor rather than
+            # re-parsing the lease shape here (avoids drift on odd Console payloads).
+            provider = _extract_lease_provider(deployment) or ""
+            if args.as_json:
+                # build_json_record spreads the trusted fields last so a hostile probe
+                # can't shadow dseq/provider/complete (unit-tested in test_benchmark).
+                print(_json.dumps(build_json_record(dseq, provider, results)))
+            else:
+                print(format_results(provider or f"dseq {dseq}", results))
+            # A partial sample must not be graded as if it were a full one.
+            sys.exit(0 if is_complete(results) else 1)
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
     elif args.command == "inject":
         from .api import AkashConsoleAPI
 
