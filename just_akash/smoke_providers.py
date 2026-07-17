@@ -728,6 +728,12 @@ def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, s
     failed (note == "deploy-failed"). Backups are disabled so the lease can only
     land on the target provider. SSH_PUBKEY (set by main) is substituted into the
     SDL's PLACEHOLDER so sshd trusts our ephemeral key.
+
+    A returned dseq means a lease genuinely exists: deploy exits non-zero on every
+    pre-lease failure, and only ever returns 0 after create_lease succeeds. That is
+    what entitles the caller to read a later terminal state as a real LEASE-DOWN
+    rather than a lease that never formed. ``dseq_ref`` is populated whenever a dseq
+    was seen at all — including on failure — so cleanup can never miss one.
     """
     r = _run(
         f"uv run just-akash deploy --sdl {q(sdl_path)} "
@@ -736,10 +742,26 @@ def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, s
         timeout=420,
     )
     out = (r.stdout or "") + (r.stderr or "")
-    m = re.search(r"DSEQ[:=]\s*(\d+)", out)
-    if m:
-        dseq_ref["dseq"] = m.group(1)
-        return m.group(1), "ok"
+    # findall + [-1], never search: on the stale-bid path (issue #19) deploy closes
+    # the original order and re-creates a fresh one, printing BOTH dseqs. The LAST
+    # is the live lease; the first is already closed. Taking the first would test a
+    # dead deployment (every feature reads LEASE-DOWN) AND orphan the live lease to
+    # drain escrow. Only one dseq can ever be live: the re-deploy aborts outright if
+    # the original's close fails ("not re-deploying, to avoid double escrow").
+    dseqs = re.findall(r"DSEQ[:=]\s*(\d+)", out)
+    if dseqs:
+        # Record for cleanup even when the deploy FAILED: deploy closes its own
+        # deployment on the way out, but that close is best-effort and can itself
+        # fail, so the finally must still be able to destroy it. A redundant destroy
+        # is a no-op; a missed one drains real escrow.
+        dseq_ref["dseq"] = dseqs[-1]
+    # A printed DSEQ is NOT success. deploy prints it at CREATE time, long before
+    # bidding, then closes the deployment and exits non-zero on every no-bid path.
+    # Gating on the exit code is what stops a no-bid (a market condition) from being
+    # misreported as a provider LEASE-DOWN — and it is what makes the notes below
+    # reachable at all: without it the DSEQ match short-circuits every one of them.
+    if dseqs and r.returncode == 0:
+        return dseqs[-1], "ok"
     # Insufficient Console credit is account-wide, not a provider fault: the
     # deployment create returns HTTP 402 and NOTHING is created on-chain. Surface
     # it as its own note so the run skips cleanly instead of scoring the provider
