@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.23.0] — 2026-07-17
+
+### Fixed
+- **The smoke test was reporting healthy providers as `LEASE-DOWN`. It was our bug, not provider infra.** `_deploy` scraped the DSEQ out of deploy's output and returned `"ok"` **without ever checking the exit code**. But deploy prints the DSEQ at *create* time, long before bidding: on a no-bid it then closes the deployment itself and exits 1. The smoke took the scraped DSEQ as success, polled a deployment deploy had already closed, read `state=closed`, and blamed the provider for a lease that never existed. The `terminal state 'closed' after 6s` was just the first poll interval — the deployment had been closed ~150s earlier. The DSEQ match also short-circuited the `no-bid`/`no-credit` branches below it, making them **dead code**: telemetry shows `deploy` **PASS 116/116** and **not one `NO-BID` row** in the dataset's entire history. Measured: a real deploy pinned to a non-bidding provider exits **1**, prints `DSEQ=…`, logs `NO BID FROM 1 allowlisted provider(s)`, and closes the deployment — and `_deploy` returned `note='ok'` for it.
+- **A live lease could be orphaned, draining escrow.** On the stale-bid path (issue #19) deploy closes the original order, mints a new one, leases *that*, and exits **0** — printing both dseqs. `re.search` returns the **first**, so the smoke tested the **closed** original (every feature reading `LEASE-DOWN`) while the **live** lease ran on unattended and cleanup destroyed the wrong dseq. Now uses `re.findall(...)[-1]`. Only one dseq can ever be live: the re-deploy aborts if the original's close fails, "to avoid double escrow". The exit-code gate does **not** fix this (it exits 0) and last-DSEQ does not fix the no-bid misreport — both are load-bearing.
+- `dseq_ref` is now recorded whenever a DSEQ is seen **at all**, including on failure: deploy's own close is best-effort and can fail, so cleanup must still reach it. A redundant destroy is a no-op; a missed one drains real escrow.
+
+Validated live across all 3 providers: hgulk6 (genuinely not bidding) now reports an honest `NO-BID` skip instead of a fake `LEASE-DOWN`, while aaul and z9nr both pass 10/10. Regression tests use transcripts of the real measured runs and were verified to fail against the pre-fix code.
+
 ## [1.22.0] — 2026-07-16
 
 ### Changed
