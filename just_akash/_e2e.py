@@ -193,8 +193,10 @@ def _confirm_settled(dseq: str, *, attempts: int = 8, interval_s: int = 3) -> bo
     Polling also covers transient blips, which matters because the caller fails
     CLOSED: without it a single API hiccup would report a leak that isn't one.
     """
-    last_state = ""
+    saw_open = False  # at least one probe positively read an open state
+    all_open = True  # EVERY attempt positively read an open state (no blip, no unknown)
     for attempt in range(1, attempts + 1):
+        got_open = False
         try:
             cmd = f"uv run just-akash status --dseq {shlex.quote(str(dseq))} --json"
             r = _run(cmd, timeout=30)
@@ -202,16 +204,21 @@ def _confirm_settled(dseq: str, *, attempts: int = 8, interval_s: int = 3) -> bo
                 state = str(json.loads(r.stdout).get("state", "")).strip().lower()
                 if state in _SETTLED_STATES:
                     return True
-                # Anything else — `active` (not settled yet) or an unrecognised value
-                # (which is UNKNOWN, never proof of life) — keeps the poll going.
-                last_state = state
+                if state in _OPEN_STATES:
+                    saw_open = got_open = True
+                # An unrecognised value is UNKNOWN, never proof of life — it leaves
+                # got_open False, so the window can no longer claim "STILL ACTIVE".
         except Exception:  # noqa: BLE001 — a probe failure must never raise from cleanup
             pass
+        if not got_open:
+            all_open = False
         if attempt < attempts:
             time.sleep(interval_s)
-    # Window exhausted. Only a state we positively recognise as open lets us claim
-    # "STILL ACTIVE"; anything else is an honest "could not confirm".
-    if last_state in _OPEN_STATES:
+    # "STILL ACTIVE" (False) requires that EVERY probe positively read open — one
+    # stale `active` followed by blips/unknowns is not persistence, it's unknown.
+    # Anything short of that is an honest "could not confirm" (None). Both fail the
+    # audit closed; they differ only in the message.
+    if saw_open and all_open:
         return False
     return None
 
@@ -236,7 +243,7 @@ def robust_destroy(dseq: str, *, retries: int = 2, audit: bool = True) -> bool:
     last_err = ""
     for attempt in range(1, retries + 2):
         try:
-            r = _run(f"just destroy {dseq}", input_text="y\n", timeout=60)
+            r = _run(f"just destroy {shlex.quote(str(dseq))}", input_text="y\n", timeout=60)
             if _destroy_succeeded(r):
                 _pass(f"Deployment {dseq} closed (attempt {attempt})")
                 break

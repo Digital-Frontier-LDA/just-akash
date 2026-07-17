@@ -9,6 +9,7 @@ tier resolution from env vars.
 
 from __future__ import annotations
 
+import shlex
 import signal
 import subprocess
 from itertools import chain, repeat
@@ -740,12 +741,12 @@ class TestRunShellInjectionContract:
     the cmd string passed to subprocess.run.
     """
 
-    def test_dseq_is_passed_unquoted_to_shell_today(self):
-        """Pin: today, dseq is interpolated raw into the shell command.
-
-        If/when the implementation switches to shlex.quote or argv list,
-        update this test (and add a corresponding test that injection no
-        longer works).
+    def test_dseq_is_shell_quoted_in_destroy(self):
+        """The destroy command interpolates dseq under shell=True, so it MUST quote
+        it — the same guarantee the audit command carries. (This replaced an earlier
+        test that pinned the raw-interpolation behaviour as a known gap; CodeRabbit,
+        PR #63, rightly flagged that the audit-quoting work left the FIRST command
+        executed still injectable.)
         """
         with (
             patch("just_akash._e2e.subprocess.run") as mock_run,
@@ -753,28 +754,24 @@ class TestRunShellInjectionContract:
         ):
             mock_run.side_effect = [
                 _completed(0, stdout="closed"),
-                _completed(0, stdout=""),
+                _completed(0, stdout='{"state": "closed"}'),
             ]
-            # The injection payload — adversarial input.
             payload = "12345 ; echo PWNED"
             robust_destroy(payload, audit=True)
 
-            destroy_call = mock_run.call_args_list[0]
-            cmd = destroy_call.args[0]
-            # Today the cmd contains the raw payload — no shell-escaping.
-            assert cmd == f"just destroy {payload}", (
-                f"Expected raw interpolation today; got {cmd!r}. If this "
-                "fails because dseq is now shell-quoted, that's a SECURITY "
-                "WIN — update this test to assert the quoted form, AND add "
-                "a positive test that '; echo PWNED' is no longer parsed "
-                "as a separate command."
+            cmd = mock_run.call_args_list[0].args[0]
+            # The whole payload is a single quoted argument — the "; echo PWNED" can
+            # no longer be parsed by the shell as a separate command.
+            assert cmd == f"just destroy {shlex.quote(payload)}", (
+                f"destroy command must shell-quote the dseq; got {cmd!r}"
             )
-            # Confirm shell=True is still used (the reason injection works).
-            assert destroy_call.kwargs.get("shell") is True, (
-                "shell=True is required for the current f-string command "
-                "format. If shell=False, the payload would be safe — "
-                "update this test to reflect the new contract."
-            )
+            assert "'12345 ; echo PWNED'" in cmd
+            assert cmd.endswith("'")  # closing quote — payload fully contained
+
+    def test_a_plain_numeric_dseq_needs_no_quoting_change(self):
+        """Guarantee the quoting is transparent for real dseqs: shlex.quote leaves a
+        pure-digit string untouched, so nothing about normal operation changes."""
+        assert shlex.quote("1784291290915") == "1784291290915"
 
     def test_audit_command_quotes_the_dseq_so_it_stays_injection_safe(self):
         """The audit can no longer be a static literal — it must name the deployment
@@ -1534,6 +1531,28 @@ class TestUnknownStateIsNotAClaimOfLife:
         result, out = self._run_audit('{"dseq": "12345"}', capsys)
         assert result is False
         assert "could not confirm" in out.lower()
+
+    def test_one_active_then_unreadable_is_not_claimed_still_active(self, capsys):
+        """Caught in review (CodeRabbit, PR #63): a single `active` read followed by
+        blips must NOT be reported as persistent activity. We saw it open ONCE, then
+        lost contact — that is "could not confirm", not "STILL ACTIVE". Only `active`
+        that positively persists through EVERY probe earns the stronger message."""
+        with (
+            patch("just_akash._e2e.subprocess.run") as mock_run,
+            patch("just_akash._e2e.time.sleep"),
+        ):
+            mock_run.side_effect = chain(
+                [
+                    _completed(0, stdout="closed"),  # destroy
+                    _completed(0, stdout='{"state": "active"}'),  # one open read...
+                ],
+                repeat(_completed(1, stderr="API 503")),  # ...then we lose contact
+            )
+            result = robust_destroy("12345")
+            out = capsys.readouterr().out
+        assert result is False, "still fails closed — we could not confirm settlement"
+        assert "could not confirm" in out.lower()
+        assert "STILL ACTIVE" not in out, "one stale active read is not persistence"
 
 
 class TestAuditPollsBecauseCloseIsNotInstant:
