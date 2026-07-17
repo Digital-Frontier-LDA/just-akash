@@ -81,14 +81,18 @@ done
 # probe leaves no artifact behind inside its container.
 BENCH_TMP="/tmp/.bench.$$"
 trap 'rm -f "$BENCH_TMP" "$BENCH_TMP.w" "$BENCH_TMP.r"' EXIT INT TERM
+# NB: no `|| echo na` on these — `tail` exits 0 even on empty input, so the fallback
+# can't fire on a pipeline (same gotcha the cpuinfo lines above document). When the
+# grep finds no rate the value is simply empty, which the parser drops → absent =
+# unmeasured, exactly the contract we want.
 dd if=/dev/zero of="$BENCH_TMP" bs=1M count={_DISK_MB} conv=fdatasync 2>"$BENCH_TMP.w" >/dev/null
-say disk_write "$(grep -oE '[0-9.]+ [MG]B/s' "$BENCH_TMP.w" 2>/dev/null | tail -1 || echo na)"
+say disk_write "$(grep -oE '[0-9.]+ [MG]B/s' "$BENCH_TMP.w" 2>/dev/null | tail -1)"
 # iflag=direct bypasses the page cache, so this measures the DEVICE rather than the
 # pages the write just populated (conv=fdatasync flushes but does NOT evict them).
-# If the fs can't do O_DIRECT (overlayfs/tmpfs), dd errors and disk_read is honestly
-# `na` — better than a cache-inflated number that would skew provider grading.
+# If the fs can't do O_DIRECT (overlayfs/tmpfs), dd errors, the grep finds no rate,
+# and disk_read is absent — better than a cache-inflated number that skews grading.
 dd if="$BENCH_TMP" of=/dev/null bs=1M iflag=direct 2>"$BENCH_TMP.r" >/dev/null
-say disk_read "$(grep -oE '[0-9.]+ [MG]B/s' "$BENCH_TMP.r" 2>/dev/null | tail -1 || echo na)"
+say disk_read "$(grep -oE '[0-9.]+ [MG]B/s' "$BENCH_TMP.r" 2>/dev/null | tail -1)"
 rm -f "$BENCH_TMP" "$BENCH_TMP.w" "$BENCH_TMP.r"
 
 # --- cpu + ram via sysbench (best-effort install; `na` if unavailable) ---
