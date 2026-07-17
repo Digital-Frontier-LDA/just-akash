@@ -340,12 +340,17 @@ class LeaseShellTransport(Transport):
     def _get_proxy_ws_url(self) -> str:
         proxy = self._config.provider_proxy_url
         parsed = urllib.parse.urlparse(proxy)
-        if parsed.scheme == "https":
-            scheme = "wss"
-        elif parsed.scheme == "http":
-            scheme = "ws"
-        else:
-            scheme = parsed.scheme
+        # Map the HTTP scheme to its WebSocket equivalent, then REQUIRE TLS: connect()
+        # is always given a TLS context, so a plaintext ws endpoint can't work anyway.
+        # Rejecting it here turns that into a clear, early error instead of an opaque
+        # failure deep in the websockets client (the secret-bearing exec/inject paths
+        # must never fall back to an unencrypted socket).
+        scheme = {"https": "wss", "http": "ws"}.get(parsed.scheme, parsed.scheme)
+        if scheme != "wss":
+            raise RuntimeError(
+                f"provider_proxy_url must use a TLS scheme (https/wss); got "
+                f"{parsed.scheme!r}. A plaintext proxy endpoint is not supported."
+            )
         return urllib.parse.urlunparse(parsed._replace(scheme=scheme))
 
     @staticmethod
