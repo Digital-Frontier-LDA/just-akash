@@ -262,6 +262,25 @@ class TestLeaseShellTransportStub:
         assert url.startswith("wss://")
         assert "http://backend" in url
 
+    def test_get_proxy_ws_url_accepts_a_wss_override(self):
+        """A wss:// override is a TLS scheme and must be preserved as-is."""
+        config = TransportConfig(
+            dseq="123", api_key="key", provider_proxy_url="wss://proxy.example.com/relay"
+        )
+        assert LeaseShellTransport(config)._get_proxy_ws_url().startswith("wss://")
+
+    def test_get_proxy_ws_url_rejects_a_plaintext_endpoint(self):
+        """connect() always supplies a TLS context, so a plaintext proxy endpoint
+        can't work — reject it with a clear error rather than fail opaquely deep in
+        the websockets client. The secret-bearing exec/inject paths must never fall
+        back to an unencrypted socket. (Hardening from review, PR #64.)"""
+        for scheme in ("http", "ws"):
+            config = TransportConfig(
+                dseq="123", api_key="key", provider_proxy_url=f"{scheme}://proxy.example.com/relay"
+            )
+            with pytest.raises(RuntimeError, match="TLS scheme"):
+                LeaseShellTransport(config)._get_proxy_ws_url()
+
 
 # --- make_transport factory ---
 

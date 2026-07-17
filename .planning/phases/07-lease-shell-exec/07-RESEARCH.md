@@ -1,5 +1,13 @@
 # Phase 7: Lease-Shell Exec — Research
 
+> ⚠️ **SUPERSEDED — trust the shipped code, not this document.**
+> This research describes an earlier *direct-provider* design — `wss://{provider}/…?cmd=…`
+> with self-signed certs accepted via `ssl.CERT_NONE`. The shipped implementation
+> **reversed** it: exec/inject route through the Console **provider-proxy** with **full
+> TLS verification**, and the command rides the proxy URL's `cmd2=` (or a stdin frame),
+> not a `?cmd=` query against the provider. For the real design see
+> `just_akash/transport/lease_shell.py`; this file is kept for history only (issue #38).
+
 **Researched:** 2026-04-19
 **Domain:** WebSocket binary framing, Akash JWT authentication, Python async-to-sync bridge
 **Confidence:** HIGH (PROTOCOL.md is authoritative; websockets API verified locally; JWT endpoint confirmed from Console source)

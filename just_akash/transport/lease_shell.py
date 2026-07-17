@@ -1,9 +1,18 @@
 """
 Lease-shell WebSocket transport via Console Provider-Proxy (Phase 7).
 
-Connects to the Akash Console provider-proxy (wss://provider-proxy.akash.network/)
-which relays WebSocket frames to the target provider. Uses JWT auth obtained from
-the Console API.
+Connects to the Akash Console provider-proxy, which relays WebSocket frames to the
+target provider. The default endpoint is ``TransportConfig.provider_proxy_url`` —
+``https://console.akash.network/provider-proxy-mainnet`` (see base.py) — and
+``_get_proxy_ws_url`` swaps its ``https`` scheme for ``wss`` at connect time, so the
+actual socket URL is ``wss://console.akash.network/provider-proxy-mainnet``. Auth is
+a JWT obtained from the Console API. On the default (``https``) endpoint the socket is
+``wss`` with full TLS verification — this is a Console-hosted proxy, NOT a direct
+provider connection (an earlier design that talked to providers directly with certs
+disabled was abandoned; trust the code). Keep the endpoint on a TLS scheme —
+``https`` (or a ``wss`` override, which ``_get_proxy_ws_url`` preserves) — since the
+client always hands ``connect()`` a TLS context. A plaintext (``http``/``ws``-scheme)
+override is unsupported: it would fail rather than silently downgrade.
 
 Protocol reference: docs/PROTOCOL.md
 """
@@ -331,12 +340,17 @@ class LeaseShellTransport(Transport):
     def _get_proxy_ws_url(self) -> str:
         proxy = self._config.provider_proxy_url
         parsed = urllib.parse.urlparse(proxy)
-        if parsed.scheme == "https":
-            scheme = "wss"
-        elif parsed.scheme == "http":
-            scheme = "ws"
-        else:
-            scheme = parsed.scheme
+        # Map the HTTP scheme to its WebSocket equivalent, then REQUIRE TLS: connect()
+        # is always given a TLS context, so a plaintext ws endpoint can't work anyway.
+        # Rejecting it here turns that into a clear, early error instead of an opaque
+        # failure deep in the websockets client (the secret-bearing exec/inject paths
+        # must never fall back to an unencrypted socket).
+        scheme = {"https": "wss", "http": "ws"}.get(parsed.scheme, parsed.scheme)
+        if scheme != "wss":
+            raise RuntimeError(
+                f"provider_proxy_url must use a TLS scheme (https/wss); got "
+                f"{parsed.scheme!r}. A plaintext proxy endpoint is not supported."
+            )
         return urllib.parse.urlunparse(parsed._replace(scheme=scheme))
 
     @staticmethod

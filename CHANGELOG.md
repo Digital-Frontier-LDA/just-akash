@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.28.0] — 2026-07-17
+
+### Changed
+- **`_get_proxy_ws_url` now rejects a plaintext `provider_proxy_url`.** `connect()` is always given a TLS context, so an `http://`/`ws://` proxy endpoint could never work — it failed opaquely deep in the websockets client. It now raises a clear `RuntimeError` naming the bad scheme, so the secret-bearing exec/inject paths can never fall back to an unencrypted socket. A `wss://` override is still accepted (it's TLS). (Hardening prompted by review on the docs PR below.)
+
+### Docs
+- Corrected the `lease_shell.py` module docstring: the default proxy is `https://console.akash.network/provider-proxy-mainnet` (converted to `wss://` at connect time), not the stale `wss://provider-proxy.akash.network/`; and the connection is a Console-hosted proxy with full TLS, not a direct-provider connection. (Issue #38 item 1.)
+- Added a "SUPERSEDED — trust the shipped code" banner to the phase-07/08 design docs, which still described the abandoned direct-provider + `ssl.CERT_NONE` + `?cmd=` design. (Issue #38 item 2.)
+
 ## [1.27.0] — 2026-07-17
 
 ### Fixed (security)

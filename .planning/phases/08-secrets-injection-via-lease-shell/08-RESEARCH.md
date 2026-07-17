@@ -1,5 +1,13 @@
 # Phase 8: Secrets Injection via Lease-Shell - Research
 
+> ⚠️ **SUPERSEDED — trust the shipped code, not this document.**
+> This research assumes the earlier *direct-provider* design (`?cmd=` against the
+> provider with `ssl.CERT_NONE`). The shipped code routes through the Console
+> **provider-proxy** with **full TLS verification**. Note also that inject's final
+> form streams the secret over a `104` stdin frame via `head -c <n> > path` (v1.27.0,
+> PR #39) — not the `echo | base64 -d` shown here. See
+> `just_akash/transport/lease_shell.py`; kept for history only (issue #38).
+
 **Researched:** 2026-04-19
 **Domain:** WebSocket-based file delivery (secrets injection) over Akash lease-shell with JWT authentication
 **Confidence:** HIGH
