@@ -9,9 +9,10 @@ actual socket URL is ``wss://console.akash.network/provider-proxy-mainnet``. Aut
 a JWT obtained from the Console API. On the default (``https``) endpoint the socket is
 ``wss`` with full TLS verification — this is a Console-hosted proxy, NOT a direct
 provider connection (an earlier design that talked to providers directly with certs
-disabled was abandoned; trust the code). Keep the endpoint on ``https``: the client
-always hands ``connect()`` a TLS context, so a non-``https`` override is unsupported
-(it does not produce a working plaintext connection).
+disabled was abandoned; trust the code). Keep the endpoint on a TLS scheme —
+``https`` (or a ``wss`` override, which ``_get_proxy_ws_url`` preserves) — since the
+client always hands ``connect()`` a TLS context. A plaintext (``http``/``ws``-scheme)
+override is unsupported: it would fail rather than silently downgrade.
 
 Protocol reference: docs/PROTOCOL.md
 """
