@@ -1,9 +1,14 @@
 """
 Lease-shell WebSocket transport via Console Provider-Proxy (Phase 7).
 
-Connects to the Akash Console provider-proxy (wss://provider-proxy.akash.network/)
-which relays WebSocket frames to the target provider. Uses JWT auth obtained from
-the Console API.
+Connects to the Akash Console provider-proxy, which relays WebSocket frames to the
+target provider. The default endpoint is ``TransportConfig.provider_proxy_url`` —
+``https://console.akash.network/provider-proxy-mainnet`` (see base.py) — and
+``_get_proxy_ws_url`` swaps its ``https`` scheme for ``wss`` at connect time, so the
+actual socket URL is ``wss://console.akash.network/provider-proxy-mainnet``. Auth is
+a JWT obtained from the Console API. Full TLS verification is used — this is a
+Console-hosted proxy, NOT a direct provider connection (an earlier design that
+talked to providers directly with certs disabled was abandoned; trust the code).
 
 Protocol reference: docs/PROTOCOL.md
 """

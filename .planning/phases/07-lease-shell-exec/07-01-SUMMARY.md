@@ -29,6 +29,11 @@ tags:
 
 # Phase 7 Plan 1: Lease-Shell Exec Implementation Summary
 
+> ⚠️ **SUPERSEDED — trust the shipped code, not this document.**
+> Parts of this summary reference the earlier *direct-provider* design (`?cmd=` with
+> `ssl.CERT_NONE`). The shipped code routes through the Console **provider-proxy** with
+> **full TLS verification**. See `just_akash/transport/lease_shell.py` (issue #38).
+
 JWT authentication + synchronous WebSocket command execution over lease-shell transport. Replaces Phase 6 stub with full exec() + prepare() implementation. 34 unit tests cover JWT fetch, provider URL extraction, frame dispatch, and end-to-end happy path.
 
 ## Overview
