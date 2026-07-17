@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.24.0] — 2026-07-17
+
+### Fixed
+- **The leak audit trusted `just list`, which lies.** Measured: `just list` reported dseq `1784291290915` as **active** while that deployment's own record read `state=closed`, `escrow.state=closed`, `funds=0`. The collection endpoint (`GET /v1/deployments`) serves stale state; the per-deployment endpoint (`GET /v1/deployments/{dseq}`) is authoritative. `robust_destroy`'s post-destroy audit trusted the list, so a **perfectly clean destroy** printed `STILL listed after destroy — manual cleanup required` — and it fired in a real 3-provider validation run: a flake, in the suite whose whole job is to not flake. The false FAIL is the *benign* direction; the same staleness can report a deployment **GONE while its escrow is still open**, a silent leak — which is the exact thing the audit exists to catch. The audit now reads the deployment's own record and **fails closed**: only a positive "settled" reading clears it, because silence is what a leak looks like. It retries first — without that, one transient API blip would report a leak that isn't one, trading a silent-leak bug for a flaky-red one.
+- A per-deployment read must name its dseq, so the audit can no longer be the static literal that made it injection-safe by construction. The **guarantee** is preserved by shell-quoting (`_run` uses `shell=True`, so an unquoted dseq is a live injection vector); the test now pins the guarantee rather than the obsolete mechanism, asserting it with a real injection payload. Substring collisions (dseq `123` vs an unrelated active `12345`) become impossible by construction rather than guarded against — we ask for *our* record instead of scanning a shared list.
+- `test_audit_detects_lingering_deployment` passed **for the wrong reason**: its fixture was unparseable text, exercising the "could not confirm" path rather than the "still active" path it claimed to test.
+
+Known gap, deliberately not widened here: `test_lifecycle.py` step 7 (`"just list — final audit"`) has the same weakness. Contrary to the report that prompted this, **no fails-closed `get_deployment` check existed anywhere** — that file has 7 steps, not 8, and never mentions escrow. New tests verified to fail against the pre-fix code (4/6).
+
 ## [1.23.0] — 2026-07-17
 
 ### Fixed
