@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.25.0] — 2026-07-17
+
+### Changed
+- **Latency-only SLO gate — the accrued telemetry view gates on p95 latency, never on reliability.** Closes out the 2026-07-14..17 accumulation burst. `aggregate()` now gives `LEASE-DOWN` its own counter, OUT of the pass/fail denominator, so the reported rate answers the actionable question ("when the lease was up, did the feature work?") instead of being deflated by provider infra the project already decided is non-gating (fleet-wide since v1.22.0). `--check` gates on **latency only**; reliability is printed as informational by design — this accrued view has no `fail_mode`/`in_pod_marker`/`eventual` context, so it structurally cannot tell a tooling regression on a healthy lease (which the per-run smoke gate already catches with full context) from demoted provider infra.
+- New analyzer flags: `--min-version` (drop pre-fix rows a shipped fix made impossible) and `--quarantine` (measured and printed, never gating).
+- **A `--check` with no ceilings now says so loudly.** An empty `--max-p95` gates on nothing — a valid calibration state, but indistinguishable from a live gate silently disabled by an empty `SMOKE_LATENCY_SLO_P95` env var. Since this whole telemetry effort exists because a gate that quietly stopped gating went unnoticed, it now prints `CHECK OK (GATE DISABLED — no ceilings set)` and warns on stderr rather than a bare green `CHECK OK`. (Caught in review by Copilot.)
+- Workflow: the report step's ceilings + version floor + quarantine secret are wired and `continue-on-error` is removed — the gate is live.
+
 ## [1.24.0] — 2026-07-17
 
 ### Fixed
