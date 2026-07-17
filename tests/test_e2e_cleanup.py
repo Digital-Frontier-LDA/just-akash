@@ -390,18 +390,15 @@ class TestRobustDestroyAdversarial:
             audit_cmd = mock_run.call_args_list[1].args[0]
             assert "123" in audit_cmd and "12345" not in audit_cmd
 
-    def test_audit_still_detects_exact_dseq_match(self):
-        """Sanity: word-boundary match must still detect the real DSEQ."""
-        with (
-            patch("just_akash._e2e.subprocess.run") as mock_run,
-            patch("just_akash._e2e.time.sleep"),
-        ):
-            mock_run.side_effect = [
-                _completed(0, stdout="Deployment 12345 closed"),
-                # Same DSEQ surrounded by non-digits on both sides — must match.
-                _completed(0, stdout="dseq=12345 active\n"),
-            ]
-            assert robust_destroy("12345") is False
+    # test_audit_still_detects_exact_dseq_match was REMOVED here. It pinned
+    # word-boundary matching of `just list` output at the robust_destroy level, which
+    # the audit no longer does at all — it reads the deployment's own record. The
+    # test kept passing, but via the "could not confirm" path (its fixture is not
+    # JSON), while claiming to prove regex matching: a green assertion about
+    # behaviour that no longer exists. The word-boundary contract is still pinned
+    # directly on _dseq_in_list_output (TestDseqWordBoundaryRegexEdges), and
+    # test_audit_cannot_confuse_a_dseq_with_a_longer_one covers the structural
+    # property that replaced it.
 
     def test_negative_retries_clamped_to_one_attempt(self):
         """retries<0 must NEVER skip the destroy loop. Clamp to 0 retries
