@@ -278,6 +278,39 @@ class TestReportAndMain:
             at.main([str(f), "--check", "--min-samples", "20", "--max-p95", "ingress=10000"]) == 0
         )
 
+    def test_check_with_empty_ceilings_warns_that_the_gate_is_disabled(self, tmp_path, capsys):
+        """--check with an empty --max-p95 gates on nothing. That is a valid
+        calibration state, but it looks identical to a live gate silently disabled by
+        an empty SMOKE_LATENCY_SLO_P95 env var — the exact class of failure this
+        telemetry effort exists to catch. It must say so loudly, not print a bare
+        green CHECK OK. (Caught in review by Copilot, PR #60.)"""
+        rows = [
+            {"provider": "p", "feature": "ingress", "outcome": "PASS", "latency_ms": 400}
+            for _ in range(20)
+        ]
+        f = tmp_path / "t.jsonl"
+        f.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+        rc = at.main([str(f), "--check", "--min-samples", "20", "--max-p95", ""])
+        out = capsys.readouterr()
+        # Still exits 0 (nothing to gate on), but the disabled state is unmissable.
+        assert rc == 0
+        assert "GATE DISABLED" in out.out
+        assert "DISABLED" in out.err and "SMOKE_LATENCY_SLO_P95" in out.err
+
+    def test_check_with_ceilings_does_not_warn_about_a_disabled_gate(self, tmp_path, capsys):
+        """The warning must fire ONLY when ceilings are absent — a configured gate
+        must stay quiet so the warning keeps its signal."""
+        rows = [
+            {"provider": "p", "feature": "ingress", "outcome": "PASS", "latency_ms": 400}
+            for _ in range(20)
+        ]
+        f = tmp_path / "t.jsonl"
+        f.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+        at.main([str(f), "--check", "--min-samples", "20", "--max-p95", "ingress=10000"])
+        out = capsys.readouterr()
+        assert "GATE DISABLED" not in out.out
+        assert "DISABLED" not in out.err
+
 
 class TestLatencySlo:
     def test_parse_thresholds(self):

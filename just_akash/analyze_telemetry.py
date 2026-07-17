@@ -372,10 +372,24 @@ def main(argv: list[str] | None = None) -> int:
                     tag = "  (quarantined — not gating)" if provider in quarantined else ""
                     print(f"  {provider} {feature}: p95 {_fmt_ms(p95)} > {_fmt_ms(thr)}{tag}")
             failed = bool(gating)
+        else:
+            # --check with no ceilings gates on NOTHING. That is a valid setup only
+            # while thresholds are still being calibrated — but it looks identical to
+            # a live gate that a misconfigured/empty SMOKE_LATENCY_SLO_P95 env var has
+            # silently disabled. This whole telemetry effort exists because a gate
+            # that quietly stopped gating went unnoticed, so say so LOUDLY rather than
+            # print a green "CHECK OK" that hides it.
+            print(
+                "\nWARNING: --check is on but NO latency ceilings were provided "
+                "(--max-p95 is empty) — the latency gate is DISABLED. If this run is "
+                "meant to gate, SMOKE_LATENCY_SLO_P95 is unset or empty.",
+                file=sys.stderr,
+            )
 
         if failed:
             return 1
-        print("\nCHECK OK (p95 within ceilings where set; reliability is informational).")
+        status = "within ceilings" if thresholds else "GATE DISABLED — no ceilings set"
+        print(f"\nCHECK OK ({status}; reliability is informational).")
     return 0
 
 
