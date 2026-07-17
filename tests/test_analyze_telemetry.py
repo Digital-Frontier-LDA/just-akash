@@ -177,6 +177,23 @@ class TestReportAndMain:
         assert g["attempts"] == 20  # lease-downs stay OUT of the denominator
         assert g["pass_rate"] == 1.0  # 20/20, not 20/30
 
+    def test_lease_down_is_visible_in_the_report_despite_100pct_pass(self):
+        """LEASE-DOWN is out of the pass/fail rate, but it IS provider-health signal
+        and must not vanish from the report — otherwise a provider that lease-downed
+        most of its runs looks pristine at 100% pass over a tiny denominator. (Caught
+        in review by Copilot, PR #60.)"""
+        rows = [
+            {"provider": "p", "feature": "exec", "outcome": "LEASE-DOWN", "latency_ms": None}
+            for _ in range(10)
+        ] + [{"provider": "p", "feature": "exec", "outcome": "PASS", "latency_ms": 1000}]
+        report = at.format_report(at.aggregate(rows))
+        assert "100%" in report  # the misleading-on-its-own headline...
+        assert "LEASE-DOWN×10" in report  # ...now carries the health signal beside it
+
+    def test_no_lease_down_flag_when_there_are_none(self):
+        rows = [{"provider": "p", "feature": "exec", "outcome": "PASS", "latency_ms": 1000}]
+        assert "LEASE-DOWN" not in at.format_report(at.aggregate(rows))
+
     def test_quarantined_provider_latency_breach_does_not_gate(self, tmp_path, capsys):
         """A quarantined provider being slow is the same known infra we already
         decided not to gate on — measured and printed, never failing."""

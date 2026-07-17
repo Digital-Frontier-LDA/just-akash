@@ -173,6 +173,12 @@ def format_report(groups: dict[tuple[str, str], dict]) -> str:
         pr = g["pass_rate"]
         if g["attempts"] and pr is not None and pr < DEFAULT_SLO:
             flags.append(f"LOW-PASS({g['pass']}/{g['attempts']})")
+        # Surface LEASE-DOWN in the report. It is excluded from the pass/fail rate
+        # (non-gating since v1.22.0), but it IS provider-health signal — without this
+        # flag a provider could show 100% pass over a tiny `att` denominator while
+        # having lease-downed most of its runs, and the report would look pristine.
+        if g.get("lease_down"):
+            flags.append(f"LEASE-DOWN×{g['lease_down']}")
         cap = g.get("cap_ms")
         p99 = g.get("p99")
         if cap and p99 is not None and p99 > _CAP_TIGHT_FRACTION * cap:
