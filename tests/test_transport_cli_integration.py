@@ -10,6 +10,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests._creds import fake_api_key
+
+# One throwaway key — a call, not a literal, so detect-secrets stays quiet and this
+# file leaves .secrets.baseline (issue #38 item 3).
+_KEY = fake_api_key()
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -18,7 +24,7 @@ import pytest
 def _run(monkeypatch, args, env=None):
     """Run CLI with given args; return SystemExit code (or None if no exit)."""
     monkeypatch.setattr(sys, "argv", args)
-    env = env or {"AKASH_API_KEY": "test-key"}
+    env = env or {"AKASH_API_KEY": _KEY}
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     from just_akash.cli import main
@@ -51,7 +57,7 @@ def _mock_client(deployment=None):
             ]
         }
     client = MagicMock()
-    client.api_key = "test-key"
+    client.api_key = _KEY
     client.get_deployment.return_value = deployment
     client.list_deployments.return_value = [{"dseq": "99999"}]
     return client
@@ -266,33 +272,33 @@ class TestMakeTransportRouting:
     def test_make_transport_ssh_returns_ssh_transport(self):
         from just_akash.transport import SSHTransport, make_transport
 
-        t = make_transport("ssh", dseq="123", api_key="key")
+        t = make_transport("ssh", dseq="123", api_key=_KEY)
         assert isinstance(t, SSHTransport)
 
     def test_make_transport_lease_shell_returns_stub(self):
         from just_akash.transport import LeaseShellTransport, make_transport
 
-        t = make_transport("lease-shell", dseq="123", api_key="key")
+        t = make_transport("lease-shell", dseq="123", api_key=_KEY)
         assert isinstance(t, LeaseShellTransport)
 
     def test_make_transport_with_deployment_kwarg(self):
         from just_akash.transport import make_transport
 
         deployment = {"leases": []}
-        t = make_transport("ssh", dseq="123", api_key="key", deployment=deployment)
+        t = make_transport("ssh", dseq="123", api_key=_KEY, deployment=deployment)
         assert t._config.deployment == deployment  # type: ignore[attr-defined]
 
     def test_make_transport_with_service_name(self):
         from just_akash.transport import make_transport
 
-        t = make_transport("lease-shell", dseq="123", api_key="key", service_name="web")
+        t = make_transport("lease-shell", dseq="123", api_key=_KEY, service_name="web")
         assert t._config.service_name == "web"  # type: ignore[attr-defined]
 
     def test_make_transport_with_console_url_override(self):
         from just_akash.transport import make_transport
 
         t = make_transport(
-            "ssh", dseq="123", api_key="key", console_url="https://custom.akash.example.com"
+            "ssh", dseq="123", api_key=_KEY, console_url="https://custom.akash.example.com"
         )
         assert t._config.console_url == "https://custom.akash.example.com"  # type: ignore[attr-defined]
 
@@ -309,7 +315,7 @@ class TestLeaseShellStubBehaviour:
         """Lease shell transport without deployment data."""
         from just_akash.transport import LeaseShellTransport, TransportConfig
 
-        return LeaseShellTransport(TransportConfig(dseq="1", api_key="k"))
+        return LeaseShellTransport(TransportConfig(dseq="1", api_key=_KEY))
 
     def _t_with_deployment(self):
         """Lease shell transport with valid deployment data."""
@@ -318,7 +324,7 @@ class TestLeaseShellStubBehaviour:
         return LeaseShellTransport(
             TransportConfig(
                 dseq="1",
-                api_key="k",
+                api_key=_KEY,
                 deployment={
                     "leases": [
                         {
@@ -412,19 +418,19 @@ class TestSSHTransportRegression:
     def test_ssh_transport_validate_with_port_22(self):
         from just_akash.transport import SSHTransport, TransportConfig
 
-        config = TransportConfig(dseq="123", api_key="key", deployment=self._deployment_with_ssh())
+        config = TransportConfig(dseq="123", api_key=_KEY, deployment=self._deployment_with_ssh())
         assert SSHTransport(config).validate() is True
 
     def test_ssh_transport_validate_no_ports(self):
         from just_akash.transport import SSHTransport, TransportConfig
 
-        config = TransportConfig(dseq="123", api_key="key", deployment={})
+        config = TransportConfig(dseq="123", api_key=_KEY, deployment={})
         assert SSHTransport(config).validate() is False
 
     def test_ssh_transport_prepare_fails_without_ssh_port(self):
         from just_akash.transport import SSHTransport, TransportConfig
 
-        config = TransportConfig(dseq="123", api_key="key", deployment={})
+        config = TransportConfig(dseq="123", api_key=_KEY, deployment={})
         t = SSHTransport(config)
         with pytest.raises(RuntimeError):
             t.prepare()
@@ -432,7 +438,7 @@ class TestSSHTransportRegression:
     def test_ssh_transport_exec_calls_subprocess(self):
         from just_akash.transport import SSHTransport, TransportConfig
 
-        config = TransportConfig(dseq="123", api_key="key", deployment=self._deployment_with_ssh())
+        config = TransportConfig(dseq="123", api_key=_KEY, deployment=self._deployment_with_ssh())
         t = SSHTransport(config)
         t._ssh_info = {"host": "provider.akash.network", "port": 32022}
         t._key_path = "/home/user/.ssh/id_ed25519"
@@ -457,7 +463,7 @@ class TestSSHTransportRegression:
     def test_ssh_transport_exec_propagates_exit_code(self):
         from just_akash.transport import SSHTransport, TransportConfig
 
-        config = TransportConfig(dseq="123", api_key="key")
+        config = TransportConfig(dseq="123", api_key=_KEY)
         t = SSHTransport(config)
         t._ssh_info = {"host": "h", "port": 22}
         t._key_path = "/key"
@@ -473,7 +479,7 @@ class TestSSHTransportRegression:
     def test_ssh_transport_inject_writes_then_chmods(self):
         from just_akash.transport import SSHTransport, TransportConfig
 
-        config = TransportConfig(dseq="123", api_key="key")
+        config = TransportConfig(dseq="123", api_key=_KEY)
         t = SSHTransport(config)
         t._ssh_info = {"host": "h", "port": 22}
         t._key_path = "/key"
@@ -508,23 +514,23 @@ class TestTransportConfigDefaults:
     def test_default_console_url(self):
         from just_akash.transport import TransportConfig
 
-        c = TransportConfig(dseq="1", api_key="k")
+        c = TransportConfig(dseq="1", api_key=_KEY)
         assert c.console_url == "https://console-api.akash.network"
 
     def test_default_service_name_none(self):
         from just_akash.transport import TransportConfig
 
-        assert TransportConfig(dseq="1", api_key="k").service_name is None
+        assert TransportConfig(dseq="1", api_key=_KEY).service_name is None
 
     def test_default_ssh_key_path_none(self):
         from just_akash.transport import TransportConfig
 
-        assert TransportConfig(dseq="1", api_key="k").ssh_key_path is None
+        assert TransportConfig(dseq="1", api_key=_KEY).ssh_key_path is None
 
     def test_default_deployment_empty_dict(self):
         from just_akash.transport import TransportConfig
 
-        c = TransportConfig(dseq="1", api_key="k")
+        c = TransportConfig(dseq="1", api_key=_KEY)
         assert c.deployment == {}
 
 

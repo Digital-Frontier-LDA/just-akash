@@ -19,6 +19,7 @@ from just_akash.api import (
     _save_tags,
     format_deployments_table,
 )
+from tests._creds import fake_api_key
 
 # ── _extract_dseq ────────────────────────────────────
 
@@ -264,10 +265,11 @@ class TestTags:
 
 class TestAkashConsoleAPI:
     def test_init(self):
-        client = AkashConsoleAPI("test-key")
-        assert client.api_key == "test-key"
+        key = fake_api_key()
+        client = AkashConsoleAPI(key)
+        assert client.api_key == key
         assert client.base_url == "https://console-api.akash.network"
-        assert client.headers["x-api-key"] == "test-key"
+        assert client.headers["x-api-key"] == key
 
     @patch("just_akash.api.urllib.request.urlopen")
     def test_request_success(self, mock_urlopen):

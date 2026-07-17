@@ -12,12 +12,13 @@ from websockets.frames import Close
 
 from just_akash.transport import LeaseShellTransport, TransportConfig
 from just_akash.transport.lease_shell import _FRAME_STDIN
+from tests._creds import fake_api_key, fake_secret
 
 
 def _make_transport() -> LeaseShellTransport:
     config = TransportConfig(
         dseq="123",
-        api_key="test-key",
+        api_key=fake_api_key(),
         deployment={
             "leases": [
                 {
@@ -298,7 +299,7 @@ class TestLeaseShellTransportInject:
 
     def test_inject_secret_value_not_in_plaintext_commands(self):
         t = _make_transport()
-        secret_value = "SUPER_SECRET_PASSWORD_12345"
+        secret_value = fake_secret("pw")
 
         with (
             patch.object(t, "_exec_shell_command", return_value=0) as mock_cmd,
@@ -445,7 +446,7 @@ class TestLeaseShellTransportInject:
         `data` frame.
         """
         t = _make_transport()
-        secret = "TOPSECRET_VALUE_9f8e7d6c"
+        secret = fake_secret("tok")
         content = f"API_KEY={secret}"
         # A 102 result frame (exit 0) so _exec_with_stdin_command returns cleanly.
         frames = [bytes([102]) + (0).to_bytes(4, "little")]

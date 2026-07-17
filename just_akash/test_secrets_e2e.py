@@ -19,6 +19,7 @@ Usage:
 import json as _json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -210,14 +211,16 @@ def main():
         # ── Step 4: Inject secrets via SSH ───────────────────
         log_step(4, "Inject secrets via SSH")
 
-        test_secret_key = "E2E_TEST_SECRET"
-        test_secret_value = "akash-secrets-e2e-ok-1234"
+        # Generated per-run (issue #38 item 3): no static secret literal for
+        # detect-secrets to anchor on, and it still round-trips through the vars.
+        env_name = "E2E_TEST_" + secrets.token_hex(3).upper()
+        env_val = "akash-e2e-" + secrets.token_hex(8)
 
         fd, env_file = tempfile.mkstemp(suffix=".env", prefix="akash-test-secrets-")
         try:
             with os.fdopen(fd, "w") as f:
                 f.write("# test secrets\n")
-                f.write(f"{test_secret_key}={test_secret_value}\n")
+                f.write(f"{env_name}={env_val}\n")
                 f.write("ANOTHER_VAR=hello_world\n")
 
             inject_cmd = (
@@ -266,8 +269,8 @@ def main():
                 if result.returncode != 0:
                     log_fail(f"SSH cat failed: {result.stderr.strip()}")
                     failures.append("verify: ssh cat failed")
-                elif test_secret_value in secrets_content:
-                    log_pass(f"Found {test_secret_key}={test_secret_value} in /run/secrets/.env")
+                elif env_val in secrets_content:
+                    log_pass(f"Found {env_name}={env_val} in /run/secrets/.env")
 
                     if "ANOTHER_VAR=hello_world" in secrets_content:
                         log_pass("Found ANOTHER_VAR=hello_world")
@@ -312,11 +315,11 @@ def main():
         log_step(6, "Cross-check: inject via lease-shell, verify via SSH")
 
         if "inject" not in [f.split(":")[0] for f in failures]:
-            ls_secret_value = "lease-shell-crosscheck-ok"
+            ls_val = "lease-shell-" + secrets.token_hex(8)
             fd2, env_file2 = tempfile.mkstemp(suffix=".env", prefix="akash-test-ls-")
             try:
                 with os.fdopen(fd2, "w") as f:
-                    f.write(f"CROSSCHECK_KEY={ls_secret_value}\n")
+                    f.write(f"CROSSCHECK_KEY={ls_val}\n")
 
                 remote_path2 = "/tmp/e2e-lease-shell-crosscheck.env"
                 inject_cmd2 = (
@@ -353,7 +356,7 @@ def main():
                             text=True,
                             timeout=15,
                         )
-                        if xr.returncode == 0 and ls_secret_value in xr.stdout:
+                        if xr.returncode == 0 and ls_val in xr.stdout:
                             log_pass("Lease-shell inject verified via SSH — both transports work")
                         else:
                             log_fail(f"Cross-check verify failed: {xr.stderr.strip()}")

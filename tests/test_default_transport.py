@@ -11,13 +11,15 @@ Requirements: TRNS-01, TRNS-03
 import sys
 from unittest.mock import MagicMock, patch
 
+from tests._creds import fake_api_key
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
 def _mock_client(dseq="99999"):
     """Return a mock AkashConsoleAPI with lease data (lease-shell available)."""
     client = MagicMock()
-    client.api_key = "test-key"
+    client.api_key = fake_api_key()
     client.list_deployments.return_value = [{"deployment": {"dseq": dseq, "state": "active"}}]
     client.get_deployment.return_value = {
         "deployment": {"dseq": dseq, "state": "active"},
@@ -36,7 +38,7 @@ def _mock_client(dseq="99999"):
 def _mock_client_no_lease(dseq="99999"):
     """Return a mock client whose deployment has NO active lease (fallback trigger)."""
     client = MagicMock()
-    client.api_key = "test-key"
+    client.api_key = fake_api_key()
     client.list_deployments.return_value = [{"deployment": {"dseq": dseq, "state": "active"}}]
     client.get_deployment.return_value = {
         "deployment": {"dseq": dseq, "state": "active"},
