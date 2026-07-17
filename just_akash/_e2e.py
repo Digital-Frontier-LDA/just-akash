@@ -10,8 +10,10 @@ same "no deployment leak" behavior — if any one diverges, that's a bug to fix
 here, not by patching three call sites.
 """
 
+import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -151,11 +153,85 @@ def _dseq_in_list_output(dseq: str, output: str) -> bool:
     return re.search(rf"(?<!\d){re.escape(dseq)}(?!\d)", output) is not None
 
 
+# Terminal on-chain states: the deployment is settled and holds no escrow —
+# measured: a `closed` deployment reads escrow.state=closed with funds=0.
+# insufficient_funds is settled by definition (the escrow is what ran out) and is
+# already treated as terminal by smoke_providers._DEAD_STATES; kept in sync with it.
+_SETTLED_STATES = ("closed", "failed", "insufficient_funds", "insufficientfunds")
+# States that positively mean the deployment is still up (and so may hold escrow).
+# Deliberately an ALLOWLIST, not "everything that isn't settled": a state we do not
+# recognise is UNKNOWN, not proof of life, and saying "STILL ACTIVE" about it would
+# be a claim we cannot support. Unknown falls through to "could not confirm", which
+# fails closed just the same but tells the operator the truth.
+_OPEN_STATES = ("active", "open")
+
+
+def _confirm_settled(dseq: str, *, attempts: int = 8, interval_s: int = 3) -> bool | None:
+    """Authoritative per-deployment read: is ``dseq`` settled (holding no escrow)?
+
+    Returns True (confirmed settled), False (positively still open — a recognised
+    open state persisted through the whole window), or None (indeterminate: either
+    no probe was readable, or the readable state was one we don't recognise as open,
+    which is UNKNOWN, not proof of life). Both False and None fail the audit closed;
+    they differ only in the message — "STILL ACTIVE" vs "could not confirm".
+
+    Deliberately NOT `just list`: the collection endpoint serves STALE state — it
+    reported a deployment as active minutes after that deployment's own record read
+    state=closed / escrow=closed / funds=0. Staleness in that direction only cries
+    wolf on a clean destroy, but the same staleness can report a deployment GONE
+    while its escrow is still open, which is a silent leak the audit exists to catch.
+    Only the per-deployment record decides whether funds are held, so ask it.
+
+    POLLS, because the per-deployment record is authoritative but NOT instantaneous:
+    a close takes ~6-12s to reflect, so a just-destroyed deployment keeps reading
+    `active` for a while. Reading once and calling that "STILL ACTIVE" fails a
+    perfectly clean destroy — measured: it broke the lease-shell E2E, whose destroy
+    reported "closed (attempt 1)" and was then declared a leak 2s later. So `active`
+    inside the window means "not settled YET", not "still open"; only `active` that
+    PERSISTS through the whole window is a real leak.
+
+    Polling also covers transient blips, which matters because the caller fails
+    CLOSED: without it a single API hiccup would report a leak that isn't one.
+    """
+    saw_open = False  # at least one probe positively read an open state
+    all_open = True  # EVERY attempt positively read an open state (no blip, no unknown)
+    for attempt in range(1, attempts + 1):
+        got_open = False
+        try:
+            cmd = f"uv run just-akash status --dseq {shlex.quote(str(dseq))} --json"
+            r = _run(cmd, timeout=30)
+            if r.returncode == 0 and r.stdout:
+                state = str(json.loads(r.stdout).get("state", "")).strip().lower()
+                if state in _SETTLED_STATES:
+                    return True
+                if state in _OPEN_STATES:
+                    saw_open = got_open = True
+                # An unrecognised value is UNKNOWN, never proof of life — it leaves
+                # got_open False, so the window can no longer claim "STILL ACTIVE".
+        except Exception:  # noqa: BLE001 — a probe failure must never raise from cleanup
+            pass
+        if not got_open:
+            all_open = False
+        if attempt < attempts:
+            time.sleep(interval_s)
+    # "STILL ACTIVE" (False) requires that EVERY probe positively read open — one
+    # stale `active` followed by blips/unknowns is not persistence, it's unknown.
+    # Anything short of that is an honest "could not confirm" (None). Both fail the
+    # audit closed; they differ only in the message.
+    if saw_open and all_open:
+        return False
+    return None
+
+
 def robust_destroy(dseq: str, *, retries: int = 2, audit: bool = True) -> bool:
     """Destroy a deployment with retry-on-fail and post-destroy audit.
 
-    Returns True if the deployment is confirmed gone, False otherwise.  Safe to
-    call from a signal handler or a finally block — never raises.
+    Returns True if the deployment is confirmed gone, False otherwise. Safe to call
+    from a signal handler or a finally block: it swallows every ``Exception`` (a
+    failed destroy or audit becomes a logged False, never a raise). The one thing it
+    lets through is ``KeyboardInterrupt`` — a ``BaseException``, not an ``Exception``
+    — so a user Ctrl-C'ing out of cleanup is never trapped. "Never raises" means
+    never on a *program* error, not never on a deliberate interrupt.
     """
     if not dseq:
         return True
@@ -167,7 +243,7 @@ def robust_destroy(dseq: str, *, retries: int = 2, audit: bool = True) -> bool:
     last_err = ""
     for attempt in range(1, retries + 2):
         try:
-            r = _run(f"just destroy {dseq}", input_text="y\n", timeout=60)
+            r = _run(f"just destroy {shlex.quote(str(dseq))}", input_text="y\n", timeout=60)
             if _destroy_succeeded(r):
                 _pass(f"Deployment {dseq} closed (attempt {attempt})")
                 break
@@ -180,19 +256,33 @@ def robust_destroy(dseq: str, *, retries: int = 2, audit: bool = True) -> bool:
             time.sleep(3)
     if not audit:
         return True
-    # Audit: confirm DSEQ is no longer in `just list`. Use word-boundary
-    # match so dseq="123" doesn't false-positive against an unrelated "12345".
+    # Audit against the deployment's OWN record, never `just list` (see
+    # _confirm_settled). Fails closed: only a positive "settled" reading clears the
+    # audit, because the whole point is to catch escrow we failed to release.
+    #
+    # Wrapped because robust_destroy swallows every Exception: it runs from
+    # a finally block and from the signal handler, so an exception escaping here
+    # would abort cleanup — the exact failure the audit exists to prevent. Scope is
+    # Exception, matching the destroy loop above: KeyboardInterrupt deliberately
+    # still propagates, so a user hammering Ctrl-C can always escape. An unreadable
+    # audit fails closed rather than claiming success.
     try:
         time.sleep(2)
-        r = _run("just list", timeout=30)
-        if not _dseq_in_list_output(dseq, r.stdout):
-            _pass(f"Audit: deployment {dseq} no longer listed")
-            return True
-        _fail(f"Audit: deployment {dseq} STILL listed after destroy — manual cleanup required")
+        settled = _confirm_settled(dseq)
+    except Exception as e:  # noqa: BLE001 — cleanup must never raise
+        _fail(f"Audit: probe raised ({type(e).__name__}) — treating as a possible leak")
         return False
-    except Exception as e:  # noqa: BLE001
-        _fail(f"Audit failed: {e}")
+    if settled is True:
+        _pass(f"Audit: deployment {dseq} confirmed settled (no escrow held)")
+        return True
+    if settled is False:
+        _fail(f"Audit: deployment {dseq} STILL ACTIVE after destroy — manual cleanup required")
         return False
+    _fail(
+        f"Audit: could not confirm {dseq} is settled — treating as a possible leak. "
+        f"Verify with: uv run just-akash status --dseq {shlex.quote(str(dseq))} --json"
+    )
+    return False
 
 
 def _signal_handler(signum, _frame):
