@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.27.0] — 2026-07-17
+
+### Fixed (security)
+- **Injected secrets no longer leak into provider-proxy logs.** `inject()` built `echo <base64> | base64 -d > path` and ran it via the shell path, which places the command in the URL's `cmd2=` — and provider-proxy logs that URL, so the base64-obscured (trivially reversible) secret landed in those logs. The write now streams the payload over a `104` stdin data frame via `_exec_with_stdin_command("head -c <n> > <path>", content_bytes)`, so the content is never part of the URL/argv (only its byte count, which is not secret). `head -c <n>` — not `cat` — because `cat` reads until stdin EOF, and provider-proxy does not translate the empty trailing stdin frame into a stdin close, so `cat > path` hangs forever; `head -c <n>` reads exactly `n` bytes and exits. `mkdir -p` and `chmod 600` are unchanged (neither carries the secret).
+
 ## [1.26.0] — 2026-07-17
 
 ### Added
