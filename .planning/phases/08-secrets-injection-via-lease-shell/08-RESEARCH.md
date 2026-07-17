@@ -5,7 +5,7 @@
 > provider with `ssl.CERT_NONE`). The shipped code routes through the Console
 > **provider-proxy** with **full TLS verification**. Note also that inject's final
 > form streams the secret over a `104` stdin frame via `head -c <n> > path` (v1.27.0,
-> issue #39) — not the `echo | base64 -d` shown here. See
+> PR #39) — not the `echo | base64 -d` shown here. See
 > `just_akash/transport/lease_shell.py`; kept for history only (issue #38).
 
 **Researched:** 2026-04-19
