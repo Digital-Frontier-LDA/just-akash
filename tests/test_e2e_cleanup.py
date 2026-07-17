@@ -168,16 +168,16 @@ class TestRobustDestroy:
             assert robust_destroy("12345", retries=2) is False
 
     def test_audit_detects_lingering_deployment(self):
-        # Destroy reports success, but `just list` shows the DSEQ is still
-        # present — audit must flip the result to False so the caller knows
-        # to flag/manual-clean.
+        # Destroy reports success, but the deployment's own record keeps reading
+        # `active` for the whole poll window — audit must flip the result to False so
+        # the caller knows to flag/manual-clean. (A single `active` read is NOT a
+        # leak: a close takes ~6-12s to reflect. Only persistence proves it.)
         with (
             patch("just_akash._e2e.subprocess.run") as mock_run,
             patch("just_akash._e2e.time.sleep") as _sleep,
         ):
-            mock_run.side_effect = [
-                _completed(0, stdout="closed"),  # destroy
-                _completed(0, stdout='{"state": "active"}'),  # authoritative: STILL ACTIVE
+            mock_run.side_effect = [_completed(0, stdout="closed")] + [  # destroy
+                _completed(0, stdout='{"state": "active"}') for _ in range(8)
             ]
             assert robust_destroy("12345") is False
 
