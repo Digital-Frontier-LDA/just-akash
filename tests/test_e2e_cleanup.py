@@ -338,7 +338,8 @@ class TestRobustDestroyAdversarial:
         or a future CLI version that prints nothing), the destroy attempt is
         currently classified as FAILED — even though the deployment is gone.
         Behavior: all `retries+1` destroy attempts run, but the post-destroy
-        audit (which checks `just list`) saves the day and returns True.
+        audit (which reads the deployment's own record) saves the day and
+        returns True.
 
         This pins two things:
           1. Silent-success is NOT auto-trusted (must see "closed" keyword).
@@ -352,12 +353,12 @@ class TestRobustDestroyAdversarial:
             patch("just_akash._e2e.time.sleep"),
         ):
             # 3 destroy attempts (retries=2 → range(1, 4)) all "silent success"
-            # — exit 0 with empty stdout/stderr. Then audit list is empty.
+            # — exit 0 with empty stdout/stderr. The audit then confirms it settled.
             mock_run.side_effect = [
                 _completed(0, stdout="", stderr=""),  # destroy attempt 1
                 _completed(0, stdout="", stderr=""),  # destroy attempt 2
                 _completed(0, stdout="", stderr=""),  # destroy attempt 3
-                _completed(0, stdout='{"state": "closed"}'),  # authoritative audit: empty → gone
+                _completed(0, stdout='{"state": "closed"}'),  # authoritative audit: settled
             ]
             # Audit clears it → True. But we ran 3 destroys (treating each as
             # failure). If the keyword check is loosened, only 1 destroy will
@@ -992,7 +993,7 @@ class TestRobustDestroyAuditFalseTrustsDestroyResult:
                 "review every audit=False caller and update this test."
             )
             assert mock_run.call_count == 3, (
-                "audit=False must NOT issue the audit `just list` call; "
+                "audit=False must NOT issue the audit probe at all; "
                 f"got {mock_run.call_count} subprocess calls (expected 3 "
                 "destroys, 0 audits)."
             )
@@ -1426,3 +1427,62 @@ class TestAuditReadsTheAuthoritativeRecordNotTheList:
                 _completed(0, stdout='{"state": "active"}'),
             ]
             assert robust_destroy("12345") is False
+
+
+class TestAuditNeverRaisesFromCleanup:
+    """robust_destroy runs from a finally block AND from the signal handler, so its
+    contract is that it never raises. Caught in review (Copilot, PR #63): the
+    authoritative audit was added OUTSIDE any try/except, so an exception there — a
+    Ctrl-C landing in the pre-audit sleep, say — would escape and abort cleanup,
+    which is the exact failure the audit exists to prevent.
+    """
+
+    def test_a_raising_sleep_does_not_escape(self):
+        with (
+            patch("just_akash._e2e.subprocess.run") as mock_run,
+            patch("just_akash._e2e.time.sleep", side_effect=RuntimeError("clock blew up")),
+        ):
+            mock_run.side_effect = [_completed(0, stdout="closed")]
+            # Must NOT raise, and must fail closed rather than claim success.
+            assert robust_destroy("12345") is False
+
+    def test_keyboardinterrupt_deliberately_still_propagates(self):
+        """Scope of "never raises": Exception, NOT BaseException — matching the
+        destroy loop above it, which has always caught only Exception. A user
+        hammering Ctrl-C must be able to abort; swallowing KeyboardInterrupt here
+        would trap them in a cleanup they are explicitly trying to escape. Pinned so
+        nobody "hardens" this into a bare except and silently removes that escape.
+        """
+        with (
+            patch("just_akash._e2e.subprocess.run") as mock_run,
+            patch("just_akash._e2e.time.sleep", side_effect=KeyboardInterrupt),
+        ):
+            mock_run.side_effect = [_completed(0, stdout="closed")]
+            with pytest.raises(KeyboardInterrupt):
+                robust_destroy("12345")
+
+    def test_a_raising_probe_does_not_escape(self, capsys):
+        with (
+            patch("just_akash._e2e.subprocess.run") as mock_run,
+            patch("just_akash._e2e.time.sleep"),
+            patch("just_akash._e2e._confirm_settled", side_effect=RuntimeError("boom")),
+        ):
+            mock_run.side_effect = [_completed(0, stdout="closed")]
+            assert robust_destroy("12345") is False
+            assert "possible leak" in capsys.readouterr().out.lower()
+
+    def test_the_manual_verify_hint_is_shell_quoted(self, capsys):
+        """The hint is copy-pasted by an operator into a shell, so it must not carry
+        an unquoted dseq any more than the probe command does."""
+        with (
+            patch("just_akash._e2e.subprocess.run") as mock_run,
+            patch("just_akash._e2e.time.sleep"),
+        ):
+            mock_run.side_effect = [
+                _completed(0, stdout="closed"),
+                _completed(1, stderr="503"),
+                _completed(1, stderr="503"),
+                _completed(1, stderr="503"),
+            ]
+            robust_destroy("123; rm -rf /tmp/x")
+            assert "'123; rm -rf /tmp/x'" in capsys.readouterr().out

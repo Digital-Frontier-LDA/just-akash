@@ -221,8 +221,19 @@ def robust_destroy(dseq: str, *, retries: int = 2, audit: bool = True) -> bool:
     # Audit against the deployment's OWN record, never `just list` (see
     # _confirm_settled). Fails closed: only a positive "settled" reading clears the
     # audit, because the whole point is to catch escrow we failed to release.
-    time.sleep(2)
-    settled = _confirm_settled(dseq)
+    #
+    # Wrapped because robust_destroy's contract is that it never raises: it runs from
+    # a finally block and from the signal handler, so an exception escaping here
+    # would abort cleanup — the exact failure the audit exists to prevent. Scope is
+    # Exception, matching the destroy loop above: KeyboardInterrupt deliberately
+    # still propagates, so a user hammering Ctrl-C can always escape. An unreadable
+    # audit fails closed rather than claiming success.
+    try:
+        time.sleep(2)
+        settled = _confirm_settled(dseq)
+    except Exception as e:  # noqa: BLE001 — cleanup must never raise
+        _fail(f"Audit: probe raised ({type(e).__name__}) — treating as a possible leak")
+        return False
     if settled is True:
         _pass(f"Audit: deployment {dseq} confirmed settled (no escrow held)")
         return True
@@ -231,7 +242,7 @@ def robust_destroy(dseq: str, *, retries: int = 2, audit: bool = True) -> bool:
         return False
     _fail(
         f"Audit: could not confirm {dseq} is settled — treating as a possible leak. "
-        f"Verify with: just-akash status --dseq {dseq}"
+        f"Verify with: uv run just-akash status --dseq {shlex.quote(dseq)} --json"
     )
     return False
 
