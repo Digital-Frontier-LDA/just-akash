@@ -169,8 +169,11 @@ _OPEN_STATES = ("active", "open")
 def _confirm_settled(dseq: str, *, attempts: int = 8, interval_s: int = 3) -> bool | None:
     """Authoritative per-deployment read: is ``dseq`` settled (holding no escrow)?
 
-    Returns True (confirmed settled), False (still open at the end of the window), or
-    None (never got a readable answer).
+    Returns True (confirmed settled), False (positively still open — a recognised
+    open state persisted through the whole window), or None (indeterminate: either
+    no probe was readable, or the readable state was one we don't recognise as open,
+    which is UNKNOWN, not proof of life). Both False and None fail the audit closed;
+    they differ only in the message — "STILL ACTIVE" vs "could not confirm".
 
     Deliberately NOT `just list`: the collection endpoint serves STALE state — it
     reported a deployment as active minutes after that deployment's own record read

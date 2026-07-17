@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import signal
 import subprocess
+from itertools import chain, repeat
 from unittest.mock import patch
 
 import pytest
@@ -1395,12 +1396,12 @@ class TestAuditReadsTheAuthoritativeRecordNotTheList:
             patch("just_akash._e2e.subprocess.run") as mock_run,
             patch("just_akash._e2e.time.sleep"),
         ):
-            mock_run.side_effect = [
-                _completed(0, stdout="closed"),
-                _completed(1, stderr="API 503"),
-                _completed(1, stderr="API 503"),
-                _completed(1, stderr="API 503"),
-            ]
+            # destroy once, then EVERY audit probe fails — chain+repeat so the test
+            # is decoupled from the exact poll count (never relies on a swallowed
+            # StopIteration to run out the window).
+            mock_run.side_effect = chain(
+                [_completed(0, stdout="closed")], repeat(_completed(1, stderr="API 503"))
+            )
             assert robust_destroy("12345") is False
             assert "could not confirm" in capsys.readouterr().out.lower()
 
@@ -1482,12 +1483,9 @@ class TestAuditNeverRaisesFromCleanup:
             patch("just_akash._e2e.subprocess.run") as mock_run,
             patch("just_akash._e2e.time.sleep"),
         ):
-            mock_run.side_effect = [
-                _completed(0, stdout="closed"),
-                _completed(1, stderr="503"),
-                _completed(1, stderr="503"),
-                _completed(1, stderr="503"),
-            ]
+            mock_run.side_effect = chain(
+                [_completed(0, stdout="closed")], repeat(_completed(1, stderr="503"))
+            )
             robust_destroy("123; rm -rf /tmp/x")
             assert "'123; rm -rf /tmp/x'" in capsys.readouterr().out
 
@@ -1505,9 +1503,12 @@ class TestUnknownStateIsNotAClaimOfLife:
             patch("just_akash._e2e.subprocess.run") as mock_run,
             patch("just_akash._e2e.time.sleep"),
         ):
-            mock_run.side_effect = [_completed(0, stdout="closed")] + [
-                _completed(0, stdout=state_json) for _ in range(3)
-            ]
+            # destroy once, then the SAME state on every audit probe — repeat() so a
+            # persistent non-settled state runs the full window (a settled read still
+            # short-circuits on the first probe). Never relies on StopIteration.
+            mock_run.side_effect = chain(
+                [_completed(0, stdout="closed")], repeat(_completed(0, stdout=state_json))
+            )
             result = robust_destroy("12345")
         return result, capsys.readouterr().out
 
