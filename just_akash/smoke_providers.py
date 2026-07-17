@@ -769,7 +769,15 @@ def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, s
     # balance endpoint, and a 402 probe commits no resources.)
     if re.search(r"\(402\)|PaymentRequired|[Ii]nsufficient balance", out):
         return None, "no-credit"
-    if re.search(r"NO BID|no bid|NONE from our providers|foreign bids", out):
+    # Case-insensitive, and "bids" as well as "bid": deploy's wording differs by path
+    # — "NO BID FROM n allowlisted provider(s)" when an allowlisted provider ignored
+    # us, but "No bids received within Ns" when nothing bid at all. The old
+    # case-sensitive "NO BID|no bid" matched neither "No bids", so that second path
+    # fell through to deploy-failed and scored a pure market condition as a provider
+    # FAIL. It only classified correctly by accident, via the co-occurring
+    # "Cleaning up deployment N (no bids)" log line — i.e. the verdict hung on
+    # incidental log wording. Matching the real message removes that dependency.
+    if re.search(r"no bids?\b|none from our providers|foreign bids", out, re.IGNORECASE):
         return None, "no-bid"
     return None, "deploy-failed"
 

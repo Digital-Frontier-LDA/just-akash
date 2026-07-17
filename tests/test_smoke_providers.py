@@ -1686,3 +1686,47 @@ class TestQuarantineMainGate:
         out = capsys.readouterr().out
         assert code == 1
         assert "fleet-wide simultaneous LEASE-DOWN" in out
+
+
+class TestNoBidPhrasingCoverage:
+    """Every no-bid message deploy can actually emit must classify as no-bid.
+
+    Caught in review (Copilot, PR #62): the regex was case-sensitive "NO BID|no bid",
+    so "No bids received within Ns" — deploy's message when NOTHING bid at all —
+    matched neither and fell through to deploy-failed, scoring a pure market
+    condition as a provider FAIL. It classified correctly only by accident, via the
+    co-occurring "(no bids)" cleanup log line.
+    """
+
+    def _note(self, out: str) -> str:
+        with patch.object(sp, "_run", return_value=_completed(out, returncode=1)):
+            return sp._deploy("sdl", "p", {"dseq": None})[1]
+
+    def test_no_bids_received_at_all(self):
+        """deploy.py: raise RuntimeError("No bids received within {n}s. ...")"""
+        assert (
+            self._note("No bids received within 180s. Your SDL may be unsatisfiable.") == "no-bid"
+        )
+
+    def test_no_bid_from_allowlisted_provider(self):
+        assert self._note("NO BID FROM 1 allowlisted provider(s):") == "no-bid"
+
+    def test_none_from_our_providers(self):
+        assert self._note("Received 6 bid(s) but NONE from our providers.") == "no-bid"
+
+    def test_foreign_bids_only(self):
+        assert self._note("Cleaning up deployment 1 (foreign bids only)...") == "no-bid"
+
+    def test_classification_does_not_depend_on_the_cleanup_log_line(self):
+        """The raise message ALONE must be enough. Previously the verdict hung on
+        deploy's incidental "Cleaning up deployment N (no bids)" log; reword that
+        log and a market no-bid would silently become a provider FAIL."""
+        assert self._note("No bids received within 180s.") == "no-bid"
+
+    def test_malformed_bids_stay_deploy_failed(self):
+        """ "No VALID bids ... all bid entries were malformed" is a data/API error,
+        not a market condition — it must NOT be excused as a no-bid skip."""
+        assert (
+            self._note("No valid bids received — all bid entries were malformed.")
+            == "deploy-failed"
+        )
