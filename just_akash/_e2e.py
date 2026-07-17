@@ -10,8 +10,10 @@ same "no deployment leak" behavior — if any one diverges, that's a bug to fix
 here, not by patching three call sites.
 """
 
+import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -151,6 +153,42 @@ def _dseq_in_list_output(dseq: str, output: str) -> bool:
     return re.search(rf"(?<!\d){re.escape(dseq)}(?!\d)", output) is not None
 
 
+# Terminal on-chain states. Reaching either means the deployment is settled and
+# holds no escrow — measured: a `closed` deployment reads escrow.state=closed with
+# funds=0. Anything else (active/open/unknown) may still be holding a deposit.
+_SETTLED_STATES = ("closed", "failed")
+
+
+def _confirm_settled(dseq: str, *, attempts: int = 3) -> bool | None:
+    """Authoritative per-deployment read: is ``dseq`` settled (holding no escrow)?
+
+    Returns True (confirmed settled), False (confirmed still open), or None (could
+    not tell after ``attempts``).
+
+    Deliberately NOT `just list`: the collection endpoint serves STALE state — it
+    reported a deployment as active minutes after that deployment's own record read
+    state=closed / escrow=closed / funds=0. Staleness in that direction only cries
+    wolf on a clean destroy, but the same staleness can report a deployment GONE
+    while its escrow is still open, which is a silent leak the audit exists to catch.
+    Only the per-deployment record decides whether funds are held, so ask it.
+
+    Retries because the caller fails CLOSED on None: without retries a single
+    transient API blip would report a leak that isn't one.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            r = _run(f"uv run just-akash status --dseq {shlex.quote(dseq)} --json", timeout=30)
+            if r.returncode == 0 and r.stdout:
+                state = str(json.loads(r.stdout).get("state", "")).strip().lower()
+                if state:
+                    return state in _SETTLED_STATES
+        except Exception:  # noqa: BLE001 — a probe failure must never raise from cleanup
+            pass
+        if attempt < attempts:
+            time.sleep(2)
+    return None
+
+
 def robust_destroy(dseq: str, *, retries: int = 2, audit: bool = True) -> bool:
     """Destroy a deployment with retry-on-fail and post-destroy audit.
 
@@ -180,19 +218,22 @@ def robust_destroy(dseq: str, *, retries: int = 2, audit: bool = True) -> bool:
             time.sleep(3)
     if not audit:
         return True
-    # Audit: confirm DSEQ is no longer in `just list`. Use word-boundary
-    # match so dseq="123" doesn't false-positive against an unrelated "12345".
-    try:
-        time.sleep(2)
-        r = _run("just list", timeout=30)
-        if not _dseq_in_list_output(dseq, r.stdout):
-            _pass(f"Audit: deployment {dseq} no longer listed")
-            return True
-        _fail(f"Audit: deployment {dseq} STILL listed after destroy — manual cleanup required")
+    # Audit against the deployment's OWN record, never `just list` (see
+    # _confirm_settled). Fails closed: only a positive "settled" reading clears the
+    # audit, because the whole point is to catch escrow we failed to release.
+    time.sleep(2)
+    settled = _confirm_settled(dseq)
+    if settled is True:
+        _pass(f"Audit: deployment {dseq} confirmed settled (no escrow held)")
+        return True
+    if settled is False:
+        _fail(f"Audit: deployment {dseq} STILL ACTIVE after destroy — manual cleanup required")
         return False
-    except Exception as e:  # noqa: BLE001
-        _fail(f"Audit failed: {e}")
-        return False
+    _fail(
+        f"Audit: could not confirm {dseq} is settled — treating as a possible leak. "
+        f"Verify with: just-akash status --dseq {dseq}"
+    )
+    return False
 
 
 def _signal_handler(signum, _frame):

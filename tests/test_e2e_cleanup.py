@@ -135,7 +135,7 @@ class TestRobustDestroy:
         with patch("just_akash._e2e.subprocess.run") as mock_run:
             mock_run.side_effect = [
                 _completed(0, stdout="Deployment 12345 closed"),  # destroy
-                _completed(0, stdout=""),  # audit list (empty)
+                _completed(0, stdout='{"state": "closed"}'),  # authoritative audit: settled
             ]
             assert robust_destroy("12345") is True
             assert mock_run.call_count == 2
@@ -148,7 +148,7 @@ class TestRobustDestroy:
             mock_run.side_effect = [
                 _completed(1, stderr="API down"),  # 1st destroy fails
                 _completed(0, stdout="Deployment 12345 closed"),  # 2nd destroy ok
-                _completed(0, stdout=""),  # audit list
+                _completed(0, stdout='{"state": "closed"}'),  # authoritative audit: settled
             ]
             assert robust_destroy("12345", retries=2) is True
             assert mock_run.call_count == 3
@@ -163,7 +163,7 @@ class TestRobustDestroy:
                 _completed(1, stderr="fail 2"),
                 _completed(1, stderr="fail 3"),
                 # audit still runs after retries exhausted
-                _completed(0, stdout="dseq=12345 active"),
+                _completed(0, stdout='{"state": "active"}'),
             ]
             assert robust_destroy("12345", retries=2) is False
 
@@ -177,7 +177,7 @@ class TestRobustDestroy:
         ):
             mock_run.side_effect = [
                 _completed(0, stdout="closed"),  # destroy
-                _completed(0, stdout="dseq 12345 still here"),  # audit failure
+                _completed(0, stdout='{"state": "active"}'),  # authoritative: STILL ACTIVE
             ]
             assert robust_destroy("12345") is False
 
@@ -199,7 +199,7 @@ class TestRobustDestroy:
             mock_run.side_effect = [
                 subprocess.TimeoutExpired(cmd="just destroy", timeout=60),
                 _completed(0, stdout="closed"),  # 2nd attempt succeeds
-                _completed(0, stdout=""),  # audit
+                _completed(0, stdout='{"state": "closed"}'),  # authoritative audit
             ]
             assert robust_destroy("12345") is True
 
@@ -357,7 +357,7 @@ class TestRobustDestroyAdversarial:
                 _completed(0, stdout="", stderr=""),  # destroy attempt 1
                 _completed(0, stdout="", stderr=""),  # destroy attempt 2
                 _completed(0, stdout="", stderr=""),  # destroy attempt 3
-                _completed(0, stdout=""),  # audit: empty → gone
+                _completed(0, stdout='{"state": "closed"}'),  # authoritative audit: empty → gone
             ]
             # Audit clears it → True. But we ran 3 destroys (treating each as
             # failure). If the keyword check is loosened, only 1 destroy will
@@ -370,13 +370,12 @@ class TestRobustDestroyAdversarial:
                 "review whether silent-success should now imply success."
             )
 
-    def test_audit_uses_word_boundary_match(self):
-        """Audit must NOT false-positive when our dseq is a substring of
-        another DSEQ in `just list` output.
-
-        dseq='123' is truly gone; the list shows only an unrelated '12345'.
-        Substring match would falsely report our deployment as lingering.
-        Word-boundary regex correctly distinguishes them.
+    def test_audit_cannot_confuse_a_dseq_with_a_longer_one(self):
+        """A substring collision (dseq '123' vs an unrelated active '12345') is now
+        impossible by construction, not merely guarded against: the audit asks for
+        OUR deployment's own record instead of scanning a shared list, so another
+        deployment's state can never enter the answer. (`_dseq_in_list_output` keeps
+        its own word-boundary tests — this pins the structural property.)
         """
         with (
             patch("just_akash._e2e.subprocess.run") as mock_run,
@@ -384,9 +383,11 @@ class TestRobustDestroyAdversarial:
         ):
             mock_run.side_effect = [
                 _completed(0, stdout="Deployment 123 closed"),
-                _completed(0, stdout="dseq=12345 active\nowner=akashfoo\n"),
+                _completed(0, stdout='{"dseq": "123", "state": "closed"}'),
             ]
             assert robust_destroy("123") is True
+            audit_cmd = mock_run.call_args_list[1].args[0]
+            assert "123" in audit_cmd and "12345" not in audit_cmd
 
     def test_audit_still_detects_exact_dseq_match(self):
         """Sanity: word-boundary match must still detect the real DSEQ."""
@@ -411,7 +412,7 @@ class TestRobustDestroyAdversarial:
         ):
             mock_run.side_effect = [
                 _completed(0, stdout="closed"),  # destroy attempt 1 (clamped)
-                _completed(0, stdout=""),  # audit
+                _completed(0, stdout='{"state": "closed"}'),  # authoritative audit
             ]
             assert robust_destroy("12345", retries=-1) is True
             # Exactly 1 destroy + 1 audit = 2 calls. Destroy MUST run.
@@ -435,7 +436,7 @@ class TestRobustDestroyAdversarial:
         ):
             mock_run.side_effect = [
                 _completed(0, stdout="closed"),  # destroy attempt 1
-                _completed(0, stdout=""),  # audit
+                _completed(0, stdout='{"state": "closed"}'),  # authoritative audit
             ]
             assert robust_destroy("12345", retries=0) is True
             assert mock_run.call_count == 2, (
@@ -774,9 +775,11 @@ class TestRunShellInjectionContract:
                 "update this test to reflect the new contract."
             )
 
-    def test_audit_list_command_is_static(self):
-        """Pin: the audit command is a fixed string, no user input. So even
-        though _run uses shell=True, the audit step is injection-safe.
+    def test_audit_command_quotes_the_dseq_so_it_stays_injection_safe(self):
+        """The audit can no longer be a static literal — it must name the deployment
+        it is auditing, because `just list` cannot be trusted to say whether escrow
+        is held. The injection-safety GUARANTEE is preserved by quoting: _run uses
+        shell=True, so an unquoted dseq would be a live injection vector.
         """
         with (
             patch("just_akash._e2e.subprocess.run") as mock_run,
@@ -784,13 +787,13 @@ class TestRunShellInjectionContract:
         ):
             mock_run.side_effect = [
                 _completed(0, stdout="closed"),
-                _completed(0, stdout=""),
+                _completed(0, stdout='{"state": "closed"}'),
             ]
-            robust_destroy("12345")
-            audit_call = mock_run.call_args_list[1]
-            assert audit_call.args[0] == "just list", (
-                "Audit command must remain a static literal. If user input "
-                "leaks into the audit command, that's a new injection vector."
+            robust_destroy("12345; rm -rf /tmp/pwned")
+            audit_cmd = mock_run.call_args_list[1].args[0]
+            assert "'12345; rm -rf /tmp/pwned'" in audit_cmd, (
+                f"the dseq must be shell-quoted in the audit command; got: {audit_cmd}. "
+                "Unquoted user input under shell=True is an injection vector."
             )
 
 
@@ -1026,7 +1029,7 @@ class TestRobustDestroyAuditFalseTrustsDestroyResult:
         ):
             mock_run.side_effect = [
                 _completed(1, stderr="destroy failed"),  # 1 attempt (clamped)
-                _completed(0, stdout="dseq=12345 active"),  # audit: still here
+                _completed(0, stdout='{"state": "active"}'),  # audit: still here
             ]
             assert robust_destroy("12345", retries=-1, audit=True) is False, (
                 "When the destroy fails AND the audit shows the DSEQ is "
@@ -1203,7 +1206,7 @@ class TestRobustDestroySuccessLogContent:
         ):
             mock_run.side_effect = [
                 _completed(0, stdout="Deployment 12345 closed"),
-                _completed(0, stdout=""),
+                _completed(0, stdout='{"state": "closed"}'),
             ]
             assert robust_destroy("12345") is True
             out = capsys.readouterr().out
@@ -1225,7 +1228,7 @@ class TestRobustDestroySuccessLogContent:
             mock_run.side_effect = [
                 _completed(1, stderr="API down"),  # attempt 1 fails
                 _completed(0, stdout="Deployment 12345 closed"),  # attempt 2 ok
-                _completed(0, stdout=""),  # audit
+                _completed(0, stdout='{"state": "closed"}'),  # authoritative audit
             ]
             assert robust_destroy("12345", retries=2) is True
             out = capsys.readouterr().out
@@ -1314,7 +1317,7 @@ class TestRobustDestroyFalsyDseqDisambiguation:
         ):
             mock_run.side_effect = [
                 _completed(0, stdout="closed"),
-                _completed(0, stdout=""),
+                _completed(0, stdout='{"state": "closed"}'),
             ]
             assert robust_destroy("0") is True
             assert mock_run.call_count == 2, (
@@ -1328,3 +1331,98 @@ class TestRobustDestroyFalsyDseqDisambiguation:
             assert "just destroy 0" in destroy_cmd, (
                 f"dseq='0' must produce `just destroy 0`; got {destroy_cmd!r}."
             )
+
+
+class TestAuditReadsTheAuthoritativeRecordNotTheList:
+    """`just list` lies. Measured 2026-07-17: it reported dseq 1784291290915 as
+    active while that deployment's OWN record read state=closed, escrow=closed,
+    funds=0. The audit used to trust the list, which caused a spurious
+    "STILL listed — manual cleanup required" FAIL on a perfectly clean destroy.
+
+    The staleness cuts both ways, and the other way is the dangerous one: the list
+    can report a deployment GONE while its escrow is still open — a silent leak,
+    which is the exact thing the audit exists to catch. Only the per-deployment
+    record decides whether funds are held.
+    """
+
+    def _audit_cmd(self, mock_run):
+        return mock_run.call_args_list[1].args[0]
+
+    def test_audit_does_not_shell_out_to_just_list(self):
+        with (
+            patch("just_akash._e2e.subprocess.run") as mock_run,
+            patch("just_akash._e2e.time.sleep"),
+        ):
+            mock_run.side_effect = [
+                _completed(0, stdout="closed"),
+                _completed(0, stdout='{"state": "closed"}'),
+            ]
+            robust_destroy("12345")
+            assert self._audit_cmd(mock_run) != "just list"
+            assert "status" in self._audit_cmd(mock_run)
+
+    def test_a_stale_list_can_no_longer_cause_a_spurious_leak_report(self):
+        """The exact 2026-07-17 flake: destroy succeeds, the list still shows the
+        dseq, but the authoritative record says closed. Must PASS, not cry leak."""
+        with (
+            patch("just_akash._e2e.subprocess.run") as mock_run,
+            patch("just_akash._e2e.time.sleep"),
+        ):
+            mock_run.side_effect = [
+                _completed(0, stdout="Deployment 1784291290915 closed"),
+                _completed(0, stdout='{"dseq": "1784291290915", "state": "closed"}'),
+            ]
+            assert robust_destroy("1784291290915") is True
+
+    def test_failed_state_is_settled_too(self):
+        """`failed` is terminal on-chain: settled, holding no escrow."""
+        with (
+            patch("just_akash._e2e.subprocess.run") as mock_run,
+            patch("just_akash._e2e.time.sleep"),
+        ):
+            mock_run.side_effect = [
+                _completed(0, stdout="closed"),
+                _completed(0, stdout='{"state": "failed"}'),
+            ]
+            assert robust_destroy("12345") is True
+
+    def test_unreadable_record_fails_closed_as_a_possible_leak(self, capsys):
+        """If we cannot positively confirm settlement, we must NOT report success:
+        silence is exactly what a leak looks like."""
+        with (
+            patch("just_akash._e2e.subprocess.run") as mock_run,
+            patch("just_akash._e2e.time.sleep"),
+        ):
+            mock_run.side_effect = [
+                _completed(0, stdout="closed"),
+                _completed(1, stderr="API 503"),
+                _completed(1, stderr="API 503"),
+                _completed(1, stderr="API 503"),
+            ]
+            assert robust_destroy("12345") is False
+            assert "could not confirm" in capsys.readouterr().out.lower()
+
+    def test_a_transient_blip_does_not_cry_leak(self):
+        """Fails-closed only AFTER retries — otherwise one API blip would report a
+        leak that isn't one, trading a silent-leak bug for a flaky-red one."""
+        with (
+            patch("just_akash._e2e.subprocess.run") as mock_run,
+            patch("just_akash._e2e.time.sleep"),
+        ):
+            mock_run.side_effect = [
+                _completed(0, stdout="closed"),
+                _completed(1, stderr="transient 503"),  # blip
+                _completed(0, stdout='{"state": "closed"}'),  # recovers
+            ]
+            assert robust_destroy("12345") is True
+
+    def test_still_active_is_reported_as_a_leak(self):
+        with (
+            patch("just_akash._e2e.subprocess.run") as mock_run,
+            patch("just_akash._e2e.time.sleep"),
+        ):
+            mock_run.side_effect = [
+                _completed(0, stdout="closed"),
+                _completed(0, stdout='{"state": "active"}'),
+            ]
+            assert robust_destroy("12345") is False
