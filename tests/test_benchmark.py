@@ -142,11 +142,13 @@ class TestBenchmarkJsonTrustsLocalMetadata:
     """
 
     def test_hostile_probe_keys_cannot_shadow_trusted_metadata(self):
-        results = {"provider": "EVIL", "dseq": "0", "complete": True, "cpu_eps": "900"}
+        # All-string values: parse_results only ever yields strings, so a hostile
+        # BENCH-complete= arrives as the string "true", not a bool.
+        results = {"provider": "EVIL", "dseq": "0", "complete": "true", "cpu_eps": "900"}
         rec = bm.build_json_record("1784", "akash1real", results)
         assert rec["provider"] == "akash1real"  # not EVIL
         assert rec["dseq"] == "1784"  # not 0
-        assert rec["complete"] is False  # our is_complete(), not the probe's claim
+        assert rec["complete"] is False  # our is_complete(), not the probe's string
         assert rec["cpu_eps"] == "900"  # genuine metrics still pass through
 
     def test_complete_reflects_the_done_marker_not_a_probe_claim(self):
