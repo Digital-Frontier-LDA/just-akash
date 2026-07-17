@@ -167,7 +167,7 @@ class TestExecWithStdin:
 
 class TestLeaseShellTransportInject:
     """inject() writes the payload by streaming it over a stdin (104) frame via
-    `cat > path`, NOT by embedding a base64 blob in the shell command. The command
+    `head -c <n> > path`, NOT by embedding a base64 blob in the shell command. The command
     that lands in the provider URL (`cmd2=`) is provider-proxy-logged, so the secret
     must never appear there. mkdir/chmod (no secret) still go via _exec_shell_command;
     only the write goes via _exec_with_stdin_command.
@@ -186,8 +186,10 @@ class TestLeaseShellTransportInject:
         assert shlex.quote("/tmp") in mkdir_call
 
     def test_inject_writes_content_via_stdin_command(self):
-        """The write step pipes the raw content over a stdin frame (`cat > path`),
-        so the shell command carries only `cat > path` — never the content."""
+        """The write step pipes the raw content over a stdin frame via
+        `head -c <n> > path`, so the shell command carries only the byte count and
+        path — never the content. head reads exactly n bytes and exits, so it does
+        not hang waiting for a stdin EOF that provider-proxy never delivers."""
         t = _make_transport()
         content = "SECRET=abc123"
 
@@ -199,7 +201,8 @@ class TestLeaseShellTransportInject:
 
         assert mock_stdin.call_count == 1
         shell_command, stdin_data = mock_stdin.call_args_list[0][0]
-        assert shell_command.startswith("cat > ")
+        n = len(content.encode("utf-8"))
+        assert shell_command.startswith(f"head -c {n} > ")
         assert shlex.quote("/tmp/secrets.env") in shell_command
         # The content rides the stdin frame, not the command string.
         assert stdin_data == content.encode("utf-8")
@@ -233,7 +236,8 @@ class TestLeaseShellTransportInject:
         assert "mkdir -p" in mock_cmd.call_args_list[0][0][0]
         assert "chmod 600" in mock_cmd.call_args_list[1][0][0]
         assert mock_stdin.call_count == 1
-        assert mock_stdin.call_args_list[0][0][0].startswith("cat > ")
+        n = len(b"KEY=value")
+        assert mock_stdin.call_args_list[0][0][0].startswith(f"head -c {n} > ")
         # No _exec_shell_command call carries the legacy base64-decode pipeline.
         for call_args in mock_cmd.call_args_list:
             assert "base64 -d" not in call_args[0][0]
@@ -276,7 +280,7 @@ class TestLeaseShellTransportInject:
             t.inject(dangerous_path, "content")
 
         write_cmd = mock_stdin.call_args_list[0][0][0]
-        assert write_cmd.startswith("cat > ")
+        assert write_cmd.startswith("head -c ")
         assert shlex.quote(dangerous_path) in write_cmd
 
     def test_inject_handles_multiline_content(self):
@@ -338,7 +342,7 @@ class TestLeaseShellTransportInject:
             t.inject("/tmp/empty.env", "")
 
         shell_command, stdin_data = mock_stdin.call_args_list[0][0]
-        assert shell_command.startswith("cat > ")
+        assert shell_command.startswith("head -c 0 > ")  # empty payload → 0 bytes
         assert stdin_data == b""
 
     def test_inject_no_mkdir_for_top_level_path(self):
@@ -354,7 +358,7 @@ class TestLeaseShellTransportInject:
         assert mock_cmd.call_count == 1
         assert "chmod 600" in mock_cmd.call_args_list[0][0][0]
         assert mock_stdin.call_count == 1
-        assert mock_stdin.call_args_list[0][0][0].startswith("cat > ")
+        assert mock_stdin.call_args_list[0][0][0].startswith("head -c ")
 
     def test_inject_root_level_absolute_path_still_runs_mkdir(self):
         """inject('/file.txt', ...) has dirname='/' which is truthy, so mkdir runs.
@@ -468,8 +472,8 @@ class TestLeaseShellTransportInject:
             assert secret not in urllib.parse.unquote(url), (
                 f"Secret leaked into provider URL (decoded): {url!r}"
             )
-            # The command in the URL is just `cat > path`.
-            assert "cat" in urllib.parse.unquote(url)
+            # The command in the URL is just `head -c <n> > path`.
+            assert "head" in urllib.parse.unquote(url)
             data = msg.get("data")
             if data:
                 frame = base64.b64decode(data)

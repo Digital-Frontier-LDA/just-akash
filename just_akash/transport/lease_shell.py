@@ -717,10 +717,18 @@ class LeaseShellTransport(Transport):
         # embedding it in the shell command. The command carried in the URL
         # (`cmd2=`) is provider-proxy-logged, so an `echo <base64> | base64 -d`
         # write would leak the (trivially reversible) secret into those logs.
-        # `cat > path` keeps the URL secret-free; the content rides the stdin
-        # frame, which is not part of the URL/argv.
+        # The reader keeps the URL secret-free; the content rides the stdin frame,
+        # which is not part of the URL/argv.
+        #
+        # `head -c <n>`, NOT `cat`: cat reads until stdin EOF, but provider-proxy
+        # does not translate our empty trailing 104 frame into a stdin close, so
+        # `cat > path` hangs forever waiting for an EOF that never arrives (the
+        # command was never actually exercised against a live provider before this).
+        # `head -c <n>` reads EXACTLY n bytes and exits on its own — no EOF needed.
+        # The byte count is not secret (it's a length), so it may ride the URL.
+        payload = content.encode("utf-8")
         rc = self._exec_with_stdin_command(
-            f"cat > {shlex.quote(remote_path)}", content.encode("utf-8")
+            f"head -c {len(payload)} > {shlex.quote(remote_path)}", payload
         )
         if rc != 0:
             raise RuntimeError(f"Failed to write {remote_path}: exit {rc}")
