@@ -3,7 +3,6 @@
 import base64
 import json
 import shlex
-import urllib.parse
 from unittest.mock import patch
 
 import pytest
@@ -167,87 +166,52 @@ class TestExecWithStdin:
 
 
 class TestLeaseShellTransportInject:
-    """inject() writes the payload by streaming it over a stdin (104) frame via
-    `head -c <n> > path`, NOT by embedding a base64 blob in the shell command. The command
-    that lands in the provider URL (`cmd2=`) is provider-proxy-logged, so the secret
-    must never appear there. mkdir/chmod (no secret) still go via _exec_shell_command;
-    only the write goes via _exec_with_stdin_command.
-    """
-
     def test_inject_creates_parent_directory(self):
         t = _make_transport()
-        with (
-            patch.object(t, "_exec_shell_command", return_value=0) as mock_cmd,
-            patch.object(t, "_exec_with_stdin_command", return_value=0),
-        ):
+        with patch.object(t, "_exec_shell_command", return_value=0) as mock_cmd:
             t.inject("/tmp/secrets.env", "KEY=value")
 
         mkdir_call = mock_cmd.call_args_list[0][0][0]
         assert "mkdir -p" in mkdir_call
         assert shlex.quote("/tmp") in mkdir_call
 
-    def test_inject_writes_content_via_stdin_command(self):
-        """The write step pipes the raw content over a stdin frame via
-        `head -c <n> > path`, so the shell command carries only the byte count and
-        path — never the content. head reads exactly n bytes and exits, so it does
-        not hang waiting for a stdin EOF that provider-proxy never delivers."""
+    def test_inject_writes_via_exec_shell_command(self):
         t = _make_transport()
         content = "SECRET=abc123"
+        expected_b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
 
-        with (
-            patch.object(t, "_exec_shell_command", return_value=0),
-            patch.object(t, "_exec_with_stdin_command", return_value=0) as mock_stdin,
-        ):
+        with patch.object(t, "_exec_shell_command", return_value=0) as mock_cmd:
             t.inject("/tmp/secrets.env", content)
 
-        assert mock_stdin.call_count == 1
-        shell_command, stdin_data = mock_stdin.call_args_list[0][0]
-        n = len(content.encode("utf-8"))
-        assert shell_command.startswith(f"head -c {n} > ")
-        assert shlex.quote("/tmp/secrets.env") in shell_command
-        # The content rides the stdin frame, not the command string.
-        assert stdin_data == content.encode("utf-8")
-        assert content not in shell_command
+        # Second call is the write (first is mkdir, third is chmod)
+        cmd = mock_cmd.call_args_list[1][0][0]
+        assert expected_b64 in cmd
+        assert "base64 -d" in cmd
+        assert "/tmp/secrets.env" in cmd
 
     def test_inject_sets_file_permissions(self):
         t = _make_transport()
-        with (
-            patch.object(t, "_exec_shell_command", return_value=0) as mock_cmd,
-            patch.object(t, "_exec_with_stdin_command", return_value=0),
-        ):
+        with patch.object(t, "_exec_shell_command", return_value=0) as mock_cmd:
             t.inject("/tmp/secrets.env", "KEY=value")
 
-        # mkdir + chmod go via _exec_shell_command (write goes via stdin), so
-        # chmod is the second (and last) _exec_shell_command call.
-        chmod_call = mock_cmd.call_args_list[-1][0][0]
+        chmod_call = mock_cmd.call_args_list[2][0][0]
         assert "chmod 600" in chmod_call
         assert shlex.quote("/tmp/secrets.env") in chmod_call
 
-    def test_inject_write_uses_stdin_command_not_shell_command(self):
-        """mkdir + chmod go through _exec_shell_command (2 calls); the secret write
-        goes through _exec_with_stdin_command (1 call) — never a base64 blob in the URL."""
+    def test_inject_uses_exec_shell_command_for_all_steps(self):
         t = _make_transport()
-        with (
-            patch.object(t, "_exec_shell_command", return_value=0) as mock_cmd,
-            patch.object(t, "_exec_with_stdin_command", return_value=0) as mock_stdin,
-        ):
+        with patch.object(t, "_exec_shell_command", return_value=0) as mock_cmd:
             t.inject("/tmp/secrets.env", "KEY=value")
 
-        assert mock_cmd.call_count == 2
+        assert mock_cmd.call_count == 3
         assert "mkdir -p" in mock_cmd.call_args_list[0][0][0]
-        assert "chmod 600" in mock_cmd.call_args_list[1][0][0]
-        assert mock_stdin.call_count == 1
-        n = len(b"KEY=value")
-        assert mock_stdin.call_args_list[0][0][0].startswith(f"head -c {n} > ")
-        # No _exec_shell_command call carries the legacy base64-decode pipeline.
-        for call_args in mock_cmd.call_args_list:
-            assert "base64 -d" not in call_args[0][0]
+        assert "base64 -d" in mock_cmd.call_args_list[1][0][0]
+        assert "chmod 600" in mock_cmd.call_args_list[2][0][0]
 
     def test_inject_raises_on_mkdir_failure(self):
         t = _make_transport()
         with (
             patch.object(t, "_exec_shell_command", return_value=1),
-            patch.object(t, "_exec_with_stdin_command", return_value=0),
             pytest.raises(RuntimeError, match="Failed to create directory"),
         ):
             t.inject("/tmp/secrets.env", "KEY=value")
@@ -255,18 +219,15 @@ class TestLeaseShellTransportInject:
     def test_inject_raises_on_write_failure(self):
         t = _make_transport()
         with (
-            patch.object(t, "_exec_shell_command", return_value=0),
-            patch.object(t, "_exec_with_stdin_command", return_value=1),
+            patch.object(t, "_exec_shell_command", side_effect=[0, 1]),
             pytest.raises(RuntimeError, match="Failed to write"),
         ):
             t.inject("/tmp/secrets.env", "KEY=value")
 
     def test_inject_raises_on_chmod_failure(self):
         t = _make_transport()
-        # mkdir ok, chmod fails (the two _exec_shell_command calls); write ok.
         with (
-            patch.object(t, "_exec_shell_command", side_effect=[0, 1]),
-            patch.object(t, "_exec_with_stdin_command", return_value=0),
+            patch.object(t, "_exec_shell_command", side_effect=[0, 0, 1]),
             pytest.raises(RuntimeError, match="Failed to set permissions"),
         ):
             t.inject("/tmp/secrets.env", "KEY=value")
@@ -274,50 +235,35 @@ class TestLeaseShellTransportInject:
     def test_inject_escapes_path_with_shell_metacharacters(self):
         t = _make_transport()
         dangerous_path = "/tmp/test'; rm -rf /"
-        with (
-            patch.object(t, "_exec_shell_command", return_value=0),
-            patch.object(t, "_exec_with_stdin_command", return_value=0) as mock_stdin,
-        ):
+        with patch.object(t, "_exec_shell_command", return_value=0) as mock_cmd:
             t.inject(dangerous_path, "content")
 
-        write_cmd = mock_stdin.call_args_list[0][0][0]
-        assert write_cmd.startswith("head -c ")
+        write_cmd = mock_cmd.call_args_list[1][0][0]
+        assert "base64 -d" in write_cmd
         assert shlex.quote(dangerous_path) in write_cmd
 
     def test_inject_handles_multiline_content(self):
         t = _make_transport()
         content = "LINE1=val1\nLINE2=val2\n"
+        expected_b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
 
-        with (
-            patch.object(t, "_exec_shell_command", return_value=0),
-            patch.object(t, "_exec_with_stdin_command", return_value=0) as mock_stdin,
-        ):
+        with patch.object(t, "_exec_shell_command", return_value=0) as mock_cmd:
             t.inject("/tmp/multiline.env", content)
 
-        stdin_data = mock_stdin.call_args_list[0][0][1]
-        assert stdin_data == content.encode("utf-8")
+        write_cmd = mock_cmd.call_args_list[1][0][0]
+        assert expected_b64 in write_cmd
 
     def test_inject_secret_value_not_in_plaintext_commands(self):
         t = _make_transport()
         secret_value = fake_secret("pw")
 
-        with (
-            patch.object(t, "_exec_shell_command", return_value=0) as mock_cmd,
-            patch.object(t, "_exec_with_stdin_command", return_value=0) as mock_stdin,
-        ):
+        with patch.object(t, "_exec_shell_command", return_value=0) as mock_cmd:
             t.inject("/tmp/secret.env", f"PASSWORD={secret_value}")
 
-        # No _exec_shell_command (URL-carried) command may contain the raw secret.
+        # no command should contain the raw secret value
         for i, call_args in enumerate(mock_cmd.call_args_list):
             cmd = call_args[0][0]
             assert secret_value not in cmd, f"Secret leaked in command[{i}]: {cmd!r}"
-        # The stdin-command's shell string (which also goes in the URL) must be
-        # secret-free; the secret must ride the stdin bytes instead.
-        shell_command, stdin_data = mock_stdin.call_args_list[0][0]
-        assert secret_value not in shell_command, (
-            f"Secret leaked into stdin shell command: {shell_command!r}"
-        )
-        assert secret_value.encode("utf-8") in stdin_data
 
     def test_inject_calls_prepare_if_not_configured(self):
         t = _make_transport()
@@ -327,7 +273,6 @@ class TestLeaseShellTransportInject:
         with (
             patch.object(t, "prepare") as mock_prepare,
             patch.object(t, "_exec_shell_command", return_value=0),
-            patch.object(t, "_exec_with_stdin_command", return_value=0),
         ):
             t.inject("/tmp/test.env", "KEY=val")
 
@@ -336,152 +281,87 @@ class TestLeaseShellTransportInject:
     def test_inject_with_empty_content_produces_valid_command(self):
         t = _make_transport()
 
-        with (
-            patch.object(t, "_exec_shell_command", return_value=0),
-            patch.object(t, "_exec_with_stdin_command", return_value=0) as mock_stdin,
-        ):
+        with patch.object(t, "_exec_shell_command", return_value=0) as mock_cmd:
             t.inject("/tmp/empty.env", "")
 
-        shell_command, stdin_data = mock_stdin.call_args_list[0][0]
-        assert shell_command.startswith("head -c 0 > ")  # empty payload → 0 bytes
-        assert stdin_data == b""
+        write_cmd = mock_cmd.call_args_list[1][0][0]
+        assert "base64 -d" in write_cmd
 
     def test_inject_no_mkdir_for_top_level_path(self):
         t = _make_transport()
-        with (
-            patch.object(t, "_exec_shell_command", return_value=0) as mock_cmd,
-            patch.object(t, "_exec_with_stdin_command", return_value=0) as mock_stdin,
-        ):
+        with patch.object(t, "_exec_shell_command", return_value=0) as mock_cmd:
             t.inject("file.txt", "content")
 
-        # No mkdir (no parent dir) → chmod is the only _exec_shell_command call;
-        # the write goes via the stdin command.
-        assert mock_cmd.call_count == 1
-        assert "chmod 600" in mock_cmd.call_args_list[0][0][0]
-        assert mock_stdin.call_count == 1
-        assert mock_stdin.call_args_list[0][0][0].startswith("head -c ")
+        # Only write + chmod, no mkdir
+        assert mock_cmd.call_count == 2
+        assert "base64 -d" in mock_cmd.call_args_list[0][0][0]
+        assert "chmod 600" in mock_cmd.call_args_list[1][0][0]
 
     def test_inject_root_level_absolute_path_still_runs_mkdir(self):
         """inject('/file.txt', ...) has dirname='/' which is truthy, so mkdir runs.
 
         This is a boundary case: os.path.dirname('/file.txt') == '/' which is
         a non-empty string, so the code enters the mkdir branch. Verify the mkdir
-        command is actually issued for root-level absolute paths (mkdir + chmod =
-        2 _exec_shell_command calls + 1 stdin write), unlike bare relative
-        filenames which skip mkdir (1 _exec_shell_command call).
+        command is actually issued for root-level absolute paths (3 calls total),
+        unlike bare relative filenames which skip mkdir (2 calls).
         """
         t = _make_transport()
-        with (
-            patch.object(t, "_exec_shell_command", return_value=0) as mock_cmd,
-            patch.object(t, "_exec_with_stdin_command", return_value=0) as mock_stdin,
-        ):
+        with patch.object(t, "_exec_shell_command", return_value=0) as mock_cmd:
             t.inject("/file.txt", "content")
 
         # dirname('/file.txt') == '/' which is truthy → mkdir IS called
-        assert mock_cmd.call_count == 2, (
-            f"Expected 2 _exec_shell_command calls (mkdir + chmod) for '/file.txt', "
+        assert mock_cmd.call_count == 3, (
+            f"Expected 3 _exec_shell_command calls (mkdir + write + chmod) for '/file.txt', "
             f"got {mock_cmd.call_count}. The dirname '/' is truthy so mkdir should run."
         )
         assert "mkdir -p" in mock_cmd.call_args_list[0][0][0]
-        assert "chmod 600" in mock_cmd.call_args_list[1][0][0]
-        assert mock_stdin.call_count == 1
 
-    def test_inject_content_with_special_chars_streamed_via_stdin(self):
+    def test_inject_content_with_equals_and_special_chars_survives_base64_roundtrip(self):
         """Content containing shell-dangerous characters (backticks, $(), newlines)
-        must ride the stdin frame verbatim and NEVER reach any shell command string.
+        must be base64-encoded so they never reach the shell interpreter directly.
 
         This tests the invariant that the raw content NEVER appears in any
-        _exec_shell_command call nor the stdin-command's shell string -- only in
-        the stdin bytes.
+        _exec_shell_command call -- only the base64-encoded form does.
         """
         t = _make_transport()
         dangerous_content = (
             "DB_URL=postgres://u:p@host/db\nSECRET=$(cat /etc/shadow)\nTOKEN=`whoami`"
         )
+        encoded = base64.b64encode(dangerous_content.encode("utf-8")).decode("ascii")
 
-        with (
-            patch.object(t, "_exec_shell_command", return_value=0) as mock_cmd,
-            patch.object(t, "_exec_with_stdin_command", return_value=0) as mock_stdin,
-        ):
+        with patch.object(t, "_exec_shell_command", return_value=0) as mock_cmd:
             t.inject("/app/.env", dangerous_content)
 
-        shell_command, stdin_data = mock_stdin.call_args_list[0][0]
-        # The content rides the stdin bytes verbatim.
-        assert stdin_data == dangerous_content.encode("utf-8")
-        # The raw dangerous substrings must NOT be present in any command string.
-        commands = [c[0][0] for c in mock_cmd.call_args_list] + [shell_command]
-        for cmd in commands:
+        write_cmd = mock_cmd.call_args_list[1][0][0]
+        # The base64-encoded string must be present
+        assert encoded in write_cmd
+        # The raw dangerous substrings must NOT be present in any command
+        for call_args in mock_cmd.call_args_list:
+            cmd = call_args[0][0]
             assert "$(cat" not in cmd, f"Shell substitution leaked into command: {cmd!r}"
             assert "`whoami`" not in cmd, f"Backtick expansion leaked into command: {cmd!r}"
 
     def test_inject_write_failure_prevents_chmod_from_running(self):
-        """When the write step fails, chmod must NOT execute.
+        """When the write step (step 2) fails, chmod (step 3) must NOT execute.
 
         This catches a regression where inject() might swallow the write error
         and proceed to chmod, or where the error check is on the wrong return code.
         """
         t = _make_transport()
-        shell_calls = []
+        call_log = []
+
+        def tracking_exec(cmd):
+            call_log.append(cmd)
+            if "base64 -d" in cmd:
+                return 1  # write fails
+            return 0  # mkdir succeeds
 
         with (
-            patch.object(
-                t, "_exec_shell_command", side_effect=lambda cmd: shell_calls.append(cmd) or 0
-            ),
-            patch.object(t, "_exec_with_stdin_command", return_value=1),  # write fails
+            patch.object(t, "_exec_shell_command", side_effect=tracking_exec),
             pytest.raises(RuntimeError, match="Failed to write"),
         ):
             t.inject("/tmp/secrets.env", "KEY=value")
 
-        # Verify chmod was never called (only mkdir ran before the write failed).
-        chmod_calls = [c for c in shell_calls if "chmod" in c]
+        # Verify chmod was never called
+        chmod_calls = [c for c in call_log if "chmod" in c]
         assert len(chmod_calls) == 0, f"chmod was called despite write failure: {chmod_calls}"
-
-    def test_inject_secret_not_in_provider_url_and_sent_via_stdin_frame(self):
-        """End-to-end frame-level guard: drive inject() through the real
-        _exec_with_stdin_command (only mkdir/chmod are stubbed) and inspect the
-        messages actually sent to provider-proxy.
-
-        The secret content must NOT appear in any frame's `url` (the URL is what
-        provider-proxy logs), and MUST be carried as the payload of a 104 stdin
-        `data` frame.
-        """
-        t = _make_transport()
-        secret = fake_secret("tok")
-        content = f"API_KEY={secret}"
-        # A 102 result frame (exit 0) so _exec_with_stdin_command returns cleanly.
-        frames = [bytes([102]) + (0).to_bytes(4, "little")]
-
-        with (
-            patch.object(t, "_exec_shell_command", return_value=0),  # mkdir + chmod
-            patch.object(t, "_fetch_jwt", return_value="jwt"),
-            patch("just_akash.transport.lease_shell.connect") as mock_connect,
-            patch("just_akash.transport.lease_shell.time.sleep"),
-        ):
-            fake_ws = FakeWebSocket(frames)
-            mock_connect.return_value = fake_ws
-            t.inject("/tmp/secret.env", content)
-
-        assert fake_ws.sent_messages, "expected messages sent to provider-proxy"
-
-        secret_seen_in_stdin_frame = False
-        for raw in fake_ws.sent_messages:
-            msg = json.loads(raw)
-            # The URL (logged by provider-proxy) must never carry the secret,
-            # raw or percent-encoded.
-            url = msg["url"]
-            assert secret not in url, f"Secret leaked into provider URL: {url!r}"
-            assert secret not in urllib.parse.unquote(url), (
-                f"Secret leaked into provider URL (decoded): {url!r}"
-            )
-            # The command in the URL is just `head -c <n> > path`.
-            assert "head" in urllib.parse.unquote(url)
-            data = msg.get("data")
-            if data:
-                frame = base64.b64decode(data)
-                if frame and frame[0] == _FRAME_STDIN and secret.encode("utf-8") in frame[1:]:
-                    assert frame[1:] == content.encode("utf-8")
-                    secret_seen_in_stdin_frame = True
-
-        assert secret_seen_in_stdin_frame, (
-            "secret content was not delivered via a 104 stdin data frame"
-        )

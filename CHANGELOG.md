@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.29.0] — 2026-07-18
+
+### Fixed
+- **`inject` over lease-shell was silently writing EMPTY files — reverted the broken stdin-frame write.** #39/#28 (v1.27.0) switched the lease-shell inject from `echo <b64> | base64 -d > path` to `head -c <n>` over a `104` stdin data frame, to keep the secret out of the provider-proxy-logged URL. But that mechanism (`_exec_with_stdin_command`) does **not** actually deliver stdin to the container: measured live against **all three** providers, `head -c <n>` read **zero bytes** and wrote a **0-byte file** while `inject` reported "Injected N secret(s)" and exited 0 — silent data loss, strictly worse than the log leak it was fixing. (The #39 E2E passed falsely; the daily provider-smoke `inject` check caught it — `inject: FAIL` on all three healthy leases.) Reverted to the working `echo <b64> | base64 -d` write. Verified live: the file now lands with the correct 48 bytes and the smoke's `_inject_and_read` passes.
+
+### Security (regression re-opened)
+- Reverting the above re-introduces #39's original concern: the base64-obscured (trivially reversible) secret rides the shell command in the provider-proxy-logged URL. This is tracked for a proper re-fix once the stdin-frame path is made to actually deliver data and is validated against a live provider. A working inject that logs a reversible secret is a lesser evil than one that silently drops it.
+
 ## [1.28.0] — 2026-07-17
 
 ### Changed
