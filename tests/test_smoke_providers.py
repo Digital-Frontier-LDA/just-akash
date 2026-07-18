@@ -364,6 +364,75 @@ class TestSshCheck:
             assert sp._check_ssh("123456", "/k") is True
 
 
+class TestInjectReadbackRetry:
+    """The inject readback is a lease-shell exec, so it can hit the cold-stdout race
+    (rc=0 + empty stdout) even though the write succeeded. It retries ONLY that
+    signature — a nonzero rc or wrong content is a real failure and never retried,
+    so a genuine inject regression is never masked."""
+
+    def test_passes_on_first_read(self):
+        outs = [
+            _completed(returncode=0),  # inject write
+            _completed(stdout="SMOKE_SECRET=injected_ok\n"),  # readback: good
+        ]
+        with patch.object(sp, "_run", side_effect=outs) as run:
+            assert sp._check_inject("123456") is True
+        assert run.call_count == 2  # write + one readback, no retry
+
+    def test_retries_past_a_cold_stdout_race_then_passes(self):
+        outs = [
+            _completed(returncode=0),  # inject write
+            _completed(stdout="", returncode=0),  # readback: cold-stdout race (empty)
+            _completed(stdout="SMOKE_SECRET=injected_ok\n"),  # readback: good on retry
+        ]
+        with (
+            patch.object(sp, "_run", side_effect=outs) as run,
+            patch.object(sp.time, "sleep"),
+        ):
+            assert sp._check_inject("123456") is True
+        assert run.call_count == 3  # write + empty + good
+
+    def test_fails_after_all_attempts_stay_empty(self):
+        # write, then _INJECT_READBACK_ATTEMPTS empty readbacks
+        outs = [_completed(returncode=0)] + [
+            _completed(stdout="", returncode=0) for _ in range(sp._INJECT_READBACK_ATTEMPTS)
+        ]
+        with (
+            patch.object(sp, "_run", side_effect=outs) as run,
+            patch.object(sp.time, "sleep"),
+        ):
+            assert sp._check_inject("123456") is False
+        # write + exactly _INJECT_READBACK_ATTEMPTS readbacks (bounded, no runaway)
+        assert run.call_count == 1 + sp._INJECT_READBACK_ATTEMPTS
+
+    def test_does_not_retry_a_nonzero_readback(self):
+        # A real exec failure (rc!=0) is NOT the race — fail on the first read.
+        outs = [
+            _completed(returncode=0),  # inject write
+            _completed(stdout="injected_ok\n", returncode=1),  # readback errored
+        ]
+        with patch.object(sp, "_run", side_effect=outs) as run:
+            assert sp._check_inject("123456") is False
+        assert run.call_count == 2  # no retry on a genuine failure
+
+    def test_does_not_retry_wrong_content(self):
+        # rc=0 with non-empty-but-wrong content means the file is wrong — a real
+        # inject defect, not the race. Must fail immediately, not retry.
+        outs = [
+            _completed(returncode=0),  # inject write
+            _completed(stdout="SMOKE_SECRET=tampered\n", returncode=0),  # wrong content
+        ]
+        with patch.object(sp, "_run", side_effect=outs) as run:
+            assert sp._check_inject("123456") is False
+        assert run.call_count == 2  # no retry — wrong content is a real failure
+
+    def test_inject_write_failure_short_circuits(self):
+        # If the write itself fails, never attempt a readback.
+        with patch.object(sp, "_run", side_effect=[_completed(returncode=1)]) as run:
+            assert sp._check_inject("123456") is False
+        assert run.call_count == 1  # write only, no readback
+
+
 class TestConnectCheck:
     def test_connect_passes_when_marker_echoed(self):
         done = subprocess.CompletedProcess(

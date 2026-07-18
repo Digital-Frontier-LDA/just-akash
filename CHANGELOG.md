@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.33.0] — 2026-07-18
+
+### Fixed
+- **The `inject` check counted a known transport race as a provider failure — it reddened a scheduled run.** `inject` writes a file then reads it back with a lease-shell exec, and that readback can hit the cold-stdout race (rc=0 with EMPTY stdout: the exit-code frame arrives before the stdout frame) even though the write succeeded — so a healthy inject reads back as FAIL. Because inject does *two* round-trips and only the first was guarded, it sat at 93–97% fleet-wide while exec ran higher; today's 07:30 scheduled smoke went red with `inject: FAIL` on both bidding providers for exactly this reason. The readback now retries **only** the race signature (rc=0 + empty stdout), up to `SMOKE_INJECT_READBACK_ATTEMPTS` (default 3) with a short backoff; a nonzero rc or non-empty-but-wrong content still fails on the first read, so a genuine inject regression is never masked. This is the retry-on-empty-stdout remedy the quorum approved for the same race, applied where it was missing. Live: 25/25 inject PASS hammering one hgulk6 lease, then the lease settled clean with no escrow held.
+
 ## [1.32.0] — 2026-07-18
 
 ### Added
