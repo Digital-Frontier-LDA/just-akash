@@ -1426,7 +1426,48 @@ def _check_update(dseq: str, sdl_path: str, uri: str, diag: dict | None = None) 
 # ── orchestration ────────────────────────────────────────────────────
 
 
-def smoke_provider(provider: str, sdl_path: str, key: str, records: list | None = None) -> dict:
+def _benchmark_provider(dseq: str, provider: str) -> dict | None:
+    """Grade the LIVE lease's hardware (quality), on top of the feature matrix
+    (responsiveness). Runs the benchmark CLI against the probe and returns its
+    parsed metrics as one telemetry record, or None.
+
+    Best-effort and NON-GATING by construction: it runs only AFTER the feature
+    matrix is complete and recorded, so benchmark load can never mask a feature
+    result (the #61 concern), and any failure here is swallowed — the smoke's
+    pass/fail is never affected by the grade. Enabled only when SMOKE_BENCHMARK_FILE
+    is set, so the default daily run is unchanged unless a benchmark sink is wired.
+    """
+    if not os.environ.get("SMOKE_BENCHMARK_FILE", "").strip():
+        return None
+    try:
+        print("  benchmark: grading hardware (non-gating)...")
+        r = _run(f"uv run just-akash benchmark --dseq {q(dseq)} --json", timeout=150)
+        line = next(
+            (ln for ln in (r.stdout or "").splitlines() if ln.strip().startswith("{")), None
+        )
+        if not line:
+            print(f"  {YELLOW}benchmark: no metrics returned (non-gating){RESET}")
+            return None
+        rec = json.loads(line)
+        if not isinstance(rec, dict):
+            return None
+        # Trust our provider/dseq over anything the probe emitted (same rule as the
+        # benchmark CLI's build_json_record).
+        rec["provider"] = provider
+        rec["dseq"] = dseq
+        return rec
+    except Exception as e:  # noqa: BLE001 — grading must never break the smoke
+        print(f"  {YELLOW}benchmark: skipped ({type(e).__name__}) — non-gating{RESET}")
+        return None
+
+
+def smoke_provider(
+    provider: str,
+    sdl_path: str,
+    key: str,
+    records: list | None = None,
+    bench_records: list | None = None,
+) -> dict:
     """Run the full feature matrix against one provider.
 
     The ``finally`` guarantees the deployment is destroyed and (when ``records``
@@ -1434,6 +1475,10 @@ def smoke_provider(provider: str, sdl_path: str, key: str, records: list | None 
     A hard error in the deploy/readiness helpers (e.g. a subprocess timeout) is
     not swallowed here — it propagates to ``main()``, which records the provider
     as all-FAIL and moves on, so one provider's failure never aborts the run.
+
+    When ``bench_records`` is provided AND the lease came up healthy, a hardware
+    benchmark runs on the live lease AFTER the matrix (quality, not just pass/fail)
+    and one record is appended — see :func:`_benchmark_provider`.
     """
     results = dict.fromkeys(FEATURES, "-")
     latencies: dict[str, float] = {}
@@ -1553,6 +1598,19 @@ def smoke_provider(provider: str, sdl_path: str, key: str, records: list | None 
             results["ingress"] = results["update"] = "FAIL"
             print(f"  {RED}ingress: FAIL{RESET} (no ingress URI assigned)")
             _diag_once("no ingress URI assigned")
+
+        # QUALITY grade on the live lease — AFTER the feature matrix above is fully
+        # recorded, so the benchmark's load can never mask a feature result. Only on
+        # a healthy lease (deploy + ready PASS): grading a dead one is pointless.
+        if (
+            bench_records is not None
+            and results.get("deploy") == "PASS"
+            and results.get("ready") == "PASS"
+            and dseq_ref["dseq"]
+        ):
+            rec = _benchmark_provider(dseq_ref["dseq"], provider)
+            if rec is not None:
+                bench_records.append(rec)
 
         return results
     finally:
@@ -1713,6 +1771,9 @@ def main() -> int:
     # Always collect records in memory (the gate reads their diag to demote a
     # quarantined provider's reliability failures); only WRITE them if asked.
     records: list = []
+    # Hardware-quality records (separate schema from the per-feature latency rows):
+    # one benchmark grade per healthy lease, written to SMOKE_BENCHMARK_FILE.
+    bench_records: list = []
     quarantined = _quarantined_providers()
 
     rows: dict = {}
@@ -1720,7 +1781,9 @@ def main() -> int:
     try:
         for provider in providers:
             try:
-                rows[provider] = smoke_provider(provider, sdl_path, key_path, records=records)
+                rows[provider] = smoke_provider(
+                    provider, sdl_path, key_path, records=records, bench_records=bench_records
+                )
             except Exception as e:  # noqa: BLE001 — one provider's hard error must not abort the run
                 print(f"  {RED}{provider} aborted: {type(e).__name__}: {e}{RESET}")
                 rows[provider] = dict.fromkeys(FEATURES, "FAIL")
@@ -1747,6 +1810,11 @@ def main() -> int:
                 rec["mass_lease_down"] = True
         if args.telemetry_file and records:
             _write_telemetry(args.telemetry_file, run_ts, _pkg_version(), records)
+        # Hardware grades go to their own sink so the quality analyzer reads them
+        # independently of the latency telemetry (they have different schemas).
+        bench_file = os.environ.get("SMOKE_BENCHMARK_FILE", "").strip()
+        if bench_file and bench_records:
+            _write_telemetry(bench_file, run_ts, _pkg_version(), bench_records)
 
     _print_matrix(rows)
     print()

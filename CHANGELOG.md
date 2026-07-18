@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.32.0] — 2026-07-18
+
+### Added
+- **Benchmark grades are now persisted — the quality signal finally accrues.** Steps 1–2 measured hardware honesty and stability, but the numbers evaporated at the end of each run: nothing recorded them, so there was no history to score a provider against. The daily smoke now piggybacks a hardware benchmark on each healthy probe — it runs on the SAME lease *after* the feature matrix is fully recorded (so its load can never mask a feature result — the #61 concern) and *before* destroy (so it costs no extra lease or escrow). Each grade is one JSON line written to `SMOKE_BENCHMARK_FILE` and accrued to the `telemetry` branch as `smoke-benchmark.jsonl`, alongside the existing latency stream. Strictly non-gating: the benchmark only runs when the sink is set and when deploy+ready both PASS, and any failure is swallowed — a provider's smoke pass/fail is never touched by its grade. Live: a z9nr probe wrote a complete row (cpu_eps≈1229, mem 4.3 GB/s, 5 stability samples at ~4% CV, throttle/steal counters) and the lease settled clean with no escrow held. Step 3a of the provider quality/health build; the fleet-relative + own-baseline scoring analyzer (3b) reads this accrued file.
+
 ## [1.31.0] — 2026-07-18
 
 ### Added

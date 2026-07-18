@@ -1583,7 +1583,7 @@ class TestQuarantineMainGate:
     definitive 'the CI gate no longer flakes on hgulk6' behavior."""
 
     def _fake_smoke(self, hgulk6, tooling=False):
-        def _f(provider, sdl, key, records=None):
+        def _f(provider, sdl, key, records=None, bench_records=None):
             if provider == hgulk6 and not tooling:
                 row = {**dict.fromkeys(sp.FEATURES, sp.LEASE_DOWN), "deploy": "PASS"}
                 diag = {"fail_kind": "lease-down"}
@@ -1635,7 +1635,7 @@ class TestQuarantineMainGate:
     def _run_main_rows(self, provider_rows, quarantine=""):
         """Drive main() with an explicit {provider: row} map and quarantine env."""
 
-        def fake_smoke(provider, sdl, key, records=None):
+        def fake_smoke(provider, sdl, key, records=None, bench_records=None):
             row = provider_rows[provider]
             if records is not None:
                 for f in sp._TELEMETRY_FEATURES:
@@ -1730,3 +1730,49 @@ class TestNoBidPhrasingCoverage:
             self._note("No valid bids received — all bid entries were malformed.")
             == "deploy-failed"
         )
+
+
+class TestBenchmarkPiggyback:
+    """Quality grading rides the smoke's live lease AFTER the feature matrix — Step 3a
+    of the provider quality build. Disabled unless SMOKE_BENCHMARK_FILE is set, and
+    NON-GATING: a benchmark failure never touches the smoke's pass/fail."""
+
+    def test_disabled_without_the_env_var(self, monkeypatch):
+        monkeypatch.delenv("SMOKE_BENCHMARK_FILE", raising=False)
+        assert sp._benchmark_provider("123", "prov") is None
+
+    def test_parses_the_benchmark_json_and_stamps_trusted_fields(self, monkeypatch):
+        monkeypatch.setenv("SMOKE_BENCHMARK_FILE", "/tmp/x.jsonl")
+        out = 'noise\n{"cpu_eps": "900", "provider": "EVIL", "dseq": "0", "complete": true}\n'
+        with patch.object(sp, "_run", return_value=_completed(out, returncode=0)):
+            rec = sp._benchmark_provider("123", "prov")
+        assert rec is not None
+        assert rec["cpu_eps"] == "900"
+        assert rec["provider"] == "prov"  # our value wins over the probe's
+        assert rec["dseq"] == "123"
+
+    def test_no_json_line_returns_none(self, monkeypatch):
+        monkeypatch.setenv("SMOKE_BENCHMARK_FILE", "/tmp/x.jsonl")
+        with patch.object(sp, "_run", return_value=_completed("only noise\n", returncode=0)):
+            assert sp._benchmark_provider("123", "prov") is None
+
+    def test_never_raises_even_if_benchmark_blows_up(self, monkeypatch):
+        monkeypatch.setenv("SMOKE_BENCHMARK_FILE", "/tmp/x.jsonl")
+        with patch.object(sp, "_run", side_effect=RuntimeError("boom")):
+            assert sp._benchmark_provider("123", "prov") is None  # swallowed, non-gating
+
+    def test_piggyback_runs_only_on_a_healthy_lease(self, monkeypatch):
+        # A benchmark record is appended only when deploy+ready PASS. This pins the
+        # sequencing guarantee: grading happens after (not instead of) the matrix.
+        monkeypatch.setenv("SMOKE_BENCHMARK_FILE", "/tmp/x.jsonl")
+        bench: list = []
+        with (
+            patch.object(sp, "_benchmark_provider", return_value={"cpu_eps": "900"}) as mock_b,
+            patch.object(sp, "_deploy", return_value=(None, "no-bid")),  # never deploys
+            patch.object(sp, "robust_destroy", return_value=True),
+            patch.object(sp, "install_signal_cleanup"),
+        ):
+            sp.smoke_provider("prov", "/sdl", "/key", bench_records=bench)
+        # no-bid → no healthy lease → benchmark never runs, bench_records stays empty
+        assert mock_b.call_count == 0
+        assert bench == []
