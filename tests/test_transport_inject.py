@@ -188,6 +188,10 @@ class TestLeaseShellTransportInject:
         assert expected_b64 in cmd
         assert "base64 -d" in cmd
         assert "/tmp/secrets.env" in cmd
+        # The write must umask 077 so the file is created 0600 — no window where the
+        # secret is world-/group-readable before chmod. (CodeRabbit, PR #66.)
+        assert "umask 077" in cmd
+        assert cmd.index("umask 077") < cmd.index("base64 -d")
 
     def test_inject_sets_file_permissions(self):
         t = _make_transport()
