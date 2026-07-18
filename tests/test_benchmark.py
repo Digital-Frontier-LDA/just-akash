@@ -254,3 +254,52 @@ class TestFidelityInReport:
     def test_report_omits_fidelity_when_unmeasured(self):
         text = bm.format_results("prov", {"cpu_eps": "900", "done": "1"})
         assert "fidelity" not in text
+
+
+class TestStability:
+    """Consistently-good vs fast-once: the sustained-load signal (Step 2)."""
+
+    def test_steady_host_is_not_unstable(self):
+        s = bm.stability({"cpu_samples": "1000 1010 990 1005 995"})
+        assert s["unstable"] is False
+        assert s["cpu_cv_pct"] < 5
+        assert s["cpu_mean"] == 1000.0
+        assert s["cpu_min"] == 990.0 and s["cpu_max"] == 1010.0
+
+    def test_noisy_host_is_flagged_unstable(self):
+        s = bm.stability({"cpu_samples": "1500 600 1400 500 900"})
+        assert s["unstable"] is True
+        assert s["cpu_cv_pct"] > bm._CV_LIMIT
+
+    def test_fewer_than_two_samples_is_nothing_to_compare(self):
+        assert bm.stability({"cpu_samples": "1000"}) == {}
+        assert bm.stability({"cpu_samples": ""}) == {}
+        assert bm.stability({}) == {}
+
+    def test_non_numeric_samples_are_skipped(self):
+        # a run that failed emits an empty token; it must not crash the parse
+        s = bm.stability({"cpu_samples": "1000  na 1020 1010"})
+        assert len(s["cpu_samples"]) == 3  # na dropped
+        assert s["unstable"] is False
+
+    def test_report_flags_an_unstable_provider(self):
+        text = bm.format_results("p", {"cpu_samples": "1500 600 1400 500 900", "done": "1"})
+        assert "stability" in text and "UNSTABLE" in text and "cv=" in text
+
+    def test_report_calls_a_steady_provider_steady(self):
+        text = bm.format_results("p", {"cpu_samples": "1000 1005 998 1002 1000", "done": "1"})
+        assert "stability" in text and "steady" in text
+
+    def test_report_omits_stability_without_samples(self):
+        assert "stability" not in bm.format_results("p", {"cpu_eps": "900", "done": "1"})
+
+
+class TestStabilityProbe:
+    def test_probe_loops_the_configured_sample_count(self):
+        # the stability loop bound must be the constant, not a hardcoded number
+        assert f"-lt {bm._STABILITY_SAMPLES}" in bm.BENCH_SH
+        assert "say cpu_samples" in bm.BENCH_SH
+
+    def test_stability_runs_are_short_so_the_probe_stays_bounded(self):
+        # each extra sample is --time=1 (not the 3s main run) to keep total CPU low
+        assert "sysbench cpu --time=1 --threads=1" in bm.BENCH_SH

@@ -41,6 +41,7 @@ benchmark is still useful, so completeness is reported separately via
 from __future__ import annotations
 
 import re
+import statistics
 
 # Bounded to stay far under the probe's 1 vCPU / 1Gi / 5Gi. See module docstring:
 # exceeding the memory cgroup would OOM-kill the container mid-benchmark.
@@ -53,6 +54,12 @@ _CPU_SECONDS = 3
 # small floor since a few percent is normal scheduler noise, not oversubscription.
 _STEAL_PCT_LIMIT = 5.0
 _CPU_PSI_LOAD_LIMIT = 10.0
+
+# Stability: run the cpu benchmark this many times back-to-back and score the spread.
+# A dedicated/steady host holds within a few percent; a noisy or oversubscribed one
+# swings, so a coefficient of variation above this floor reads as UNSTABLE.
+_STABILITY_SAMPLES = 5
+_CV_LIMIT = 15.0
 
 # One shell program, exec'd into the lease. Keep it dependency-light: sysbench is
 # apk-added best-effort, and every probe degrades to `na` instead of erroring, so a
@@ -130,6 +137,18 @@ if command -v sysbench >/dev/null 2>&1; then
   say steal_post "$(awk '/^cpu /{{print $9}}' /proc/stat 2>/dev/null)"
   say cputot_post "$(awk '/^cpu /{{t=0;for(i=2;i<=NF;i++)t+=$i;print t}}' /proc/stat 2>/dev/null)"
   say cpu_psi_load "$(grep '^some' /proc/pressure/cpu 2>/dev/null | cut -d' ' -f2)"
+  # STABILITY under sustained load: run the cpu benchmark several more times, each
+  # short, and emit every sample. A provider that's fast ONCE but degrades (thermal,
+  # a neighbor ramping up) is worse than a steady one; the parser scores the spread.
+  _samples=""
+  _n=0
+  while [ $_n -lt {_STABILITY_SAMPLES} ]; do
+    _s=$(sysbench cpu --time=1 --threads=1 run 2>/dev/null \
+         | grep -m1 'events per second' | cut -d: -f2 | tr -d ' ')
+    _samples="$_samples $_s"
+    _n=$((_n + 1))
+  done
+  say cpu_samples "$_samples"
   # --memory-total-size is the TOTAL streamed, not resident -- but keep it small
   # anyway; a big value here is what OOM-kills the container.
   mem=$(sysbench memory --memory-block-size=1M --memory-total-size={_MEM_MB}M \
@@ -248,6 +267,39 @@ def resource_fidelity(results: dict[str, str]) -> dict:
     return out
 
 
+def stability(results: dict[str, str]) -> dict:
+    """How steady is the CPU across back-to-back runs? The "consistently good" signal.
+
+    A single spot benchmark can't tell a provider that's fast ONCE from one that
+    holds up — a host that peaks high then degrades (thermal, a neighbor ramping up)
+    is worse than a steady one. From the ``cpu_samples`` the probe collected, this
+    reports mean / min / max and the coefficient of variation (spread as a % of the
+    mean), and flags ``unstable`` when the swing exceeds the floor. High variance is
+    also the fingerprint of a noisy neighbor on an oversubscribed host.
+
+    Returns ``{}`` when there are fewer than two usable samples — nothing to compare.
+    """
+    vals: list[float] = []
+    for tok in (results.get("cpu_samples") or "").split():
+        try:
+            vals.append(float(tok))
+        except ValueError:
+            continue
+    if len(vals) < 2:
+        return {}
+    mean = statistics.fmean(vals)
+    cv = round(statistics.pstdev(vals) / mean * 100, 1) if mean else None
+    out: dict = {
+        "cpu_samples": vals,
+        "cpu_mean": round(mean, 1),
+        "cpu_min": min(vals),
+        "cpu_max": max(vals),
+        "cpu_cv_pct": cv,
+    }
+    out["unstable"] = cv is not None and cv > _CV_LIMIT
+    return out
+
+
 def build_json_record(dseq: str, provider: str, results: dict[str, str]) -> dict:
     """Merge the remote probe's metrics with locally-known, trusted metadata.
 
@@ -290,4 +342,13 @@ def format_results(provider: str, results: dict[str, str]) -> str:
         else:
             verdict = "OK (delivering the CPU it sold)"
         lines.append(f"  {'fidelity':11s} {verdict}  {detail}")
+
+    # Stability: is the CPU consistently good, or fast-once-then-degrades?
+    stab = stability(results)
+    if stab:
+        tag = "UNSTABLE" if stab["unstable"] else "steady"
+        lines.append(
+            f"  {'stability':11s} {tag} (cv={stab['cpu_cv_pct']}% over {len(stab['cpu_samples'])} "
+            f"runs)  mean={stab['cpu_mean']}  min={stab['cpu_min']}  max={stab['cpu_max']}"
+        )
     return "\n".join(lines)

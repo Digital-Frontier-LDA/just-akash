@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.31.0] — 2026-07-18
+
+### Added
+- **Stability under sustained load — is the CPU *consistently* good, or fast-once?** A single spot benchmark can't tell a provider that peaks high then degrades (thermal, a neighbour ramping up) from a steady one. The probe now runs the cpu benchmark `_STABILITY_SAMPLES` more times (each short), and `stability()` reports mean/min/max and the coefficient of variation, flagging **UNSTABLE** when the swing exceeds the floor — high variance is also the fingerprint of a noisy neighbour on an oversubscribed host. Live: a z9nr lease read `stability steady (cv=1.9% over 5 runs)` while still `UNDER-DELIVERING` on throttle — the two signals are orthogonal and both correct. Step 2 of the provider quality/health build.
+
 ## [1.30.0] — 2026-07-18
 
 ### Fixed
