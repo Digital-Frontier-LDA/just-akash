@@ -336,31 +336,27 @@ class TestFrameDispatch:
 
         assert result == 42
 
-    def test_dispatch_frame_code_102_json_fallback(self):
-        """Test code 102 falls back to JSON parsing when fewer than 4 bytes available."""
+    def test_dispatch_frame_code_102_truncated_json_raises(self):
+        """Code 102 with a truncated (<4 byte) non-JSON payload must RAISE, not
+        silently return 0. A corrupt result frame is not a silent success
+        (rc=0 is not trustworthy — see docs/exec-reliability-investigation.md)."""
         json_payload = json.dumps({"exit_code": 137}).encode("utf-8")
-        # Use only 2 bytes of the JSON so int32 parse skips and falls back to JSON
-        frame = bytes([102]) + json_payload[:2]
-        # Will fail both int32 and JSON parse, so defaults to 0
-        result = LeaseShellTransport._dispatch_frame(frame)
-        assert result == 0
+        frame = bytes([102]) + json_payload[:2]  # 2 bytes: not valid JSON, <4 bytes
+        with pytest.raises(RuntimeError, match="malformed result frame"):
+            LeaseShellTransport._dispatch_frame(frame)
 
-    def test_dispatch_frame_code_102_zero_default(self):
-        """Test code 102 defaults to 0 if both int32 and JSON parsing fail."""
-        # Use exactly 3 bytes so int32 skip happens and JSON parse fails
-        frame = bytes([102]) + b"bad"
-        result = LeaseShellTransport._dispatch_frame(frame)
+    def test_dispatch_frame_code_102_unparsable_short_payload_raises(self):
+        """Code 102 with a short non-JSON payload must RAISE, not default to 0."""
+        frame = bytes([102]) + b"bad"  # 3 bytes: not JSON, <4 bytes
+        with pytest.raises(RuntimeError, match="malformed result frame"):
+            LeaseShellTransport._dispatch_frame(frame)
 
-        assert result == 0
-
-    def test_dispatch_frame_code_102_json_valid_with_less_than_4_bytes(self):
-        """Test code 102 with JSON payload when less than 4 bytes available."""
-        # Payload with < 4 bytes will skip int32 and try JSON
+    def test_dispatch_frame_code_102_short_invalid_json_raises(self):
+        """Code 102 with <4 bytes of invalid JSON must RAISE, not default to 0."""
         json_payload = b'{"exit_code":99}'
-        frame = bytes([102]) + json_payload[:2]  # Only 2 bytes, not valid JSON
-        result = LeaseShellTransport._dispatch_frame(frame)
-        # Should default to 0 since JSON parse will fail
-        assert result == 0
+        frame = bytes([102]) + json_payload[:2]  # 2 bytes, not valid JSON
+        with pytest.raises(RuntimeError, match="malformed result frame"):
+            LeaseShellTransport._dispatch_frame(frame)
 
     def test_dispatch_frame_code_103_failure(self):
         """Test code 103 raises RuntimeError."""
@@ -393,11 +389,13 @@ class TestFrameDispatch:
 
         assert result is None
 
-    def test_dispatch_frame_code_102_json_non_dict_payload_returns_zero(self):
-        """Code 102 with JSON non-dict payload must not crash with AttributeError."""
+    def test_dispatch_frame_code_102_json_non_dict_payload_raises(self):
+        """Code 102 with a valid-but-non-dict JSON payload (e.g. a list) must RAISE,
+        not silently return 0. A result frame that isn't an exit-code object is
+        malformed, not a silent success."""
         frame = bytes([102]) + b"[1]"
-        result = LeaseShellTransport._dispatch_frame(frame)
-        assert result == 0
+        with pytest.raises(RuntimeError, match="malformed result frame"):
+            LeaseShellTransport._dispatch_frame(frame)
 
 
 class TestInferService:
@@ -602,7 +600,7 @@ class TestProxyErrorFrames:
         ws.recv.return_value = PROXY_PROVIDER_ERROR
 
         with pytest.raises(RuntimeError, match="Proxy error"):
-            _transport()._pump_frames(ws, 0)
+            _transport()._pump_frames(ws)
 
     def test_auth_expiry_error_frame_is_recoverable(self):
         """An expired-token frame must reach the reconnect logic that was written for it."""
@@ -612,7 +610,7 @@ class TestProxyErrorFrames:
         )
 
         with pytest.raises(RuntimeError) as exc:
-            _transport()._pump_frames(ws, 0)
+            _transport()._pump_frames(ws)
 
         assert _is_auth_expiry_message(str(exc.value))
 
@@ -633,7 +631,7 @@ class TestExecTimeoutIsBounded:
         ws.recv.side_effect = TimeoutError
 
         with pytest.raises(RuntimeError, match="sent nothing for"):
-            _transport()._pump_frames(ws, 0)
+            _transport()._pump_frames(ws)
 
     def test_recv_timeout_is_configurable(self):
         config = TransportConfig(
@@ -643,7 +641,7 @@ class TestExecTimeoutIsBounded:
         ws.recv.side_effect = TimeoutError
 
         with pytest.raises(RuntimeError, match="7s"):
-            LeaseShellTransport(config)._pump_frames(ws, 0)
+            LeaseShellTransport(config)._pump_frames(ws)
 
         assert ws.recv.call_args.kwargs["timeout"] == 7
 
@@ -1279,7 +1277,7 @@ class TestColdStdoutRace:
         buf = io.BytesIO()
         with patch("sys.stdout") as mock_stdout:
             mock_stdout.buffer = buf
-            code = _transport()._pump_frames(ws, 0)
+            code = _transport()._pump_frames(ws)
         return code, buf.getvalue()
 
     def test_trailing_stdout_after_result_is_not_dropped(self):
@@ -1367,14 +1365,14 @@ class TestColdStdoutRace:
             bytes([102]) + json.dumps({"exit_code": 7}).encode(),
             TimeoutError(),  # no trailing frame, no close within the grace window
         ]
-        assert _transport()._pump_frames(ws, 0) == 7
+        assert _transport()._pump_frames(ws) == 7
 
     def test_silence_before_result_still_raises_hang_diagnosis(self):
         """Before any result frame, silence is a hang and must still be surfaced."""
         ws = MagicMock()
         ws.recv.side_effect = TimeoutError()
         with pytest.raises(RuntimeError, match="sent nothing"):
-            _transport()._pump_frames(ws, 0)
+            _transport()._pump_frames(ws)
 
     def test_grace_window_uses_config_result_grace_s(self):
         """After the result frame, recv switches to the short result_grace_s timeout."""
@@ -1391,7 +1389,7 @@ class TestColdStdoutRace:
         cfg = TransportConfig(
             dseq="123", api_key=_KEY, deployment=DEPLOYMENT_FIXTURE, result_grace_s=0.05
         )
-        LeaseShellTransport(cfg)._pump_frames(ws, 0)
+        LeaseShellTransport(cfg)._pump_frames(ws)
         # First recv uses recv_timeout (pre-result); after RESULT it drops to the
         # grace budget (min(result_grace_s, remaining) -> at or just under 0.05).
         assert seen_timeouts[0] == 300.0
@@ -1420,8 +1418,42 @@ class TestColdStdoutRace:
             dseq="123", api_key=_KEY, deployment=DEPLOYMENT_FIXTURE, result_grace_s=0.05
         )
         with patch("just_akash.transport.lease_shell.time.monotonic", lambda: next(clock)):
-            code = LeaseShellTransport(cfg)._pump_frames(DribblingWS(), 0)
+            code = LeaseShellTransport(cfg)._pump_frames(DribblingWS())
         assert code == 3
+
+
+class TestCleanCloseWithoutResult:
+    """Regression: a clean WebSocket close that arrives BEFORE any result
+    (exit-code) frame must surface as an error, not silently return 0.
+
+    _pump_frames used to fall back to the caller's default exit code (0), which
+    false-passed a dropped/closed session as success. rc=0 is not a trustworthy
+    success signal (see docs/exec-reliability-investigation.md), so a session
+    that ended with no result frame must not be allowed to masquerade as success.
+    """
+
+    def test_immediate_clean_close_raises(self):
+        ws = FakeWebSocket([])  # clean close, no frames at all
+        with pytest.raises(RuntimeError, match="without sending a result"):
+            _transport()._pump_frames(ws)
+
+    def test_stdout_then_clean_close_no_result_raises(self):
+        buf = io.BytesIO()
+        with patch("sys.stdout") as mock_stdout:
+            mock_stdout.buffer = buf
+            # stdout arrives but no result frame, then a clean close.
+            ws = FakeWebSocket([bytes([100]) + b"partial"])
+            with pytest.raises(RuntimeError, match="without sending a result"):
+                _transport()._pump_frames(ws)
+        # The stdout that DID arrive before the close is still emitted — only the
+        # missing exit code is treated as an error.
+        assert b"partial" in buf.getvalue()
+
+    def test_result_then_clean_close_returns_exit_code(self):
+        """The normal terminator (result frame, then provider closes) returns the
+        exit code — this is NOT the false-success path and must keep working."""
+        ws = FakeWebSocket([bytes([102]) + json.dumps({"exit_code": 0}).encode()])
+        assert _transport()._pump_frames(ws) == 0
 
 
 class TestExecShellScript:
