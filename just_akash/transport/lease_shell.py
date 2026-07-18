@@ -718,6 +718,20 @@ class LeaseShellTransport(Transport):
         return self._exec_with_refresh(command)
 
     def inject(self, remote_path: str, content: str) -> None:
+        """Write ``content`` to ``remote_path`` inside the lease container.
+
+        SECURITY CAVEAT (issue #39, reopened): the payload is base64-decoded IN the
+        shell command, so the base64-obscured — and trivially reversible — secret
+        lands in the provider-proxy-logged URL (``cmd2=``). The intended fix was to
+        stream it over a 104 stdin frame so it never touches the URL, but that
+        mechanism (``_exec_with_stdin_command``) does NOT actually deliver stdin to
+        the container: measured against all three live providers, ``head -c <n>``
+        read ZERO bytes and wrote an EMPTY file while reporting success — a silent
+        data-loss bug far worse than the log leak. Reverted to this working form
+        until the stdin path is fixed and proven live. See ``_inject_and_read`` in
+        the smoke, which catches the empty-write regression. Use ``--transport ssh``
+        when the provider-proxy URL log is in your threat model.
+        """
         if self._service is None:
             self.prepare()
 
@@ -727,23 +741,14 @@ class LeaseShellTransport(Transport):
             if rc != 0:
                 raise RuntimeError(f"Failed to create directory for {remote_path}: exit {rc}")
 
-        # Stream the payload over stdin (a 104 stdin data frame) instead of
-        # embedding it in the shell command. The command carried in the URL
-        # (`cmd2=`) is provider-proxy-logged, so an `echo <base64> | base64 -d`
-        # write would leak the (trivially reversible) secret into those logs.
-        # The reader keeps the URL secret-free; the content rides the stdin frame,
-        # which is not part of the URL/argv.
-        #
-        # `head -c <n>`, NOT `cat`: cat reads until stdin EOF, but provider-proxy
-        # does not translate our empty trailing 104 frame into a stdin close, so
-        # `cat > path` hangs forever waiting for an EOF that never arrives (the
-        # command was never actually exercised against a live provider before this).
-        # `head -c <n>` reads EXACTLY n bytes and exits on its own — no EOF needed.
-        # The byte count is not secret (it's a length), so it may ride the URL.
-        payload = content.encode("utf-8")
-        rc = self._exec_with_stdin_command(
-            f"head -c {len(payload)} > {shlex.quote(remote_path)}", payload
-        )
+        # `umask 077` so the redirect CREATES the file 0600 — the secret is never
+        # briefly world-/group-readable in the window before chmod (and stays 0600
+        # even if the later chmod somehow fails). The explicit chmod still runs to
+        # cover the case where `remote_path` PRE-EXISTED with looser perms (the `>`
+        # redirect truncates but keeps an existing file's mode).
+        encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
+        shell_cmd = f"umask 077; echo {encoded} | base64 -d > {shlex.quote(remote_path)}"
+        rc = self._exec_shell_command(shell_cmd)
         if rc != 0:
             raise RuntimeError(f"Failed to write {remote_path}: exit {rc}")
 
