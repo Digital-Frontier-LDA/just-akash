@@ -85,16 +85,27 @@ jobs:
           # as an artifact below; aggregate across runs to set percentile timeouts
           # and detect latency/success-rate regressions.
           SMOKE_TELEMETRY_FILE: ${{ github.workspace }}/smoke-telemetry.jsonl
+          # Hardware-QUALITY grade per healthy lease (cpu/mem/throttle/steal/stability),
+          # a separate schema from the latency rows above. Runs on the SAME probe after
+          # its feature matrix (before destroy) so it costs no extra lease/escrow, and
+          # is non-gating: a benchmark failure never reddens the smoke. Accrued to the
+          # telemetry branch as smoke-benchmark.jsonl for the quality analyzer.
+          SMOKE_BENCHMARK_FILE: ${{ github.workspace }}/smoke-benchmark.jsonl
         run: uv run python -m just_akash.smoke_providers ${{ inputs.all && '--all' || '' }}
 
       # Keep the run's latency/outcome telemetry even when the smoke step fails
-      # (a red run's latencies are exactly what we want to inspect).
+      # (a red run's latencies are exactly what we want to inspect). The benchmark
+      # grades ride in the same artifact (second path) so the accrue job downloads
+      # both in one shot; if-no-files-found: ignore covers the default run where the
+      # benchmark sink is unset and no benchmark file is produced.
       - name: Upload smoke telemetry
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: smoke-telemetry-${{ github.run_id }}
-          path: ${{ github.workspace }}/smoke-telemetry.jsonl
+          path: |
+            ${{ github.workspace }}/smoke-telemetry.jsonl
+            ${{ github.workspace }}/smoke-benchmark.jsonl
           if-no-files-found: ignore
           retention-days: 90
 
@@ -136,6 +147,10 @@ jobs:
       - name: Append to telemetry branch
         env:
           SRC: dl/smoke-telemetry.jsonl
+          # Hardware-quality grades, accrued into the SAME telemetry branch as a
+          # second data file. Optional: a default run (no benchmark sink) produces
+          # no such file and the script skips it.
+          BENCH_SRC: dl/smoke-benchmark.jsonl
           RUN_ID: ${{ github.run_id }}
         run: bash .github/scripts/accrue-telemetry.sh
 
