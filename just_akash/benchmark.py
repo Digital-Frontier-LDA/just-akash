@@ -201,6 +201,8 @@ def resource_fidelity(results: dict[str, str]) -> dict:
 
     * ``throttled_during`` — cgroup CPU-throttle events across the run. Any throttling
       of ONE thread on a lease sold as >=1 vCPU means you're being capped below spec.
+    * ``throttled_usec_during`` — total microseconds throttled across the run (how
+      LONG you were capped, not just how many times).
     * ``steal_pct`` — host CPU stolen by the hypervisor over the window. >0 means the
       host is a VM sharing cores (bare-metal is ~0).
     * ``cpu_psi_load`` — CPU pressure (PSI ``some avg10``) measured under load.
