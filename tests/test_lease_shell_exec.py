@@ -397,6 +397,28 @@ class TestFrameDispatch:
         with pytest.raises(RuntimeError, match="malformed result frame"):
             LeaseShellTransport._dispatch_frame(frame)
 
+    def test_dispatch_frame_code_102_non_numeric_string_exit_code_raises(self):
+        """A valid dict with a NON-NUMERIC exit_code (e.g. {"exit_code": "abc"})
+        must RAISE, not degrade to a garbage int. Surfaced by quorum (opencode-1):
+        int("abc") raised ValueError, the old broad except swallowed it, and the
+        frame fell through to int32-of-the-JSON-bytes — returning a garbage exit
+        code (the same false-success family as the truncated-frame fix)."""
+        frame = bytes([102]) + json.dumps({"exit_code": "abc"}).encode()
+        with pytest.raises(RuntimeError, match="exit_code 'abc' is not an integer"):
+            LeaseShellTransport._dispatch_frame(frame)
+
+    def test_dispatch_frame_code_102_list_exit_code_raises(self):
+        """A list-valued exit_code must raise (int([1,2]) TypeError), not fall through."""
+        frame = bytes([102]) + json.dumps({"exit_code": [1, 2]}).encode()
+        with pytest.raises(RuntimeError, match="not an integer"):
+            LeaseShellTransport._dispatch_frame(frame)
+
+    def test_dispatch_frame_code_102_numeric_string_exit_code_coerces(self):
+        """A NUMERIC string exit_code (e.g. "5") still coerces to 5 — the fix only
+        rejects non-numeric values, not lenient numeric coercion."""
+        frame = bytes([102]) + json.dumps({"exit_code": "5"}).encode()
+        assert LeaseShellTransport._dispatch_frame(frame) == 5
+
 
 class TestInferService:
     def test_infer_service_returns_none_when_services_is_list(self):

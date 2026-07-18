@@ -366,19 +366,36 @@ class LeaseShellTransport(Transport):
             sys.stderr.buffer.write(payload)
             sys.stderr.buffer.flush()
         elif code == 102:
+            # A result frame is EITHER a JSON object {"exit_code": N} OR a raw
+            # 4-byte LE int32 (provider-version dependent). Only a JSON *parse*
+            # failure means "try the int32 form" — a valid JSON object whose
+            # exit_code is not an integer (e.g. {"exit_code": "abc"}) is malformed,
+            # NOT a reason to fall back to int32 (which would return the first 4
+            # bytes of the JSON text as a garbage exit code). Surfaced by quorum
+            # review (opencode-1) on ed7a26a: the old broad except swallowed the
+            # int() ValueError and silently degraded to a garbage exit code.
             try:
                 parsed = json.loads(payload)
-                if isinstance(parsed, dict):
-                    exit_code = parsed.get("exit_code", 0)
-                    return 0 if exit_code is None else int(exit_code)
+            except ValueError:  # JSONDecodeError + UnicodeDecodeError are ValueErrors
+                parsed = None
+            if isinstance(parsed, dict):
+                exit_code = parsed.get("exit_code", 0)
+                if exit_code is None:
+                    return 0
+                try:
+                    return int(exit_code)
+                except (TypeError, ValueError):
+                    raise RuntimeError(
+                        f"malformed result frame: exit_code {exit_code!r} is not an integer"
+                    ) from None
+            if parsed is not None:
                 # Valid JSON but not a result object (a bare list/number/string):
                 # the result frame is malformed, not a silent success.
                 raise RuntimeError(
                     f"malformed result frame: JSON payload is a {type(parsed).__name__}, "
                     "expected an object with exit_code"
                 )
-            except (json.JSONDecodeError, TypeError, ValueError):
-                pass
+            # Not valid JSON — try the raw 4-byte LE int32 form.
             if len(payload) >= 4:
                 try:
                     return int.from_bytes(payload[:4], "little")
