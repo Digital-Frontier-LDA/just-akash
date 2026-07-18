@@ -85,6 +85,15 @@ INGRESS_BASELINE = "probe-baseline"
 READY_CAP_S = float(os.environ.get("SMOKE_READY_CAP_S", "240"))
 INGRESS_CAP_S = float(os.environ.get("SMOKE_INGRESS_CAP_S", "180"))
 
+# The inject check reads its file back with a lease-shell exec, which can hit the
+# cold-stdout race (rc=0 with EMPTY stdout: the exit-code frame arrives before the
+# stdout frame) even though the write succeeded — so a healthy inject reads back as
+# a FAIL. Retry ONLY that signature a few times; a nonzero rc or wrong content still
+# fails on the first read (never mask a genuine inject regression). This is the
+# retry-on-empty-stdout remedy the quorum approved for the same fleet-wide race.
+_INJECT_READBACK_ATTEMPTS = int(os.environ.get("SMOKE_INJECT_READBACK_ATTEMPTS", "3"))
+_INJECT_READBACK_BACKOFF_S = float(os.environ.get("SMOKE_INJECT_READBACK_BACKOFF_S", "2"))
+
 # After a check's cap expires (verdict already FAIL) — readiness, initial-ingress,
 # and update-cutover — keep probing for at most this long to classify the failure as
 # SLOW (resource eventually appears → the cap was too tight) vs STUCK (never appears
@@ -1081,12 +1090,30 @@ def _inject_and_read(dseq: str, transport: str, key: str = "") -> bool:
         )
         if inj.returncode != 0:
             return False
-        back = _run(
-            f"uv run just-akash exec 'cat {q(remote)}' --dseq {q(dseq)} "
-            f"--transport {transport} {keyarg}",
-            timeout=45,
-        )
-        return back.returncode == 0 and "injected_ok" in (back.stdout or "")
+        # Read the file back. The readback is a lease-shell exec, so it can hit the
+        # cold-stdout race (rc=0 + EMPTY stdout) even though the file was written
+        # fine — a transport flake, not a failed inject. Retry ONLY that signature;
+        # a nonzero rc or non-empty-but-wrong content is a real failure and returns
+        # immediately, so a genuine inject regression is never masked.
+        for attempt in range(_INJECT_READBACK_ATTEMPTS):
+            back = _run(
+                f"uv run just-akash exec 'cat {q(remote)}' --dseq {q(dseq)} "
+                f"--transport {transport} {keyarg}",
+                timeout=45,
+            )
+            out = back.stdout or ""
+            if back.returncode == 0 and "injected_ok" in out:
+                return True
+            # Only rc=0-with-empty-stdout (the race) is retryable — stop otherwise.
+            if not (back.returncode == 0 and not out.strip()):
+                return False
+            if attempt + 1 < _INJECT_READBACK_ATTEMPTS:
+                print(
+                    f"    {YELLOW}inject: empty readback (cold-stdout race) — "
+                    f"retry {attempt + 2}/{_INJECT_READBACK_ATTEMPTS}{RESET}"
+                )
+                time.sleep(_INJECT_READBACK_BACKOFF_S)
+        return False
     finally:
         os.unlink(env_file)
 
