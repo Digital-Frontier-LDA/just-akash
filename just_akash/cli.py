@@ -582,10 +582,17 @@ def main():
                 def flush(self):
                     pass
 
+            # BENCH_SH is a shell SCRIPT — it must run via `sh -c`, not exec()'s argv
+            # path (which returns $()/pipes/`;` literal and yields no output). That
+            # method lives on LeaseShellTransport; assert rather than type: ignore, so
+            # a future factory change fails loudly here instead of silently.
+            from .transport.lease_shell import LeaseShellTransport
+
+            assert isinstance(transport, LeaseShellTransport)  # noqa: S101
             real_stdout = sys.stdout
             sys.stdout = _Capture()  # type: ignore[assignment]
             try:
-                transport.exec(BENCH_SH)
+                transport.exec_shell_script(BENCH_SH)
             finally:
                 sys.stdout = real_stdout
             results = parse_results(cap.getvalue().decode("utf-8", errors="replace"))

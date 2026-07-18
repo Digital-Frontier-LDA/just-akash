@@ -154,3 +154,103 @@ class TestBenchmarkJsonTrustsLocalMetadata:
     def test_complete_reflects_the_done_marker_not_a_probe_claim(self):
         assert bm.build_json_record("1", "p", {"done": "1"})["complete"] is True
         assert bm.build_json_record("1", "p", {"cpu_eps": "900"})["complete"] is False
+
+
+class TestResourceFidelity:
+    """Delivered-vs-promised CPU: the "is it good?", not just "is it responsive?"
+    signal (Step 1 of the provider-quality build)."""
+
+    def _clean(self):
+        # one thread ran, no throttling, no steal, no pressure
+        return {
+            "thr_pre": "5",
+            "thr_post": "5",
+            "thrus_pre": "0",
+            "thrus_post": "0",
+            "steal_pre": "1000",
+            "steal_post": "1001",
+            "cputot_pre": "100000",
+            "cputot_post": "200000",
+            "cpu_psi_load": "avg10=0.00",
+        }
+
+    def test_clean_provider_is_delivering(self):
+        f = bm.resource_fidelity(self._clean())
+        assert f["under_delivering"] is False
+        assert f["reasons"] == []
+        assert f["throttled_during"] == 0
+        assert f["steal_pct"] == 0.0  # 1/100000
+
+    def test_throttled_during_single_thread_is_under_delivering(self):
+        r = self._clean() | {"thr_pre": "2", "thr_post": "9"}
+        f = bm.resource_fidelity(r)
+        assert f["under_delivering"] is True
+        assert f["throttled_during"] == 7
+        assert any("throttled" in x.lower() for x in f["reasons"])
+
+    def test_high_steal_flags_a_vm_host(self):
+        # 30000 stolen out of 100000 ticks = 30% steal
+        r = self._clean() | {"steal_pre": "0", "steal_post": "30000"}
+        f = bm.resource_fidelity(r)
+        assert f["steal_pct"] == 30.0
+        assert f["under_delivering"] is True
+        assert any("steal" in x.lower() for x in f["reasons"])
+
+    def test_high_psi_under_load_flags_contention(self):
+        r = self._clean() | {"cpu_psi_load": "avg10=42.50"}
+        f = bm.resource_fidelity(r)
+        assert f["cpu_psi_load"] == 42.5
+        assert f["under_delivering"] is True
+        assert any("pressure" in x.lower() for x in f["reasons"])
+
+    def test_small_steal_is_scheduler_noise_not_a_flag(self):
+        r = self._clean() | {"steal_pre": "0", "steal_post": "2000"}  # 2% < 5% floor
+        f = bm.resource_fidelity(r)
+        assert f["steal_pct"] == 2.0
+        assert f["under_delivering"] is False
+
+    def test_absent_snapshots_are_omitted_never_guessed(self):
+        f = bm.resource_fidelity({"cpu_eps": "900"})  # no fidelity keys
+        assert "throttled_during" not in f
+        assert "steal_pct" not in f
+        assert f["under_delivering"] is False  # nothing measured = no accusation
+
+    def test_zero_cpu_window_does_not_divide_by_zero(self):
+        r = self._clean() | {"cputot_pre": "5000", "cputot_post": "5000"}
+        f = bm.resource_fidelity(r)  # must not raise
+        assert "steal_pct" not in f  # can't compute a rate over a zero window
+
+
+class TestFidelityInReport:
+    def test_report_flags_an_under_delivering_provider(self):
+        r = {
+            "cpu_eps": "900",
+            "done": "1",
+            "thr_pre": "0",
+            "thr_post": "12",
+            "cputot_pre": "1",
+            "cputot_post": "2",
+        }
+        text = bm.format_results("prov", r)
+        assert "fidelity" in text
+        assert "UNDER-DELIVERING" in text
+        assert "throttled_during=12" in text
+
+    def test_report_confirms_a_healthy_provider(self):
+        r = {
+            "cpu_eps": "900",
+            "done": "1",
+            "thr_pre": "3",
+            "thr_post": "3",
+            "steal_pre": "0",
+            "steal_post": "0",
+            "cputot_pre": "100",
+            "cputot_post": "200",
+            "cpu_psi_load": "avg10=1.00",
+        }
+        text = bm.format_results("prov", r)
+        assert "fidelity" in text and "OK (delivering" in text
+
+    def test_report_omits_fidelity_when_unmeasured(self):
+        text = bm.format_results("prov", {"cpu_eps": "900", "done": "1"})
+        assert "fidelity" not in text
