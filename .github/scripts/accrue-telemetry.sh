@@ -36,9 +36,13 @@ else
   echo "Creating orphan $BRANCH."
   git checkout --orphan "$BRANCH"
   git rm -rf . >/dev/null 2>&1 || true
-  printf '# Smoke test telemetry (accrued)\n\n`smoke-latency.jsonl` — one JSON line per (provider, feature) per run.\n`smoke-benchmark.jsonl` — one hardware-quality grade per healthy lease per run (optional).\nBoth appended by `.github/workflows/provider-smoke.yml`.\nAnalyze latency with `uv run python -m just_akash.analyze_telemetry smoke-latency.jsonl`.\n' > README.md
   : > "$DEST"
 fi
+
+# Refresh the on-branch README every run (not only at orphan creation), so a
+# pre-existing branch still documents a newly-added data file like
+# smoke-benchmark.jsonl. Idempotent: unchanged content stages to nothing.
+printf '# Smoke test telemetry (accrued)\n\n`smoke-latency.jsonl` — one JSON line per (provider, feature) per run.\n`smoke-benchmark.jsonl` — one hardware-quality grade per healthy lease per run (optional).\nBoth appended by `.github/workflows/provider-smoke.yml`.\nAnalyze latency with `uv run python -m just_akash.analyze_telemetry smoke-latency.jsonl`.\n' > README.md
 
 cat "$SRC" >> "$DEST"
 rows="$(wc -l < "$DEST" | tr -d ' ')"
