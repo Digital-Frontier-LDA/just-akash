@@ -47,6 +47,20 @@ select = ["E", "F", "I", "UP", "B", "SIM", "S"]
 testpaths = ["tests"]
 addopts = "--cov=just_akash --cov-report=term-missing"
 
+# The three live e2e modules are invoked as scripts (`just test`, `just
+# test-secrets`, `just test-shell` / the CI e2e jobs), never collected by pytest,
+# so they cannot contribute coverage. Omitting them stops ~540 un-runnable
+# statements from depressing the reported total — the percentage then reflects
+# only the unit-tested surface. Their behavior IS covered: the shared helpers in
+# _e2e.py are unit-tested by tests/test_e2e_cleanup.py (100%), and the scripts
+# run live in CI.
+[tool.coverage.run]
+omit = [
+  "just_akash/test_lifecycle.py",
+  "just_akash/test_secrets_e2e.py",
+  "just_akash/test_shell_e2e.py",
+]
+
 [tool.pyright]
 pythonVersion = "3.10"
 typeCheckingMode = "basic"

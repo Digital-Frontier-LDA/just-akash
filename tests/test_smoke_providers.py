@@ -7,8 +7,11 @@ classified, and how each feature check reads a subprocess result.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from just_akash import smoke_providers as sp
 
@@ -1845,3 +1848,42 @@ class TestBenchmarkPiggyback:
         # no-bid → no healthy lease → benchmark never runs, bench_records stays empty
         assert mock_b.call_count == 0
         assert bench == []
+
+
+class TestGenerateKeypairCleanup:
+    """_generate_keypair creates an UNENCRYPTED ephemeral keypair, so a failure
+    partway through must not leave that key on disk."""
+
+    def test_keygen_failure_removes_keydir(self, monkeypatch, tmp_path):
+        key_dir = tmp_path / "smoke-ssh-xxx"
+        key_dir.mkdir()
+        (key_dir / "id_ed25519").write_text("partial-unencrypted-key")  # half-generated
+
+        monkeypatch.setattr(sp.tempfile, "mkdtemp", lambda **kw: str(key_dir))
+
+        def _fail(*a, **kw):
+            raise subprocess.CalledProcessError(1, "ssh-keygen")
+
+        monkeypatch.setattr(sp.subprocess, "run", _fail)
+
+        with pytest.raises(subprocess.CalledProcessError):
+            sp._generate_keypair()
+        # The half-generated key directory was cleaned up — no leaked key material.
+        assert not key_dir.exists()
+
+    def test_keygen_success_sets_pubkey_and_returns_path(self, monkeypatch, tmp_path):
+        key_dir = tmp_path / "smoke-ssh-ok"
+        key_dir.mkdir()
+        monkeypatch.setattr(sp.tempfile, "mkdtemp", lambda **kw: str(key_dir))
+        monkeypatch.delenv("SSH_PUBKEY", raising=False)
+
+        def _ok(*a, **kw):
+            # ssh-keygen writes the pubkey sibling file.
+            (key_dir / "id_ed25519.pub").write_text("ssh-ed25519 AAAAfake smoke-probe\n")
+            return _completed(returncode=0)
+
+        monkeypatch.setattr(sp.subprocess, "run", _ok)
+
+        path = sp._generate_keypair()
+        assert path == str(key_dir / "id_ed25519")
+        assert os.environ["SSH_PUBKEY"] == "ssh-ed25519 AAAAfake smoke-probe"
