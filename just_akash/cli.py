@@ -585,7 +585,10 @@ def main():
             real_stdout = sys.stdout
             sys.stdout = _Capture()  # type: ignore[assignment]
             try:
-                transport.exec(BENCH_SH)
+                # BENCH_SH is a shell SCRIPT — it must run via `sh -c`, not exec()'s
+                # argv path (which returns $()/pipes/`;` literal and yields no output).
+                # make_transport("lease-shell", ...) always returns a LeaseShellTransport.
+                transport.exec_shell_script(BENCH_SH)  # type: ignore[attr-defined]
             finally:
                 sys.stdout = real_stdout
             results = parse_results(cap.getvalue().decode("utf-8", errors="replace"))

@@ -7,6 +7,14 @@ provider can be graded, not just pass/fail'd. It exists because the fleet shows 
 stable ~6x spread in readiness latency between providers with the SAME declared
 resources (1 vCPU / 1Gi / 5Gi), and pass/fail can't explain WHY.
 
+RESOURCE HONESTY (delivered vs promised): a provider can be perfectly RESPONSIVE
+(passes every feature) and still hand you a fraction of the vCPU you paid for. The
+probe snapshots the cgroup CPU-throttle counters and host steal AROUND its single-
+threaded cpu benchmark; :func:`resource_fidelity` turns those into a delivered-vs-
+promised verdict (being throttled while running ONE thread on a lease sold as
+>=1 vCPU is the tell-tale of oversubscription). Measured live: a fleet provider
+that passed 10/10 features throttled the benchmark on every run.
+
 Design constraints (3-model quorum, unanimous):
 
 * **Bounded WELL under the lease's cgroup limits.** The obvious mistake is a big
@@ -39,6 +47,12 @@ import re
 _MEM_MB = 256
 _DISK_MB = 256
 _CPU_SECONDS = 3
+
+# Resource-honesty verdict thresholds. ANY throttling during a single-threaded run
+# is already damning, so throttled has no tolerance; steal and under-load PSI get a
+# small floor since a few percent is normal scheduler noise, not oversubscription.
+_STEAL_PCT_LIMIT = 5.0
+_CPU_PSI_LOAD_LIMIT = 10.0
 
 # One shell program, exec'd into the lease. Keep it dependency-light: sysbench is
 # apk-added best-effort, and every probe degrades to `na` instead of erroring, so a
@@ -98,9 +112,24 @@ rm -f "$BENCH_TMP" "$BENCH_TMP.w" "$BENCH_TMP.r"
 # --- cpu + ram via sysbench (best-effort install; `na` if unavailable) ---
 apk add --no-cache sysbench >/dev/null 2>&1
 if command -v sysbench >/dev/null 2>&1; then
+  # RESOURCE HONESTY (delivered vs promised): snapshot the cgroup CPU-throttle
+  # counters and host steal, run a SINGLE-THREADED cpu benchmark, snapshot again.
+  # The idle throttled/PSI above says little; what's damning is being throttled
+  # WHILE running one thread on a lease sold as >=1 vCPU — that means the provider
+  # is capping you below what you paid for. steal>0 means the host is a VM sharing
+  # CPU. Emitted raw (pre/post); parse_results computes the deltas.
+  say thr_pre "$(grep nr_throttled /sys/fs/cgroup/cpu.stat 2>/dev/null | cut -d' ' -f2)"
+  say thrus_pre "$(grep throttled_usec /sys/fs/cgroup/cpu.stat 2>/dev/null | cut -d' ' -f2)"
+  say steal_pre "$(awk '/^cpu /{{print $9}}' /proc/stat 2>/dev/null)"
+  say cputot_pre "$(awk '/^cpu /{{t=0;for(i=2;i<=NF;i++)t+=$i;print t}}' /proc/stat 2>/dev/null)"
   cpu=$(sysbench cpu --time={_CPU_SECONDS} --threads=1 run 2>/dev/null \
         | grep -m1 'events per second' | cut -d: -f2 | tr -d ' ')
   say cpu_eps "${{cpu:-na}}"
+  say thr_post "$(grep nr_throttled /sys/fs/cgroup/cpu.stat 2>/dev/null | cut -d' ' -f2)"
+  say thrus_post "$(grep throttled_usec /sys/fs/cgroup/cpu.stat 2>/dev/null | cut -d' ' -f2)"
+  say steal_post "$(awk '/^cpu /{{print $9}}' /proc/stat 2>/dev/null)"
+  say cputot_post "$(awk '/^cpu /{{t=0;for(i=2;i<=NF;i++)t+=$i;print t}}' /proc/stat 2>/dev/null)"
+  say cpu_psi_load "$(grep '^some' /proc/pressure/cpu 2>/dev/null | cut -d' ' -f2)"
   # --memory-total-size is the TOTAL streamed, not resident -- but keep it small
   # anyway; a big value here is what OOM-kills the container.
   mem=$(sysbench memory --memory-block-size=1M --memory-total-size={_MEM_MB}M \
@@ -150,6 +179,73 @@ def is_complete(results: dict[str, str]) -> bool:
     return results.get("done") == "1"
 
 
+def _leading_number(value: str | None) -> float | None:
+    """The metric's number, from ``avg10=12.34`` (→12.34) or a bare ``900.5``.
+
+    PSI fields are ``key=value`` (e.g. ``avg10=12.34``), so a naive "first number"
+    match would grab the ``10`` out of the KEY. Take the number after the last ``=``.
+    """
+    if not value:
+        return None
+    m = re.search(r"[0-9]+\.?[0-9]*", value.rsplit("=", 1)[-1])
+    return float(m.group()) if m else None
+
+
+def resource_fidelity(results: dict[str, str]) -> dict:
+    """Did the provider deliver the CPU it sold? Derived from the under-load snapshots.
+
+    A provider can pass every feature check and still hand you a fraction of the vCPU
+    you paid for — invisible to pass/fail. This turns the raw pre/post counters the
+    probe captured around its single-threaded cpu benchmark into three delivered-vs-
+    promised signals, plus a verdict:
+
+    * ``throttled_during`` — cgroup CPU-throttle events across the run. Any throttling
+      of ONE thread on a lease sold as >=1 vCPU means you're being capped below spec.
+    * ``steal_pct`` — host CPU stolen by the hypervisor over the window. >0 means the
+      host is a VM sharing cores (bare-metal is ~0).
+    * ``cpu_psi_load`` — CPU pressure (PSI ``some avg10``) measured under load.
+
+    Returns the derived metrics that were computable, plus ``under_delivering`` (bool)
+    and human-readable ``reasons``. Absent inputs are simply omitted — never guessed.
+    """
+
+    def _delta(pre_key: str, post_key: str) -> int | None:
+        pre, post = results.get(pre_key), results.get(post_key)
+        try:
+            return int(post) - int(pre)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+
+    out: dict = {}
+    thr = _delta("thr_pre", "thr_post")
+    thrus = _delta("thrus_pre", "thrus_post")
+    steal_d = _delta("steal_pre", "steal_post")
+    tot_d = _delta("cputot_pre", "cputot_post")
+    psi = _leading_number(results.get("cpu_psi_load"))
+
+    if thr is not None:
+        out["throttled_during"] = thr
+    if thrus is not None:
+        out["throttled_usec_during"] = thrus
+    steal_pct = None
+    if steal_d is not None and tot_d and tot_d > 0:
+        steal_pct = round(steal_d / tot_d * 100, 2)
+        out["steal_pct"] = steal_pct
+    if psi is not None:
+        out["cpu_psi_load"] = psi
+
+    reasons: list[str] = []
+    if thr and thr > 0:
+        reasons.append(f"CPU-throttled {thr}x during a single-threaded run")
+    if steal_pct is not None and steal_pct > _STEAL_PCT_LIMIT:
+        reasons.append(f"host CPU steal {steal_pct}%")
+    if psi is not None and psi > _CPU_PSI_LOAD_LIMIT:
+        reasons.append(f"CPU pressure {psi} under load")
+    out["under_delivering"] = bool(reasons)
+    out["reasons"] = reasons
+    return out
+
+
 def build_json_record(dseq: str, provider: str, results: dict[str, str]) -> dict:
     """Merge the remote probe's metrics with locally-known, trusted metadata.
 
@@ -181,4 +277,15 @@ def format_results(provider: str, results: dict[str, str]) -> str:
         present = [(k, results[k]) for k in keys if k in results]
         if present:
             lines.append(f"  {title:11s} " + "  ".join(f"{k}={v}" for k, v in present))
+
+    # Resource-honesty verdict: is the provider delivering the CPU it sold?
+    fid = resource_fidelity(results)
+    measured = [(k, fid[k]) for k in ("throttled_during", "steal_pct", "cpu_psi_load") if k in fid]
+    if measured:
+        detail = "  ".join(f"{k}={v}" for k, v in measured)
+        if fid["under_delivering"]:
+            verdict = f"UNDER-DELIVERING ({'; '.join(fid['reasons'])})"
+        else:
+            verdict = "OK (delivering the CPU it sold)"
+        lines.append(f"  {'fidelity':11s} {verdict}  {detail}")
     return "\n".join(lines)

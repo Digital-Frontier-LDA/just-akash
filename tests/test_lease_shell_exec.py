@@ -1422,3 +1422,36 @@ class TestColdStdoutRace:
         with patch("just_akash.transport.lease_shell.time.monotonic", lambda: next(clock)):
             code = LeaseShellTransport(cfg)._pump_frames(DribblingWS(), 0)
         assert code == 3
+
+
+class TestExecShellScript:
+    """A shell SCRIPT must run via `sh -c`, not exec()'s argv path (which returns
+    $()/pipes/`;` literal). The benchmark's BENCH_SH depends on this — via exec() it
+    silently produced no output (verified live)."""
+
+    def _transport(self):
+        t = LeaseShellTransport(
+            TransportConfig(dseq="1", api_key=_KEY, deployment=DEPLOYMENT_FIXTURE)
+        )
+        t._provider_host_uri = "https://provider.example.com:8443"
+        t._service = "web"
+        return t
+
+    def test_exec_shell_script_uses_the_sh_c_builder(self):
+        t = self._transport()
+        with patch.object(t, "_exec_loop", return_value=0) as loop:
+            rc = t.exec_shell_script("echo a\necho b\nx=$(nproc)")
+        assert rc == 0
+        url = loop.call_args[0][0]
+        # sh -c path puts cmd0=sh cmd1=-c cmd2=<script>; the argv path would not.
+        assert "cmd0=sh" in url and "cmd1=-c" in url
+
+    def test_exec_shell_script_differs_from_exec_argv_path(self):
+        t = self._transport()
+        with patch.object(t, "_exec_loop", return_value=0) as loop:
+            t.exec("echo a; echo b")  # argv path
+            argv_url = loop.call_args[0][0]
+            t.exec_shell_script("echo a; echo b")  # sh -c path
+            script_url = loop.call_args[0][0]
+        assert argv_url != script_url
+        assert "cmd1=-c" in script_url  # only the script path wraps in sh -c

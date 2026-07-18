@@ -717,6 +717,20 @@ class LeaseShellTransport(Transport):
             self.prepare()
         return self._exec_with_refresh(command)
 
+    def exec_shell_script(self, script: str) -> int:
+        """Run a full shell SCRIPT (multi-line, pipes, ``$()``, ``;``) inside the lease.
+
+        ``exec()`` sends the command down the provider's argv path, which does NOT
+        interpret shell syntax — ``$()``, pipes, redirects and ``;`` come back
+        literal, so a script yields garbage or nothing. A script must ride ``sh -c``
+        instead. Output streams to stdout identically, so callers capture it the same
+        way. (The benchmark's BENCH_SH depends on this; via ``exec()`` it silently
+        produced no output — verified live before this was fixed.)
+        """
+        if self._service is None:
+            self.prepare()
+        return self._exec_shell_command(script)
+
     def inject(self, remote_path: str, content: str) -> None:
         """Write ``content`` to ``remote_path`` inside the lease container.
 
