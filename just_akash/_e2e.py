@@ -19,6 +19,8 @@ import subprocess
 import sys
 import time
 
+from ._states import TERMINAL_DEPLOYMENT_STATES
+
 GREEN = "\033[92m"
 RED = "\033[91m"
 YELLOW = "\033[93m"
@@ -155,9 +157,10 @@ def _dseq_in_list_output(dseq: str, output: str) -> bool:
 
 # Terminal on-chain states: the deployment is settled and holds no escrow —
 # measured: a `closed` deployment reads escrow.state=closed with funds=0.
-# insufficient_funds is settled by definition (the escrow is what ran out) and is
-# already treated as terminal by smoke_providers._DEAD_STATES; kept in sync with it.
-_SETTLED_STATES = ("closed", "failed", "insufficient_funds", "insufficientfunds")
+# insufficient_funds is settled by definition (the escrow is what ran out). Defined
+# once in _states.py and shared with smoke_providers._DEAD_STATES — the old "kept in
+# sync by comment" pair is gone.
+_SETTLED_STATES = TERMINAL_DEPLOYMENT_STATES
 # States that positively mean the deployment is still up (and so may hold escrow).
 # Deliberately an ALLOWLIST, not "everything that isn't settled": a state we do not
 # recognise is UNKNOWN, not proof of life, and saying "STILL ACTIVE" about it would
