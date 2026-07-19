@@ -26,6 +26,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from ._diagnostics import Code, emit, enabled
 from .api import (
     AkashConsoleAPI,
     _extract_bid_price,
@@ -278,6 +279,68 @@ def _prepare_sdl_content(
     return sdl_content
 
 
+def _check_wallet_credit(client: AkashConsoleAPI, deposit: float) -> None:
+    """Pre-deploy wallet probe: emit a structured ``WALLET_*`` diagnostic so a caller
+    can tell "out of deploy credit" from "provider capacity outage" (the two failures
+    that otherwise look identical). Reads the Console DepositAuthorization credit
+    straight from the chain via ``chain.deploy_credit``.
+
+    Warn-only — NEVER raises. A failed probe (no creds, LCD down) emits
+    ``WALLET_CREDIT_QUERY_FAILED`` and returns; the deploy proceeds regardless. The
+    caller decides whether to act (e.g. pre-fail a CI job); just-akash does not abort.
+    """
+    if not enabled():
+        # Skip the JWT-mint + LCD round-trip entirely when diagnostics are silent
+        # (e.g. an interactive terminal) — the probe is only useful to a consumer.
+        return
+    from . import chain  # lazy: chain.py queries the public LCD only for this probe
+
+    try:
+        address = client.account_address()
+    except RuntimeError as e:
+        emit(
+            Code.WALLET_CREDIT_QUERY_FAILED,
+            "warning",
+            f"could not resolve account address for credit check: {e}",
+        )
+        return
+    try:
+        credit = chain.deploy_credit(address)  # {denom: micro_units}
+    except RuntimeError as e:
+        emit(
+            Code.WALLET_CREDIT_QUERY_FAILED,
+            "warning",
+            f"deploy-credit query failed (LCD unreachable?): {e}",
+            account=address,
+        )
+        return
+
+    # uact (Akash Credit Token, USD-pegged, 1e6 = $1) is the Console deploy currency.
+    uact = credit.get("uact", 0)
+    low_threshold_uact = int(max(deposit * 2, 1.0) * 1_000_000)  # cover >= 2 deposits
+    if uact <= 0:
+        emit(
+            Code.WALLET_INSUFFICIENT_CREDIT,
+            "error",
+            "no deploy credit (DepositAuthorization spend_limits is empty/zero) — "
+            "deploy will likely fail with HTTP 402",
+            account=address,
+            deploy_credit_uact=uact,
+            deposit_usd=deposit,
+        )
+    elif uact < low_threshold_uact:
+        emit(
+            Code.WALLET_LOW_CREDIT,
+            "warning",
+            f"deploy credit is low ({uact / 1e6:.2f} ACT ≈ ${uact / 1e6:.2f}) — "
+            "may not survive a long run",
+            account=address,
+            deploy_credit_uact=uact,
+            deposit_usd=deposit,
+            low_threshold_uact=low_threshold_uact,
+        )
+
+
 def deploy(
     sdl_path: str,
     gpu: bool = False,
@@ -323,6 +386,7 @@ def deploy(
     sdl_path = _resolve_sdl_path(sdl_path, gpu)
     _log(logging.INFO, "STEP 1: Preparing SDL")
     sdl_content = _prepare_sdl_content(sdl_path, image=image, env_vars=env_vars)
+    _check_wallet_credit(client, deposit)
 
     # Step 2: Create deployment (with stale-deployment recovery)
     _log(
@@ -355,11 +419,17 @@ def deploy(
                 deployment_response = client.create_deployment(sdl_content, deposit=deposit)
             except RuntimeError as retry_err:
                 _log(logging.ERROR, f"Create deployment FAILED after retry: {retry_err}")
+                emit(
+                    Code.DEPLOY_CREATE_FAILED,
+                    "error",
+                    f"create deployment failed after retry: {retry_err}",
+                )
                 raise RuntimeError(
                     f"Failed to create deployment after retry: {retry_err}"
                 ) from retry_err
         else:
             _log(logging.ERROR, f"Create deployment FAILED: {e}")
+            emit(Code.DEPLOY_CREATE_FAILED, "error", f"create deployment failed: {e}")
             raise RuntimeError(f"Failed to create deployment: {e}") from e
 
     dseq = deployment_response.get("dseq")
@@ -369,6 +439,14 @@ def deploy(
         _log(
             logging.ERROR,
             f"No DSEQ in response: {json.dumps(deployment_response, default=str)}",
+        )
+        emit(
+            Code.NO_DSEQ_RETURNED,
+            "error",
+            "create deployment returned no DSEQ",
+            response_keys=list(deployment_response.keys())
+            if isinstance(deployment_response, dict)
+            else None,
         )
         raise RuntimeError(
             f"No DSEQ returned from API. Response: {json.dumps(deployment_response)}"
@@ -606,13 +684,57 @@ def deploy(
                             f"mem_avail={mem.get('available')} "
                             f"mem_active={mem.get('active')}",
                         )
+                        # Classify WHY this provider didn't bid, from its on-chain
+                        # status — a structured event a caller (CI/Sentry) can act on.
+                        if online is False:
+                            pcode, pmsg = Code.PROVIDER_OFFLINE, "provider reports offline"
+                        elif valid is False:
+                            pcode, pmsg = (
+                                Code.PROVIDER_INVALID_VERSION,
+                                "provider is running an invalid/disallowed version",
+                            )
+                        else:
+                            pcode, pmsg = (
+                                Code.PROVIDER_NO_BID,
+                                "provider looks healthy on-chain but did not bid "
+                                "(capacity full, SDL didn't match, or market timing)",
+                            )
+                        emit(
+                            pcode,
+                            "warning",
+                            f"{pmsg}: {p}",
+                            provider=p,
+                            tier=tier,
+                            isOnline=online,
+                            isValidVersion=valid,
+                            uptime1d=uptime,
+                            cpu_available=cpu.get("available"),
+                            cpu_active=cpu.get("active"),
+                            mem_available=mem.get("available"),
+                            mem_active=mem.get("active"),
+                        )
                     else:
                         _log(
                             logging.WARNING,
                             "    on-chain status: NOT FOUND in provider registry",
                         )
+                        emit(
+                            Code.PROVIDER_UNKNOWN,
+                            "warning",
+                            f"allowlisted provider not in registry: {p}",
+                            provider=p,
+                            tier=tier,
+                        )
                 except RuntimeError as e:
                     _log(logging.WARNING, f"    on-chain status: query failed: {e}")
+                    emit(
+                        Code.PROVIDER_STATUS_QUERY_FAILED,
+                        "warning",
+                        f"on-chain status query failed for {p}: {e}",
+                        provider=p,
+                        tier=tier,
+                        query_error=str(e)[:120],
+                    )
 
     # Failure paths.
     if selected_bid is None:
@@ -633,6 +755,17 @@ def deploy(
                 _log(logging.INFO, f"Deployment {dseq} closed after no bids received")
             except Exception as cleanup_err:
                 _log(logging.ERROR, f"Cleanup of deployment {dseq} failed: {cleanup_err}")
+            emit(
+                Code.NO_BIDS_RECEIVED,
+                "error",
+                f"no bids received after {bid_wait + bid_wait_retry}s",
+                dseq=str(dseq),
+                poll_count=poll_count,
+                elapsed_s=elapsed_total,
+                has_allowlist=has_allowlist,
+                preferred=preferred,
+                backup=backup,
+            )
             raise RuntimeError(
                 f"No bids received within {bid_wait + bid_wait_retry}s. "
                 "Your SDL may be unsatisfiable or all providers are busy."
@@ -646,6 +779,12 @@ def deploy(
                 client.close_deployment(str(dseq))
             except Exception as cleanup_err:
                 _log(logging.ERROR, f"Cleanup of deployment {dseq} failed: {cleanup_err}")
+            emit(
+                Code.BIDS_MALFORMED,
+                "error",
+                f"all {len(bids)} bid(s) were malformed (non-dict entries)",
+                dseq=str(dseq),
+            )
             raise RuntimeError("No valid bids received — all bid entries were malformed.")
         # Bids from our own providers exist, but every one has aged out of the
         # 'open' state (issue #14). Without this branch the failure below would
@@ -674,6 +813,14 @@ def deploy(
                 _log(logging.INFO, f"Deployment {dseq} closed after no open bids")
             except Exception as cleanup_err:
                 _log(logging.ERROR, f"Cleanup of deployment {dseq} failed: {cleanup_err}")
+            emit(
+                Code.BIDS_STALE,
+                "error",
+                f"{len(allowed_bids)} bid(s) from allowed providers but none still open",
+                dseq=str(dseq),
+                states=states,
+                providers=providers,
+            )
             raise RuntimeError(
                 f"Received {len(allowed_bids)} bid(s) from your providers but none "
                 f"are still open (states seen: {states}). Akash bids expire ~5 min "
@@ -691,6 +838,15 @@ def deploy(
             _log(logging.INFO, f"Deployment {dseq} closed after foreign bids rejection")
         except Exception as cleanup_err:
             _log(logging.ERROR, f"Cleanup of deployment {dseq} failed: {cleanup_err}")
+        emit(
+            Code.BIDS_FOREIGN_ONLY,
+            "error",
+            f"{len(bids)} bid(s) but none from allowed providers",
+            dseq=str(dseq),
+            preferred=preferred,
+            backup=backup,
+            received_from=foreign,
+        )
         raise RuntimeError(
             f"Received {len(bids)} bid(s) but NONE from our providers.\n"
             f"  Preferred: {preferred}\n"
@@ -978,6 +1134,12 @@ def deploy(
                 try:
                     dseq, manifest, provider, price_amount, price_denom = _redeploy_and_reselect()
                 except RuntimeError as redeploy_err:
+                    emit(
+                        Code.REDEPLOY_FAILED,
+                        "error",
+                        f"re-deploy round failed: {redeploy_err}",
+                        dseq=str(dseq),
+                    )
                     raise RuntimeError(
                         f"Failed to create lease after re-deploy: {redeploy_err}"
                     ) from redeploy_err
@@ -989,6 +1151,13 @@ def deploy(
                 _log(logging.INFO, f"Deployment {dseq} closed after lease failure")
             except Exception as cleanup_err:
                 _log(logging.ERROR, f"Cleanup of deployment {dseq} also failed: {cleanup_err}")
+            emit(
+                Code.LEASE_CREATE_FAILED,
+                "error",
+                f"lease creation failed: {e}",
+                dseq=str(dseq),
+                provider=provider,
+            )
             raise RuntimeError(f"Failed to create lease: {e}") from e
 
     _log(logging.INFO, "Lease created successfully!")
