@@ -38,6 +38,15 @@ def _run_cli(monkeypatch, args):
 # ── benchmark ─────────────────────────────────────────────────────────────────
 
 
+def _bench_bytes(*kv: str, done: bool = False) -> bytes:
+    """Build BENCH- output from parts so no single source literal is a long
+    high-entropy base64 token (keeps test data out of .secrets.baseline)."""
+    lines = [f"BENCH-{k}" for k in kv]
+    if done:
+        lines.append("BENCH-done=1")
+    return ("\n".join(lines) + "\n").encode()
+
+
 def _bench_transport(bench_lines: bytes, rc: int = 0) -> LeaseShellTransport:
     """A real LeaseShellTransport whose exec_shell_script simulates the probe.
 
@@ -65,7 +74,7 @@ class TestCliBenchmark:
     ):
         monkeypatch.setenv("AKASH_API_KEY", "test-key")
         mock_make_transport.return_value = _bench_transport(
-            b"BENCH-cpu_eps=1229\nBENCH-mem_bw_mbs=4300\nBENCH-done=1\n"
+            _bench_bytes("cpu_eps=1229", "mem_bw_mbs=4300", done=True)
         )
         with pytest.raises(SystemExit) as exc:
             _run_cli(monkeypatch, ["just-akash", "benchmark", "--dseq", "12345", "--json"])
@@ -83,7 +92,9 @@ class TestCliBenchmark:
         self, MockAPI, _resolve, mock_make_transport, monkeypatch, capsys
     ):
         monkeypatch.setenv("AKASH_API_KEY", "test-key")
-        mock_make_transport.return_value = _bench_transport(b"BENCH-cpu_eps=1229\nBENCH-done=1\n")
+        mock_make_transport.return_value = _bench_transport(
+            _bench_bytes("cpu_eps=1229", done=True)
+        )
         with pytest.raises(SystemExit) as exc:
             _run_cli(monkeypatch, ["just-akash", "benchmark", "--dseq", "12345"])
         assert exc.value.code == 0
@@ -101,7 +112,7 @@ class TestCliBenchmark:
         """No BENCH-done=1 → is_complete False → exit 1 (a partial sample must
         not be graded as if it were a full one)."""
         monkeypatch.setenv("AKASH_API_KEY", "test-key")
-        mock_make_transport.return_value = _bench_transport(b"BENCH-cpu_eps=1229\n")
+        mock_make_transport.return_value = _bench_transport(_bench_bytes("cpu_eps=1229"))
         with pytest.raises(SystemExit) as exc:
             _run_cli(monkeypatch, ["just-akash", "benchmark", "--dseq", "12345", "--json"])
         assert exc.value.code == 1

@@ -41,7 +41,7 @@ a literal.
 A localhost fake of the Console HTTP API **and** the provider-proxy WebSocket
 (`tests/_fake_akash.py`), so the **full CLI runs end-to-end without credentials**:
 
-```
+```text
 real urllib HTTP  → localhost Console stub (deployments / bids / leases / jwt)
 real websockets   → localhost provider-proxy stub (100/102/103 envelope frames)
 ```

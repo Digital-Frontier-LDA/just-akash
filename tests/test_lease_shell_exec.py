@@ -419,6 +419,16 @@ class TestFrameDispatch:
         frame = bytes([102]) + json.dumps({"exit_code": "5"}).encode()
         assert LeaseShellTransport._dispatch_frame(frame) == 5
 
+    def test_dispatch_frame_code_102_exact_four_byte_int_accepted(self):
+        """A non-JSON result frame of EXACTLY 4 bytes is the legacy binary int32 form."""
+        assert LeaseShellTransport._dispatch_frame(bytes([102]) + (42).to_bytes(4, "little")) == 42
+
+    def test_dispatch_frame_code_102_overlong_non_json_payload_raises(self):
+        """A non-JSON result frame longer than 4 bytes is malformed, not a silent 0.
+        Regression (CodeRabbit): 5 NUL bytes used to read payload[:4] as exit 0."""
+        with pytest.raises(RuntimeError, match="malformed result frame"):
+            LeaseShellTransport._dispatch_frame(bytes([102]) + b"\x00\x00\x00\x00\x00")
+
 
 class TestInferService:
     def test_infer_service_returns_none_when_services_is_list(self):

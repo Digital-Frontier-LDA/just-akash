@@ -9,15 +9,18 @@ seams (the only things patched).
 """
 
 import sys
+from unittest.mock import patch
 
 import pytest
 
 
 def _run_cli(args: list[str]):
-    sys.argv = args
-    from just_akash.cli import main
+    # Patch sys.argv (not bare assignment) so it is always restored, even when
+    # cli.main raises SystemExit — a leak would make later tests order-dependent.
+    with patch.object(sys, "argv", args):
+        from just_akash.cli import main
 
-    return main()
+        return main()
 
 
 @pytest.fixture

@@ -13,8 +13,9 @@ uv sync --dev                   # package + dev tools
 uv run pre-commit install       # gitleaks + ruff + detect-secrets hooks
 ```
 
-Python ≥ 3.10 (`pyproject.toml`). The project is **stdlib-only at runtime**
-(`websockets`, `pexpect`, `pyyaml` only) — don't add a runtime dependency without
+Python ≥ 3.10 (`pyproject.toml`; CI runs 3.13). The project is **minimal-dependency
+at runtime** — only `websockets`, `pexpect`, `pyyaml` — so don't add a runtime
+dependency without
 discussing it.
 
 ## Quality recipes (`just`)

@@ -6,7 +6,7 @@ transport abstraction. Read alongside `PROTOCOL.md` (the wire format) and
 
 ## Layers
 
-```
+```text
                      just <recipe>            (Justfile — logging wrapper)
                          │
                   just-akash <cmd>           (cli.main — argparse dispatch)
@@ -36,7 +36,7 @@ Two surfaces sit on top of one Python package:
 The core of the tool. A deployment is a 6-step orchestration; step 3 is a
 three-phase tiered bid-selection state machine.
 
-```
+```text
 1. prepare SDL     read → validate (sdl_validate) → image/SSH-key/env overrides
 2. create deploy   POST /v1/deployments (recovers from "already exists")
 3. select bid      ┌─ Phase 1: preferred-only patience  [0, T1]  (default 60s)
@@ -72,7 +72,7 @@ Selection.
 
 ## Transport abstraction (`transport/`)
 
-```
+```text
 Transport (ABC)              base.py — prepare / exec / inject / connect / validate
   ├── SSHTransport           ssh.py   — wraps ssh subprocess (the fallback)
   └── LeaseShellTransport    lease_shell.py — WebSocket via Console provider-proxy
@@ -85,7 +85,7 @@ back to SSH when the deployment has no active lease / provider hostUri. `logs` a
 
 ### Lease-shell data flow (exec)
 
-```
+```text
 exec(cmd)
   └─ _exec_loop: fetch JWT → _get_proxy_ws_url (wss://) → connect
        └─ send proxy connect message  {url: /lease/dseq/gseq/oseq/shell?cmd0=.., auth:{jwt}}

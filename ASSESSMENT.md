@@ -3,7 +3,7 @@
 **Date:** 2026-07-18 · **Scope:** the v1.33.0 codebase as built (commit baseline) plus
 the assessment changes in this branch (`docs-tests-deep-assessment`).
 
-just-akash is a stdlib-only Python CLI + `just` recipe layer for deploying and
+just-akash is a minimal-dependency Python CLI + `just` recipe layer for deploying and
 operating workloads on [Akash Network](https://akash.network) via the Console API.
 It is unusually mature for its size: a deliberate 3-phase tiered bid-selection
 state machine, a no-SSH lease-shell transport, leak-proof teardown, and a daily
@@ -21,7 +21,7 @@ documentation set it anchors.
 |---|---|
 | Version | 1.33.0 |
 | Source LOC | ~8.7k (`just_akash/`) |
-| Runtime deps | `websockets`, `pexpect`, `pyyaml` (stdlib-only ethos) |
+| Runtime deps | `websockets`, `pexpect`, `pyyaml` (minimal-dependency ethos — add cautiously) |
 | Python | ≥ 3.10 |
 | Unit tests | ~1150 passing (1128 at baseline + this branch) |
 | Honest unit coverage* | ~92% (was reported 80% — see §4) |

@@ -395,12 +395,14 @@ class LeaseShellTransport(Transport):
                     f"malformed result frame: JSON payload is a {type(parsed).__name__}, "
                     "expected an object with exit_code"
                 )
-            # Not valid JSON — try the raw 4-byte LE int32 form.
-            if len(payload) >= 4:
-                try:
-                    return int.from_bytes(payload[:4], "little")
-                except (ValueError, OverflowError):
-                    pass
+            # Not valid JSON — the legacy binary result form is an EXACT 4-byte LE
+            # int32. A longer non-JSON payload is malformed (e.g. 5 NUL bytes must
+            # not be read as exit 0 via payload[:4]), so only the exact-width binary
+            # form is accepted; anything else surfaces as an error. (Surfaced by
+            # CodeRabbit review: the old `>= 4` reinterpreted the first 4 bytes of a
+            # too-long frame and could return a silent 0.)
+            if len(payload) == 4:
+                return int.from_bytes(payload, "little")
             # No usable exit code: a corrupt/truncated result frame must surface as
             # an error, NOT a silent exit 0. rc=0 is not a trustworthy success signal
             # (see docs/exec-reliability-investigation.md), so an unparsable result
