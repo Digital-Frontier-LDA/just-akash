@@ -1737,11 +1737,13 @@ services:
             client, "get_bids", lambda _: [{"id": {"provider": "p"}, "price": {"amount": 10}}]
         )
 
-        with patch("just_akash.deploy.AkashConsoleAPI", return_value=client):
-            # bid_wait=0 runs no polls, so deploy raises "No bids" AFTER it has already
-            # submitted the SDL — create_deployment has captured it by then.
-            with pytest.raises(RuntimeError, match="No bids"):
-                deploy(sdl_path=str(sdl_file), image="alpine:latest", bid_wait=0, bid_wait_retry=0)
+        # bid_wait=0 runs no polls, so deploy raises "No bids" AFTER it has already
+        # submitted the SDL — create_deployment has captured it by then.
+        with (
+            patch("just_akash.deploy.AkashConsoleAPI", return_value=client),
+            pytest.raises(RuntimeError, match="No bids"),
+        ):
+            deploy(sdl_path=str(sdl_file), image="alpine:latest", bid_wait=0, bid_wait_retry=0)
         # The override was applied; the regex-special '.' in the original image name
         # did not corrupt the image: substitution.
         assert "alpine:latest" in captured["sdl"]
@@ -1775,9 +1777,11 @@ services:
             client, "get_bids", lambda _: [{"id": {"provider": "p"}, "price": {"amount": 10}}]
         )
 
-        with patch("just_akash.deploy.AkashConsoleAPI", return_value=client):
-            with pytest.raises(RuntimeError, match="No bids"):
-                deploy(sdl_path=str(sdl_file), image="node:20", bid_wait=0, bid_wait_retry=0)
+        with (
+            patch("just_akash.deploy.AkashConsoleAPI", return_value=client),
+            pytest.raises(RuntimeError, match="No bids"),
+        ):
+            deploy(sdl_path=str(sdl_file), image="node:20", bid_wait=0, bid_wait_retry=0)
         # The override was applied; the '+' in the original image name did not corrupt
         # the image: substitution.
         assert "node:20" in captured["sdl"]
