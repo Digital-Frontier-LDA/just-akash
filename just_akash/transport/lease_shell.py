@@ -366,19 +366,51 @@ class LeaseShellTransport(Transport):
             sys.stderr.buffer.write(payload)
             sys.stderr.buffer.flush()
         elif code == 102:
+            # A result frame is EITHER a JSON object {"exit_code": N} OR a raw
+            # 4-byte LE int32 (provider-version dependent). Only a JSON *parse*
+            # failure means "try the int32 form" — a valid JSON object whose
+            # exit_code is not an integer (e.g. {"exit_code": "abc"}) is malformed,
+            # NOT a reason to fall back to int32 (which would return the first 4
+            # bytes of the JSON text as a garbage exit code). Surfaced by quorum
+            # review (opencode-1) on ed7a26a: the old broad except swallowed the
+            # int() ValueError and silently degraded to a garbage exit code.
             try:
                 parsed = json.loads(payload)
-                if isinstance(parsed, dict):
-                    exit_code = parsed.get("exit_code", 0)
-                    return 0 if exit_code is None else int(exit_code)
-            except (json.JSONDecodeError, TypeError, ValueError):
-                pass
-            if len(payload) >= 4:
+            except ValueError:  # JSONDecodeError + UnicodeDecodeError are ValueErrors
+                parsed = None
+            if isinstance(parsed, dict):
+                exit_code = parsed.get("exit_code", 0)
+                if exit_code is None:
+                    return 0
                 try:
-                    return int.from_bytes(payload[:4], "little")
-                except (ValueError, OverflowError):
-                    pass
-            return 0
+                    return int(exit_code)
+                except (TypeError, ValueError):
+                    raise RuntimeError(
+                        f"malformed result frame: exit_code {exit_code!r} is not an integer"
+                    ) from None
+            if parsed is not None:
+                # Valid JSON but not a result object (a bare list/number/string):
+                # the result frame is malformed, not a silent success.
+                raise RuntimeError(
+                    f"malformed result frame: JSON payload is a {type(parsed).__name__}, "
+                    "expected an object with exit_code"
+                )
+            # Not valid JSON — the legacy binary result form is an EXACT 4-byte LE
+            # int32. A longer non-JSON payload is malformed (e.g. 5 NUL bytes must
+            # not be read as exit 0 via payload[:4]), so only the exact-width binary
+            # form is accepted; anything else surfaces as an error. (Surfaced by
+            # CodeRabbit review: the old `>= 4` reinterpreted the first 4 bytes of a
+            # too-long frame and could return a silent 0.)
+            if len(payload) == 4:
+                return int.from_bytes(payload, "little")
+            # No usable exit code: a corrupt/truncated result frame must surface as
+            # an error, NOT a silent exit 0. rc=0 is not a trustworthy success signal
+            # (see docs/exec-reliability-investigation.md), so an unparsable result
+            # must not be allowed to masquerade as success.
+            raise RuntimeError(
+                f"malformed result frame: {len(payload)} byte(s), could not parse an "
+                'exit code (expected JSON {"exit_code": N} or a 4-byte LE int32)'
+            )
         elif code == 103:
             msg = payload.decode("utf-8", errors="replace")
             raise RuntimeError(f"Provider error: {msg}")
@@ -511,11 +543,15 @@ class LeaseShellTransport(Transport):
             return self._decode_payload(msg["data"], text_fallback=text_fallback)
         return None
 
-    def _pump_frames(self, ws, exit_code: int) -> int | None:
+    def _pump_frames(self, ws) -> int | None:
         """Read frames until the remote command reports its exit code.
 
         Returns that exit code, or None to tell the caller the JWT expired and the
-        session should be re-established. Raises on any proxy or provider error.
+        session should be re-established. Raises on any proxy or provider error,
+        and ALSO raises if the proxy closes cleanly without ever sending a result
+        (exit-code) frame — the command's outcome is then unknown, and returning a
+        default 0 would false-pass a dropped session as success (rc=0 is not
+        trustworthy; see docs/exec-reliability-investigation.md).
 
         The provider-proxy does not guarantee the result (exit-code) frame is the
         last one on the wire: a stdout frame can still be in flight when the result
@@ -566,7 +602,17 @@ class LeaseShellTransport(Transport):
                 frame = self._recv_proxy_message(ws, timeout=timeout)
             except ConnectionClosedOK:
                 self._report_exec_trace(recovered, _trace, t_result)
-                return pending_exit if pending_exit is not None else exit_code
+                if pending_exit is not None:
+                    return pending_exit
+                # Clean close before any result (exit-code) frame arrived: the
+                # command's outcome is unknown. Previously this returned the caller's
+                # default exit code (0), false-passing a dropped/closed session as
+                # success. Surface it as an error instead.
+                raise RuntimeError(
+                    "provider-proxy closed the connection without sending a result "
+                    "(exit-code) frame; the command's exit code is unknown. Re-run; "
+                    "if this persists the provider may be closing the session early."
+                ) from None
             except ConnectionClosedError as exc:
                 if _is_auth_expiry(exc):
                     return None
@@ -676,7 +722,6 @@ class LeaseShellTransport(Transport):
 
     def _exec_loop(self, shell_path: str) -> int:
         attempts = 0
-        exit_code = 0
 
         while attempts < MAX_RECONNECT_ATTEMPTS:
             jwt = self._fetch_jwt()
@@ -694,7 +739,7 @@ class LeaseShellTransport(Transport):
                     ping_timeout=20,
                 ) as ws:
                     ws.send(connect_msg)
-                    result = self._pump_frames(ws, exit_code)
+                    result = self._pump_frames(ws)
                     if result is not None:
                         return result
             except RuntimeError as exc:
@@ -772,7 +817,6 @@ class LeaseShellTransport(Transport):
 
     def _exec_with_stdin(self, command: str, stdin_data: bytes) -> int:
         attempts = 0
-        exit_code = 0
 
         while attempts < MAX_RECONNECT_ATTEMPTS:
             jwt = self._fetch_jwt()
@@ -795,7 +839,7 @@ class LeaseShellTransport(Transport):
                     stdin_frame = bytes([_FRAME_STDIN]) + stdin_data
                     ws.send(self._proxy_frame_msg(shell_url, jwt, stdin_frame))
 
-                    result = self._pump_frames(ws, exit_code)
+                    result = self._pump_frames(ws)
                     if result is not None:
                         return result
             except RuntimeError as exc:
@@ -811,7 +855,6 @@ class LeaseShellTransport(Transport):
         import time
 
         attempts = 0
-        exit_code = 0
 
         while attempts < MAX_RECONNECT_ATTEMPTS:
             jwt = self._fetch_jwt()
@@ -838,7 +881,7 @@ class LeaseShellTransport(Transport):
                     ws.send(self._proxy_frame_msg(shell_url, jwt, data_frame))
                     ws.send(self._proxy_frame_msg(shell_url, jwt, bytes([_FRAME_STDIN])))
 
-                    result = self._pump_frames(ws, exit_code)
+                    result = self._pump_frames(ws)
                     if result is not None:
                         return result
             except RuntimeError as exc:

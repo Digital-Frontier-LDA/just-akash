@@ -9,6 +9,17 @@ Self-contained — clone, configure `.env`, and run.
 > commitment to making Akash enterprise-ready — adding robustness to the deployment lifecycle and
 > security to post-deploy operations (no-SSH lease-shell exec, off-SDL secret injection).
 
+## Documentation
+
+- [**ASSESSMENT.md**](ASSESSMENT.md) — deep technical assessment: module health, strengths, findings, recommendations.
+- [**docs/ARCHITECTURE.md**](docs/ARCHITECTURE.md) — layers, the 3-phase bid-selection state machine, the transport abstraction.
+- [**docs/MODULE_REFERENCE.md**](docs/MODULE_REFERENCE.md) — per-module purpose, public API, invariants.
+- [**docs/DEVELOPING.md**](docs/DEVELOPING.md) — contributor setup, recipes, adding a command/transport, release flow.
+- [**docs/TESTING.md**](docs/TESTING.md) — unit vs live-e2e vs the local fake-Akash integration suite.
+- [**docs/TROUBLESHOOTING.md**](docs/TROUBLESHOOTING.md) — failure modes indexed by command.
+- [**docs/PROTOCOL.md**](docs/PROTOCOL.md) — the lease-shell WebSocket frame protocol.
+- [**docs/exec-reliability-investigation.md**](docs/exec-reliability-investigation.md) — root-cause of the `rc=0`+empty-stdout symptom.
+
 ## What's New
 
 - **Full lifecycle API coverage** — five new commands round out the deploy→operate→maintain loop:

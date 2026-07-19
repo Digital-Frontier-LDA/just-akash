@@ -1726,23 +1726,28 @@ services:
         sdl_file.write_text(SDL_WITH_DOT)
 
         client = AkashConsoleAPI("key")
-        monkeypatch.setattr(
-            client, "create_deployment", lambda *a, **k: {"dseq": "123", "manifest": "abc"}
-        )
+        captured: dict = {}
+
+        def _create(sdl, *a, **k):
+            captured["sdl"] = sdl
+            return {"dseq": "123", "manifest": "abc"}
+
+        monkeypatch.setattr(client, "create_deployment", _create)
         monkeypatch.setattr(
             client, "get_bids", lambda _: [{"id": {"provider": "p"}, "price": {"amount": 10}}]
         )
 
-        with patch("just_akash.deploy.AkashConsoleAPI", return_value=client):
-            try:
-                deploy(sdl_path=str(sdl_file), image="alpine:latest", bid_wait=0, bid_wait_retry=0)
-                # Should succeed, not crash
-                assert True
-            except RuntimeError as e:
-                if "No bids" in str(e):
-                    pass  # Expected due to mocking
-                else:
-                    raise
+        # bid_wait=0 runs no polls, so deploy raises "No bids" AFTER it has already
+        # submitted the SDL — create_deployment has captured it by then.
+        with (
+            patch("just_akash.deploy.AkashConsoleAPI", return_value=client),
+            pytest.raises(RuntimeError, match="No bids"),
+        ):
+            deploy(sdl_path=str(sdl_file), image="alpine:latest", bid_wait=0, bid_wait_retry=0)
+        # The override was applied; the regex-special '.' in the original image name
+        # did not corrupt the image: substitution.
+        assert "alpine:latest" in captured["sdl"]
+        assert "ubuntu:22.04" not in captured["sdl"]
 
     def test_image_override_with_plus(self, tmp_path, monkeypatch):
         from just_akash.api import AkashConsoleAPI
@@ -1761,22 +1766,26 @@ services:
         sdl_file.write_text(SDL_WITH_PLUS)
 
         client = AkashConsoleAPI("key")
-        monkeypatch.setattr(
-            client, "create_deployment", lambda *a, **k: {"dseq": "123", "manifest": "abc"}
-        )
+        captured: dict = {}
+
+        def _create(sdl, *a, **k):
+            captured["sdl"] = sdl
+            return {"dseq": "123", "manifest": "abc"}
+
+        monkeypatch.setattr(client, "create_deployment", _create)
         monkeypatch.setattr(
             client, "get_bids", lambda _: [{"id": {"provider": "p"}, "price": {"amount": 10}}]
         )
 
-        with patch("just_akash.deploy.AkashConsoleAPI", return_value=client):
-            try:
-                deploy(sdl_path=str(sdl_file), image="node:20", bid_wait=0, bid_wait_retry=0)
-                assert True
-            except RuntimeError as e:
-                if "No bids" in str(e):
-                    pass
-                else:
-                    raise
+        with (
+            patch("just_akash.deploy.AkashConsoleAPI", return_value=client),
+            pytest.raises(RuntimeError, match="No bids"),
+        ):
+            deploy(sdl_path=str(sdl_file), image="node:20", bid_wait=0, bid_wait_retry=0)
+        # The override was applied; the '+' in the original image name did not corrupt
+        # the image: substitution.
+        assert "node:20" in captured["sdl"]
+        assert "node:18+lts" not in captured["sdl"]
 
 
 class TestDeployEmptySdlContent:
