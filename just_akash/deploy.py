@@ -1081,6 +1081,13 @@ def deploy(
         except RuntimeError as e:
             err_str = str(e).lower()
             stale = "no longer open" in err_str
+            # 404 "no lease for deployment": the deployment's order became
+            # un-leaseable during the bid-wait (Console GC/propagation, or a
+            # shared-wallet sweep closing an un-leased deployment). Unlike a
+            # stale bid, re-fetching bids on the SAME order can't recover it
+            # (the order is gone), so this skips the same-order bid re-fetch
+            # below and goes straight to the issue-#19 re-deploy round.
+            no_order = "no lease for deployment" in err_str
             # Console API intermittently rejects lease creation with
             # 400 "JWT has invalid claims" while the bid itself is healthy
             # (transient auth flap on the Console side — see issue #18).
@@ -1124,10 +1131,18 @@ def deploy(
                     )
                     continue
                 _log(logging.WARNING, "  No other open bid available to retry with")
-            if stale and not redeployed:
+            if (stale or no_order) and not redeployed:
                 # issue #19: every bid on this order has expired (bids share the
                 # ORDER's ~5-min clock, so re-fetching the same order can't
-                # recover). Close it, re-create once, and lease a fresh bid.
+                # recover), OR the order itself became un-leaseable (no_order
+                # 404). Either way: close it, re-create once, lease a fresh bid.
+                if no_order:
+                    _log(
+                        logging.WARNING,
+                        f"Lease creation got 404 'no lease for deployment' for "
+                        f"{dseq} (order un-leaseable after the bid-wait) — "
+                        "re-creating the order for fresh bids...",
+                    )
                 redeployed = True
                 attempt = 0
                 failed_providers.clear()
