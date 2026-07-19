@@ -18,6 +18,7 @@ Self-contained — clone, configure `.env`, and run.
 - [**docs/TESTING.md**](docs/TESTING.md) — unit vs live-e2e vs the local fake-Akash integration suite.
 - [**docs/TROUBLESHOOTING.md**](docs/TROUBLESHOOTING.md) — failure modes indexed by command.
 - [**docs/PROTOCOL.md**](docs/PROTOCOL.md) — the lease-shell WebSocket frame protocol.
+- [**docs/diagnostics.md**](docs/diagnostics.md) — structured diagnostic events (reason codes for Sentry/CI: wallet credit, provider health, bid/lease failures).
 - [**docs/exec-reliability-investigation.md**](docs/exec-reliability-investigation.md) — root-cause of the `rc=0`+empty-stdout symptom.
 
 ## What's New
