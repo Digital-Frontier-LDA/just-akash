@@ -8,6 +8,7 @@ Provides:
 - Shared helpers: _confirm, _json_output
 """
 
+import base64
 import json
 import logging
 import os
@@ -436,6 +437,32 @@ class AkashConsoleAPI:
             if isinstance(token, str) and token:
                 return token
         raise RuntimeError(f"JWT token not found in response: {response}")
+
+    def account_address(self) -> str:
+        """The on-chain account address behind this API key.
+
+        The Console API has no "whoami" endpoint, but every JWT it mints carries the
+        account as the ``iss`` (issuer) claim, so we read it from a short-lived token.
+        We decode only that public claim from the unauthenticated base64 payload (the
+        signature is never verified, and the token is never used), so this is a cheap,
+        side-effect-free identity probe.
+        """
+        token = self.create_jwt(dseq="0", ttl=300)
+        parts = token.split(".")
+        if len(parts) < 2:
+            raise RuntimeError(f"malformed JWT (no payload segment): {token[:24]}...")
+        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)  # restore base64url padding
+        try:
+            claims = json.loads(base64.urlsafe_b64decode(payload_b64.encode("ascii")))
+        except ValueError as e:
+            # ValueError covers every decode failure: binascii.Error (bad base64),
+            # UnicodeDecodeError, and json.JSONDecodeError — all normalized to one
+            # RuntimeError so a malformed token never escapes as a different type.
+            raise RuntimeError(f"could not decode JWT payload: {e}") from e
+        addr = claims.get("iss")
+        if not isinstance(addr, str) or not addr.startswith("akash1"):
+            raise RuntimeError(f"JWT payload has no akash issuer claim: {claims!r}")
+        return addr
 
     def create_jwt_with_provider(
         self, dseq: str, provider: str, ttl: int = 3600, scope: list[str] | None = None
