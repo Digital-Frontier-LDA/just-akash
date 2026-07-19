@@ -981,9 +981,13 @@ def deploy(
             time.sleep(interval_s)
         return None
 
-    def _redeploy_and_reselect() -> tuple[str, str, str, float, str]:
-        """Close the stale order and create a fresh one (issue #19), then select
+    def _redeploy_and_reselect(reason: str = "all bids stale") -> tuple[str, str, str, float, str]:
+        """Close the stale/gone order and create a fresh one (issue #19), then select
         a fresh open bid on it.
+
+        ``reason`` is the cause of the re-deploy (e.g. "all bids stale" for the
+        issue-#14 path, or "order un-leaseable (404)" for the lease-CREATE 404) so
+        the operator log names the actual failure mode, not a generic "stale".
 
         Returns ``(dseq, manifest, provider, price_amount, price_denom)`` for the
         re-created order. Raises RuntimeError with an accurate cause if the round
@@ -991,8 +995,8 @@ def deploy(
         """
         _log(
             logging.WARNING,
-            f"All bids on order {dseq} are stale — re-creating the order for "
-            "fresh bids (1 re-deploy round)...",
+            f"Re-creating the order for fresh bids — {reason} (1 re-deploy round); "
+            f"closing {dseq}...",
         )
         # Close the stale order BEFORE creating a new one — never leave two
         # funded orders on-chain. Transient close failures (often the same
@@ -1081,6 +1085,13 @@ def deploy(
         except RuntimeError as e:
             err_str = str(e).lower()
             stale = "no longer open" in err_str
+            # 404 "no lease for deployment": the deployment's order became
+            # un-leaseable during the bid-wait (Console GC/propagation, or a
+            # shared-wallet sweep closing an un-leased deployment). Unlike a
+            # stale bid, re-fetching bids on the SAME order can't recover it
+            # (the order is gone), so this skips the same-order bid re-fetch
+            # below and goes straight to the issue-#19 re-deploy round.
+            no_order = "no lease for deployment" in err_str
             # Console API intermittently rejects lease creation with
             # 400 "JWT has invalid claims" while the bid itself is healthy
             # (transient auth flap on the Console side — see issue #18).
@@ -1124,15 +1135,20 @@ def deploy(
                     )
                     continue
                 _log(logging.WARNING, "  No other open bid available to retry with")
-            if stale and not redeployed:
+            if (stale or no_order) and not redeployed:
                 # issue #19: every bid on this order has expired (bids share the
                 # ORDER's ~5-min clock, so re-fetching the same order can't
-                # recover). Close it, re-create once, and lease a fresh bid.
+                # recover), OR the order itself became un-leaseable (no_order
+                # 404). Either way: close it, re-create once, lease a fresh bid.
                 redeployed = True
                 attempt = 0
                 failed_providers.clear()
                 try:
-                    dseq, manifest, provider, price_amount, price_denom = _redeploy_and_reselect()
+                    dseq, manifest, provider, price_amount, price_denom = _redeploy_and_reselect(
+                        reason="order un-leaseable (404 'no lease for deployment')"
+                        if no_order
+                        else "all bids stale"
+                    )
                 except RuntimeError as redeploy_err:
                     emit(
                         Code.REDEPLOY_FAILED,

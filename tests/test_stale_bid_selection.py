@@ -487,3 +487,78 @@ class TestLeaseTransientJWTRetry:
         assert result["dseq"] == "222"
         assert result["provider"] == "akash1back"  # backup tier selected post-redeploy
         client.close_deployment.assert_called_once_with("111")
+
+
+class TestLeaseNoOrder404Retry:
+    """The lease-CREATE 404 'no lease for deployment' (the hgulk CI flake — order
+    becomes un-leaseable during the bid-wait) is recovered by the issue-#19
+    re-deploy round, NOT a terminal failure. Unlike a stale bid it skips the
+    same-order bid re-fetch (the order is gone) and goes straight to re-deploy."""
+
+    NO_ORDER_ERR = RuntimeError("API Error (404): no lease for deployment\n")
+
+    @patch("just_akash.deploy.time")
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_redeploys_on_no_lease_404(self, MockAPI, mock_time, tmp_path, monkeypatch):
+        """404 on the first order → close it, re-create, lease the fresh bid."""
+        client, sdl = _setup(MockAPI, mock_time, tmp_path, monkeypatch, providers="akash1a")
+        client.create_deployment.side_effect = [
+            {"dseq": "111", "manifest": "m1"},
+            {"dseq": "222", "manifest": "m2"},
+        ]
+        client.get_bids.return_value = [_make_bid("akash1a", 10)]
+        client.create_lease.side_effect = [self.NO_ORDER_ERR, {"lease": "ok"}]
+
+        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+
+        assert result["dseq"] == "222"
+        assert result["provider"] == "akash1a"
+        assert client.create_lease.call_count == 2
+        # The gone order was closed; the fresh order was leased.
+        client.close_deployment.assert_called_once_with("111")
+        _, round2_kwargs = client.create_lease.call_args
+        assert round2_kwargs["dseq"] == "222"
+
+    @patch("just_akash.deploy.time")
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_404_skips_same_order_bid_refetch(
+        self, MockAPI, mock_time, tmp_path, monkeypatch, capsys
+    ):
+        """A 404 must NOT trigger the stale-bid same-order re-fetch (which would log
+        're-fetching open bids') — it goes straight to re-deploy, logging the
+        no_order reason. Assert on the log so the skip is actually proven, not just
+        inferred from a re-deploy having happened."""
+        client, sdl = _setup(MockAPI, mock_time, tmp_path, monkeypatch, providers="akash1a")
+        client.create_deployment.side_effect = [
+            {"dseq": "111", "manifest": "m1"},
+            {"dseq": "222", "manifest": "m2"},
+        ]
+        client.get_bids.return_value = [_make_bid("akash1a", 10)]
+        client.create_lease.side_effect = [self.NO_ORDER_ERR, {"lease": "ok"}]
+
+        deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+        out = capsys.readouterr().out
+        # The stale-bid same-order re-fetch was NOT taken:
+        assert "re-fetching open bids" not in out
+        # The no_order reason is in the re-deploy log (proves the 404 path):
+        assert "order un-leaseable (404" in out
+
+    @patch("just_akash.deploy.time")
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_404_then_redeploy_also_fails_is_terminal(
+        self, MockAPI, mock_time, tmp_path, monkeypatch
+    ):
+        """If the re-created order ALSO 404s, it's a terminal failure (one bounded
+        re-deploy round, like issue #19) — both orders are torn down."""
+        client, sdl = _setup(MockAPI, mock_time, tmp_path, monkeypatch, providers="akash1a")
+        client.create_deployment.side_effect = [
+            {"dseq": "111", "manifest": "m1"},
+            {"dseq": "222", "manifest": "m2"},
+        ]
+        client.get_bids.return_value = [_make_bid("akash1a", 10)]
+        client.create_lease.side_effect = self.NO_ORDER_ERR  # always 404
+
+        with pytest.raises(RuntimeError, match="Failed to create lease"):
+            deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+        assert client.create_lease.call_count == 2  # one attempt per order
+        assert client.close_deployment.call_count == 2  # both orders torn down
