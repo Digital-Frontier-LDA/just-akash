@@ -454,7 +454,10 @@ class AkashConsoleAPI:
         payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)  # restore base64url padding
         try:
             claims = json.loads(base64.urlsafe_b64decode(payload_b64.encode("ascii")))
-        except (ValueError, json.JSONDecodeError) as e:
+        except ValueError as e:
+            # ValueError covers every decode failure: binascii.Error (bad base64),
+            # UnicodeDecodeError, and json.JSONDecodeError — all normalized to one
+            # RuntimeError so a malformed token never escapes as a different type.
             raise RuntimeError(f"could not decode JWT payload: {e}") from e
         addr = claims.get("iss")
         if not isinstance(addr, str) or not addr.startswith("akash1"):

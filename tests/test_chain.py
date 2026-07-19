@@ -2,6 +2,8 @@
 
 from unittest.mock import patch
 
+import pytest
+
 from just_akash import chain
 
 _DEPOSIT = "/akash.escrow.v1.DepositAuthorization"
@@ -160,3 +162,18 @@ class TestLcdGet:
                 raise AssertionError("expected RuntimeError")
             except RuntimeError as e:
                 assert "non-JSON" in str(e)
+
+
+class TestRestUrl:
+    def test_rejects_non_http_scheme(self, monkeypatch):
+        monkeypatch.setenv("AKASH_REST_URL", "file:///etc/passwd")
+        with pytest.raises(RuntimeError, match="http/https scheme"):
+            chain.rest_url()
+
+    def test_accepts_https_and_strips_trailing_slash(self, monkeypatch):
+        monkeypatch.setenv("AKASH_REST_URL", "https://akash.example/rpc/")
+        assert chain.rest_url() == "https://akash.example/rpc"
+
+    def test_defaults_to_public_lcd(self, monkeypatch):
+        monkeypatch.delenv("AKASH_REST_URL", raising=False)
+        assert chain.rest_url() == chain.DEFAULT_REST_URL

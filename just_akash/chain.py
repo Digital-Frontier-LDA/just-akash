@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -35,8 +36,20 @@ _DENOM_META = {
 
 
 def rest_url() -> str:
-    """The LCD base URL (no trailing slash), from env or the public default."""
-    return os.environ.get("AKASH_REST_URL", DEFAULT_REST_URL).rstrip("/")
+    """The LCD base URL (no trailing slash), from env or the public default.
+
+    Restricted to http/https so a crafted ``AKASH_REST_URL`` (e.g. ``file://``)
+    can't point ``urllib`` at a local resource — this is what justifies the
+    ``# noqa: S310`` on the ``urlopen`` calls below. Raises RuntimeError on any
+    other scheme.
+    """
+    url = os.environ.get("AKASH_REST_URL", DEFAULT_REST_URL).rstrip("/")
+    scheme = urllib.parse.urlparse(url).scheme.lower()
+    if scheme not in ("http", "https"):
+        raise RuntimeError(
+            f"AKASH_REST_URL must use an http/https scheme; got {scheme!r} from {url!r}"
+        )
+    return url
 
 
 def _lcd_get(path: str, timeout: int = 15) -> dict[str, Any]:
@@ -62,10 +75,10 @@ def _lcd_get(path: str, timeout: int = 15) -> dict[str, Any]:
 
 
 def _coins_map(coins: list[dict[str, Any]]) -> dict[str, int]:
-    """Sum a list of {denom, amount} into {denom: int_amount}. Amounts can arrive as
-    integer strings or decimal strings (the authz grant reports "170623558" but some
-    nodes decimal-format it); float() then int() tolerates both without losing the
-    micro-unit precision we care about."""
+    """Sum a list of {denom, amount} into {denom: int_amount}. Amounts arrive as
+    integer strings; some nodes append a decimal suffix (``"170623558.000…"``), so
+    the integer part is parsed directly — never via float(), which would silently
+    round large micro-unit balances."""
     out: dict[str, int] = {}
     for c in coins or []:
         denom = c.get("denom")
@@ -73,7 +86,7 @@ def _coins_map(coins: list[dict[str, Any]]) -> dict[str, int]:
         if not denom or raw is None:
             continue
         try:
-            amt = int(float(raw))
+            amt = int(str(raw).split(".", 1)[0])  # drop any ".000…" suffix, parse as int
         except (TypeError, ValueError):
             continue
         out[denom] = out.get(denom, 0) + amt

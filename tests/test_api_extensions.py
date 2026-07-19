@@ -337,3 +337,15 @@ class TestAccountAddress:
             pytest.raises(RuntimeError, match="no akash issuer"),
         ):
             client.account_address()
+
+    def test_undecodable_payload_raises(self):
+        """A payload that decodes to non-JSON (or fails base64) is normalized to one
+        RuntimeError — binascii.Error / UnicodeDecodeError / JSONDecodeError are all
+        ValueError subclasses, caught together."""
+        client = AkashConsoleAPI("key")
+        bad_payload = base64.urlsafe_b64encode(b"not-json").decode().rstrip("=")
+        with (
+            patch.object(client, "create_jwt", return_value=f"head.{bad_payload}.sig"),
+            pytest.raises(RuntimeError, match="could not decode JWT payload"),
+        ):
+            client.account_address()
