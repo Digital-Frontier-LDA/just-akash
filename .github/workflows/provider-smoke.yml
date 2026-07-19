@@ -220,3 +220,30 @@ jobs:
             --min-version "$SMOKE_MIN_VERSION" \
             --quarantine "$SMOKE_QUARANTINE_PROVIDERS" \
             --max-p95 "$SMOKE_LATENCY_SLO_P95"
+
+      # Render the SAME accrued JSONL into Prometheus textfile-collector format so the
+      # natural errors (no-credit / no-bid / lease-down / no-room) and per-feature
+      # latency percentiles become Grafana-trackable. Non-gating and if: always() so it
+      # runs even when the latency gate above fails (a red run's metrics are exactly
+      # what we want to keep). The .prom is uploaded as an artifact for a Prometheus
+      # scrape/pushgateway job to pick up; the deploy-credit gauge (--with-credit) is
+      # deliberately NOT emitted here (this job holds no AKASH_API_KEY — run
+      # `just export-metrics "" out.prom with-credit=1` from a credentialed context).
+      - name: Export Prometheus metrics
+        if: always()
+        run: |
+          if [ ! -f accrued.jsonl ]; then
+            echo "no accrued telemetry to export yet"; exit 0
+          fi
+          python3 -m just_akash.prometheus_exporter accrued.jsonl --output smoke-metrics.prom
+          echo "── rendered $(grep -c '^just_akash' smoke-metrics.prom) metric sample(s) ──"
+          head -40 smoke-metrics.prom
+
+      - name: Upload Prometheus metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-prometheus-metrics-${{ github.run_id }}
+          path: smoke-metrics.prom
+          if-no-files-found: ignore
+          retention-days: 90

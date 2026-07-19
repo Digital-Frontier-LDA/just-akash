@@ -316,6 +316,29 @@ smoke-telemetry-report file="":
         uv run python -m just_akash.analyze_telemetry "$tmp"
     fi
 
+# Render accrued smoke telemetry as Prometheus textfile-collector metrics so
+# no-credit/no-bid/lease-down outcomes + deploy-credit burn-down are Grafana-trackable.
+# With no FILE, pulls the live `telemetry` branch. OUTPUT writes a .prom atomically;
+# with-credit=1 also emits the deploy-credit gauge (needs AKASH_API_KEY).
+#   just export-metrics path.jsonl                    # -> stdout
+#   just export-metrics path.jsonl smoke.prom          # -> file
+#   just export-metrics "" smoke.prom with-credit=1     # accrued CI data + credit gauge
+export-metrics file="" output="" with-credit="":
+    #!/bin/bash
+    set -euo pipefail
+    args=()
+    if [ -n "{{output}}" ]; then args+=(--output "{{output}}"); fi
+    if [ -n "{{with-credit}}" ]; then args+=(--with-credit); fi
+    if [ -n "{{file}}" ]; then
+        uv run just-akash export-metrics "{{file}}" "${args[@]}"
+    else
+        tmp="$(mktemp)"
+        trap 'rm -f "$tmp"' EXIT   # clean up on every exit path
+        if ! git fetch origin telemetry >/dev/null 2>&1; then echo "no telemetry branch yet"; exit 0; fi
+        git show origin/telemetry:smoke-latency.jsonl > "$tmp"
+        uv run just-akash export-metrics "$tmp" "${args[@]}"
+    fi
+
 # ── Lint & Quality ───────────────────────────────────
 
 # Run ruff lint + format check

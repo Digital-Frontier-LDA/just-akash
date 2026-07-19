@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.34.0] — 2026-07-19
+
+### Added
+- **Smoke telemetry is now Grafana-trackable — a Prometheus exporter turns the accrued JSONL into first-class metrics.** Until now the daily smoke's outcomes lived only as CI-log text and a `telemetry` git branch of JSONL: the natural errors we most want to watch (wallet out of funds → `no-credit`, no provider bid → `no-bid`, the lease died on-chain → `lease-down`, a full/offline provider → `no-room`) were invisible to any dashboard. New `just_akash/prometheus_exporter.py` (`just-akash export-metrics <jsonl> [--output f.prom] [--with-credit]`, plus a `just export-metrics` recipe) renders the SAME JSONL into Prometheus **textfile-collector** format — pure stdlib, no server, no new deps — exposing `just_akash_smoke_outcome_total{provider,feature,outcome}` (a counter, so each outcome is a trendable series for `rate()`/`increase()`), `just_akash_smoke_latency_ms{provider,feature,quantile}` (p50/p95/p99 over PASS samples, reusing `analyze_telemetry`'s percentile logic), and `just_akash_smoke_last_run_timestamp` (staleness alerting). The daily smoke's `report` job now renders and uploads a `.prom` artifact (non-gating, `if: always()`) so a scrape/pushgateway job can pick it up.
+- **Deploy-credit burn-down gauge + a proactive low-credit alarm.** `export-metrics --with-credit` emits `just_akash_deploy_credit_usd{account}` (from `chain.deploy_credit(account_address())`, USD-pegged uact), so Grafana can trend and forecast when the wallet runs dry. And `balance --check --min-usd N` prints a machine-readable verdict (`CREDIT-CHECK status=OK|LOW …`, or JSON with `--json`) and exits non-zero when the remaining deploy credit is below the threshold — so a scheduled job flags a low wallet **before** deploys start returning HTTP 402.
+
 ## [1.33.0] — 2026-07-18
 
 ### Fixed
