@@ -371,6 +371,13 @@ def main():
     list_p = subparsers.add_parser("list", help="List active deployments")
     list_p.add_argument("--json", action="store_true", help="Output in JSON format")
 
+    # ── balance ────────────────────────────────────────
+    balance_p = subparsers.add_parser(
+        "balance",
+        help="Show the Console-API wallet and its remaining deploy credit",
+    )
+    balance_p.add_argument("--json", action="store_true", help="Output in JSON format")
+
     # ── status ─────────────────────────────────────────
     status_p = subparsers.add_parser("status", help="Show deployment details")
     status_p.add_argument("--dseq", default="")
@@ -708,6 +715,61 @@ def main():
                 print(format_deployments_json(deployments))
             else:
                 print(format_deployments_table(deployments))
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    # ── balance ────────────────────────────────────────
+    elif args.command == "balance":
+        import json
+
+        from . import chain
+        from .api import AkashConsoleAPI
+
+        try:
+            client = AkashConsoleAPI(_require_api_key())
+            use_json = args.json or not sys.stdout.isatty()
+            address = client.account_address()
+            # Deploy credit is the real "wallet balance": Console holds the funds and
+            # grants this account an escrow DepositAuthorization whose spend_limits is
+            # what's left to spend. Liquid bank balance is usually empty (funds live as
+            # the grant, not AKT). Both are read straight from the public chain.
+            credit = chain.describe_coins(chain.deploy_credit(address))
+            liquid = chain.describe_coins(chain.bank_balances(address))
+            grant = chain.credit_grant_detail(address)
+
+            if use_json:
+                print(
+                    json.dumps(
+                        {
+                            "account": address,
+                            "deploy_credit": credit,
+                            "liquid": liquid,
+                            "credit_grant": grant,
+                            "rest_url": chain.rest_url(),
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                print("Akash Console wallet")
+                print(f"  account:        {address}")
+                if credit:
+                    lead = credit[0]
+                    usd = f"  (≈ ${lead['usd_estimate']:,.2f})" if lead["usd_estimate"] else ""
+                    print(f"  deploy credit:  {lead['display']}{usd}")
+                    for row in credit[1:]:
+                        print(f"                  {row['display']}")
+                else:
+                    print("  deploy credit:  none (no DepositAuthorization grant found)")
+                if liquid:
+                    print(f"  liquid on-chain: {', '.join(r['display'] for r in liquid)}")
+                else:
+                    print("  liquid on-chain: none")
+                if grant:
+                    exp = (grant.get("expiration") or "")[:10] or "no expiry"
+                    print(f"  credit grant:   from {grant.get('granter')} (expires {exp})")
+                print(f"  source:         {chain.rest_url()}")
         except RuntimeError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)

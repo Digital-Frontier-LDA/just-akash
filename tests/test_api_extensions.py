@@ -4,6 +4,8 @@ Covers: update_deployment (PUT), deposit_deployment, deployment-settings
 (GET/POST/PATCH + set_auto_top_up upsert), and the JWT scope parameter.
 """
 
+import base64
+import json
 from unittest.mock import patch
 
 import pytest
@@ -291,3 +293,47 @@ class TestJwtScope:
         client.create_jwt_with_provider("12345", "akash1prov")
         perm = mock_req.call_args[0][2]["data"]["leases"]["permissions"][0]
         assert perm["scope"] == ["shell"]
+
+
+# ── account_address (JWT iss-claim "whoami") ────────────────────────
+
+
+def _jwt_with_iss(claims: dict) -> str:
+    """Build a fake JWT whose payload is the base64url of ``claims`` (signature
+    is irrelevant — account_address never verifies it)."""
+    payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+    return f"head.{payload}.sig"
+
+
+class TestAccountAddress:
+    """account_address() reads the ``iss`` claim from a Console JWT to identify the
+    account behind the API key (no signature verification — the token is unused)."""
+
+    def test_returns_iss_claim(self):
+        client = AkashConsoleAPI("key")
+        with patch.object(client, "create_jwt", return_value=_jwt_with_iss({"iss": "akash1me"})):
+            assert client.account_address() == "akash1me"
+
+    def test_malformed_jwt_raises(self):
+        client = AkashConsoleAPI("key")
+        with (
+            patch.object(client, "create_jwt", return_value="not-a-jwt"),
+            pytest.raises(RuntimeError, match="malformed JWT"),
+        ):
+            client.account_address()
+
+    def test_missing_iss_raises(self):
+        client = AkashConsoleAPI("key")
+        with (
+            patch.object(client, "create_jwt", return_value=_jwt_with_iss({"sub": "x"})),
+            pytest.raises(RuntimeError, match="no akash issuer"),
+        ):
+            client.account_address()
+
+    def test_non_akash_iss_raises(self):
+        client = AkashConsoleAPI("key")
+        with (
+            patch.object(client, "create_jwt", return_value=_jwt_with_iss({"iss": "notakash1"})),
+            pytest.raises(RuntimeError, match="no akash issuer"),
+        ):
+            client.account_address()
