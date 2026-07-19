@@ -152,7 +152,7 @@ def render_latency_summary(records: list[dict]) -> list[str]:
 
 
 def _parse_ts(ts: object) -> float | None:
-    """A telemetry ``ts`` as unix epoch seconds, or None if unparseable.
+    """A telemetry ``ts`` as unix epoch seconds, or None if unparsable.
 
     The smoke writer stamps ``datetime.now(timezone.utc).isoformat()`` (offset-aware,
     e.g. ``2026-07-19T07:00:00.5+00:00``); tolerate a trailing ``Z`` and a raw numeric

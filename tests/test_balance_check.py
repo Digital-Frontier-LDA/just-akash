@@ -18,8 +18,9 @@ import pytest
 def _run_balance_check(monkeypatch, argv, credit):
     """Drive `cli.main()` for a balance command with a mocked account + credit.
 
-    Returns (exit_code, stdout, stderr). stdout is non-tty under pytest, so the
-    verdict is emitted as JSON — parse it in the caller.
+    Returns the process exit code (``SystemExit.code``). stdout/stderr are not
+    returned — callers that need the verdict read it via ``capsys``; stdout is
+    non-tty under pytest, so the verdict is emitted as JSON there to parse.
     """
     monkeypatch.setenv("AKASH_API_KEY", "test-key")
     monkeypatch.setattr(sys, "argv", argv)
