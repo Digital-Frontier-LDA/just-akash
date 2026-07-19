@@ -70,6 +70,7 @@ from ._e2e import (
     resolve_tiers,
     robust_destroy,
 )
+from ._states import TERMINAL_DEPLOYMENT_STATES
 from .api import AkashConsoleAPI, _extract_dseq
 
 # The baseline HTTP marker the probe serves; the update check changes it and
@@ -844,8 +845,10 @@ def _service_availability(dseq: str) -> tuple[int, int] | None:
 # accepted the bid then the lease died = a LEASE-DOWN fulfillment failure. Escrow
 # exhaustion is OUR funding issue, not a provider fault, so it is dead but NOT
 # lease-down. "failed" was originally missing here — that omission is why a failed
-# lease wasn't fast-failed and readiness burned the whole cap.
-_DEAD_STATES = {"closed", "failed", "insufficient_funds", "insufficientfunds"}
+# lease wasn't fast-failed and readiness burned the whole cap. _DEAD_STATES is the
+# shared TERMINAL_DEPLOYMENT_STATES (single-sourced in _states.py); _LEASE_DOWN_STATES
+# is a distinct, smoke-specific subset (failed/closed = provider infra fault).
+_DEAD_STATES = TERMINAL_DEPLOYMENT_STATES
 _LEASE_DOWN_STATES = {"failed", "closed"}
 
 
