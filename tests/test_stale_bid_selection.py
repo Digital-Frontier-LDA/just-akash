@@ -521,10 +521,13 @@ class TestLeaseNoOrder404Retry:
 
     @patch("just_akash.deploy.time")
     @patch("just_akash.deploy.AkashConsoleAPI")
-    def test_404_skips_same_order_bid_refetch(self, MockAPI, mock_time, tmp_path, monkeypatch):
-        """A 404 must NOT trigger the same-order bid re-fetch (the order is gone,
-        re-fetching is pointless) — verify get_bids is called only for the
-        re-created order, not as a mid-order retry."""
+    def test_404_skips_same_order_bid_refetch(
+        self, MockAPI, mock_time, tmp_path, monkeypatch, capsys
+    ):
+        """A 404 must NOT trigger the stale-bid same-order re-fetch (which would log
+        're-fetching open bids') — it goes straight to re-deploy, logging the
+        no_order reason. Assert on the log so the skip is actually proven, not just
+        inferred from a re-deploy having happened."""
         client, sdl = _setup(MockAPI, mock_time, tmp_path, monkeypatch, providers="akash1a")
         client.create_deployment.side_effect = [
             {"dseq": "111", "manifest": "m1"},
@@ -534,11 +537,11 @@ class TestLeaseNoOrder404Retry:
         client.create_lease.side_effect = [self.NO_ORDER_ERR, {"lease": "ok"}]
 
         deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
-        # The stale-bid path calls get_bids mid-lease-retry; the 404 path must not.
-        # (get_bids is called during phase polling AND potentially the stale retry;
-        # here we assert create_lease's first attempt 404'd and the recovery was a
-        # re-deploy, proven by create_deployment being called twice.)
-        assert client.create_deployment.call_count == 2
+        out = capsys.readouterr().out
+        # The stale-bid same-order re-fetch was NOT taken:
+        assert "re-fetching open bids" not in out
+        # The no_order reason is in the re-deploy log (proves the 404 path):
+        assert "order un-leaseable (404" in out
 
     @patch("just_akash.deploy.time")
     @patch("just_akash.deploy.AkashConsoleAPI")
