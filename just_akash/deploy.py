@@ -26,7 +26,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ._diagnostics import Code, emit
+from ._diagnostics import Code, emit, enabled
 from .api import (
     AkashConsoleAPI,
     _extract_bid_price,
@@ -289,6 +289,10 @@ def _check_wallet_credit(client: AkashConsoleAPI, deposit: float) -> None:
     ``WALLET_CREDIT_QUERY_FAILED`` and returns; the deploy proceeds regardless. The
     caller decides whether to act (e.g. pre-fail a CI job); just-akash does not abort.
     """
+    if not enabled():
+        # Skip the JWT-mint + LCD round-trip entirely when diagnostics are silent
+        # (e.g. an interactive terminal) — the probe is only useful to a consumer.
+        return
     from . import chain  # lazy: chain.py queries the public LCD only for this probe
 
     try:
@@ -440,7 +444,9 @@ def deploy(
             Code.NO_DSEQ_RETURNED,
             "error",
             "create deployment returned no DSEQ",
-            response=json.dumps(deployment_response, default=str)[:200],
+            response_keys=list(deployment_response.keys())
+            if isinstance(deployment_response, dict)
+            else None,
         )
         raise RuntimeError(
             f"No DSEQ returned from API. Response: {json.dumps(deployment_response)}"
@@ -722,11 +728,12 @@ def deploy(
                 except RuntimeError as e:
                     _log(logging.WARNING, f"    on-chain status: query failed: {e}")
                     emit(
-                        Code.PROVIDER_NO_BID,
+                        Code.PROVIDER_STATUS_QUERY_FAILED,
                         "warning",
-                        f"provider did not bid (on-chain status query failed: {e}): {p}",
+                        f"on-chain status query failed for {p}: {e}",
                         provider=p,
                         tier=tier,
+                        query_error=str(e)[:120],
                     )
 
     # Failure paths.
@@ -1127,6 +1134,12 @@ def deploy(
                 try:
                     dseq, manifest, provider, price_amount, price_denom = _redeploy_and_reselect()
                 except RuntimeError as redeploy_err:
+                    emit(
+                        Code.REDEPLOY_FAILED,
+                        "error",
+                        f"re-deploy round failed: {redeploy_err}",
+                        dseq=str(dseq),
+                    )
                     raise RuntimeError(
                         f"Failed to create lease after re-deploy: {redeploy_err}"
                     ) from redeploy_err

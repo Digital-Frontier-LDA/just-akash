@@ -47,6 +47,7 @@ Silent in an interactive terminal (humans keep the existing `_log`/`Error:` pros
 | `PROVIDER_INVALID_VERSION` | `isValidVersion: false`. |
 | `PROVIDER_NO_CAPACITY` | cpu/mem available too low for the SDL (reserved). |
 | `PROVIDER_NO_BID` | Healthy on-chain but didn't bid (catch-all). |
+| `PROVIDER_STATUS_QUERY_FAILED` | On-chain status query failed (couldn't classify). |
 | `PROVIDER_UNKNOWN` | Not in the provider registry. |
 
 ### Deploy lifecycle (one per `deploy.py` failure path)
@@ -77,12 +78,15 @@ workflow (`akash-runner.yml`):
 
 ```bash
 # Run deploy; capture stderr, grep for diagnostic events, emit ::error annotations.
+set -o pipefail  # so $? reflects just-akash's exit, not tee's
 uv run just-akash deploy --sdl sdl/app.yaml 2>&1 | tee /tmp/deploy.log
+deploy_rc=$?
 grep '"type":"akash-diag"' /tmp/deploy.log | while read -r line; do
   code=$(echo "$line" | jq -r '.code')
   msg=$(echo "$line" | jq -r '.message')
   echo "::error title=$code::$msg"
 done
+exit $deploy_rc  # preserve the deploy's exit status (don't let the annotation loop mask it)
 ```
 
 For Sentry: pipe stderr through a thin `sentry-sdk` shim that captures each `akash-diag`

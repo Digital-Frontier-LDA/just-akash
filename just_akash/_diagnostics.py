@@ -54,6 +54,7 @@ class Code:
     PROVIDER_INVALID_VERSION = "PROVIDER_INVALID_VERSION"  # isValidVersion false
     PROVIDER_NO_CAPACITY = "PROVIDER_NO_CAPACITY"  # cpu/mem available too low for the SDL
     PROVIDER_NO_BID = "PROVIDER_NO_BID"  # on-chain looks OK but no bid (catch-all)
+    PROVIDER_STATUS_QUERY_FAILED = "PROVIDER_STATUS_QUERY_FAILED"  # couldn't read status
     PROVIDER_UNKNOWN = "PROVIDER_UNKNOWN"  # not in the provider registry
 
     # Deploy lifecycle — one per deploy.py failure path.
@@ -81,6 +82,14 @@ def _enabled() -> bool:
     if flag in ("1", "json", "true", "on"):
         return True
     return not sys.stderr.isatty()
+
+
+def enabled() -> bool:
+    """Public alias of :func:`_enabled` — whether diagnostic events are currently
+    emitted. Callers use this to gate *expensive* probes (e.g. the pre-deploy wallet
+    check, which does network calls) so an interactive terminal pays no latency when
+    diagnostics are silent."""
+    return _enabled()
 
 
 def emit(
