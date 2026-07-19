@@ -18,6 +18,8 @@ Subcommands:
   destroy-all — Destroy all deployments
   tag         — Tag a deployment with a name
   test        — End-to-end lifecycle test
+  balance     — Show the wallet + deploy credit (--check --min-usd for alerting)
+  export-metrics — Render smoke telemetry as Prometheus textfile metrics
 """
 
 import argparse
@@ -377,6 +379,38 @@ def main():
         help="Show the Console-API wallet and its remaining deploy credit",
     )
     balance_p.add_argument("--json", action="store_true", help="Output in JSON format")
+    balance_p.add_argument(
+        "--check",
+        action="store_true",
+        help="Threshold mode: print a machine-readable verdict and exit non-zero when "
+        "deploy credit is below --min-usd (so a scheduled job can flag a low wallet "
+        "BEFORE deploys start 402ing).",
+    )
+    balance_p.add_argument(
+        "--min-usd",
+        type=float,
+        default=None,
+        metavar="N",
+        help="Minimum acceptable deploy credit in USD for --check.",
+    )
+
+    # ── export-metrics ─────────────────────────────────
+    export_p = subparsers.add_parser(
+        "export-metrics",
+        help="Render smoke telemetry JSONL as Prometheus textfile-collector metrics",
+    )
+    export_p.add_argument("jsonl", help="Path to the smoke telemetry JSONL file")
+    export_p.add_argument(
+        "--output",
+        default=None,
+        metavar="FILE",
+        help="Write metrics atomically to FILE (default: stdout)",
+    )
+    export_p.add_argument(
+        "--with-credit",
+        action="store_true",
+        help="Also emit just_akash_deploy_credit_usd from on-chain credit (needs AKASH_API_KEY)",
+    )
 
     # ── status ─────────────────────────────────────────
     status_p = subparsers.add_parser("status", help="Show deployment details")
@@ -730,6 +764,39 @@ def main():
             client = AkashConsoleAPI(_require_api_key())
             use_json = args.json or not sys.stdout.isatty()
             address = client.account_address()
+
+            # Threshold mode: a scheduled low-credit alarm. Print a machine-readable
+            # verdict and exit non-zero when the remaining deploy credit is under
+            # --min-usd, so a cron/CI job flags "wallet low" BEFORE deploys start
+            # returning HTTP 402. uact (Akash Credit Token) is the USD-pegged Console
+            # deploy currency, so its USD estimate is exact (1e6 uact = $1).
+            if args.check:
+                if args.min_usd is None:
+                    print("Error: balance --check requires --min-usd N", file=sys.stderr)
+                    sys.exit(2)
+                uact = chain.deploy_credit(address).get("uact", 0)
+                usd = chain.usd_estimate("uact", uact) or 0.0
+                low = usd < args.min_usd
+                status = "LOW" if low else "OK"
+                if use_json:
+                    print(
+                        json.dumps(
+                            {
+                                "check": "deploy_credit",
+                                "status": status,
+                                "account": address,
+                                "deploy_credit_usd": usd,
+                                "min_usd": args.min_usd,
+                            }
+                        )
+                    )
+                else:
+                    print(
+                        f"CREDIT-CHECK status={status} deploy_credit_usd={usd:.2f} "
+                        f"min_usd={args.min_usd:.2f} account={address}"
+                    )
+                sys.exit(1 if low else 0)
+
             # Deploy credit is the real "wallet balance": Console holds the funds and
             # grants this account an escrow DepositAuthorization whose spend_limits is
             # what's left to spend. Liquid bank balance is usually empty (funds live as
@@ -773,6 +840,12 @@ def main():
         except RuntimeError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
+
+    # ── export-metrics ─────────────────────────────────
+    elif args.command == "export-metrics":
+        from .prometheus_exporter import run as export_metrics
+
+        sys.exit(export_metrics(args.jsonl, output=args.output, with_credit=args.with_credit))
 
     # ── status ─────────────────────────────────────────
     elif args.command == "status":
