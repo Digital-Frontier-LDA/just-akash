@@ -12,9 +12,13 @@ from unittest.mock import patch
 
 from just_akash.smoke_providers import _bidders_from_output, _record_no_bid_evidence
 
-TARGET = "akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x"
-OTHER1 = "akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk"
-OTHER2 = "akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z"
+# Synthetic addresses — never real provider addresses. Real ones are operationally
+# sensitive (AKASH_PROVIDERS is a CI secret) and their entropy trips detect-secrets,
+# which would churn .secrets.baseline on every edit. Built to the bech32 shape the
+# parser expects (akash1 + lowercase alnum), not copied from the fleet.
+TARGET = "akash1" + "targetprovider00000000000000000000000000"
+OTHER1 = "akash1" + "otherbidder1000000000000000000000000000a"
+OTHER2 = "akash1" + "otherbidder2000000000000000000000000000b"
 
 DEPLOY_OUT_OTHERS_BID = f"""
 [2026-07-20T15:33:07Z]   poll #2 @ 5s: 12 bid(s) received
