@@ -60,6 +60,7 @@ import urllib.request
 from datetime import datetime, timezone
 from shlex import quote as q
 
+from ._diagnostics import Code, emit
 from ._e2e import (
     GREEN,
     RED,
@@ -731,6 +732,88 @@ def _provider_room(provider: str) -> tuple[bool, str]:
     return True, "ok"
 
 
+def _bidders_from_output(out: str) -> list[str]:
+    """Provider addresses that DID bid, parsed from deploy's bid-table output.
+
+    deploy logs every bid it saw as ``provider=akash1... price=N uact state=...``
+    (both the poll lines and the tier tables), so a no-bid run still carries proof
+    of who was in the market. Deduped, order-preserving.
+    """
+    seen: dict[str, None] = {}
+    for m in re.finditer(r"provider=(akash1[a-z0-9]+)", out):
+        seen.setdefault(m.group(1), None)
+    return list(seen)
+
+
+def _record_no_bid_evidence(provider: str, out: str) -> None:
+    """Explain a NO-BID instead of silently recording it.
+
+    A bare "NO-BID" cannot distinguish "the provider declined" from "we never got a
+    usable answer" — that ambiguity let a HEALTHY, actively-bidding provider read as
+    absent for 32 consecutive runs. So capture the evidence that was already on
+    screen but thrown away: WHO did bid on the same order, and the target's on-chain
+    status. Emits a structured PROVIDER_NO_BID / PROVIDER_OFFLINE / ... diagnostic
+    (docs/diagnostics.md) so CI/Sentry can act on it, plus a human line.
+
+    Best-effort and never raises: this is diagnostics, not control flow.
+    """
+    try:
+        bidders = _bidders_from_output(out)
+        others = [b for b in bidders if b != provider]
+        info = {}
+        try:
+            info = _api().get_provider(provider) or {}
+        except Exception:  # noqa: BLE001 — evidence is best-effort
+            info = {}
+        online = info.get("isOnline")
+        valid = info.get("isValidVersion")
+        raw_stats = info.get("stats")
+        stats: dict = raw_stats if isinstance(raw_stats, dict) else {}
+        raw_cpu = stats.get("cpu")
+        cpu: dict = raw_cpu if isinstance(raw_cpu, dict) else {}
+        raw_mem = stats.get("memory")
+        mem: dict = raw_mem if isinstance(raw_mem, dict) else {}
+
+        # Classify from the on-chain status, mirroring deploy.py's no-bid block.
+        if not info:
+            code, msg = Code.PROVIDER_UNKNOWN, "not found in the provider registry"
+        elif online is False:
+            code, msg = Code.PROVIDER_OFFLINE, "provider reports offline"
+        elif valid is False:
+            code, msg = Code.PROVIDER_INVALID_VERSION, "provider runs an invalid version"
+        else:
+            code, msg = (
+                Code.PROVIDER_NO_BID,
+                f"healthy on-chain but did not bid, while {len(others)} other "
+                "provider(s) bid on the same order",
+            )
+        emit(
+            code,
+            "warning",
+            f"NO-BID {provider}: {msg}",
+            provider=provider,
+            isOnline=online,
+            isValidVersion=valid,
+            cpu_available=cpu.get("available"),
+            mem_available=mem.get("available"),
+            other_bidders=len(others),
+            market_had_bids=bool(bidders),
+        )
+        # Human line: the market context is the part that makes a NO-BID readable.
+        if others:
+            print(
+                f"  {YELLOW}NO-BID evidence{RESET}: {len(others)} other provider(s) bid "
+                f"on this order — {msg} (isOnline={online} isValidVersion={valid})"
+            )
+        else:
+            print(
+                f"  {YELLOW}NO-BID evidence{RESET}: NOBODY bid on this order "
+                f"(market-wide, not {provider[:14]}…-specific)"
+            )
+    except Exception as e:  # noqa: BLE001 — diagnostics must never break the run
+        print(f"  {YELLOW}NO-BID evidence unavailable{RESET}: {type(e).__name__}: {e}")
+
+
 def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, str]:
     """Deploy the probe pinned to ``provider``. Returns (dseq, note).
 
@@ -788,6 +871,7 @@ def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, s
     # "Cleaning up deployment N (no bids)" log line — i.e. the verdict hung on
     # incidental log wording. Matching the real message removes that dependency.
     if re.search(r"no bids?\b|none from our providers|foreign bids", out, re.IGNORECASE):
+        _record_no_bid_evidence(provider, out)
         return None, "no-bid"
     return None, "deploy-failed"
 
