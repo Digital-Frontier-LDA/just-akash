@@ -9,6 +9,7 @@ Provides:
 """
 
 import base64
+import contextlib
 import json
 import logging
 import os
@@ -810,6 +811,100 @@ def _interactive_pick(deployments: list[dict[str, Any]], client: "AkashConsoleAP
     dseq = items[selected][0]
     print(f"Selected: {dseq}")
     return dseq
+
+
+def _format_hours(hours: float) -> str:
+    """Human-readable time-remaining from hours."""
+    if hours >= 48:
+        return f"~{hours / 24:.0f} days"
+    if hours >= 1:
+        return f"~{hours:.1f} hours"
+    return f"~{hours * 60:.0f} minutes"
+
+
+def compute_lease_runway(
+    client: "AkashConsoleAPI", dseq: str, block_time_s: float = 6.0
+) -> dict[str, Any]:
+    """Estimate how long a deployment's escrow will last at the current burn rate.
+
+    Reads the deployment's escrow balance + the winning bid's per-block price, then
+    computes: ``time_remaining = escrow_remaining / (price_per_block × blocks_per_hour)``.
+
+    Requires an active lease (to identify the provider) and a matching bid (for the
+    price). Raises ``RuntimeError`` if either is missing, or if the denoms don't match
+    (escrow in one denom, price in another — can't compute without conversion).
+
+    Returns a dict with escrow, burn_rate, and time_remaining for both ``--json`` and
+    human display. Reuses ``chain.format_amount`` / ``chain.usd_estimate`` for display.
+    """
+    from .chain import format_amount, usd_estimate
+
+    deployment = client.get_deployment(dseq)
+
+    # ── escrow remaining ──
+    escrow_account = deployment.get("escrow_account") or {}
+    escrow_state = escrow_account.get("state") or {} if isinstance(escrow_account, dict) else {}
+    funds_list = escrow_state.get("funds") or []
+    if not isinstance(funds_list, list):
+        funds_list = []
+    escrow_by_denom: dict[str, int] = {}
+    for f in funds_list:
+        if not isinstance(f, dict):
+            continue
+        denom = f.get("denom", "")
+        raw = f.get("amount", "0")
+        with contextlib.suppress(TypeError, ValueError):
+            escrow_by_denom[denom] = escrow_by_denom.get(denom, 0) + int(str(raw).split(".", 1)[0])
+
+    # ── lease provider (to match the winning bid) ──
+    lease_provider = _extract_lease_provider(deployment)
+    if not lease_provider:
+        raise RuntimeError(
+            "No active lease on this deployment — cannot determine the burn rate. "
+            "The deployment may not have been leased yet."
+        )
+
+    # ── winning bid's per-block price ──
+    bids = client.get_bids(str(dseq))
+    price_per_block: float | None = None
+    price_denom: str | None = None
+    for b in bids:
+        if not isinstance(b, dict):
+            continue
+        if _extract_provider(b) == lease_provider:
+            price_per_block, price_denom = _extract_bid_price(b)
+            break
+    if price_per_block is None or price_per_block == float("inf"):
+        raise RuntimeError(
+            f"Could not find the bid price for provider {lease_provider} on deployment {dseq}."
+        )
+
+    # ── runway (escrow and price must be the same denom) ──
+    escrow_amount = escrow_by_denom.get(price_denom or "", 0)
+    if price_per_block <= 0:
+        raise RuntimeError("Bid price is zero — cannot compute runway.")
+    blocks_per_hour = 3600.0 / block_time_s
+    burn_per_hour = price_per_block * blocks_per_hour
+    time_remaining_h = escrow_amount / burn_per_hour if burn_per_hour > 0 else float("inf")
+
+    return {
+        "dseq": str(dseq),
+        "provider": lease_provider,
+        "escrow": {
+            "amount": escrow_amount,
+            "denom": price_denom,
+            "display": format_amount(price_denom or "", escrow_amount),
+            "usd_estimate": usd_estimate(price_denom or "", escrow_amount),
+        },
+        "burn_rate": {
+            "per_block": price_per_block,
+            "per_hour": round(burn_per_hour, 1),
+            "denom": price_denom,
+        },
+        "time_remaining_hours": round(time_remaining_h, 1),
+        "time_remaining_display": _format_hours(time_remaining_h),
+        "block_time_s": block_time_s,
+    }
 
 
 def api_main():
