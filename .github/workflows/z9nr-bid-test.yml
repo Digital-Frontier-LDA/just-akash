@@ -1,0 +1,70 @@
+name: z9nr bid isolation test
+on:
+  workflow_dispatch:
+jobs:
+  bid-test:
+    name: Does z9nr bid from CI?
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with: { enable-cache: true }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.13' }
+      - run: uv sync --dev
+      - name: Egress identity (is CI on a different IP/ASN?)
+        run: |
+          echo "CI egress:"; curl -s https://ipinfo.io/json | head -20 || echo "(ipinfo unavailable)"
+      - name: Create order, poll bids, close — NO lease (deposit refunded)
+        env:
+          AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
+          AKASH_PROVIDERS: ${{ secrets.AKASH_PROVIDERS }}
+        run: |
+          uv run python - <<'PY'
+          import os, time
+          from just_akash.api import AkashConsoleAPI, _extract_provider
+          SDL = """---
+          version: "2.0"
+          services:
+            probe:
+              image: alpine:3.20
+              args: ["sh","-c","echo p; sleep 120"]
+              expose:
+                - port: 80
+                  as: 80
+                  to: [{ global: true }]
+          profiles:
+            compute:
+              probe:
+                resources:
+                  cpu: { units: 1 }
+                  memory: { size: 1Gi }
+                  storage: [{ size: 5Gi }]
+            placement:
+              akash:
+                pricing:
+                  probe: { denom: uact, amount: 10000 }
+          deployment:
+            probe:
+              akash: { profile: probe, count: 1 }
+          """
+          c = AkashConsoleAPI(os.environ["AKASH_API_KEY"])
+          ours = [p.strip() for p in os.environ.get("AKASH_PROVIDERS","").split(",") if p.strip()]
+          d = c.create_deployment(SDL, deposit=0.5); dseq = str(d.get("dseq") or "")
+          print(f"dseq={dseq}", flush=True)
+          bidders = set()
+          try:
+              for _ in range(12):
+                  time.sleep(8)
+                  for b in c.get_bids(dseq) or []:
+                      p = _extract_provider(b)
+                      if p: bidders.add(p)
+                  print(f"  bidders so far: {len(bidders)}", flush=True)
+          finally:
+              c.close_deployment(dseq); print(f"closed {dseq}", flush=True)
+          print("\n=== RESULT (from CI) ===")
+          for p in ours:
+              print(f"  {p[:16]}…: {'BID' if p in bidders else 'NO BID'}")
+          print(f"  total market bidders: {len(bidders)}")
+          PY
