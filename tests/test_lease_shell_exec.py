@@ -3,6 +3,7 @@
 import base64
 import io
 import json
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1310,20 +1311,57 @@ class TestTokenRefresh:
         exc.__str__ = MagicMock(return_value="websocket closed: token expired")
         assert _is_auth_expiry(exc) is True
 
-    def test_dispatch_frame_code_102_json_exit_code_null_raises(self):
-        """A null exit_code is a MALFORMED frame, not exit 0.
+    def test_dispatch_frame_code_102_null_exit_code_shim_returns_zero(self, caplog):
+        """TEMPORARY SHIM (issue #85): a null exit_code returns 0, with a warning.
 
-        BEHAVIOUR CHANGE: this previously returned 0 (SUCCESS). Adopting the
-        shared akash_lease_core makes it raise, because rc=0 is not a trustworthy
-        success signal and a frame carrying no usable exit code must surface as an
-        error. Note the closed-lease failure mode emits {"exit_code": 0} with the
-        key PRESENT, so a null/keyless frame is a distinct, unexplained condition
-        — exactly the false-success this package exists to prevent.
-        (Unanimous multi-model quorum.)
+        The shared core treats this as malformed. We deliberately preserve the OLD
+        behaviour (return 0) for exactly this shape, because we have NO evidence
+        about what real providers send here — the investigation's data covers only
+        the closed-lease synthetic {"exit_code": 0} (key PRESENT). Shipping strict
+        would bundle an unvalidated breaking change into a codec refactor.
+        Quorum-designed, 3 rounds, unanimous CE-5 convergence.
+
+        Delete this test when the shim goes (see issue #85).
         """
         frame = bytes([102]) + json.dumps({"exit_code": None}).encode()
-        with pytest.raises(RuntimeError, match="malformed result frame"):
-            LeaseShellTransport._dispatch_frame(frame)
+        with caplog.at_level(logging.DEBUG, logger="just_akash.transport.lease_shell"):
+            assert LeaseShellTransport._dispatch_frame(frame) == 0
+        # Distinct label for THIS shape (the survey signal).
+        assert "a null exit_code" in caplog.text
+        assert "issue #85" in caplog.text
+        # Bounded payload sample, at DEBUG (not WARNING — frames can carry output).
+        payload_records = [r for r in caplog.records if "payload sample" in r.message]
+        assert payload_records and payload_records[0].levelno == logging.DEBUG
+
+    def test_dispatch_frame_code_102_missing_exit_code_shim_returns_zero(self, caplog):
+        """TEMPORARY SHIM (issue #85): a MISSING exit_code key returns 0 + warning.
+
+        Same behaviour as the null case (both mean "no trustworthy exit code" —
+        splitting the behaviour without evidence is premature) but a DISTINCT log
+        label, so the survey can tell whether null and missing come from different
+        provider versions. Delete when the shim goes.
+        """
+        frame = bytes([102]) + json.dumps({}).encode()
+        with caplog.at_level(logging.DEBUG, logger="just_akash.transport.lease_shell"):
+            assert LeaseShellTransport._dispatch_frame(frame) == 0
+        assert "no exit_code key" in caplog.text  # distinct from the null label
+        assert "a null exit_code" not in caplog.text
+
+    def test_shim_does_not_widen_to_other_malformed_frames(self):
+        """The shim must fire ONLY for null/missing exit_code — everything else
+        still RAISES. This is the guard that stops a compatibility bridge from
+        silently becoming "return 0 whenever parsing fails"."""
+        still_raises = [
+            (json.dumps({"exit_code": "abc"}).encode(), "non-integer exit_code"),
+            (json.dumps([1]).encode(), "valid JSON but not an object"),
+            (b"\x00\x00\x00\x00\x00", "overlong non-JSON payload"),
+            (b"bad", "unparsable, under 4 bytes"),
+        ]
+        for payload, label in still_raises:
+            with pytest.raises(RuntimeError, match="malformed result frame"):
+                LeaseShellTransport._dispatch_frame(bytes([102]) + payload)
+            # (label is for failure readability only)
+            assert label
 
     def _pump(self, ws):
         buf = io.BytesIO()
