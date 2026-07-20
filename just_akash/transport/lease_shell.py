@@ -88,6 +88,28 @@ def _is_auth_expiry(exc: ConnectionClosedError) -> bool:
 _logger = logging.getLogger(__name__)
 
 
+def _null_or_missing_exit_code(payload: bytes) -> str | None:
+    """Classify a result payload as the null / missing-key shape, else None.
+
+    Supports the temporary compatibility shim in ``_dispatch_frame`` (issue #85):
+    it must fire for EXACTLY the two shapes the old parser returned 0 for, and for
+    nothing else — so a genuinely corrupt frame keeps raising instead of silently
+    becoming a success. Returns a human label for the log, or None when this is not
+    one of the two shapes.
+    """
+    try:
+        parsed = json.loads(payload)
+    except ValueError:
+        return None  # not JSON at all — not our shape, let it raise
+    if not isinstance(parsed, dict):
+        return None  # valid JSON but not a result object — let it raise
+    if "exit_code" not in parsed:
+        return "no exit_code key"
+    if parsed["exit_code"] is None:
+        return "a null exit_code"
+    return None  # key present with a non-null value — a different problem
+
+
 class LeaseShellTransport(Transport):
     """WebSocket-based lease-shell transport via Console Provider-Proxy.
 
@@ -375,20 +397,55 @@ class LeaseShellTransport(Transport):
             # returning 0, because rc=0 is not a trustworthy success signal (see
             # docs/exec-reliability-investigation.md).
             #
-            # BEHAVIOUR CHANGE vs the previous local implementation, both fixes:
-            #   * a frame with a missing or null exit_code used to return 0
-            #     (SUCCESS). It is corruption and now raises — note the closed-lease
-            #     failure mode emits {"exit_code": 0} with the key PRESENT, so a
-            #     keyless frame is a distinct, unexplained condition.
+            # BEHAVIOUR CHANGE vs the previous local implementation:
             #   * b"null" is valid JSON *and* exactly 4 bytes, so it used to fall
-            #     through to the int32 branch and return a bogus 1819047278.
+            #     through to the int32 branch and return a bogus 1819047278. It now
+            #     raises. (Kept — nobody wants a garbage exit code.)
             # Re-raised as RuntimeError to preserve this function's contract.
             try:
                 return _core.parse_result_exit_code(payload)
             except _core.MalformedResultFrame as exc:
-                # Preserve this function's historical message contract
-                # ("malformed result frame: ...") that callers and tests match on.
-                raise RuntimeError(f"malformed result frame: {exc}") from None
+                # TODO(shim): remove once the provider survey is clean — see
+                # https://github.com/Digital-Frontier-LDA/just-akash/issues/85
+                #
+                # COMPATIBILITY SHIM (temporary, telemetry-gated).
+                #
+                # The core treats a null or MISSING exit_code as malformed. The old
+                # local parser returned 0 for both. Strictness is probably right — a
+                # null/absent exit code is genuinely UNKNOWN, and returning 0
+                # conflates "unknown" with "success" (the rc=0 trap). BUT we have no
+                # evidence about what real providers send in these shapes: the
+                # investigation's data covers only the closed-lease synthetic
+                # {"exit_code": 0} (key PRESENT, explicitly 0), which is unaffected
+                # either way. Shipping strict would bundle an unvalidated breaking
+                # change into a codec refactor.
+                #
+                # So: preserve the old behaviour for EXACTLY these two shapes, make
+                # them observable, and let real traffic decide. Every other malformed
+                # shape still raises — the shim must not widen into a blanket
+                # "return 0 on anything we can't parse".
+                #
+                # Quorum-designed (3 rounds, unanimous CE-5 convergence: codex-1,
+                # copilot-1, claude-1). Removal condition in issue #85: zero
+                # occurrences across all active smoke providers over 30 consecutive
+                # days — coverage-based, not a calendar date.
+                shape = _null_or_missing_exit_code(payload)
+                if shape is None:
+                    # Preserve this function's historical message contract
+                    # ("malformed result frame: ...") that callers/tests match on.
+                    raise RuntimeError(f"malformed result frame: {exc}") from None
+                # Same BEHAVIOUR for both shapes (both mean "no trustworthy exit
+                # code"; splitting that without evidence is premature), but DISTINCT
+                # log labels — that distinction is the whole point of the survey.
+                _logger.warning(
+                    "result frame has %s; treating as exit 0 for compatibility "
+                    "(temporary shim, see issue #85). Please report this frame.",
+                    shape,
+                )
+                # Bounded, and at DEBUG so frame contents are not emitted at default
+                # verbosity — this can carry command output.
+                _logger.debug("  result frame payload sample: %r", payload[:128])
+                return 0
         elif code == _FRAME_FAILURE:
             msg = payload.decode("utf-8", errors="replace")
             raise RuntimeError(f"Provider error: {msg}")
