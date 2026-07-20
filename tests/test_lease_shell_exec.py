@@ -413,11 +413,18 @@ class TestFrameDispatch:
         with pytest.raises(RuntimeError, match="not an integer"):
             LeaseShellTransport._dispatch_frame(frame)
 
-    def test_dispatch_frame_code_102_numeric_string_exit_code_coerces(self):
-        """A NUMERIC string exit_code (e.g. "5") still coerces to 5 — the fix only
-        rejects non-numeric values, not lenient numeric coercion."""
+    def test_dispatch_frame_code_102_numeric_string_exit_code_raises(self):
+        """A string exit_code (even a numeric one like "5") is a MALFORMED frame.
+
+        BEHAVIOUR CHANGE: this previously coerced "5" -> 5. Adopting the shared
+        akash_lease_core dropped int() coercion, because coercing silently turns
+        nonsense on the wire into a plausible exit code — a provider emitting a
+        string exit_code is a provider bug that should surface, not be papered
+        over. (Unanimous multi-model quorum.)
+        """
         frame = bytes([102]) + json.dumps({"exit_code": "5"}).encode()
-        assert LeaseShellTransport._dispatch_frame(frame) == 5
+        with pytest.raises(RuntimeError, match="malformed result frame"):
+            LeaseShellTransport._dispatch_frame(frame)
 
     def test_dispatch_frame_code_102_exact_four_byte_int_accepted(self):
         """A non-JSON result frame of EXACTLY 4 bytes is the legacy binary int32 form."""
@@ -1279,31 +1286,20 @@ class TestTokenRefresh:
         exc.__str__ = MagicMock(return_value="websocket closed: token expired")
         assert _is_auth_expiry(exc) is True
 
-    def test_dispatch_frame_code_102_json_exit_code_null_returns_zero(self):
-        """Code 102 with JSON {"exit_code": null} must return 0, not crash.
+    def test_dispatch_frame_code_102_json_exit_code_null_raises(self):
+        """A null exit_code is a MALFORMED frame, not exit 0.
 
-        json.loads produces {"exit_code": None}. The code does
-        int(json.loads(...).get("exit_code", 0)) which means int(None) is called,
-        raising TypeError. The except clause should catch this and fall through
-        to the int32 path or default to 0. This test verifies the implementation
-        handles null exit_code gracefully.
+        BEHAVIOUR CHANGE: this previously returned 0 (SUCCESS). Adopting the
+        shared akash_lease_core makes it raise, because rc=0 is not a trustworthy
+        success signal and a frame carrying no usable exit code must surface as an
+        error. Note the closed-lease failure mode emits {"exit_code": 0} with the
+        key PRESENT, so a null/keyless frame is a distinct, unexplained condition
+        — exactly the false-success this package exists to prevent.
+        (Unanimous multi-model quorum.)
         """
-        payload = json.dumps({"exit_code": None}).encode("utf-8")
-        frame = bytes([102]) + payload
-        result = LeaseShellTransport._dispatch_frame(frame)
-        # null exit_code must be treated as 0
-        assert result == 0
-
-
-class TestColdStdoutRace:
-    """Issue #12 -- the provider-proxy can deliver a stdout frame AFTER the result
-    (exit-code) frame, so returning the instant the exit code lands drops that
-    trailing output (rc=0 with EMPTY stdout, ~5% of execs on some providers).
-
-    _pump_frames must keep draining for a short bounded grace window once the exit
-    code is in hand, so every exec caller -- not just the smoke test -- gets the
-    trailing output, and must surface a flaky-pass marker so the race stays visible.
-    """
+        frame = bytes([102]) + json.dumps({"exit_code": None}).encode()
+        with pytest.raises(RuntimeError, match="malformed result frame"):
+            LeaseShellTransport._dispatch_frame(frame)
 
     def _pump(self, ws):
         buf = io.BytesIO()

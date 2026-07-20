@@ -37,6 +37,7 @@ import time
 import tty
 import urllib.parse
 
+import akash_lease_core as _core
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 from websockets.sync.client import connect
 
@@ -52,12 +53,14 @@ MAX_RECONNECT_ATTEMPTS = 3
 # block forever.
 PROXY_RECV_TIMEOUT = 300.0
 
-_FRAME_STDOUT = 100
-_FRAME_STDERR = 101
-_FRAME_RESULT = 102
-_FRAME_FAILURE = 103
-_FRAME_STDIN = 104
-_FRAME_RESIZE = 105
+# Frame codes come from the shared core so the CLI and the control plane cannot
+# drift. Aliased to the historical private names to keep call sites unchanged.
+_FRAME_STDOUT = _core.STDOUT
+_FRAME_STDERR = _core.STDERR
+_FRAME_RESULT = _core.RESULT
+_FRAME_FAILURE = _core.FAILURE
+_FRAME_STDIN = _core.STDIN
+_FRAME_RESIZE = _core.RESIZE
 
 
 def _is_auth_expiry_message(msg: str) -> bool:
@@ -366,51 +369,26 @@ class LeaseShellTransport(Transport):
             sys.stderr.buffer.write(payload)
             sys.stderr.buffer.flush()
         elif code == 102:
-            # A result frame is EITHER a JSON object {"exit_code": N} OR a raw
-            # 4-byte LE int32 (provider-version dependent). Only a JSON *parse*
-            # failure means "try the int32 form" — a valid JSON object whose
-            # exit_code is not an integer (e.g. {"exit_code": "abc"}) is malformed,
-            # NOT a reason to fall back to int32 (which would return the first 4
-            # bytes of the JSON text as a garbage exit code). Surfaced by quorum
-            # review (opencode-1) on ed7a26a: the old broad except swallowed the
-            # int() ValueError and silently degraded to a garbage exit code.
+            # Result parsing lives in the shared core (akash_lease_core), so the
+            # CLI and the control plane interpret exit codes identically. The core
+            # is deliberately strict: a frame we cannot parse RAISES rather than
+            # returning 0, because rc=0 is not a trustworthy success signal (see
+            # docs/exec-reliability-investigation.md).
+            #
+            # BEHAVIOUR CHANGE vs the previous local implementation, both fixes:
+            #   * a frame with a missing or null exit_code used to return 0
+            #     (SUCCESS). It is corruption and now raises — note the closed-lease
+            #     failure mode emits {"exit_code": 0} with the key PRESENT, so a
+            #     keyless frame is a distinct, unexplained condition.
+            #   * b"null" is valid JSON *and* exactly 4 bytes, so it used to fall
+            #     through to the int32 branch and return a bogus 1819047278.
+            # Re-raised as RuntimeError to preserve this function's contract.
             try:
-                parsed = json.loads(payload)
-            except ValueError:  # JSONDecodeError + UnicodeDecodeError are ValueErrors
-                parsed = None
-            if isinstance(parsed, dict):
-                exit_code = parsed.get("exit_code", 0)
-                if exit_code is None:
-                    return 0
-                try:
-                    return int(exit_code)
-                except (TypeError, ValueError):
-                    raise RuntimeError(
-                        f"malformed result frame: exit_code {exit_code!r} is not an integer"
-                    ) from None
-            if parsed is not None:
-                # Valid JSON but not a result object (a bare list/number/string):
-                # the result frame is malformed, not a silent success.
-                raise RuntimeError(
-                    f"malformed result frame: JSON payload is a {type(parsed).__name__}, "
-                    "expected an object with exit_code"
-                )
-            # Not valid JSON — the legacy binary result form is an EXACT 4-byte LE
-            # int32. A longer non-JSON payload is malformed (e.g. 5 NUL bytes must
-            # not be read as exit 0 via payload[:4]), so only the exact-width binary
-            # form is accepted; anything else surfaces as an error. (Surfaced by
-            # CodeRabbit review: the old `>= 4` reinterpreted the first 4 bytes of a
-            # too-long frame and could return a silent 0.)
-            if len(payload) == 4:
-                return int.from_bytes(payload, "little")
-            # No usable exit code: a corrupt/truncated result frame must surface as
-            # an error, NOT a silent exit 0. rc=0 is not a trustworthy success signal
-            # (see docs/exec-reliability-investigation.md), so an unparsable result
-            # must not be allowed to masquerade as success.
-            raise RuntimeError(
-                f"malformed result frame: {len(payload)} byte(s), could not parse an "
-                'exit code (expected JSON {"exit_code": N} or a 4-byte LE int32)'
-            )
+                return _core.parse_result_exit_code(payload)
+            except _core.MalformedResultFrame as exc:
+                # Preserve this function's historical message contract
+                # ("malformed result frame: ...") that callers and tests match on.
+                raise RuntimeError(f"malformed result frame: {exc}") from None
         elif code == 103:
             msg = payload.decode("utf-8", errors="replace")
             raise RuntimeError(f"Provider error: {msg}")
@@ -485,9 +463,13 @@ class LeaseShellTransport(Transport):
         frame that MUST NOT reach here is a proxy error frame -- _recv_proxy_message
         raises on those first, so silence here can no longer hide a failure.
         """
-        try:
-            return base64.b64decode(data, validate=True)
-        except (ValueError, TypeError):
+        # Strict decode is delegated to the shared core so the CLI and the control
+        # plane cannot drift on it; the logging and the replace-fallback below stay
+        # here because they are CLI presentation concerns, not wire semantics.
+        decoded = _core.decode_proxy_payload(data, text_fallback=False)
+        if decoded is not None:
+            return decoded
+        if True:
             if text_fallback:
                 # Non-base64 on the logs/events path == the provider streamed the
                 # JSON/text content directly; hand it to the formatter verbatim.
