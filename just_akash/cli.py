@@ -441,6 +441,20 @@ def main():
     )
     test_p.add_argument("--ssh", action="store_true", help="Verify SSH connectivity")
 
+    # ── lease-remaining ────────────────────────────────
+    lr_p = subparsers.add_parser(
+        "lease-remaining",
+        help="Estimate how long the escrow lasts at the current burn rate",
+    )
+    lr_p.add_argument("--dseq", default="", help="Deployment DSEQ (auto-selects if omitted)")
+    lr_p.add_argument("--json", action="store_true", help="Output in JSON format")
+    lr_p.add_argument(
+        "--block-time",
+        type=float,
+        default=None,
+        help="Block time in seconds (default: 6.0; env AKASH_BLOCK_TIME_S)",
+    )
+
     # ── validate-sdl ───────────────────────────────────
     validate_p = subparsers.add_parser(
         "validate-sdl",
@@ -1083,6 +1097,41 @@ def main():
         from .test_lifecycle import main as test_main
 
         test_main()
+
+    # ── lease-remaining ────────────────────────────────
+    elif args.command == "lease-remaining":
+        from .api import AkashConsoleAPI, _json_output, compute_lease_runway
+
+        try:
+            client = AkashConsoleAPI(_require_api_key())
+            dseq = _resolve_deployment(client, args.dseq)
+            block_time = (
+                args.block_time
+                if args.block_time is not None
+                else float(os.environ.get("AKASH_BLOCK_TIME_S", "6.0"))
+            )
+            use_json = args.json or not sys.stdout.isatty()
+            runway = compute_lease_runway(client, dseq, block_time_s=block_time)
+            if use_json:
+                print(_json_output(runway))
+            else:
+                esc = runway["escrow"]
+                burn = runway["burn_rate"]
+                usd = f" (≈ ${esc['usd_estimate']})" if esc["usd_estimate"] else ""
+                print(f"Deployment {dseq}:")
+                print(f"  Provider:       {runway['provider']}")
+                print(f"  Escrow:         {esc['display']}{usd}")
+                print(
+                    f"  Burn rate:      {burn['per_block']} {burn['denom']}/block "
+                    f"→ {burn['per_hour']:,.0f} {burn['denom']}/h"
+                )
+                print(
+                    f"  Time remaining: {runway['time_remaining_display']} "
+                    f"({runway['time_remaining_hours']:.1f}h)"
+                )
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
 
     # ── validate-sdl ───────────────────────────────────
     elif args.command == "validate-sdl":
