@@ -839,11 +839,15 @@ def compute_lease_runway(
     """
     from .chain import format_amount, usd_estimate
 
+    if block_time_s <= 0 or block_time_s != block_time_s or block_time_s == float("inf"):
+        raise RuntimeError(f"block_time_s must be positive and finite; got {block_time_s}")
+
     deployment = client.get_deployment(dseq)
 
     # ── escrow remaining ──
     escrow_account = deployment.get("escrow_account") or {}
-    escrow_state = escrow_account.get("state") or {} if isinstance(escrow_account, dict) else {}
+    # Parenthesized so the precedence is unambiguous (Copilot review).
+    escrow_state = (escrow_account.get("state") or {}) if isinstance(escrow_account, dict) else {}
     funds_list = escrow_state.get("funds") or []
     if not isinstance(funds_list, list):
         funds_list = []
@@ -880,6 +884,11 @@ def compute_lease_runway(
         )
 
     # ── runway (escrow and price must be the same denom) ──
+    if price_denom and price_denom not in escrow_by_denom and escrow_by_denom:
+        raise RuntimeError(
+            f"Denom mismatch: escrow has {list(escrow_by_denom)} but the bid price "
+            f"is in {price_denom}. Cannot compute runway without conversion."
+        )
     escrow_amount = escrow_by_denom.get(price_denom or "", 0)
     if price_per_block <= 0:
         raise RuntimeError("Bid price is zero — cannot compute runway.")

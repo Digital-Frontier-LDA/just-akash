@@ -106,3 +106,29 @@ class TestComputeLeaseRunway:
         r = compute_lease_runway(client, "12345")
         assert r["escrow"]["amount"] == 0
         assert r["time_remaining_hours"] == 0.0
+
+    def test_block_time_zero_raises(self):
+        client = MagicMock()
+        client.get_deployment.return_value = _deployment()
+        client.get_bids.return_value = _bids()
+        with pytest.raises(RuntimeError, match="positive and finite"):
+            compute_lease_runway(client, "12345", block_time_s=0.0)
+
+    def test_block_time_negative_raises(self):
+        client = MagicMock()
+        client.get_deployment.return_value = _deployment()
+        client.get_bids.return_value = _bids()
+        with pytest.raises(RuntimeError, match="positive and finite"):
+            compute_lease_runway(client, "12345", block_time_s=-1.0)
+
+    def test_denom_mismatch_raises(self):
+        """Escrow in uakt but bid price in uact → cannot compute, must raise."""
+        client = MagicMock()
+        client.get_deployment.return_value = {
+            "deployment": {"state": "active", "dseq": "12345"},
+            "leases": [{"id": {"provider": "akash1prov"}}],
+            "escrow_account": {"state": {"funds": [{"amount": "1000", "denom": "uakt"}]}},
+        }
+        client.get_bids.return_value = _bids()  # bid price in uact
+        with pytest.raises(RuntimeError, match="Denom mismatch"):
+            compute_lease_runway(client, "12345")

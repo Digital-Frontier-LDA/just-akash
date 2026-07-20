@@ -446,8 +446,8 @@ def main():
         "lease-remaining",
         help="Estimate how long the escrow lasts at the current burn rate",
     )
-    lr_p.add_argument("--dseq", default="")
-    lr_p.add_argument("--json", action="store_true")
+    lr_p.add_argument("--dseq", default="", help="Deployment DSEQ (auto-selects if omitted)")
+    lr_p.add_argument("--json", action="store_true", help="Output in JSON format")
     lr_p.add_argument(
         "--block-time",
         type=float,
@@ -1105,7 +1105,11 @@ def main():
         try:
             client = AkashConsoleAPI(_require_api_key())
             dseq = _resolve_deployment(client, args.dseq)
-            block_time = args.block_time or float(os.environ.get("AKASH_BLOCK_TIME_S", "6.0"))
+            block_time = (
+                args.block_time
+                if args.block_time is not None
+                else float(os.environ.get("AKASH_BLOCK_TIME_S", "6.0"))
+            )
             use_json = args.json or not sys.stdout.isatty()
             runway = compute_lease_runway(client, dseq, block_time_s=block_time)
             if use_json:
