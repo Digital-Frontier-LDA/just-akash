@@ -430,6 +430,30 @@ class TestFrameDispatch:
         """A non-JSON result frame of EXACTLY 4 bytes is the legacy binary int32 form."""
         assert LeaseShellTransport._dispatch_frame(bytes([102]) + (42).to_bytes(4, "little")) == 42
 
+    def test_dispatch_frame_code_102_legacy_int32_is_SIGNED(self):
+        """The legacy 4-byte form decodes as a SIGNED little-endian int32.
+
+        Pins the sign convention against a future akash_lease_core bump silently
+        switching to unsigned, which would turn a -1 exit code into 4294967295 —
+        a nonsense status that would still read as "non-zero, so it failed" and
+        so could drift unnoticed. Only a signed-specific case catches it; the
+        positive example above passes under either interpretation.
+        """
+        assert LeaseShellTransport._dispatch_frame(bytes([102]) + b"\xff\xff\xff\xff") == -1, (
+            "0xFFFFFFFF must decode as -1 (signed), not 4294967295 (unsigned)"
+        )
+        # A high-bit-set value that differs between the two readings.
+        assert (
+            LeaseShellTransport._dispatch_frame(
+                bytes([102]) + (-2).to_bytes(4, "little", signed=True)
+            )
+            == -2
+        )
+        # Positive values are unaffected by the sign convention.
+        assert (
+            LeaseShellTransport._dispatch_frame(bytes([102]) + (255).to_bytes(4, "little")) == 255
+        )
+
     def test_dispatch_frame_code_102_overlong_non_json_payload_raises(self):
         """A non-JSON result frame longer than 4 bytes is malformed, not a silent 0.
         Regression (CodeRabbit): 5 NUL bytes used to read payload[:4] as exit 0."""
