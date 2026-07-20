@@ -15,6 +15,12 @@ dependencies = [
     "websockets>=16.0",
     "pexpect>=4.9.0",
     "pyyaml>=6.0",
+    # Shared sans-I/O core for the lease-shell wire protocol — the same package
+    # the DigitalFrontier control plane consumes, so the frame codec, proxy
+    # envelope and exec result semantics have exactly ONE implementation.
+    # Pinned to a release wheel (not a branch) so the protocol cannot shift
+    # under an installed CLI.
+    "akash-lease-core @ https://github.com/Digital-Frontier-LDA/akash-lease-core/releases/download/v0.2.0/akash_lease_core-0.2.0-py3-none-any.whl#sha256=eda7e7a51284c61941ca64b3c4d429791a5c9248a8b118d3da50b36ffcd2fec0",
 ]
 
 [project.scripts]
@@ -64,6 +70,13 @@ omit = [
 [tool.pyright]
 pythonVersion = "3.10"
 typeCheckingMode = "basic"
+
+[tool.hatch.metadata]
+# akash-lease-core is pinned to a release wheel URL (PEP 508 direct reference).
+# Hatchling rejects direct references in project.dependencies unless this is set
+# — the package is not on PyPI, and pinning a URL is deliberate so the wire
+# protocol cannot shift under an installed CLI.
+allow-direct-references = true
 
 [build-system]
 requires = ["hatchling"]
