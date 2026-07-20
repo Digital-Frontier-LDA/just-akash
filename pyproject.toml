@@ -20,7 +20,7 @@ dependencies = [
     # envelope and exec result semantics have exactly ONE implementation.
     # Pinned to a release wheel (not a branch) so the protocol cannot shift
     # under an installed CLI.
-    "akash-lease-core @ https://github.com/Digital-Frontier-LDA/akash-lease-core/releases/download/v0.2.0/akash_lease_core-0.2.0-py3-none-any.whl",
+    "akash-lease-core @ https://github.com/Digital-Frontier-LDA/akash-lease-core/releases/download/v0.2.0/akash_lease_core-0.2.0-py3-none-any.whl#sha256=eda7e7a51284c61941ca64b3c4d429791a5c9248a8b118d3da50b36ffcd2fec0",
 ]
 
 [project.scripts]

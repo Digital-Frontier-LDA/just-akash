@@ -362,13 +362,13 @@ class LeaseShellTransport(Transport):
             return None
         code = frame[0]
         payload = frame[1:]
-        if code == 100:
+        if code == _FRAME_STDOUT:
             sys.stdout.buffer.write(payload)
             sys.stdout.buffer.flush()
-        elif code == 101:
+        elif code == _FRAME_STDERR:
             sys.stderr.buffer.write(payload)
             sys.stderr.buffer.flush()
-        elif code == 102:
+        elif code == _FRAME_RESULT:
             # Result parsing lives in the shared core (akash_lease_core), so the
             # CLI and the control plane interpret exit codes identically. The core
             # is deliberately strict: a frame we cannot parse RAISES rather than
@@ -389,7 +389,7 @@ class LeaseShellTransport(Transport):
                 # Preserve this function's historical message contract
                 # ("malformed result frame: ...") that callers and tests match on.
                 raise RuntimeError(f"malformed result frame: {exc}") from None
-        elif code == 103:
+        elif code == _FRAME_FAILURE:
             msg = payload.decode("utf-8", errors="replace")
             raise RuntimeError(f"Provider error: {msg}")
         return None
@@ -469,19 +469,18 @@ class LeaseShellTransport(Transport):
         decoded = _core.decode_proxy_payload(data, text_fallback=False)
         if decoded is not None:
             return decoded
-        if True:
-            if text_fallback:
-                # Non-base64 on the logs/events path == the provider streamed the
-                # JSON/text content directly; hand it to the formatter verbatim.
-                return data.encode("utf-8", "replace")
-            # Log only the length, not the payload: an undecodable frame is unexpected
-            # data of unknown provenance, and echoing it into logs risks leaking
-            # whatever it happens to contain. The size is enough to flag the anomaly.
-            _logger.warning(
-                "Discarding an undecodable (non-base64) frame from provider-proxy (%d chars)",
-                len(data),
-            )
-            return None
+        if text_fallback:
+            # Non-base64 on the logs/events path == the provider streamed the
+            # JSON/text content directly; hand it to the formatter verbatim.
+            return data.encode("utf-8", "replace")
+        # Log only the length, not the payload: an undecodable frame is unexpected
+        # data of unknown provenance, and echoing it into logs risks leaking
+        # whatever it happens to contain. The size is enough to flag the anomaly.
+        _logger.warning(
+            "Discarding an undecodable (non-base64) frame from provider-proxy (%d chars)",
+            len(data),
+        )
+        return None
 
     def _recv_proxy_message(
         self, ws, timeout: float = PROXY_RECV_TIMEOUT, *, text_fallback: bool = False
