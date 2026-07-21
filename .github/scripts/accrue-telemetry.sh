@@ -110,6 +110,9 @@ if [ "$BRANCH_EXISTS" = "1" ]; then
   echo "Checked out existing $BRANCH."
 else
   echo "Creating orphan $BRANCH."
+  # A CI runner never has a local branch of this name, but a local re-run might —
+  # --orphan refuses to reuse an existing name, so clear it first.
+  git branch -D "$BRANCH" >/dev/null 2>&1 || true
   git checkout --orphan "$BRANCH"
   git rm -rf . >/dev/null 2>&1 || true
   : > "$DEST"
