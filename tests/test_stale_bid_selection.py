@@ -660,8 +660,14 @@ class TestRedeployProviderDiversification:
         self, MockAPI, mock_time, tmp_path, monkeypatch
     ):
         """The misconfiguration fallback must not quietly become the one place
-        that ignores tier order. Both bidders are de-prioritised, and the BACKUP
-        is cheaper — the PREFERRED one still wins."""
+        that ignores tier order.
+
+        Tier order only decides among providers that ALL just failed, so both
+        bidders have to be de-prioritised for this to mean anything: a stale
+        400 on the PREFERRED bid banks it in `failed_providers` and advances to
+        the BACKUP, whose 404 then carries BOTH into the re-deploy round. The
+        BACKUP is cheaper; the PREFERRED one still wins.
+        """
         monkeypatch.setenv("JUST_AKASH_REDEPLOY_WAIT_S", "10")
         monkeypatch.setenv("JUST_AKASH_REDEPLOY_BACKUP_COURTESY_S", "999")
         client, sdl = _setup(
@@ -670,12 +676,38 @@ class TestRedeployProviderDiversification:
         self._two_orders(client)
         # akash1back is cheaper, but akash1pref is the higher tier.
         client.get_bids.return_value = [_make_bid("akash1pref", 90), _make_bid("akash1back", 5)]
-        # Both fail the first lease, so both end up de-prioritised.
-        client.create_lease.side_effect = [self.NO_ORDER_ERR, {"lease": "ok"}]
+        client.create_lease.side_effect = [
+            self.STALE_ERR,  # akash1pref -> failed_providers
+            self.NO_ORDER_ERR,  # akash1back -> re-deploy, both de-prioritised
+            {"lease": "ok"},
+        ]
 
         result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
 
         assert result["provider"] == "akash1pref"  # tier beats price, as everywhere else
+
+    @patch("just_akash.deploy.time")
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_misconfigured_window_still_prefers_a_provider_that_did_not_fail(
+        self, MockAPI, mock_time, tmp_path, monkeypatch
+    ):
+        """Tier order decides only AMONG failed providers — it must not outrank
+        the soft skip itself. Here only the PREFERRED provider failed, so the
+        fresh BACKUP wins the fallback, exactly as it does on the normal
+        courtesy path (`..._prefers_fresh_backup_over_failed_preferred`)."""
+        monkeypatch.setenv("JUST_AKASH_REDEPLOY_WAIT_S", "10")
+        monkeypatch.setenv("JUST_AKASH_REDEPLOY_BACKUP_COURTESY_S", "999")
+        client, sdl = _setup(
+            MockAPI, mock_time, tmp_path, monkeypatch, providers="akash1pref", backup="akash1back"
+        )
+        self._two_orders(client)
+        # The failed provider is also the CHEAPER one, so price can't explain a pass.
+        client.get_bids.return_value = [_make_bid("akash1pref", 5), _make_bid("akash1back", 90)]
+        client.create_lease.side_effect = [self.NO_ORDER_ERR, {"lease": "ok"}]
+
+        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+
+        assert result["provider"] == "akash1back"  # not-just-failed beats tier AND price
 
     @patch("just_akash.deploy.time")
     @patch("just_akash.deploy.AkashConsoleAPI")

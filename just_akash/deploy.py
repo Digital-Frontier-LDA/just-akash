@@ -1037,7 +1037,14 @@ def deploy(
         # deploy over a misconfigured window — tier-first, as everywhere else.
         if not deprioritize:
             return None
-        return _cheapest_bid(last_first) or _cheapest_bid(last_backup)
+        return (
+            # Same preference order the courtesy branch uses: a provider that
+            # has NOT just failed wins even across a tier drop, and only then
+            # does tier order decide between the ones that did.
+            _cheapest_bid(last_backup, deprioritize)
+            or _cheapest_bid(last_first)
+            or _cheapest_bid(last_backup)
+        )
 
     def _redeploy_and_reselect(
         reason: str = "all bids stale",
