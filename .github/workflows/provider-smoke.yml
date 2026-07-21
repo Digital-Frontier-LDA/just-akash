@@ -93,11 +93,32 @@ jobs:
           SMOKE_BENCHMARK_FILE: ${{ github.workspace }}/smoke-benchmark.jsonl
         run: uv run python -m just_akash.smoke_providers ${{ inputs.all && '--all' || '' }}
 
+      # Snapshot the remaining deploy credit HERE, in the one job that holds the
+      # API key — the accrue job (which renders the Prometheus metrics) deliberately
+      # has no AKASH_API_KEY, so it reads this snapshot instead of the chain.
+      # --min-usd 0 makes --check purely observational (credit can't go negative,
+      # so the exit code is always 0); best-effort because a missing credit sample
+      # must never redden the smoke or block the telemetry pipeline (the accrue
+      # render falls back to the last snapshot persisted on the telemetry branch).
+      # timeout-minutes is load-bearing: the Console JWT mint has no socket
+      # timeout, and this step sits BETWEEN the smoke step and the always()-reap
+      # step — an unbounded hang here would ride into the 70m job backstop, which
+      # cancels the reap and leaks a live probe for ~24h. Budget stays within the
+      # backstop: ~5m setup + 40m smoke + 5m here + 10m reap = 60m < 70m.
+      - name: Snapshot deploy credit
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
+        run: uv run just-akash balance --check --min-usd 0 --json > "${{ github.workspace }}/deploy-credit.json"
+
       # Keep the run's latency/outcome telemetry even when the smoke step fails
       # (a red run's latencies are exactly what we want to inspect). The benchmark
-      # grades ride in the same artifact (second path) so the accrue job downloads
-      # both in one shot; if-no-files-found: ignore covers the default run where the
-      # benchmark sink is unset and no benchmark file is produced.
+      # grades and the deploy-credit snapshot ride in the same artifact so the
+      # accrue job downloads everything in one shot; if-no-files-found: ignore
+      # covers the default run where the benchmark sink is unset and no benchmark
+      # file is produced.
       - name: Upload smoke telemetry
         if: always()
         uses: actions/upload-artifact@v4
@@ -106,6 +127,7 @@ jobs:
           path: |
             ${{ github.workspace }}/smoke-telemetry.jsonl
             ${{ github.workspace }}/smoke-benchmark.jsonl
+            ${{ github.workspace }}/deploy-credit.json
           if-no-files-found: ignore
           retention-days: 90
 
@@ -128,8 +150,9 @@ jobs:
   # accumulates across runs (main is branch-protected; the telemetry branch is
   # not, and keeping data off main keeps its history clean). Isolated from the
   # smoke job so the privileged `contents: write` token never runs alongside the
-  # deploy code. Runs even when the smoke job failed — a red run's latencies are
-  # exactly what we want to keep.
+  # deploy code (the render step below runs only the pure-stdlib exporter — no
+  # network, no API key). Runs even when the smoke job failed — a red run's
+  # latencies are exactly what we want to keep.
   accrue:
     name: Accrue telemetry
     needs: smoke
@@ -151,6 +174,9 @@ jobs:
           # second data file. Optional: a default run (no benchmark sink) produces
           # no such file and the script skips it.
           BENCH_SRC: dl/smoke-benchmark.jsonl
+          # Deploy-credit snapshot from the credentialed smoke job (optional) —
+          # rendered into just_akash_deploy_credit_usd without needing a key here.
+          CREDIT_SRC: dl/deploy-credit.json
           RUN_ID: ${{ github.run_id }}
         run: bash .github/scripts/accrue-telemetry.sh
 
@@ -221,29 +247,9 @@ jobs:
             --quarantine "$SMOKE_QUARANTINE_PROVIDERS" \
             --max-p95 "$SMOKE_LATENCY_SLO_P95"
 
-      # Render the SAME accrued JSONL into Prometheus textfile-collector format so the
-      # natural errors (no-credit / no-bid / lease-down / no-room) and per-feature
-      # latency percentiles become Grafana-trackable. Non-gating and if: always() so it
-      # runs even when the latency gate above fails (a red run's metrics are exactly
-      # what we want to keep). The .prom is uploaded as an artifact for a Prometheus
-      # scrape/pushgateway job to pick up; the deploy-credit gauge (--with-credit) is
-      # deliberately NOT emitted here (this job holds no AKASH_API_KEY — run
-      # `just export-metrics "" out.prom with-credit=1` from a credentialed context).
-      - name: Export Prometheus metrics
-        if: always()
-        run: |
-          if [ ! -f accrued.jsonl ]; then
-            echo "no accrued telemetry to export yet"; exit 0
-          fi
-          python3 -m just_akash.prometheus_exporter accrued.jsonl --output smoke-metrics.prom
-          echo "── rendered $(grep -c '^just_akash' smoke-metrics.prom) metric sample(s) ──"
-          head -40 smoke-metrics.prom
-
-      - name: Upload Prometheus metrics
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: smoke-prometheus-metrics-${{ github.run_id }}
-          path: smoke-metrics.prom
-          if-no-files-found: ignore
-          retention-days: 90
+      # NOTE: the Prometheus rendering that used to live here as an artifact-only
+      # export now happens in the accrue job (accrue-telemetry.sh), which commits
+      # `smoke-metrics.prom` to the telemetry branch every run — including the
+      # benchmark gauges and the deploy-credit snapshot from the credentialed smoke
+      # job. Consumers fetch it straight off the branch (raw URL) instead of digging
+      # through per-run artifacts.

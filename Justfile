@@ -317,9 +317,11 @@ smoke-telemetry-report file="":
     fi
 
 # Render accrued smoke telemetry as Prometheus textfile-collector metrics so
-# no-credit/no-bid/lease-down outcomes + deploy-credit burn-down are Grafana-trackable.
-# With no FILE, pulls the live `telemetry` branch. OUTPUT writes a .prom atomically;
-# with-credit=1 also emits the deploy-credit gauge (needs AKASH_API_KEY).
+# no-credit/no-bid/lease-down outcomes, hardware-benchmark grades, and the
+# deploy-credit burn-down are Grafana-trackable.
+# With no FILE, pulls the live `telemetry` branch (latency + benchmark streams).
+# OUTPUT writes a .prom atomically; with-credit=1 also emits the deploy-credit
+# gauge (needs AKASH_API_KEY).
 #   just export-metrics path.jsonl                    # -> stdout
 #   just export-metrics path.jsonl smoke.prom          # -> file
 #   just export-metrics "" smoke.prom with-credit=1     # accrued CI data + credit gauge
@@ -332,10 +334,14 @@ export-metrics file="" output="" with-credit="":
     if [ -n "{{file}}" ]; then
         uv run just-akash export-metrics "{{file}}" "${args[@]}"
     else
-        tmp="$(mktemp)"
-        trap 'rm -f "$tmp"' EXIT   # clean up on every exit path
+        tmp="$(mktemp)"; bench_tmp="$(mktemp)"
+        trap 'rm -f "$tmp" "$bench_tmp"' EXIT   # clean up on every exit path
         if ! git fetch origin telemetry >/dev/null 2>&1; then echo "no telemetry branch yet"; exit 0; fi
         git show origin/telemetry:smoke-latency.jsonl > "$tmp"
+        # The benchmark stream is optional (older branches predate it).
+        if git show origin/telemetry:smoke-benchmark.jsonl > "$bench_tmp" 2>/dev/null && [ -s "$bench_tmp" ]; then
+            args+=(--benchmark "$bench_tmp")
+        fi
         uv run just-akash export-metrics "$tmp" "${args[@]}"
     fi
 
