@@ -20,6 +20,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
   Deliberately **soft, not a ban**: with n=2 we cannot prove the provider is at fault (versus Console-side order GC/propagation), and the allowlisted market is thin, so if the de-prioritised provider is the only bidder on the fresh order it is still leased — after the same courtesy window BACKUP already gets (`JUST_AKASH_REDEPLOY_BACKUP_COURTESY_S`, 20s), giving another provider a real chance to bid first. And deliberately **scoped to the 404 path**: a `stale` failure belongs to the ORDER's ~5-min bid clock, which every bid shares, so it carries no provider-specific signal — on a new order that provider is as good as any, and skipping it would shrink a thin market for nothing. The operator log names who is being skipped and that it is not a ban. The "not a ban" guarantee holds even under misconfiguration: if `JUST_AKASH_REDEPLOY_BACKUP_COURTESY_S` is set at or above `JUST_AKASH_REDEPLOY_WAIT_S` the courtesy window can never open before the poll gives up, so a de-prioritised bid seen during the wait is leased on the way out rather than silently turned into a hard ban.
 
+## [1.37.0] — 2026-07-21
+
+### Added
+- **`just_akash_smoke_latest_outcome_info{provider,feature,outcome}` — the state view alert rules should gate on.** The cumulative outcome counter answers "how often has this failed" but not "is it failing NOW": at one smoke run per day, a downstream `increase(...[26h]) > 0` alert keeps paging for a full day after a single transient flake the very next run already passed (measured today: onidc `update` FAIL 17:03 → PASS 17:16, warning pinned firing all evening). The exporter now also emits an info-style series carrying each (provider, feature)'s LATEST outcome; when the outcome flips, the old outcome's series disappears from the exposition, so a NoData=OK rule matching only failing outcomes auto-resolves on the next passing run. Rendered against live accrued data: 33 series, onidc `update` correctly reads `pass`.
+
 ## [1.36.0] — 2026-07-21
 
 ### Added

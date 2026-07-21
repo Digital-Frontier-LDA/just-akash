@@ -424,3 +424,44 @@ class TestBenchmarkPoisonRows:
         assert px.run(str(src), output=str(out), benchmark_path=str(bench)) == 0
         body = out.read_text()
         assert px.OUTCOME_METRIC in body  # the primary stream always renders
+
+
+class TestLatestOutcomes:
+    def test_latest_run_wins_per_provider_feature(self):
+        recs = [
+            _rec("p", "update", "FAIL", 9000, ts="2026-07-21T17:03:00+00:00"),
+            _rec("p", "update", "PASS", 30000, ts="2026-07-21T17:16:00+00:00"),
+            _rec("p", "deploy", "NO-BID", None, ts="2026-07-21T17:16:00+00:00"),
+        ]
+        lines = px.render_latest_outcomes(recs)
+        assert f"# TYPE {px.LATEST_OUTCOME_METRIC} gauge" in lines
+        # The 17:16 PASS shadows the 17:03 FAIL — only ONE series per (p, feature),
+        # so a failing-outcome alert auto-resolves on the next passing run.
+        assert (
+            'just_akash_smoke_latest_outcome_info{provider="p",feature="update",'
+            'outcome="pass"} 1' in lines
+        )
+        assert not any('feature="update",outcome="fail"' in ln for ln in lines)
+        assert (
+            'just_akash_smoke_latest_outcome_info{provider="p",feature="deploy",'
+            'outcome="no-bid"} 1' in lines
+        )
+
+    def test_unparseable_ts_falls_back_to_file_order(self):
+        recs = [
+            _rec("p", "exec", "FAIL", 1),  # no ts at all
+            _rec("p", "exec", "PASS", 1),  # later line wins
+        ]
+        lines = [
+            ln for ln in px.render_latest_outcomes(recs) if ln.startswith(px.LATEST_OUTCOME_METRIC)
+        ]
+        assert lines == [
+            'just_akash_smoke_latest_outcome_info{provider="p",feature="exec",outcome="pass"} 1'
+        ]
+
+    def test_empty_records_render_nothing(self):
+        assert px.render_latest_outcomes([]) == []
+
+    def test_included_in_full_document(self):
+        recs = [_rec("p", "deploy", "PASS", 500, ts="2026-07-19T07:00:00+00:00")]
+        assert px.LATEST_OUTCOME_METRIC in px.render_metrics(recs)
