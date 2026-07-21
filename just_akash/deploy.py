@@ -995,9 +995,13 @@ def deploy(
         """
         first_tier = "PREFERRED" if has_allowlist else "ACCEPTED"
         start = time.time()
-        # De-prioritised bids seen on the last poll, kept so the soft-skip stays
-        # soft even if the courtesy window never opens (see the return below).
-        skipped: list = []
+        # Last NON-EMPTY pool seen per tier, kept so the soft skip stays soft
+        # even if the courtesy window never opens (see the return below). Held
+        # per tier so the fallback stays tier-first, and only overwritten when
+        # non-empty so a transient get_bids() failure late in the loop cannot
+        # erase the evidence and re-create the ban it exists to prevent.
+        last_first: list = []
+        last_backup: list = []
         while True:
             elapsed = time.time() - start
             if elapsed >= wait_s:
@@ -1020,15 +1024,20 @@ def deploy(
                 )
             if choice is not None:
                 return choice
-            skipped = first_pool + backup_pool
+            if first_pool:
+                last_first = first_pool
+            if backup_pool:
+                last_backup = backup_pool
             time.sleep(interval_s)
         # The wait expired without the courtesy window ever opening — reachable
         # only when courtesy_s was configured >= wait_s, which would otherwise
         # turn the soft skip into a silent hard ban (and make the "still
         # leasable if nothing else bids" log a lie). De-prioritisation is never
         # a ban, so honour a de-prioritised bid here rather than fail the
-        # deploy over a misconfigured window.
-        return _cheapest_bid(skipped) if deprioritize else None
+        # deploy over a misconfigured window — tier-first, as everywhere else.
+        if not deprioritize:
+            return None
+        return _cheapest_bid(last_first) or _cheapest_bid(last_backup)
 
     def _redeploy_and_reselect(
         reason: str = "all bids stale",

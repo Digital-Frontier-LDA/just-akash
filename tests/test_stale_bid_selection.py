@@ -656,6 +656,61 @@ class TestRedeployProviderDiversification:
 
     @patch("just_akash.deploy.time")
     @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_misconfigured_window_fallback_stays_tier_first(
+        self, MockAPI, mock_time, tmp_path, monkeypatch
+    ):
+        """The misconfiguration fallback must not quietly become the one place
+        that ignores tier order. Both bidders are de-prioritised, and the BACKUP
+        is cheaper — the PREFERRED one still wins."""
+        monkeypatch.setenv("JUST_AKASH_REDEPLOY_WAIT_S", "10")
+        monkeypatch.setenv("JUST_AKASH_REDEPLOY_BACKUP_COURTESY_S", "999")
+        client, sdl = _setup(
+            MockAPI, mock_time, tmp_path, monkeypatch, providers="akash1pref", backup="akash1back"
+        )
+        self._two_orders(client)
+        # akash1back is cheaper, but akash1pref is the higher tier.
+        client.get_bids.return_value = [_make_bid("akash1pref", 90), _make_bid("akash1back", 5)]
+        # Both fail the first lease, so both end up de-prioritised.
+        client.create_lease.side_effect = [self.NO_ORDER_ERR, {"lease": "ok"}]
+
+        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+
+        assert result["provider"] == "akash1pref"  # tier beats price, as everywhere else
+
+    @patch("just_akash.deploy.time")
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_transient_bid_fetch_failure_does_not_erase_the_fallback(
+        self, MockAPI, mock_time, tmp_path, monkeypatch
+    ):
+        """A `get_bids` flap on a late poll must not clear the recorded bids and
+        re-create the ban this fallback exists to prevent — only non-empty polls
+        overwrite what was seen."""
+        monkeypatch.setenv("JUST_AKASH_REDEPLOY_WAIT_S", "10")
+        monkeypatch.setenv("JUST_AKASH_REDEPLOY_BACKUP_COURTESY_S", "999")
+        client, sdl = _setup(MockAPI, mock_time, tmp_path, monkeypatch, providers="akash1a")
+        self._two_orders(client)
+        seen = {"n": 0}
+
+        def _bids(d):
+            if d != "222":
+                return [_make_bid("akash1a", 10)]
+            # Fresh order: bids on the first poll, then the Console flaps for
+            # every remaining poll in the window.
+            seen["n"] += 1
+            if seen["n"] == 1:
+                return [_make_bid("akash1a", 10)]
+            raise RuntimeError("API Error (503): upstream unavailable")
+
+        client.get_bids.side_effect = _bids
+        client.create_lease.side_effect = [self.NO_ORDER_ERR, {"lease": "ok"}]
+
+        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+
+        assert seen["n"] > 1  # the flap really did happen after the good poll
+        assert result["provider"] == "akash1a"
+
+    @patch("just_akash.deploy.time")
+    @patch("just_akash.deploy.AkashConsoleAPI")
     def test_404_redeploy_prefers_fresh_backup_over_failed_preferred(
         self, MockAPI, mock_time, tmp_path, monkeypatch
     ):
