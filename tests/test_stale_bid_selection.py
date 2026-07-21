@@ -562,3 +562,148 @@ class TestLeaseNoOrder404Retry:
             deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
         assert client.create_lease.call_count == 2  # one attempt per order
         assert client.close_deployment.call_count == 2  # both orders torn down
+
+
+class TestRedeployProviderDiversification:
+    """issue #84 — the bounded re-deploy round must not deterministically re-pick
+    the provider that just failed. `_poll_fresh_bid` takes the cheapest bid, so
+    whenever the failed provider is also the cheapest, the retry is guaranteed to
+    reproduce the failure and the one re-deploy round is spent for nothing.
+
+    The correction is SOFT (de-prioritise, not exclude) and scoped to the 404
+    path: a `stale` failure belongs to the order's shared bid clock, not to the
+    provider.
+    """
+
+    NO_ORDER_ERR = RuntimeError("API Error (404): no lease for deployment\n")
+    STALE_ERR = RuntimeError(
+        "API Error (400): Failed to create lease: Cannot create lease: "
+        "The selected bid is no longer open. Please refresh and select an available bid."
+    )
+
+    @staticmethod
+    def _two_orders(client):
+        client.create_deployment.side_effect = [
+            {"dseq": "111", "manifest": "m1"},
+            {"dseq": "222", "manifest": "m2"},
+        ]
+
+    @patch("just_akash.deploy.time")
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_404_redeploy_prefers_a_different_provider(
+        self, MockAPI, mock_time, tmp_path, monkeypatch
+    ):
+        """The regression from run 29765070530: both providers bid on the fresh
+        order and the failed one is CHEAPER, so the pre-fix code re-picked it.
+        The fresh order must lease the other provider instead."""
+        client, sdl = _setup(
+            MockAPI, mock_time, tmp_path, monkeypatch, providers="akash1bad,akash1good"
+        )
+        self._two_orders(client)
+        # akash1bad is cheapest on BOTH orders — it wins initial selection, and
+        # pre-fix it would win the re-selection too.
+        client.get_bids.return_value = [_make_bid("akash1bad", 10), _make_bid("akash1good", 50)]
+        client.create_lease.side_effect = [self.NO_ORDER_ERR, {"lease": "ok"}]
+
+        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+
+        assert result["dseq"] == "222"
+        assert result["provider"] == "akash1good"  # NOT the cheapest — the one that works
+
+    @patch("just_akash.deploy.time")
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_404_redeploy_falls_back_to_the_failed_provider_when_sole_bidder(
+        self, MockAPI, mock_time, tmp_path, monkeypatch
+    ):
+        """De-prioritise, don't ban. With n=2 evidence we can't prove the provider
+        is at fault (versus Console-side order GC), and the allowlisted market is
+        thin — so when it is the ONLY bidder on the fresh order, lease it rather
+        than fail the deploy outright."""
+        client, sdl = _setup(MockAPI, mock_time, tmp_path, monkeypatch, providers="akash1a")
+        self._two_orders(client)
+        client.get_bids.return_value = [_make_bid("akash1a", 10)]
+        client.create_lease.side_effect = [self.NO_ORDER_ERR, {"lease": "ok"}]
+
+        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+
+        assert result["dseq"] == "222"
+        assert result["provider"] == "akash1a"  # leased anyway — soft, not a ban
+
+    @patch("just_akash.deploy.time")
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_404_redeploy_prefers_fresh_backup_over_failed_preferred(
+        self, MockAPI, mock_time, tmp_path, monkeypatch
+    ):
+        """A provider that has not just failed beats one that has, even across a
+        tier drop: the failed PREFERRED provider yields to a working BACKUP."""
+        monkeypatch.setenv("JUST_AKASH_REDEPLOY_BACKUP_COURTESY_S", "0")
+        client, sdl = _setup(
+            MockAPI, mock_time, tmp_path, monkeypatch, providers="akash1pref", backup="akash1back"
+        )
+        self._two_orders(client)
+        client.get_bids.return_value = [_make_bid("akash1pref", 10), _make_bid("akash1back", 50)]
+        client.create_lease.side_effect = [self.NO_ORDER_ERR, {"lease": "ok"}]
+
+        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+
+        assert result["provider"] == "akash1back"
+
+    @patch("just_akash.deploy.time")
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_404_logs_the_deprioritised_provider(
+        self, MockAPI, mock_time, tmp_path, monkeypatch, capsys
+    ):
+        """The operator log names who is being skipped and that it's not a ban —
+        otherwise a re-deploy that changes provider looks arbitrary."""
+        client, sdl = _setup(
+            MockAPI, mock_time, tmp_path, monkeypatch, providers="akash1bad,akash1good"
+        )
+        self._two_orders(client)
+        client.get_bids.return_value = [_make_bid("akash1bad", 10), _make_bid("akash1good", 50)]
+        client.create_lease.side_effect = [self.NO_ORDER_ERR, {"lease": "ok"}]
+
+        deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+        out = capsys.readouterr().out
+        assert "Preferring a provider other than akash1bad" in out
+        assert "still leasable if nothing else bids" in out
+
+    @patch("just_akash.deploy.time")
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_stale_redeploy_does_not_deprioritize(
+        self, MockAPI, mock_time, tmp_path, monkeypatch, capsys
+    ):
+        """The `stale` path must keep re-picking the cheapest bid, including the
+        provider whose bid expired. Bids share the ORDER's ~5-min clock, so
+        expiry carries no provider-specific signal — on a NEW order that provider
+        is as good as any, and skipping it would shrink a thin market for nothing.
+        """
+        client, sdl = _setup(
+            MockAPI, mock_time, tmp_path, monkeypatch, providers="akash1a,akash1b"
+        )
+        self._two_orders(client)
+        expired = {"yet": False}
+
+        def _bids(d):
+            # Fresh order: both bid, akash1a cheapest.
+            if d == "222":
+                return [_make_bid("akash1a", 10), _make_bid("akash1b", 50)]
+            # Original order: open through selection, then every bid expires the
+            # moment the lease is attempted — so the same-order re-fetch finds
+            # nothing and the re-deploy round is the only way forward.
+            state = "closed" if expired["yet"] else "open"
+            return [_make_bid("akash1a", 10, state=state), _make_bid("akash1b", 50, state=state)]
+
+        def _lease(**kwargs):
+            if kwargs["dseq"] == "111":
+                expired["yet"] = True
+                raise self.STALE_ERR
+            return {"lease": "ok"}
+
+        client.get_bids.side_effect = _bids
+        client.create_lease.side_effect = _lease
+
+        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+
+        assert result["dseq"] == "222"
+        assert result["provider"] == "akash1a"  # cheapest, NOT skipped
+        assert "Preferring a provider other than" not in capsys.readouterr().out
