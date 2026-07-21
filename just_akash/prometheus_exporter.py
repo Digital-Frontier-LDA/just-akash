@@ -223,6 +223,25 @@ def render_deploy_credit_gauge(account: str, usd: float | None) -> list[str]:
     return lines
 
 
+def _normalize_grade(record: dict) -> dict:
+    """A benchmark row reduced to what the verdict helpers can safely consume.
+
+    The helpers (:func:`benchmark.resource_fidelity` / :func:`benchmark.stability` /
+    ``_leading_number``) are written for the probe's native ``dict[str, str]``. The
+    accrued JSONL is append-only and unprotected, so a row can carry a type the
+    current writer never emits (a bare JSON number, a list — schema drift or a hand
+    edit). One such row must degrade to "that field is unmeasured", never crash the
+    whole export: numbers are stringified, anything else non-string is dropped.
+    """
+    out: dict = {}
+    for k, v in record.items():
+        if isinstance(v, str):
+            out[k] = v
+        elif _is_number(v):  # excludes bool
+            out[k] = repr(float(v)) if isinstance(v, float) else str(v)
+    return out
+
+
 def _latest_complete_grade_per_provider(records: list[dict]) -> dict[str, dict]:
     """Each provider's most recent COMPLETE benchmark grade.
 
@@ -235,12 +254,11 @@ def _latest_complete_grade_per_provider(records: list[dict]) -> dict[str, dict]:
     latest: dict[str, tuple[float, int, dict]] = {}
     for idx, r in enumerate(records):
         provider = r.get("provider")
-        if not provider or not is_complete(r):
+        if not provider or not isinstance(provider, str) or not is_complete(r):
             continue
         epoch = _parse_ts(r.get("ts")) or 0.0
-        key = str(provider)
-        if key not in latest or (epoch, idx) >= latest[key][:2]:
-            latest[key] = (epoch, idx, r)
+        if provider not in latest or (epoch, idx) >= latest[provider][:2]:
+            latest[provider] = (epoch, idx, r)
     return {p: rec for p, (_, _, rec) in latest.items()}
 
 
@@ -306,24 +324,38 @@ def render_benchmark_metrics(records: list[dict]) -> list[str]:
         if _is_number(value):
             families[metric][1].append((provider, float(value)))  # type: ignore[arg-type]
 
-    for provider, rec in sorted(grades.items()):
-        fidelity = resource_fidelity(rec)
-        stab = stability(rec)
-        _add(BENCH_CPU_EPS_METRIC, provider, _leading_number(rec.get("cpu_eps")))
-        _add(BENCH_CPU_CV_METRIC, provider, stab.get("cpu_cv_pct"))
-        if "unstable" in stab:
-            _add(BENCH_CPU_UNSTABLE_METRIC, provider, int(bool(stab["unstable"])))
-        _add(BENCH_THROTTLED_METRIC, provider, fidelity.get("throttled_during"))
-        _add(BENCH_THROTTLED_USEC_METRIC, provider, fidelity.get("throttled_usec_during"))
-        _add(BENCH_STEAL_METRIC, provider, fidelity.get("steal_pct"))
-        _add(BENCH_PSI_METRIC, provider, fidelity.get("cpu_psi_load"))
-        # under_delivering is only meaningful when at least one honesty input was
-        # measured — resource_fidelity returns bare {under_delivering: False,
-        # reasons: []} even for an empty record, which must read as unmeasured.
-        if any(k in fidelity for k in ("throttled_during", "steal_pct", "cpu_psi_load")):
-            _add(BENCH_UNDER_DELIVERING_METRIC, provider, int(bool(fidelity["under_delivering"])))
-        _add(BENCH_MEM_BW_METRIC, provider, _leading_number(rec.get("mem_bw")))
-        _add(BENCH_LAST_RUN_METRIC, provider, _parse_ts(rec.get("ts")))
+    for provider, raw_rec in sorted(grades.items()):
+        rec = _normalize_grade(raw_rec)
+        try:
+            fidelity = resource_fidelity(rec)
+            stab = stability(rec)
+            _add(BENCH_CPU_EPS_METRIC, provider, _leading_number(rec.get("cpu_eps")))
+            _add(BENCH_CPU_CV_METRIC, provider, stab.get("cpu_cv_pct"))
+            if "unstable" in stab:
+                _add(BENCH_CPU_UNSTABLE_METRIC, provider, int(bool(stab["unstable"])))
+            _add(BENCH_THROTTLED_METRIC, provider, fidelity.get("throttled_during"))
+            _add(BENCH_THROTTLED_USEC_METRIC, provider, fidelity.get("throttled_usec_during"))
+            _add(BENCH_STEAL_METRIC, provider, fidelity.get("steal_pct"))
+            _add(BENCH_PSI_METRIC, provider, fidelity.get("cpu_psi_load"))
+            # under_delivering is only meaningful when at least one honesty input was
+            # measured — resource_fidelity returns bare {under_delivering: False,
+            # reasons: []} even for an empty record, which must read as unmeasured.
+            if any(k in fidelity for k in ("throttled_during", "steal_pct", "cpu_psi_load")):
+                _add(
+                    BENCH_UNDER_DELIVERING_METRIC,
+                    provider,
+                    int(bool(fidelity["under_delivering"])),
+                )
+            _add(BENCH_MEM_BW_METRIC, provider, _leading_number(rec.get("mem_bw")))
+            _add(BENCH_LAST_RUN_METRIC, provider, _parse_ts(rec.get("ts")))
+        except Exception as e:  # noqa: BLE001 — one poisoned row must never kill the export
+            # The accrued file is re-read in FULL every run, so letting one bad row
+            # raise would freeze smoke-metrics.prom permanently (the accrue job only
+            # warns on a render failure). Skip the provider's grade and keep going.
+            print(
+                f"export-metrics: skipping unusable benchmark grade for {provider}: {e}",
+                file=sys.stderr,
+            )
 
     lines: list[str] = []
     for metric, (help_text, samples) in families.items():

@@ -98,10 +98,17 @@ jobs:
       # has no AKASH_API_KEY, so it reads this snapshot instead of the chain.
       # --min-usd 0 makes --check purely observational (credit can't go negative,
       # so the exit code is always 0); best-effort because a missing credit sample
-      # must never redden the smoke or block the telemetry pipeline.
+      # must never redden the smoke or block the telemetry pipeline (the accrue
+      # render falls back to the last snapshot persisted on the telemetry branch).
+      # timeout-minutes is load-bearing: the Console JWT mint has no socket
+      # timeout, and this step sits BETWEEN the smoke step and the always()-reap
+      # step — an unbounded hang here would ride into the 70m job backstop, which
+      # cancels the reap and leaks a live probe for ~24h. Budget stays within the
+      # backstop: ~5m setup + 40m smoke + 5m here + 10m reap = 60m < 70m.
       - name: Snapshot deploy credit
         if: always()
         continue-on-error: true
+        timeout-minutes: 5
         env:
           AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
         run: uv run just-akash balance --check --min-usd 0 --json > "${{ github.workspace }}/deploy-credit.json"

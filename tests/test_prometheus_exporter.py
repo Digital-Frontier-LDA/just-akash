@@ -382,3 +382,45 @@ class TestCreditJson:
         out = capsys.readouterr().out
         assert px.BENCH_CPU_EPS_METRIC in out
         assert 'just_akash_deploy_credit_usd{account="akash1me"} 7.5' in out
+
+
+class TestBenchmarkPoisonRows:
+    """One type-drifted row on the append-only branch must never freeze the export
+    (the accrued file is re-read in FULL every run, so a raising row would poison
+    every future render, not just one)."""
+
+    def test_numeric_and_list_fields_degrade_to_unmeasured(self, capsys):
+        poisoned = _bench(
+            "prov1",
+            cpu_eps=900.5,  # JSON number, not the writer's string
+            cpu_samples=[781.2, 793.8],  # JSON array
+            cpu_psi_load={"avg10": 15.63},  # even a dict must not raise
+        )
+        lines = px.render_benchmark_metrics([poisoned])
+        # Stringified number is salvaged; un-stringifiable fields read unmeasured.
+        assert 'just_akash_bench_cpu_events_per_s{provider="prov1"} 900.5' in lines
+        assert not any(px.BENCH_CPU_CV_METRIC in ln for ln in lines)
+        assert not any(px.BENCH_PSI_METRIC in ln for ln in lines)
+        # The honest string fields still render.
+        assert 'just_akash_bench_steal_pct{provider="prov1"} 0' in lines
+
+    def test_poisoned_provider_never_hides_a_healthy_one(self):
+        healthy = _bench("prov-ok")
+        poisoned = {"provider": "prov-bad", "done": "1", "ts": 12345, "cpu_eps": ["x"]}
+        lines = px.render_benchmark_metrics([poisoned, healthy])
+        assert 'just_akash_bench_cpu_events_per_s{provider="prov-ok"} 787.79' in lines
+
+    def test_full_render_survives_a_poisoned_jsonl(self, tmp_path):
+        src = tmp_path / "t.jsonl"
+        src.write_text(json.dumps(_rec("p", "deploy", "PASS", 10)) + "\n")
+        bench = tmp_path / "b.jsonl"
+        bench.write_text(
+            json.dumps(_bench("p", cpu_eps=900.5, cpu_samples=[1, 2]))
+            + "\n"
+            + json.dumps({"provider": 42, "done": "1"})  # non-string provider: skipped
+            + "\n"
+        )
+        out = tmp_path / "smoke.prom"
+        assert px.run(str(src), output=str(out), benchmark_path=str(bench)) == 0
+        body = out.read_text()
+        assert px.OUTCOME_METRIC in body  # the primary stream always renders
