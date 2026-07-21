@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.35.0] — 2026-07-21
+
+### Added
+- **The Grafana last mile — the rendered metrics now ship to a fetchable URL, with the benchmark grades and the credit gauge on board.** 1.34.0 rendered the smoke telemetry into Prometheus format but the `.prom` died as a per-run CI artifact: nothing could scrape it, the hardware-benchmark stream wasn't rendered at all, and the deploy-credit gauge never ran in CI (the report job rightly holds no API key). Three changes close all three gaps. (1) `export-metrics --benchmark smoke-benchmark.jsonl` renders `just_akash_bench_*{provider}` gauges — delivered CPU rate, stability CV + the UNSTABLE verdict, throttle/steal/PSI + the UNDER-DELIVERING verdict, memory bandwidth — from each provider's **latest complete** grade, derived through the SAME `benchmark.resource_fidelity`/`stability` logic as the CLI report so dashboard and report can never disagree; absent inputs stay absent, never zero. (2) `export-metrics --credit-json FILE` reads a `balance --check --json` snapshot, so the credentialed smoke job snapshots the credit once and the unprivileged render step emits `just_akash_deploy_credit_usd` without ever holding the key (`--with-credit` still does the live query). (3) The accrue job now re-renders **`smoke-metrics.prom` onto the `telemetry` branch every run** — data and metrics land in the same commit, and any Prometheus can ingest the fleet's smoke health by fetching one stable raw URL (the DePIN-LiveAutobidder `price_server` splices it into its `/metrics`; Grafana dashboards + alert rules live in that repo). Rendered against the live accrued data: 234 samples, including onidc's CV 15.7% UNSTABLE flag and the under-delivering verdicts — and hetzner's conspicuous *absence* of grades (its probes aren't reaching the benchmark stage), which is exactly the kind of signal this exists to surface.
+
 ## [1.34.0] — 2026-07-19
 
 ### Added

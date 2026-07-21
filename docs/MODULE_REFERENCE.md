@@ -121,6 +121,20 @@ latency percentiles (p50/p95/p99). LEASE-DOWN is excluded from the pass/fail den
 `latency_breaches` is **the only gate**. `parse_thresholds` is strict (rejects
 non-numeric / ≤0 — a bad ceiling would silently disable the gate).
 
+## `prometheus_exporter.py` — Grafana-facing metrics render
+
+Renders the accrued telemetry into Prometheus **textfile-collector** format (pure
+stdlib, no server): `just_akash_smoke_outcome_total{provider,feature,outcome}`,
+`just_akash_smoke_latency_ms` (p50/p95/p99 over PASS, same `_percentile` as the SLO
+gate), `just_akash_smoke_last_run_timestamp`, `just_akash_deploy_credit_usd{account}`
+(`--with-credit` live, or `--credit-json` from a `balance --check --json` snapshot so
+an uncredentialed CI job can render it), and — with `--benchmark` —
+`just_akash_bench_*{provider}` gauges from each provider's **latest complete** grade,
+derived through `benchmark.resource_fidelity`/`stability` so the dashboard and the CLI
+report can never disagree. Absent inputs stay absent (never zero). The CI accrue job
+re-renders `smoke-metrics.prom` onto the `telemetry` branch every run; consumers fetch
+it by raw URL.
+
 ## `benchmark.py` — hardware honesty probe
 
 `BENCH_SH` (POSIX sh, bounded under 1 vCPU/1Gi) → `parse_results` (`BENCH-k=v`);
