@@ -124,6 +124,19 @@ def _classify_bid(provider: str | None, preferred: list[str], backup: list[str])
     return "FOREIGN"
 
 
+def _cheapest_bid(pool: list, exclude: frozenset[str] = frozenset()):
+    """Cheapest bid in ``pool`` whose provider is named and not in ``exclude``.
+
+    Returns None when nothing qualifies, so a caller can widen the pool (retry
+    with a smaller ``exclude``) rather than lease a bid it meant to skip. Bids
+    with no provider are never returned — the caller could not lease them.
+    """
+    eligible = [b for b in pool if (p := _extract_provider(b)) and p not in exclude]
+    if not eligible:
+        return None
+    return min(eligible, key=lambda b: _extract_bid_price(b)[0])
+
+
 def _log_bid_table(
     bids: list,
     label: str,
@@ -947,47 +960,105 @@ def deploy(
     def _next_open_bid(fresh: list, exclude: set[str]):
         tiers = ["PREFERRED", "BACKUP"] if has_allowlist else ["ACCEPTED"]
         for tier in tiers:
-            pool = [
-                b
-                for b in _filter_tier(fresh, tier)
-                if _extract_provider(b) and _extract_provider(b) not in exclude
-            ]
-            if pool:
-                return min(pool, key=lambda b: _extract_bid_price(b)[0])
+            choice = _cheapest_bid(_filter_tier(fresh, tier), frozenset(exclude))
+            if choice is not None:
+                return choice
         return None
 
-    def _poll_fresh_bid(order_dseq: str, wait_s: float, courtesy_s: float, interval_s: float):
+    def _poll_fresh_bid(
+        order_dseq: str,
+        wait_s: float,
+        courtesy_s: float,
+        interval_s: float,
+        deprioritize: frozenset[str] = frozenset(),
+    ):
         """Poll a freshly re-created order for the cheapest OPEN bid, tier-first.
 
         Preferred (or ACCEPTED when no allowlist) wins immediately; BACKUP is
         accepted only after ``courtesy_s``. Returns the bid dict, or None if
         nothing eligible appears within ``wait_s``. Reuses ``_filter_tier`` so
         only open bids are ever considered.
+
+        ``deprioritize`` holds providers that already failed to lease THIS
+        workload (issue #84). They are soft-skipped, never banned: without it
+        the re-created order deterministically re-picks the cheapest bid, so
+        when the provider that just failed is also the cheapest, the single
+        bounded re-deploy round is guaranteed to reproduce the failure. A hard
+        exclusion would over-correct — with n=2 we cannot prove the provider is
+        at fault (versus Console-side order GC/propagation), and the allowlisted
+        market is thin — so a de-prioritised provider is still leased if nothing
+        else bids, after the same ``courtesy_s`` head start BACKUP already gets.
+
+        Preference order: fresh preferred > fresh backup > failed preferred >
+        failed backup. A provider that has NOT just failed always wins, tier
+        order intact.
         """
         first_tier = "PREFERRED" if has_allowlist else "ACCEPTED"
         start = time.time()
-        while time.time() - start < wait_s:
+        # Last NON-EMPTY pool seen per tier, kept so the soft skip stays soft
+        # even if the courtesy window never opens (see the return below). Held
+        # per tier so the fallback stays tier-first, and only overwritten when
+        # non-empty so a transient get_bids() failure late in the loop cannot
+        # erase the evidence and re-create the ban it exists to prevent.
+        last_first: list = []
+        last_backup: list = []
+        while True:
+            elapsed = time.time() - start
+            if elapsed >= wait_s:
+                break
             try:
                 current = client.get_bids(str(order_dseq))
             except RuntimeError:
                 current = []
-            pool = _filter_tier(current, first_tier)
-            if pool:
-                return min(pool, key=lambda b: _extract_bid_price(b)[0])
-            if has_allowlist and time.time() - start >= courtesy_s:
-                backup_pool = _filter_tier(current, "BACKUP")
-                if backup_pool:
-                    return min(backup_pool, key=lambda b: _extract_bid_price(b)[0])
+            first_pool = _filter_tier(current, first_tier)
+            backup_pool = _filter_tier(current, "BACKUP") if has_allowlist else []
+            choice = _cheapest_bid(first_pool, deprioritize)
+            if choice is None and elapsed >= courtesy_s:
+                choice = (
+                    _cheapest_bid(backup_pool, deprioritize)
+                    # Only de-prioritised bids are on offer: the courtesy window
+                    # gave a different provider its chance and none came, so take
+                    # one rather than fail the deploy outright.
+                    or _cheapest_bid(first_pool)
+                    or _cheapest_bid(backup_pool)
+                )
+            if choice is not None:
+                return choice
+            if first_pool:
+                last_first = first_pool
+            if backup_pool:
+                last_backup = backup_pool
             time.sleep(interval_s)
-        return None
+        # The wait expired without the courtesy window ever opening — reachable
+        # only when courtesy_s was configured >= wait_s, which would otherwise
+        # turn the soft skip into a silent hard ban (and make the "still
+        # leasable if nothing else bids" log a lie). De-prioritisation is never
+        # a ban, so honour a de-prioritised bid here rather than fail the
+        # deploy over a misconfigured window — tier-first, as everywhere else.
+        if not deprioritize:
+            return None
+        return (
+            # Same preference order the courtesy branch uses: a provider that
+            # has NOT just failed wins even across a tier drop, and only then
+            # does tier order decide between the ones that did.
+            _cheapest_bid(last_backup, deprioritize)
+            or _cheapest_bid(last_first)
+            or _cheapest_bid(last_backup)
+        )
 
-    def _redeploy_and_reselect(reason: str = "all bids stale") -> tuple[str, str, str, float, str]:
+    def _redeploy_and_reselect(
+        reason: str = "all bids stale",
+        deprioritize: frozenset[str] = frozenset(),
+    ) -> tuple[str, str, str, float, str]:
         """Close the stale/gone order and create a fresh one (issue #19), then select
         a fresh open bid on it.
 
         ``reason`` is the cause of the re-deploy (e.g. "all bids stale" for the
         issue-#14 path, or "order un-leaseable (404)" for the lease-CREATE 404) so
         the operator log names the actual failure mode, not a generic "stale".
+
+        ``deprioritize`` names providers that already failed to lease this
+        workload, so the fresh order prefers a different one (issue #84).
 
         Returns ``(dseq, manifest, provider, price_amount, price_denom)`` for the
         re-created order. Raises RuntimeError with an accurate cause if the round
@@ -1040,7 +1111,14 @@ def deploy(
             f"  Re-deployed: new order DSEQ={new_dseq} — fast-polling for fresh bids...",
         )
         wait_s, courtesy_s, interval_s = _redeploy_poll_window()
-        fresh = _poll_fresh_bid(str(new_dseq), wait_s, courtesy_s, interval_s)
+        if deprioritize:
+            _log(
+                logging.INFO,
+                "  Preferring a provider other than "
+                f"{', '.join(sorted(deprioritize))} on the fresh order "
+                f"(still leasable if nothing else bids within {courtesy_s:g}s)",
+            )
+        fresh = _poll_fresh_bid(str(new_dseq), wait_s, courtesy_s, interval_s, deprioritize)
         fresh_provider = _extract_provider(fresh) if fresh is not None else None
         if fresh is None or not fresh_provider:
             try:
@@ -1142,12 +1220,26 @@ def deploy(
                 # 404). Either way: close it, re-create once, lease a fresh bid.
                 redeployed = True
                 attempt = 0
+                # issue #84: carry the provider that just failed into the fresh
+                # order's bid selection, but ONLY on the 404 path. A `stale`
+                # failure is the ORDER's ~5-min bid clock, which every bid
+                # shares — it says nothing about the provider, and re-excluding
+                # it on a NEW order would needlessly shrink an already-thin
+                # allowlisted market. A 404 does carry provider-shaped signal,
+                # so the fresh order prefers someone else (soft, not a ban —
+                # see _poll_fresh_bid). Computed before the clear() below.
+                deprioritize = (
+                    frozenset(p for p in (failed_providers | {provider}) if p)
+                    if no_order
+                    else frozenset()
+                )
                 failed_providers.clear()
                 try:
                     dseq, manifest, provider, price_amount, price_denom = _redeploy_and_reselect(
                         reason="order un-leaseable (404 'no lease for deployment')"
                         if no_order
-                        else "all bids stale"
+                        else "all bids stale",
+                        deprioritize=deprioritize,
                     )
                 except RuntimeError as redeploy_err:
                     emit(
