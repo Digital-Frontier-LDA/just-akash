@@ -995,18 +995,21 @@ def deploy(
         """
         first_tier = "PREFERRED" if has_allowlist else "ACCEPTED"
         start = time.time()
+        # De-prioritised bids seen on the last poll, kept so the soft-skip stays
+        # soft even if the courtesy window never opens (see the return below).
+        skipped: list = []
         while True:
             elapsed = time.time() - start
             if elapsed >= wait_s:
-                return None
+                break
             try:
                 current = client.get_bids(str(order_dseq))
             except RuntimeError:
                 current = []
             first_pool = _filter_tier(current, first_tier)
+            backup_pool = _filter_tier(current, "BACKUP") if has_allowlist else []
             choice = _cheapest_bid(first_pool, deprioritize)
             if choice is None and elapsed >= courtesy_s:
-                backup_pool = _filter_tier(current, "BACKUP") if has_allowlist else []
                 choice = (
                     _cheapest_bid(backup_pool, deprioritize)
                     # Only de-prioritised bids are on offer: the courtesy window
@@ -1017,7 +1020,15 @@ def deploy(
                 )
             if choice is not None:
                 return choice
+            skipped = first_pool + backup_pool
             time.sleep(interval_s)
+        # The wait expired without the courtesy window ever opening — reachable
+        # only when courtesy_s was configured >= wait_s, which would otherwise
+        # turn the soft skip into a silent hard ban (and make the "still
+        # leasable if nothing else bids" log a lie). De-prioritisation is never
+        # a ban, so honour a de-prioritised bid here rather than fail the
+        # deploy over a misconfigured window.
+        return _cheapest_bid(skipped) if deprioritize else None
 
     def _redeploy_and_reselect(
         reason: str = "all bids stale",

@@ -631,6 +631,31 @@ class TestRedeployProviderDiversification:
 
     @patch("just_akash.deploy.time")
     @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_soft_skip_survives_a_courtesy_window_longer_than_the_wait(
+        self, MockAPI, mock_time, tmp_path, monkeypatch
+    ):
+        """Misconfiguration must not silently promote the soft skip to a hard ban.
+
+        The fallback branch is gated on `elapsed >= courtesy_s`, but the poll
+        loop gives up at `elapsed >= wait_s` — so with courtesy >= wait the
+        fallback could never fire, and a sole de-prioritised bidder would fail
+        the deploy even though a leasable bid was sitting right there (and the
+        'still leasable if nothing else bids' log would be a lie).
+        """
+        monkeypatch.setenv("JUST_AKASH_REDEPLOY_WAIT_S", "10")
+        monkeypatch.setenv("JUST_AKASH_REDEPLOY_BACKUP_COURTESY_S", "999")
+        client, sdl = _setup(MockAPI, mock_time, tmp_path, monkeypatch, providers="akash1a")
+        self._two_orders(client)
+        client.get_bids.return_value = [_make_bid("akash1a", 10)]
+        client.create_lease.side_effect = [self.NO_ORDER_ERR, {"lease": "ok"}]
+
+        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+
+        assert result["dseq"] == "222"
+        assert result["provider"] == "akash1a"  # leased, not banned by a bad window
+
+    @patch("just_akash.deploy.time")
+    @patch("just_akash.deploy.AkashConsoleAPI")
     def test_404_redeploy_prefers_fresh_backup_over_failed_preferred(
         self, MockAPI, mock_time, tmp_path, monkeypatch
     ):
