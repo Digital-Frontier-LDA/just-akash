@@ -25,6 +25,7 @@ import argparse
 import json
 import math
 import sys
+from datetime import datetime, timezone
 
 # Feature -> the configured cap (ms) it is bounded by, so the report can flag a
 # cap that is getting tight relative to observed p99. Imported lazily to avoid a
@@ -42,6 +43,12 @@ except Exception:  # noqa: BLE001 — analysis must work standalone
 
 DEFAULT_SLO = 0.95  # success-rate floor for --check
 _CAP_TIGHT_FRACTION = 0.7  # flag p99 within this fraction of the cap
+
+# issue #85 shim survey. Records below this version predate the `exit_code_shapes`
+# instrumentation: their silence means "not measured", not "clean", so they can
+# never count toward the streak. Bump ONLY if the instrumentation itself changes.
+SHIM_SURVEY_MIN_VERSION = "1.37.0"
+SHIM_REQUIRED_CLEAN_DAYS = 30  # the removal condition agreed in issue #85
 
 
 def load_records(path: str) -> list[dict]:
@@ -257,6 +264,129 @@ def latency_breaches(
     return out
 
 
+def _parse_ts(ts: object) -> float | None:
+    """A telemetry ``ts`` as unix epoch seconds, or None if unparsable.
+
+    Defined here rather than imported from ``prometheus_exporter`` because that
+    module imports THIS one — the reverse import would be a cycle.
+    """
+    if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+        return float(ts)
+    if not isinstance(ts, str):
+        return None
+    s = ts.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s).timestamp()
+    except ValueError:
+        return None
+
+
+def shim_survey(records: list[dict], required_days: int = SHIM_REQUIRED_CLEAN_DAYS) -> dict:
+    """Evidence for the issue-#85 removal condition: zero null/missing ``exit_code``
+    occurrences across all active providers over ``required_days`` consecutive days.
+
+    Only records at or above :data:`SHIM_SURVEY_MIN_VERSION` are evidence. Older rows
+    predate the instrumentation, so their silence means "not measured", not "clean" —
+    counting them would let the streak start in the past and retire the shim on
+    evidence that was never collected. That distinction is the whole survey.
+
+    Returns ``{eligible, occurrences, providers, provider_hits, first_ts, last_ts,
+    last_hit_ts, clean_days, required_days, clean}``. ``clean`` is the verdict: the
+    condition holds and the shim can go.
+    """
+    floor = _version_key(SHIM_SURVEY_MIN_VERSION)
+    eligible = [r for r in records if _version_key(r.get("version")) >= floor]
+    stamps = [t for t in (_parse_ts(r.get("ts")) for r in eligible) if t is not None]
+    provider_hits: dict[str, int] = {}
+    hit_stamps: list[float] = []
+    for r in eligible:
+        # A list of shapes; absent/empty means the shim never fired for that probe.
+        if not r.get("exit_code_shapes"):
+            continue
+        provider_hits[str(r.get("provider") or "?")] = (
+            provider_hits.get(str(r.get("provider") or "?"), 0) + 1
+        )
+        ts = _parse_ts(r.get("ts"))
+        if ts is not None:
+            hit_stamps.append(ts)
+
+    last_hit = max(hit_stamps) if hit_stamps else None
+    last_ts = max(stamps) if stamps else None
+    first_ts = min(stamps) if stamps else None
+    # Clean days run from the last occurrence — or from the first instrumented
+    # record when there has never been one. Measured against the newest record
+    # rather than "now" so the verdict is a property of the DATA, reproducible
+    # whenever it is re-run.
+    since = last_hit if last_hit is not None else first_ts
+    clean_days = 0.0
+    if since is not None and last_ts is not None:
+        clean_days = max(0.0, (last_ts - since) / 86400.0)
+    return {
+        "eligible": len(eligible),
+        "occurrences": sum(provider_hits.values()),
+        "providers": sorted({str(r.get("provider")) for r in eligible if r.get("provider")}),
+        "provider_hits": provider_hits,
+        "first_ts": first_ts,
+        "last_ts": last_ts,
+        "last_hit_ts": last_hit,
+        "clean_days": clean_days,
+        "required_days": required_days,
+        "clean": not provider_hits and clean_days >= required_days,
+    }
+
+
+def _fmt_day(ts: float | None) -> str:
+    if ts is None:
+        return "?"
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def format_shim_survey(survey: dict) -> str:
+    """Human report for :func:`shim_survey` — the answer to 'can the shim go yet?'."""
+    lines = [
+        f"SHIM SURVEY (issue #85) — null/missing exit_code, "
+        f"instrumented records only (>= v{SHIM_SURVEY_MIN_VERSION})",
+    ]
+    if not survey["eligible"]:
+        lines.append(
+            f"  no instrumented records yet — the survey starts once a smoke run on "
+            f"v{SHIM_SURVEY_MIN_VERSION}+ lands. VERDICT: KEEP THE SHIM."
+        )
+        return "\n".join(lines)
+    lines.append(
+        f"  {survey['eligible']} record(s) from {_fmt_day(survey['first_ts'])} "
+        f"to {_fmt_day(survey['last_ts'])}, "
+        f"{len(survey['providers'])} provider(s): {', '.join(survey['providers']) or '-'}"
+    )
+    if survey["provider_hits"]:
+        lines.append(f"  occurrences: {survey['occurrences']}  (shim is LOAD-BEARING)")
+        for provider, n in sorted(survey["provider_hits"].items(), key=lambda kv: -kv[1]):
+            lines.append(f"    {provider}: {n}")
+        lines.append(f"  most recent: {_fmt_day(survey['last_hit_ts'])}")
+        lines.append(
+            "  VERDICT: KEEP THE SHIM — real providers still send these frames. "
+            "This is the evidence issue #85 wanted; decide the right semantics, "
+            "do not just delete it."
+        )
+        return "\n".join(lines)
+    lines.append(f"  occurrences: 0 over {survey['clean_days']:.1f} clean day(s)")
+    if survey["clean"]:
+        lines.append(
+            f"  VERDICT: REMOVABLE — {survey['required_days']} consecutive clean days met. "
+            "Confirm the provider list above covers the active smoke inventory, then "
+            "follow the removal steps in issue #85."
+        )
+    else:
+        remaining = survey["required_days"] - survey["clean_days"]
+        lines.append(
+            f"  VERDICT: NOT YET — {remaining:.1f} more clean day(s) needed "
+            f"({survey['required_days']} required)."
+        )
+    return "\n".join(lines)
+
+
 def _version_key(v: object) -> tuple[int, ...]:
     """Sortable key for a semver-ish string. Unparseable/missing sorts LOWEST so an
     unversioned legacy record is dropped by any --min-version floor rather than
@@ -299,6 +429,14 @@ def main(argv: list[str] | None = None) -> int:
         "job). They are still measured and printed, just never fail the check.",
     )
     ap.add_argument(
+        "--shim-survey",
+        action="store_true",
+        help="Report the issue-#85 compatibility-shim survey (null/missing exit_code "
+        "occurrences per provider, and whether the 30-consecutive-clean-day removal "
+        "condition is met) instead of the latency report. Never gates: the verdict is "
+        "advice to a human, and removing the shim is a deliberate breaking change.",
+    )
+    ap.add_argument(
         "--min-samples", type=int, default=20, help="Min samples before --check judges"
     )
     ap.add_argument("--slo", type=float, default=DEFAULT_SLO, help="Success-rate floor (0-1)")
@@ -331,6 +469,13 @@ def main(argv: list[str] | None = None) -> int:
         if not records:
             print("No records at or above that version yet.")
             return 0
+
+    if args.shim_survey:
+        # Deliberately BEFORE the version filter: the survey applies its own
+        # instrumentation floor, and a --min-version below it would silently
+        # readmit records that never carried the field.
+        print(format_shim_survey(shim_survey(records)))
+        return 0
 
     quarantined = {p.strip() for p in args.quarantine.split(",") if p.strip()}
     if quarantined:

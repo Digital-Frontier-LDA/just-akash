@@ -372,6 +372,7 @@ def _provider_records(
     latencies: dict,
     diagnostics: dict | None = None,
     frame_shape: str | None = None,
+    exit_code_shapes: set[str] | None = None,
 ) -> list[dict]:
     """One telemetry record per feature: outcome + how long it took (ms).
 
@@ -393,6 +394,16 @@ def _provider_records(
             # frame_shape rides on the exec record for EVERY exec (pass or fail) so the
             # DROP-vs-drained-reorder rate is quantifiable over time (issue #3438).
             **({"frame_shape": frame_shape} if feat == "exec" and frame_shape else {}),
+            # issue #85 survey: the null/missing-exit_code shapes the shim reported
+            # anywhere in this probe. Recorded ONLY when the shim actually fired, so
+            # the field's absence is the clean signal the 30-day streak counts — a
+            # present-but-empty field would be indistinguishable from "not measured"
+            # in the historical records written before this existed.
+            **(
+                {"exit_code_shapes": sorted(exit_code_shapes)}
+                if feat == "exec" and exit_code_shapes
+                else {}
+            ),
             # diag is failure evidence — attach it only to a failing outcome (FAIL or
             # LEASE-DOWN), so a PASS/skip can never carry a stale/partial diag payload.
             **(
@@ -1109,6 +1120,11 @@ def _check_status(dseq: str) -> bool:
 # reorder over time without mining CI logs).
 _EXEC_FRAME_SHAPES: dict[str, str] = {}
 
+# dseq -> the null/missing-exit_code shapes the issue-#85 shim reported during this
+# run, across every exec (not just the `exec` check). Absent means the shim never
+# fired, which is the outcome the removal condition is waiting to see hold.
+_EXEC_EXIT_CODE_SHAPES: dict[str, set[str]] = {}
+
 
 def _frame_trace_line(stderr: str) -> str | None:
     """The transport's one-line FRAME-TRACE from captured stderr, if present.
@@ -1121,6 +1137,44 @@ def _frame_trace_line(stderr: str) -> str | None:
         if line.lstrip().startswith("[lease-shell] FRAME-TRACE"):
             return line.strip()
     return None
+
+
+def _exit_code_shapes(stderr: str) -> set[str]:
+    """Null/missing-``exit_code`` shapes reported by the issue-#85 compatibility
+    shim, parsed from a command's captured stderr.
+
+    Reads the structured ``akash-diag`` event (``EXEC_EXIT_CODE_UNKNOWN``) rather
+    than the human warning beside it: the shim's removal condition is a COUNT per
+    provider over time, and a prose log line cannot be counted. Unparseable or
+    unrelated stderr yields an empty set — this must never raise into a check.
+    """
+    shapes: set[str] = set()
+    for line in (stderr or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{") or Code.EXEC_EXIT_CODE_UNKNOWN not in line:
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict) or event.get("code") != Code.EXEC_EXIT_CODE_UNKNOWN:
+            continue
+        shape = (event.get("context") or {}).get("shape")
+        if isinstance(shape, str) and shape:
+            shapes.add(shape)
+    return shapes
+
+
+def _note_exit_code_shapes(dseq: str, stderr: str) -> None:
+    """Accumulate shim occurrences seen on ANY exec for ``dseq``.
+
+    Every exec the smoke runs is a survey sample, not just the ``exec`` check —
+    under-counting here would let the 30-day clean streak run out on partial
+    evidence and retire the shim early.
+    """
+    shapes = _exit_code_shapes(stderr)
+    if shapes:
+        _EXEC_EXIT_CODE_SHAPES.setdefault(dseq, set()).update(shapes)
 
 
 def _frame_shape(trace_line: str | None) -> str | None:
@@ -1151,6 +1205,7 @@ def _check_exec(dseq: str) -> bool:
         timeout=45,
     )
     ok = r.returncode == 0 and token in (r.stdout or "")
+    _note_exit_code_shapes(dseq, r.stderr or "")
     trace = _frame_trace_line(r.stderr or "")
     shape = _frame_shape(trace)
     if shape:
@@ -1189,6 +1244,7 @@ def _inject_and_read(dseq: str, transport: str, key: str = "") -> bool:
                 timeout=45,
             )
             out = back.stdout or ""
+            _note_exit_code_shapes(dseq, back.stderr or "")
             if back.returncode == 0 and "injected_ok" in out:
                 return True
             # Only rc=0-with-empty-stdout (the race) is retryable — stop otherwise.
@@ -1751,6 +1807,7 @@ def smoke_provider(
                     # the entry here to keep the process-global cache from growing and
                     # to prevent any stale-state reuse if a dseq ever recurs.
                     frame_shape=_EXEC_FRAME_SHAPES.pop(_dseq, None),
+                    exit_code_shapes=_EXEC_EXIT_CODE_SHAPES.pop(_dseq, None),
                 )
             )
 

@@ -41,6 +41,7 @@ import akash_lease_core as _core
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 from websockets.sync.client import connect
 
+from just_akash._diagnostics import Code, emit
 from just_akash.api import AkashConsoleAPI
 
 from .base import Transport, TransportConfig
@@ -441,6 +442,17 @@ class LeaseShellTransport(Transport):
                     "result frame has %s; treating as exit 0 for compatibility "
                     "(temporary shim, see issue #85). Please report this frame.",
                     shape,
+                )
+                # The machine-readable half of the same event. The removal
+                # condition is a COUNT over time per provider, and a human log
+                # line cannot be counted — this is what the smoke records into
+                # telemetry and what `analyze-telemetry --shim-survey` reads.
+                emit(
+                    Code.EXEC_EXIT_CODE_UNKNOWN,
+                    "warning",
+                    f"result frame has {shape}; exit status is unknown, "
+                    "reported as 0 by the temporary shim (issue #85)",
+                    shape=shape,
                 )
                 # Bounded, and at DEBUG so frame contents are not emitted at default
                 # verbosity — this can carry command output.

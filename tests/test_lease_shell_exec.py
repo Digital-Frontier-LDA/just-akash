@@ -1347,6 +1347,40 @@ class TestTokenRefresh:
         assert "no exit_code key" in caplog.text  # distinct from the null label
         assert "a null exit_code" not in caplog.text
 
+    def test_shim_emits_a_structured_diagnostic_for_the_survey(self, monkeypatch, capsys):
+        """The shim's occurrences must be COUNTABLE, not just loggable.
+
+        Issue #85 retires the shim on "zero occurrences over 30 consecutive days",
+        which is a count per provider over time — a prose warning can't provide
+        that. The structured event is what the smoke records into telemetry and
+        what `analyze-telemetry --shim-survey` reads. Without it the removal
+        condition can never be evaluated and the shim is immortal.
+        """
+        monkeypatch.setenv("AKASH_DIAGNOSTICS", "1")
+        for payload, shape in (
+            (json.dumps({"exit_code": None}).encode(), "a null exit_code"),
+            (json.dumps({}).encode(), "no exit_code key"),
+        ):
+            assert LeaseShellTransport._dispatch_frame(bytes([102]) + payload) == 0
+            events = [
+                json.loads(line)
+                for line in capsys.readouterr().err.splitlines()
+                if line.startswith("{")
+            ]
+            diag = [e for e in events if e.get("code") == "EXEC_EXIT_CODE_UNKNOWN"]
+            assert len(diag) == 1, f"expected one survey event for {shape!r}"
+            assert diag[0]["level"] == "warning"  # the op continues; it is not a failure
+            # The shape rides in context so the survey can tell the two apart.
+            assert diag[0]["context"]["shape"] == shape
+
+    def test_no_diagnostic_when_the_frame_parses_normally(self, monkeypatch, capsys):
+        """A healthy frame must emit NOTHING — otherwise the survey counts noise
+        and the clean streak never starts."""
+        monkeypatch.setenv("AKASH_DIAGNOSTICS", "1")
+        frame = bytes([102]) + json.dumps({"exit_code": 0}).encode()
+        assert LeaseShellTransport._dispatch_frame(frame) == 0
+        assert "EXEC_EXIT_CODE_UNKNOWN" not in capsys.readouterr().err
+
     def test_shim_does_not_widen_to_other_malformed_frames(self):
         """The shim must fire ONLY for null/missing exit_code — everything else
         still RAISES. This is the guard that stops a compatibility bridge from

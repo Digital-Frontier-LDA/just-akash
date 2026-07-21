@@ -71,6 +71,11 @@ class Code:
 
     # Reliability — post-deploy / smoke; the "external sweep reaps the lease" symptom.
     LEASE_DOWN = "LEASE_DOWN"
+    # A result frame carried a null or absent exit_code, so the command's real exit
+    # status is UNKNOWN and the temporary shim reported 0 (issue #85). Emitted on
+    # every occurrence: the survey that decides the shim's fate is literally the
+    # count of these, per provider, over time. context.shape distinguishes the two.
+    EXEC_EXIT_CODE_UNKNOWN = "EXEC_EXIT_CODE_UNKNOWN"
 
 
 def _enabled() -> bool:

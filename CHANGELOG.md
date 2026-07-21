@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.37.0] — 2026-07-21
+
+### Added
+- **The issue-#85 compatibility shim is now measurable — its removal condition was previously impossible to evaluate.** The null/missing-`exit_code` shim shipped with a documented exit criterion ("zero occurrences across all active providers over 30 consecutive days") and a code comment describing it as "telemetry-gated"… but no telemetry hook was ever built. The shim only wrote a human `_logger.warning`, and a prose log line cannot be counted per provider over time, so the 30-day clock could never start and the "temporary" shim had no path to removal. Three changes close the loop. (1) The shim now also emits a structured `EXEC_EXIT_CODE_UNKNOWN` diagnostic (`context.shape` distinguishing `a null exit_code` from `no exit_code key`) through the same `akash-diag` rail Sentry/CI already consume. (2) The provider smoke parses that event from **every** exec's stderr — not just the `exec` check, since under-counting would let the clean streak run out on partial evidence — and records the shapes on the run's `exec` telemetry row as `exit_code_shapes`; the field is **absent** when the shim never fired, so absence is the clean signal and can't be confused with a pre-instrumentation row. (3) `analyze-telemetry --shim-survey` (plus `just smoke-shim-survey`, and a non-gating step in the daily smoke's report job) reports occurrences per provider, the clean-day streak, and a verdict: KEEP THE SHIM / NOT YET / REMOVABLE.
+
+  The survey refuses to count records below `SHIM_SURVEY_MIN_VERSION`: they predate the instrumentation, so their silence means "not measured", not "clean" — counting them would start the 30-day clock in the past and retire the shim on evidence that was never collected. Verified against the live accrued telemetry (2,486 real records): the survey correctly admits **none** of them as evidence and reports "the survey starts once a smoke run on v1.37.0+ lands."
+
 ## [1.36.1] — 2026-07-21
 
 ### Fixed

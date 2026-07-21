@@ -70,6 +70,34 @@ Silent in an interactive terminal (humans keep the existing `_log`/`Error:` pros
 | Code | Condition |
 |---|---|
 | `LEASE_DOWN` | Lease died after creation (provider eviction / sweep / node loss). |
+| `EXEC_EXIT_CODE_UNKNOWN` | A result frame carried a null or absent `exit_code`, so the command's real exit status is **unknown**; the temporary shim reported 0. `context.shape` is `a null exit_code` or `no exit_code key`. |
+
+### `EXEC_EXIT_CODE_UNKNOWN` and the issue-#85 survey
+
+This code is not only a Sentry signal — it is the *measurement instrument* for
+retiring the compatibility shim. The removal condition in
+[#85](https://github.com/Digital-Frontier-LDA/just-akash/issues/85) is "zero
+occurrences across all active providers over 30 consecutive days", which is a
+count per provider over time; the human log line beside this event cannot be
+counted, so without the structured event the condition could never be evaluated.
+
+The chain:
+
+1. `LeaseShellTransport._dispatch_frame` emits the event when the shim fires.
+2. The provider smoke parses it from every exec's stderr and records the shapes
+   on the run's `exec` telemetry row as `exit_code_shapes` (field **absent** when
+   the shim never fired — that absence is the clean signal).
+3. `analyze-telemetry --shim-survey` reports occurrences per provider and the
+   clean-day streak, and prints the verdict.
+
+```bash
+just smoke-shim-survey          # against the live accrued telemetry branch
+```
+
+Records below `SHIM_SURVEY_MIN_VERSION` are **not** evidence: they predate the
+instrumentation, so their silence means "not measured", not "clean". Counting
+them would start the 30-day clock in the past and retire the shim on evidence
+that was never collected.
 
 ## Caller bridge — turning events into GitHub `::error` / Sentry
 
