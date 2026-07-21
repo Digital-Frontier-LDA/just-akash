@@ -63,6 +63,7 @@ from .benchmark import _leading_number, is_complete, resource_fidelity, stabilit
 OUTCOME_METRIC = "just_akash_smoke_outcome_total"
 LATENCY_METRIC = "just_akash_smoke_latency_ms"
 LAST_RUN_METRIC = "just_akash_smoke_last_run_timestamp"
+LATEST_OUTCOME_METRIC = "just_akash_smoke_latest_outcome_info"
 CREDIT_METRIC = "just_akash_deploy_credit_usd"
 
 # Benchmark gauge families (hardware-quality grades from smoke-benchmark.jsonl).
@@ -193,6 +194,50 @@ def _parse_ts(ts: object) -> float | None:
         return datetime.fromisoformat(s).timestamp()
     except ValueError:
         return None
+
+
+def render_latest_outcomes(records: list[dict]) -> list[str]:
+    """``just_akash_smoke_latest_outcome_info{provider,feature,outcome} 1`` — the
+    LATEST run's outcome per (provider, feature), info-style.
+
+    The cumulative counter answers "how often has this failed" but cannot answer
+    "is it failing NOW": at one smoke run per day, an ``increase(...[26h]) > 0``
+    alert keeps paging for a full day after a single transient flake that the
+    very next run already passed (onidc `update`, 2026-07-21: FAIL 17:03, PASS
+    17:16, warning pinned firing until the bump aged out). This gauge is the
+    state view alert rules should gate on: when the outcome flips, the OLD
+    outcome's series disappears from the exposition, so a NoData=OK rule that
+    matches only failing outcomes auto-resolves on the next passing run.
+
+    "Latest" is by parsed ``ts`` with file position as tie-break — the same
+    ordering rule the benchmark gauges use.
+    """
+    latest: dict[tuple[str, str], tuple[float, int, str]] = {}
+    for idx, r in enumerate(records):
+        provider = r.get("provider")
+        feature = r.get("feature")
+        if not provider or not feature:
+            continue
+        epoch = _parse_ts(r.get("ts")) or 0.0
+        key = (str(provider), str(feature))
+        if key not in latest or (epoch, idx) >= latest[key][:2]:
+            latest[key] = (epoch, idx, _outcome_label(r.get("outcome")))
+    if not latest:
+        return []
+    lines = [
+        f"# HELP {LATEST_OUTCOME_METRIC} The most recent smoke run's outcome per "
+        "(provider, feature), as an info-style series — alert on failing outcomes; "
+        "the series disappears when the outcome changes.",
+        f"# TYPE {LATEST_OUTCOME_METRIC} gauge",
+    ]
+    for (provider, feature), (_, _, outcome) in sorted(latest.items()):
+        labels = (
+            f'provider="{_escape_label_value(provider)}",'
+            f'feature="{_escape_label_value(feature)}",'
+            f'outcome="{_escape_label_value(outcome)}"'
+        )
+        lines.append(f"{LATEST_OUTCOME_METRIC}{{{labels}}} 1")
+    return lines
 
 
 def render_last_run(records: list[dict]) -> list[str]:
@@ -405,6 +450,7 @@ def render_metrics(
     hardware-benchmark gauges."""
     blocks = [
         render_outcome_counters(records),
+        render_latest_outcomes(records),
         render_latency_summary(records),
         render_last_run(records),
     ]
