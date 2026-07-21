@@ -43,7 +43,11 @@ jobs:
           python-version: "3.13"
       - name: Install dependencies
         run: uv sync
+      # Secrets live in secrets/ci.sops.env since #89 — this exports AKASH_API_KEY
+      # (and friends) into $GITHUB_ENV; SOPS_AGE_KEY is the only GitHub secret.
+      - name: Load SOPS secrets
+        uses: ./.github/actions/sops-env
+        with:
+          age-key: ${{ secrets.SOPS_AGE_KEY }}
       - name: Inventory / cleanup
-        env:
-          AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
         run: uv run python -m just_akash.cleanup_stale ${{ inputs.execute && '--execute' || '' }}
