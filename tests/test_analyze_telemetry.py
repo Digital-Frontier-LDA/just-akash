@@ -457,6 +457,18 @@ class TestShimSurvey:
         survey = at.shim_survey([self._rec(1, shapes=[])])
         assert survey["occurrences"] == 0
 
+    def test_min_version_cannot_shrink_the_survey(self, tmp_path, capsys):
+        """--min-version must not pre-filter the survey's input. It could only
+        ever DROP instrumented records — shortening the observed clean streak or
+        hiding an occurrence — and this verdict decides whether a compatibility
+        shim gets deleted. The survey owns its own floor."""
+        f = tmp_path / "t.jsonl"
+        f.write_text("\n".join(json.dumps(self._rec(d)) for d in range(1, 32)))
+        assert at.main([str(f), "--shim-survey", "--min-version", "99.0.0"]) == 0
+        out = capsys.readouterr().out
+        assert "REMOVABLE" in out  # the 30-day streak survived the bogus floor
+        assert "version filter" not in out  # the filter never ran
+
     def test_main_shim_survey_flag_runs(self, tmp_path, capsys):
         f = tmp_path / "t.jsonl"
         f.write_text("\n".join(json.dumps(self._rec(d)) for d in range(1, 32)))

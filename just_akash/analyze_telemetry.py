@@ -459,6 +459,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"No telemetry records in {args.path} yet.")
         return 0
 
+    if args.shim_survey:
+        # Deliberately BEFORE the --min-version filter. The survey owns its own
+        # instrumentation floor (SHIM_SURVEY_MIN_VERSION); letting a caller's
+        # --min-version pre-filter the input could only ever DROP instrumented
+        # records, shortening the observed clean streak or hiding an occurrence
+        # — and the verdict decides whether a compatibility shim gets deleted.
+        print(format_shim_survey(shim_survey(records)))
+        return 0
+
     if args.min_version:
         floor = _version_key(args.min_version)
         kept = [r for r in records if _version_key(r.get("version")) >= floor]
@@ -469,13 +478,6 @@ def main(argv: list[str] | None = None) -> int:
         if not records:
             print("No records at or above that version yet.")
             return 0
-
-    if args.shim_survey:
-        # Deliberately BEFORE the version filter: the survey applies its own
-        # instrumentation floor, and a --min-version below it would silently
-        # readmit records that never carried the field.
-        print(format_shim_survey(shim_survey(records)))
-        return 0
 
     quarantined = {p.strip() for p in args.quarantine.split(",") if p.strip()}
     if quarantined:

@@ -1912,6 +1912,14 @@ class TestShimSurveyCapture:
         assert sp._exit_code_shapes('{"code": "EXEC_EXIT_CODE_UNKNOWN"') == set()
         assert sp._exit_code_shapes("") == set()
 
+    def test_non_object_context_never_raises(self):
+        """stderr is untrusted: a line can carry the right code with a scalar or
+        list context. `.get` on that would raise through the no-raise contract
+        and fail the smoke check this parser only rides along on."""
+        for ctx in ('"a string"', "[1, 2]", "12", "null"):
+            line = f'{{"type": "akash-diag", "code": "EXEC_EXIT_CODE_UNKNOWN", "context": {ctx}}}'
+            assert sp._exit_code_shapes(line) == set()
+
     def test_shapes_accumulate_across_execs_for_a_dseq(self, monkeypatch):
         """Every exec is a survey sample, not just the `exec` check. Under-counting
         would let the clean streak run out on partial evidence."""

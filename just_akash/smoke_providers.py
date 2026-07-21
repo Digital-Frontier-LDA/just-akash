@@ -1159,7 +1159,13 @@ def _exit_code_shapes(stderr: str) -> set[str]:
             continue
         if not isinstance(event, dict) or event.get("code") != Code.EXEC_EXIT_CODE_UNKNOWN:
             continue
-        shape = (event.get("context") or {}).get("shape")
+        # stderr is untrusted input: a line can carry the right code with a
+        # scalar/list context, and `.get` on that would raise straight through
+        # the no-raise contract and fail the smoke check this only rides along on.
+        context = event.get("context")
+        if not isinstance(context, dict):
+            continue
+        shape = context.get("shape")
         if isinstance(shape, str) and shape:
             shapes.add(shape)
     return shapes
