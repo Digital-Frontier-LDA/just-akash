@@ -238,7 +238,10 @@ def _normalize_grade(record: dict) -> dict:
         if isinstance(v, str):
             out[k] = v
         elif _is_number(v):  # excludes bool
-            out[k] = repr(float(v)) if isinstance(v, float) else str(v)
+            # Fixed-point, never repr: repr(1e-05) is "1e-05", whose exponent
+            # _leading_number does not parse — it would read as 1, a silently
+            # wrong magnitude rather than a safe degradation.
+            out[k] = format(v, "f") if isinstance(v, float) else str(v)
     return out
 
 
@@ -373,7 +376,7 @@ def render_benchmark_metrics(records: list[dict]) -> list[str]:
 def load_credit_json(path: str) -> tuple[str, float | None] | None:
     """(account, deploy_credit_usd) from a ``balance --check --json`` snapshot file.
 
-    Lets an UNcredentialed job (the CI accrue step holds no AKASH_API_KEY by design)
+    Lets an uncredentialed job (the CI accrue step holds no AKASH_API_KEY by design)
     still render the credit gauge from a snapshot the credentialed smoke job wrote.
     Best-effort like resolve_deploy_credit: any problem logs to stderr and returns
     None so the rest of the metrics still render.
