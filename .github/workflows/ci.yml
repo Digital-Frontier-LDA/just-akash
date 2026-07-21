@@ -117,11 +117,14 @@ jobs:
         with:
           tool: just
 
+      # AKASH_API_KEY / AKASH_PROVIDERS / SSH_PUBKEY come from secrets/ci.sops.env
+      # (SOPS+age); SOPS_AGE_KEY is the only GitHub secret this needs.
+      - name: Load SOPS secrets
+        uses: ./.github/actions/sops-env
+        with:
+          age-key: ${{ secrets.SOPS_AGE_KEY }}
+
       - name: Run E2E lease-shell test
-        env:
-          AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
-          AKASH_PROVIDERS: ${{ secrets.AKASH_PROVIDERS }}
-          SSH_PUBKEY: ${{ secrets.SSH_PUBKEY }}
         run: uv run python -m just_akash.test_shell_e2e
 
   e2e-secrets:
@@ -134,9 +137,6 @@ jobs:
     # failed" (422) and "lease not active". Serializing keeps each job isolated.
     needs: e2e-shell
     if: always() && (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
-    env:
-      AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
-      AKASH_PROVIDERS: ${{ secrets.AKASH_PROVIDERS }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -159,6 +159,15 @@ jobs:
         with:
           tool: just
 
+      # AKASH_API_KEY / AKASH_PROVIDERS come from secrets/ci.sops.env (SOPS+age).
+      - name: Load SOPS secrets
+        uses: ./.github/actions/sops-env
+        with:
+          age-key: ${{ secrets.SOPS_AGE_KEY }}
+
+      # Runs AFTER the SOPS load on purpose: this job needs a throwaway keypair it
+      # holds the private half of, so the generated SSH_PUBKEY must override the
+      # one from the encrypted file (later $GITHUB_ENV write wins).
       - name: Generate SSH keypair
         run: |
           mkdir -p ~/.ssh

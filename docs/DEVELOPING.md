@@ -18,6 +18,40 @@ at runtime** — only `websockets`, `pexpect`, `pyyaml` — so don't add a runti
 dependency without
 discussing it.
 
+## Secrets (SOPS + age)
+
+CI secrets live **encrypted in git** at `secrets/ci.sops.env`, not in a pile of
+GitHub secrets. The only GitHub secret is `SOPS_AGE_KEY` — the bootstrap key CI
+uses to decrypt everything else.
+
+```bash
+sops -d secrets/ci.sops.env      # read (decrypts to stdout)
+sops secrets/ci.sops.env         # edit in $EDITOR, re-encrypts on save
+```
+
+Recipients are in `.sops.yaml`: **ops** (laptop), **breakglass** (1Password), and
+**ci-just-akash** (the `SOPS_AGE_KEY` secret on this repo). Per-repo CI keys mean a
+compromised CI key exposes only this repo. After changing recipients, re-encrypt
+with `sops updatekeys secrets/ci.sops.env`.
+
+Workflows load them via a composite action that decrypts to a private tmpfile,
+masks every value, then exports to `$GITHUB_ENV`:
+
+```yaml
+- name: Load SOPS secrets
+  uses: ./.github/actions/sops-env
+  with:
+    age-key: ${{ secrets.SOPS_AGE_KEY }}
+```
+
+**Adding a secret:** `sops secrets/ci.sops.env`, add `KEY=value`, save, commit. Any
+job with the load step picks it up — no GitHub-secret change, and the addition is
+reviewable in the PR diff.
+
+Local development still uses a plain untracked `.env` (see `.env.example`).
+`.gitignore` blocks `secrets/*.env` so a decrypted sibling can never be committed;
+only `*.sops.env` is trackable.
+
 ## Quality recipes (`just`)
 
 | Recipe | Does | Spend? |
