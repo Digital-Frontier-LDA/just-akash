@@ -111,8 +111,7 @@ jobs:
         if: always()
         continue-on-error: true
         timeout-minutes: 5
-        env:
-          AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
+        # AKASH_API_KEY is already in $GITHUB_ENV from the SOPS load step.
         run: uv run just-akash balance --check --min-usd 0 --json > "${{ github.workspace }}/deploy-credit.json"
 
       # Keep the run's latency/outcome telemetry even when the smoke step fails
