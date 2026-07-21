@@ -1,0 +1,22 @@
+# SOPS recipient policy for just-akash.
+# Mirrors the sister repos (DigitalFrontier-infra / DigitalFrontier-Website /
+# latitude-api-adapter / Akash-Console): shared human keys (ops = laptop,
+# breakglass = 1Password) + a per-repo CI key (ci-just-akash → the SOPS_AGE_KEY
+# GitHub secret on THIS repo). No single key loss is fatal, and a compromised CI
+# key exposes only this repo's secrets.
+#
+# Recipients:
+#   age1dyt7ls7v0y8ytqglfs7uhvn2m6jxg20awc780hslknu3g6aaz32s8pnqr2  ops / laptop
+#   age1pv4np235vaqfgznp2p24qwcfn05y6urrgjjdq7mru6eph6k9z3esnm3pmt  breakglass / 1Password
+#   age1kpgu7kh9akdjsu26vsm64zjzf5nwhdpevmllf2kc0xlz8mjvfyasmz84lz  ci-just-akash (SOPS_AGE_KEY)
+#
+# Rotate/revoke: edit the recipients below, then `sops updatekeys <file>` for
+# each affected file (re-encrypts the data key to the new recipient set).
+#
+# NOTE: SOPS does not remove the need for GitHub secrets entirely — CI still
+# needs ONE bootstrap secret (SOPS_AGE_KEY) to decrypt everything else. The win
+# is that every OTHER secret lives encrypted in git: reviewable, diffable, and
+# rotatable through a normal PR instead of an opaque web form.
+creation_rules:
+  - path_regex: ^secrets/.*\.sops\.(env|ya?ml|json)$
+    age: "age1dyt7ls7v0y8ytqglfs7uhvn2m6jxg20awc780hslknu3g6aaz32s8pnqr2,age1pv4np235vaqfgznp2p24qwcfn05y6urrgjjdq7mru6eph6k9z3esnm3pmt,age1kpgu7kh9akdjsu26vsm64zjzf5nwhdpevmllf2kc0xlz8mjvfyasmz84lz"

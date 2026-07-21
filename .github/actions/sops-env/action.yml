@@ -1,0 +1,65 @@
+name: Load SOPS secrets
+description: >-
+  Decrypt secrets/ci.sops.env with the repo's age key and export every variable
+  into $GITHUB_ENV, so jobs read one bootstrap secret (SOPS_AGE_KEY) instead of
+  a growing list of individual GitHub secrets.
+
+inputs:
+  age-key:
+    description: The ci-just-akash age private key (pass secrets.SOPS_AGE_KEY).
+    required: true
+  file:
+    description: Path to the SOPS-encrypted env file.
+    required: false
+    default: secrets/ci.sops.env
+
+runs:
+  using: composite
+  steps:
+    - name: Install sops
+      shell: bash
+      run: |
+        set -euo pipefail
+        if command -v sops >/dev/null 2>&1; then exit 0; fi
+        VERSION=3.13.1
+        curl -sSfL -o /tmp/sops \
+          "https://github.com/getsops/sops/releases/download/v${VERSION}/sops-v${VERSION}.linux.amd64"
+        sudo install -m 0755 /tmp/sops /usr/local/bin/sops
+        rm -f /tmp/sops
+        sops --version
+
+    - name: Decrypt and export
+      shell: bash
+      env:
+        SOPS_AGE_KEY: ${{ inputs.age-key }}
+        SOPS_FILE: ${{ inputs.file }}
+      run: |
+        set -euo pipefail
+        if [ -z "${SOPS_AGE_KEY:-}" ]; then
+          echo "::error::SOPS_AGE_KEY is empty — cannot decrypt ${SOPS_FILE}"
+          exit 1
+        fi
+        # Decrypt to a private tmpfile, never to stdout: a decrypted value echoed
+        # into the log would defeat the whole point of encrypting it at rest.
+        umask 077
+        PLAIN=$(mktemp)
+        trap 'rm -f "$PLAIN"' EXIT
+        sops -d "$SOPS_FILE" > "$PLAIN"
+
+        # Mask every value BEFORE exporting, so any later accidental echo is
+        # redacted by the runner, then append to $GITHUB_ENV.
+        while IFS= read -r line; do
+          case "$line" in ''|\#*) continue ;; esac
+          key=${line%%=*}
+          val=${line#*=}
+          [ -z "$key" ] && continue
+          echo "::add-mask::$val"
+          # Multi-line-safe heredoc form (SSH_PUBKEY can carry newlines).
+          {
+            echo "$key<<__SOPS_EOF__"
+            echo "$val"
+            echo "__SOPS_EOF__"
+          } >> "$GITHUB_ENV"
+        done < "$PLAIN"
+
+        echo "Loaded $(grep -cE '^[A-Za-z_][A-Za-z_0-9]*=' "$PLAIN") secret(s) from ${SOPS_FILE}"

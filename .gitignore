@@ -9,3 +9,8 @@ dist/
 .venv/
 .coverage
 .claude/
+
+# SOPS: only *.sops.env (encrypted) belongs in git. A decrypted sibling
+# (e.g. secrets/ci.env from `sops -d`) must never be committed.
+secrets/*.env
+!secrets/*.sops.env

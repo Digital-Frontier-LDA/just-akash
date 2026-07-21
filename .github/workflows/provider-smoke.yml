@@ -67,20 +67,22 @@ jobs:
         with:
           tool: just
 
+      - name: Load SOPS secrets
+        uses: ./.github/actions/sops-env
+        with:
+          age-key: ${{ secrets.SOPS_AGE_KEY }}
+
       - name: Run provider smoke test
         # Step-level timeout (not job-level) so a hang fails THIS step and still
         # lets the always()-cleanup step below reap any probe left behind.
         timeout-minutes: 40
         env:
-          AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
-          AKASH_PROVIDERS: ${{ secrets.AKASH_PROVIDERS }}
-          AKASH_PROVIDERS_BACKUP: ${{ secrets.AKASH_PROVIDERS_BACKUP }}
-          # Comma-separated providers quarantined as genuinely-unreliable: they are
-          # still deployed, tested, shown + recorded, but their PROVIDER-RELIABILITY
-          # failures (LEASE-DOWN / proven ingress stall) do NOT gate the run — a
-          # TOOLING regression on them still does. Keeps a known-bad provider
-          # monitored without its infra flakiness reddening CI. Empty = none quarantined.
-          SMOKE_QUARANTINE_PROVIDERS: ${{ secrets.SMOKE_QUARANTINE_PROVIDERS }}
+          # AKASH_API_KEY / AKASH_PROVIDERS / AKASH_PROVIDERS_BACKUP and
+          # SMOKE_QUARANTINE_PROVIDERS are loaded from secrets/ci.sops.env by the
+          # "Load SOPS secrets" step above. (Quarantine = comma-separated providers
+          # whose PROVIDER-RELIABILITY failures don't gate the run; a TOOLING
+          # regression on them still does. Empty = none quarantined.)
+          #
           # Per-(provider,feature) outcome + latency, one JSON line each. Uploaded
           # as an artifact below; aggregate across runs to set percentile timeouts
           # and detect latency/success-rate regressions.
@@ -120,8 +122,7 @@ jobs:
       - name: Reap any leaked probe
         if: always()
         timeout-minutes: 10
-        env:
-          AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
+        # AKASH_API_KEY is already in $GITHUB_ENV from the SOPS load step.
         run: uv run python -m just_akash.smoke_providers --sweep-only --min-age 0
 
   # Accrue this run's telemetry onto the long-lived `telemetry` branch so the data
@@ -170,6 +171,11 @@ jobs:
       - uses: actions/setup-python@v5 # pin the interpreter (module uses 3.10+ typing)
         with:
           python-version: "3.13"
+      # Supplies SMOKE_QUARANTINE_PROVIDERS (used by the --quarantine flag below).
+      - name: Load SOPS secrets
+        uses: ./.github/actions/sops-env
+        with:
+          age-key: ${{ secrets.SOPS_AGE_KEY }}
       - name: Aggregate + latency gate
         # LIVE (no continue-on-error) — the close-out of the 2026-07-14..17 burst.
         # It gates on LATENCY ONLY: "this provider got too slow" is the one thing
@@ -197,9 +203,9 @@ jobs:
           # they cannot recur, so counting them understates the fleet (exec reads 96%
           # across all versions, 100% since the fix).
           SMOKE_MIN_VERSION: "1.17.0"
-          # Same list the smoke job uses: a quarantined provider is measured and
+          # SMOKE_QUARANTINE_PROVIDERS comes from the SOPS load step above — the
+          # same list the smoke job uses: a quarantined provider is measured and
           # printed, never gating (its failures are infra we can't fix).
-          SMOKE_QUARANTINE_PROVIDERS: ${{ secrets.SMOKE_QUARANTINE_PROVIDERS }}
         run: |
           # Distinguish "branch doesn't exist yet" (a clean no-op) from a real
           # network/auth failure (which must NOT be silently reported as "no
