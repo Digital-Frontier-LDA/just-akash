@@ -316,6 +316,25 @@ smoke-telemetry-report file="":
         uv run python -m just_akash.analyze_telemetry "$tmp"
     fi
 
+# Report the issue-#85 compatibility-shim survey: null/missing exit_code
+# occurrences per provider, and whether the 30-consecutive-clean-day removal
+# condition is met yet. Advisory only — retiring the shim is a deliberate
+# breaking change a human decides on.
+#   just smoke-shim-survey                      # against the live accrued data
+#   just smoke-shim-survey path.jsonl           # against a local file
+smoke-shim-survey file="":
+    #!/bin/bash
+    set -euo pipefail
+    if [ -n "{{file}}" ]; then
+        uv run python -m just_akash.analyze_telemetry "{{file}}" --shim-survey
+    else
+        tmp="$(mktemp)"
+        trap 'rm -f "$tmp"' EXIT
+        if ! git fetch origin telemetry >/dev/null 2>&1; then echo "no telemetry branch yet"; exit 0; fi
+        git show origin/telemetry:smoke-latency.jsonl > "$tmp"
+        uv run python -m just_akash.analyze_telemetry "$tmp" --shim-survey
+    fi
+
 # Render accrued smoke telemetry as Prometheus textfile-collector metrics so
 # no-credit/no-bid/lease-down outcomes, hardware-benchmark grades, and the
 # deploy-credit burn-down are Grafana-trackable.

@@ -246,6 +246,16 @@ jobs:
           # branch grows every run, so a full fetch would slow down over time.
           git fetch --depth 1 origin telemetry
           git show origin/telemetry:smoke-latency.jsonl > accrued.jsonl
+          # issue #85 shim survey FIRST, and never gating: it reports whether the
+          # null/missing exit_code compatibility shim can be retired yet. Runs
+          # before the gating check so the verdict is in the log even when the
+          # SLO check below fails the step.
+          # `|| true` is load-bearing: the step runs under `set -e`, so a crash
+          # in this advisory command would abort before the SLO gate below ever
+          # runs — failing the step for a reason unrelated to the SLO, which is
+          # the opposite of "never gating".
+          python3 -m just_akash.analyze_telemetry accrued.jsonl --shim-survey || true
+          echo
           python3 -m just_akash.analyze_telemetry accrued.jsonl \
             --check --min-samples "$SMOKE_SLO_MIN_SAMPLES" --slo 0.95 \
             --min-version "$SMOKE_MIN_VERSION" \

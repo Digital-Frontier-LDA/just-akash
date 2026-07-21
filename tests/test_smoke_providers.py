@@ -1887,3 +1887,67 @@ class TestGenerateKeypairCleanup:
         path = sp._generate_keypair()
         assert path == str(key_dir / "id_ed25519")
         assert os.environ["SSH_PUBKEY"] == "ssh-ed25519 AAAAfake smoke-probe"
+
+
+class TestShimSurveyCapture:
+    """Smoke-side half of the issue-#85 survey: shim occurrences must reach the
+    telemetry file, or the 30-day removal condition has no data to evaluate."""
+
+    NULL_DIAG = (
+        '{"type": "akash-diag", "level": "warning", "code": "EXEC_EXIT_CODE_UNKNOWN", '
+        '"message": "result frame has a null exit_code", '
+        '"context": {"shape": "a null exit_code"}}'
+    )
+
+    def test_parses_the_shape_from_a_diag_line(self):
+        assert sp._exit_code_shapes(self.NULL_DIAG) == {"a null exit_code"}
+
+    def test_ignores_unrelated_stderr(self):
+        noise = 'warning: something else\n{"type": "akash-diag", "code": "LEASE_DOWN"}\n'
+        assert sp._exit_code_shapes(noise) == set()
+
+    def test_malformed_json_never_raises(self):
+        """A survey parser must never break a smoke check — the check's own
+        verdict matters more than the survey riding along with it."""
+        assert sp._exit_code_shapes('{"code": "EXEC_EXIT_CODE_UNKNOWN"') == set()
+        assert sp._exit_code_shapes("") == set()
+
+    def test_non_object_context_never_raises(self):
+        """stderr is untrusted: a line can carry the right code with a scalar or
+        list context. `.get` on that would raise through the no-raise contract
+        and fail the smoke check this parser only rides along on."""
+        for ctx in ('"a string"', "[1, 2]", "12", "null"):
+            line = f'{{"type": "akash-diag", "code": "EXEC_EXIT_CODE_UNKNOWN", "context": {ctx}}}'
+            assert sp._exit_code_shapes(line) == set()
+
+    def test_shapes_accumulate_across_execs_for_a_dseq(self, monkeypatch):
+        """Every exec is a survey sample, not just the `exec` check. Under-counting
+        would let the clean streak run out on partial evidence."""
+        monkeypatch.setattr(sp, "_EXEC_EXIT_CODE_SHAPES", {})
+        sp._note_exit_code_shapes("111", self.NULL_DIAG)
+        sp._note_exit_code_shapes(
+            "111", self.NULL_DIAG.replace("a null exit_code", "no exit_code key")
+        )
+        assert sp._EXEC_EXIT_CODE_SHAPES["111"] == {"a null exit_code", "no exit_code key"}
+
+    def test_clean_stderr_records_nothing(self, monkeypatch):
+        monkeypatch.setattr(sp, "_EXEC_EXIT_CODE_SHAPES", {})
+        sp._note_exit_code_shapes("111", "all good\n")
+        assert "111" not in sp._EXEC_EXIT_CODE_SHAPES
+
+    def test_telemetry_record_carries_the_shapes(self):
+        recs = sp._provider_records(
+            "akash1a",
+            "111",
+            {"exec": "PASS"},
+            {"exec": 10},
+            exit_code_shapes={"a null exit_code"},
+        )
+        exec_rec = next(r for r in recs if r["feature"] == "exec")
+        assert exec_rec["exit_code_shapes"] == ["a null exit_code"]
+
+    def test_field_is_absent_when_the_shim_never_fired(self):
+        """Absence is the clean signal. A present-but-empty field would be
+        indistinguishable from a pre-instrumentation record."""
+        recs = sp._provider_records("akash1a", "111", {"exec": "PASS"}, {"exec": 10})
+        assert all("exit_code_shapes" not in r for r in recs)

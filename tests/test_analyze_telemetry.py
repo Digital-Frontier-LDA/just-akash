@@ -374,3 +374,103 @@ class TestLatencySlo:
         f = tmp_path / "empty.jsonl"
         f.write_text("")
         assert at.main([str(f)]) == 0
+
+
+class TestShimSurvey:
+    """The issue-#85 removal condition, made evaluable.
+
+    The condition is "zero null/missing exit_code occurrences across all active
+    providers over 30 consecutive days". Before this existed the shim logged a
+    human warning that nothing counted, so the condition could never be checked
+    and the 'temporary' shim had no path to removal.
+    """
+
+    NEW = at.SHIM_SURVEY_MIN_VERSION
+
+    def _rec(self, day, *, version=None, provider="akash1a", shapes=None):
+        rec = {
+            "ts": f"2026-08-{day:02d}T07:00:00+00:00",
+            "version": version or self.NEW,
+            "provider": provider,
+            "feature": "exec",
+            "outcome": "PASS",
+        }
+        if shapes:
+            rec["exit_code_shapes"] = shapes
+        return rec
+
+    def test_pre_instrumentation_records_are_not_evidence(self):
+        """The crux: an old record has no exit_code_shapes field because the field
+        did not EXIST, not because the shim stayed quiet. Counting that silence
+        would start the 30-day clock in the past and retire the shim on evidence
+        that was never collected."""
+        old = [self._rec(d, version="1.36.0") for d in range(1, 29)]
+        survey = at.shim_survey(old)
+        assert survey["eligible"] == 0
+        assert survey["clean"] is False
+        assert "KEEP THE SHIM" in at.format_shim_survey(survey)
+
+    def test_clean_streak_shorter_than_required_is_not_removable(self):
+        survey = at.shim_survey([self._rec(d) for d in range(1, 11)])  # ~9 days
+        assert survey["occurrences"] == 0
+        assert survey["clean"] is False
+        assert "NOT YET" in at.format_shim_survey(survey)
+
+    def test_thirty_clean_days_is_removable(self):
+        survey = at.shim_survey([self._rec(d) for d in range(1, 32)])  # 30 days span
+        assert survey["occurrences"] == 0
+        assert survey["clean"] is True
+        assert "REMOVABLE" in at.format_shim_survey(survey)
+
+    def test_an_occurrence_keeps_the_shim_however_long_the_span(self):
+        """A single real occurrence is decisive — it is proof the shim is
+        load-bearing, and no amount of surrounding clean time overrides it."""
+        records = [self._rec(d) for d in range(1, 32)]
+        records.append(self._rec(2, shapes=["a null exit_code"]))
+        survey = at.shim_survey(records)
+        assert survey["occurrences"] == 1
+        assert survey["clean"] is False
+        report = at.format_shim_survey(survey)
+        assert "LOAD-BEARING" in report and "KEEP THE SHIM" in report
+
+    def test_streak_restarts_from_the_last_occurrence(self):
+        """Clean days count from the last hit, not from the first record."""
+        records = [self._rec(d) for d in range(1, 32)]
+        records.append(self._rec(29, shapes=["no exit_code key"]))
+        survey = at.shim_survey(records)
+        assert survey["clean_days"] < 5  # not the ~30-day span of the file
+        assert survey["clean"] is False
+
+    def test_occurrences_are_attributed_per_provider(self):
+        """The condition is 'across all active providers', so a hit has to name
+        the provider it came from — a fleet-wide total can't answer it."""
+        records = [
+            self._rec(1, provider="akash1a", shapes=["a null exit_code"]),
+            self._rec(2, provider="akash1a", shapes=["a null exit_code"]),
+            self._rec(3, provider="akash1b", shapes=["no exit_code key"]),
+        ]
+        survey = at.shim_survey(records)
+        assert survey["provider_hits"] == {"akash1a": 2, "akash1b": 1}
+        assert survey["providers"] == ["akash1a", "akash1b"]
+
+    def test_empty_shapes_list_is_not_an_occurrence(self):
+        survey = at.shim_survey([self._rec(1, shapes=[])])
+        assert survey["occurrences"] == 0
+
+    def test_min_version_cannot_shrink_the_survey(self, tmp_path, capsys):
+        """--min-version must not pre-filter the survey's input. It could only
+        ever DROP instrumented records — shortening the observed clean streak or
+        hiding an occurrence — and this verdict decides whether a compatibility
+        shim gets deleted. The survey owns its own floor."""
+        f = tmp_path / "t.jsonl"
+        f.write_text("\n".join(json.dumps(self._rec(d)) for d in range(1, 32)))
+        assert at.main([str(f), "--shim-survey", "--min-version", "99.0.0"]) == 0
+        out = capsys.readouterr().out
+        assert "REMOVABLE" in out  # the 30-day streak survived the bogus floor
+        assert "version filter" not in out  # the filter never ran
+
+    def test_main_shim_survey_flag_runs(self, tmp_path, capsys):
+        f = tmp_path / "t.jsonl"
+        f.write_text("\n".join(json.dumps(self._rec(d)) for d in range(1, 32)))
+        assert at.main([str(f), "--shim-survey"]) == 0
+        assert "SHIM SURVEY (issue #85)" in capsys.readouterr().out
