@@ -16,7 +16,14 @@ the natural errors we care about become first-class time series:
     the PASS samples (the same percentile logic ``analyze_telemetry`` gates on).
   * ``just_akash_smoke_last_run_timestamp`` — freshness / staleness alerting.
   * ``just_akash_deploy_credit_usd{account}`` — remaining Console deploy credit in
-    USD, emitted with ``--with-credit`` so Grafana can trend/forecast burn-down.
+    USD, emitted with ``--with-credit`` (live chain query) or ``--credit-json``
+    (a snapshot file from ``balance --check --json``, so an uncredentialed CI job
+    can still render the gauge) so Grafana can trend/forecast burn-down.
+  * ``just_akash_bench_*{provider}`` — with ``--benchmark BENCH.jsonl``, the
+    hardware-quality grades (``smoke-benchmark.jsonl``): delivered CPU rate, the
+    stability CV, throttle/steal (the resource-honesty signals), memory bandwidth.
+    Gauges from each provider's LATEST complete grade — scraped daily, Prometheus's
+    own history becomes the trend.
 
 Pure stdlib string output: it does NOT run a server. Point it at the accrued JSONL
 and write the ``.prom`` file into the collector's ``textfile`` directory (an atomic
@@ -29,6 +36,7 @@ Usage:
     uv run just-akash export-metrics PATH.jsonl                     # -> stdout
     uv run just-akash export-metrics PATH.jsonl --output smoke.prom  # atomic file
     uv run just-akash export-metrics PATH.jsonl --with-credit        # + credit gauge
+    uv run just-akash export-metrics PATH.jsonl --benchmark B.jsonl  # + bench gauges
     uv run python -m just_akash.prometheus_exporter PATH.jsonl
 """
 
@@ -36,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import os
 import sys
 import tempfile
@@ -44,14 +53,30 @@ from datetime import datetime
 
 # Reuse, don't re-implement: the JSONL reader and the percentile logic already live
 # in analyze_telemetry (the SLO/latency gate), so the exporter and the gate compute
-# latency identically from the identical parse.
+# latency identically from the identical parse. Same for the benchmark verdicts:
+# resource_fidelity/stability ARE the honesty/stability logic — the exporter only
+# formats what they derive (_leading_number is their unit-string parser).
 from .analyze_telemetry import _percentile, load_records
+from .benchmark import _leading_number, is_complete, resource_fidelity, stability
 
 # Metric names (module constants so tests and any dashboard-as-code stay in sync).
 OUTCOME_METRIC = "just_akash_smoke_outcome_total"
 LATENCY_METRIC = "just_akash_smoke_latency_ms"
 LAST_RUN_METRIC = "just_akash_smoke_last_run_timestamp"
 CREDIT_METRIC = "just_akash_deploy_credit_usd"
+
+# Benchmark gauge families (hardware-quality grades from smoke-benchmark.jsonl).
+# One sample per provider, from its latest COMPLETE grade.
+BENCH_CPU_EPS_METRIC = "just_akash_bench_cpu_events_per_s"
+BENCH_CPU_CV_METRIC = "just_akash_bench_cpu_cv_pct"
+BENCH_CPU_UNSTABLE_METRIC = "just_akash_bench_cpu_unstable"
+BENCH_THROTTLED_METRIC = "just_akash_bench_cpu_throttled_events"
+BENCH_THROTTLED_USEC_METRIC = "just_akash_bench_cpu_throttled_usec"
+BENCH_STEAL_METRIC = "just_akash_bench_steal_pct"
+BENCH_PSI_METRIC = "just_akash_bench_cpu_psi_load"
+BENCH_UNDER_DELIVERING_METRIC = "just_akash_bench_under_delivering"
+BENCH_MEM_BW_METRIC = "just_akash_bench_mem_bandwidth_mib_s"
+BENCH_LAST_RUN_METRIC = "just_akash_bench_last_run_timestamp"
 
 # The percentiles emitted for the latency summary, as (q, prometheus-quantile-label).
 _QUANTILES = ((50, "0.5"), (95, "0.95"), (99, "0.99"))
@@ -198,14 +223,193 @@ def render_deploy_credit_gauge(account: str, usd: float | None) -> list[str]:
     return lines
 
 
-def render_metrics(records: list[dict], *, credit: tuple[str, float | None] | None = None) -> str:
+def _normalize_grade(record: dict) -> dict:
+    """A benchmark row reduced to what the verdict helpers can safely consume.
+
+    The helpers (:func:`benchmark.resource_fidelity` / :func:`benchmark.stability` /
+    ``_leading_number``) are written for the probe's native ``dict[str, str]``. The
+    accrued JSONL is append-only and unprotected, so a row can carry a type the
+    current writer never emits (a bare JSON number, a list — schema drift or a hand
+    edit). One such row must degrade to "that field is unmeasured", never crash the
+    whole export: numbers are stringified, anything else non-string is dropped.
+    """
+    out: dict = {}
+    for k, v in record.items():
+        if isinstance(v, str):
+            out[k] = v
+        elif _is_number(v):  # excludes bool
+            # Fixed-point, never repr: repr(1e-05) is "1e-05", whose exponent
+            # _leading_number does not parse — it would read as 1, a silently
+            # wrong magnitude rather than a safe degradation.
+            out[k] = format(v, "f") if isinstance(v, float) else str(v)
+    return out
+
+
+def _latest_complete_grade_per_provider(records: list[dict]) -> dict[str, dict]:
+    """Each provider's most recent COMPLETE benchmark grade.
+
+    "Latest" is by parsed ``ts``; a record with an unparseable ts falls back to its
+    file position (later line wins), so a clock-less row can never shadow a properly
+    stamped newer one but two clock-less rows still order by accrual. Incomplete
+    grades (the exec was cut short — no ``BENCH-done=1``) are partial samples that
+    must not be graded, so they never become the exported gauge.
+    """
+    latest: dict[str, tuple[float, int, dict]] = {}
+    for idx, r in enumerate(records):
+        provider = r.get("provider")
+        if not provider or not isinstance(provider, str) or not is_complete(r):
+            continue
+        epoch = _parse_ts(r.get("ts")) or 0.0
+        if provider not in latest or (epoch, idx) >= latest[provider][:2]:
+            latest[provider] = (epoch, idx, r)
+    return {p: rec for p, (_, _, rec) in latest.items()}
+
+
+def render_benchmark_metrics(records: list[dict]) -> list[str]:
+    """``just_akash_bench_*{provider}`` gauges from the hardware-quality grades.
+
+    Renders each provider's latest complete grade through the SAME verdict logic the
+    CLI report uses (:func:`benchmark.resource_fidelity` / :func:`benchmark.stability`)
+    so the dashboard and the report can never disagree on what "throttled" or
+    "unstable" means. The benchmark contract is that an unavailable metric is ABSENT,
+    never zero — so each gauge is emitted only when its input was actually measured.
+    """
+    grades = _latest_complete_grade_per_provider(records)
+
+    # metric -> (help text, [(provider, value)])
+    families: dict[str, tuple[str, list[tuple[str, float]]]] = {
+        BENCH_CPU_EPS_METRIC: (
+            "Single-threaded CPU benchmark rate (events/s) from the latest complete grade.",
+            [],
+        ),
+        BENCH_CPU_CV_METRIC: (
+            "Coefficient of variation (%) across back-to-back CPU runs — the "
+            "statistical-stability signal (high = noisy neighbour / oversubscribed).",
+            [],
+        ),
+        BENCH_CPU_UNSTABLE_METRIC: (
+            "1 when the CPU stability CV exceeded the instability floor.",
+            [],
+        ),
+        BENCH_THROTTLED_METRIC: (
+            "cgroup CPU-throttle events during a single-threaded run (any > 0 means "
+            "the lease is capped below the vCPU it was sold as).",
+            [],
+        ),
+        BENCH_THROTTLED_USEC_METRIC: (
+            "Total microseconds CPU-throttled during the benchmark window.",
+            [],
+        ),
+        BENCH_STEAL_METRIC: (
+            "Host CPU steal (%) over the benchmark window (>0 = VM sharing cores).",
+            [],
+        ),
+        BENCH_PSI_METRIC: (
+            "CPU pressure (PSI some avg10) measured under load.",
+            [],
+        ),
+        BENCH_UNDER_DELIVERING_METRIC: (
+            "1 when the resource-honesty verdict flagged the provider as delivering "
+            "less than the resources it sold.",
+            [],
+        ),
+        BENCH_MEM_BW_METRIC: (
+            "Memory write bandwidth (MiB/s) from the latest complete grade.",
+            [],
+        ),
+        BENCH_LAST_RUN_METRIC: (
+            "Unix time of the provider's latest complete benchmark grade.",
+            [],
+        ),
+    }
+
+    def _add(metric: str, provider: str, value: object) -> None:
+        if _is_number(value):
+            families[metric][1].append((provider, float(value)))  # type: ignore[arg-type]
+
+    for provider, raw_rec in sorted(grades.items()):
+        rec = _normalize_grade(raw_rec)
+        try:
+            fidelity = resource_fidelity(rec)
+            stab = stability(rec)
+            _add(BENCH_CPU_EPS_METRIC, provider, _leading_number(rec.get("cpu_eps")))
+            _add(BENCH_CPU_CV_METRIC, provider, stab.get("cpu_cv_pct"))
+            if "unstable" in stab:
+                _add(BENCH_CPU_UNSTABLE_METRIC, provider, int(bool(stab["unstable"])))
+            _add(BENCH_THROTTLED_METRIC, provider, fidelity.get("throttled_during"))
+            _add(BENCH_THROTTLED_USEC_METRIC, provider, fidelity.get("throttled_usec_during"))
+            _add(BENCH_STEAL_METRIC, provider, fidelity.get("steal_pct"))
+            _add(BENCH_PSI_METRIC, provider, fidelity.get("cpu_psi_load"))
+            # under_delivering is only meaningful when at least one honesty input was
+            # measured — resource_fidelity returns bare {under_delivering: False,
+            # reasons: []} even for an empty record, which must read as unmeasured.
+            if any(k in fidelity for k in ("throttled_during", "steal_pct", "cpu_psi_load")):
+                _add(
+                    BENCH_UNDER_DELIVERING_METRIC,
+                    provider,
+                    int(bool(fidelity["under_delivering"])),
+                )
+            _add(BENCH_MEM_BW_METRIC, provider, _leading_number(rec.get("mem_bw")))
+            _add(BENCH_LAST_RUN_METRIC, provider, _parse_ts(rec.get("ts")))
+        except Exception as e:  # noqa: BLE001 — one poisoned row must never kill the export
+            # The accrued file is re-read in FULL every run, so letting one bad row
+            # raise would freeze smoke-metrics.prom permanently (the accrue job only
+            # warns on a render failure). Skip the provider's grade and keep going.
+            print(
+                f"export-metrics: skipping unusable benchmark grade for {provider}: {e}",
+                file=sys.stderr,
+            )
+
+    lines: list[str] = []
+    for metric, (help_text, samples) in families.items():
+        if not samples:
+            continue
+        lines.append(f"# HELP {metric} {help_text}")
+        lines.append(f"# TYPE {metric} gauge")
+        for provider, value in samples:
+            lines.append(
+                f'{metric}{{provider="{_escape_label_value(provider)}"}} {_fmt_num(value)}'
+            )
+    return lines
+
+
+def load_credit_json(path: str) -> tuple[str, float | None] | None:
+    """(account, deploy_credit_usd) from a ``balance --check --json`` snapshot file.
+
+    Lets an uncredentialed job (the CI accrue step holds no AKASH_API_KEY by design)
+    still render the credit gauge from a snapshot the credentialed smoke job wrote.
+    Best-effort like resolve_deploy_credit: any problem logs to stderr and returns
+    None so the rest of the metrics still render.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+        account = payload["account"]
+        usd = payload["deploy_credit_usd"]
+        if not isinstance(account, str) or not _is_number(usd):
+            raise ValueError("unexpected field types")
+        return account, float(usd)
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        print(f"export-metrics: unusable credit snapshot {path}: {e}", file=sys.stderr)
+        return None
+
+
+def render_metrics(
+    records: list[dict],
+    *,
+    credit: tuple[str, float | None] | None = None,
+    benchmark_records: list[dict] | None = None,
+) -> str:
     """The full textfile-collector document: outcome counters, latency percentiles,
-    last-run freshness, and (when ``credit`` is given) the deploy-credit gauge."""
+    last-run freshness, and — when given — the deploy-credit gauge and the
+    hardware-benchmark gauges."""
     blocks = [
         render_outcome_counters(records),
         render_latency_summary(records),
         render_last_run(records),
     ]
+    if benchmark_records:
+        blocks.append(render_benchmark_metrics(benchmark_records))
     if credit is not None:
         account, usd = credit
         blocks.append(render_deploy_credit_gauge(account, usd))
@@ -264,15 +468,40 @@ def write_metrics(text: str, output: str | None = None) -> None:
         raise
 
 
-def run(jsonl_path: str, *, output: str | None = None, with_credit: bool = False) -> int:
+def run(
+    jsonl_path: str,
+    *,
+    output: str | None = None,
+    with_credit: bool = False,
+    benchmark_path: str | None = None,
+    credit_json: str | None = None,
+) -> int:
     """Read the smoke JSONL, render the metrics, write them, return an exit code."""
     try:
         records = load_records(jsonl_path)
     except OSError as e:
         print(f"Error: cannot read {jsonl_path}: {e}", file=sys.stderr)
         return 2
-    credit = resolve_deploy_credit() if with_credit else None
-    write_metrics(render_metrics(records, credit=credit), output)
+    benchmark_records: list[dict] | None = None
+    if benchmark_path:
+        # Best-effort: a missing/unreadable grades file must not sink the primary
+        # latency/outcome export (the benchmark stream is optional by contract).
+        try:
+            benchmark_records = load_records(benchmark_path)
+        except OSError as e:
+            print(
+                f"export-metrics: skipping benchmark file {benchmark_path}: {e}",
+                file=sys.stderr,
+            )
+    if credit_json:
+        credit = load_credit_json(credit_json)
+    elif with_credit:
+        credit = resolve_deploy_credit()
+    else:
+        credit = None
+    write_metrics(
+        render_metrics(records, credit=credit, benchmark_records=benchmark_records), output
+    )
     return 0
 
 
@@ -289,12 +518,32 @@ def main(argv: list[str] | None = None) -> int:
         "dir); default is stdout.",
     )
     ap.add_argument(
+        "--benchmark",
+        default=None,
+        metavar="FILE",
+        help="Also render the hardware-benchmark gauges from this smoke-benchmark.jsonl.",
+    )
+    credit_group = ap.add_mutually_exclusive_group()
+    credit_group.add_argument(
         "--with-credit",
         action="store_true",
         help=f"Also emit {CREDIT_METRIC} from the on-chain deploy credit (needs AKASH_API_KEY).",
     )
+    credit_group.add_argument(
+        "--credit-json",
+        default=None,
+        metavar="FILE",
+        help=f"Also emit {CREDIT_METRIC} from a `balance --check --json` snapshot file "
+        "(no API key needed).",
+    )
     args = ap.parse_args(argv)
-    return run(args.path, output=args.output, with_credit=args.with_credit)
+    return run(
+        args.path,
+        output=args.output,
+        with_credit=args.with_credit,
+        benchmark_path=args.benchmark,
+        credit_json=args.credit_json,
+    )
 
 
 if __name__ == "__main__":

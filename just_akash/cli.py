@@ -407,9 +407,23 @@ def main():
         help="Write metrics atomically to FILE (default: stdout)",
     )
     export_p.add_argument(
+        "--benchmark",
+        default=None,
+        metavar="FILE",
+        help="Also render just_akash_bench_* gauges from this smoke-benchmark.jsonl",
+    )
+    export_credit_group = export_p.add_mutually_exclusive_group()
+    export_credit_group.add_argument(
         "--with-credit",
         action="store_true",
         help="Also emit just_akash_deploy_credit_usd from on-chain credit (needs AKASH_API_KEY)",
+    )
+    export_credit_group.add_argument(
+        "--credit-json",
+        default=None,
+        metavar="FILE",
+        help="Also emit just_akash_deploy_credit_usd from a `balance --check --json` "
+        "snapshot file (no API key needed)",
     )
 
     # ── status ─────────────────────────────────────────
@@ -902,7 +916,15 @@ def main():
     elif args.command == "export-metrics":
         from .prometheus_exporter import run as export_metrics
 
-        sys.exit(export_metrics(args.jsonl, output=args.output, with_credit=args.with_credit))
+        sys.exit(
+            export_metrics(
+                args.jsonl,
+                output=args.output,
+                with_credit=args.with_credit,
+                benchmark_path=args.benchmark,
+                credit_json=args.credit_json,
+            )
+        )
 
     # ── status ─────────────────────────────────────────
     elif args.command == "status":

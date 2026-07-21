@@ -219,3 +219,208 @@ class TestResolveDeployCredit:
             rc = px.run(str(src), output=str(out), with_credit=True)
         assert rc == 0
         assert 'just_akash_deploy_credit_usd{account="akash1me"} 42' in out.read_text()
+
+
+def _bench(provider, ts="2026-07-20T12:32:55+00:00", complete=True, **overrides):
+    """A realistic accrued smoke-benchmark.jsonl row (values from a live grade)."""
+    r = {
+        "ts": ts,
+        "provider": provider,
+        "complete": complete,
+        "cpu_eps": "787.79",
+        "cpu_samples": "781.22 793.84 777.73 773.39 786.99",
+        "thr_pre": "1",
+        "thr_post": "6",
+        "thrus_pre": "625",
+        "thrus_post": "14396",
+        "steal_pre": "0",
+        "steal_post": "0",
+        "cputot_pre": "43184696563",
+        "cputot_post": "43184718002",
+        "cpu_psi_load": "avg10=15.63",
+        "mem_bw": "7320.98 MiB/sec",
+        "dseq": "1784551027087",
+    }
+    if complete:
+        r["done"] = "1"
+    r.update(overrides)
+    return r
+
+
+class TestBenchmarkMetrics:
+    def test_gauges_from_a_complete_grade(self):
+        lines = px.render_benchmark_metrics([_bench("prov1")])
+        assert f"# TYPE {px.BENCH_CPU_EPS_METRIC} gauge" in lines
+        assert 'just_akash_bench_cpu_events_per_s{provider="prov1"} 787.79' in lines
+        # Fidelity deltas: 6-1 throttle events, 14396-625 usec — the honesty signals.
+        assert 'just_akash_bench_cpu_throttled_events{provider="prov1"} 5' in lines
+        assert 'just_akash_bench_cpu_throttled_usec{provider="prov1"} 13771' in lines
+        assert 'just_akash_bench_steal_pct{provider="prov1"} 0' in lines
+        assert 'just_akash_bench_cpu_psi_load{provider="prov1"} 15.63' in lines
+        # Throttled during a single-threaded run => under-delivering verdict.
+        assert 'just_akash_bench_under_delivering{provider="prov1"} 1' in lines
+        assert 'just_akash_bench_mem_bandwidth_mib_s{provider="prov1"} 7320.98' in lines
+        assert any(
+            ln.startswith('just_akash_bench_last_run_timestamp{provider="prov1"}') for ln in lines
+        )
+
+    def test_stability_matches_the_benchmark_modules_own_math(self):
+        from just_akash import benchmark
+
+        row = _bench("prov1")
+        expected_cv = benchmark.stability(row)["cpu_cv_pct"]
+        lines = px.render_benchmark_metrics([row])
+        got = next(ln for ln in lines if ln.startswith(px.BENCH_CPU_CV_METRIC + "{"))
+        assert float(got.split()[-1]) == expected_cv
+        # A steady grade (cv ~1%) reads stable.
+        assert 'just_akash_bench_cpu_unstable{provider="prov1"} 0' in lines
+
+    def test_incomplete_grade_is_never_exported(self):
+        # No BENCH-done — a cut-short partial sample must not become the gauge.
+        lines = px.render_benchmark_metrics([_bench("prov1", complete=False)])
+        assert lines == []
+
+    def test_latest_complete_grade_wins(self):
+        old = _bench("prov1", ts="2026-07-01T00:00:00+00:00", cpu_eps="100")
+        new = _bench("prov1", ts="2026-07-19T00:00:00+00:00", cpu_eps="900")
+        newer_but_incomplete = _bench(
+            "prov1", ts="2026-07-20T00:00:00+00:00", cpu_eps="1", complete=False
+        )
+        lines = px.render_benchmark_metrics([new, old, newer_but_incomplete])
+        assert 'just_akash_bench_cpu_events_per_s{provider="prov1"} 900' in lines
+
+    def test_absent_inputs_stay_absent_not_zero(self):
+        # Only cpu_eps was measurable: no honesty inputs, <2 stability samples.
+        row = {"ts": "2026-07-20T00:00:00+00:00", "provider": "p", "done": "1", "cpu_eps": "500"}
+        lines = px.render_benchmark_metrics([row])
+        assert 'just_akash_bench_cpu_events_per_s{provider="p"} 500' in lines
+        # under_delivering unmeasured (no throttle/steal/psi input) — absent, not 0.
+        assert not any(px.BENCH_UNDER_DELIVERING_METRIC in ln for ln in lines)
+        assert not any(px.BENCH_CPU_CV_METRIC in ln for ln in lines)
+        assert not any(px.BENCH_CPU_UNSTABLE_METRIC in ln for ln in lines)
+
+    def test_render_metrics_includes_bench_only_when_given(self):
+        recs = [_rec("p", "deploy", "PASS", 1)]
+        assert px.BENCH_CPU_EPS_METRIC not in px.render_metrics(recs)
+        text = px.render_metrics(recs, benchmark_records=[_bench("p")])
+        assert px.BENCH_CPU_EPS_METRIC in text
+
+    def test_run_with_benchmark_file(self, tmp_path):
+        src = tmp_path / "t.jsonl"
+        src.write_text(json.dumps(_rec("p", "deploy", "PASS", 10)) + "\n")
+        bench = tmp_path / "b.jsonl"
+        bench.write_text(json.dumps(_bench("p")) + "\n")
+        out = tmp_path / "smoke.prom"
+        assert px.run(str(src), output=str(out), benchmark_path=str(bench)) == 0
+        assert px.BENCH_CPU_EPS_METRIC in out.read_text()
+
+    def test_run_with_missing_benchmark_file_still_renders(self, tmp_path, capsys):
+        src = tmp_path / "t.jsonl"
+        src.write_text(json.dumps(_rec("p", "deploy", "PASS", 10)) + "\n")
+        out = tmp_path / "smoke.prom"
+        rc = px.run(str(src), output=str(out), benchmark_path=str(tmp_path / "nope.jsonl"))
+        assert rc == 0  # optional stream: its absence never sinks the export
+        assert px.OUTCOME_METRIC in out.read_text()
+        assert "skipping benchmark file" in capsys.readouterr().err
+
+
+class TestCreditJson:
+    def test_loads_balance_check_snapshot(self, tmp_path):
+        f = tmp_path / "credit.json"
+        f.write_text(
+            json.dumps(
+                {
+                    "check": "deploy_credit",
+                    "status": "OK",
+                    "account": "akash1me",
+                    "deploy_credit_usd": 170.62,
+                    "min_usd": 0.0,
+                }
+            )
+        )
+        assert px.load_credit_json(str(f)) == ("akash1me", 170.62)
+
+    def test_malformed_snapshot_returns_none_and_warns(self, tmp_path, capsys):
+        f = tmp_path / "credit.json"
+        f.write_text('{"account": 42}')
+        assert px.load_credit_json(str(f)) is None
+        assert "unusable credit snapshot" in capsys.readouterr().err
+
+    def test_missing_snapshot_returns_none(self, tmp_path, capsys):
+        assert px.load_credit_json(str(tmp_path / "nope.json")) is None
+        assert "unusable credit snapshot" in capsys.readouterr().err
+
+    def test_run_with_credit_json_emits_gauge_without_api_key(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("AKASH_API_KEY", raising=False)
+        src = tmp_path / "t.jsonl"
+        src.write_text(json.dumps(_rec("p", "deploy", "PASS", 10)) + "\n")
+        f = tmp_path / "credit.json"
+        f.write_text(json.dumps({"account": "akash1me", "deploy_credit_usd": 42.0}))
+        out = tmp_path / "smoke.prom"
+        assert px.run(str(src), output=str(out), credit_json=str(f)) == 0
+        assert 'just_akash_deploy_credit_usd{account="akash1me"} 42' in out.read_text()
+
+    def test_cli_rejects_both_credit_sources(self, tmp_path):
+        src = tmp_path / "t.jsonl"
+        src.write_text(json.dumps(_rec("p", "deploy", "PASS", 10)) + "\n")
+        try:
+            px.main([str(src), "--with-credit", "--credit-json", "x.json"])
+        except SystemExit as e:
+            assert e.code == 2  # argparse mutual-exclusion error
+        else:
+            raise AssertionError("expected SystemExit")
+
+    def test_main_with_benchmark_and_credit_json(self, tmp_path, capsys):
+        src = tmp_path / "t.jsonl"
+        src.write_text(json.dumps(_rec("p", "deploy", "PASS", 10)) + "\n")
+        bench = tmp_path / "b.jsonl"
+        bench.write_text(json.dumps(_bench("p")) + "\n")
+        credit = tmp_path / "credit.json"
+        credit.write_text(json.dumps({"account": "akash1me", "deploy_credit_usd": 7.5}))
+        rc = px.main([str(src), "--benchmark", str(bench), "--credit-json", str(credit)])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert px.BENCH_CPU_EPS_METRIC in out
+        assert 'just_akash_deploy_credit_usd{account="akash1me"} 7.5' in out
+
+
+class TestBenchmarkPoisonRows:
+    """One type-drifted row on the append-only branch must never freeze the export
+    (the accrued file is re-read in FULL every run, so a raising row would poison
+    every future render, not just one)."""
+
+    def test_numeric_and_list_fields_degrade_to_unmeasured(self, capsys):
+        poisoned = _bench(
+            "prov1",
+            cpu_eps=900.5,  # JSON number, not the writer's string
+            cpu_samples=[781.2, 793.8],  # JSON array
+            cpu_psi_load={"avg10": 15.63},  # even a dict must not raise
+        )
+        lines = px.render_benchmark_metrics([poisoned])
+        # Stringified number is salvaged; un-stringifiable fields read unmeasured.
+        assert 'just_akash_bench_cpu_events_per_s{provider="prov1"} 900.5' in lines
+        assert not any(px.BENCH_CPU_CV_METRIC in ln for ln in lines)
+        assert not any(px.BENCH_PSI_METRIC in ln for ln in lines)
+        # The honest string fields still render.
+        assert 'just_akash_bench_steal_pct{provider="prov1"} 0' in lines
+
+    def test_poisoned_provider_never_hides_a_healthy_one(self):
+        healthy = _bench("prov-ok")
+        poisoned = {"provider": "prov-bad", "done": "1", "ts": 12345, "cpu_eps": ["x"]}
+        lines = px.render_benchmark_metrics([poisoned, healthy])
+        assert 'just_akash_bench_cpu_events_per_s{provider="prov-ok"} 787.79' in lines
+
+    def test_full_render_survives_a_poisoned_jsonl(self, tmp_path):
+        src = tmp_path / "t.jsonl"
+        src.write_text(json.dumps(_rec("p", "deploy", "PASS", 10)) + "\n")
+        bench = tmp_path / "b.jsonl"
+        bench.write_text(
+            json.dumps(_bench("p", cpu_eps=900.5, cpu_samples=[1, 2]))
+            + "\n"
+            + json.dumps({"provider": 42, "done": "1"})  # non-string provider: skipped
+            + "\n"
+        )
+        out = tmp_path / "smoke.prom"
+        assert px.run(str(src), output=str(out), benchmark_path=str(bench)) == 0
+        body = out.read_text()
+        assert px.OUTCOME_METRIC in body  # the primary stream always renders
