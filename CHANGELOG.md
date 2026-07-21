@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.36.0] — 2026-07-21
+
+### Added
+- **`cleanup_stale` — an on-demand escrow reaper for leaked test deployments.** Every active deployment holds its deposit in escrow against the deploy-credit grant; leaked test deployments starve the account until deploys 402 (measured today: ~$191 of a $246 grant locked, free credit under the $5 deposit floor — e2e red for hours). The daily smoke's sweep only reaps `{probe}`-service deployments, so e2e leftovers (service `backtest`) accumulate with no reaper. `uv run python -m just_akash.cleanup_stale` prints a per-deployment verdict table (dseq age from the ms-epoch dseq, service set, verdict) plus granted/locked/FREE credit; `--execute` closes ONLY the unambiguous test residue: `{probe}` older than 1h, `{backtest}` older than 48h. Real/unknown services (`node`, `runner`, `train`, …), empty service sets, and unknown ages are always left alone — same fail-safe posture as the smoke sweep. Ships with a `workflow_dispatch` workflow (`cleanup-stale.yml`, dry-run by default, serialized with the smoke via the shared concurrency group) so the reaper runs where the API key already lives.
+
 ## [1.35.0] — 2026-07-21
 
 ### Added

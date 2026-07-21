@@ -1,0 +1,49 @@
+name: Cleanup stale deployments
+
+# On-demand escrow reaper: closes leaked TEST deployments (smoke probes older
+# than 1h, e2e `backtest` workloads older than 48h) on the CI Console account.
+# Every active deployment holds its deposit in escrow against the deploy-credit
+# grant; leaks starve the account until deploys 402 (2026-07-21: ~$191 of $246
+# locked, e2e red for hours). The daily smoke's sweep only reaps `probe`-service
+# deployments — this catches the rest. Classification is conservative: anything
+# not positively identified as test residue is left alone and listed in the log.
+#
+# Dry-run by default. Dispatch once with execute=false, review the verdict
+# table in the log, then dispatch again with execute=true.
+
+on:
+  workflow_dispatch:
+    inputs:
+      execute:
+        description: "Actually close the stale deployments (false = dry-run report)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Never overlap with a live smoke run: the smoke holds young probes that the
+# age floors already spare, but serializing removes even the theoretical race.
+concurrency:
+  group: provider-smoke
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    name: ${{ inputs.execute && 'Close stale deployments' || 'Dry-run stale report' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: uv sync
+      - name: Inventory / cleanup
+        env:
+          AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
+        run: uv run python -m just_akash.cleanup_stale ${{ inputs.execute && '--execute' || '' }}
