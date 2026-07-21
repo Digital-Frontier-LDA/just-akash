@@ -772,7 +772,7 @@ def main():
         import json
 
         from . import chain
-        from .api import AkashConsoleAPI
+        from .api import AkashConsoleAPI, escrow_locked
 
         try:
             client = AkashConsoleAPI(_require_api_key())
@@ -788,8 +788,17 @@ def main():
                 if args.min_usd is None:
                     print("Error: balance --check requires --min-usd N", file=sys.stderr)
                     sys.exit(2)
-                uact = chain.deploy_credit(address).get("uact", 0)
-                usd = chain.usd_estimate("uact", uact) or 0.0
+                granted_uact = chain.deploy_credit(address).get("uact", 0)
+                # Check FREE credit, not the grant. Every active deployment holds a
+                # deposit in escrow against the same grant, so the grant alone reads
+                # "healthy" while Console is already returning 402 (measured: 165 of
+                # 170.62 ACT locked -> a 5 ACT deploy failed). Free is what decides
+                # whether the next deploy succeeds, so that is what the alarm gates on.
+                locked_uact = escrow_locked(client)["locked_uact"]
+                free_uact = max(granted_uact - locked_uact, 0)
+                granted_usd = chain.usd_estimate("uact", granted_uact) or 0.0
+                locked_usd = chain.usd_estimate("uact", locked_uact) or 0.0
+                usd = chain.usd_estimate("uact", free_uact) or 0.0
                 low = usd < args.min_usd
                 status = "LOW" if low else "OK"
                 if use_json:
@@ -799,14 +808,19 @@ def main():
                                 "check": "deploy_credit",
                                 "status": status,
                                 "account": address,
+                                # free_usd is the gating value; the other two explain it.
                                 "deploy_credit_usd": usd,
+                                "free_usd": usd,
+                                "granted_usd": granted_usd,
+                                "locked_in_escrow_usd": locked_usd,
                                 "min_usd": args.min_usd,
                             }
                         )
                     )
                 else:
                     print(
-                        f"CREDIT-CHECK status={status} deploy_credit_usd={usd:.2f} "
+                        f"CREDIT-CHECK status={status} free_usd={usd:.2f} "
+                        f"(granted={granted_usd:.2f} locked_in_escrow={locked_usd:.2f}) "
                         f"min_usd={args.min_usd:.2f} account={address}"
                     )
                 sys.exit(1 if low else 0)
@@ -815,9 +829,17 @@ def main():
             # grants this account an escrow DepositAuthorization whose spend_limits is
             # what's left to spend. Liquid bank balance is usually empty (funds live as
             # the grant, not AKT). Both are read straight from the public chain.
-            credit = chain.describe_coins(chain.deploy_credit(address))
+            granted = chain.deploy_credit(address)
+            credit = chain.describe_coins(granted)
             liquid = chain.describe_coins(chain.bank_balances(address))
             grant = chain.credit_grant_detail(address)
+            # The grant is what Console AUTHORIZED; active deployments hold deposits
+            # in escrow against it. free = granted - locked is what actually decides
+            # whether the next deploy succeeds (see escrow_locked's docstring).
+            locked_info = escrow_locked(client)
+            granted_uact = granted.get("uact", 0)
+            locked_uact = locked_info["locked_uact"]
+            free_uact = max(granted_uact - locked_uact, 0)
 
             if use_json:
                 print(
@@ -825,6 +847,11 @@ def main():
                         {
                             "account": address,
                             "deploy_credit": credit,
+                            "granted_uact": granted_uact,
+                            "locked_in_escrow_uact": locked_uact,
+                            "free_uact": free_uact,
+                            "free_usd": chain.usd_estimate("uact", free_uact),
+                            "active_deployments": locked_info["deployments"],
                             "liquid": liquid,
                             "credit_grant": grant,
                             "rest_url": chain.rest_url(),
@@ -838,9 +865,25 @@ def main():
                 if credit:
                     lead = credit[0]
                     usd = f"  (≈ ${lead['usd_estimate']:,.2f})" if lead["usd_estimate"] else ""
-                    print(f"  deploy credit:  {lead['display']}{usd}")
+                    print(f"  deploy credit:  {lead['display']}{usd}   (granted)")
                     for row in credit[1:]:
                         print(f"                  {row['display']}")
+                    # Free is the number that predicts whether the next deploy works.
+                    free_usd = chain.usd_estimate("uact", free_uact) or 0.0
+                    n = locked_info["deployments"]
+                    print(
+                        f"  in escrow:      {chain.format_amount('uact', locked_uact)}"
+                        f"   ({n} active deployment{'s' if n != 1 else ''})"
+                    )
+                    print(
+                        f"  FREE to spend:  {chain.format_amount('uact', free_uact)}"
+                        f"  (≈ ${free_usd:,.2f})"
+                    )
+                    if locked_info["unreadable"]:
+                        print(
+                            f"                  note: {locked_info['unreadable']} deployment(s) "
+                            "unreadable — locked is a lower bound, free an upper bound"
+                        )
                 else:
                     print("  deploy credit:  none (no DepositAuthorization grant found)")
                 if liquid:
