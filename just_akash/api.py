@@ -822,6 +822,53 @@ def _format_hours(hours: float) -> str:
     return f"~{hours * 60:.0f} minutes"
 
 
+def escrow_locked(client: "AkashConsoleAPI") -> dict[str, Any]:
+    """How much of the deploy credit is already committed to active deployments.
+
+    The grant (``chain.deploy_credit``) is what Console AUTHORIZED, not what is
+    SPENDABLE: every active deployment holds a deposit in escrow against that same
+    grant. Measured live — 28 active deployments held 165 of a 170.62 ACT grant, so
+    Console returned HTTP 402 "Insufficient balance" on a 5 ACT deploy while the
+    grant still read 170.62. Reporting the grant alone therefore says "healthy" at
+    the exact moment deploys start failing; free = grant - locked is the actionable
+    number.
+
+    Returns ``{"locked_uact", "deployments", "by_deployment"}``. Best-effort per
+    deployment: a deployment whose detail cannot be read is skipped rather than
+    aborting the whole tally (the sum is then a lower bound, flagged by
+    ``unreadable``).
+    """
+    locked = 0
+    rows: list[dict[str, Any]] = []
+    unreadable = 0
+    for d in client.list_deployments():
+        dseq = _extract_dseq(d)
+        if not dseq:
+            continue
+        try:
+            detail = client.get_deployment(dseq)
+        except RuntimeError:
+            unreadable += 1
+            continue
+        escrow_account = detail.get("escrow_account") or {}
+        state = (escrow_account.get("state") or {}) if isinstance(escrow_account, dict) else {}
+        funds = state.get("funds") or []
+        amount = 0
+        for f in funds if isinstance(funds, list) else []:
+            if not isinstance(f, dict) or f.get("denom") != "uact":
+                continue
+            with contextlib.suppress(TypeError, ValueError):
+                amount += int(str(f.get("amount", "0")).split(".", 1)[0])
+        locked += amount
+        rows.append({"dseq": str(dseq), "escrow_uact": amount})
+    return {
+        "locked_uact": locked,
+        "deployments": len(rows),
+        "unreadable": unreadable,
+        "by_deployment": rows,
+    }
+
+
 def compute_lease_runway(
     client: "AkashConsoleAPI", dseq: str, block_time_s: float = 6.0
 ) -> dict[str, Any]:

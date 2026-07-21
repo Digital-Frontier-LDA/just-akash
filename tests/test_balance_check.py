@@ -84,7 +84,13 @@ class TestBalanceCheck:
         assert code == 1
         out = capsys.readouterr().out
         assert "CREDIT-CHECK status=LOW" in out
-        assert "deploy_credit_usd=10.00" in out
+        # The gating value is FREE credit (granted minus escrow held by active
+        # deployments), not the grant — the grant reads "healthy" while Console is
+        # already returning 402. The breakdown is printed alongside so an operator
+        # can see WHY free is low.
+        assert "free_usd=10.00" in out
+        assert "granted=10.00" in out
+        assert "locked_in_escrow=0.00" in out
         assert "min_usd=50.00" in out
 
     def test_check_without_min_usd_exits_two(self, monkeypatch, capsys):
@@ -95,3 +101,72 @@ class TestBalanceCheck:
         )
         assert code == 2
         assert "requires --min-usd" in capsys.readouterr().err
+
+
+class TestCheckGatesOnFreeNotGrant:
+    """The alarm must gate on FREE credit (granted - escrow held by active
+    deployments), not the grant.
+
+    Measured regression: 28 active deployments held 165 of a 170.62 ACT grant, so
+    Console returned HTTP 402 "Insufficient balance" on a 5 ACT deploy while the
+    grant still read 170.62 — the old check reported OK at the exact moment deploys
+    were failing.
+    """
+
+    def _run(self, monkeypatch, argv, credit, deployments):
+        monkeypatch.setenv("AKASH_API_KEY", "test-key")
+        monkeypatch.setattr(sys, "argv", argv)
+        with (
+            patch("just_akash.api.AkashConsoleAPI") as MockAPI,
+            patch("just_akash.chain.deploy_credit", return_value=credit),
+        ):
+            client = MockAPI.return_value
+            client.account_address.return_value = "akash1me"
+            client.list_deployments.return_value = deployments
+            client.get_deployment.side_effect = lambda dseq: next(
+                (d for d in deployments if d["dseq"] == str(dseq)), {}
+            )
+            from just_akash.cli import main
+
+            with pytest.raises(SystemExit) as exc:
+                main()
+        return exc.value.code
+
+    @staticmethod
+    def _dep(dseq, uact):
+        return {
+            "deployment": {"state": "active", "dseq": str(dseq)},
+            "dseq": str(dseq),
+            "escrow_account": {"state": {"funds": [{"amount": str(uact), "denom": "uact"}]}},
+        }
+
+    def test_low_when_escrow_locks_the_grant(self, monkeypatch, capsys):
+        """Grant 170.62 ACT (over the 100 threshold) but 165 locked -> free 5.62 -> LOW.
+        The OLD behaviour reported OK here; that was the bug."""
+        deps = [self._dep(i, 5_000_000) for i in range(33)]  # 165 ACT locked
+        code = self._run(
+            monkeypatch,
+            ["just-akash", "balance", "--check", "--min-usd", "100"],
+            {"uact": 170_623_558},
+            deps,
+        )
+        out = capsys.readouterr().out
+        assert code == 1, "must FAIL: only 5.62 ACT is actually spendable"
+        assert '"status": "LOW"' in out
+        assert '"free_usd": 5.62' in out
+        assert '"granted_usd": 170.62' in out  # the misleading number, kept for context
+        assert '"locked_in_escrow_usd": 165.0' in out
+
+    def test_ok_when_escrow_is_released(self, monkeypatch, capsys):
+        """Same grant, escrow released -> free is high -> OK. Confirms the check is
+        not simply always-LOW."""
+        code = self._run(
+            monkeypatch,
+            ["just-akash", "balance", "--check", "--min-usd", "100"],
+            {"uact": 170_623_558},
+            [self._dep(1, 5_000_000)],
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert '"status": "OK"' in out
+        assert '"free_usd": 165.62' in out
