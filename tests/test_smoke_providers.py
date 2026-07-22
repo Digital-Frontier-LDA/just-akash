@@ -1981,6 +1981,14 @@ class TestMatrixTimings:
         for bad in (None, "abc", -1, True):
             assert sp._fmt_latency(bad) == ""
 
+    def test_non_finite_latency_renders_blank(self):
+        """NaN and infinities arrive from arbitrary JSON in the telemetry records
+        and slip past a `< 0` guard (NaN compares False to everything), rendering
+        as 'nans'/'infs'. A latency we cannot state is a blank cell."""
+        assert sp._fmt_latency(float("nan")) == ""
+        assert sp._fmt_latency(float("inf")) == ""
+        assert sp._fmt_latency(float("-inf")) == ""
+
     def test_timing_appears_next_to_the_outcome(self, capsys):
         rows = {self.PROV: {"exec": "PASS"}}
         records = [{"provider": self.PROV, "feature": "exec", "latency_ms": 1600}]

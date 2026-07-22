@@ -1821,7 +1821,10 @@ def smoke_provider(
 def _fmt_latency(ms: object) -> str:
     """A latency in ms as a compact cell suffix ('354ms', '1.6s'), or '' when the
     feature was never reached (skips carry no latency)."""
-    if isinstance(ms, bool) or not isinstance(ms, (int, float)) or ms < 0:
+    # NaN/inf reach here from arbitrary JSON in the telemetry records, and both
+    # slip past `ms < 0` (NaN compares False to everything) to render as "nans"
+    # / "infs". A latency we cannot state is a blank cell, like any other.
+    if isinstance(ms, bool) or not isinstance(ms, (int, float)) or not math.isfinite(ms) or ms < 0:
         return ""
     return f"{int(ms)}ms" if ms < 1000 else f"{ms / 1000:.1f}s"
 
