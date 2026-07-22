@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.39.0] — 2026-07-22
+
+### Added
+- **CI now enforces the two repo invariants that kept silently regressing.** New `.github/scripts/check_repo_invariants.py`, wired into the Secret Scan workflow as a fast dependency-free gate. (1) **SOPS is the only secret channel** — the v1.35.0 migration left `SOPS_AGE_KEY` as the sole GitHub secret, but two later PRs re-added a direct `secrets.AKASH_API_KEY` (once in the Prometheus work, once in `cleanup-stale`, fixed by #92), each caught by hand *after* merge. A direct reference is ordinary-looking YAML and it works, so the migration erodes one workflow at a time with nothing to surface it; the guard now fails the build, naming the file, line, and the `sops-env` action to use instead. It matches only inside `${{ }}` expressions, so the detect-secrets baseline *filename* (`.secrets.baseline`, which appears in these workflows) can't trigger a false alarm, and it allows `GITHUB_TOKEN`, which is auto-provisioned per job and could never live in SOPS. (2) **The changelog stays coherent** — versions must be unique, strictly descending, and match `pyproject.toml`; a merge had already left main with two `## [1.37.0]` sections, the stray one sitting below 1.36.1. Every check is pinned by a test built from the regression that actually happened, plus one that asserts this repo satisfies the rules it enforces.
+
 ## [1.38.0] — 2026-07-22
 
 ### Added
