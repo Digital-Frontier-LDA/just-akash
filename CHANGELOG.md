@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.40.0] — 2026-07-22
+
+### Added
+- **`just_akash_smoke_latest_latency_ms{provider,feature}` — per-run timing for SPC/drift charting.** The cumulative p50/p95/p99 summary smooths every new run into all of history, so a feature quietly getting slower is invisible until it breaches a static ceiling. This gauge carries the most recent PASSING run's latency per (provider, feature) — one point per smoke run — so Prometheus retention becomes an individuals (XmR) series a statistical-process-control panel can put control limits around. PASS-only with last-known-good semantics: a failure's time-to-failure never pollutes the timing series (failures alert via the latest-outcome series). Downstream: the DePIN-LiveAutobidder provider dashboard's "Feature Timing Drift — SPC" row charts this with 30d ±3σ bands and a fleet-wide drift z-table.
+
 ## [1.39.0] — 2026-07-22
 
 ### Added
