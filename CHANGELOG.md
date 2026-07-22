@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.38.0] — 2026-07-22
+
+### Added
+- **The smoke matrix now shows how long each feature took, not just whether it passed.** Pass/fail is the lagging binary; latency is the leading signal — a feature that still passes but has doubled in latency is exactly the regression worth catching, and until now seeing it meant cross-referencing the accrued telemetry report in a different job. The per-run matrix renders the timing beside each outcome (`PASS 1.6s`, `PASS 267ms`, `PASS 30.8s`), read back from the same telemetry records the analyzer consumes so the two can never disagree about how long something took. A **failing** feature keeps its timing ("failed after 30s" and "failed instantly" are different problems and the timing is the tell); a skipped one (`NO-BID`, `-`) renders blank rather than `0ms`, which would read as instantaneous. Columns size to their widest cell so the table stays aligned as timings vary between `354ms` and `30.8s`, and the provider column now uses the same 14-character truncation as the accrued report, so a provider reads identically in both tables (the full address is still printed in the per-provider header above).
+
 ## [1.37.0] — 2026-07-21
 
 ### Added

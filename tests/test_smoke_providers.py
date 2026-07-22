@@ -1951,3 +1951,79 @@ class TestShimSurveyCapture:
         indistinguishable from a pre-instrumentation record."""
         recs = sp._provider_records("akash1a", "111", {"exec": "PASS"}, {"exec": 10})
         assert all("exit_code_shapes" not in r for r in recs)
+
+
+class TestMatrixTimings:
+    """The run matrix shows how long each feature took, not just pass/fail.
+
+    Pass/fail is the lagging binary; the timing is the leading signal — a feature
+    that still passes but has doubled in latency is the regression you want to see
+    in the table you actually read, without cross-referencing the accrued report.
+    """
+
+    PROV = "akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk"
+
+    def _render(self, capsys, rows, records):
+        sp._print_matrix(rows, records)
+        # Strip ANSI so assertions are about content, not colour codes.
+        import re
+
+        return re.sub(r"\x1b\[[0-9;]*m", "", capsys.readouterr().out)
+
+    def test_sub_second_is_ms_and_over_is_seconds(self):
+        assert sp._fmt_latency(267) == "267ms"
+        assert sp._fmt_latency(1600) == "1.6s"
+        assert sp._fmt_latency(30800) == "30.8s"
+
+    def test_missing_or_bogus_latency_renders_blank(self):
+        """A feature that was never reached has no timing — it must render empty
+        rather than '0ms', which would read as 'instantaneous'."""
+        for bad in (None, "abc", -1, True):
+            assert sp._fmt_latency(bad) == ""
+
+    def test_timing_appears_next_to_the_outcome(self, capsys):
+        rows = {self.PROV: {"exec": "PASS"}}
+        records = [{"provider": self.PROV, "feature": "exec", "latency_ms": 1600}]
+        assert "PASS 1.6s" in self._render(capsys, rows, records)
+
+    def test_failure_keeps_its_timing(self, capsys):
+        """'failed after 30s' and 'failed instantly' are different problems and the
+        timing is the tell — so a FAIL must not drop its latency."""
+        rows = {self.PROV: {"update": "FAIL"}}
+        records = [{"provider": self.PROV, "feature": "update", "latency_ms": 30800}]
+        assert "FAIL 30.8s" in self._render(capsys, rows, records)
+
+    def test_skipped_feature_shows_no_timing(self, capsys):
+        rows = {self.PROV: {"deploy": "NO-BID"}}
+        records = [{"provider": self.PROV, "feature": "deploy", "latency_ms": None}]
+        out = self._render(capsys, rows, records)
+        assert "NO-BID" in out and "0ms" not in out
+
+    def test_matrix_still_renders_without_records(self, capsys):
+        """Timings are additive: the matrix must degrade to outcomes alone rather
+        than break if it is ever called without telemetry records."""
+        rows = {self.PROV: dict.fromkeys(sp.FEATURES, "PASS")}
+        out = self._render(capsys, rows, None)
+        assert "PASS" in out
+
+    def test_provider_label_matches_the_accrued_report(self, capsys):
+        """Same 14-char truncation the accrued telemetry report uses, so a provider
+        reads identically in both tables."""
+        rows = {self.PROV: {"exec": "PASS"}}
+        out = self._render(capsys, rows, [])
+        assert "akash1hgulk6ae" in out
+        assert self.PROV not in out  # not the full 44-char address
+
+    def test_columns_stay_aligned_when_timings_differ_in_width(self, capsys):
+        """354ms and 30.8s are different widths; the column must size to the widest
+        cell or the table shears."""
+        rows = {self.PROV: {"ingress": "PASS", "update": "PASS"}}
+        records = [
+            {"provider": self.PROV, "feature": "ingress", "latency_ms": 354},
+            {"provider": self.PROV, "feature": "update", "latency_ms": 30800},
+        ]
+        lines = [ln for ln in self._render(capsys, rows, records).splitlines() if ln.strip()]
+        header = next(ln for ln in lines if ln.startswith("provider"))
+        row = next(ln for ln in lines if ln.startswith("akash1"))
+        assert len(header) == len(row.rstrip()) or len(row.rstrip()) <= len(header)
+        assert "PASS 354ms" in row and "PASS 30.8s" in row
