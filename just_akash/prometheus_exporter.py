@@ -64,6 +64,7 @@ OUTCOME_METRIC = "just_akash_smoke_outcome_total"
 LATENCY_METRIC = "just_akash_smoke_latency_ms"
 LAST_RUN_METRIC = "just_akash_smoke_last_run_timestamp"
 LATEST_OUTCOME_METRIC = "just_akash_smoke_latest_outcome_info"
+LATEST_LATENCY_METRIC = "just_akash_smoke_latest_latency_ms"
 CREDIT_METRIC = "just_akash_deploy_credit_usd"
 
 # Benchmark gauge families (hardware-quality grades from smoke-benchmark.jsonl).
@@ -237,6 +238,51 @@ def render_latest_outcomes(records: list[dict]) -> list[str]:
             f'outcome="{_escape_label_value(outcome)}"'
         )
         lines.append(f"{LATEST_OUTCOME_METRIC}{{{labels}}} 1")
+    return lines
+
+
+def render_latest_latencies(records: list[dict]) -> list[str]:
+    """``just_akash_smoke_latest_latency_ms{provider,feature}`` — the most recent
+    PASSING run's latency per (provider, feature).
+
+    The raw material for statistical-process-control charting: one point per
+    smoke run, so Prometheus's own history becomes an individuals (XmR) series
+    a control-chart panel can put limits around — drift in a feature's timing
+    ("something in the code or the machine got slower") shows as points walking
+    outside the training-window band. The cumulative percentile summary can't
+    do this: it smooths every new run into all of history.
+
+    PASS-only with last-known-good semantics: a FAIL/no-bid latency is a
+    time-to-failure, not the feature's cost, so on a failing run the series
+    simply holds the previous passing value (failures already alert through
+    the latest-outcome series — the timing chart should never double-report).
+    """
+    latest: dict[tuple[str, str], tuple[float, int, float]] = {}
+    for idx, r in enumerate(records):
+        if r.get("outcome") != "PASS":
+            continue
+        provider = r.get("provider")
+        feature = r.get("feature")
+        value = r.get("latency_ms")
+        if not provider or not feature or not _is_number(value):
+            continue
+        epoch = _parse_ts(r.get("ts")) or 0.0
+        key = (str(provider), str(feature))
+        if key not in latest or (epoch, idx) >= latest[key][:2]:
+            latest[key] = (epoch, idx, float(value))  # type: ignore[arg-type]
+    if not latest:
+        return []
+    lines = [
+        f"# HELP {LATEST_LATENCY_METRIC} Latency (ms) of the most recent PASSING "
+        "smoke run per (provider, feature) — one point per run, for SPC/drift "
+        "charting. Holds the last good value across failing runs.",
+        f"# TYPE {LATEST_LATENCY_METRIC} gauge",
+    ]
+    for (provider, feature), (_, _, value) in sorted(latest.items()):
+        labels = (
+            f'provider="{_escape_label_value(provider)}",feature="{_escape_label_value(feature)}"'
+        )
+        lines.append(f"{LATEST_LATENCY_METRIC}{{{labels}}} {_fmt_num(value)}")
     return lines
 
 
@@ -452,6 +498,7 @@ def render_metrics(
         render_outcome_counters(records),
         render_latest_outcomes(records),
         render_latency_summary(records),
+        render_latest_latencies(records),
         render_last_run(records),
     ]
     if benchmark_records:

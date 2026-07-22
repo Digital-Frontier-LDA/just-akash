@@ -465,3 +465,34 @@ class TestLatestOutcomes:
     def test_included_in_full_document(self):
         recs = [_rec("p", "deploy", "PASS", 500, ts="2026-07-19T07:00:00+00:00")]
         assert px.LATEST_OUTCOME_METRIC in px.render_metrics(recs)
+
+
+class TestLatestLatencies:
+    def test_latest_pass_wins_and_failures_hold_last_good(self):
+        recs = [
+            _rec("p", "deploy", "PASS", 41000, ts="2026-07-21T07:00:00+00:00"),
+            _rec("p", "deploy", "PASS", 39000, ts="2026-07-22T07:00:00+00:00"),
+            # A later FAIL must NOT overwrite the last good timing (time-to-failure
+            # is not the feature's cost) — the series holds 39000.
+            _rec("p", "deploy", "FAIL", 5000, ts="2026-07-22T09:00:00+00:00"),
+        ]
+        lines = px.render_latest_latencies(recs)
+        assert f"# TYPE {px.LATEST_LATENCY_METRIC} gauge" in lines
+        assert 'just_akash_smoke_latest_latency_ms{provider="p",feature="deploy"} 39000' in lines
+        assert not any(" 5000" in ln for ln in lines)
+
+    def test_never_passed_pair_is_absent(self):
+        recs = [_rec("p", "deploy", "NO-BID", None, ts="2026-07-22T07:00:00+00:00")]
+        assert [
+            ln
+            for ln in px.render_latest_latencies(recs)
+            if ln.startswith(px.LATEST_LATENCY_METRIC)
+        ] == []
+
+    def test_bool_latency_never_sneaks_in(self):
+        recs = [_rec("p", "exec", "PASS", True, ts="2026-07-22T07:00:00+00:00")]
+        assert px.render_latest_latencies(recs) == []
+
+    def test_included_in_full_document(self):
+        recs = [_rec("p", "deploy", "PASS", 500, ts="2026-07-19T07:00:00+00:00")]
+        assert px.LATEST_LATENCY_METRIC in px.render_metrics(recs)
