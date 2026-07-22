@@ -853,7 +853,10 @@ class TestListDeploymentsFailsLoud:
     @patch.object(AkashConsoleAPI, "_request")
     def test_hitting_the_ceiling_warns(self, mock_req, capsys):
         """At the ceiling, truncated and complete are indistinguishable — say so."""
-        rows = [{"deployment": {"state": "active"}, "dseq": str(i)} for i in range(AkashConsoleAPI.LIST_LIMIT)]
+        rows = [
+            {"deployment": {"state": "active"}, "dseq": str(i)}
+            for i in range(AkashConsoleAPI.LIST_LIMIT)
+        ]
         mock_req.return_value = {"data": {"deployments": rows}}
         AkashConsoleAPI("key").list_deployments(active_only=False)
         assert "may be TRUNCATED" in capsys.readouterr().err
