@@ -113,7 +113,7 @@ jobs:
         run: uv sync --dev
 
       - name: Install just
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.83.2
         with:
           tool: just
 
@@ -155,7 +155,7 @@ jobs:
         run: uv sync --dev
 
       - name: Install just
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.83.2
         with:
           tool: just
 
