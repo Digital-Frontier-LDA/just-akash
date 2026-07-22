@@ -1818,20 +1818,65 @@ def smoke_provider(
             )
 
 
-def _print_matrix(rows: dict) -> None:
+def _fmt_latency(ms: object) -> str:
+    """A latency in ms as a compact cell suffix ('354ms', '1.6s'), or '' when the
+    feature was never reached (skips carry no latency)."""
+    # NaN/inf reach here from arbitrary JSON in the telemetry records, and both
+    # slip past `ms < 0` (NaN compares False to everything) to render as "nans"
+    # / "infs". A latency we cannot state is a blank cell, like any other.
+    if isinstance(ms, bool) or not isinstance(ms, (int, float)) or not math.isfinite(ms) or ms < 0:
+        return ""
+    return f"{int(ms)}ms" if ms < 1000 else f"{ms / 1000:.1f}s"
+
+
+def _latency_index(records: list | None) -> dict[tuple[str, str], object]:
+    """``(provider, feature) -> latency_ms`` from the telemetry records.
+
+    Read back from the records rather than threaded separately so the matrix and
+    the telemetry can never disagree about how long something took — they are
+    literally the same numbers.
+    """
+    index: dict[tuple[str, str], object] = {}
+    for rec in records or []:
+        if not isinstance(rec, dict):
+            continue
+        provider, feature = rec.get("provider"), rec.get("feature")
+        if isinstance(provider, str) and isinstance(feature, str):
+            index[(provider, feature)] = rec.get("latency_ms")
+    return index
+
+
+def _print_matrix(rows: dict, records: list | None = None) -> None:
     _hdr("SMOKE TEST MATRIX")
-    wp = max((len(p) for p in rows), default=10)
-    header = f"{'provider'.ljust(wp)}  " + " ".join(f.ljust(8) for f in FEATURES)
+    latencies = _latency_index(records)
+    # Truncate to the same 14 chars the accrued telemetry report uses, so a
+    # provider reads identically in both tables. The full address is printed in
+    # this run's per-provider header above, so nothing is lost.
+    label = {p: p[:14] for p in rows}
+    wp = max([len("provider")] + [len(v) for v in label.values()])
+
+    def _cell(prov: str, feat: str) -> tuple[str, str]:
+        """(text, color) for one cell — outcome plus how long it took."""
+        v = rows.get(prov, {}).get(feat, "-")
+        skips = ("-", "NO-BID", "NO-ROOM", "NO-CREDIT")
+        color = GREEN if v == "PASS" else (YELLOW if v in skips else RED)
+        # A FAILING feature keeps its latency: "failed after 45s" and "failed
+        # instantly" are different problems, and the timing is the tell.
+        t = _fmt_latency(latencies.get((prov, feat)))
+        return (f"{v} {t}" if t else v), color
+
+    # Size every column to its widest cell so the table stays aligned once the
+    # timings vary in width (354ms vs 39.4s).
+    widths = {f: max([len(f)] + [len(_cell(p, f)[0]) for p in rows] + [8]) for f in FEATURES}
+    header = f"{'provider'.ljust(wp)}  " + " ".join(f.ljust(widths[f]) for f in FEATURES)
     print(header)
     print("-" * len(header))
-    for prov, res in rows.items():
+    for prov in rows:
         cells = []
         for f in FEATURES:
-            v = res.get(f, "-")
-            skips = ("-", "NO-BID", "NO-ROOM", "NO-CREDIT")
-            color = GREEN if v == "PASS" else (YELLOW if v in skips else RED)
-            cells.append(f"{color}{v.ljust(8)}{RESET}")
-        print(f"{prov.ljust(wp)}  " + " ".join(cells))
+            text, color = _cell(prov, f)
+            cells.append(f"{color}{text.ljust(widths[f])}{RESET}")
+        print(f"{label[prov].ljust(wp)}  " + " ".join(cells))
 
 
 def _generate_keypair() -> str:
@@ -1993,7 +2038,7 @@ def main() -> int:
         if bench_file and bench_records:
             _write_telemetry(bench_file, run_ts, _pkg_version(), bench_records)
 
-    _print_matrix(rows)
+    _print_matrix(rows, records)
     print()
 
     # Insufficient credit is not a provider verdict at all — nothing was tested.
