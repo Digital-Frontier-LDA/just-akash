@@ -1,0 +1,20 @@
+# Pinning actions to SHAs without this is not a complete fix — it trades a
+# supply-chain risk for a staleness one, which is how these migrations rot. Dependabot
+# raises a PR when an upstream action publishes a new release, so a pinned SHA stays
+# current by review rather than by nobody noticing.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(actions)"
+    groups:
+      # One PR for the routine first-party bumps instead of five; a compromised or
+      # surprising update to a security-scanning action is easier to spot when it is
+      # not buried among checkout/setup-python churn.
+      github-official:
+        patterns: ["actions/*"]
