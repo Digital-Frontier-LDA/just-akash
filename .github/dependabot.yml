@@ -9,6 +9,13 @@ updates:
     schedule:
       interval: "weekly"
       day: "monday"
+    # Wait before proposing a brand-new release. The window when a compromised or
+    # accidentally-broken action version is live is also the window when nobody has
+    # looked at it yet; a week is usually enough for the ecosystem to notice. This
+    # matters more here than for library deps — a GitHub Action executes with the
+    # job's token and secrets.
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     commit-message:
       prefix: "chore(actions)"
