@@ -34,11 +34,19 @@ class TestListDeploymentsHandlesListData:
         assert result[0]["dseq"] == "1"
 
     @patch.object(AkashConsoleAPI, "_request")
-    def test_list_deployments_bare_list_response(self, mock_req):
+    def test_list_deployments_bare_list_response_now_raises(self, mock_req):
+        """A top-level bare list is an unrecognised envelope -> RAISE, not [].
+
+        This test previously asserted `result == []`, i.e. it PINNED the fail-open.
+        That is the defect: two deleting consumers read a falsy result as "nothing to
+        do", so a malformed response was indistinguishable from an empty account.
+        Measured: 7 of 25 Blazing-Back sweeper runs logged "Listed 0 active" against a
+        wallet holding 15-27 on-chain, and exited 0.
+        """
         mock_req.return_value = [{"deployment": {"state": "active"}, "dseq": "1"}]
         client = AkashConsoleAPI("key")
-        result = client.list_deployments()
-        assert result == []
+        with pytest.raises(RuntimeError, match="unexpected response type"):
+            client.list_deployments()
 
 
 class TestGetDeploymentHandlesListData:
@@ -775,10 +783,83 @@ class TestListDeploymentsFiltersNonDictEntries:
 
     @patch.object(AkashConsoleAPI, "_request")
     def test_data_contains_only_garbage(self, mock_req):
+        """A well-formed ENVELOPE whose rows are all junk is legitimately empty.
+
+        Row-level junk is dropped, not fatal — only an unrecognised envelope raises.
+        Keeping this as `== []` is the control for the raise tests below: it proves the
+        new behaviour did not become "raise on anything unusual".
+        """
         mock_req.return_value = {"data": [None, 42, True, "hello"]}
         client = AkashConsoleAPI("key")
         result = client.list_deployments()
         assert result == []
+
+
+class TestListDeploymentsFailsLoud:
+    """`[]` must mean "empty account", never "the request went wrong".
+
+    Fault injection per the honesty goal: F = a malformed envelope. Green without F
+    (well-formed response -> deployments returned), red with F (RuntimeError). Before
+    this change every case below returned `[]` and a sweeper reported "nothing to do".
+    """
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            pytest.param("server error", id="string"),
+            pytest.param(None, id="none"),
+            pytest.param(42, id="int"),
+            pytest.param([{"dseq": "1"}], id="bare-list"),
+        ],
+    )
+    @patch.object(AkashConsoleAPI, "_request")
+    def test_unrecognised_top_level_raises(self, mock_req, bad):
+        mock_req.return_value = bad
+        with pytest.raises(RuntimeError, match="unexpected response type"):
+            AkashConsoleAPI("key").list_deployments()
+
+    @patch.object(AkashConsoleAPI, "_request")
+    def test_deployments_key_not_a_list_raises(self, mock_req):
+        mock_req.return_value = {"data": {"deployments": 42}}
+        with pytest.raises(RuntimeError, match="data.deployments is int"):
+            AkashConsoleAPI("key").list_deployments()
+
+    @patch.object(AkashConsoleAPI, "_request")
+    def test_data_envelope_wrong_type_raises(self, mock_req):
+        mock_req.return_value = {"data": "oops"}
+        with pytest.raises(RuntimeError, match="data envelope is str"):
+            AkashConsoleAPI("key").list_deployments()
+
+    @patch.object(AkashConsoleAPI, "_request")
+    def test_genuinely_empty_account_does_not_raise(self, mock_req):
+        """THE CONTROL. An empty account must stay green, or the guard is useless."""
+        mock_req.return_value = {"data": {"deployments": []}}
+        assert AkashConsoleAPI("key").list_deployments() == []
+
+    @patch.object(AkashConsoleAPI, "_request")
+    def test_request_asks_for_an_explicit_limit(self, mock_req):
+        """The server's hasMore/total cannot detect truncation, so we must over-ask.
+
+        VERIFIED live: `?limit=1` returns total=1, hasMore=false while 15+ exist.
+        A bare request would silently take whatever page the server chose.
+        """
+        mock_req.return_value = {"data": {"deployments": []}}
+        AkashConsoleAPI("key").list_deployments()
+        path = mock_req.call_args[0][1]
+        assert f"limit={AkashConsoleAPI.LIST_LIMIT}" in path, (
+            f"list_deployments must request an explicit limit; asked for {path!r}"
+        )
+
+    @patch.object(AkashConsoleAPI, "_request")
+    def test_hitting_the_ceiling_warns(self, mock_req, capsys):
+        """At the ceiling, truncated and complete are indistinguishable — say so."""
+        rows = [
+            {"deployment": {"state": "active"}, "dseq": str(i)}
+            for i in range(AkashConsoleAPI.LIST_LIMIT)
+        ]
+        mock_req.return_value = {"data": {"deployments": rows}}
+        AkashConsoleAPI("key").list_deployments(active_only=False)
+        assert "may be TRUNCATED" in capsys.readouterr().err
 
 
 class TestExtractSshInfoNonIterablePorts:
@@ -2274,23 +2355,42 @@ class TestExtractLeaseProviderLeasesNone:
 
 
 class TestListDeploymentsNonListDeploymentsValue:
-    """BUG: list_deployments crashes when response["data"]["deployments"] is a
-    non-list (e.g. 42).  data.get("deployments", []) returns 42; then the
-    active_only filter iterates `for d in 42` → TypeError."""
+    """A non-list `data.deployments` (e.g. 42) must not TypeError — and must not
+    silently become an empty account either.
+
+    ORIGINAL BUG (still fixed): `data.get("deployments", [])` returned 42, then the
+    active_only filter did `for d in 42` -> TypeError.
+
+    ORIGINAL FIX, now superseded: swallow it and `return []`. That removed the crash
+    but created a worse failure — two DELETING consumers read a falsy result as
+    "nothing to do", so a malformed response was indistinguishable from an empty
+    account. Measured: 7 of 25 Blazing-Back sweeper runs logged "Listed 0 active"
+    against a wallet holding 15-27 on-chain, and exited 0.
+
+    CURRENT CONTRACT: raise RuntimeError. No TypeError (the original goal is kept)
+    AND no silent empty (the regression is closed)."""
 
     @patch.object(AkashConsoleAPI, "_request")
     def test_deployments_value_is_int(self, mock_req):
         mock_req.return_value = {"data": {"deployments": 42}}
         client = AkashConsoleAPI("key")
-        result = client.list_deployments()
-        assert result == []
+        with pytest.raises(RuntimeError, match="data.deployments is int"):
+            client.list_deployments()
 
     @patch.object(AkashConsoleAPI, "_request")
     def test_deployments_value_is_string(self, mock_req):
         mock_req.return_value = {"data": {"deployments": "oops"}}
         client = AkashConsoleAPI("key")
-        result = client.list_deployments()
-        assert result == []
+        with pytest.raises(RuntimeError, match="data.deployments is str"):
+            client.list_deployments()
+
+    @patch.object(AkashConsoleAPI, "_request")
+    def test_no_typeerror_leaks_out(self, mock_req):
+        """Pin the ORIGINAL bug too: the failure must be a clear RuntimeError, not the
+        raw TypeError from iterating a non-iterable."""
+        mock_req.return_value = {"data": {"deployments": 42}}
+        with pytest.raises(RuntimeError):
+            AkashConsoleAPI("key").list_deployments()
 
 
 class TestListDeploymentsNonDictDeploymentField:
