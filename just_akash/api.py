@@ -99,6 +99,10 @@ def _unwrap_data(response: Any) -> dict[str, Any]:
 
 
 class AkashConsoleAPI:
+    # Ceiling for list_deployments. See that method's docstring: the server's
+    # hasMore/total cannot detect truncation, so we over-ask and warn at the ceiling.
+    LIST_LIMIT = 1000
+
     """Client for Akash Console API (https://console-api.akash.network)"""
 
     def __init__(self, api_key: str, base_url: str | None = None):
@@ -178,17 +182,59 @@ class AkashConsoleAPI:
             raise RuntimeError(f"Connection error: {e}") from e
 
     def list_deployments(self, active_only: bool = True) -> list[dict[str, Any]]:
-        response = self._request("GET", "/v1/deployments")
+        """Active deployments for this API key.
+
+        An empty list means "the account is empty" and NEVER "the request went wrong".
+        Two DELETING consumers treat a falsy result as "nothing to do":
+          - Borduas-Holdings/Blazing-Back  scripts/ci_cleanup_runner_deployments.py
+          - Borduas-Holdings/blazing       scripts/akash-stale-sweep.sh
+        Measured consequence of the old fail-open (`return []` on a bad envelope):
+        7 of 25 runs of the first logged "Listed 0 active deployment(s)" against a
+        wallet on-chain holding 15-27, and exited 0 as "Nothing to do."
+
+        Raises RuntimeError on an unrecognised envelope. A loud break in two downstream
+        repos beats a silent misinterpretation in a path that deletes infrastructure.
+        Individual malformed ROWS are still dropped — only the envelope is fatal.
+
+        ⚠ `limit` is not cosmetic. The server's pagination metadata cannot detect
+        truncation — VERIFIED live: `?limit=1` returns `total=1, hasMore=false` while
+        15+ deployments exist, i.e. `total` is the RETURNED PAGE SIZE and `hasMore` is
+        always false. Do NOT replace this with a page-until-short-page loop: that is an
+        undocumented guess about server semantics, and the metadata that would justify
+        it is known-wrong. Asking for more than we ever expect to hold, and warning when
+        we hit the ceiling, is the only defence available.
+        """
+        response = self._request("GET", f"/v1/deployments?limit={self.LIST_LIMIT}")
         if not isinstance(response, dict):
-            return []
+            raise RuntimeError(
+                f"list_deployments: unexpected response type {type(response).__name__} "
+                "(expected a JSON object). Refusing to report an empty account — a "
+                "malformed response must not look like 'nothing to do' to a sweeper."
+            )
         data = response.get("data", response)
         if isinstance(data, list):
             deployments = [d for d in data if isinstance(d, dict)]
         elif isinstance(data, dict):
             raw = data.get("deployments", [])
-            deployments = raw if isinstance(raw, list) else []
+            if not isinstance(raw, list):
+                raise RuntimeError(
+                    f"list_deployments: data.deployments is {type(raw).__name__}, expected "
+                    "a list. Refusing to report an empty account."
+                )
+            deployments = [d for d in raw if isinstance(d, dict)]
         else:
-            deployments = []
+            raise RuntimeError(
+                f"list_deployments: data envelope is {type(data).__name__}, expected a list "
+                "or an object. Refusing to report an empty account."
+            )
+        if len(deployments) >= self.LIST_LIMIT:
+            # At the ceiling we cannot distinguish "exactly this many" from "truncated",
+            # because hasMore is always false. Say so rather than silently under-report.
+            print(
+                f"WARNING: list_deployments hit the limit of {self.LIST_LIMIT}; the result may be "
+                "TRUNCATED and the server's hasMore/total cannot confirm either way.",
+                file=sys.stderr,
+            )
         if active_only:
             result = []
             for d in deployments:
