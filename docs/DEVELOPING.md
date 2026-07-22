@@ -52,6 +52,19 @@ Local development still uses a plain untracked `.env` (see `.env.example`).
 `.gitignore` blocks `secrets/*.env` so a decrypted sibling can never be committed;
 only `*.sops.env` is trackable.
 
+**This is enforced, not just convention.** `.github/scripts/check_repo_invariants.py`
+fails CI if any workflow or composite action references a GitHub secret other than
+`SOPS_AGE_KEY` (or `GITHUB_TOKEN`, which is auto-provisioned per job and could never
+live in SOPS). The migration was eroded twice by PRs that re-added a direct
+`secrets.AKASH_API_KEY` — a direct reference is ordinary-looking YAML and it *works*,
+so nothing surfaced it until someone re-read the workflows. The same script checks
+that `CHANGELOG.md` versions are unique, strictly descending, and match
+`pyproject.toml` (a merge once left two `## [1.37.0]` sections). Run it locally with:
+
+```bash
+python3 .github/scripts/check_repo_invariants.py
+```
+
 ## Quality recipes (`just`)
 
 | Recipe | Does | Spend? |
