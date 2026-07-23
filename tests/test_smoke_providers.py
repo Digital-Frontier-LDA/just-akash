@@ -58,6 +58,107 @@ class TestDeployClassification:
         assert note == "deploy-failed"
 
 
+class TestNoBidChainCrossCheck:
+    """2026-07-23 single-node audit: a Console-index empty answer alone must not
+    produce a pageable NO-BID — the chain LCD gets a veto."""
+
+    # Pure "nothing bid at all" transcript — no foreign-bid evidence, so the
+    # chain cross-check must run.
+    PURE_NO_BID = (
+        "Deployment created  DSEQ=1784300000001  manifest_len=812\n"
+        "STEP 3: Polling for bids...\n"
+        "Cleaning up deployment 1784300000001 (no bids)...\n"
+        "No bids received within 180s.\n"
+    )
+
+    def _deploy_with(self, chain_verdict):
+        ref: dict = {"dseq": None}
+        with patch.object(
+            sp, "_run", return_value=_completed(self.PURE_NO_BID, returncode=1)
+        ), patch.object(sp, "_chain_bids_exist", return_value=chain_verdict) as cbe:
+            dseq, note = sp._deploy("sdl", "p", ref)
+        return dseq, note, cbe
+
+    def test_chain_shows_bids_reclassifies_as_index_lag(self):
+        dseq, note, cbe = self._deploy_with(True)
+        assert note == "bid-index-lag"
+        assert dseq is None
+        cbe.assert_called_once_with("1784300000001")
+
+    def test_chain_unreachable_is_unverified_not_no_bid(self):
+        _, note, _ = self._deploy_with(None)
+        assert note == "no-bid-unverified"
+
+    def test_chain_confirms_absence_stays_no_bid(self):
+        _, note, _ = self._deploy_with(False)
+        assert note == "no-bid"
+
+    def test_foreign_bid_evidence_skips_the_cross_check(self):
+        ref: dict = {"dseq": None}
+        out = "Received 6 bid(s) but NONE from our providers.\n"
+        with patch.object(sp, "_run", return_value=_completed(out)), patch.object(
+            sp, "_chain_bids_exist"
+        ) as cbe:
+            _, note = sp._deploy("sdl", "p", ref)
+        assert note == "no-bid"
+        cbe.assert_not_called()
+
+    def test_new_notes_map_to_skip_outcomes_not_fail(self):
+        mapping = {
+            "no-bid": "NO-BID",
+            "no-credit": "NO-CREDIT",
+            "bid-index-lag": "BID-INDEX-LAG",
+            "no-bid-unverified": "NO-BID-UNVERIFIED",
+        }
+        for note, outcome in mapping.items():
+            assert outcome not in sp._FAILING_OUTCOMES
+            assert mapping.get(note, "FAIL") == outcome
+
+
+class TestChainBidsExist:
+    def _urlopen_returning(self, payloads):
+        """Sequence of context managers whose .read feeds json.load."""
+        import io
+        import json as _json
+
+        cms = []
+        for p in payloads:
+            if isinstance(p, Exception):
+                cms.append(p)
+            else:
+                cm = MagicMock()
+                cm.__enter__ = MagicMock(
+                    return_value=io.StringIO(_json.dumps(p))
+                )
+                cm.__exit__ = MagicMock(return_value=False)
+                cms.append(cm)
+        return cms
+
+    def test_positive_bids_win_immediately(self):
+        cms = self._urlopen_returning([{"bids": [{"bid": {}}]}])
+        with patch.object(sp.urllib.request, "urlopen", side_effect=cms):
+            assert sp._chain_bids_exist("123") is True
+
+    def test_two_empty_answers_confirm_absence(self):
+        cms = self._urlopen_returning([{"bids": []}, {"bids": []}])
+        with patch.object(sp.urllib.request, "urlopen", side_effect=cms):
+            assert sp._chain_bids_exist("123") is False
+
+    def test_single_empty_plus_failure_is_unverified(self):
+        cms = self._urlopen_returning([{"bids": []}, OSError("down")])
+        with patch.object(sp.urllib.request, "urlopen", side_effect=cms):
+            assert sp._chain_bids_exist("123") is None
+
+    def test_all_endpoints_down_is_unverified(self):
+        with patch.object(
+            sp.urllib.request, "urlopen", side_effect=OSError("down")
+        ):
+            assert sp._chain_bids_exist("123") is None
+
+    def test_missing_dseq_is_unverified(self):
+        assert sp._chain_bids_exist("") is None
+
+
 class TestDeployMisreportsRegressions:
     """Two proven bugs, both of which made a HEALTHY provider look broken.
 
@@ -1771,7 +1872,12 @@ class TestNoBidPhrasingCoverage:
     """
 
     def _note(self, out: str) -> str:
-        with patch.object(sp, "_run", return_value=_completed(out, returncode=1)):
+        # Chain cross-check pinned to "confirmed absent" so these tests keep
+        # testing PHRASING recognition; the veto itself is covered in
+        # TestNoBidChainCrossCheck.
+        with patch.object(
+            sp, "_run", return_value=_completed(out, returncode=1)
+        ), patch.object(sp, "_chain_bids_exist", return_value=False):
             return sp._deploy("sdl", "p", {"dseq": None})[1]
 
     def test_no_bids_received_at_all(self):
