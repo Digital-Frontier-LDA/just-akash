@@ -73,9 +73,10 @@ class TestNoBidChainCrossCheck:
 
     def _deploy_with(self, chain_verdict):
         ref: dict = {"dseq": None}
-        with patch.object(
-            sp, "_run", return_value=_completed(self.PURE_NO_BID, returncode=1)
-        ), patch.object(sp, "_chain_bids_exist", return_value=chain_verdict) as cbe:
+        with (
+            patch.object(sp, "_run", return_value=_completed(self.PURE_NO_BID, returncode=1)),
+            patch.object(sp, "_chain_bids_exist", return_value=chain_verdict) as cbe,
+        ):
             dseq, note = sp._deploy("sdl", "p", ref)
         return dseq, note, cbe
 
@@ -96,9 +97,10 @@ class TestNoBidChainCrossCheck:
     def test_foreign_bid_evidence_skips_the_cross_check(self):
         ref: dict = {"dseq": None}
         out = "Received 6 bid(s) but NONE from our providers.\n"
-        with patch.object(sp, "_run", return_value=_completed(out)), patch.object(
-            sp, "_chain_bids_exist"
-        ) as cbe:
+        with (
+            patch.object(sp, "_run", return_value=_completed(out)),
+            patch.object(sp, "_chain_bids_exist") as cbe,
+        ):
             _, note = sp._deploy("sdl", "p", ref)
         assert note == "no-bid"
         cbe.assert_not_called()
@@ -127,9 +129,7 @@ class TestChainBidsExist:
                 cms.append(p)
             else:
                 cm = MagicMock()
-                cm.__enter__ = MagicMock(
-                    return_value=io.StringIO(_json.dumps(p))
-                )
+                cm.__enter__ = MagicMock(return_value=io.StringIO(_json.dumps(p)))
                 cm.__exit__ = MagicMock(return_value=False)
                 cms.append(cm)
         return cms
@@ -150,9 +150,7 @@ class TestChainBidsExist:
             assert sp._chain_bids_exist("123") is None
 
     def test_all_endpoints_down_is_unverified(self):
-        with patch.object(
-            sp.urllib.request, "urlopen", side_effect=OSError("down")
-        ):
+        with patch.object(sp.urllib.request, "urlopen", side_effect=OSError("down")):
             assert sp._chain_bids_exist("123") is None
 
     def test_missing_dseq_is_unverified(self):
@@ -1875,9 +1873,10 @@ class TestNoBidPhrasingCoverage:
         # Chain cross-check pinned to "confirmed absent" so these tests keep
         # testing PHRASING recognition; the veto itself is covered in
         # TestNoBidChainCrossCheck.
-        with patch.object(
-            sp, "_run", return_value=_completed(out, returncode=1)
-        ), patch.object(sp, "_chain_bids_exist", return_value=False):
+        with (
+            patch.object(sp, "_run", return_value=_completed(out, returncode=1)),
+            patch.object(sp, "_chain_bids_exist", return_value=False),
+        ):
             return sp._deploy("sdl", "p", {"dseq": None})[1]
 
     def test_no_bids_received_at_all(self):

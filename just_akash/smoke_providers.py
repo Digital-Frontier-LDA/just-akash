@@ -924,9 +924,7 @@ def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, s
         # page as NO-BID. (The "foreign bids / none from ours / NO BID FROM n
         # allowlisted" variants carry positive evidence that the order flow
         # worked — other bids were seen and classified — so they stay NO-BID.)
-        if not re.search(
-            r"none from our providers|foreign bids|no bid from", out, re.IGNORECASE
-        ):
+        if not re.search(r"none from our providers|foreign bids|no bid from", out, re.IGNORECASE):
             on_chain = _chain_bids_exist(dseqs[-1] if dseqs else "")
             if on_chain is True:
                 # Providers DID bid on-chain; the Console index lagged/lied.
