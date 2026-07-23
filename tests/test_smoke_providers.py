@@ -117,6 +117,13 @@ class TestNoBidChainCrossCheck:
 
 
 class TestChainBidsExist:
+    # Pinned to exactly two fixed HTTPS bases so a developer/CI environment
+    # with its own JUST_AKASH_LCD_BASES cannot change the call count.
+    TWO_BASES = {"JUST_AKASH_LCD_BASES": "https://lcd-a.test,https://lcd-b.test"}
+    THREE_BASES = {
+        "JUST_AKASH_LCD_BASES": "https://lcd-a.test,https://lcd-b.test,https://lcd-c.test"
+    }
+
     def _urlopen_returning(self, payloads):
         """Sequence of context managers whose .read feeds json.load."""
         import io
@@ -135,25 +142,65 @@ class TestChainBidsExist:
 
     def test_positive_bids_win_immediately(self):
         cms = self._urlopen_returning([{"bids": [{"bid": {}}]}])
-        with patch.object(sp.urllib.request, "urlopen", side_effect=cms):
+        with (
+            patch.dict(os.environ, self.TWO_BASES),
+            patch.object(sp.urllib.request, "urlopen", side_effect=cms),
+        ):
             assert sp._chain_bids_exist("123") is True
 
     def test_two_empty_answers_confirm_absence(self):
         cms = self._urlopen_returning([{"bids": []}, {"bids": []}])
-        with patch.object(sp.urllib.request, "urlopen", side_effect=cms):
+        with (
+            patch.dict(os.environ, self.TWO_BASES),
+            patch.object(sp.urllib.request, "urlopen", side_effect=cms),
+        ):
             assert sp._chain_bids_exist("123") is False
 
     def test_single_empty_plus_failure_is_unverified(self):
         cms = self._urlopen_returning([{"bids": []}, OSError("down")])
-        with patch.object(sp.urllib.request, "urlopen", side_effect=cms):
+        with (
+            patch.dict(os.environ, self.TWO_BASES),
+            patch.object(sp.urllib.request, "urlopen", side_effect=cms),
+        ):
             assert sp._chain_bids_exist("123") is None
 
     def test_all_endpoints_down_is_unverified(self):
-        with patch.object(sp.urllib.request, "urlopen", side_effect=OSError("down")):
+        with (
+            patch.dict(os.environ, self.TWO_BASES),
+            patch.object(sp.urllib.request, "urlopen", side_effect=OSError("down")),
+        ):
             assert sp._chain_bids_exist("123") is None
 
     def test_missing_dseq_is_unverified(self):
         assert sp._chain_bids_exist("") is None
+
+    def test_non_numeric_dseq_is_unverified(self):
+        assert sp._chain_bids_exist("123; rm -rf /") is None
+
+    def test_late_positive_evidence_beats_two_earlier_empties(self):
+        """Positive data wins even after two empty answers (>2 bases)."""
+        cms = self._urlopen_returning([{"bids": []}, {"bids": []}, {"bids": [{"bid": {}}]}])
+        with (
+            patch.dict(os.environ, self.THREE_BASES),
+            patch.object(sp.urllib.request, "urlopen", side_effect=cms),
+        ):
+            assert sp._chain_bids_exist("123") is True
+
+    def test_garbled_payload_is_no_evidence(self):
+        cms = self._urlopen_returning([["not", "a", "dict"], {"bids": "nope"}])
+        with (
+            patch.dict(os.environ, self.TWO_BASES),
+            patch.object(sp.urllib.request, "urlopen", side_effect=cms),
+        ):
+            assert sp._chain_bids_exist("123") is None
+
+    def test_env_with_no_usable_bases_falls_back_to_defaults(self):
+        cms = self._urlopen_returning([{"bids": [{"bid": {}}]}])
+        with (
+            patch.dict(os.environ, {"JUST_AKASH_LCD_BASES": "ftp://nope, ,file:///etc"}),
+            patch.object(sp.urllib.request, "urlopen", side_effect=cms),
+        ):
+            assert sp._chain_bids_exist("123") is True
 
 
 class TestDeployMisreportsRegressions:

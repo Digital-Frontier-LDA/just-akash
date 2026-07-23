@@ -841,13 +841,14 @@ def _chain_bids_exist(dseq: str) -> bool | None:
 
     # `or default` (not a .get default): an env var set-but-empty must fall
     # back too, not silently disable the cross-check. Dedupe preserving order —
-    # a repeated entry must not count as two independent confirmations. Only
-    # http(s) bases are accepted (urllib would happily open file:// etc.).
+    # a repeated entry must not count as two independent confirmations. HTTPS
+    # only (urllib would happily open file:// etc., and an LCD answer that can
+    # be tampered with in transit is not evidence).
     def _parse_bases(raw: str) -> list[str]:
         out: list[str] = []
         for b in raw.split(","):
             b = b.strip().rstrip("/")
-            if b and b.startswith(("https://", "http://")) and b not in out:
+            if b and b.startswith("https://") and b not in out:
                 out.append(b)
         return out
 
@@ -875,8 +876,11 @@ def _chain_bids_exist(dseq: str) -> bool | None:
         if bids:
             return True
         empty_confirmations += 1
-        if empty_confirmations >= 2:
-            return False
+    # Positive data wins over ANY number of empties, so the verdict on
+    # absence is only reached after every base has been given the chance
+    # to produce a bid.
+    if empty_confirmations >= 2:
+        return False
     return None
 
 
