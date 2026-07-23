@@ -835,23 +835,27 @@ def _chain_bids_exist(dseq: str) -> bool | None:
     of the fleet: positive data from any endpoint wins; an EMPTY answer needs
     TWO independent endpoints to agree; anything less is None (unverifiable).
     """
-    if not dseq:
+    if not dseq or not str(dseq).isdigit():
         return None
-    bases = [
-        b.strip().rstrip("/")
-        for b in os.environ.get(
-            "JUST_AKASH_LCD_BASES",
-            "https://akash-api.polkachu.com,https://akash-rest.publicnode.com",
-        ).split(",")
-        if b.strip()
-    ]
+    default_bases = "https://akash-api.polkachu.com,https://akash-rest.publicnode.com"
+    # `or default` (not a .get default): an env var set-but-empty must fall
+    # back too, not silently disable the cross-check. Dedupe preserving order —
+    # a repeated entry must not count as two independent confirmations. Only
+    # http(s) bases are accepted (urllib would happily open file:// etc.).
+    bases: list[str] = []
+    for b in (os.environ.get("JUST_AKASH_LCD_BASES") or default_bases).split(","):
+        b = b.strip().rstrip("/")
+        if b and b.startswith(("https://", "http://")) and b not in bases:
+            bases.append(b)
     empty_confirmations = 0
     for base in bases:
         url = f"{base}/akash/market/v1beta5/bids/list?filters.dseq={dseq}&pagination.limit=5"
         try:
-            with urllib.request.urlopen(url, timeout=8) as resp:
+            with urllib.request.urlopen(url, timeout=8) as resp:  # noqa: S310 — scheme-validated above
                 bids = json.load(resp).get("bids", [])
-        except Exception:  # noqa: BLE001 — an unreachable LCD is simply no evidence
+        except (OSError, ValueError):
+            # URLError/HTTPError/timeouts are OSError; JSONDecodeError is
+            # ValueError. An unreachable or garbled LCD is simply no evidence.
             continue
         if bids:
             return True

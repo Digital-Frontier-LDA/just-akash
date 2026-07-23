@@ -112,9 +112,8 @@ class TestNoBidChainCrossCheck:
             "bid-index-lag": "BID-INDEX-LAG",
             "no-bid-unverified": "NO-BID-UNVERIFIED",
         }
-        for note, outcome in mapping.items():
+        for outcome in mapping.values():
             assert outcome not in sp._FAILING_OUTCOMES
-            assert mapping.get(note, "FAIL") == outcome
 
 
 class TestChainBidsExist:
