@@ -838,24 +838,39 @@ def _chain_bids_exist(dseq: str) -> bool | None:
     if not dseq or not str(dseq).isdigit():
         return None
     default_bases = "https://akash-api.polkachu.com,https://akash-rest.publicnode.com"
+
     # `or default` (not a .get default): an env var set-but-empty must fall
     # back too, not silently disable the cross-check. Dedupe preserving order —
     # a repeated entry must not count as two independent confirmations. Only
     # http(s) bases are accepted (urllib would happily open file:// etc.).
-    bases: list[str] = []
-    for b in (os.environ.get("JUST_AKASH_LCD_BASES") or default_bases).split(","):
-        b = b.strip().rstrip("/")
-        if b and b.startswith(("https://", "http://")) and b not in bases:
-            bases.append(b)
+    def _parse_bases(raw: str) -> list[str]:
+        out: list[str] = []
+        for b in raw.split(","):
+            b = b.strip().rstrip("/")
+            if b and b.startswith(("https://", "http://")) and b not in out:
+                out.append(b)
+        return out
+
+    # An env var that parses to nothing usable (empty, whitespace, bad
+    # schemes) falls back to the defaults rather than silently disabling
+    # the cross-check.
+    bases = _parse_bases(os.environ.get("JUST_AKASH_LCD_BASES") or default_bases)
+    if not bases:
+        bases = _parse_bases(default_bases)
     empty_confirmations = 0
     for base in bases:
         url = f"{base}/akash/market/v1beta5/bids/list?filters.dseq={dseq}&pagination.limit=5"
         try:
             with urllib.request.urlopen(url, timeout=8) as resp:  # noqa: S310 — scheme-validated above
-                bids = json.load(resp).get("bids", [])
+                payload = json.load(resp)
         except (OSError, ValueError):
             # URLError/HTTPError/timeouts are OSError; JSONDecodeError is
             # ValueError. An unreachable or garbled LCD is simply no evidence.
+            continue
+        # Defensive shape check: a non-dict payload or non-list "bids" is a
+        # garbled answer, not evidence of anything.
+        bids = payload.get("bids") if isinstance(payload, dict) else None
+        if not isinstance(bids, list):
             continue
         if bids:
             return True
