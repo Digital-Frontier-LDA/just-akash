@@ -825,6 +825,65 @@ def _record_no_bid_evidence(provider: str, out: str) -> None:
         print(f"  {YELLOW}NO-BID evidence unavailable{RESET}: {type(e).__name__}: {e}")
 
 
+def _chain_bids_exist(dseq: str) -> bool | None:
+    """Do any bids exist ON-CHAIN for this dseq? (2026-07-23 audit.)
+
+    The smoke's NO-BID verdict — and the critical page behind it — used to rest
+    entirely on the Console bid index, a single endpoint whose HTTP-200 empty
+    answer during indexer lag is indistinguishable from "nobody bid". Ask the
+    chain's own LCD before believing the absence. Evidence rules match the rest
+    of the fleet: positive data from any endpoint wins; an EMPTY answer needs
+    TWO independent endpoints to agree; anything less is None (unverifiable).
+    """
+    if not dseq or not str(dseq).isdigit():
+        return None
+    default_bases = "https://akash-api.polkachu.com,https://akash-rest.publicnode.com"
+
+    # `or default` (not a .get default): an env var set-but-empty must fall
+    # back too, not silently disable the cross-check. Dedupe preserving order —
+    # a repeated entry must not count as two independent confirmations. HTTPS
+    # only (urllib would happily open file:// etc., and an LCD answer that can
+    # be tampered with in transit is not evidence).
+    def _parse_bases(raw: str) -> list[str]:
+        out: list[str] = []
+        for b in raw.split(","):
+            b = b.strip().rstrip("/")
+            if b and b.startswith("https://") and b not in out:
+                out.append(b)
+        return out
+
+    # An env var that parses to nothing usable (empty, whitespace, bad
+    # schemes) falls back to the defaults rather than silently disabling
+    # the cross-check.
+    bases = _parse_bases(os.environ.get("JUST_AKASH_LCD_BASES") or default_bases)
+    if not bases:
+        bases = _parse_bases(default_bases)
+    empty_confirmations = 0
+    for base in bases:
+        url = f"{base}/akash/market/v1beta5/bids/list?filters.dseq={dseq}&pagination.limit=5"
+        try:
+            with urllib.request.urlopen(url, timeout=8) as resp:  # noqa: S310 — scheme-validated above
+                payload = json.load(resp)
+        except (OSError, ValueError):
+            # URLError/HTTPError/timeouts are OSError; JSONDecodeError is
+            # ValueError. An unreachable or garbled LCD is simply no evidence.
+            continue
+        # Defensive shape check: a non-dict payload or non-list "bids" is a
+        # garbled answer, not evidence of anything.
+        bids = payload.get("bids") if isinstance(payload, dict) else None
+        if not isinstance(bids, list):
+            continue
+        if bids:
+            return True
+        empty_confirmations += 1
+    # Positive data wins over ANY number of empties, so the verdict on
+    # absence is only reached after every base has been given the chance
+    # to produce a bid.
+    if empty_confirmations >= 2:
+        return False
+    return None
+
+
 def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, str]:
     """Deploy the probe pinned to ``provider``. Returns (dseq, note).
 
@@ -883,6 +942,20 @@ def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, s
     # incidental log wording. Matching the real message removes that dependency.
     if re.search(r"no bids?\b|none from our providers|foreign bids", out, re.IGNORECASE):
         _record_no_bid_evidence(provider, out)
+        # 2026-07-23 audit: "no bids AT ALL" is an absence claim from the single
+        # Console bid index — cross-check the chain's own LCD before letting it
+        # page as NO-BID. (The "foreign bids / none from ours / NO BID FROM n
+        # allowlisted" variants carry positive evidence that the order flow
+        # worked — other bids were seen and classified — so they stay NO-BID.)
+        if not re.search(r"none from our providers|foreign bids|no bid from", out, re.IGNORECASE):
+            on_chain = _chain_bids_exist(dseqs[-1] if dseqs else "")
+            if on_chain is True:
+                # Providers DID bid on-chain; the Console index lagged/lied.
+                return None, "bid-index-lag"
+            if on_chain is None:
+                # Neither Console nor chain could confirm the absence — a
+                # "couldn't test", never a provider verdict.
+                return None, "no-bid-unverified"
         return None, "no-bid"
     return None, "deploy-failed"
 
@@ -1681,6 +1754,10 @@ def smoke_provider(
             results["deploy"] = {
                 "no-bid": "NO-BID",
                 "no-credit": "NO-CREDIT",
+                # 2026-07-23 audit: Console-index lag / unverifiable absence are
+                # "couldn't test" skips — they never page and never gate.
+                "bid-index-lag": "BID-INDEX-LAG",
+                "no-bid-unverified": "NO-BID-UNVERIFIED",
             }.get(note, "FAIL")
             colour = RED if results["deploy"] == "FAIL" else YELLOW
             print(f"  {colour}{note}{RESET} — cannot test remaining features")
