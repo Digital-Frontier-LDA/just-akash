@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.42.0] — 2026-07-28
+
+### Added
+- **`capacity-probe` — "will N×GPU actually place right now?" answered by a real bid, not the provider `/status` inventory.** The provider inventory is unreliable for this question: it collapses **rented / available / provisioning** into one number, and a node mid-image-pull / mid-GPU-reset drops out of `allocatable` entirely (reads as *non-existent*), so `allocatable.gpu=0` cannot be distinguished from "dead". The chain's order/bid market is the ground truth. `capacity-probe --gpu-model v100 --gpu-count 2` creates a **throwaway order** requesting that GPU shape, polls for open bids, reports which providers bid (and at what price), then **closes the order without ever creating a lease** — no container runs, and the order's minimal deposit is escrowed only for the poll window. `--provider` filters the reported bidders; `--json` for scripting. Codifies the manual "deploy an alpine+GPU and see if it bids" probe that kept being rewritten as throwaway scripts — with the order-cleanup enforced in a `finally` (the escrow-leak the ad-hoc version kept producing) and pinned by tests. New `just_akash/capacity.py`.
+
 ## [1.41.0] — 2026-07-28
 
 ### Added

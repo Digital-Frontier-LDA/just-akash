@@ -20,6 +20,7 @@ Subcommands:
   test        — End-to-end lifecycle test
   balance     — Show the wallet + deploy credit (--check --min-usd for alerting)
   lease-status — Reconcile lease/deployment/escrow state; flag closeable leases
+  capacity-probe — Probe if N×GPU will actually place (a real bid, not /status)
   export-metrics — Render smoke telemetry as Prometheus textfile metrics
 """
 
@@ -490,6 +491,28 @@ def main():
         help="Show only leases flagged closeable (terminal state or drained escrow) — "
         "the set worth closing to stop escrow bleed.",
     )
+
+    # ── capacity-probe ─────────────────────────────────
+    cap_p = subparsers.add_parser(
+        "capacity-probe",
+        help="Probe whether N×GPU will actually place right now — a real bid, not the "
+        "provider /status inventory (creates a throwaway order, reads bids, closes it "
+        "without leasing)",
+    )
+    cap_p.add_argument("--gpu-count", type=int, default=1, help="GPUs to request (default: 1)")
+    cap_p.add_argument(
+        "--gpu-model",
+        default=None,
+        metavar="M",
+        help="GPU model to pin (e.g. v100, rtx4000ada, t4). Omit for any NVIDIA GPU.",
+    )
+    cap_p.add_argument(
+        "--wait", type=int, default=45, help="Seconds to poll for bids (default: 45)"
+    )
+    cap_p.add_argument(
+        "--provider", default=None, metavar="ADDR", help="Only report bids from this provider"
+    )
+    cap_p.add_argument("--json", action="store_true", help="Output in JSON format")
 
     # ── validate-sdl ───────────────────────────────────
     validate_p = subparsers.add_parser(
@@ -986,6 +1009,41 @@ def main():
                         "`just-akash destroy --dseq <DSEQ>` to stop the escrow bleed."
                     )
         except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    # ── capacity-probe ─────────────────────────────────
+    elif args.command == "capacity-probe":
+        import json
+
+        from .api import AkashConsoleAPI
+        from .capacity import capacity_probe
+
+        try:
+            client = AkashConsoleAPI(_require_api_key())
+            use_json = args.json or not sys.stdout.isatty()
+            res = capacity_probe(
+                client,
+                args.gpu_count,
+                args.gpu_model,
+                wait_s=args.wait,
+                provider=args.provider,
+            )
+            shape = f"{res['gpu_count']}×{res['gpu_model']}"
+            if use_json:
+                print(json.dumps(res, indent=2))
+            elif res["placeable"]:
+                print(f"PLACEABLE: {shape} — {len(res['bidders'])} provider(s) bid:")
+                for b in res["bidders"]:
+                    print(f"  {b['provider']}  @ {b['price_amount']} {b['price_denom']}/block")
+                print(f"(probe order {res['dseq']} closed; no lease created)")
+            else:
+                print(
+                    f"NO_BID: {shape} won't place right now "
+                    f"(no provider bid in {res['waited_s']}s)."
+                )
+                print(f"(probe order {res['dseq']} closed; no lease created)")
+        except (RuntimeError, ValueError) as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
 
