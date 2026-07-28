@@ -6,26 +6,30 @@ The shapes here mirror a real Console API `/v1/deployments` record (verified liv
 The escrow balance remaining is ``escrow_account.state.funds`` (not ``transferred``).
 """
 
+from __future__ import annotations
+
+from typing import Any
+
 from just_akash import api
 
 
 class _FakeClient:
-    def __init__(self, deployments):
+    def __init__(self, deployments: list[Any]):
         self._deps = deployments
-        self.last_active_only = None
+        self.last_active_only: bool | None = None
 
-    def list_deployments(self, active_only=True):
+    def list_deployments(self, active_only: bool = True) -> list[Any]:
         self.last_active_only = active_only
         return self._deps
 
 
 def _dep(
-    dseq,
-    dep_state="active",
-    lease_state="active",
-    provider="akash1prov",
-    escrow_state="open",
-    funds=(("uact", "2986627.000000000000000000"),),
+    dseq: str,
+    dep_state: str = "active",
+    lease_state: str | None = "active",
+    provider: str = "akash1prov",
+    escrow_state: str = "open",
+    funds: tuple[tuple[str, str], ...] | None = (("uact", "2986627.000000000000000000"),),
 ):
     d = {
         "deployment": {"id": {"owner": "akash1me", "dseq": dseq}, "state": dep_state},
@@ -93,7 +97,7 @@ class TestReconcileLeaseRow:
 class TestLeaseStatus:
     def test_maps_all_deployments_and_passes_active_only_flag(self):
         c = _FakeClient([_dep("1"), _dep("2", dep_state="closed", funds=(("uact", "0"),))])
-        rows = api.lease_status(c, active_only=False)
+        rows = api.lease_status(c, active_only=False)  # type: ignore[arg-type]
         assert c.last_active_only is False
         assert [r["dseq"] for r in rows] == ["1", "2"]
         assert rows[0]["closeable"] is False
@@ -101,10 +105,10 @@ class TestLeaseStatus:
 
     def test_defaults_to_active_only(self):
         c = _FakeClient([_dep("1")])
-        api.lease_status(c)
+        api.lease_status(c)  # type: ignore[arg-type]
         assert c.last_active_only is True
 
     def test_skips_non_dict_records(self):
         c = _FakeClient([_dep("1"), "garbage", None])
-        rows = api.lease_status(c)
+        rows = api.lease_status(c)  # type: ignore[arg-type]
         assert [r["dseq"] for r in rows] == ["1"]
