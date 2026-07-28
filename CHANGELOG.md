@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.41.0] — 2026-07-28
+
+### Added
+- **`lease-status` — reconcile the lease states a provider's `/status` inventory can't separate (#107).** A provider's aggregate `/status` collapses **rented / available / provisioning** into one number, and a node mid-image-pull or mid-GPU-reset drops out of `allocatable` entirely, reading as *non-existent* — so a busy or provisioning node is indistinguishable from a dead one. `lease-status` answers the tenant-side question authoritatively from the Console API (which proxies chain state): per deployment it prints the chain `deployment_state`, each lease's `state` + `provider`, and the **escrow balance remaining** (from `escrow_account.state.funds`), with a `closeable` flag set when the deployment/lease is terminal, the escrow is closed, or the balance has drained to zero. `--closeable-only` narrows to exactly the set worth `destroy`-ing to stop escrow bleed (the authoritative "which leases should I close?" answer, read from chain rather than guessed from a provider's ambiguous inventory); `--all` includes closed deployments; `--json` for scripting. Sourced via `list_deployments` (one API round-trip) rather than raw akash-module LCD queries, which public LCD nodes return **501** for. Verified live against an 18-deployment account (2 flagged closeable).
+
 ## [1.40.0] — 2026-07-22
 
 ### Added

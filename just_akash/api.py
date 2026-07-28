@@ -915,6 +915,98 @@ def escrow_locked(client: "AkashConsoleAPI") -> dict[str, Any]:
     }
 
 
+def _reconcile_lease_row(d: dict[str, Any]) -> dict[str, Any]:
+    """Flatten one Console deployment record into a reconciled lease-status row:
+    ``deployment.state``, the (active) lease's ``state`` + ``provider``, and the escrow
+    balance remaining (uact) — with a ``closeable`` flag.
+
+    ``closeable`` is True when the deployment or lease is in a terminal state, the escrow
+    is closed/overdrawn, or the escrow has drained to zero uact. A healthy active/open
+    deployment with funds left is never flagged. The escrow balance comes from
+    ``escrow_account.state.funds`` (what's left), not ``transferred`` (already paid out);
+    when the record omits funds entirely the balance is left ``None`` (unknown, not zero)
+    so a missing field can't masquerade as a drained lease.
+    """
+    from ._states import TERMINAL_DEPLOYMENT_STATES
+
+    dep = d.get("deployment")
+    if not isinstance(dep, dict):
+        dep = {}
+    dep_state = dep.get("state")
+    dseq = _extract_dseq(d)
+
+    escrow_account = d.get("escrow_account")
+    if not isinstance(escrow_account, dict):
+        escrow_account = {}
+    estate = escrow_account.get("state")
+    if not isinstance(estate, dict):
+        estate = {}
+    escrow_state = estate.get("state")
+    funds = estate.get("funds")
+    if not isinstance(funds, list):
+        funds = None
+    escrow_uact: int | None = None
+    if funds is not None:
+        escrow_uact = 0
+        for f in funds:
+            if isinstance(f, dict) and f.get("denom") == "uact":
+                with contextlib.suppress(TypeError, ValueError):
+                    escrow_uact += int(str(f.get("amount", "0")).split(".", 1)[0])
+
+    # Prefer an active lease's state; else the first lease present. Provider comes from
+    # the existing helper (reads leases[].id.provider).
+    leases = d.get("leases")
+    if not isinstance(leases, list):
+        leases = []
+    lease_state = None
+    lease_count = 0
+    for lease in leases:
+        if not isinstance(lease, dict):
+            continue
+        lease_count += 1
+        if lease_state is None or lease.get("state") == "active":
+            lease_state = lease.get("state")
+    provider = _extract_lease_provider(d)
+
+    closeable = bool(
+        dep_state in TERMINAL_DEPLOYMENT_STATES
+        or lease_state in TERMINAL_DEPLOYMENT_STATES
+        or escrow_state in ("closed", "overdrawn")
+        or (escrow_uact is not None and escrow_uact <= 0)
+    )
+    return {
+        "dseq": dseq,
+        "deployment_state": dep_state,
+        "lease_state": lease_state,
+        "lease_count": lease_count,
+        "provider": provider,
+        "escrow_state": escrow_state,
+        "escrow_remaining_uact": escrow_uact,
+        "closeable": closeable,
+    }
+
+
+def lease_status(client: "AkashConsoleAPI", active_only: bool = True) -> list[dict[str, Any]]:
+    """Reconcile, per deployment, the three states a provider's aggregate ``/status``
+    inventory can't separate — chain ``deployment_state``, each lease's ``state`` +
+    ``provider``, and the escrow balance remaining — with a ``closeable`` flag.
+
+    Sourced from the Console API (which proxies chain state), so it holds regardless of
+    what any single provider self-reports, and — unlike the raw akash-module LCD queries,
+    which public LCD nodes return 501 for — it actually works against the default
+    endpoints. ``list_deployments`` already carries the lease + escrow detail, so this is
+    one API round-trip. ``active_only=False`` includes closed/terminal deployments too.
+
+    The ``closeable`` set is exactly what to ``destroy`` to stop escrow bleed — the
+    authoritative answer to "which of my leases should I close", read from chain state
+    rather than guessed from a provider's ambiguous inventory."""
+    return [
+        _reconcile_lease_row(d)
+        for d in client.list_deployments(active_only=active_only)
+        if isinstance(d, dict)
+    ]
+
+
 def compute_lease_runway(
     client: "AkashConsoleAPI", dseq: str, block_time_s: float = 6.0
 ) -> dict[str, Any]:
