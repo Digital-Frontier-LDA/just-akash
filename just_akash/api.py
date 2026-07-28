@@ -929,14 +929,22 @@ def _reconcile_lease_row(d: dict[str, Any]) -> dict[str, Any]:
     """
     from ._states import TERMINAL_DEPLOYMENT_STATES
 
-    dep = d.get("deployment") if isinstance(d.get("deployment"), dict) else {}
+    dep = d.get("deployment")
+    if not isinstance(dep, dict):
+        dep = {}
     dep_state = dep.get("state")
     dseq = _extract_dseq(d)
 
-    escrow_account = d.get("escrow_account") or {}
-    estate = (escrow_account.get("state") or {}) if isinstance(escrow_account, dict) else {}
-    escrow_state = estate.get("state") if isinstance(estate, dict) else None
-    funds = estate.get("funds") if isinstance(estate.get("funds"), list) else None
+    escrow_account = d.get("escrow_account")
+    if not isinstance(escrow_account, dict):
+        escrow_account = {}
+    estate = escrow_account.get("state")
+    if not isinstance(estate, dict):
+        estate = {}
+    escrow_state = estate.get("state")
+    funds = estate.get("funds")
+    if not isinstance(funds, list):
+        funds = None
     escrow_uact: int | None = None
     if funds is not None:
         escrow_uact = 0
@@ -947,7 +955,9 @@ def _reconcile_lease_row(d: dict[str, Any]) -> dict[str, Any]:
 
     # Prefer an active lease's state; else the first lease present. Provider comes from
     # the existing helper (reads leases[].id.provider).
-    leases = d.get("leases") if isinstance(d.get("leases"), list) else []
+    leases = d.get("leases")
+    if not isinstance(leases, list):
+        leases = []
     lease_state = None
     lease_count = 0
     for lease in leases:
