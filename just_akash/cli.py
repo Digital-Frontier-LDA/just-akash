@@ -19,6 +19,7 @@ Subcommands:
   tag         — Tag a deployment with a name
   test        — End-to-end lifecycle test
   balance     — Show the wallet + deploy credit (--check --min-usd for alerting)
+  lease-status — Reconcile lease/deployment/escrow state; flag closeable leases
   export-metrics — Render smoke telemetry as Prometheus textfile metrics
 """
 
@@ -469,6 +470,27 @@ def main():
         help="Block time in seconds (default: 6.0; env AKASH_BLOCK_TIME_S)",
     )
 
+    # ── lease-status ───────────────────────────────────
+    ls_p = subparsers.add_parser(
+        "lease-status",
+        help="Reconcile chain lease + deployment + escrow state across all your leases "
+        "(authoritative 'which leases are live / closeable', independent of a provider's "
+        "self-reported /status)",
+    )
+    ls_p.add_argument("--json", action="store_true", help="Output in JSON format")
+    ls_p.add_argument(
+        "--all",
+        action="store_true",
+        dest="include_closed",
+        help="Include closed/terminal deployments too (default: active deployments only).",
+    )
+    ls_p.add_argument(
+        "--closeable-only",
+        action="store_true",
+        help="Show only leases flagged closeable (terminal state or drained escrow) — "
+        "the set worth closing to stop escrow bleed.",
+    )
+
     # ── validate-sdl ───────────────────────────────────
     validate_p = subparsers.add_parser(
         "validate-sdl",
@@ -908,6 +930,61 @@ def main():
                     exp = (grant.get("expiration") or "")[:10] or "no expiry"
                     print(f"  credit grant:   from {grant.get('granter')} (expires {exp})")
                 print(f"  source:         {chain.rest_url()}")
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    # ── lease-status ───────────────────────────────────
+    elif args.command == "lease-status":
+        import json
+
+        from . import chain
+        from .api import AkashConsoleAPI, lease_status
+
+        try:
+            client = AkashConsoleAPI(_require_api_key())
+            use_json = args.json or not sys.stdout.isatty()
+            address = client.account_address()
+            rows = lease_status(client, active_only=not args.include_closed)
+            if args.closeable_only:
+                rows = [r for r in rows if r["closeable"]]
+            n_close = sum(1 for r in rows if r["closeable"])
+
+            def _esc(r):
+                micro = r["escrow_remaining_uact"]
+                return "?" if micro is None else chain.format_amount("uact", micro)
+
+            if use_json:
+                print(
+                    json.dumps(
+                        {
+                            "account": address,
+                            "scope": "all" if args.include_closed else "active",
+                            "closeable_count": n_close,
+                            "leases": rows,
+                        },
+                        indent=2,
+                    )
+                )
+            elif not rows:
+                scope = "" if args.include_closed else " active"
+                only = "closeable " if args.closeable_only else ""
+                print(f"No {only}{scope} leases for {address}")
+            else:
+                print(f"Leases for {address}")
+                print(f"  {'DSEQ':<14} {'LEASE':<13} {'DEPLOY':<10} {'ESCROW LEFT':>13}  PROVIDER")
+                for r in rows:
+                    flag = "  ⚠ closeable" if r["closeable"] else ""
+                    print(
+                        f"  {str(r['dseq']):<14} {str(r['lease_state'] or '-'):<13} "
+                        f"{str(r['deployment_state'] or '?'):<10} {_esc(r):>13}  "
+                        f"{str(r['provider'] or 'no lease')}{flag}"
+                    )
+                if n_close:
+                    print(
+                        f"\n  {n_close} lease(s) closeable (terminal state or drained escrow) — "
+                        "`just-akash destroy --dseq <DSEQ>` to stop the escrow bleed."
+                    )
         except RuntimeError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
