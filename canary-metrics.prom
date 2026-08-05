@@ -28,4 +28,4 @@
 # TYPE akash_canary_scrape_seconds gauge
 # HELP akash_canary_last_collect_timestamp_seconds Unix time of this collection.
 # TYPE akash_canary_last_collect_timestamp_seconds gauge
-akash_canary_last_collect_timestamp_seconds 1785956222
+akash_canary_last_collect_timestamp_seconds 1785960534
