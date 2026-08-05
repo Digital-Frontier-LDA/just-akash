@@ -13,6 +13,7 @@ from __future__ import annotations
 import canary.canary as agent
 from canary.collect import (
     extract_boot_id,
+    load_json_mapping,
     merge,
     metrics_url,
     parse_exposition,
@@ -390,3 +391,41 @@ def test_duplicate_addresses_do_not_produce_duplicate_plan_entries():
     names = [n for n, _ in providers_from_env(f"{addr},{addr},{addr}")]
     _, missing = plan([], names)
     assert missing == ["alphavps"], "one provider, one deploy"
+
+
+# ── state files that are missing, empty or corrupt ──────────────────────────────────────
+
+
+def test_empty_state_file_is_treated_as_no_prior_state(tmp_path):
+    """`git show BRANCH:file > out` creates `out` BEFORE the command runs, so a first run —
+    where the telemetry branch has no such file — leaves a zero-byte file rather than none.
+    json.loads("") then raises and takes the whole run down, which is exactly how the first
+    live dispatch failed."""
+    p = tmp_path / "targets.json"
+    p.write_text("", encoding="utf-8")
+    assert load_json_mapping(p) == {}
+
+
+def test_missing_state_file_is_treated_as_no_prior_state(tmp_path):
+    assert load_json_mapping(tmp_path / "nope.json") == {}
+
+
+def test_corrupt_state_file_degrades_instead_of_crashing(tmp_path):
+    """An unreadable state file must degrade to 'no prior state', never to a crash: the
+    collector exists to publish a reading, and refusing to run because its own bookkeeping
+    is unparseable loses the measurement."""
+    p = tmp_path / "state.json"
+    p.write_text("{not json at all", encoding="utf-8")
+    assert load_json_mapping(p) == {}
+
+
+def test_a_json_list_is_not_mistaken_for_a_mapping(tmp_path):
+    p = tmp_path / "state.json"
+    p.write_text("[1, 2, 3]", encoding="utf-8")
+    assert load_json_mapping(p) == {}
+
+
+def test_a_real_mapping_is_returned_unchanged(tmp_path):
+    p = tmp_path / "state.json"
+    p.write_text('{"alphavps": {"dseq": "1"}}', encoding="utf-8")
+    assert load_json_mapping(p) == {"alphavps": {"dseq": "1"}}
