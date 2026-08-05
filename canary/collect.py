@@ -80,16 +80,17 @@ _HOST_RE = re.compile(r"[A-Za-z0-9.\-:]+")
 def metrics_url(uri: str) -> str:
     """Build the metrics URL from a provider-assigned ingress value.
 
-    Akash lease status yields a BARE host[:port] (`leases[].status.services[].uris[0]`),
-    served over plain http — see just_akash.smoke_providers._ingress_uri/_fetch. Accept
-    that form, and tolerate a full http(s) URL for local testing.
+    BARE host[:port] ONLY. Akash lease status yields that form
+    (`leases[].status.services[].uris[0]`), served over plain http — see
+    just_akash.smoke_providers._ingress_uri/_fetch.
 
-    The bare-host branch is regex-guarded for the same reason `_fetch` guards it: the
-    value is chosen by the PROVIDER, and an unvalidated one could smuggle a scheme or
-    path into the request. Hard-coding the scheme keeps file:// unreachable.
+    An earlier revision also accepted a full http(s) URL "for local testing", and that
+    was a hole rather than a convenience: this value is chosen by the PROVIDER, so the
+    accepting branch let a hostile ingress smuggle a scheme, host or path straight into
+    the request (SSRF). There is no need for it — local testing passes `127.0.0.1:8080`,
+    which takes the guarded path like everything else. Rejecting the full-URL form is what
+    makes hard-coding the scheme actually mean something, and keeps file:// unreachable.
     """
-    if uri.startswith(("http://", "https://")):
-        return uri.rstrip("/") + "/metrics"
     if not _HOST_RE.fullmatch(uri):
         raise ValueError(f"unexpected ingress host: {uri!r}")
     return f"http://{uri}/metrics"
@@ -134,26 +135,45 @@ def merge(prev: dict, provider: str, dseq: str, reachable: bool, body: str,
 
     if not reachable:
         p["unreachable_checks_total"] += 1
-        p["dseq"] = dseq or p["dseq"]
+        # DELIBERATELY NOT advancing dseq here. A redeploy is normally observed while the
+        # new lease is still coming up, so recording the new dseq now would mean that by
+        # the time the canary answers, dseq looks unchanged — and the inevitable boot_id
+        # change would then be booked as a RESTART instead of a lease replacement. The
+        # dseq only advances on a scrape that actually saw the new container, which is the
+        # only moment we can attribute the boot_id change correctly.
         return {**prev, provider: p}
 
     boot = extract_boot_id(body)
-    dseq_changed = dseq and p["dseq"] and dseq != p["dseq"]
+    dseq_changed = bool(dseq and p["dseq"] and dseq != p["dseq"])
+    boot_changed = bool(boot and p["boot_id"] and boot != p["boot_id"])
     if dseq_changed:
         # New lease: the container is new by construction. Not a restart.
         p["lease_replacements_total"] += 1
-    elif boot and p["boot_id"] and boot != p["boot_id"]:
+    elif boot_changed:
         p["restarts_total"] += 1
+
+    s = parse_exposition(body)
+    # The agent's counters are PROCESS-LOCAL and reset to zero on every restart. Passing
+    # them straight through would publish a *_total that decreases, and would silently
+    # discard every failure from earlier process lifetimes. Accumulate the deltas here
+    # instead, where the state is durable: a reset (boot_id changed, or the raw value went
+    # backwards) contributes the new reading in full rather than a negative delta.
+    for key, metric, labels in (
+        ("egress_ok", "akash_canary_egress_probe_total", {"outcome": "ok"}),
+        ("egress_fail", "akash_canary_egress_probe_total", {"outcome": "fail"}),
+        ("dns_ok", "akash_canary_dns_probe_total", {"outcome": "ok"}),
+        ("dns_fail", "akash_canary_dns_probe_total", {"outcome": "fail"}),
+    ):
+        raw = get(s, metric, **labels) or 0.0
+        prev_raw = p.get(f"raw_{key}")
+        reset = boot_changed or prev_raw is None or raw < prev_raw
+        delta = raw if reset else raw - prev_raw
+        p[key] = p.get(key, 0.0) + delta
+        p[f"raw_{key}"] = raw
 
     p["boot_id"] = boot or p["boot_id"]
     p["dseq"] = dseq or p["dseq"]
-
-    s = parse_exposition(body)
     p["uptime_seconds"] = get(s, "akash_canary_uptime_seconds") or 0.0
-    p["egress_ok"] = get(s, "akash_canary_egress_probe_total", outcome="ok") or 0.0
-    p["egress_fail"] = get(s, "akash_canary_egress_probe_total", outcome="fail") or 0.0
-    p["dns_ok"] = get(s, "akash_canary_dns_probe_total", outcome="ok") or 0.0
-    p["dns_fail"] = get(s, "akash_canary_dns_probe_total", outcome="fail") or 0.0
     p["disk_write_seconds"] = get(s, "akash_canary_disk_write_seconds")
     p["sched_jitter_seconds"] = get(s, "akash_canary_sched_jitter_seconds")
     return {**prev, provider: p}

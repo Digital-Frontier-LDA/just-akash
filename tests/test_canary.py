@@ -150,7 +150,7 @@ def test_render_omits_missing_gauges_rather_than_emitting_none():
 def test_scrape_of_a_dead_endpoint_reports_rather_than_raises():
     """An unreachable canary is the measurement. If this raised, the collector would die
     on the first provider outage and publish nothing — losing the reading entirely."""
-    ok, body, elapsed = scrape("http://127.0.0.1:1/", timeout=1.0)
+    ok, body, elapsed = scrape("127.0.0.1:1", timeout=1.0)
     assert ok is False
     assert body == ""
     assert elapsed >= 0.0
@@ -174,9 +174,18 @@ def test_bare_ingress_host_becomes_a_plain_http_metrics_url():
     assert metrics_url("host.example.com:8080") == "http://host.example.com:8080/metrics"
 
 
-def test_full_url_is_accepted_for_local_testing():
-    assert metrics_url("http://127.0.0.1:8080") == "http://127.0.0.1:8080/metrics"
-    assert metrics_url("http://127.0.0.1:8080/") == "http://127.0.0.1:8080/metrics"
+def test_full_urls_are_rejected_even_though_they_look_harmless():
+    """An earlier revision accepted these "for local testing". That branch bypassed the
+    bare-host guard entirely, and the value comes from the PROVIDER — so it was an SSRF
+    hole dressed as a convenience. Local testing uses 127.0.0.1:8080, which takes the
+    guarded path like everything else."""
+    for u in ("http://127.0.0.1:8080", "https://evil.example.com/x"):
+        try:
+            metrics_url(u)
+        except ValueError:
+            continue
+        raise AssertionError(f"{u!r} should have been rejected")
+    assert metrics_url("127.0.0.1:8080") == "http://127.0.0.1:8080/metrics"
 
 
 def test_hostile_ingress_value_cannot_smuggle_a_scheme_or_path():
@@ -256,3 +265,41 @@ def test_live_canary_without_ingress_yet_keeps_previous_uri():
 def test_plan_accepts_a_wrapped_listing_object():
     targets, _ = plan({"deployments": [_dep("canary-onidc", "7", "z.example.com")]}, ["onidc"])
     assert targets["onidc"]["dseq"] == "7"
+
+
+# ── the two data-integrity bugs the review caught ───────────────────────────────────────
+
+def test_redeploy_observed_during_an_outage_is_still_a_lease_replacement():
+    """The realistic sequence, and the one an earlier revision got wrong.
+
+    A lease lapses; the workflow redeploys; the collector runs while the NEW container is
+    still coming up, so the scrape fails but the targets file already carries the new
+    dseq. If that dseq were recorded during the outage, the eventual boot_id change would
+    look like a restart on an unchanged lease — booking a provider-closed deployment as a
+    container restart, which is precisely the conflation this design exists to prevent.
+    """
+    st = merge({}, ALPHA, "100", True, _body("aaa"), 0.1, 1000.0)
+    st = merge(st, ALPHA, "200", False, "", 20.0, 1100.0)      # redeployed, not up yet
+    assert st[ALPHA]["dseq"] == "100", "dseq must not advance on an unverified lease"
+    st = merge(st, ALPHA, "200", True, _body("zzz"), 0.1, 1200.0)  # new container answers
+    assert st[ALPHA]["lease_replacements_total"] == 1
+    assert st[ALPHA]["restarts_total"] == 0
+
+
+def test_egress_failures_survive_a_restart_instead_of_being_discarded():
+    """The agent's counters are process-local and reset to zero on restart. Passing them
+    through would publish a *_total that decreases and would throw away every failure from
+    the previous process lifetime."""
+    st = merge({}, ALPHA, "100", True, _body("aaa", egress_fail=5), 0.1, 1000.0)
+    assert st[ALPHA]["egress_fail"] == 5
+    # restart: the agent's own counter is back to 0 and climbs again to 2
+    st = merge(st, ALPHA, "100", True, _body("bbb", egress_fail=2), 0.1, 1100.0)
+    assert st[ALPHA]["restarts_total"] == 1
+    assert st[ALPHA]["egress_fail"] == 7, "5 before the restart + 2 after, not 2"
+
+
+def test_counter_accumulation_is_monotonic_across_normal_scrapes():
+    st = merge({}, ALPHA, "100", True, _body("aaa", egress_fail=1), 0.1, 1000.0)
+    st = merge(st, ALPHA, "100", True, _body("aaa", egress_fail=4), 0.1, 1100.0)
+    st = merge(st, ALPHA, "100", True, _body("aaa", egress_fail=9), 0.1, 1200.0)
+    assert st[ALPHA]["egress_fail"] == 9, "same process: track the raw value, do not sum it"

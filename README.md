@@ -324,10 +324,18 @@ Configuration is repository variables, not secrets (none of it is sensitive):
 | `CANARY_PROVIDER_WALLETS` | JSON `{"name": "akash1..."}` — which wallet each name deploys to. |
 | `CANARY_AUTODEPLOY` | `true` to let the schedule recreate a missing canary. |
 
-⚠️ **The `canary-<provider>` tag is load-bearing.** It is how the next run finds the lease,
-and it is what keeps `cleanup-stale` and the smoke startup sweep from reaping it. Remove the
-tag and the next sweep deletes the canary — which would present as "the provider keeps
-closing our deployment", i.e. it would masquerade as the very fault the canary measures.
+⚠️ **What actually stops the canary being reaped is its SERVICE NAME, not its tag.**
+`cleanup_stale` and the smoke startup sweep classify by service set — `{probe}` is stale
+after 1h, `{backtest}` after 48h, `{}` is left alone as unclassifiable. This deployment's
+service is `canary`, so it matches no stale rule.
+
+That protection is incidental rather than declared, which makes it fragile in a specific
+way: rename the service to `probe`, or add `canary` to a stale rule, and the next sweep
+deletes it within the hour. The symptom would be *"the provider keeps closing our
+deployment"* — the canary masquerading as the very fault it measures.
+
+The `canary-<provider>` tag is separately load-bearing, but for **adoption**: it is how the
+next run finds the lease in `just-akash list` and knows which `dseq` it is looking at.
 
 ## Logs
 

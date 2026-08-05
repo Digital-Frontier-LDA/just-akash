@@ -11,9 +11,13 @@ targets file the collector consumes, and the list of providers needing a deploy.
 
 WHY MATCH ON A TAG AND NOT ON THE SDL OR IMAGE. `tag` gives each canary a stable name
 (`canary-<provider>`) that survives redeploys and is visible in `list`. Matching on image
-would also match the smoke probes (same base images) and matching on SDL is not something
-`list` reports. The tag is also what keeps `cleanup-stale` and the smoke startup sweep from
-reaping this lease — see the warning in sdl/canary.yaml.
+would also match the smoke probes (same base images), and matching on SDL is not something
+`list` reports.
+
+The tag does NOT protect the lease from the reapers, and an earlier version of this
+docstring wrongly said it did. `cleanup_stale` and the smoke sweep classify by SERVICE SET
+({probe} after 1h, {backtest} after 48h, {} left alone) — never by tag. The canary survives
+because its service is named `canary` and matches no stale rule. See sdl/canary.yaml.
 """
 
 from __future__ import annotations

@@ -71,7 +71,12 @@ PROBE_INTERVAL = float(os.environ.get("CANARY_PROBE_INTERVAL", "15"))
 EGRESS_URLS = [
     u.strip()
     for u in os.environ.get(
-        "CANARY_EGRESS_URLS", "https://api.github.com/zen,https://1.1.1.1"
+        # NOT api.github.com: its unauthenticated limit is 60 requests/hour and this probe
+        # runs every 15s (240/hour). The 429s would be counted as egress FAILURES — the
+        # canary would manufacture the outages it exists to detect. Both defaults are
+        # anycast endpoints built to be hammered and returning tiny bodies.
+        "CANARY_EGRESS_URLS",
+        "https://cloudflare.com/cdn-cgi/trace,https://1.1.1.1",
     ).split(",")
     if u.strip()
 ]
@@ -113,9 +118,16 @@ def _probe_egress() -> bool:
 
 
 def _probe_dns() -> bool:
+    """Resolve at least one name.
+
+    Deliberately does NOT call socket.setdefaulttimeout(): that mutates the default for
+    every socket created anywhere in the process — including the ones the metrics server
+    accepts on — so a probe tweak would silently reconfigure the server. getaddrinfo has
+    no per-call timeout, so this accepts the resolver's own bound rather than buying a
+    weak guarantee at the cost of global state.
+    """
     for name in DNS_NAMES:
         try:
-            socket.setdefaulttimeout(PROBE_TIMEOUT)
             socket.getaddrinfo(name, 443, proto=socket.IPPROTO_TCP)
             return True
         except (OSError, socket.gaierror):

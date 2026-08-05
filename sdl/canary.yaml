@@ -6,12 +6,19 @@
 # the failures it exists to catch (a provider closing the deployment, a container restart
 # at 03:00, egress dying for twenty minutes) only happen over time. See canary/canary.py.
 #
-# ⚠️ MUST NOT BE REAPED. `cleanup-stale` and the smoke workflow's startup sweep exist to
-# destroy leaked probe leases, and this deployment looks exactly like one to them: same
-# wallet, long-lived, nobody watching it interactively. It is tagged below and excluded by
-# name in those paths. Removing the tag silently converts the canary into something the
-# next sweep deletes, and the symptom would be "the provider keeps closing our deployment"
-# — i.e. it would masquerade as the very fault it measures.
+# ⚠️ MUST NOT BE REAPED — and the real mechanism is the SERVICE NAME, not the tag.
+# `cleanup_stale` and the smoke startup sweep classify by SERVICE SET, verified in
+# just_akash/cleanup_stale.py: services == {probe} is stale after 1h, {backtest} after
+# 48h, and {} is left alone as unclassifiable. This deployment's service is `canary`, so
+# it matches no stale rule and is not reaped.
+#
+# That protection is INCIDENTAL rather than declared, which makes it fragile in a specific
+# way worth knowing: rename this service to `probe`, or add `canary` to a stale rule, and
+# the next sweep deletes it within the hour. The symptom would be "the provider keeps
+# closing our deployment" — the canary masquerading as the very fault it measures.
+#
+# The `canary-<provider>` tag is separately load-bearing, but for ADOPTION: it is how the
+# next run finds this lease in `just-akash list` and knows which dseq it is looking at.
 #
 # THE IMAGE INSTALLS NOTHING AT BOOT, deliberately. The other SDLs `apt-get install` on
 # start; a canary must not. If this container needed a package mirror to come up, a PyPI
