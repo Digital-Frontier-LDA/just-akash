@@ -26,6 +26,8 @@ import argparse
 import json
 import pathlib
 
+from canary._state import load_json_mapping
+
 TAG_PREFIX = "canary-"
 
 # Provider ADDRESS -> friendly name. These are the same three addresses already carried in
@@ -199,7 +201,7 @@ def main() -> int:
 
     listing = json.loads(pathlib.Path(a.listing).read_text(encoding="utf-8"))
     tp = pathlib.Path(a.targets)
-    prev = json.loads(tp.read_text(encoding="utf-8")) if tp.exists() else {}
+    prev = load_json_mapping(tp)
 
     pairs = providers_from_env(a.akash_providers)
     names = [n for n, _ in pairs]

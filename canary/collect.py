@@ -33,6 +33,8 @@ import time
 import urllib.error
 import urllib.request
 
+from canary._state import load_json_mapping
+
 SCRAPE_TIMEOUT = 20.0
 
 _SAMPLE_RE = re.compile(
@@ -309,7 +311,7 @@ def main() -> int:
 
     targets = json.loads(pathlib.Path(a.targets).read_text(encoding="utf-8"))
     sp = pathlib.Path(a.state)
-    state = json.loads(sp.read_text(encoding="utf-8")) if sp.exists() else {}
+    state = load_json_mapping(sp)
     now = time.time()
 
     for provider, t in sorted(targets.items()):

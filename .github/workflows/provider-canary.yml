@@ -97,8 +97,17 @@ jobs:
           set -euo pipefail
           mkdir -p prior
           git fetch --depth=1 origin telemetry || exit 0
-          git show FETCH_HEAD:canary-state.json   > prior/canary-state.json   2>/dev/null || true
-          git show FETCH_HEAD:canary-targets.json > prior/canary-targets.json 2>/dev/null || true
+          # `git show A:b > out` CREATES out BEFORE the command runs, so a missing file on
+          # the branch leaves a ZERO-BYTE out rather than none — and the `cp ... || echo '{}'`
+          # fallback downstream then copies the empty file happily. That is what broke the
+          # first live dispatch. Write to a temp and keep it only if non-empty.
+          for f in canary-state.json canary-targets.json; do
+            if git show "FETCH_HEAD:$f" > "prior/$f.tmp" 2>/dev/null && [ -s "prior/$f.tmp" ]; then
+              mv "prior/$f.tmp" "prior/$f"
+            else
+              rm -f "prior/$f.tmp"
+            fi
+          done
           ls -l prior/ || true
 
       - name: Resolve which providers still have a live canary
