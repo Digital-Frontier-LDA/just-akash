@@ -41,6 +41,16 @@ select = ["E", "F", "I", "UP", "B", "SIM", "S"]
 "just_akash/api.py" = ["S603", "S606", "S607"]
 "just_akash/cli.py" = ["S603", "S606", "S607"]
 "just_akash/transport/ssh.py" = ["S603", "S606", "S607"]
+# The persistent canary. Every ignore here is the thing the module EXISTS to do, and
+# each is scoped to a specific rule rather than blanket-disabling S:
+#   S310 - it opens URLs on purpose. That is the egress probe. Targets come from our own
+#          CANARY_EGRESS_URLS / the collector's targets file, never from user input.
+#   S104 - it binds 0.0.0.0 on purpose. Binding loopback would make it unreachable on its
+#          Akash ingress, i.e. it would fail the exact check it exists to answer.
+#   S108 - it writes a probe file under /tmp on purpose (CANARY_DISK_PATH), to measure
+#          fsync latency as the workload feels it.
+# S602 (shell=True) and the rest of S stay ENABLED here.
+"canary/**" = ["S310", "S104", "S108"]
 # Test and e2e code: assert-based tests (S101), hardcoded test creds (S105) and
 # /tmp paths (S108), and shell-based test orchestration (S602) are expected and
 # are not part of the shipped attack surface.
