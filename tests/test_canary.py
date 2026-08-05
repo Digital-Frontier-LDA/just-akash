@@ -448,3 +448,50 @@ def test_both_modules_share_one_implementation():
     import canary.ensure as ensure
 
     assert ensure.load_json_mapping is collect.load_json_mapping
+
+
+# ── wallet credit republishing ──────────────────────────────────────────────────────────
+
+CREDIT = {
+    "check": "deploy_credit",
+    "status": "OK",
+    "account": "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee",  # pragma: allowlist secret
+    "deploy_credit_usd": 81.37,
+    "free_usd": 81.37,
+    "granted_usd": 154.33,
+    "locked_in_escrow_usd": 72.95,
+    "min_usd": 25.0,
+}
+
+
+def test_credit_is_republished_with_the_three_components():
+    """free / granted / locked are different questions and the wallet's behaviour is only
+    legible with all three: a flat grant with rising escrow looks identical to a draining
+    wallet if you only plot the free figure."""
+    out = render({}, 1.0, CREDIT)
+    s = parse_exposition(out)
+    acct = (("account", CREDIT["account"]),)
+    assert s[("akash_wallet_free_credit_usd", acct)] == 81.37
+    assert s[("akash_wallet_granted_usd", acct)] == 154.33
+    assert s[("akash_wallet_locked_in_escrow_usd", acct)] == 72.95
+    assert ("akash_wallet_credit_timestamp_seconds", ()) in s
+
+
+def test_credit_metrics_do_not_reuse_the_smoke_metric_name():
+    """Two series with one name across two jobs would BOTH be scraped, and df-grafana's
+    rule takes max(just_akash_deploy_credit_usd) — a stale HIGH reading would mask a fresh
+    low one and suppress exactly the alert that matters."""
+    assert "just_akash_deploy_credit_usd" not in render({}, 1.0, CREDIT)
+
+
+def test_no_credit_file_means_no_credit_series_rather_than_zeros():
+    """A missing reading must be ABSENT, not published as 0 — a zero would read as an empty
+    wallet and fire the low-credit alert on a measurement gap."""
+    out = render({}, 1.0, {})
+    assert "akash_wallet_" not in out
+
+
+def test_partial_credit_json_emits_only_what_it_has():
+    out = render({}, 1.0, {"account": "akash1x", "free_usd": 10.0})
+    assert "akash_wallet_free_credit_usd" in out
+    assert "akash_wallet_granted_usd" not in out

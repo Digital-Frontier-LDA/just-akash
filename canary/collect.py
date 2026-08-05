@@ -189,7 +189,7 @@ def merge(
     return {**prev, provider: p}
 
 
-def render(state: dict, now: float) -> str:
+def render(state: dict, now: float, credit: dict | None = None) -> str:
     """Emit the exposition file df-grafana scrapes off the telemetry branch."""
     L: list[str] = []
     add = L.append
@@ -296,6 +296,43 @@ def render(state: dict, now: float) -> str:
     add("# HELP akash_canary_last_collect_timestamp_seconds Unix time of this collection.")
     add("# TYPE akash_canary_last_collect_timestamp_seconds gauge")
     add(f"akash_canary_last_collect_timestamp_seconds {now:.0f}")
+    # ── wallet credit, republished on the CANARY's cadence ──────────────────────────────
+    # just_akash_deploy_credit_usd is written once a day by the smoke, so a dashboard shows
+    # it as current when it can be 24h old — measured 2026-08-05 it read $81.37 while the
+    # live figure had moved. These carry the same numbers every ~30 minutes.
+    #
+    # DELIBERATELY DIFFERENT METRIC NAMES, not a second copy of the smoke's. Two series
+    # sharing one name across two jobs would both be scraped, and df-grafana's rule takes
+    # max(just_akash_deploy_credit_usd) — a stale HIGH reading would then mask a fresh low
+    # one and suppress exactly the alert that matters. Distinct names make the switchover
+    # explicit instead of silently wrong.
+    if credit:
+        acct = str(credit.get("account", ""))
+        for metric, key, help_ in (
+            (
+                "akash_wallet_free_credit_usd",
+                "free_usd",
+                "Deploy credit available NOW. This is what gates the next deploy.",
+            ),
+            (
+                "akash_wallet_granted_usd",
+                "granted_usd",
+                "Total Console grant. Nearly constant, and NOT the spendable figure.",
+            ),
+            (
+                "akash_wallet_locked_in_escrow_usd",
+                "locked_in_escrow_usd",
+                "Grant currently held in escrow by live deployments.",
+            ),
+        ):
+            v = credit.get(key)
+            if isinstance(v, (int, float)):
+                add(f"# HELP {metric} {help_}")
+                add(f"# TYPE {metric} gauge")
+                add(f'{metric}{{account="{acct}"}} {v}')
+        add("# HELP akash_wallet_credit_timestamp_seconds Unix time this credit was read.")
+        add("# TYPE akash_wallet_credit_timestamp_seconds gauge")
+        add(f"akash_wallet_credit_timestamp_seconds {now:.0f}")
     return "\n".join(L) + "\n"
 
 
@@ -307,6 +344,7 @@ def main() -> int:
     ap.add_argument("--state", required=True, help="Durable state JSON (read+write)")
     ap.add_argument("--out", required=True, help="Exposition file to write")
     ap.add_argument("--timeout", type=float, default=SCRAPE_TIMEOUT)
+    ap.add_argument("--credit", help="`balance --check --json` output to republish")
     a = ap.parse_args()
 
     targets = json.loads(pathlib.Path(a.targets).read_text(encoding="utf-8"))
@@ -327,7 +365,8 @@ def main() -> int:
         )
 
     sp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    pathlib.Path(a.out).write_text(render(state, now), encoding="utf-8")
+    credit = load_json_mapping(pathlib.Path(a.credit)) if a.credit else {}
+    pathlib.Path(a.out).write_text(render(state, now, credit), encoding="utf-8")
     # Exit 0 even when a canary is down: an unreachable provider is the DATA, and a
     # non-zero exit here would fail the workflow and stop the file being published —
     # losing the very measurement we came for.
