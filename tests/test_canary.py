@@ -19,9 +19,14 @@ from canary.collect import (
     render,
     scrape,
 )
-from canary.ensure import plan
+from canary.ensure import name_for, plan, providers_from_env
 
 ALPHA = "alphavps"
+
+# Public provider addresses — the same three in .env.example / AKASH_PROVIDERS.
+ADDR_ALPHAVPS = "akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z"  # pragma: allowlist secret
+ADDR_ONIDC = "akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk"  # pragma: allowlist secret
+ADDR_HETZNER = "akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x"  # pragma: allowlist secret
 
 
 def _body(
@@ -327,3 +332,61 @@ def test_counter_accumulation_is_monotonic_across_normal_scrapes():
     st = merge(st, ALPHA, "100", True, _body("aaa", egress_fail=4), 0.1, 1100.0)
     st = merge(st, ALPHA, "100", True, _body("aaa", egress_fail=9), 0.1, 1200.0)
     assert st[ALPHA]["egress_fail"] == 9, "same process: track the raw value, do not sum it"
+
+
+# ── provider config comes from AKASH_PROVIDERS, not a canary-specific copy ───────────────
+
+
+def test_known_provider_addresses_resolve_to_fleet_names():
+    """The same three addresses AKASH_PROVIDERS carries, df-grafana label_replaces into
+    cluster names, and the autobidder dashboards pin."""
+    assert name_for(ADDR_ALPHAVPS) == "alphavps"
+    assert name_for(ADDR_ONIDC) == "onidc"
+    assert name_for(ADDR_HETZNER) == "hetzner_hel"
+
+
+def test_unknown_provider_gets_an_ugly_label_rather_than_being_dropped():
+    """Adding a fourth provider to AKASH_PROVIDERS must not silently exclude it from the
+    canary. An ugly label is a visible prompt to name it; a silent omission is a provider
+    nobody is watching."""
+    label = name_for("akash1newprovideraddress0000000000000000ab")
+    assert label.startswith("akash1new") and label.endswith("0000ab")
+
+
+def test_two_unknown_providers_never_collide_on_one_label():
+    """Every Akash address starts `akash1`, so a plain prefix truncation leaves only a few
+    distinguishing characters. A collision here is silently destructive, not just ugly:
+    plan() and the targets file are keyed by this name, so two providers would fold into
+    one entry and one would go unwatched — the exact outcome the fallback exists to
+    prevent. These two share their first 30 characters."""
+    a = name_for("akash1qqqqqqqqqqqqqqqqqqqqqqqqqqqqq7h9dx4")
+    b = name_for("akash1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqk2m5wz")
+    assert a != b
+
+
+def test_providers_parse_from_the_real_akash_providers_format():
+    pairs = providers_from_env(f"{ADDR_ONIDC},{ADDR_ALPHAVPS},{ADDR_HETZNER}")
+    assert [n for n, _ in pairs] == ["onidc", "alphavps", "hetzner_hel"]
+    assert all(a.startswith("akash1") for _, a in pairs)
+
+
+def test_blank_entries_and_whitespace_are_tolerated():
+    """A trailing comma in a SOPS-managed env value must not create a phantom provider."""
+    pairs = providers_from_env(f" {ADDR_ALPHAVPS} , ,")
+    assert pairs == [("alphavps", ADDR_ALPHAVPS)]
+
+
+def test_a_repeated_address_does_not_create_two_leases():
+    """AKASH_PROVIDERS is a hand-maintained comma-separated string in a SOPS file, so a
+    repeated address is an ordinary copy-paste slip. Un-deduplicated it would put the
+    provider in `missing` twice, run the deploy loop twice, and open TWO leases on one
+    provider — paying twice to watch the same thing."""
+    addr = ADDR_ALPHAVPS
+    assert providers_from_env(f"{addr},{addr}") == [("alphavps", addr)]
+
+
+def test_duplicate_addresses_do_not_produce_duplicate_plan_entries():
+    addr = ADDR_ALPHAVPS
+    names = [n for n, _ in providers_from_env(f"{addr},{addr},{addr}")]
+    _, missing = plan([], names)
+    assert missing == ["alphavps"], "one provider, one deploy"

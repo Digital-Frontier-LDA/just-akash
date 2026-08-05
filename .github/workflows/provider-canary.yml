@@ -26,7 +26,11 @@ name: Provider canary (persistent)
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    # :05 and :35, NOT :00 and :30. The smoke runs at 07:00 and a */30 schedule
+    # collides with it head-on. Offsetting does not by itself make this safe (the
+    # smoke can run 40 minutes), which is what the shared concurrency group below
+    # is for — but it keeps the common case from queueing needlessly.
+    - cron: "5,35 * * * *"
   workflow_dispatch:
     inputs:
       deploy_missing:
@@ -34,10 +38,25 @@ on:
         type: boolean
         default: true
 
-# NEVER cancel in flight. A run can be mid-deploy holding a live lease; a hard cancel
-# would leak it — the same reasoning as provider-smoke's concurrency block.
+# ⚠️ SHARED WITH provider-smoke.yml, and this is the important line in the file.
+#
+# Both workflows spend from the SAME Console-API wallet (AKASH_API_KEY) — there is
+# only one. That wallet is a single Cosmos account, and a Cosmos account cannot have
+# two transactions in flight: they share a sequence number, so a concurrent deploy
+# from each workflow makes one of them fail with an account-sequence mismatch.
+# Nothing in just_akash retries that (grepped: no sequence handling anywhere), so the
+# loser is a hard failure — and the canary losing looks identical to a provider
+# refusing to bid, which would be a fabricated fault in the signal.
+#
+# A shared group makes GitHub queue them instead of racing. The cost is that a
+# collection can be delayed behind a smoke run (up to ~70 minutes, once a day), and
+# that cost is near-zero BY DESIGN: the agent's counters are cumulative, so a late
+# collection loses timing precision and no events. That property was built for the
+# 30-minute cadence and it pays for this too.
+#
+# NEVER cancel in flight: a run can be mid-deploy holding a live lease.
 concurrency:
-  group: provider-canary
+  group: akash-wallet
   cancel-in-progress: false
 
 permissions:
@@ -83,18 +102,20 @@ jobs:
           ls -l prior/ || true
 
       - name: Resolve which providers still have a live canary
-        env:
-          PROVIDERS: ${{ vars.CANARY_PROVIDERS || 'alphavps,onidc,hetzner_hel' }}
+        # AKASH_PROVIDERS comes from secrets/ci.sops.env via the SOPS step above — the
+        # SAME variable the smoke test uses. Deliberately not a canary-specific copy: a
+        # second list could drift, and the canary and the smoke would then be measuring
+        # different fleets while both looked correctly configured.
         run: |
           set -euo pipefail
           uv run just-akash list --json > listing.json
           cp prior/canary-targets.json targets.json 2>/dev/null || echo '{}' > targets.json
           uv run python -m canary.ensure \
             --listing listing.json \
-            --providers "$PROVIDERS" \
+            --akash-providers "$AKASH_PROVIDERS" \
             --targets targets.json \
             --missing-out missing.txt
-          echo "missing: $(tr '\n' ' ' < missing.txt || true)"
+          echo "missing: $(cut -f1 missing.txt | tr '\n' ' ' || true)"
 
       # THE ONLY STEP THAT SPENDS MONEY, kept separate and visible on purpose.
       #
@@ -107,32 +128,52 @@ jobs:
       # akash_canary_lease_replacements_total is the alertable signal that it is doing so.
       - name: Deploy canaries for providers missing one
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_missing || vars.CANARY_AUTODEPLOY == 'true' }}
-        env:
-          PROVIDER_WALLETS: ${{ vars.CANARY_PROVIDER_WALLETS }}
         run: |
           set -euo pipefail
           [ -s missing.txt ] || { echo "Every provider has a live canary — nothing to deploy."; exit 0; }
+
+          # CREDIT FLOOR — the second half of sharing one wallet.
+          #
+          # The lock above stops the two workflows racing on the account SEQUENCE. It does
+          # nothing about them sharing a BUDGET. The canary holds escrow permanently, the
+          # smoke needs credit to deploy at all, and it is one pool: a canary that keeps
+          # recreating leases on a flapping provider could quietly starve the smoke into
+          # 402ing every morning. The existing AkashSmokeWalletCredit alerts would fire on
+          # the shared number and point at nothing in particular.
+          #
+          # Measured 2026-08-05 from just_akash_deploy_credit_usd: $81.37 now, $154.33 a
+          # week earlier — roughly $10/day already, i.e. the wallet reaches the <$20
+          # warning in about six days on EXISTING usage. This is not a hypothetical.
+          #
+          # So the canary yields. Below the floor it declines to deploy and says so; the
+          # smoke keeps the remaining budget, because "can we deploy at all" is the more
+          # important question and it is the one the canary cannot answer for itself.
+          # The already-running canaries are untouched — this only blocks NEW leases.
+          floor="${CANARY_MIN_CREDIT_USD:-25}"
+          if ! uv run just-akash balance --check --min-usd "$floor" >/dev/null 2>&1; then
+            echo "::warning::deploy credit below the \$${floor} floor - NOT creating canary leases, so the daily smoke keeps the remaining budget. Top up the wallet."
+            exit 0
+          fi
+
           CANARY_PY_B64=$(base64 -w0 canary/canary.py)
-          while read -r provider; do
-            [ -n "$provider" ] || continue
-            wallet=$(python -c "import json,os,sys;print(json.loads(os.environ.get('PROVIDER_WALLETS') or '{}').get(sys.argv[1],''))" "$provider")
-            if [ -z "$wallet" ]; then
-              echo "::warning::no wallet mapped for '$provider' in CANARY_PROVIDER_WALLETS — skipping"
-              continue
-            fi
-            echo "::group::deploy canary on $provider ($wallet)"
+          # name<TAB>address, both resolved by canary/ensure.py from AKASH_PROVIDERS.
+          while IFS=$'\t' read -r provider address; do
+            [ -n "$provider" ] && [ -n "$address" ] || continue
+            echo "::group::deploy canary on $provider ($address)"
             sed -e "s|PLACEHOLDER_CANARY_PY_B64|${CANARY_PY_B64}|" \
                 -e "s|PLACEHOLDER_PROVIDER|${provider}|" \
                 sdl/canary.yaml > "sdl-canary-${provider}.yaml"
             uv run just-akash deploy \
               --sdl "sdl-canary-${provider}.yaml" \
-              --provider "$wallet" \
-              --deposit "${CANARY_DEPOSIT_USD:-5.0}" \
+              --provider "$address" \
+              --deposit "${CANARY_DEPOSIT_USD:-2.0}" \
             | tee "deploy-${provider}.log"
             dseq=$(grep -oE 'dseq[ =:]+[0-9]+' "deploy-${provider}.log" | grep -oE '[0-9]+' | head -1 || true)
             if [ -n "$dseq" ]; then
-              # The tag is load-bearing twice over: it is how the next run finds this
-              # lease, and it is what keeps cleanup-stale from reaping it.
+              # The tag is how the NEXT RUN finds this lease in `just-akash list`.
+              # It does not protect it from the reapers — those classify by service set
+              # ({probe}/{backtest}), and this deployment's service is `canary`. See the
+              # warning in sdl/canary.yaml.
               uv run just-akash tag --dseq "$dseq" --name "canary-${provider}"
               uv run just-akash auto-topup --dseq "$dseq" --enable || \
                 echo "::warning::auto-topup could not be enabled on ${dseq}; escrow will need watching"
@@ -143,13 +184,12 @@ jobs:
           done < missing.txt
 
       - name: Re-resolve targets after any deploy
-        env:
-          PROVIDERS: ${{ vars.CANARY_PROVIDERS || 'alphavps,onidc,hetzner_hel' }}
         run: |
           set -euo pipefail
           uv run just-akash list --json > listing.json
           uv run python -m canary.ensure \
-            --listing listing.json --providers "$PROVIDERS" --targets targets.json
+            --listing listing.json --akash-providers "$AKASH_PROVIDERS" \
+            --targets targets.json
 
       # An unreachable canary is the MEASUREMENT, so this step must not fail the run —
       # collect.py exits 0 on an outage by design. If it failed here the file would never
