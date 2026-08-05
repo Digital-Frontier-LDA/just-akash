@@ -54,8 +54,18 @@ def name_for(address: str) -> str:
     The fallback matters: adding a fourth provider to AKASH_PROVIDERS must not silently
     drop it from the canary. It gets an ugly label until someone adds it above, which is a
     visible prompt rather than a silent omission.
+
+    PREFIX **AND** SUFFIX, not a plain truncation. Every Akash address starts `akash1`, so
+    address[:12] leaves only six distinguishing characters — two unknown providers could
+    collide on one label. That would be silently destructive rather than merely ugly:
+    `plan()` and the targets file are keyed by this name, so two providers would fold into
+    one entry and one of them would go unwatched. That is precisely the outcome the
+    fallback exists to prevent. The trailing characters of a bech32 address include its
+    checksum, so prefix+suffix is effectively unique.
     """
-    return PROVIDER_NAMES.get(address, address[:12])
+    if address in PROVIDER_NAMES:
+        return PROVIDER_NAMES[address]
+    return f"{address[:10]}..{address[-6:]}" if len(address) > 18 else address
 
 
 def providers_from_env(akash_providers: str) -> list[tuple[str, str]]:

@@ -344,7 +344,19 @@ def test_unknown_provider_gets_an_ugly_label_rather_than_being_dropped():
     """Adding a fourth provider to AKASH_PROVIDERS must not silently exclude it from the
     canary. An ugly label is a visible prompt to name it; a silent omission is a provider
     nobody is watching."""
-    assert name_for("akash1newprovideraddress000000000000000000") == "akash1newpro"
+    label = name_for("akash1newprovideraddress0000000000000000ab")
+    assert label.startswith("akash1new") and label.endswith("0000ab")
+
+
+def test_two_unknown_providers_never_collide_on_one_label():
+    """Every Akash address starts `akash1`, so a plain prefix truncation leaves only a few
+    distinguishing characters. A collision here is silently destructive, not just ugly:
+    plan() and the targets file are keyed by this name, so two providers would fold into
+    one entry and one would go unwatched — the exact outcome the fallback exists to
+    prevent. These two share their first 30 characters."""
+    a = name_for("akash1qqqqqqqqqqqqqqqqqqqqqqqqqqqqq7h9dx4")
+    b = name_for("akash1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqk2m5wz")
+    assert a != b
 
 
 def test_providers_parse_from_the_real_akash_providers_format():
