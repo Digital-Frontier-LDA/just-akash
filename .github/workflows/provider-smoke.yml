@@ -25,8 +25,13 @@ on:
 
 # Serialize runs and NEVER cancel one mid-flight: a run holds live probe leases it
 # must destroy in its cleanup, and a hard cancel would leak them. Queue instead.
+#
+# ⚠️ THE GROUP IS SHARED WITH provider-canary.yml, and renaming it here silently
+# un-serialises the two. Both spend from the same Console-API wallet, which is a single
+# Cosmos account: two concurrent deploys share a sequence number and one fails with an
+# account-sequence mismatch. See the long note in provider-canary.yml.
 concurrency:
-  group: provider-smoke
+  group: akash-wallet
   cancel-in-progress: false
 
 permissions:

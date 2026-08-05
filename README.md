@@ -328,11 +328,45 @@ measuring different fleets while both looked correctly configured. The name was 
 misleading — every entry is a *provider's* address, not one of our wallets. We have one
 wallet, and `just_akash_deploy_credit_usd` (already alerted on in df-grafana) is its credit.
 
-One switch exists, and only because it spends money:
+Two switches exist, both about money:
 
 | Variable | Purpose |
 |---|---|
 | `CANARY_AUTODEPLOY` | `true` to let the schedule recreate a missing canary. |
+| `CANARY_MIN_CREDIT_USD` | Credit floor below which the canary declines to create leases. Default `25`. |
+
+### ⚠️ One wallet means the canary and the smoke must not run at once
+
+They share `AKASH_API_KEY`, and that is a **single Cosmos account**. Two accounts-worth of
+work, one sequence number: concurrent deploys make one of them fail with an account-sequence
+mismatch, and nothing in `just_akash` retries that. The canary losing that race looks
+identical to a provider refusing to bid — a fabricated fault in the very signal it exists to
+produce.
+
+So both workflows share the concurrency group **`akash-wallet`**. Renaming it in either file
+silently un-serialises them. The canary's schedule is also offset to `:05`/`:35` rather than
+the hour, since the smoke runs at 07:00 and can run for 40 minutes.
+
+The cost is that a collection can queue behind a smoke run — up to ~70 minutes, once a day —
+and that cost is near-zero by design: the counters are cumulative, so a late collection loses
+timing precision and no events.
+
+### ⚠️ One wallet is also one budget
+
+The lock solves the sequence race. It does nothing about the two competing for **credit**:
+the canary holds escrow permanently, the smoke needs credit to deploy at all, and a canary
+recreating leases against a flapping provider could quietly starve the smoke into 402ing
+every morning.
+
+Measured from `just_akash_deploy_credit_usd` on 2026-08-05 — **$81.37, against $154.33 a week
+earlier**, i.e. roughly $10/day on existing usage alone, reaching the `<$20` warning in about
+six days. This is not hypothetical.
+
+So the canary **yields**: below `CANARY_MIN_CREDIT_USD` it declines to create new leases and
+says so in the run log, leaving the remaining budget to the smoke — because *"can we deploy at
+all"* is the more important question, and it is the one the canary cannot answer for itself.
+Canaries already running are untouched; only new leases are blocked. Deposit defaults to $2
+each rather than $5, so three canaries hold $6 rather than $15 of a wallet this size.
 
 ⚠️ **What actually stops the canary being reaped is its SERVICE NAME, not its tag.**
 `cleanup_stale` and the smoke startup sweep classify by service set — `{probe}` is stale

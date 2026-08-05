@@ -26,7 +26,11 @@ name: Provider canary (persistent)
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    # :05 and :35, NOT :00 and :30. The smoke runs at 07:00 and a */30 schedule
+    # collides with it head-on. Offsetting does not by itself make this safe (the
+    # smoke can run 40 minutes), which is what the shared concurrency group below
+    # is for — but it keeps the common case from queueing needlessly.
+    - cron: "5,35 * * * *"
   workflow_dispatch:
     inputs:
       deploy_missing:
@@ -34,10 +38,25 @@ on:
         type: boolean
         default: true
 
-# NEVER cancel in flight. A run can be mid-deploy holding a live lease; a hard cancel
-# would leak it — the same reasoning as provider-smoke's concurrency block.
+# ⚠️ SHARED WITH provider-smoke.yml, and this is the important line in the file.
+#
+# Both workflows spend from the SAME Console-API wallet (AKASH_API_KEY) — there is
+# only one. That wallet is a single Cosmos account, and a Cosmos account cannot have
+# two transactions in flight: they share a sequence number, so a concurrent deploy
+# from each workflow makes one of them fail with an account-sequence mismatch.
+# Nothing in just_akash retries that (grepped: no sequence handling anywhere), so the
+# loser is a hard failure — and the canary losing looks identical to a provider
+# refusing to bid, which would be a fabricated fault in the signal.
+#
+# A shared group makes GitHub queue them instead of racing. The cost is that a
+# collection can be delayed behind a smoke run (up to ~70 minutes, once a day), and
+# that cost is near-zero BY DESIGN: the agent's counters are cumulative, so a late
+# collection loses timing precision and no events. That property was built for the
+# 30-minute cadence and it pays for this too.
+#
+# NEVER cancel in flight: a run can be mid-deploy holding a live lease.
 concurrency:
-  group: provider-canary
+  group: akash-wallet
   cancel-in-progress: false
 
 permissions:
@@ -112,6 +131,30 @@ jobs:
         run: |
           set -euo pipefail
           [ -s missing.txt ] || { echo "Every provider has a live canary — nothing to deploy."; exit 0; }
+
+          # CREDIT FLOOR — the second half of sharing one wallet.
+          #
+          # The lock above stops the two workflows racing on the account SEQUENCE. It does
+          # nothing about them sharing a BUDGET. The canary holds escrow permanently, the
+          # smoke needs credit to deploy at all, and it is one pool: a canary that keeps
+          # recreating leases on a flapping provider could quietly starve the smoke into
+          # 402ing every morning. The existing AkashSmokeWalletCredit alerts would fire on
+          # the shared number and point at nothing in particular.
+          #
+          # Measured 2026-08-05 from just_akash_deploy_credit_usd: $81.37 now, $154.33 a
+          # week earlier — roughly $10/day already, i.e. the wallet reaches the <$20
+          # warning in about six days on EXISTING usage. This is not a hypothetical.
+          #
+          # So the canary yields. Below the floor it declines to deploy and says so; the
+          # smoke keeps the remaining budget, because "can we deploy at all" is the more
+          # important question and it is the one the canary cannot answer for itself.
+          # The already-running canaries are untouched — this only blocks NEW leases.
+          floor="${CANARY_MIN_CREDIT_USD:-25}"
+          if ! uv run just-akash balance --check --min-usd "$floor" >/dev/null 2>&1; then
+            echo "::warning::deploy credit below the \$${floor} floor - NOT creating canary leases, so the daily smoke keeps the remaining budget. Top up the wallet."
+            exit 0
+          fi
+
           CANARY_PY_B64=$(base64 -w0 canary/canary.py)
           # name<TAB>address, both resolved by canary/ensure.py from AKASH_PROVIDERS.
           while IFS=$'\t' read -r provider address; do
@@ -123,7 +166,7 @@ jobs:
             uv run just-akash deploy \
               --sdl "sdl-canary-${provider}.yaml" \
               --provider "$address" \
-              --deposit "${CANARY_DEPOSIT_USD:-5.0}" \
+              --deposit "${CANARY_DEPOSIT_USD:-2.0}" \
             | tee "deploy-${provider}.log"
             dseq=$(grep -oE 'dseq[ =:]+[0-9]+' "deploy-${provider}.log" | grep -oE '[0-9]+' | head -1 || true)
             if [ -n "$dseq" ]; then
