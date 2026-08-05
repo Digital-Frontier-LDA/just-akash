@@ -495,3 +495,42 @@ def test_partial_credit_json_emits_only_what_it_has():
     out = render({}, 1.0, {"account": "akash1x", "free_usd": 10.0})
     assert "akash_wallet_free_credit_usd" in out
     assert "akash_wallet_granted_usd" not in out
+
+
+def test_boolean_credit_values_are_not_published_as_numbers():
+    """A bool IS an int in Python, so a stray `true` would publish as `1` — a wallet
+    reading of $1. The repo's _is_number excludes bool for exactly this reason."""
+    out = render({}, 1.0, {"account": "akash1x", "free_usd": True, "granted_usd": 5.0})
+    assert "akash_wallet_free_credit_usd" not in out
+    assert "akash_wallet_granted_usd" in out
+
+
+def test_account_label_is_escaped():
+    """The account comes from JSON. An unescaped quote would produce a malformed line and
+    make the WHOLE exposition unparseable, taking every other series down with it.
+
+    Built with chr() rather than escape sequences: counting backslashes across a Python
+    literal, a test file and an exposition line is how you write an assertion that passes
+    for the wrong reason.
+    """
+    bs, q = chr(92), chr(34)
+    raw = "a" + q + "b" + bs + "c"  # a"b\c
+    expected = "account=" + q + "a" + bs + q + "b" + bs + bs + "c" + q
+    out = render({}, 1.0, {"account": raw, "free_usd": 1.0})
+    assert expected in out
+    parse_exposition(out)  # must still parse
+
+
+def test_timestamp_is_omitted_when_no_credit_value_was_emitted():
+    """A mapping with only status fields must not publish a freshness stamp for data that
+    was never published — that would assert a reading exists when none does."""
+    out = render({}, 1.0, {"status": "OK", "check": "deploy_credit"})
+    assert "akash_wallet_credit_timestamp_seconds" not in out
+
+
+def test_timestamp_reports_when_credit_was_read_not_when_collected():
+    """The balance step runs before the deploy step, which can take minutes. Stamping with
+    collection time would overstate freshness by exactly the interval that matters."""
+    out = render({}, 9_999.0, {"account": "a", "free_usd": 1.0}, credit_read_at=1_000.0)
+    s = parse_exposition(out)
+    assert s[("akash_wallet_credit_timestamp_seconds", ())] == 1000.0
