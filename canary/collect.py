@@ -35,6 +35,13 @@ import urllib.request
 
 from canary._state import load_json_mapping
 
+# Reused from the exporter rather than re-implemented: _escape_label_value handles the
+# exposition-format escapes, and _is_number excludes bool (a bool IS an int, so a
+# stray `true` would otherwise publish as `1`). canary/canary.py stays stdlib-only
+# because it runs INSIDE the lease; this module runs in CI where just_akash is
+# installed, so it should use the repo's implementations, not copies of them.
+from just_akash.prometheus_exporter import _escape_label_value, _is_number
+
 SCRAPE_TIMEOUT = 20.0
 
 _SAMPLE_RE = re.compile(
@@ -189,7 +196,12 @@ def merge(
     return {**prev, provider: p}
 
 
-def render(state: dict, now: float) -> str:
+def render(
+    state: dict,
+    now: float,
+    credit: dict | None = None,
+    credit_read_at: float | None = None,
+) -> str:
     """Emit the exposition file df-grafana scrapes off the telemetry branch."""
     L: list[str] = []
     add = L.append
@@ -296,6 +308,52 @@ def render(state: dict, now: float) -> str:
     add("# HELP akash_canary_last_collect_timestamp_seconds Unix time of this collection.")
     add("# TYPE akash_canary_last_collect_timestamp_seconds gauge")
     add(f"akash_canary_last_collect_timestamp_seconds {now:.0f}")
+    # ── wallet credit, republished on the CANARY's cadence ──────────────────────────────
+    # just_akash_deploy_credit_usd is written once per day by the smoke, so anything reading
+    # it sees a figure that can be a full day old while looking current. These carry the same
+    # numbers on this workflow's cadence instead.
+    #
+    # ALL THREE COMPONENTS, deliberately. The free figure alone is ambiguous: a constant
+    # grant with escrow climbing looks exactly like a wallet draining, and the two call for
+    # opposite responses (reclaim leases vs. add funds). granted and locked disambiguate it.
+    #
+    # DELIBERATELY DIFFERENT METRIC NAMES from the smoke's. Two series sharing one name
+    # across two jobs would both be scraped, and a rule taking max() over them would let a
+    # stale HIGH reading mask a fresh low one — suppressing the alert that matters.
+    if credit:
+        acct = _escape_label_value(str(credit.get("account", "")))
+        emitted = 0
+        for metric, key, help_ in (
+            (
+                "akash_wallet_free_credit_usd",
+                "free_usd",
+                "Deploy credit available NOW. This is what gates the next deploy.",
+            ),
+            (
+                "akash_wallet_granted_usd",
+                "granted_usd",
+                "Total Console grant. Nearly constant, and NOT the spendable figure.",
+            ),
+            (
+                "akash_wallet_locked_in_escrow_usd",
+                "locked_in_escrow_usd",
+                "Grant currently held in escrow by live deployments.",
+            ),
+        ):
+            v = credit.get(key)
+            if _is_number(v):
+                add(f"# HELP {metric} {help_}")
+                add(f"# TYPE {metric} gauge")
+                add(f'{metric}{{account="{acct}"}} {v}')
+                emitted += 1
+        # Only when a value actually went out, and stamped with when the CREDIT was read —
+        # not with collection time. The balance step runs before the deploy step, which can
+        # take minutes, so `now` would overstate freshness by exactly the interval that
+        # matters when judging whether to trust the number.
+        if emitted:
+            add("# HELP akash_wallet_credit_timestamp_seconds Unix time the credit was READ.")
+            add("# TYPE akash_wallet_credit_timestamp_seconds gauge")
+            add(f"akash_wallet_credit_timestamp_seconds {credit_read_at or now:.0f}")
     return "\n".join(L) + "\n"
 
 
@@ -307,6 +365,7 @@ def main() -> int:
     ap.add_argument("--state", required=True, help="Durable state JSON (read+write)")
     ap.add_argument("--out", required=True, help="Exposition file to write")
     ap.add_argument("--timeout", type=float, default=SCRAPE_TIMEOUT)
+    ap.add_argument("--credit", help="`balance --check --json` output to republish")
     a = ap.parse_args()
 
     targets = json.loads(pathlib.Path(a.targets).read_text(encoding="utf-8"))
@@ -327,7 +386,18 @@ def main() -> int:
         )
 
     sp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    pathlib.Path(a.out).write_text(render(state, now), encoding="utf-8")
+    credit_path = pathlib.Path(a.credit) if a.credit else None
+    credit = load_json_mapping(credit_path) if credit_path else {}
+    # The file's mtime IS the moment the balance was read — the workflow writes it
+    # straight from `balance --check`. Using it needs no extra plumbing and cannot
+    # drift from reality the way a hand-passed timestamp would.
+    credit_read_at = None
+    if credit_path is not None:
+        try:
+            credit_read_at = credit_path.stat().st_mtime
+        except OSError:
+            credit_read_at = None
+    pathlib.Path(a.out).write_text(render(state, now, credit, credit_read_at), encoding="utf-8")
     # Exit 0 even when a canary is down: an unreachable provider is the DATA, and a
     # non-zero exit here would fail the workflow and stop the file being published —
     # losing the very measurement we came for.

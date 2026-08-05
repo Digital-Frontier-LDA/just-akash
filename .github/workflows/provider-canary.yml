@@ -135,6 +135,21 @@ jobs:
       # One deploy per provider per run is the cap. A provider that keeps closing our
       # deployment therefore costs at most one lease per 30 minutes, and the resulting
       # akash_canary_lease_replacements_total is the alertable signal that it is doing so.
+      # ALWAYS runs, even when deploying is disabled, because this reading is not just
+      # a gate — it is published. just_akash_deploy_credit_usd is written once a day by
+      # the smoke, so a dashboard shows it as current when it can be 24 hours old.
+      # Reading it here puts a ~30 minute figure on the same branch.
+      - name: Read deploy credit
+        run: |
+          set -euo pipefail
+          floor="${CANARY_MIN_CREDIT_USD:-25}"
+          set +e
+          uv run just-akash balance --check --min-usd "$floor" --json > credit.json 2>credit.err
+          echo "balance rc=$?"
+          set -e
+          cat credit.json 2>/dev/null || true
+          [ -s credit.err ] && cat credit.err || true
+
       - name: Deploy canaries for providers missing one
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_missing || vars.CANARY_AUTODEPLOY == 'true' }}
         run: |
@@ -158,12 +173,21 @@ jobs:
           # smoke keeps the remaining budget, because "can we deploy at all" is the more
           # important question and it is the one the canary cannot answer for itself.
           # The already-running canaries are untouched — this only blocks NEW leases.
+          # Read the verdict captured by the step above — one balance call per run.
+          # `status` distinguishes the two outcomes an exit code cannot: LOW means the
+          # wallet really is short, anything else means we could not MEASURE it. The
+          # first version of this guard was `if ! balance ... >/dev/null 2>&1`, which
+          # conflated them and reported a low wallet on a run where credit was $81.
           floor="${CANARY_MIN_CREDIT_USD:-25}"
-          if ! uv run just-akash balance --check --min-usd "$floor" >/dev/null 2>&1; then
-            echo "::warning::deploy credit below the \$${floor} floor - NOT creating canary leases, so the daily smoke keeps the remaining budget. Top up the wallet."
+          status=$(python -c "import json,sys;print(json.load(open('credit.json')).get('status',''))" 2>/dev/null || true)
+          if [ "$status" = "LOW" ]; then
+            echo "::warning::deploy credit is below the \$${floor} floor - NOT creating canary leases, so the daily smoke keeps the remaining budget. Top up the wallet."
             exit 0
           fi
-
+          if [ "$status" != "OK" ]; then
+            echo "::warning::could not READ the deploy credit - NOT creating canary leases. This is a measurement failure, not a low wallet; see the Read deploy credit step above."
+            exit 0
+          fi
           CANARY_PY_B64=$(base64 -w0 canary/canary.py)
           # name<TAB>address, both resolved by canary/ensure.py from AKASH_PROVIDERS.
           while IFS=$'\t' read -r provider address; do
@@ -208,7 +232,8 @@ jobs:
           set -euo pipefail
           cp prior/canary-state.json state.json 2>/dev/null || echo '{}' > state.json
           uv run python -m canary.collect \
-            --targets targets.json --state state.json --out canary-metrics.prom
+            --targets targets.json --state state.json --out canary-metrics.prom \
+            --credit credit.json
           echo "--- exposition ---"; cat canary-metrics.prom
 
       - name: Publish to the telemetry branch

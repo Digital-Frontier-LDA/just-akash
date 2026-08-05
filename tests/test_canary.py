@@ -448,3 +448,89 @@ def test_both_modules_share_one_implementation():
     import canary.ensure as ensure
 
     assert ensure.load_json_mapping is collect.load_json_mapping
+
+
+# ── wallet credit republishing ──────────────────────────────────────────────────────────
+
+CREDIT = {
+    "check": "deploy_credit",
+    "status": "OK",
+    "account": "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee",  # pragma: allowlist secret
+    "deploy_credit_usd": 81.37,
+    "free_usd": 81.37,
+    "granted_usd": 154.33,
+    "locked_in_escrow_usd": 72.95,
+    "min_usd": 25.0,
+}
+
+
+def test_credit_is_republished_with_the_three_components():
+    """free / granted / locked are different questions and the wallet's behaviour is only
+    legible with all three: a flat grant with rising escrow looks identical to a draining
+    wallet if you only plot the free figure."""
+    out = render({}, 1.0, CREDIT)
+    s = parse_exposition(out)
+    acct = (("account", CREDIT["account"]),)
+    assert s[("akash_wallet_free_credit_usd", acct)] == 81.37
+    assert s[("akash_wallet_granted_usd", acct)] == 154.33
+    assert s[("akash_wallet_locked_in_escrow_usd", acct)] == 72.95
+    assert ("akash_wallet_credit_timestamp_seconds", ()) in s
+
+
+def test_credit_metrics_do_not_reuse_the_smoke_metric_name():
+    """Two series with one name across two jobs would BOTH be scraped, and df-grafana's
+    rule takes max(just_akash_deploy_credit_usd) — a stale HIGH reading would mask a fresh
+    low one and suppress exactly the alert that matters."""
+    assert "just_akash_deploy_credit_usd" not in render({}, 1.0, CREDIT)
+
+
+def test_no_credit_file_means_no_credit_series_rather_than_zeros():
+    """A missing reading must be ABSENT, not published as 0 — a zero would read as an empty
+    wallet and fire the low-credit alert on a measurement gap."""
+    out = render({}, 1.0, {})
+    assert "akash_wallet_" not in out
+
+
+def test_partial_credit_json_emits_only_what_it_has():
+    out = render({}, 1.0, {"account": "akash1x", "free_usd": 10.0})
+    assert "akash_wallet_free_credit_usd" in out
+    assert "akash_wallet_granted_usd" not in out
+
+
+def test_boolean_credit_values_are_not_published_as_numbers():
+    """A bool IS an int in Python, so a stray `true` would publish as `1` — a wallet
+    reading of $1. The repo's _is_number excludes bool for exactly this reason."""
+    out = render({}, 1.0, {"account": "akash1x", "free_usd": True, "granted_usd": 5.0})
+    assert "akash_wallet_free_credit_usd" not in out
+    assert "akash_wallet_granted_usd" in out
+
+
+def test_account_label_is_escaped():
+    """The account comes from JSON. An unescaped quote would produce a malformed line and
+    make the WHOLE exposition unparseable, taking every other series down with it.
+
+    Built with chr() rather than escape sequences: counting backslashes across a Python
+    literal, a test file and an exposition line is how you write an assertion that passes
+    for the wrong reason.
+    """
+    bs, q = chr(92), chr(34)
+    raw = "a" + q + "b" + bs + "c"  # a"b\c
+    expected = "account=" + q + "a" + bs + q + "b" + bs + bs + "c" + q
+    out = render({}, 1.0, {"account": raw, "free_usd": 1.0})
+    assert expected in out
+    parse_exposition(out)  # must still parse
+
+
+def test_timestamp_is_omitted_when_no_credit_value_was_emitted():
+    """A mapping with only status fields must not publish a freshness stamp for data that
+    was never published — that would assert a reading exists when none does."""
+    out = render({}, 1.0, {"status": "OK", "check": "deploy_credit"})
+    assert "akash_wallet_credit_timestamp_seconds" not in out
+
+
+def test_timestamp_reports_when_credit_was_read_not_when_collected():
+    """The balance step runs before the deploy step, which can take minutes. Stamping with
+    collection time would overstate freshness by exactly the interval that matters."""
+    out = render({}, 9_999.0, {"account": "a", "free_usd": 1.0}, credit_read_at=1_000.0)
+    s = parse_exposition(out)
+    assert s[("akash_wallet_credit_timestamp_seconds", ())] == 1000.0
