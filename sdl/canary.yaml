@@ -1,0 +1,84 @@
+---
+# Persistent per-provider canary — the deployment that STAYS UP.
+#
+# Unlike every other SDL here this one is NOT throwaway. provider-smoke.yml deploys,
+# tests and destroys inside a few minutes; this lease is meant to live for weeks, because
+# the failures it exists to catch (a provider closing the deployment, a container restart
+# at 03:00, egress dying for twenty minutes) only happen over time. See canary/canary.py.
+#
+# ⚠️ MUST NOT BE REAPED — and the real mechanism is the SERVICE NAME, not the tag.
+# `cleanup_stale` and the smoke startup sweep classify by SERVICE SET, verified in
+# just_akash/cleanup_stale.py: services == {probe} is stale after 1h, {backtest} after
+# 48h, and {} is left alone as unclassifiable. This deployment's service is `canary`, so
+# it matches no stale rule and is not reaped.
+#
+# That protection is INCIDENTAL rather than declared, which makes it fragile in a specific
+# way worth knowing: rename this service to `probe`, or add `canary` to a stale rule, and
+# the next sweep deletes it within the hour. The symptom would be "the provider keeps
+# closing our deployment" — the canary masquerading as the very fault it measures.
+#
+# The `canary-<provider>` tag is separately load-bearing, but for ADOPTION: it is how the
+# next run finds this lease in `just-akash list` and knows which dseq it is looking at.
+#
+# THE IMAGE INSTALLS NOTHING AT BOOT, deliberately. The other SDLs `apt-get install` on
+# start; a canary must not. If this container needed a package mirror to come up, a PyPI
+# or Debian outage would present as a provider failure and send someone hunting the wrong
+# thing. python:3.13-alpine + stdlib only means it boots on a broken internet and is then
+# able to TELL us the internet is broken.
+#
+# CANARY_PY_B64 is substituted at deploy time from canary/canary.py (see
+# .github/workflows/provider-canary.yml) — same placeholder pattern as
+# cpu-backtest-ssh.yaml's SSH_PUBKEY_B64. The agent is therefore version-controlled as
+# readable Python, not as an unreviewable blob pasted into YAML.
+version: "2.0"
+
+services:
+  canary:
+    image: python:3.13-alpine
+    env:
+      - CANARY_PY_B64=PLACEHOLDER_CANARY_PY_B64
+      - CANARY_PROVIDER=PLACEHOLDER_PROVIDER
+      - CANARY_PORT=8080
+      - CANARY_PROBE_INTERVAL=15
+      - DF_ROLE=persistent-canary
+    expose:
+      - port: 8080
+        as: 80
+        to:
+          - global: true
+    args:
+      - sh
+      - -c
+      - |
+        set -e
+        echo "$CANARY_PY_B64" | base64 -d > /canary.py
+        exec python3 -u /canary.py
+
+profiles:
+  compute:
+    canary:
+      resources:
+        cpu:
+          units: 0.1
+        memory:
+          size: 128Mi
+        storage:
+          - size: 512Mi
+
+  placement:
+    akash:
+      pricing:
+        canary:
+          denom: uact
+          # Generous relative to the footprint, on purpose. This lease must not be
+          # outbid or priced out — a canary that lapses because we underbid produces a
+          # false "provider closed our deployment", which is precisely the reading we
+          # are trying to make trustworthy. The resource profile keeps the real spend
+          # small regardless.
+          amount: 10000
+
+deployment:
+  canary:
+    akash:
+      profile: canary
+      count: 1

@@ -1,0 +1,171 @@
+name: Provider canary (persistent)
+
+# ONE PERSISTENT DEPLOYMENT PER PROVIDER, kept alive, measured FROM INSIDE.
+#
+# provider-smoke.yml answers "can I deploy right now?" — it runs once a day and then
+# deliberately erases itself (robust_destroy, the SIGINT handler, the no-leak guarantee).
+# That makes an entire class of failure invisible, because it is the class that only
+# happens over TIME: a provider closing the deployment on Tuesday, a container restarted
+# at 03:00, egress dying for twenty minutes. A customer meets all of those, because a
+# customer's deployment stays up. This workflow is the deployment that stays up.
+#
+# What it produces, on the `telemetry` branch for df-grafana to scrape:
+#   akash_canary_reachable                  the customer-visible up/down
+#   akash_canary_restarts_total             container restarts within the SAME lease
+#   akash_canary_lease_replacements_total   deployments closed/lapsed and recreated
+#   akash_canary_egress_fail_total          the workload could not reach the internet
+#   akash_canary_dns_fail_total             ...or could not resolve
+#   akash_canary_disk_write_seconds         fsync latency as the workload feels it
+#   akash_canary_sched_jitter_seconds       CPU contention from the customer's side
+#
+# CADENCE IS 30 MINUTES, AND THE COST OF THAT IS BOUNDED BY DESIGN. The agent's counters
+# are CUMULATIVE, so a coarse sampling interval loses timing precision but never loses
+# events — twelve egress failures between two collections still arrive as twelve. That is
+# why this can run every 30m instead of every minute without going blind, which matters
+# because this repo already moved the smoke to daily to limit Actions minutes.
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      deploy_missing:
+        description: "Deploy a canary for any provider that has none (spends escrow)"
+        type: boolean
+        default: true
+
+# NEVER cancel in flight. A run can be mid-deploy holding a live lease; a hard cancel
+# would leak it — the same reasoning as provider-smoke's concurrency block.
+concurrency:
+  group: provider-canary
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    name: Ensure + collect
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # publishes to the telemetry branch
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4
+        with:
+          enable-cache: true
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Load SOPS secrets
+        uses: ./.github/actions/sops-env
+        with:
+          age-key: ${{ secrets.SOPS_AGE_KEY }}
+
+      # Prior targets + durable counters. `continue-on-error` because a first run has no
+      # telemetry branch yet, which is legitimate — but note publish-canary.sh treats an
+      # UNREACHABLE remote as fatal, so this cannot silently reset the counters.
+      - name: Fetch prior canary state
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          mkdir -p prior
+          git fetch --depth=1 origin telemetry || exit 0
+          git show FETCH_HEAD:canary-state.json   > prior/canary-state.json   2>/dev/null || true
+          git show FETCH_HEAD:canary-targets.json > prior/canary-targets.json 2>/dev/null || true
+          ls -l prior/ || true
+
+      - name: Resolve which providers still have a live canary
+        env:
+          PROVIDERS: ${{ vars.CANARY_PROVIDERS || 'alphavps,onidc,hetzner_hel' }}
+        run: |
+          set -euo pipefail
+          uv run just-akash list --json > listing.json
+          cp prior/canary-targets.json targets.json 2>/dev/null || echo '{}' > targets.json
+          uv run python -m canary.ensure \
+            --listing listing.json \
+            --providers "$PROVIDERS" \
+            --targets targets.json \
+            --missing-out missing.txt
+          echo "missing: $(tr '\n' ' ' < missing.txt || true)"
+
+      # THE ONLY STEP THAT SPENDS MONEY, kept separate and visible on purpose.
+      #
+      # On a schedule it is gated behind the CANARY_AUTODEPLOY repository variable, so
+      # merging this workflow cannot start opening leases on its own — turning it on is a
+      # deliberate act. Bootstrap by dispatching this workflow manually once.
+      #
+      # One deploy per provider per run is the cap. A provider that keeps closing our
+      # deployment therefore costs at most one lease per 30 minutes, and the resulting
+      # akash_canary_lease_replacements_total is the alertable signal that it is doing so.
+      - name: Deploy canaries for providers missing one
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_missing || vars.CANARY_AUTODEPLOY == 'true' }}
+        env:
+          PROVIDER_WALLETS: ${{ vars.CANARY_PROVIDER_WALLETS }}
+        run: |
+          set -euo pipefail
+          [ -s missing.txt ] || { echo "Every provider has a live canary — nothing to deploy."; exit 0; }
+          CANARY_PY_B64=$(base64 -w0 canary/canary.py)
+          while read -r provider; do
+            [ -n "$provider" ] || continue
+            wallet=$(python -c "import json,os,sys;print(json.loads(os.environ.get('PROVIDER_WALLETS') or '{}').get(sys.argv[1],''))" "$provider")
+            if [ -z "$wallet" ]; then
+              echo "::warning::no wallet mapped for '$provider' in CANARY_PROVIDER_WALLETS — skipping"
+              continue
+            fi
+            echo "::group::deploy canary on $provider ($wallet)"
+            sed -e "s|PLACEHOLDER_CANARY_PY_B64|${CANARY_PY_B64}|" \
+                -e "s|PLACEHOLDER_PROVIDER|${provider}|" \
+                sdl/canary.yaml > "sdl-canary-${provider}.yaml"
+            uv run just-akash deploy \
+              --sdl "sdl-canary-${provider}.yaml" \
+              --provider "$wallet" \
+              --deposit "${CANARY_DEPOSIT_USD:-5.0}" \
+            | tee "deploy-${provider}.log"
+            dseq=$(grep -oE 'dseq[ =:]+[0-9]+' "deploy-${provider}.log" | grep -oE '[0-9]+' | head -1 || true)
+            if [ -n "$dseq" ]; then
+              # The tag is load-bearing twice over: it is how the next run finds this
+              # lease, and it is what keeps cleanup-stale from reaping it.
+              uv run just-akash tag --dseq "$dseq" --name "canary-${provider}"
+              uv run just-akash auto-topup --dseq "$dseq" --enable || \
+                echo "::warning::auto-topup could not be enabled on ${dseq}; escrow will need watching"
+            else
+              echo "::warning::could not parse a dseq from the deploy output for ${provider}"
+            fi
+            echo "::endgroup::"
+          done < missing.txt
+
+      - name: Re-resolve targets after any deploy
+        env:
+          PROVIDERS: ${{ vars.CANARY_PROVIDERS || 'alphavps,onidc,hetzner_hel' }}
+        run: |
+          set -euo pipefail
+          uv run just-akash list --json > listing.json
+          uv run python -m canary.ensure \
+            --listing listing.json --providers "$PROVIDERS" --targets targets.json
+
+      # An unreachable canary is the MEASUREMENT, so this step must not fail the run —
+      # collect.py exits 0 on an outage by design. If it failed here the file would never
+      # be published and we would lose the very reading we came for.
+      - name: Collect from inside every deployment
+        run: |
+          set -euo pipefail
+          cp prior/canary-state.json state.json 2>/dev/null || echo '{}' > state.json
+          uv run python -m canary.collect \
+            --targets targets.json --state state.json --out canary-metrics.prom
+          echo "--- exposition ---"; cat canary-metrics.prom
+
+      - name: Publish to the telemetry branch
+        env:
+          SRC_PROM: canary-metrics.prom
+          SRC_STATE: state.json
+          SRC_TARGETS: targets.json
+          RUN_ID: ${{ github.run_id }}
+        run: bash .github/scripts/publish-canary.sh

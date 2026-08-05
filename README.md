@@ -256,6 +256,87 @@ preferred nor backup), the cheapest bid from any provider wins.
 Each bid is tagged in the log as `[PREFERRED]`, `[BACKUP]`, or `[FOREIGN]`,
 and the selection log line names which phase chose the winner.
 
+## Persistent provider canary
+
+The smoke test answers **"can I deploy right now?"** — it runs once a day and then
+deliberately erases itself (`robust_destroy()`, the SIGINT handler, the no-leak guarantee).
+That is correct for what it measures, and it makes an entire class of failure invisible,
+because that class only appears over **time**:
+
+- a provider closing the deployment on Tuesday afternoon
+- a container restarted at 03:00
+- egress that stops resolving DNS for twenty minutes
+- an ingress that goes dark while the container is perfectly healthy
+
+None of those happen inside a five-minute window at 07:00 UTC. A customer meets all of
+them, because a customer's deployment **stays up**. The canary is the deployment that
+stays up — one per provider, kept alive, measured from the inside.
+
+| Piece | What it is |
+|---|---|
+| `canary/canary.py` | The agent that runs *inside* the lease. stdlib only, serves `/metrics`. |
+| `canary/collect.py` | Scrapes each canary's ingress and keeps the durable counters. |
+| `canary/ensure.py` | Decides which providers still have a live canary. Never deploys. |
+| `sdl/canary.yaml` | The deployment. Minimal footprint, **not** throwaway. |
+| `.github/workflows/provider-canary.yml` | Keeps them alive, collects every 30m, publishes. |
+
+### What it measures, and why each is only visible from inside
+
+| Signal | Metric |
+|---|---|
+| provider closed our deployment | `akash_canary_lease_replacements_total` |
+| container restarted | `akash_canary_restarts_total` |
+| customer can't reach the app | `akash_canary_reachable` / `akash_canary_unreachable_checks_total` |
+| the app can't reach out | `akash_canary_egress_fail_total`, `akash_canary_dns_fail_total` |
+| storage as the workload feels it | `akash_canary_disk_write_seconds` (fsync latency) |
+| CPU contention from the customer's side | `akash_canary_sched_jitter_seconds` |
+
+Published to the `telemetry` branch as `canary-metrics.prom`, next to the smoke data.
+
+### Three design points that are load-bearing
+
+**The agent cannot count its own restarts.** A restart wipes it, so a self-counter would
+always read zero. It emits a `boot_id` that changes every process start and the *collector*
+does the counting by diffing it across scrapes.
+
+**A redeploy is not a restart.** When a lapsed lease is recreated the container is new, so
+its `boot_id` changes too. The targets file carries the `dseq`; if that changed, the change
+is attributed to a lease replacement and never to a restart. A provider closing our
+deployment and a provider restarting our container are different faults, and conflating
+them would destroy the signal in exactly the case where telling them apart matters.
+
+**The counters are cumulative, so the 30-minute cadence loses timing precision but never
+loses events.** Twelve egress failures between two collections still arrive as twelve.
+That is what makes a cheap sampling interval acceptable instead of going blind between runs.
+
+### Turning it on
+
+The deploy step is the only one that spends money and is gated deliberately: on a schedule
+it runs only when the `CANARY_AUTODEPLOY` repository variable is `true`, so merging the
+workflow cannot start opening leases on its own. Bootstrap it by dispatching the workflow
+once, confirm the leases and telemetry look right, then set the variable.
+
+Configuration is repository variables, not secrets (none of it is sensitive):
+
+| Variable | Purpose |
+|---|---|
+| `CANARY_PROVIDERS` | Comma-separated names. Default `alphavps,onidc,hetzner_hel`. |
+| `CANARY_PROVIDER_WALLETS` | JSON `{"name": "akash1..."}` — which wallet each name deploys to. |
+| `CANARY_AUTODEPLOY` | `true` to let the schedule recreate a missing canary. |
+
+⚠️ **What actually stops the canary being reaped is its SERVICE NAME, not its tag.**
+`cleanup_stale` and the smoke startup sweep classify by service set — `{probe}` is stale
+after 1h, `{backtest}` after 48h, `{}` is left alone as unclassifiable. This deployment's
+service is `canary`, so it matches no stale rule.
+
+That protection is incidental rather than declared, which makes it fragile in a specific
+way: rename the service to `probe`, or add `canary` to a stale rule, and the next sweep
+deletes it within the hour. The symptom would be *"the provider keeps closing our
+deployment"* — the canary masquerading as the very fault it measures.
+
+The `canary-<provider>` tag is separately load-bearing, but for **adoption**: it is how the
+next run finds the lease in `just-akash list` and knows which `dseq` it is looking at.
+
 ## Logs
 
 Every `just` recipe writes timestamped logs to `.logs/just/` with start/end metadata, exit codes, and full output.
