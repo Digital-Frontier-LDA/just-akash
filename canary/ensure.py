@@ -28,6 +28,44 @@ import pathlib
 
 TAG_PREFIX = "canary-"
 
+# Provider ADDRESS -> friendly name. These are the same three addresses already carried in
+# AKASH_PROVIDERS (secrets/ci.sops.env, and .env.example), the same ones df-grafana's
+# akash-external-smoke rules label_replace into cluster names, and the same ones the
+# autobidder's per-cluster dashboards pin. They are public provider addresses, not our
+# wallet, which is why they are committed rather than injected.
+#
+# WHY MAP HERE INSTEAD OF ASKING FOR A NEW CONFIG VARIABLE. An earlier revision took a
+# CANARY_PROVIDER_WALLETS variable listing exactly this. That was duplicated config — a
+# second copy of AKASH_PROVIDERS that could silently drift out of step with the providers
+# the smoke test actually exercises, so the canary and the smoke could end up measuring
+# different fleets while both looked configured. It was also badly named: it reads like
+# OUR wallets, when every entry is a PROVIDER's address. We spend from AKASH_API_KEY, one
+# Console-API wallet, the same one the smoke test has always deployed with.
+PROVIDER_NAMES = {
+    "akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z": "alphavps",
+    "akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk": "onidc",
+    "akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x": "hetzner_hel",
+}
+
+
+def name_for(address: str) -> str:
+    """Friendly name for a provider address, falling back to a truncated address.
+
+    The fallback matters: adding a fourth provider to AKASH_PROVIDERS must not silently
+    drop it from the canary. It gets an ugly label until someone adds it above, which is a
+    visible prompt rather than a silent omission.
+    """
+    return PROVIDER_NAMES.get(address, address[:12])
+
+
+def providers_from_env(akash_providers: str) -> list[tuple[str, str]]:
+    """[(name, address)] from an AKASH_PROVIDERS-style comma-separated list."""
+    out: list[tuple[str, str]] = []
+    for addr in (a.strip() for a in akash_providers.split(",")):
+        if addr:
+            out.append((name_for(addr), addr))
+    return out
+
 
 def canary_tag(provider: str) -> str:
     return f"{TAG_PREFIX}{provider}"
@@ -116,27 +154,39 @@ def plan(listing, providers: list[str], prev_targets: dict | None = None) -> tup
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--listing", required=True, help="`just-akash list --json` output file")
-    ap.add_argument("--providers", required=True, help="Comma-separated provider names")
+    ap.add_argument(
+        "--akash-providers",
+        required=True,
+        help="AKASH_PROVIDERS value: comma-separated provider ADDRESSES. Deliberately the "
+        "same variable the smoke test uses, so the two cannot drift apart.",
+    )
     ap.add_argument("--targets", required=True, help="Targets file to read+write")
-    ap.add_argument("--missing-out", help="Write providers needing a deploy, one per line")
+    ap.add_argument(
+        "--missing-out",
+        help="Write providers needing a deploy as 'name<TAB>address', one per line",
+    )
     a = ap.parse_args()
 
     listing = json.loads(pathlib.Path(a.listing).read_text(encoding="utf-8"))
     tp = pathlib.Path(a.targets)
     prev = json.loads(tp.read_text(encoding="utf-8")) if tp.exists() else {}
-    providers = [p.strip() for p in a.providers.split(",") if p.strip()]
 
-    targets, missing = plan(listing, providers, prev)
+    pairs = providers_from_env(a.akash_providers)
+    names = [n for n, _ in pairs]
+    addr_of = dict(pairs)
+
+    targets, missing = plan(listing, names, prev)
     tp.write_text(json.dumps(targets, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if a.missing_out:
+        lines = [f"{n}\t{addr_of[n]}" for n in missing]
         pathlib.Path(a.missing_out).write_text(
-            "\n".join(missing) + ("\n" if missing else ""), encoding="utf-8"
+            "\n".join(lines) + ("\n" if lines else ""), encoding="utf-8"
         )
-    for p in providers:
-        t = targets.get(p, {})
+    for n in names:
+        t = targets.get(n, {})
         print(
-            f"{p:14} dseq={t.get('dseq', '-'):>12} uri={t.get('uri', '') or '(none)'}"
-            f"{'  NEEDS DEPLOY' if p in missing else ''}",
+            f"{n:14} dseq={t.get('dseq', '-'):>12} uri={t.get('uri', '') or '(none)'}"
+            f"{'  NEEDS DEPLOY' if n in missing else ''}",
             flush=True,
         )
     return 0

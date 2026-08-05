@@ -19,7 +19,7 @@ from canary.collect import (
     render,
     scrape,
 )
-from canary.ensure import plan
+from canary.ensure import name_for, plan, providers_from_env
 
 ALPHA = "alphavps"
 
@@ -327,3 +327,37 @@ def test_counter_accumulation_is_monotonic_across_normal_scrapes():
     st = merge(st, ALPHA, "100", True, _body("aaa", egress_fail=4), 0.1, 1100.0)
     st = merge(st, ALPHA, "100", True, _body("aaa", egress_fail=9), 0.1, 1200.0)
     assert st[ALPHA]["egress_fail"] == 9, "same process: track the raw value, do not sum it"
+
+
+# ── provider config comes from AKASH_PROVIDERS, not a canary-specific copy ───────────────
+
+
+def test_known_provider_addresses_resolve_to_fleet_names():
+    """The same three addresses AKASH_PROVIDERS carries, df-grafana label_replaces into
+    cluster names, and the autobidder dashboards pin."""
+    assert name_for("akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z") == "alphavps"
+    assert name_for("akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk") == "onidc"
+    assert name_for("akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x") == "hetzner_hel"
+
+
+def test_unknown_provider_gets_an_ugly_label_rather_than_being_dropped():
+    """Adding a fourth provider to AKASH_PROVIDERS must not silently exclude it from the
+    canary. An ugly label is a visible prompt to name it; a silent omission is a provider
+    nobody is watching."""
+    assert name_for("akash1newprovideraddress000000000000000000") == "akash1newpro"
+
+
+def test_providers_parse_from_the_real_akash_providers_format():
+    pairs = providers_from_env(
+        "akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk,"
+        "akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z,"
+        "akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x"
+    )
+    assert [n for n, _ in pairs] == ["onidc", "alphavps", "hetzner_hel"]
+    assert all(a.startswith("akash1") for _, a in pairs)
+
+
+def test_blank_entries_and_whitespace_are_tolerated():
+    """A trailing comma in a SOPS-managed env value must not create a phantom provider."""
+    pairs = providers_from_env(" akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z , ,")
+    assert pairs == [("alphavps", "akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z")]

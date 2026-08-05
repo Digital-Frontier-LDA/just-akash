@@ -316,12 +316,22 @@ it runs only when the `CANARY_AUTODEPLOY` repository variable is `true`, so merg
 workflow cannot start opening leases on its own. Bootstrap it by dispatching the workflow
 once, confirm the leases and telemetry look right, then set the variable.
 
-Configuration is repository variables, not secrets (none of it is sensitive):
+**There is nothing new to configure.** The canary deploys from the same
+Console-API wallet as everything else here (`AKASH_API_KEY`, loaded from SOPS by the same
+`sops-env` action), and it targets the same providers the smoke test does — it reads
+`AKASH_PROVIDERS` directly rather than taking its own copy of that list. Provider addresses
+are mapped to fleet names by `PROVIDER_NAMES` in `canary/ensure.py`.
+
+That is deliberate. An earlier draft asked for a `CANARY_PROVIDER_WALLETS` variable
+duplicating the address list; two copies drift, and the canary and the smoke would then be
+measuring different fleets while both looked correctly configured. The name was also
+misleading — every entry is a *provider's* address, not one of our wallets. We have one
+wallet, and `just_akash_deploy_credit_usd` (already alerted on in df-grafana) is its credit.
+
+One switch exists, and only because it spends money:
 
 | Variable | Purpose |
 |---|---|
-| `CANARY_PROVIDERS` | Comma-separated names. Default `alphavps,onidc,hetzner_hel`. |
-| `CANARY_PROVIDER_WALLETS` | JSON `{"name": "akash1..."}` — which wallet each name deploys to. |
 | `CANARY_AUTODEPLOY` | `true` to let the schedule recreate a missing canary. |
 
 ⚠️ **What actually stops the canary being reaped is its SERVICE NAME, not its tag.**

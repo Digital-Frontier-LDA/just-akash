@@ -83,18 +83,20 @@ jobs:
           ls -l prior/ || true
 
       - name: Resolve which providers still have a live canary
-        env:
-          PROVIDERS: ${{ vars.CANARY_PROVIDERS || 'alphavps,onidc,hetzner_hel' }}
+        # AKASH_PROVIDERS comes from secrets/ci.sops.env via the SOPS step above — the
+        # SAME variable the smoke test uses. Deliberately not a canary-specific copy: a
+        # second list could drift, and the canary and the smoke would then be measuring
+        # different fleets while both looked correctly configured.
         run: |
           set -euo pipefail
           uv run just-akash list --json > listing.json
           cp prior/canary-targets.json targets.json 2>/dev/null || echo '{}' > targets.json
           uv run python -m canary.ensure \
             --listing listing.json \
-            --providers "$PROVIDERS" \
+            --akash-providers "$AKASH_PROVIDERS" \
             --targets targets.json \
             --missing-out missing.txt
-          echo "missing: $(tr '\n' ' ' < missing.txt || true)"
+          echo "missing: $(cut -f1 missing.txt | tr '\n' ' ' || true)"
 
       # THE ONLY STEP THAT SPENDS MONEY, kept separate and visible on purpose.
       #
@@ -107,32 +109,28 @@ jobs:
       # akash_canary_lease_replacements_total is the alertable signal that it is doing so.
       - name: Deploy canaries for providers missing one
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_missing || vars.CANARY_AUTODEPLOY == 'true' }}
-        env:
-          PROVIDER_WALLETS: ${{ vars.CANARY_PROVIDER_WALLETS }}
         run: |
           set -euo pipefail
           [ -s missing.txt ] || { echo "Every provider has a live canary — nothing to deploy."; exit 0; }
           CANARY_PY_B64=$(base64 -w0 canary/canary.py)
-          while read -r provider; do
-            [ -n "$provider" ] || continue
-            wallet=$(python -c "import json,os,sys;print(json.loads(os.environ.get('PROVIDER_WALLETS') or '{}').get(sys.argv[1],''))" "$provider")
-            if [ -z "$wallet" ]; then
-              echo "::warning::no wallet mapped for '$provider' in CANARY_PROVIDER_WALLETS — skipping"
-              continue
-            fi
-            echo "::group::deploy canary on $provider ($wallet)"
+          # name<TAB>address, both resolved by canary/ensure.py from AKASH_PROVIDERS.
+          while IFS=$'\t' read -r provider address; do
+            [ -n "$provider" ] && [ -n "$address" ] || continue
+            echo "::group::deploy canary on $provider ($address)"
             sed -e "s|PLACEHOLDER_CANARY_PY_B64|${CANARY_PY_B64}|" \
                 -e "s|PLACEHOLDER_PROVIDER|${provider}|" \
                 sdl/canary.yaml > "sdl-canary-${provider}.yaml"
             uv run just-akash deploy \
               --sdl "sdl-canary-${provider}.yaml" \
-              --provider "$wallet" \
+              --provider "$address" \
               --deposit "${CANARY_DEPOSIT_USD:-5.0}" \
             | tee "deploy-${provider}.log"
             dseq=$(grep -oE 'dseq[ =:]+[0-9]+' "deploy-${provider}.log" | grep -oE '[0-9]+' | head -1 || true)
             if [ -n "$dseq" ]; then
-              # The tag is load-bearing twice over: it is how the next run finds this
-              # lease, and it is what keeps cleanup-stale from reaping it.
+              # The tag is how the NEXT RUN finds this lease in `just-akash list`.
+              # It does not protect it from the reapers — those classify by service set
+              # ({probe}/{backtest}), and this deployment's service is `canary`. See the
+              # warning in sdl/canary.yaml.
               uv run just-akash tag --dseq "$dseq" --name "canary-${provider}"
               uv run just-akash auto-topup --dseq "$dseq" --enable || \
                 echo "::warning::auto-topup could not be enabled on ${dseq}; escrow will need watching"
@@ -143,13 +141,12 @@ jobs:
           done < missing.txt
 
       - name: Re-resolve targets after any deploy
-        env:
-          PROVIDERS: ${{ vars.CANARY_PROVIDERS || 'alphavps,onidc,hetzner_hel' }}
         run: |
           set -euo pipefail
           uv run just-akash list --json > listing.json
           uv run python -m canary.ensure \
-            --listing listing.json --providers "$PROVIDERS" --targets targets.json
+            --listing listing.json --akash-providers "$AKASH_PROVIDERS" \
+            --targets targets.json
 
       # An unreachable canary is the MEASUREMENT, so this step must not fail the run —
       # collect.py exits 0 on an outage by design. If it failed here the file would never
