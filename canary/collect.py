@@ -33,6 +33,8 @@ import time
 import urllib.error
 import urllib.request
 
+from canary._state import load_json_mapping
+
 SCRAPE_TIMEOUT = 20.0
 
 _SAMPLE_RE = re.compile(
@@ -41,31 +43,6 @@ _SAMPLE_RE = re.compile(
     r"\s+(?P<value>-?[\d.eE+]+)\s*$"
 )
 _LABEL_RE = re.compile(r'(\w+)="([^"]*)"')
-
-
-def load_json_mapping(path: pathlib.Path) -> dict:
-    """Read a JSON object, treating missing/empty/corrupt as an empty mapping.
-
-    NOT defensive programming for its own sake. `git show BRANCH:file > out` CREATES `out`
-    before the command runs, so a first run — where the telemetry branch has no such file
-    yet — leaves a zero-byte file behind rather than no file. `json.loads("")` then raises
-    and takes the whole run down, which is exactly what happened on the first live dispatch.
-
-    An unreadable state file must degrade to "no prior state", never to a crash: the
-    collector's job is to publish a reading, and refusing to run because its own bookkeeping
-    is unparseable loses the measurement it exists to take.
-    """
-    try:
-        raw = path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return {}
-    if not raw:
-        return {}
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return {}
-    return data if isinstance(data, dict) else {}
 
 
 def parse_exposition(text: str) -> dict:

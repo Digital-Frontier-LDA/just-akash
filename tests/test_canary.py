@@ -429,3 +429,22 @@ def test_a_real_mapping_is_returned_unchanged(tmp_path):
     p = tmp_path / "state.json"
     p.write_text('{"alphavps": {"dseq": "1"}}', encoding="utf-8")
     assert load_json_mapping(p) == {"alphavps": {"dseq": "1"}}
+
+
+def test_binary_state_file_degrades_instead_of_crashing(tmp_path):
+    """UnicodeDecodeError is NOT an OSError, so it escapes an OSError-only guard. A
+    truncated or binary state file — an interrupted write, a git read that produced junk —
+    raises it from read_text rather than from json, which is the corruption case this
+    helper most plausibly meets."""
+    p = tmp_path / "state.json"
+    p.write_bytes(b"\xff\xfe\x00\x01binary garbage\x80\x81")
+    assert load_json_mapping(p) == {}
+
+
+def test_both_modules_share_one_implementation():
+    """Two copies of a 'degrade, never crash' helper drift: one gains an exception class the
+    other lacks, and the narrower copy starts dying on files the other tolerates."""
+    import canary.collect as collect
+    import canary.ensure as ensure
+
+    assert ensure.load_json_mapping is collect.load_json_mapping

@@ -26,6 +26,8 @@ import argparse
 import json
 import pathlib
 
+from canary._state import load_json_mapping
+
 TAG_PREFIX = "canary-"
 
 # Provider ADDRESS -> friendly name. These are the same three addresses already carried in
@@ -46,31 +48,6 @@ PROVIDER_NAMES = {
     "akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk": "onidc",  # pragma: allowlist secret
     "akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x": "hetzner_hel",  # pragma: allowlist secret
 }
-
-
-def load_json_mapping(path: pathlib.Path) -> dict:
-    """Read a JSON object, treating missing/empty/corrupt as an empty mapping.
-
-    NOT defensive programming for its own sake. `git show BRANCH:file > out` CREATES `out`
-    before the command runs, so a first run — where the telemetry branch has no such file
-    yet — leaves a zero-byte file behind rather than no file. `json.loads("")` then raises
-    and takes the whole run down, which is exactly what happened on the first live dispatch.
-
-    An unreadable state file must degrade to "no prior state", never to a crash: the
-    collector's job is to publish a reading, and refusing to run because its own bookkeeping
-    is unparseable loses the measurement it exists to take.
-    """
-    try:
-        raw = path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return {}
-    if not raw:
-        return {}
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return {}
-    return data if isinstance(data, dict) else {}
 
 
 def name_for(address: str) -> str:
