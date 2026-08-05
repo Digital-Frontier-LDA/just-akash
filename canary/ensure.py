@@ -129,12 +129,16 @@ def main() -> int:
     targets, missing = plan(listing, providers, prev)
     tp.write_text(json.dumps(targets, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if a.missing_out:
-        pathlib.Path(a.missing_out).write_text("\n".join(missing) + ("\n" if missing else ""),
-                                               encoding="utf-8")
+        pathlib.Path(a.missing_out).write_text(
+            "\n".join(missing) + ("\n" if missing else ""), encoding="utf-8"
+        )
     for p in providers:
         t = targets.get(p, {})
-        print(f"{p:14} dseq={t.get('dseq','-'):>12} uri={t.get('uri','') or '(none)'}"
-              f"{'  NEEDS DEPLOY' if p in missing else ''}", flush=True)
+        print(
+            f"{p:14} dseq={t.get('dseq', '-'):>12} uri={t.get('uri', '') or '(none)'}"
+            f"{'  NEEDS DEPLOY' if p in missing else ''}",
+            flush=True,
+        )
     return 0
 
 

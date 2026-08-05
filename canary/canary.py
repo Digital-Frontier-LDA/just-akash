@@ -211,18 +211,18 @@ def render_metrics() -> str:
         f'akash_canary_dns_probe_total{{outcome="fail"}} {s["dns_fail"]}',
         "# HELP akash_canary_probe_cycles_total Completed probe cycles.",
         "# TYPE akash_canary_probe_cycles_total counter",
-        f'akash_canary_probe_cycles_total {s["cycles"]}',
+        f"akash_canary_probe_cycles_total {s['cycles']}",
         "# HELP akash_canary_disk_write_seconds Last fsync latency for a 4KiB write "
         "(-1 = write path unusable).",
         "# TYPE akash_canary_disk_write_seconds gauge",
-        f'akash_canary_disk_write_seconds {s["disk_write_seconds"]:.6f}',
+        f"akash_canary_disk_write_seconds {s['disk_write_seconds']:.6f}",
         "# HELP akash_canary_sched_jitter_seconds How late the last probe tick fired "
         "(CPU contention as the workload feels it).",
         "# TYPE akash_canary_sched_jitter_seconds gauge",
-        f'akash_canary_sched_jitter_seconds {s["sched_jitter_seconds"]:.6f}',
+        f"akash_canary_sched_jitter_seconds {s['sched_jitter_seconds']:.6f}",
         "# HELP akash_canary_last_probe_timestamp_seconds Unix time of the last cycle.",
         "# TYPE akash_canary_last_probe_timestamp_seconds gauge",
-        f'akash_canary_last_probe_timestamp_seconds {s["last_probe_unixtime"]:.3f}',
+        f"akash_canary_last_probe_timestamp_seconds {s['last_probe_unixtime']:.3f}",
     ]
     return "\n".join(lines) + "\n"
 
@@ -257,8 +257,7 @@ def main() -> None:
     # slow client stops answering /metrics, which the collector would read as the
     # deployment being unreachable — a self-inflicted false positive.
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"akash-canary {VERSION} boot_id={BOOT_ID} provider={PROVIDER} port={PORT}",
-          flush=True)
+    print(f"akash-canary {VERSION} boot_id={BOOT_ID} provider={PROVIDER} port={PORT}", flush=True)
     srv.serve_forever()
 
 

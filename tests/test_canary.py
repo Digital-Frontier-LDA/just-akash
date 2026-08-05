@@ -24,8 +24,15 @@ from canary.ensure import plan
 ALPHA = "alphavps"
 
 
-def _body(boot: str, *, uptime: float = 100.0, egress_ok: int = 10,
-          egress_fail: int = 0, dns_ok: int = 10, dns_fail: int = 0) -> str:
+def _body(
+    boot: str,
+    *,
+    uptime: float = 100.0,
+    egress_ok: int = 10,
+    egress_fail: int = 0,
+    dns_ok: int = 10,
+    dns_fail: int = 0,
+) -> str:
     return (
         f'akash_canary_build_info{{version="1.0.0",provider="{ALPHA}",boot_id="{boot}"}} 1\n'
         f"akash_canary_uptime_seconds {uptime}\n"
@@ -39,6 +46,7 @@ def _body(boot: str, *, uptime: float = 100.0, egress_ok: int = 10,
 
 
 # ── the agent ───────────────────────────────────────────────────────────────────────────
+
 
 def test_agent_exposition_parses_and_carries_boot_identity():
     """The agent's own output must be valid exposition AND carry boot_id — the collector
@@ -56,6 +64,7 @@ def test_agent_boot_id_is_stable_within_a_process():
 
 
 # ── restart vs redeploy: the distinction that makes the signal usable ────────────────────
+
 
 def test_boot_id_change_on_same_lease_counts_as_a_restart():
     st = merge({}, ALPHA, "100", True, _body("aaa"), 0.1, 1000.0)
@@ -85,6 +94,7 @@ def test_stable_boot_id_counts_nothing():
 
 
 # ── reachability: the customer-visible up/down ──────────────────────────────────────────
+
 
 def test_unreachable_records_the_outage_without_inventing_a_restart():
     st = merge({}, ALPHA, "100", True, _body("aaa"), 0.1, 1000.0)
@@ -124,6 +134,7 @@ def test_inside_the_deployment_values_are_passed_through():
 
 # ── the published file ──────────────────────────────────────────────────────────────────
 
+
 def test_render_emits_per_provider_series_and_is_parseable():
     st = merge({}, ALPHA, "100", True, _body("aaa"), 0.1, 1000.0)
     st = merge(st, "onidc", "300", False, "", 20.0, 1000.0)
@@ -147,6 +158,7 @@ def test_render_omits_missing_gauges_rather_than_emitting_none():
 
 # ── scrape() must never raise ───────────────────────────────────────────────────────────
 
+
 def test_scrape_of_a_dead_endpoint_reports_rather_than_raises():
     """An unreachable canary is the measurement. If this raised, the collector would die
     on the first provider outage and publish nothing — losing the reading entirely."""
@@ -157,7 +169,7 @@ def test_scrape_of_a_dead_endpoint_reports_rather_than_raises():
 
 
 def test_parse_exposition_ignores_comments_and_junk():
-    text = "# HELP x y\n# TYPE x gauge\nx 1\nnot a metric line\ny{a=\"b\"} 2.5\n"
+    text = '# HELP x y\n# TYPE x gauge\nx 1\nnot a metric line\ny{a="b"} 2.5\n'
     s = parse_exposition(text)
     assert s[("x", ())] == 1.0
     assert s[("y", (("a", "b"),))] == 2.5
@@ -165,12 +177,14 @@ def test_parse_exposition_ignores_comments_and_junk():
 
 # ── ingress URI handling: the value is chosen by the PROVIDER ────────────────────────────
 
+
 def test_bare_ingress_host_becomes_a_plain_http_metrics_url():
     """Akash lease status yields a bare host[:port] over plain http — the same shape
     just_akash.smoke_providers._ingress_uri returns. Assuming a full URL would make every
     scrape fail while the canary was perfectly healthy."""
-    assert metrics_url("abc123.provider.example.com") == \
-        "http://abc123.provider.example.com/metrics"
+    assert (
+        metrics_url("abc123.provider.example.com") == "http://abc123.provider.example.com/metrics"
+    )
     assert metrics_url("host.example.com:8080") == "http://host.example.com:8080/metrics"
 
 
@@ -206,6 +220,7 @@ def test_malformed_host_is_reported_unreachable_not_raised():
 
 # ── ensure.plan: which providers still have a live canary ───────────────────────────────
 
+
 def _dep(tag, dseq, uri=None, state="active"):
     d = {"name": tag, "dseq": dseq, "state": state}
     if uri:
@@ -214,8 +229,10 @@ def _dep(tag, dseq, uri=None, state="active"):
 
 
 def test_plan_finds_live_canaries_and_flags_missing_ones():
-    listing = [_dep("canary-alphavps", "100", "a.example.com"),
-               _dep("canary-onidc", "200", "b.example.com")]
+    listing = [
+        _dep("canary-alphavps", "100", "a.example.com"),
+        _dep("canary-onidc", "200", "b.example.com"),
+    ]
     targets, missing = plan(listing, ["alphavps", "onidc", "hetzner_hel"])
     assert targets["alphavps"] == {"uri": "a.example.com", "dseq": "100"}
     assert missing == ["hetzner_hel"]
@@ -239,8 +256,14 @@ def test_unknown_state_fails_open_rather_than_deploying_a_second_canary():
     """Mislabelling a live canary as missing makes the workflow open a SECOND lease on
     that provider. Two canaries reporting the same provider is worse than a late
     redeploy, so an unrecognised state must be treated as live."""
-    listing = [{"name": "canary-alphavps", "dseq": "100", "state": "some-new-state",
-                "leases": [{"status": {"services": {"c": {"uris": ["a.example.com"]}}}}]}]
+    listing = [
+        {
+            "name": "canary-alphavps",
+            "dseq": "100",
+            "state": "some-new-state",
+            "leases": [{"status": {"services": {"c": {"uris": ["a.example.com"]}}}}],
+        }
+    ]
     _, missing = plan(listing, ["alphavps"])
     assert missing == []
 
@@ -269,6 +292,7 @@ def test_plan_accepts_a_wrapped_listing_object():
 
 # ── the two data-integrity bugs the review caught ───────────────────────────────────────
 
+
 def test_redeploy_observed_during_an_outage_is_still_a_lease_replacement():
     """The realistic sequence, and the one an earlier revision got wrong.
 
@@ -279,7 +303,7 @@ def test_redeploy_observed_during_an_outage_is_still_a_lease_replacement():
     container restart, which is precisely the conflation this design exists to prevent.
     """
     st = merge({}, ALPHA, "100", True, _body("aaa"), 0.1, 1000.0)
-    st = merge(st, ALPHA, "200", False, "", 20.0, 1100.0)      # redeployed, not up yet
+    st = merge(st, ALPHA, "200", False, "", 20.0, 1100.0)  # redeployed, not up yet
     assert st[ALPHA]["dseq"] == "100", "dseq must not advance on an unverified lease"
     st = merge(st, ALPHA, "200", True, _body("zzz"), 0.1, 1200.0)  # new container answers
     assert st[ALPHA]["lease_replacements_total"] == 1
