@@ -42,9 +42,9 @@ TAG_PREFIX = "canary-"
 # OUR wallets, when every entry is a PROVIDER's address. We spend from AKASH_API_KEY, one
 # Console-API wallet, the same one the smoke test has always deployed with.
 PROVIDER_NAMES = {
-    "akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z": "alphavps",
-    "akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk": "onidc",
-    "akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x": "hetzner_hel",
+    "akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z": "alphavps",  # pragma: allowlist secret
+    "akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk": "onidc",  # pragma: allowlist secret
+    "akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x": "hetzner_hel",  # pragma: allowlist secret
 }
 
 

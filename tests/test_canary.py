@@ -23,6 +23,11 @@ from canary.ensure import name_for, plan, providers_from_env
 
 ALPHA = "alphavps"
 
+# Public provider addresses — the same three in .env.example / AKASH_PROVIDERS.
+ADDR_ALPHAVPS = "akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z"  # pragma: allowlist secret
+ADDR_ONIDC = "akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk"  # pragma: allowlist secret
+ADDR_HETZNER = "akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x"  # pragma: allowlist secret
+
 
 def _body(
     boot: str,
@@ -335,9 +340,9 @@ def test_counter_accumulation_is_monotonic_across_normal_scrapes():
 def test_known_provider_addresses_resolve_to_fleet_names():
     """The same three addresses AKASH_PROVIDERS carries, df-grafana label_replaces into
     cluster names, and the autobidder dashboards pin."""
-    assert name_for("akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z") == "alphavps"
-    assert name_for("akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk") == "onidc"
-    assert name_for("akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x") == "hetzner_hel"
+    assert name_for(ADDR_ALPHAVPS) == "alphavps"
+    assert name_for(ADDR_ONIDC) == "onidc"
+    assert name_for(ADDR_HETZNER) == "hetzner_hel"
 
 
 def test_unknown_provider_gets_an_ugly_label_rather_than_being_dropped():
@@ -360,19 +365,15 @@ def test_two_unknown_providers_never_collide_on_one_label():
 
 
 def test_providers_parse_from_the_real_akash_providers_format():
-    pairs = providers_from_env(
-        "akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk,"
-        "akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z,"
-        "akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x"
-    )
+    pairs = providers_from_env(f"{ADDR_ONIDC},{ADDR_ALPHAVPS},{ADDR_HETZNER}")
     assert [n for n, _ in pairs] == ["onidc", "alphavps", "hetzner_hel"]
     assert all(a.startswith("akash1") for _, a in pairs)
 
 
 def test_blank_entries_and_whitespace_are_tolerated():
     """A trailing comma in a SOPS-managed env value must not create a phantom provider."""
-    pairs = providers_from_env(" akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z , ,")
-    assert pairs == [("alphavps", "akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z")]
+    pairs = providers_from_env(f" {ADDR_ALPHAVPS} , ,")
+    assert pairs == [("alphavps", ADDR_ALPHAVPS)]
 
 
 def test_a_repeated_address_does_not_create_two_leases():
@@ -380,12 +381,12 @@ def test_a_repeated_address_does_not_create_two_leases():
     repeated address is an ordinary copy-paste slip. Un-deduplicated it would put the
     provider in `missing` twice, run the deploy loop twice, and open TWO leases on one
     provider — paying twice to watch the same thing."""
-    addr = "akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z"
+    addr = ADDR_ALPHAVPS
     assert providers_from_env(f"{addr},{addr}") == [("alphavps", addr)]
 
 
 def test_duplicate_addresses_do_not_produce_duplicate_plan_entries():
-    addr = "akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z"
+    addr = ADDR_ALPHAVPS
     names = [n for n, _ in providers_from_env(f"{addr},{addr},{addr}")]
     _, missing = plan([], names)
     assert missing == ["alphavps"], "one provider, one deploy"
