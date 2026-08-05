@@ -373,3 +373,19 @@ def test_blank_entries_and_whitespace_are_tolerated():
     """A trailing comma in a SOPS-managed env value must not create a phantom provider."""
     pairs = providers_from_env(" akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z , ,")
     assert pairs == [("alphavps", "akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z")]
+
+
+def test_a_repeated_address_does_not_create_two_leases():
+    """AKASH_PROVIDERS is a hand-maintained comma-separated string in a SOPS file, so a
+    repeated address is an ordinary copy-paste slip. Un-deduplicated it would put the
+    provider in `missing` twice, run the deploy loop twice, and open TWO leases on one
+    provider — paying twice to watch the same thing."""
+    addr = "akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z"
+    assert providers_from_env(f"{addr},{addr}") == [("alphavps", addr)]
+
+
+def test_duplicate_addresses_do_not_produce_duplicate_plan_entries():
+    addr = "akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z"
+    names = [n for n, _ in providers_from_env(f"{addr},{addr},{addr}")]
+    _, missing = plan([], names)
+    assert missing == ["alphavps"], "one provider, one deploy"

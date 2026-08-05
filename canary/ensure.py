@@ -69,11 +69,31 @@ def name_for(address: str) -> str:
 
 
 def providers_from_env(akash_providers: str) -> list[tuple[str, str]]:
-    """[(name, address)] from an AKASH_PROVIDERS-style comma-separated list."""
+    """[(name, address)] from an AKASH_PROVIDERS-style comma-separated list.
+
+    DE-DUPLICATED, on both the address and the resolved name, because a duplicate here is
+    not harmless. `missing` would carry the provider twice, the deploy loop would run twice
+    for it, and we would open TWO leases on one provider — paying twice to watch the same
+    thing, and publishing two entries that overwrite each other. AKASH_PROVIDERS is a
+    hand-maintained comma-separated string in a SOPS file, so a repeated address is an
+    ordinary copy-paste slip rather than an exotic input.
+
+    Name-level de-duplication is the belt to that braces: two distinct addresses resolving
+    to one label would silently fold together downstream, since plan() and the targets file
+    are keyed by name. First occurrence wins so the order stays predictable.
+    """
     out: list[tuple[str, str]] = []
+    seen_addr: set[str] = set()
+    seen_name: set[str] = set()
     for addr in (a.strip() for a in akash_providers.split(",")):
-        if addr:
-            out.append((name_for(addr), addr))
+        if not addr or addr in seen_addr:
+            continue
+        name = name_for(addr)
+        if name in seen_name:
+            continue
+        seen_addr.add(addr)
+        seen_name.add(name)
+        out.append((name, addr))
     return out
 
 
