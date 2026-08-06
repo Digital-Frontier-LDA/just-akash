@@ -333,7 +333,7 @@ Two switches exist, both about money:
 | Variable | Purpose |
 |---|---|
 | `CANARY_AUTODEPLOY` | `true` to let the schedule recreate a missing canary. |
-| `CANARY_MIN_CREDIT_USD` | Credit floor below which the canary declines to create leases. Default `25`. |
+| `CANARY_MIN_CREDIT_USD` | Credit floor below which the canary declines to create leases. Default **`0` (disabled)** — see the authorization-vs-balance note above for why. |
 
 ### ⚠️ One wallet means the canary and the smoke must not run at once
 

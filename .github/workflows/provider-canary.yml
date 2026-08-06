@@ -38,7 +38,8 @@ on:
         type: boolean
         default: true
       min_credit_usd:
-        description: "Override the credit floor (0 disables it — for testing what actually gates a deploy)"
+        description: "Override the credit floor (0 disables gating). Blank = repo default."
+        type: string
         default: ""
         required: false
 
@@ -163,18 +164,23 @@ jobs:
           # authorization genuinely binds.
           floor="${MIN_CREDIT_OVERRIDE:-${CANARY_MIN_CREDIT_USD:-0}}"
           set +e
-          uv run just-akash balance --check --min-usd "$floor" --json > credit.json 2>credit.err
+          timeout 120 uv run just-akash balance --check --min-usd "$floor" --json > credit.json 2>credit.err
           echo "balance rc=$?"
           set -e
           cat credit.json 2>/dev/null || true
           # FULL balance too — `--check` reports only granted-minus-escrow, which is
           # the DepositAuthorization headroom, NOT the account's available balance.
           echo '--- full balance ---'
-          uv run just-akash balance --json || true
+          timeout 120 uv run just-akash balance --json || true
           [ -s credit.err ] && cat credit.err || true
 
       - name: Deploy canaries for providers missing one
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_missing || vars.CANARY_AUTODEPLOY == 'true' }}
+        env:
+          # Same override the read step sees. Without this the two steps compute
+          # DIFFERENT floors from the same dispatch, and the one that decides whether
+          # to spend is the one that cannot see the input.
+          MIN_CREDIT_OVERRIDE: ${{ inputs.min_credit_usd }}
         run: |
           set -euo pipefail
           [ -s missing.txt ] || { echo "Every provider has a live canary — nothing to deploy."; exit 0; }
@@ -215,16 +221,18 @@ jobs:
           # dispatch input) above 0 to re-enable, if a case is ever found where the
           # authorization genuinely binds.
           floor="${MIN_CREDIT_OVERRIDE:-${CANARY_MIN_CREDIT_USD:-0}}"
-          status=$(python -c "import json,sys;print(json.load(open('credit.json')).get('status',''))" 2>/dev/null || true)
           if [ "${floor%%.*}" = "0" ]; then
-            echo "credit floor disabled (floor=$floor) - proceeding; see the note above."
-          elif [ "$status" = "LOW" ]; then
-            echo "::warning::deploy credit is below the \$${floor} floor - NOT creating canary leases, so the daily smoke keeps the remaining budget. Top up the wallet."
-            exit 0
-          fi
-          if [ "$status" != "OK" ]; then
-            echo "::warning::could not READ the deploy credit - NOT creating canary leases. This is a measurement failure, not a low wallet; see the Read deploy credit step above."
-            exit 0
+            echo "credit floor disabled (floor=$floor) - not gating on credit at all."
+          else
+            status=$(python -c "import json,sys;print(json.load(open('credit.json')).get('status',''))" 2>/dev/null || true)
+            if [ "$status" = "LOW" ]; then
+              echo "::warning::deploy credit is below the \$${floor} floor - NOT creating canary leases, so the daily smoke keeps the remaining budget."
+              exit 0
+            fi
+            if [ "$status" != "OK" ]; then
+              echo "::warning::could not READ the deploy credit - NOT creating canary leases. This is a measurement failure, not a low wallet; see the Read deploy credit step above."
+              exit 0
+            fi
           fi
           CANARY_PY_B64=$(base64 -w0 canary/canary.py)
           # name<TAB>address, both resolved by canary/ensure.py from AKASH_PROVIDERS.
