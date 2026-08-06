@@ -351,6 +351,20 @@ The cost is that a collection can queue behind a smoke run — up to ~70 minutes
 and that cost is near-zero by design: the counters are cumulative, so a late collection loses
 timing precision and no events.
 
+### ⚠️ `balance --check` reports authorization headroom, NOT available balance
+
+Worth knowing before you read `free_usd` as money. Console issues this API key a
+**DepositAuthorization** with a spend limit; `balance --check` reports
+`granted − locked_in_escrow`, i.e. how much of *that authorization* is uncommitted. The
+account's available balance is a different, larger number and lives on the Console side —
+the on-chain `liquid` bank balance is empty, because the funds sit with the granter.
+
+Measured 2026-08-06: `free_usd` read **$2.31** while the Console account held **$573.38**,
+and a deploy at that moment succeeded on all three providers. A credit floor gating on
+`free_usd` was therefore blocking deploys that work, so it now defaults to **0 (disabled)**.
+The figure is still read and published every run — the information was never the problem,
+the blocking was.
+
 ### ⚠️ One wallet is also one budget
 
 The lock solves the sequence race. It does nothing about the two competing for **credit**:

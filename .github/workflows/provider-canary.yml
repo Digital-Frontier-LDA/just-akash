@@ -148,7 +148,20 @@ jobs:
           MIN_CREDIT_OVERRIDE: ${{ inputs.min_credit_usd }}
         run: |
           set -euo pipefail
-          floor="${MIN_CREDIT_OVERRIDE:-${CANARY_MIN_CREDIT_USD:-25}}"
+          # DEFAULT 0 = DISABLED, and that is a correction, not a loosening.
+          #
+          # This gated on `balance --check`'s free_usd, which is grant MINUS escrow —
+          # headroom under the DepositAuthorization Console issues to this API key. It
+          # is not the account's available balance, and I had been reporting it as one.
+          # Measured 2026-08-06: free_usd read $2.31 while the Console account held
+          # $573.38, and a deploy at that moment SUCCEEDED on all three providers. The
+          # guard was blocking deploys that work, on a number that does not gate them.
+          #
+          # The credit is still read and published every run — the information was
+          # never the problem, the blocking was. Set CANARY_MIN_CREDIT_USD (or the
+          # dispatch input) above 0 to re-enable, if a case is ever found where the
+          # authorization genuinely binds.
+          floor="${MIN_CREDIT_OVERRIDE:-${CANARY_MIN_CREDIT_USD:-0}}"
           set +e
           uv run just-akash balance --check --min-usd "$floor" --json > credit.json 2>credit.err
           echo "balance rc=$?"
@@ -188,9 +201,24 @@ jobs:
           # wallet really is short, anything else means we could not MEASURE it. The
           # first version of this guard was `if ! balance ... >/dev/null 2>&1`, which
           # conflated them and reported a low wallet on a run where credit was $81.
-          floor="${MIN_CREDIT_OVERRIDE:-${CANARY_MIN_CREDIT_USD:-25}}"
+          # DEFAULT 0 = DISABLED, and that is a correction, not a loosening.
+          #
+          # This gated on `balance --check`'s free_usd, which is grant MINUS escrow —
+          # headroom under the DepositAuthorization Console issues to this API key. It
+          # is not the account's available balance, and I had been reporting it as one.
+          # Measured 2026-08-06: free_usd read $2.31 while the Console account held
+          # $573.38, and a deploy at that moment SUCCEEDED on all three providers. The
+          # guard was blocking deploys that work, on a number that does not gate them.
+          #
+          # The credit is still read and published every run — the information was
+          # never the problem, the blocking was. Set CANARY_MIN_CREDIT_USD (or the
+          # dispatch input) above 0 to re-enable, if a case is ever found where the
+          # authorization genuinely binds.
+          floor="${MIN_CREDIT_OVERRIDE:-${CANARY_MIN_CREDIT_USD:-0}}"
           status=$(python -c "import json,sys;print(json.load(open('credit.json')).get('status',''))" 2>/dev/null || true)
-          if [ "$status" = "LOW" ]; then
+          if [ "${floor%%.*}" = "0" ]; then
+            echo "credit floor disabled (floor=$floor) - proceeding; see the note above."
+          elif [ "$status" = "LOW" ]; then
             echo "::warning::deploy credit is below the \$${floor} floor - NOT creating canary leases, so the daily smoke keeps the remaining budget. Top up the wallet."
             exit 0
           fi
@@ -218,7 +246,7 @@ jobs:
               # ({probe}/{backtest}), and this deployment's service is `canary`. See the
               # warning in sdl/canary.yaml.
               uv run just-akash tag --dseq "$dseq" --name "canary-${provider}"
-              uv run just-akash auto-topup --dseq "$dseq" --enable || \
+              uv run just-akash auto-topup --dseq "$dseq" --on || \
                 echo "::warning::auto-topup could not be enabled on ${dseq}; escrow will need watching"
             else
               echo "::warning::could not parse a dseq from the deploy output for ${provider}"
