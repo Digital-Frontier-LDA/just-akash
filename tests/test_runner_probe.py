@@ -13,6 +13,7 @@ silent while success is cheap and obvious.
 
 from __future__ import annotations
 
+import json
 import pytest
 
 from just_akash.runner_probe import (
@@ -78,11 +79,33 @@ def test_probe_error_is_indeterminate_never_a_verdict():
 # --------------------------------------------------------------------------
 
 
-def test_unasked_registration_does_not_demote():
-    """Without a token the probe answers only the scheduling question. Reporting
-    'never registered' when we never asked would demote on evidence we did not
-    gather — and scheduling is already the discriminator for the recorded failures."""
-    assert _ok(registered=None, job_ran=None) is Outcome.PASS
+def test_unmeasured_stages_neither_demote_NOR_promote():
+    """None must cut BOTH ways.
+
+    Not demoting on it was always right: reporting "never registered" when we never
+    asked would condemn a provider on evidence we did not gather. But PROMOTING on it
+    was a real bug — a scheduling-only probe reached PASS, and three of those reach
+    runner_host, on a bar whose registration and job steps nobody measured.
+
+    SCHEDULED_ONLY is neither: not a failure, not a qualification."""
+    assert _ok(registered=None, job_ran=None) is Outcome.SCHEDULED_ONLY
+
+
+def test_scheduled_only_can_never_reach_runner_host():
+    """The property that matters. Any number of partial measurements must not qualify."""
+    v = _v(Outcome.SCHEDULED_ONLY, Outcome.SCHEDULED_ONLY, Outcome.SCHEDULED_ONLY)
+    assert v.consecutive_passes == 0
+    assert v.marker() == "unproven"
+
+
+def test_an_unmeasured_job_alone_blocks_promotion():
+    """Registration measured, job execution not — still not a full pass."""
+    assert _ok(registered=True, job_ran=None) is Outcome.SCHEDULED_ONLY
+
+
+def test_a_measured_job_failure_is_still_disqualifying():
+    """SCHEDULED_ONLY must not become a hiding place for real failures."""
+    assert _ok(job_ran=False) is Outcome.JOB_NOT_RUN
 
 
 def test_but_a_measured_failure_to_register_does_demote():
@@ -266,11 +289,13 @@ def _driver(
     state="active",
     destroyed=True,
     registered=True,
+    job_ran=True,
 ):
     monkeypatch.setattr(rp, "_deploy", lambda *a, **k: (dseq, deploy_out))
     monkeypatch.setattr(rp, "_pod_started", lambda d: state == "active")
     monkeypatch.setattr(rp, "_destroy", lambda d: destroyed)
     monkeypatch.setattr(rp, "_registered", lambda *a, **k: registered)
+    monkeypatch.setattr(rp, "_run_noop_job", lambda *a, **k: job_ran)
     monkeypatch.setattr(rp.time, "sleep", lambda s: None)
 
 
@@ -328,14 +353,19 @@ def test_the_lease_is_destroyed_even_when_the_probe_raises(monkeypatch, tmp_path
     assert seen == ["999"], "the lease must be closed on the failure path too"
 
 
-def test_without_a_token_registration_is_unasked_not_failed(monkeypatch, tmp_path):
-    """None != False. Reporting POD_NO_REGISTER when we never asked would demote a
-    provider on evidence we did not gather."""
+def test_without_a_token_the_attempt_is_scheduled_only(monkeypatch, tmp_path):
+    """None != False, and it is also != PASS.
+
+    Reporting POD_NO_REGISTER when we never asked would demote on evidence we did not
+    gather. But returning PASS would qualify a provider on a bar whose registration and
+    job steps were never measured — three of those reach runner_host. SCHEDULED_ONLY is
+    the only honest reading of a partial measurement."""
     _driver(monkeypatch, registered=False)
     a = rp.probe_once(
         "akash1x", sdl=tmp_path, org="o", label="l", token="", bid_wait=1, register_timeout=1
     )
-    assert a.outcome is rp.Outcome.PASS
+    assert a.outcome is rp.Outcome.SCHEDULED_ONLY
+    assert a.observed_pod is True, "scheduling WAS measured and still counts as a control"
 
 
 def test_an_active_lease_running_nothing_is_not_a_pass(monkeypatch, tmp_path):
@@ -501,3 +531,36 @@ def test_probe_once_records_whether_a_pod_was_seen(monkeypatch, tmp_path):
         "akash1x", sdl=tmp_path, org="o", label="l", token="t", bid_wait=1, register_timeout=0
     )
     assert b.observed_pod is False
+
+
+def test_an_undispatchable_job_is_unmeasured_not_failed(monkeypatch):
+    """workflow_dispatch only resolves on the DEFAULT branch, so before this workflow
+    merges the dispatch 404s. That must read as "not measured" — returning False would
+    invent a JOB_NOT_RUN and disqualify every provider on OUR deployment gap."""
+    monkeypatch.setattr(rp, "_run", lambda *a, **k: (1, "could not find any workflows"))
+    assert rp._run_noop_job("org", "label", "o/r", 1) is None
+
+
+def test_a_successful_run_is_a_measured_pass(monkeypatch):
+    calls = {"n": 0}
+
+    def fake(cmd, timeout=60):
+        calls["n"] += 1
+        if cmd[1] == "workflow":
+            return 0, ""
+        return 0, json.dumps([{"status": "completed", "conclusion": "success"}])
+
+    monkeypatch.setattr(rp, "_run", fake)
+    monkeypatch.setattr(rp.time, "sleep", lambda s: None)
+    assert rp._run_noop_job("org", "label", "o/r", 30) is True
+
+
+def test_a_failed_run_is_a_measured_failure(monkeypatch):
+    def fake(cmd, timeout=60):
+        if cmd[1] == "workflow":
+            return 0, ""
+        return 0, json.dumps([{"status": "completed", "conclusion": "failure"}])
+
+    monkeypatch.setattr(rp, "_run", fake)
+    monkeypatch.setattr(rp.time, "sleep", lambda s: None)
+    assert rp._run_noop_job("org", "label", "o/r", 30) is False

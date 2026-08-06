@@ -43,7 +43,11 @@ version: "2.0"
 
 services:
   probe:
-    image: ghcr.io/akash-network/github-runner:latest
+    # Pinned by DIGEST, not :latest. A floating tag can change between the three fresh
+    # provisions a qualification requires, so the streak would be measuring different
+    # runner artifacts rather than one provider capability — and a provider promoted on
+    # one image would be trusted while running another. Requalify when this digest moves.
+    image: ghcr.io/akash-network/github-runner@sha256:030ae11a6b597c5db28b12375461e35f694d74ceb06a1b73c90545b1adef16da
     env:
       - {{TOKEN_ENV}}
       - ORG_NAME={{ORG_NAME}}

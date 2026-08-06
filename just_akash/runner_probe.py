@@ -71,6 +71,10 @@ class Outcome(str, Enum):
     POD_NO_REGISTER = "POD_NO_REGISTER"  # came up, never reached GitHub
     JOB_NOT_RUN = "JOB_NOT_RUN"  # registered, could not execute
     TEARDOWN_FAILED = "TEARDOWN_FAILED"  # worked, but leaked the lease
+    # Scheduled fine, but registration and/or job execution were never MEASURED. Not a
+    # failure and not a qualification — deliberately non-promotable, so a token-less or
+    # un-dispatchable run can never reach runner_host on a partial bar.
+    SCHEDULED_ONLY = "SCHEDULED_ONLY"
     # noqa S105: an outcome name whose value equals its own name, not a credential.
     PASS = "PASS"  # noqa: S105
     INDETERMINATE = "INDETERMINATE"  # the probe itself failed — never a verdict
@@ -169,6 +173,12 @@ def classify(
         return Outcome.JOB_NOT_RUN
     if not torn_down:
         return Outcome.TEARDOWN_FAILED
+    # None is "never asked", and it must cut BOTH ways. Not demoting on it was already
+    # right; PROMOTING on it was the bug — a scheduling-only probe could reach PASS and,
+    # three times over, runner_host, on a bar whose registration and job steps nobody
+    # measured. Non-promotable is the honest reading of a partial measurement.
+    if registered is None or job_ran is None:
+        return Outcome.SCHEDULED_ONLY
     return Outcome.PASS
 
 
@@ -390,6 +400,46 @@ def _destroy(dseq: str) -> bool:
     return False
 
 
+def _run_noop_job(org: str, label: str, repo: str, timeout_s: int) -> bool | None:
+    """Dispatch the no-op workflow at this runner's label and wait for a conclusion.
+
+    Returns True/False when a verdict was reached, and None when the job could not be
+    dispatched at all — most often because runner-probe-job.yml is not yet on the default
+    branch, which is where workflow_dispatch resolves. None is NOT a failure: it means the
+    step was never measured, and the attempt is then SCHEDULED_ONLY rather than PASS.
+
+    This replaces `job_ran = registered`, which silently equated two different claims. A
+    runner can register and still never pick up work — wrong label set, busy/offline flip,
+    broken work directory — so inferring it left the strongest part of the ratified bar
+    unmeasured while reporting it as met.
+    """
+    rc, _ = _run(
+        ["gh", "workflow", "run", "runner-probe-job.yml", "--repo", repo,
+         "-f", f"runner-label={label}"],
+        timeout=60,
+    )
+    if rc != 0:
+        return None  # not dispatchable — unmeasured, never "failed"
+
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        rc, out = _run(
+            ["gh", "run", "list", "--repo", repo, "--workflow", "runner-probe-job.yml",
+             "--limit", "5", "--json", "status,conclusion,createdAt"],
+            timeout=60,
+        )
+        if rc == 0 and out.strip():
+            try:
+                runs = json.loads(out)
+            except Exception:  # noqa: BLE001 - a bad read just means "keep waiting"
+                runs = []
+            for r in runs:
+                if r.get("status") == "completed":
+                    return r.get("conclusion") == "success"
+        time.sleep(10)
+    return False
+
+
 def _registered(org: str, label: str, token: str, timeout_s: int) -> bool:
     """Poll GitHub for a runner carrying this probe's label."""
     deadline = time.time() + timeout_s
@@ -420,6 +470,7 @@ def probe_once(
     token: str,
     bid_wait: int,
     register_timeout: int,
+    job_repo: str = "Digital-Frontier-LDA/just-akash",
 ) -> Attempt:
     """One attempt against one provider, classified by the stage that failed."""
     started = time.time()
@@ -448,9 +499,10 @@ def probe_once(
         registered = job_ran = None
         if token and pod_running:
             registered = _registered(org, label, token, register_timeout)
-            # A runner that registered can take a job; the pool's own wait proves the
-            # rest, and asking for more here would need a real workflow dispatch.
-            job_ran = registered
+            if registered:
+                # MEASURED, not inferred. `job_ran = registered` equated two different
+                # claims and left the bar's strongest step unchecked.
+                job_ran = _run_noop_job(org, label, job_repo, register_timeout)
     finally:
         torn_down = _destroy(dseq)
 
