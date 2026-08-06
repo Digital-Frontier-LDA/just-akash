@@ -116,20 +116,56 @@ one specific fleet at one specific resource profile; shipping a default would ma
 operator's trust decision everyone else's. Qualify your own:
 
 ```bash
-# GH_RUNNER_PAT is optional. Without it the probe answers only the scheduling
-# question — which is still the discriminator for the recorded failures — and says so.
-GH_RUNNER_PAT=… python -m just_akash.runner_probe \
+# No PAT needed. With `admin:org` on your existing credential the probe mints a
+# short-lived runner registration token itself, so full qualification is the default.
+python -m just_akash.runner_probe \
   --providers akash1…,akash1… \
   --cpu 4 --memory 16Gi --storage 30Gi \
-  --org my-org --json
+  --org my-org --attempts 3 --json
 ```
 
 Each attempt takes a **real lease and spends real credit**, so it stops early on a
-disqualifying outcome rather than paying three times to confirm what one attempt
-already proved.
+disqualifying outcome rather than paying three times to confirm what one attempt proved.
+
+> **Minting beats supplying a PAT, and not only for convenience.** A PAT expiry is
+> silent — it surfaces as `runner did not come online` after a ~15-minute wait, i.e.
+> indistinguishable from a provider fault. An expired PAT handed to the probe reports
+> `POD_NO_REGISTER` and demotes healthy providers for what is really your own credential
+> failure. A token minted seconds before use cannot be stale.
+
+### Outcomes, and which of them can promote
+
+| outcome | meaning | promotes? |
+|---|---|---|
+| `PASS` | every stage measured and passed | ✅ counts toward the streak |
+| `SCHEDULED_ONLY` | scheduled fine; registration and/or job **never measured** | ❌ never |
+| `NO_BID` | capacity or price — says nothing about hosting | ❌ and never demotes |
+| `LEASE_NO_POD` / `POD_NO_REGISTER` / `JOB_NOT_RUN` | measured failures | ❌ **permanent `runner_deny`** |
+| `TEARDOWN_FAILED` | hosted fine but leaked the lease | ❌ our bug, not theirs |
+| `INDETERMINATE` | the probe itself failed | ❌ never a verdict about a provider |
+
+`SCHEDULED_ONLY` exists because "not checked" and "checked and fine" are different
+claims. Without it, a probe that never measured registration returned `PASS`, and three
+of those promoted a provider to `runner_host` on a bar nobody verified.
+
+### It refuses to disqualify without a positive control
+
+If a run never observes a running container on **any** provider, every disqualification
+is downgraded to `INDETERMINATE` and the run says so loudly.
+
+This is not defensive padding. A detector that has only ever returned one answer has not
+been validated — it has only been observed agreeing with itself. A probe once reported
+`LEASE_NO_POD` for the fleet's one production-proven host, because an un-propagated lease
+looks exactly like one that will never schedule; a `runner_deny` was recorded from it and
+had to be withdrawn. Since `runner_deny` is permanent and outranks any later streak, a
+false one silently shrinks the pool.
+
+**Include a provider you know serves in every probe run.** It costs one lease and makes
+every negative in that run mean something.
 
 A provider is promoted to `runner_host` only after the real runner SDL, at **your**
-profile, is scheduled → registers within 120s → runs a no-op job → tears down cleanly,
+profile, is scheduled → registers within 120s → **runs a real no-op job dispatched at its
+own label** → tears down cleanly,
 **three consecutive times**. Disqualification outranks any later streak: promotion has to
 be harder than demotion when the failure is expensive and silent while success is cheap
 and obvious.
