@@ -60,6 +60,36 @@ def fetch(client, listing: list) -> tuple[list[dict], list[str]]:
     return details, errors
 
 
+def parse_listing(payload) -> list:
+    """Rows out of a `list --json` payload, RAISING on an envelope we do not recognise.
+
+    The distinction that matters is between an empty account and an unreadable answer. A bare
+    `[]` is a real, recognisable "you have no deployments". A dict carrying none of the known
+    keys is not an answer at all — and silently reading it as zero rows would produce a
+    details document claiming `complete: true` with nothing in it, which tells ensure.py that
+    every provider has lost its canary and authorises a deploy onto all three. The leases
+    already there would keep billing, unswept, because a canary matches no stale rule.
+
+    This is the same trade api.list_deployments makes, and for the same measured reason: its
+    old fail-open `return []` had two downstream repos delete nothing while reporting
+    "Nothing to do" against a wallet holding 15-27 deployments. Loud beats plausible whenever
+    the next step spends money.
+    """
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("deployments", "items", "results", "data"):
+            v = payload.get(key)
+            if isinstance(v, list):
+                return v
+    raise ValueError(
+        f"unrecognised `list --json` envelope ({type(payload).__name__}"
+        + (f", keys {sorted(payload)[:6]}" if isinstance(payload, dict) else "")
+        + "). Refusing to read this as an empty account: that would look like every "
+        "provider having lost its canary and authorise a duplicate deploy onto each."
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--listing", required=True, help="`just-akash list --json` output")
@@ -67,15 +97,19 @@ def main() -> int:
     a = ap.parse_args()
 
     payload = json.loads(pathlib.Path(a.listing).read_text(encoding="utf-8"))
-    # Same envelope tolerance as ensure._as_list: `list --json` has returned both a bare
-    # list and an object wrapping one, and this must not care which.
-    rows = payload if isinstance(payload, list) else []
-    if isinstance(payload, dict):
-        for key in ("deployments", "items", "results", "data"):
-            v = payload.get(key)
-            if isinstance(v, list):
-                rows = v
-                break
+    try:
+        rows = parse_listing(payload)
+    except ValueError as exc:
+        # Publish the incomplete verdict rather than exiting non-zero. `complete: false` is
+        # exactly the right statement here, it stops any deploy, and it leaves the collector
+        # free to run — an unreadable listing does not stop the canaries answering, and
+        # losing that reading too would compound one blind spot into two.
+        print(f"::warning::{exc}", file=sys.stderr)
+        pathlib.Path(a.out).write_text(
+            json.dumps({"complete": False, "deployments": []}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return 0
 
     # A named cause, not a KeyError traceback. This runs in CI where the key comes from a
     # SOPS-decrypted env file, so the realistic failure is that the decrypt step did not run

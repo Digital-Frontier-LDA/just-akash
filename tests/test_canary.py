@@ -22,7 +22,7 @@ from canary.collect import (
     render,
     scrape,
 )
-from canary.details import fetch
+from canary.details import fetch, parse_listing
 from canary.ensure import load_details, name_for, plan, providers_from_env
 
 ALPHA = "alphavps"
@@ -702,3 +702,33 @@ def test_an_incomplete_details_document_still_loads(tmp_path):
     document making a true statement, and plan() needs to see it to suppress deploying."""
     p = _write(tmp_path, "details.json", {"complete": False, "deployments": []})
     assert load_details(p)["complete"] is False
+
+
+# ── an unreadable listing must not read as an empty account ─────────────────────────────
+
+
+def test_a_bare_empty_list_is_a_real_empty_account():
+    """`[]` is a recognisable answer meaning "you have no deployments", and must stay
+    usable — otherwise the very first bootstrap run could never deploy anything."""
+    assert parse_listing([]) == []
+
+
+def test_known_envelopes_are_unwrapped():
+    rows = [{"dseq": "1"}]
+    assert parse_listing(rows) == rows
+    assert parse_listing({"deployments": rows}) == rows
+    assert parse_listing({"data": rows}) == rows
+
+
+def test_an_unrecognised_envelope_raises_rather_than_reading_as_empty():
+    """The failure this guards is asymmetric. Reading an unreadable answer as "no
+    deployments" tells ensure.py every provider has lost its canary, which authorises a
+    deploy onto all three while the existing leases keep billing — and a canary matches no
+    stale rule, so nothing sweeps them up."""
+    for payload in ({"unexpected": "shape"}, {"data": {"not": "a list"}}, "a string", 7, None):
+        try:
+            parse_listing(payload)
+        except ValueError as exc:
+            assert "empty account" in str(exc)
+        else:
+            raise AssertionError(f"{payload!r} must not be read as an empty account")
