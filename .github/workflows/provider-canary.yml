@@ -123,9 +123,12 @@ jobs:
         run: |
           set -euo pipefail
           uv run just-akash list --json > listing.json
+          # list rows are SUMMARIES and carry no leases, so neither the service set nor the
+          # provider address is on them. details.py fetches the real thing per dseq.
+          uv run python -m canary.details --listing listing.json --out details.json
           cp prior/canary-targets.json targets.json 2>/dev/null || echo '{}' > targets.json
           uv run python -m canary.ensure \
-            --listing listing.json \
+            --details details.json \
             --akash-providers "$AKASH_PROVIDERS" \
             --targets targets.json \
             --missing-out missing.txt
@@ -249,11 +252,13 @@ jobs:
             | tee "deploy-${provider}.log"
             dseq=$(grep -oE 'dseq[ =:]+[0-9]+' "deploy-${provider}.log" | grep -oE '[0-9]+' | head -1 || true)
             if [ -n "$dseq" ]; then
-              # The tag is how the NEXT RUN finds this lease in `just-akash list`.
-              # It does not protect it from the reapers — those classify by service set
-              # ({probe}/{backtest}), and this deployment's service is `canary`. See the
-              # warning in sdl/canary.yaml.
-              uv run just-akash tag --dseq "$dseq" --name "canary-${provider}"
+              # A LOCAL CONVENIENCE ONLY — deliberately not how the next run finds this
+              # lease. `tag` writes .tags.json in the working copy, and this runner is
+              # destroyed when the job ends, so the tag is gone by the next run. It once
+              # WAS the matching key, which meant every run saw three missing canaries and
+              # would have opened three more leases. canary/ensure.py now identifies a
+              # canary by service set + lease provider, both read off the deployment.
+              uv run just-akash tag --dseq "$dseq" --name "canary-${provider}" || true
               uv run just-akash auto-topup --dseq "$dseq" --on || \
                 echo "::warning::auto-topup could not be enabled on ${dseq}; escrow will need watching"
             else
@@ -266,8 +271,9 @@ jobs:
         run: |
           set -euo pipefail
           uv run just-akash list --json > listing.json
+          uv run python -m canary.details --listing listing.json --out details.json
           uv run python -m canary.ensure \
-            --listing listing.json --akash-providers "$AKASH_PROVIDERS" \
+            --details details.json --akash-providers "$AKASH_PROVIDERS" \
             --targets targets.json
 
       # An unreachable canary is the MEASUREMENT, so this step must not fail the run —

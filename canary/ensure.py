@@ -6,18 +6,24 @@ deploys. The money-spending action (`just-akash deploy`) stays in the workflow w
 visible in the run log and bounded by an explicit cap. A bug in here can therefore mislabel
 a canary as missing, but it cannot silently open leases in a loop.
 
-Input is the JSON from `just-akash list --json` plus a provider->wallet map. Output is the
-targets file the collector consumes, and the list of providers needing a deploy.
+Input is the DETAILS document from canary/details.py plus a provider->wallet map. Output is
+the targets file the collector consumes, and the list of providers needing a deploy.
 
-WHY MATCH ON A TAG AND NOT ON THE SDL OR IMAGE. `tag` gives each canary a stable name
-(`canary-<provider>`) that survives redeploys and is visible in `list`. Matching on image
-would also match the smoke probes (same base images), and matching on SDL is not something
-`list` reports.
+HOW A CANARY IS IDENTIFIED, AND WHY NOT BY TAG. A deployment is our canary for provider P
+when its service set is exactly {canary} and its lease is held by P. Both facts come off the
+deployment itself, so they are readable from any machine at any time.
 
-The tag does NOT protect the lease from the reapers, and an earlier version of this
-docstring wrongly said it did. `cleanup_stale` and the smoke sweep classify by SERVICE SET
-({probe} after 1h, {backtest} after 48h, {} left alone) — never by tag. The canary survives
-because its service is named `canary` and matches no stale rule. See sdl/canary.yaml.
+This started out matching `just-akash tag` names (`canary-<provider>`) and that was simply
+broken. Tags are stored in `.tags.json` in the working copy — local state, never on chain and
+never in the API. A GitHub runner is destroyed after every job, so the tag written by the
+deploy step no longer existed by the next run, `plan()` matched nothing, and all three
+providers reported NEEDS DEPLOY forever. Under CANARY_AUTODEPLOY that is not a cosmetic bug:
+it opens three fresh leases every thirty minutes, none of which any reaper collects.
+
+The service set is the right key because it is what the reapers themselves classify on
+({probe} after 1h, {backtest} after 48h, {} left alone). Matching on the same property the
+sweepers use means "what survives" and "what we recognise" cannot drift apart. Matching on
+image would collide with the smoke probes, which share base images.
 """
 
 from __future__ import annotations
@@ -28,7 +34,9 @@ import pathlib
 
 from canary._state import load_json_mapping
 
-TAG_PREFIX = "canary-"
+# The sole service in sdl/canary.yaml. Deliberately a name no other SDL in this repo uses,
+# so the service set alone identifies a canary and no reaper's stale rule matches it.
+CANARY_SERVICE = "canary"
 
 # Provider ADDRESS -> friendly name. These are the same three addresses already carried in
 # AKASH_PROVIDERS (secrets/ci.sops.env, and .env.example), the same ones df-grafana's
@@ -99,12 +107,8 @@ def providers_from_env(akash_providers: str) -> list[tuple[str, str]]:
     return out
 
 
-def canary_tag(provider: str) -> str:
-    return f"{TAG_PREFIX}{provider}"
-
-
 def _as_list(payload) -> list:
-    """`list --json` may return a bare list or an object wrapping one."""
+    """Deployments out of a details document, a bare list, or a list-style envelope."""
     if isinstance(payload, list):
         return payload
     if isinstance(payload, dict):
@@ -113,6 +117,53 @@ def _as_list(payload) -> list:
             if isinstance(v, list):
                 return v
     return []
+
+
+def is_complete(payload) -> bool:
+    """Whether the details document claims to have read EVERY deployment.
+
+    Absent flag means complete, so a hand-written fixture or a bare list still works. Only
+    an explicit `false` — which canary/details.py writes when a fetch failed — turns off
+    deploying.
+    """
+    return not (isinstance(payload, dict) and payload.get("complete") is False)
+
+
+def service_names(dep: dict) -> set[str]:
+    """Service names the provider reports running, from leases[].status.services.
+
+    Same traversal as smoke_providers._deployment_service_names, guarding every hop for the
+    same reason: a malformed provider response must read as "no services", not raise and
+    take the run down. Empty means CANNOT CLASSIFY (down, or still starting) — never "not a
+    canary". Callers must keep those apart; see plan().
+    """
+    names: set[str] = set()
+    for lease in dep.get("leases") or []:
+        if not isinstance(lease, dict):
+            continue
+        status = lease.get("status")
+        services = status.get("services") if isinstance(status, dict) else None
+        if isinstance(services, dict):
+            names.update(str(k) for k in services)
+    return names
+
+
+def lease_provider(dep: dict) -> str | None:
+    """Provider address holding the lease, from leases[].id.provider.
+
+    Mirrors just_akash.api._extract_lease_provider rather than importing it, because this
+    module is deliberately importable without the API package — plan() is pure, and its
+    tests run on a fixture, not a client.
+    """
+    for lease in dep.get("leases") or []:
+        if not isinstance(lease, dict):
+            continue
+        lease_id = lease.get("id")
+        if isinstance(lease_id, dict):
+            provider = lease_id.get("provider")
+            if isinstance(provider, str) and provider:
+                return provider
+    return None
 
 
 def _is_live(dep: dict) -> bool:
@@ -149,43 +200,117 @@ def ingress_uri(dep: dict) -> str | None:
     return None
 
 
-def plan(listing, providers: list[str], prev_targets: dict | None = None) -> tuple[dict, list]:
-    """Return (targets, providers_needing_deploy).
+def _dseq_of(dep: dict) -> str:
+    return str(dep.get("dseq") or dep.get("id") or "")
+
+
+def _newest(deps: list[dict]) -> dict:
+    """The most recently created of several deployments.
+
+    dseqs are minted as millisecond epochs (see smoke_providers._probe_age_seconds), so the
+    largest is the newest. A non-numeric dseq sorts oldest rather than raising — this runs on
+    whatever the API returned, and a surprise here must not abort the run.
+    """
+
+    def key(d: dict) -> int:
+        try:
+            return int(_dseq_of(d))
+        except (TypeError, ValueError):
+            return -1
+
+    return max(deps, key=key)
+
+
+def plan(
+    details, providers: list[tuple[str, str]], prev_targets: dict | None = None
+) -> tuple[dict, list, list]:
+    """Return (targets, providers_needing_deploy, notes).
+
+    `providers` is [(name, address)]. Matching is on the DEPLOYMENT, never on local state:
+    service set exactly {canary}, lease held by that provider's address.
 
     A provider whose canary is live but has no ingress yet keeps its PREVIOUS uri rather
     than being blanked: ingress routes can take a moment to propagate after a redeploy,
     and dropping the uri would make the collector report the provider unreachable — a
     self-inflicted outage in the signal.
+
+    THREE OUTCOMES, NOT TWO. "has a canary", "has none", and "cannot tell" are distinct, and
+    only the middle one may trigger a deploy:
+
+      * A deployment whose provider is ours but whose service set is EMPTY is unclassifiable
+        — the provider has not reported services yet, which is exactly how a canary looks in
+        the minutes after it is created. Reading that as "no canary" is how you deploy a
+        second one on top of the first.
+      * An incomplete details document (a failed API read) is unclassifiable for the same
+        reason, everywhere at once.
+
+    Both suppress the deploy for the providers they touch and say so in `notes`. The cost of
+    being wrong is asymmetric: waiting 30 minutes for the next run is free, while a duplicate
+    lease matches no reaper and bills until a human spots it.
     """
     prev = prev_targets or {}
-    by_tag: dict[str, dict] = {}
-    for dep in _as_list(listing):
-        if not isinstance(dep, dict):
+    notes: list[str] = []
+    complete = is_complete(details)
+    if not complete:
+        notes.append(
+            "details are INCOMPLETE (a deployment could not be read) - not reporting any "
+            "provider as missing, because 'could not look' is not 'nothing there'."
+        )
+
+    name_of_addr = {addr: name for name, addr in providers}
+    found: dict[str, list[dict]] = {}
+    unclassifiable: set[str] = set()
+    for dep in _as_list(details):
+        if not isinstance(dep, dict) or not _is_live(dep):
             continue
-        name = dep.get("name") or dep.get("tag") or dep.get("label")
-        if isinstance(name, str) and name.startswith(TAG_PREFIX) and _is_live(dep):
-            by_tag[name] = dep
+        provider_name = name_of_addr.get(lease_provider(dep) or "")
+        if provider_name is None:
+            continue  # someone else's lease, or no lease yet — not ours to reason about
+        services = service_names(dep)
+        if services == {CANARY_SERVICE}:
+            found.setdefault(provider_name, []).append(dep)
+        elif not services:
+            unclassifiable.add(provider_name)
 
     targets: dict = {}
     missing: list[str] = []
-    for provider in providers:
-        dep = by_tag.get(canary_tag(provider))
-        if dep is None:
-            missing.append(provider)
+    for provider, _addr in providers:
+        deps = found.get(provider) or []
+        if len(deps) > 1:
+            # Not self-correcting: canaries match no stale rule, so the loser of this race
+            # runs until someone closes it by hand. Name the dseqs so that is a one-liner.
+            notes.append(
+                f"{provider}: {len(deps)} live canaries "
+                f"({', '.join(sorted(_dseq_of(d) for d in deps))}) - watching the newest; "
+                "close the others by hand, no reaper will."
+            )
+        if not deps:
+            if provider in unclassifiable:
+                notes.append(
+                    f"{provider}: a lease here reports no services yet - cannot tell a "
+                    "starting canary from none, so NOT deploying this run."
+                )
+            elif complete:
+                missing.append(provider)
             # Keep the last known target so the collector still records the outage
             # against the right endpoint instead of losing the provider entirely.
             if provider in prev:
                 targets[provider] = prev[provider]
             continue
-        dseq = str(dep.get("dseq") or dep.get("id") or "")
+        dep = _newest(deps)
         uri = ingress_uri(dep) or (prev.get(provider, {}) or {}).get("uri", "")
-        targets[provider] = {"uri": uri, "dseq": dseq}
-    return targets, missing
+        targets[provider] = {"uri": uri, "dseq": _dseq_of(dep)}
+    return targets, missing, notes
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--listing", required=True, help="`just-akash list --json` output file")
+    ap.add_argument(
+        "--details",
+        required=True,
+        help="canary/details.py output. NOT `list --json`: the summary rows carry no "
+        "leases, so neither the service set nor the provider is readable from them.",
+    )
     ap.add_argument(
         "--akash-providers",
         required=True,
@@ -199,7 +324,7 @@ def main() -> int:
     )
     a = ap.parse_args()
 
-    listing = json.loads(pathlib.Path(a.listing).read_text(encoding="utf-8"))
+    details = json.loads(pathlib.Path(a.details).read_text(encoding="utf-8"))
     tp = pathlib.Path(a.targets)
     prev = load_json_mapping(tp)
 
@@ -207,7 +332,9 @@ def main() -> int:
     names = [n for n, _ in pairs]
     addr_of = dict(pairs)
 
-    targets, missing = plan(listing, names, prev)
+    targets, missing, notes = plan(details, pairs, prev)
+    for n in notes:
+        print(f"  note: {n}", flush=True)
     tp.write_text(json.dumps(targets, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if a.missing_out:
         lines = [f"{n}\t{addr_of[n]}" for n in missing]

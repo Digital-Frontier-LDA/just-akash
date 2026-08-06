@@ -20,6 +20,7 @@ from canary.collect import (
     render,
     scrape,
 )
+from canary.details import fetch
 from canary.ensure import name_for, plan, providers_from_env
 
 ALPHA = "alphavps"
@@ -227,73 +228,144 @@ def test_malformed_host_is_reported_unreachable_not_raised():
 # ── ensure.plan: which providers still have a live canary ───────────────────────────────
 
 
-def _dep(tag, dseq, uri=None, state="active"):
-    d = {"name": tag, "dseq": dseq, "state": state}
-    if uri:
-        d["leases"] = [{"status": {"services": {"canary": {"uris": [uri]}}}}]
-    return d
+ALL_PAIRS = [
+    (ALPHA, ADDR_ALPHAVPS),
+    ("onidc", ADDR_ONIDC),
+    ("hetzner_hel", ADDR_HETZNER),
+]
+ALPHA_ONLY = [(ALPHA, ADDR_ALPHAVPS)]
+
+
+def _dep(addr, dseq, uri=None, state="active", services=("canary",)):
+    """A deployment DETAIL, shaped like the API's — the only shape plan() ever sees.
+
+    Both identifying facts hang off `leases`: the provider on `id.provider`, the service set
+    on `status.services`. Neither is present on a `list --json` summary row, which is exactly
+    the bug these tests now pin: ensure.py used to be fed those rows.
+    """
+    svc = {name: ({"uris": [uri]} if uri else {}) for name in services}
+    lease = {"id": {"provider": addr}, "status": {"services": svc}}
+    return {"dseq": dseq, "state": state, "leases": [lease]}
 
 
 def test_plan_finds_live_canaries_and_flags_missing_ones():
-    listing = [
-        _dep("canary-alphavps", "100", "a.example.com"),
-        _dep("canary-onidc", "200", "b.example.com"),
+    details = [
+        _dep(ADDR_ALPHAVPS, "100", "a.example.com"),
+        _dep(ADDR_ONIDC, "200", "b.example.com"),
     ]
-    targets, missing = plan(listing, ["alphavps", "onidc", "hetzner_hel"])
-    assert targets["alphavps"] == {"uri": "a.example.com", "dseq": "100"}
+    targets, missing, _ = plan(details, ALL_PAIRS)
+    assert targets[ALPHA] == {"uri": "a.example.com", "dseq": "100"}
     assert missing == ["hetzner_hel"]
 
 
-def test_plan_ignores_untagged_deployments():
-    """The smoke probes share this wallet and these images. Only the tag distinguishes a
-    canary, so an untagged deployment must never be adopted as one."""
-    targets, missing = plan([_dep("smoke-probe-xyz", "999", "x.example.com")], ["alphavps"])
-    assert missing == ["alphavps"]
-    assert "alphavps" not in targets
+def test_plan_ignores_deployments_that_are_not_canaries():
+    """The smoke probes share this wallet, these images, and these providers. The SERVICE
+    SET is what separates them, so a probe must never be adopted as a canary."""
+    details = [_dep(ADDR_ALPHAVPS, "999", "x.example.com", services=("probe",))]
+    targets, missing, _ = plan(details, ALPHA_ONLY)
+    assert missing == [ALPHA]
+    assert ALPHA not in targets
+
+
+def test_plan_ignores_a_canary_on_someone_elses_provider():
+    """Attribution is by lease provider. A canary on a provider we no longer watch must not
+    be credited to one we do — that would report a live endpoint for the wrong cluster."""
+    details = [_dep("akash1someoneelse", "100", "a.example.com")]
+    _, missing, _ = plan(details, ALPHA_ONLY)
+    assert missing == [ALPHA]
 
 
 def test_closed_deployment_counts_as_missing():
-    listing = [_dep("canary-alphavps", "100", "a.example.com", state="closed")]
-    _, missing = plan(listing, ["alphavps"])
-    assert missing == ["alphavps"]
+    details = [_dep(ADDR_ALPHAVPS, "100", "a.example.com", state="closed")]
+    _, missing, _ = plan(details, ALPHA_ONLY)
+    assert missing == [ALPHA]
 
 
 def test_unknown_state_fails_open_rather_than_deploying_a_second_canary():
     """Mislabelling a live canary as missing makes the workflow open a SECOND lease on
     that provider. Two canaries reporting the same provider is worse than a late
     redeploy, so an unrecognised state must be treated as live."""
-    listing = [
-        {
-            "name": "canary-alphavps",
-            "dseq": "100",
-            "state": "some-new-state",
-            "leases": [{"status": {"services": {"c": {"uris": ["a.example.com"]}}}}],
-        }
-    ]
-    _, missing = plan(listing, ["alphavps"])
+    details = [_dep(ADDR_ALPHAVPS, "100", "a.example.com", state="some-new-state")]
+    _, missing, _ = plan(details, ALPHA_ONLY)
     assert missing == []
 
 
 def test_missing_provider_keeps_its_previous_target():
     """So the collector records the outage against the right endpoint instead of dropping
     the provider from the exposition entirely."""
-    prev = {"alphavps": {"uri": "old.example.com", "dseq": "50"}}
-    targets, missing = plan([], ["alphavps"], prev)
-    assert missing == ["alphavps"]
-    assert targets["alphavps"]["uri"] == "old.example.com"
+    prev = {ALPHA: {"uri": "old.example.com", "dseq": "50"}}
+    targets, missing, _ = plan([], ALPHA_ONLY, prev)
+    assert missing == [ALPHA]
+    assert targets[ALPHA]["uri"] == "old.example.com"
 
 
 def test_live_canary_without_ingress_yet_keeps_previous_uri():
     """Ingress propagation lags a redeploy; blanking the uri would report a healthy
     provider as unreachable."""
-    prev = {"alphavps": {"uri": "old.example.com", "dseq": "50"}}
-    targets, _ = plan([_dep("canary-alphavps", "100")], ["alphavps"], prev)
-    assert targets["alphavps"] == {"uri": "old.example.com", "dseq": "100"}
+    prev = {ALPHA: {"uri": "old.example.com", "dseq": "50"}}
+    targets, _, _ = plan([_dep(ADDR_ALPHAVPS, "100")], ALPHA_ONLY, prev)
+    assert targets[ALPHA] == {"uri": "old.example.com", "dseq": "100"}
 
 
-def test_plan_accepts_a_wrapped_listing_object():
-    targets, _ = plan({"deployments": [_dep("canary-onidc", "7", "z.example.com")]}, ["onidc"])
+def test_plan_accepts_a_wrapped_details_object():
+    details = {"deployments": [_dep(ADDR_ONIDC, "7", "z.example.com")]}
+    targets, _, _ = plan(details, [("onidc", ADDR_ONIDC)])
     assert targets["onidc"]["dseq"] == "7"
+
+
+# ── the tag bug: local state cannot identify a lease from an ephemeral runner ────────────
+
+
+def test_a_tagged_deployment_is_not_required_to_be_recognised():
+    """THE REGRESSION THIS FIX EXISTS FOR. Matching used to be on `just-akash tag` names,
+    which live in .tags.json in the working copy — never on chain, never in the API. A
+    GitHub runner is wiped after each job, so by the next run the tag was gone, every
+    provider reported NEEDS DEPLOY, and autodeploy would have opened three leases every
+    thirty minutes forever. Identity must come off the deployment, with no tag in sight."""
+    details = [_dep(ADDR_ALPHAVPS, "100", "a.example.com")]
+    assert "name" not in details[0] and "tag" not in details[0]
+    targets, missing, _ = plan(details, ALPHA_ONLY)
+    assert missing == []
+    assert targets[ALPHA]["dseq"] == "100"
+
+
+def test_a_starting_canary_is_not_reported_missing():
+    """A provider populates status.services only once the workload is running, so a canary
+    reads as an empty service set for its first minutes. Calling that 'no canary' is how a
+    second lease gets opened on top of the first."""
+    details = [_dep(ADDR_ALPHAVPS, "100", services=())]
+    _, missing, notes = plan(details, ALPHA_ONLY)
+    assert missing == []
+    assert any("no services yet" in n for n in notes)
+
+
+def test_incomplete_details_never_report_anything_missing():
+    """A failed API read must not read as an empty account. Deploying on 'could not look'
+    duplicates every canary at once — and a canary matches no reaper, so nothing sweeps the
+    duplicates up."""
+    _, missing, notes = plan({"complete": False, "deployments": []}, ALL_PAIRS)
+    assert missing == []
+    assert any("INCOMPLETE" in n for n in notes)
+
+
+def test_complete_details_do_report_missing():
+    """The guard above must not be so broad it never deploys: a document that read cleanly
+    and found nothing is a real answer."""
+    _, missing, _ = plan({"complete": True, "deployments": []}, ALPHA_ONLY)
+    assert missing == [ALPHA]
+
+
+def test_duplicate_canaries_report_the_newest_and_say_so():
+    """dseqs are ms epochs, so the largest is newest. The older one bills until a human
+    closes it, which is why it gets named rather than silently ignored."""
+    details = [
+        _dep(ADDR_ALPHAVPS, "1786017183151", "old.example.com"),
+        _dep(ADDR_ALPHAVPS, "1786020000000", "new.example.com"),
+    ]
+    targets, missing, notes = plan(details, ALPHA_ONLY)
+    assert targets[ALPHA]["dseq"] == "1786020000000"
+    assert missing == []
+    assert any("1786017183151" in n and "by hand" in n for n in notes)
 
 
 # ── the two data-integrity bugs the review caught ───────────────────────────────────────
@@ -388,8 +460,8 @@ def test_a_repeated_address_does_not_create_two_leases():
 
 def test_duplicate_addresses_do_not_produce_duplicate_plan_entries():
     addr = ADDR_ALPHAVPS
-    names = [n for n, _ in providers_from_env(f"{addr},{addr},{addr}")]
-    _, missing = plan([], names)
+    pairs = providers_from_env(f"{addr},{addr},{addr}")
+    _, missing, _ = plan([], pairs)
     assert missing == ["alphavps"], "one provider, one deploy"
 
 
@@ -534,3 +606,61 @@ def test_timestamp_reports_when_credit_was_read_not_when_collected():
     out = render({}, 9_999.0, {"account": "a", "free_usd": 1.0}, credit_read_at=1_000.0)
     s = parse_exposition(out)
     assert s[("akash_wallet_credit_timestamp_seconds", ())] == 1000.0
+
+
+# ── details.fetch: turning summary rows into the detail plan() actually needs ────────────
+
+
+class _FakeClient:
+    """Answers get_deployment from a dict; anything absent raises, as the API would."""
+
+    def __init__(self, by_dseq):
+        self.by_dseq = by_dseq
+        self.asked = []
+
+    def get_deployment(self, dseq):
+        self.asked.append(dseq)
+        if dseq not in self.by_dseq:
+            raise RuntimeError(f"no such deployment {dseq}")
+        return self.by_dseq[dseq]
+
+
+def test_fetch_expands_every_row_into_a_detail():
+    """The whole point: list rows carry no leases, details do. plan() reads leases."""
+    client = _FakeClient({"100": _dep(ADDR_ALPHAVPS, "100", "a.example.com")})
+    details, errors = fetch(client, [{"dseq": "100"}])
+    assert errors == []
+    assert details[0]["leases"][0]["id"]["provider"] == ADDR_ALPHAVPS
+
+
+def test_one_unreadable_deployment_does_not_lose_the_others():
+    client = _FakeClient({"100": _dep(ADDR_ALPHAVPS, "100", "a.example.com")})
+    details, errors = fetch(client, [{"dseq": "100"}, {"dseq": "404"}])
+    assert len(details) == 1
+    assert len(errors) == 1 and "404" in errors[0]
+
+
+def test_a_failed_read_makes_the_document_incomplete_so_nothing_deploys():
+    """The two halves joined up: a fetch error must reach plan() as `complete: false`, or
+    the failure silently reads as an empty account and every canary is deployed again."""
+    client = _FakeClient({})
+    details, errors = fetch(client, [{"dseq": "404"}])
+    doc = {"complete": not errors, "deployments": details}
+    _, missing, notes = plan(doc, ALL_PAIRS)
+    assert missing == [], "an unreadable API must never authorise spending"
+    assert any("INCOMPLETE" in n for n in notes)
+
+
+def test_a_row_without_a_dseq_counts_as_an_error_not_a_skip():
+    """Silently dropping a row is how a live canary becomes invisible — and invisible reads
+    as missing, which spends money."""
+    _, errors = fetch(_FakeClient({}), [{"no": "dseq"}])
+    assert len(errors) == 1 and "without a dseq" in errors[0]
+
+
+def test_an_empty_detail_response_is_an_error_not_a_deployment():
+    """get_deployment returns {} on an unrecognised envelope rather than raising. Treating
+    that as a real deployment would put an unidentifiable entry into the picture."""
+    details, errors = fetch(_FakeClient({"100": {}}), [{"dseq": "100"}])
+    assert details == []
+    assert len(errors) == 1 and "empty detail" in errors[0]
