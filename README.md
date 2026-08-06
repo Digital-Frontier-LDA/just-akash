@@ -407,8 +407,15 @@ way: rename the service to `probe`, or add `canary` to a stale rule, and the nex
 deletes it within the hour. The symptom would be *"the provider keeps closing our
 deployment"* — the canary masquerading as the very fault it measures.
 
-The `canary-<provider>` tag is separately load-bearing, but for **adoption**: it is how the
-next run finds the lease in `just-akash list` and knows which `dseq` it is looking at.
+The service name carries a **second** job: it is also how the next run recognises the lease
+as ours (service set `{canary}` + lease provider). So renaming it breaks two things at once
+and in opposite directions — the sweep deletes the lease, or `ensure.py` stops seeing it and
+deploys another alongside. Treat the name as an interface.
+
+The `canary-<provider>` tag is a local convenience only. `just-akash tag` writes
+`.tags.json` in the working copy, which a GitHub runner destroys with the job, so the tag
+cannot identify anything on the next run — it was the original matching key and that is
+exactly why every provider read as `NEEDS DEPLOY` forever.
 
 ## Logs
 

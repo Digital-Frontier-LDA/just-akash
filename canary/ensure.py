@@ -229,7 +229,27 @@ def ingress_uri(dep: dict) -> str | None:
 
 
 def _dseq_of(dep: dict) -> str:
-    return str(dep.get("dseq") or dep.get("id") or "")
+    """dseq off a deployment detail, top-level or nested under deployment.id.
+
+    Mirrors just_akash.api._extract_dseq — the same reason lease_provider() mirrors
+    _extract_lease_provider: this module stays importable without the API package so plan()
+    can be exercised on a fixture.
+
+    THE NESTED FORM IS THE REAL ONE. An earlier version read only `dep["dseq"]` (falling
+    back to `dep["id"]`, which on a real detail is a DICT and would have stringified to
+    garbage). Against the actual API shape it returned "" for every canary, and an empty
+    dseq is not a loud failure — the collector compares dseqs across runs to detect a
+    replaced lease, so a constant "" means akash_canary_lease_replacements_total reads zero
+    forever. That is the headline signal of the whole canary, reporting perfect health
+    because it could not find a number.
+    """
+    val = dep.get("dseq")
+    if val is None:
+        inner = dep.get("deployment")
+        dep_id = inner.get("id") if isinstance(inner, dict) else None
+        if isinstance(dep_id, dict):
+            val = dep_id.get("dseq")
+    return "" if val is None else str(val)
 
 
 def _newest(deps: list[dict]) -> dict:

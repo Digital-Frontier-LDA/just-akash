@@ -267,7 +267,15 @@ jobs:
             echo "::endgroup::"
           done < missing.txt
 
+      # BEST EFFORT, deliberately. This step only refreshes targets.json to pick up a
+      # just-created lease; the copy written by the resolve step above is already usable, and
+      # a provider missing its uri for one cycle costs a single sample. Failing here would
+      # cost the whole collection instead — details.py goes to some trouble to exit 0 on an
+      # unreadable listing precisely so the reachability reading survives, and a `set -e`
+      # step wrapping it would throw that away for any OTHER failure (a `list` timeout, or
+      # ensure.py exiting 2 on a rejected document).
       - name: Re-resolve targets after any deploy
+        continue-on-error: true
         run: |
           set -euo pipefail
           uv run just-akash list --json > listing.json

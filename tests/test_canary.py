@@ -732,3 +732,41 @@ def test_an_unrecognised_envelope_raises_rather_than_reading_as_empty():
             assert "empty account" in str(exc)
         else:
             raise AssertionError(f"{payload!r} must not be read as an empty account")
+
+
+# ── the dseq must survive the real API shape ────────────────────────────────────────────
+
+
+def test_dseq_is_read_from_the_nested_api_shape():
+    """THE SILENT-ZERO CASE. Real details carry the dseq at deployment.id.dseq, not at the
+    top level. An earlier version read only the top-level key and fell back to `id` — which
+    on a real detail is a DICT — so it produced "" for every canary. Nothing errors: the
+    collector compares dseqs across runs to detect a replaced lease, so a constant ""
+    means akash_canary_lease_replacements_total reads zero forever. The headline signal of
+    the whole canary, reporting perfect health because it could not find a number."""
+    dep = {
+        "deployment": {"id": {"owner": "akash1owner", "dseq": "1786017183151"}},
+        "leases": [
+            {
+                "id": {"provider": ADDR_ALPHAVPS},
+                "status": {"services": {"canary": {"uris": ["a.example.com"]}}},
+            }
+        ],
+    }
+    targets, missing, _ = plan([dep], ALPHA_ONLY)
+    assert missing == []
+    assert targets[ALPHA]["dseq"] == "1786017183151", "an empty dseq blinds replacement detection"
+
+
+def test_a_top_level_dseq_still_wins():
+    """The flat shape is what the fixtures and some responses use; both must work."""
+    targets, _, _ = plan([_dep(ADDR_ALPHAVPS, "100", "a.example.com")], ALPHA_ONLY)
+    assert targets[ALPHA]["dseq"] == "100"
+
+
+def test_a_non_dict_row_is_an_error_not_a_silent_skip():
+    """Same rule as a row with no dseq: an unaccounted row makes a live canary invisible,
+    and invisible reads as 'no canary', which deploys a duplicate."""
+    details, errors = fetch(_FakeClient({}), ["not-an-object", None])
+    assert details == []
+    assert len(errors) == 2 and all("not an object" in e for e in errors)

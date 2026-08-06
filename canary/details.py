@@ -40,6 +40,9 @@ def fetch(client, listing: list) -> tuple[list[dict], list[str]]:
     errors: list[str] = []
     for row in listing:
         if not isinstance(row, dict):
+            # An error, NOT a skip — same rule as a row with no dseq. A dropped row makes a
+            # live canary invisible, and invisible reads as "no canary", which spends money.
+            errors.append(f"row is {type(row).__name__}, not an object")
             continue
         dseq = _extract_dseq(row)
         if not dseq:
@@ -96,10 +99,15 @@ def main() -> int:
     ap.add_argument("--out", required=True, help="Where to write the details document")
     a = ap.parse_args()
 
-    payload = json.loads(pathlib.Path(a.listing).read_text(encoding="utf-8"))
+    # READING the file is inside the guard too, not just parsing it. A truncated or empty
+    # listing.json raises from read_text/json.loads, and the workflow step runs under
+    # `set -euo pipefail`, so a traceback here fails the step and the collection never runs —
+    # losing the reachability reading on exactly the run where something is already wrong.
+    # `git show BRANCH:file > out` creating a zero-byte file on a first run is the same trap
+    # that killed the first live dispatch (see canary/_state.py).
     try:
-        rows = parse_listing(payload)
-    except ValueError as exc:
+        rows = parse_listing(json.loads(pathlib.Path(a.listing).read_text(encoding="utf-8")))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         # Publish the incomplete verdict rather than exiting non-zero. `complete: false` is
         # exactly the right statement here, it stops any deploy, and it leaves the collector
         # free to run — an unreadable listing does not stop the canaries answering, and
