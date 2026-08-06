@@ -95,7 +95,9 @@ jobs:
           TAG_PREFIX: ${{ inputs.tag-prefix }}
         run: |
           set -uo pipefail
-          JA="uv run --with . just-akash"
+          # An ARRAY: the command is multiple words, so a quoted string breaks it and an
+          # unquoted one is SC2086.
+          JA=(uv run --with . just-akash)
 
           if [ -z "${DSEQ}" ]; then
             echo "closed=noop" >> "$GITHUB_OUTPUT"
@@ -126,8 +128,8 @@ jobs:
           # destroyed that way). That is akash-stale-sweeper's job, not this one's.
           echo "closing dseq=$DSEQ (created by this run; tagged ${TAG_PREFIX}-*)"
 
-          for try in 1 2 3; do
-            $JA destroy --dseq "$DSEQ" -y 2>&1 | tee /tmp/destroy.log && break
+          for _try in 1 2 3; do
+            "${JA[@]}" destroy --dseq "$DSEQ" -y 2>&1 | tee /tmp/destroy.log && break
             # A non-zero exit whose output says the deployment is already closed IS a
             # success. Treating it as a failure sends the next reader looking for an
             # outage that never happened.
@@ -136,7 +138,7 @@ jobs:
           done
 
           # Verify rather than trust: read the state back.
-          STATE=$($JA status --dseq "$DSEQ" --json 2>/dev/null \
+          STATE=$("${JA[@]}" status --dseq "$DSEQ" --json 2>/dev/null \
                   | python3 -c "import json,sys;print((json.load(sys.stdin) or {}).get('state',''))" 2>/dev/null || true)
           case "$STATE" in
             closed|"")

@@ -37,7 +37,14 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Prove this executed on the runner under test
+        # The label goes through ENV, never `${{ }}` interpolated into the script body.
+        # workflow_dispatch inputs are caller-controlled, so interpolating one directly
+        # into `run:` is shell injection: the value is spliced into the script before bash
+        # ever sees it, and this job runs on a runner that holds registration credentials.
+        # Via env it stays data — bash quotes it, and no interpolation happens.
+        env:
+          RUNNER_LABEL: ${{ inputs.runner-label }}
         run: |
           echo "runner-probe no-op job executed"
           echo "  runner name : ${RUNNER_NAME:-<unset>}"
-          echo "  requested   : ${{ inputs.runner-label }}"
+          echo "  requested   : ${RUNNER_LABEL}"

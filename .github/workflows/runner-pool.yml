@@ -303,7 +303,10 @@ jobs:
           RUNNER_WAIT_TRIES: '90'
         run: |
           set -uo pipefail
-          JA="uv run --with . just-akash"
+          # An ARRAY, not a string. Both this and the provider list rely on word
+          # splitting, so quoting them breaks the command and NOT quoting them is SC2086.
+          # Arrays are the only form that is both correct and lint-clean.
+          JA=(uv run --with . just-akash)
 
           MIN_POOL="${MIN_POOL_SIZE:-}"
           case "$MIN_POOL" in ''|*[!0-9]*) MIN_POOL="$POOL_SIZE" ;; esac
@@ -316,14 +319,15 @@ jobs:
 
           for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
             echo "::group::provision attempt $attempt/$MAX_ATTEMPTS"
-            PROV_ARGS=""
+            PROV_ARGS=()
             for p in $CANDIDATES; do
               case " $EXCLUDED " in *" $p "*) continue ;; esac
-              PROV_ARGS="$PROV_ARGS --provider $p"
+              PROV_ARGS+=(--provider "$p")
             done
 
             rm -f /tmp/ja.log
-            $JA deploy --sdl /tmp/runner-sdl.yaml --bid-wait 60 --bid-wait-retry 120 $PROV_ARGS 2>&1 | tee /tmp/ja.log || true
+            "${JA[@]}" deploy --sdl /tmp/runner-sdl.yaml --bid-wait 60 \
+              --bid-wait-retry 120 "${PROV_ARGS[@]}" 2>&1 | tee /tmp/ja.log || true
             DSEQ=$(awk -F': +' '/^[[:space:]]*DSEQ:/{print $2; exit}' /tmp/ja.log || true)
             PROVIDER=$(awk -F': +' '/^[[:space:]]*Provider:/{print $2; exit}' /tmp/ja.log || true)
 
@@ -343,7 +347,7 @@ jobs:
 
             # Tag FIRST: if this job is cancelled between deploy and teardown, only a
             # tagged lease can be reaped by the caller's sweeper.
-            $JA tag --dseq "$DSEQ" --name "${TAG_PREFIX}-${RUN_ID}" \
+            "${JA[@]}" tag --dseq "$DSEQ" --name "${TAG_PREFIX}-${RUN_ID}" \
               || echo "::warning::tag failed for dseq=$DSEQ — a sweeper will not see it"
 
             ONLINE=0
@@ -359,8 +363,8 @@ jobs:
               echo "::warning::attempt $attempt: ${ONLINE:-0}/${POOL_SIZE} online on $PROVIDER (need >= ${MIN_POOL}) — discarding this lease"
               # Escrow-critical, and deliberately a literal locally-parsed --dseq so a
               # destroy-safety lint can prove this only tears down what this loop made.
-              for try in 1 2 3; do
-                $JA destroy --dseq "$DSEQ" -y 2>&1 | tee /tmp/ja-destroy.log && break
+              for _try in 1 2 3; do
+                "${JA[@]}" destroy --dseq "$DSEQ" -y 2>&1 | tee /tmp/ja-destroy.log && break
                 grep -qi "Deployment closed" /tmp/ja-destroy.log && break
                 sleep 5
               done

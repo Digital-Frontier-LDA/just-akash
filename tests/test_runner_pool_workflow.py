@@ -72,7 +72,7 @@ def test_the_lease_is_tagged_before_the_wait_not_after():
     """The wait is the long part and the likeliest place to be cancelled. A lease
     tagged only afterwards is invisible to every sweeper and leaks escrow forever."""
     body = PROVISION["run"]
-    assert body.index("$JA tag") < body.index("online (usable at"), (
+    assert body.index('"${JA[@]}" tag') < body.index("online (usable at"), (
         "tag must precede the runner wait, or a cancellation leaks an untagged lease"
     )
 
@@ -86,7 +86,7 @@ def test_teardown_targets_one_locally_parsed_dseq():
     """A sweep destroyed 14 third-party deployments once. Every destroy here must name
     a single DSEQ parsed from this job's own deploy output — never a tag glob, never
     an --all."""
-    for m in re.finditer(r"\$JA destroy[^\n]*", PROVISION["run"]):
+    for m in re.finditer(r'"\$\{JA\[@\]\}" destroy[^\n]*', PROVISION["run"]):
         line = m.group(0)
         assert '--dseq "$DSEQ"' in line, f"destroy must name this run's dseq: {line}"
         assert not re.search(r"--all\b|--tag\b|\*", line), f"blast radius too wide: {line}"
@@ -96,8 +96,8 @@ def test_a_discarded_lease_is_actually_destroyed():
     """Rejecting a pool without closing it holds escrow against the same grant the
     next attempt spends from — the failure compounds itself."""
     body = PROVISION["run"]
-    assert "$JA destroy" in body
-    assert body.index("discarding this lease") < body.index("$JA destroy")
+    assert '"${JA[@]}" destroy' in body
+    assert body.index("discarding this lease") < body.index('"${JA[@]}" destroy')
 
 
 # --------------------------------------------------------------------------
@@ -275,7 +275,7 @@ MUTATIONS = [
     ),
     (
         "destroy stays narrow",
-        lambda s: s.replace('$JA destroy --dseq "$DSEQ" -y', "$JA destroy --all -y"),
+        lambda s: s.replace('"${JA[@]}" destroy --dseq "$DSEQ" -y', '"${JA[@]}" destroy --all -y'),
     ),
     ("discard uses MIN_POOL", lambda s: s.replace('-lt "${MIN_POOL}"', '-lt "${POOL_SIZE}"')),
     ("min-pool clamp", lambda s: s.replace('[ "$MIN_POOL" -ge 1 ]', '[ "$MIN_POOL" -ge 0 ]')),
@@ -348,8 +348,8 @@ def test_teardown_verifies_the_close_instead_of_trusting_the_exit_code():
     zero exit is not proof either. Reporting a success we did not achieve is how
     leases accumulate for weeks while every run looks green."""
     body = TD_CLOSE["run"]
-    assert "$JA status" in body and ".get('state'" in body.replace('"', "'")
-    assert body.index("$JA destroy") < body.rindex("$JA status"), (
+    assert '"${JA[@]}" status' in body and ".get('state'" in body.replace('"', "'")
+    assert body.index('"${JA[@]}" destroy') < body.rindex('"${JA[@]}" status'), (
         "must read state back AFTER destroying"
     )
 
