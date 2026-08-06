@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import sys
 
 from canary._state import load_json_mapping
 
@@ -124,9 +125,36 @@ def is_complete(payload) -> bool:
 
     Absent flag means complete, so a hand-written fixture or a bare list still works. Only
     an explicit `false` — which canary/details.py writes when a fetch failed — turns off
-    deploying.
+    deploying. main() rejects a file that lacks the flag entirely; see load_details.
     """
     return not (isinstance(payload, dict) and payload.get("complete") is False)
+
+
+def load_details(path: pathlib.Path) -> dict:
+    """Parse the details document, REFUSING anything that is not one.
+
+    This guards a wiring mistake with expensive consequences. `listing.json` and
+    `details.json` sit side by side in the workflow and both parse as JSON, but a listing
+    is summary rows with no `leases` — so plan() would match nothing, report every provider
+    missing, and deploy a duplicate canary onto every provider that already has one. That is
+    the exact failure this module was rewritten to remove, so it must not be reachable by
+    passing the wrong filename.
+
+    The `complete` key is what makes the document self-identifying: details.py always writes
+    it, and nothing else in the repo produces it. Requiring it here turns a silent
+    misinterpretation into a loud stop, which is the same trade `list_deployments` makes
+    when it refuses to report an unrecognised envelope as an empty account.
+    """
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or "complete" not in payload:
+        kind = "a list" if isinstance(payload, list) else type(payload).__name__
+        raise ValueError(
+            f"{path} is not a details document (parsed as {kind}, no 'complete' key). "
+            "Generate it with `python -m canary.details --listing ... --out ...`; passing "
+            "`just-akash list --json` output here would make every provider look like it "
+            "has no canary and deploy a duplicate onto each one."
+        )
+    return payload
 
 
 def service_names(dep: dict) -> set[str]:
@@ -324,7 +352,11 @@ def main() -> int:
     )
     a = ap.parse_args()
 
-    details = json.loads(pathlib.Path(a.details).read_text(encoding="utf-8"))
+    try:
+        details = load_details(pathlib.Path(a.details))
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
     tp = pathlib.Path(a.targets)
     prev = load_json_mapping(tp)
 

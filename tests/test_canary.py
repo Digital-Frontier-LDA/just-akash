@@ -10,6 +10,8 @@ derivations are pinned here rather than trusted.
 
 from __future__ import annotations
 
+import json
+
 import canary.canary as agent
 from canary.collect import (
     extract_boot_id,
@@ -21,7 +23,7 @@ from canary.collect import (
     scrape,
 )
 from canary.details import fetch
-from canary.ensure import name_for, plan, providers_from_env
+from canary.ensure import load_details, name_for, plan, providers_from_env
 
 ALPHA = "alphavps"
 
@@ -664,3 +666,39 @@ def test_an_empty_detail_response_is_an_error_not_a_deployment():
     details, errors = fetch(_FakeClient({"100": {}}), [{"dseq": "100"}])
     assert details == []
     assert len(errors) == 1 and "empty detail" in errors[0]
+
+
+# ── the details document must be self-identifying ───────────────────────────────────────
+
+
+def _write(tmp_path, name, payload):
+    p = tmp_path / name
+    p.write_text(json.dumps(payload), encoding="utf-8")
+    return p
+
+
+def test_a_listing_passed_as_details_is_refused(tmp_path):
+    """listing.json and details.json sit side by side in the workflow and both parse as
+    JSON. A listing has no leases, so plan() would match nothing, call every provider
+    missing, and deploy a duplicate canary onto each — the exact failure this module was
+    rewritten to remove. Wiring the wrong filename must stop the run, not proceed."""
+    p = _write(tmp_path, "listing.json", [{"dseq": "100", "state": "active"}])
+    try:
+        load_details(p)
+    except ValueError as exc:
+        assert "not a details document" in str(exc)
+        assert "duplicate" in str(exc)
+    else:
+        raise AssertionError("a bare listing must be refused, not accepted as complete")
+
+
+def test_a_real_details_document_loads(tmp_path):
+    p = _write(tmp_path, "details.json", {"complete": True, "deployments": []})
+    assert load_details(p) == {"complete": True, "deployments": []}
+
+
+def test_an_incomplete_details_document_still_loads(tmp_path):
+    """Refusal is about the SHAPE being unrecognisable. `complete: false` is a valid
+    document making a true statement, and plan() needs to see it to suppress deploying."""
+    p = _write(tmp_path, "details.json", {"complete": False, "deployments": []})
+    assert load_details(p)["complete"] is False

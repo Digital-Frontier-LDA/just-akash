@@ -77,7 +77,19 @@ def main() -> int:
                 rows = v
                 break
 
-    client = AkashConsoleAPI(os.environ["AKASH_API_KEY"])
+    # A named cause, not a KeyError traceback. This runs in CI where the key comes from a
+    # SOPS-decrypted env file, so the realistic failure is that the decrypt step did not run
+    # or exported a different name — and "KeyError: 'AKASH_API_KEY'" in a stack trace sends
+    # people looking at this file instead of at that step.
+    api_key = os.environ.get("AKASH_API_KEY")
+    if not api_key:
+        print(
+            "Error: AKASH_API_KEY is not set. It is decrypted from secrets/ci.sops.env by "
+            "the SOPS step in .github/workflows/provider-canary.yml; check that step ran.",
+            file=sys.stderr,
+        )
+        return 2
+    client = AkashConsoleAPI(api_key)
     details, errors = fetch(client, rows)
 
     for e in errors:
