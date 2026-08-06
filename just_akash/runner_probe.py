@@ -414,8 +414,16 @@ def _run_noop_job(org: str, label: str, repo: str, timeout_s: int) -> bool | Non
     unmeasured while reporting it as met.
     """
     rc, _ = _run(
-        ["gh", "workflow", "run", "runner-probe-job.yml", "--repo", repo,
-         "-f", f"runner-label={label}"],
+        [
+            "gh",
+            "workflow",
+            "run",
+            "runner-probe-job.yml",
+            "--repo",
+            repo,
+            "-f",
+            f"runner-label={label}",
+        ],
         timeout=60,
     )
     if rc != 0:
@@ -424,8 +432,19 @@ def _run_noop_job(org: str, label: str, repo: str, timeout_s: int) -> bool | Non
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         rc, out = _run(
-            ["gh", "run", "list", "--repo", repo, "--workflow", "runner-probe-job.yml",
-             "--limit", "5", "--json", "status,conclusion,createdAt"],
+            [
+                "gh",
+                "run",
+                "list",
+                "--repo",
+                repo,
+                "--workflow",
+                "runner-probe-job.yml",
+                "--limit",
+                "5",
+                "--json",
+                "status,conclusion,createdAt",
+            ],
             timeout=60,
         )
         if rc == 0 and out.strip():

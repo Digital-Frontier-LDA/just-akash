@@ -270,7 +270,7 @@ MUTATIONS = [
         lambda s: s.replace(
             "        required: true\n        type: string\n      github-org:",
             "        required: true\n        type: string\n"
-        "        default: 'ci-shared'\n      github-org:",
+            "        default: 'ci-shared'\n      github-org:",
         ),
     ),
     (

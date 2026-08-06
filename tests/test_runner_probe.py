@@ -14,6 +14,7 @@ silent while success is cheap and obvious.
 from __future__ import annotations
 
 import json
+
 import pytest
 
 from just_akash.runner_probe import (
