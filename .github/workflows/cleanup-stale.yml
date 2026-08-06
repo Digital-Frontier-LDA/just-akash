@@ -24,8 +24,15 @@ permissions:
 
 # Never overlap with a live smoke run: the smoke holds young probes that the
 # age floors already spare, but serializing removes even the theoretical race.
+#
+# ⚠️ GROUP RENAMED provider-smoke -> akash-wallet. The smoke moved to that shared
+# group when provider-canary.yml was added, because all three spend from ONE
+# Console-API wallet — a single Cosmos account, whose sequence number cannot carry
+# two transactions at once. This file was left behind on the old name, which
+# silently un-serialised the one workflow here that DESTROYS deployments from the
+# two that create them. A stale group name fails open and says nothing.
 concurrency:
-  group: provider-smoke
+  group: akash-wallet
   cancel-in-progress: false
 
 jobs:
