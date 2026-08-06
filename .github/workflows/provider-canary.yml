@@ -37,6 +37,10 @@ on:
         description: "Deploy a canary for any provider that has none (spends escrow)"
         type: boolean
         default: true
+      min_credit_usd:
+        description: "Override the credit floor (0 disables it — for testing what actually gates a deploy)"
+        default: ""
+        required: false
 
 # ⚠️ SHARED WITH provider-smoke.yml, and this is the important line in the file.
 #
@@ -140,9 +144,11 @@ jobs:
       # the smoke, so a dashboard shows it as current when it can be 24 hours old.
       # Reading it here puts a ~30 minute figure on the same branch.
       - name: Read deploy credit
+        env:
+          MIN_CREDIT_OVERRIDE: ${{ inputs.min_credit_usd }}
         run: |
           set -euo pipefail
-          floor="${CANARY_MIN_CREDIT_USD:-25}"
+          floor="${MIN_CREDIT_OVERRIDE:-${CANARY_MIN_CREDIT_USD:-25}}"
           set +e
           uv run just-akash balance --check --min-usd "$floor" --json > credit.json 2>credit.err
           echo "balance rc=$?"
@@ -182,7 +188,7 @@ jobs:
           # wallet really is short, anything else means we could not MEASURE it. The
           # first version of this guard was `if ! balance ... >/dev/null 2>&1`, which
           # conflated them and reported a low wallet on a run where credit was $81.
-          floor="${CANARY_MIN_CREDIT_USD:-25}"
+          floor="${MIN_CREDIT_OVERRIDE:-${CANARY_MIN_CREDIT_USD:-25}}"
           status=$(python -c "import json,sys;print(json.load(open('credit.json')).get('status',''))" 2>/dev/null || true)
           if [ "$status" = "LOW" ]; then
             echo "::warning::deploy credit is below the \$${floor} floor - NOT creating canary leases, so the daily smoke keeps the remaining budget. Top up the wallet."
