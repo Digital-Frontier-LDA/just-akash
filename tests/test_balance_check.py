@@ -170,3 +170,69 @@ class TestCheckGatesOnFreeNotGrant:
         assert code == 0
         assert '"status": "OK"' in out
         assert '"free_usd": 165.62' in out
+
+
+class TestIncompleteEscrowTally:
+    """An escrow tally that could not finish must not read as OK.
+
+    `escrow_locked` skips a deployment whose detail will not load and reports how
+    many via `unreadable`, so `locked_uact` is a LOWER bound — which makes `free` an
+    UPPER bound. `balance --check` used to drop that flag on the floor and print
+    OK/exit 0 on credit that may not exist.
+
+    That is worse than no alarm. A caller gating on this deploys, takes a 402, and
+    blames the provider — the exact mis-attribution the free-vs-granted distinction
+    was introduced to prevent, one layer up.
+    """
+
+    @staticmethod
+    def _with_escrow(monkeypatch, argv, credit, escrow):
+        monkeypatch.setenv("AKASH_API_KEY", "test-key")
+        monkeypatch.setattr(sys, "argv", argv)
+        with (
+            patch("just_akash.api.AkashConsoleAPI") as MockAPI,
+            patch("just_akash.chain.deploy_credit", return_value=credit),
+            patch("just_akash.api.escrow_locked", return_value=escrow),
+        ):
+            MockAPI.return_value.account_address.return_value = "akash1me"
+            from just_akash.cli import main
+
+            with pytest.raises(SystemExit) as exc:
+                main()
+        return exc.value.code
+
+    def test_unreadable_deployment_yields_UNKNOWN_not_OK(self, monkeypatch, capsys):
+        code = self._with_escrow(
+            monkeypatch,
+            ["just-akash", "balance", "--check", "--min-usd", "50"],
+            {"uact": 170_000_000},
+            {"locked_uact": 0, "deployments": 1, "unreadable": 1, "by_deployment": []},
+        )
+        verdict = json.loads(capsys.readouterr().out)
+        assert verdict["status"] == "UNKNOWN", "an incomplete count reported as OK"
+        assert verdict["escrow_unreadable_deployments"] == 1
+        assert code != 0, "exit 0 tells a gating caller it is safe to deploy"
+
+    def test_low_still_wins_over_unknown(self, monkeypatch, capsys):
+        """Definitely short beats maybe short — the caller needs the actionable one."""
+        code = self._with_escrow(
+            monkeypatch,
+            ["just-akash", "balance", "--check", "--min-usd", "50"],
+            {"uact": 10_000_000},
+            {"locked_uact": 0, "deployments": 1, "unreadable": 1, "by_deployment": []},
+        )
+        assert json.loads(capsys.readouterr().out)["status"] == "LOW"
+        assert code != 0
+
+    def test_a_complete_tally_is_still_plain_OK(self, monkeypatch, capsys):
+        code = self._with_escrow(
+            monkeypatch,
+            ["just-akash", "balance", "--check", "--min-usd", "50"],
+            {"uact": 170_000_000},
+            {"locked_uact": 20_000_000, "deployments": 2, "unreadable": 0, "by_deployment": []},
+        )
+        verdict = json.loads(capsys.readouterr().out)
+        assert verdict["status"] == "OK"
+        assert verdict["escrow_unreadable_deployments"] == 0
+        assert verdict["free_usd"] == 150.0
+        assert code == 0

@@ -853,13 +853,28 @@ def main():
                 # "healthy" while Console is already returning 402 (measured: 165 of
                 # 170.62 ACT locked -> a 5 ACT deploy failed). Free is what decides
                 # whether the next deploy succeeds, so that is what the alarm gates on.
-                locked_uact = escrow_locked(client)["locked_uact"]
+                escrow = escrow_locked(client)
+                locked_uact = escrow["locked_uact"]
                 free_uact = max(granted_uact - locked_uact, 0)
                 granted_usd = chain.usd_estimate("uact", granted_uact) or 0.0
                 locked_usd = chain.usd_estimate("uact", locked_uact) or 0.0
                 usd = chain.usd_estimate("uact", free_uact) or 0.0
                 low = usd < args.min_usd
-                status = "LOW" if low else "OK"
+                # `escrow_locked` skips a deployment whose detail will not load and
+                # reports how many via `unreadable`, so `locked_uact` is a LOWER
+                # bound — which makes `free` an UPPER bound. Ignoring that flag lets
+                # this print "OK" on credit that may not exist, and an alarm that
+                # over-reports is worse than no alarm: the caller deploys, takes a
+                # 402, and blames the provider. UNKNOWN is a third answer, distinct
+                # from both OK and LOW, so a caller can tell "you are short" from
+                # "I could not finish counting".
+                unreadable = escrow.get("unreadable", 0)
+                if low:
+                    status = "LOW"
+                elif unreadable:
+                    status = "UNKNOWN"
+                else:
+                    status = "OK"
                 if use_json:
                     print(
                         json.dumps(
@@ -872,17 +887,29 @@ def main():
                                 "free_usd": usd,
                                 "granted_usd": granted_usd,
                                 "locked_in_escrow_usd": locked_usd,
+                                # >0 means the escrow tally is INCOMPLETE, so
+                                # free_usd is an upper bound, not a measurement.
+                                "escrow_unreadable_deployments": unreadable,
                                 "min_usd": args.min_usd,
                             }
                         )
                     )
                 else:
                     print(
-                        f"CREDIT-CHECK status={status} free_usd={usd:.2f} "
-                        f"(granted={granted_usd:.2f} locked_in_escrow={locked_usd:.2f}) "
+                        f"CREDIT-CHECK status={status} free_usd={usd:.2f}"
+                        + (
+                            f" (UPPER BOUND: {unreadable} deployment(s) unreadable)"
+                            if unreadable
+                            else ""
+                        )
+                        + f" (granted={granted_usd:.2f} locked_in_escrow={locked_usd:.2f}) "
                         f"min_usd={args.min_usd:.2f} account={address}"
                     )
-                sys.exit(1 if low else 0)
+                # Non-zero for UNKNOWN as well as LOW. A caller gating on the exit
+                # code is asking "is it safe to deploy?", and "I could not finish
+                # counting" is not a yes. Exiting 0 there is precisely how an
+                # over-reported balance becomes a 402 nobody predicted.
+                sys.exit(1 if (low or unreadable) else 0)
 
             # Deploy credit is the real "wallet balance": Console holds the funds and
             # grants this account an escrow DepositAuthorization whose spend_limits is

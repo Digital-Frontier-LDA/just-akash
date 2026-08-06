@@ -92,3 +92,24 @@ class TestEscrowLocked:
     def test_tolerates_decimal_and_malformed_amounts(self):
         c = _client([_deployment(1, "5000000.000000"), _deployment(2, "notanumber")])
         assert escrow_locked(c)["locked_uact"] == 5_000_000
+
+
+class TestFundsNotTransferred:
+    """`funds` is what is still locked; `transferred` is what already went to the
+    provider. Summing `transferred` would overstate escrow and understate free
+    credit — and understating free is the direction that makes a funded wallet
+    look empty, which in CI means paying for hosted runners while credit sits idle.
+
+    The distinction is stated in `_reconcile_lease_row`'s docstring but was not
+    pinned for `escrow_locked` itself, so nothing failed if the field were swapped.
+    """
+
+    def test_transferred_is_ignored(self):
+        c = _client([_deployment(1, 5_000_000)])
+        detail = c.get_deployment.return_value
+        # Real payloads carry BOTH; only `funds` is the remaining balance.
+        detail["escrow_account"]["state"]["transferred"] = [
+            {"denom": "uact", "amount": "2789555.0000000000"}
+        ]
+        r = escrow_locked(c)
+        assert r["locked_uact"] == 5_000_000, "transferred leaked into the locked total"
