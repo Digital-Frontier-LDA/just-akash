@@ -87,6 +87,10 @@ class Attempt:
     seconds: float | None = None
     dseq: str | None = None
     detail: str = ""
+    # Did THIS attempt actually observe a running container? Tracked separately from the
+    # outcome so a run can tell "we measured no pod" from "we never demonstrated we can
+    # measure a pod at all". See require_positive_control().
+    observed_pod: bool = False
 
     @property
     def passed(self) -> bool:
@@ -168,6 +172,50 @@ def classify(
     return Outcome.PASS
 
 
+def require_positive_control(verdicts: list[ProviderVerdict]) -> tuple[list[ProviderVerdict], str]:
+    """Downgrade every disqualification unless the run PROVED it can detect a live pod.
+
+    Why this exists, concretely: a probe run reported LEASE_NO_POD for the fleet's one
+    production-proven runner_host, and across two runs EVERY provider that won a lease
+    reported LEASE_NO_POD. `_pod_started` had never once returned True in the field. A
+    detector that has only ever produced one answer has not been validated — it has only
+    been observed agreeing with itself.
+
+    The underlying ambiguity is real and cannot be reasoned away: for a lease whose
+    provider hostUri has not propagated yet, the logs channel returns
+
+        Error: no active lease / provider hostUri for this deployment yet.
+
+    which is indistinguishable, to this code, from a provider that will never schedule.
+    Only elapsed time separates them, and calibrating that needs a known-good reading.
+
+    So a NEGATIVE is only trusted once the same run has produced a POSITIVE. Without one,
+    disqualifications become INDETERMINATE — "we could not measure", never "it failed".
+    That direction is deliberate: runner_deny is permanent and outranks any later passing
+    streak, so a false deny silently shrinks a pool that is already one host deep.
+    """
+    if any(a.observed_pod for v in verdicts for a in v.attempts):
+        return verdicts, ""
+
+    downgraded = 0
+    for v in verdicts:
+        for a in v.attempts:
+            if a.outcome in DISQUALIFYING:
+                a.outcome = Outcome.INDETERMINATE
+                a.detail = (a.detail + "; " if a.detail else "") + "no positive control this run"
+                downgraded += 1
+    if not downgraded:
+        return verdicts, ""
+    return verdicts, (
+        f"::warning title=No positive control — {downgraded} disqualification(s) withheld::"
+        "This run never observed a running container on ANY provider, so a 'no pod' reading "
+        "carries no information: an un-propagated lease looks identical to one that will "
+        "never schedule. Those outcomes were recorded as INDETERMINATE rather than "
+        "runner_deny. Re-run including a provider known to serve, and only trust the "
+        "negatives once that provider reads as a pass."
+    )
+
+
 def render_verdicts(
     verdicts: list[ProviderVerdict], required: int = REQUIRED_CONSECUTIVE_PASSES
 ) -> list[str]:
@@ -233,9 +281,13 @@ def mint_registration_token(org: str) -> str:
     """
     rc, out = _run(
         [
-            "gh", "api", "-X", "POST",
+            "gh",
+            "api",
+            "-X",
+            "POST",
             f"/orgs/{org}/actions/runners/registration-token",
-            "--jq", ".token",
+            "--jq",
+            ".token",
         ],
         timeout=60,
     )
@@ -414,6 +466,7 @@ def probe_once(
         ),
         seconds=time.time() - started,
         dseq=dseq,
+        observed_pod=pod_running,
     )
 
 
@@ -494,6 +547,10 @@ def main(argv: list[str] | None = None) -> int:
             if a.outcome in DISQUALIFYING:
                 break
         verdicts.append(v)
+
+    verdicts, control_warning = require_positive_control(verdicts)
+    if control_warning:
+        print(control_warning, file=sys.stderr)
 
     if args.json:
         print(

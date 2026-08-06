@@ -428,3 +428,66 @@ def test_minting_returns_empty_rather_than_a_bogus_token(monkeypatch):
 def test_a_minted_token_is_returned_stripped(monkeypatch):
     monkeypatch.setattr(rp, "_run", lambda *a, **k: (0, "AAABBB\n"))
     assert rp.mint_registration_token("org") == "AAABBB"
+
+
+# ==========================================================================
+# Positive control — a negative only counts if a positive was demonstrated
+# ==========================================================================
+
+
+def _att(outcome, observed=False):
+    return Attempt(outcome=outcome, observed_pod=observed)
+
+
+def test_a_run_with_no_positive_control_withholds_disqualifications():
+    """The incident: a probe reported LEASE_NO_POD for the fleet's one production-proven
+    runner_host, and across two runs EVERY leasing provider reported LEASE_NO_POD while
+    `_pod_started` had never once returned True. An un-propagated lease is
+    indistinguishable from one that will never schedule, so without a known-good reading
+    a 'no pod' result carries no information."""
+    v = ProviderVerdict(address=P, attempts=[_att(Outcome.LEASE_NO_POD)])
+    out, warning = rp.require_positive_control([v])
+    assert out[0].attempts[0].outcome is Outcome.INDETERMINATE
+    assert out[0].marker() == "unknown", "must not be runner_deny"
+    assert "positive control" in warning.lower()
+
+
+def test_a_run_WITH_a_positive_control_keeps_its_disqualifications():
+    """Once the instrument is shown capable of a True, a False means something."""
+    good = ProviderVerdict(address="akash1good", attempts=[_att(Outcome.PASS, observed=True)])
+    bad = ProviderVerdict(address="akash1bad", attempts=[_att(Outcome.LEASE_NO_POD)])
+    out, warning = rp.require_positive_control([good, bad])
+    assert out[1].attempts[0].outcome is Outcome.LEASE_NO_POD
+    assert out[1].marker() == "runner_deny"
+    assert warning == ""
+
+
+def test_the_control_can_come_from_a_DIFFERENT_provider():
+    """It validates the INSTRUMENT, not the provider under test."""
+    good = ProviderVerdict(
+        address="akash1a", attempts=[_att(Outcome.TEARDOWN_FAILED, observed=True)]
+    )
+    bad = ProviderVerdict(address="akash1b", attempts=[_att(Outcome.POD_NO_REGISTER)])
+    out, _ = rp.require_positive_control([good, bad])
+    assert out[1].attempts[0].outcome is Outcome.POD_NO_REGISTER
+
+
+def test_no_bid_is_untouched_by_the_control_gate():
+    """NO_BID needs no pod detection, so it is unaffected either way."""
+    v = ProviderVerdict(address=P, attempts=[_att(Outcome.NO_BID)])
+    out, warning = rp.require_positive_control([v])
+    assert out[0].attempts[0].outcome is Outcome.NO_BID
+    assert warning == "", "nothing was withheld, so nothing to warn about"
+
+
+def test_probe_once_records_whether_a_pod_was_seen(monkeypatch, tmp_path):
+    _driver(monkeypatch)
+    a = rp.probe_once(
+        "akash1x", sdl=tmp_path, org="o", label="l", token="t", bid_wait=1, register_timeout=1
+    )
+    assert a.observed_pod is True
+    _driver(monkeypatch, state="pending")
+    b = rp.probe_once(
+        "akash1x", sdl=tmp_path, org="o", label="l", token="t", bid_wait=1, register_timeout=0
+    )
+    assert b.observed_pod is False
