@@ -268,7 +268,8 @@ def _driver(
     registered=True,
 ):
     monkeypatch.setattr(rp, "_deploy", lambda *a, **k: (dseq, deploy_out))
-    monkeypatch.setattr(rp, "_state", lambda d: state)
+    monkeypatch.setattr(rp, "_lease_active", lambda d: state == "active")
+    monkeypatch.setattr(rp, "_pod_started", lambda d: state == "active")
     monkeypatch.setattr(rp, "_destroy", lambda d: destroyed)
     monkeypatch.setattr(rp, "_registered", lambda *a, **k: registered)
     monkeypatch.setattr(rp.time, "sleep", lambda s: None)
@@ -320,7 +321,7 @@ def test_the_lease_is_destroyed_even_when_the_probe_raises(monkeypatch, tmp_path
     def boom(d):
         raise RuntimeError("console 500")
 
-    monkeypatch.setattr(rp, "_state", boom)
+    monkeypatch.setattr(rp, "_lease_active", boom)
     with pytest.raises(RuntimeError):
         rp.probe_once(
             "akash1x", sdl=tmp_path, org="o", label="l", token="t", bid_wait=1, register_timeout=1
@@ -336,3 +337,37 @@ def test_without_a_token_registration_is_unasked_not_failed(monkeypatch, tmp_pat
         "akash1x", sdl=tmp_path, org="o", label="l", token="", bid_wait=1, register_timeout=1
     )
     assert a.outcome is rp.Outcome.PASS
+
+
+def test_an_active_lease_running_nothing_is_not_a_pass(monkeypatch, tmp_path):
+    """THE trap. `deployment_state == "active"` is true the moment the deployment
+    exists and stays true for a lease that never schedules anything — measured across
+    seven simultaneous leases on a provider already marked runner_deny, every one
+    reporting active while running nothing.
+
+    Keying the probe on it would return PASS for exactly the failure it exists to find,
+    and would promote the worst providers in the fleet to runner_host.
+    """
+    monkeypatch.setattr(rp, "_deploy", lambda *a, **k: ("77", "  DSEQ: 77"))
+    monkeypatch.setattr(rp, "_lease_active", lambda d: True)  # lease IS active
+    monkeypatch.setattr(rp, "_pod_started", lambda d: False)  # ...running nothing
+    monkeypatch.setattr(rp, "_destroy", lambda d: True)
+    monkeypatch.setattr(rp.time, "sleep", lambda s: None)
+    a = rp.probe_once(
+        "akash1x", sdl=tmp_path, org="o", label="l", token="t", bid_wait=1, register_timeout=0
+    )
+    assert a.outcome is rp.Outcome.LEASE_NO_POD
+
+
+def test_provider_transport_noise_is_not_container_output(monkeypatch):
+    """An unreachable provider returns an error on the logs channel. Counting that as
+    'the pod started' reads a broken host as healthy."""
+    monkeypatch.setattr(rp, "_run", lambda *a, **k: (0, "Error: no such pod"))
+    assert rp._pod_started("1") is False
+    monkeypatch.setattr(rp, "_run", lambda *a, **k: (0, "Runner listening for jobs"))
+    assert rp._pod_started("1") is True
+
+
+def test_empty_log_output_is_not_a_started_pod(monkeypatch):
+    monkeypatch.setattr(rp, "_run", lambda *a, **k: (0, "   \n"))
+    assert rp._pod_started("1") is False

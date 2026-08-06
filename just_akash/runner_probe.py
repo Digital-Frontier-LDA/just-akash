@@ -259,12 +259,44 @@ def _deploy(sdl: Path, provider: str, bid_wait: int) -> tuple[str | None, str]:
     return (m.group(1) if m else None), out
 
 
-def _state(dseq: str) -> str:
-    rc, out = _run(["just-akash", "status", "--dseq", dseq, "--json"], timeout=120)
+def _pod_started(dseq: str) -> bool:
+    """Did a CONTAINER actually start — not merely: is the deployment active?
+
+    `deployment_state == "active"` is the trap. It is true the moment the deployment
+    exists, and stays true for a lease that never schedules a thing: measured across
+    seven simultaneous leases on a provider already marked runner_deny, every one
+    reporting `active` while running nothing. A probe keyed on it would return PASS for
+    precisely the failure it exists to detect, and would then promote the worst
+    providers in the fleet to runner_host.
+
+    Container logs are the discriminator: a pod that never started has none.
+    """
+    rc, out = _run(["just-akash", "logs", "--dseq", dseq, "--service", "probe"], timeout=120)
+    if rc != 0:
+        return False
+    body = out.strip()
+    if not body:
+        return False
+    # Provider transport errors are not pod output; treating them as "started" would
+    # read an unreachable provider as healthy.
+    return not re.search(
+        r"no such (pod|service)|not found|connection refused|failed to", body, re.I
+    )
+
+
+def _lease_active(dseq: str) -> bool:
+    """A lease exists and is active — necessary, nowhere near sufficient."""
+    rc, out = _run(["just-akash", "lease-status", "--json"], timeout=120)
     try:
-        return (json.loads(out.strip().splitlines()[-1]) or {}).get("state", "")
+        dec = json.JSONDecoder()
+        i = out.find("{")
+        obj, _ = dec.raw_decode(out, i)
+        for r in obj.get("leases", []):
+            if str(r.get("dseq")) == str(dseq):
+                return r.get("lease_count", 0) >= 1 and r.get("lease_state") == "active"
     except Exception:
-        return ""
+        return False
+    return False
 
 
 def _destroy(dseq: str) -> bool:
@@ -317,13 +349,16 @@ def probe_once(
         return Attempt(outcome=Outcome.NO_BID, seconds=time.time() - started)
 
     try:
+        # Two stages, deliberately separate. A lease that never becomes active is a
+        # market/provider condition; a lease that IS active while no container ever
+        # starts is the disqualifying failure this tool exists to name.
         pod_running = False
         deadline = time.time() + register_timeout
         while time.time() < deadline:
-            if _state(dseq) == "active":
+            if _lease_active(dseq) and _pod_started(dseq):
                 pod_running = True
                 break
-            time.sleep(5)
+            time.sleep(10)
 
         registered = job_ran = None
         if token and pod_running:
