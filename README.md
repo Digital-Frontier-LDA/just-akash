@@ -333,7 +333,7 @@ Two switches exist, both about money:
 | Variable | Purpose |
 |---|---|
 | `CANARY_AUTODEPLOY` | `true` to let the schedule recreate a missing canary. |
-| `CANARY_MIN_CREDIT_USD` | Credit floor below which the canary declines to create leases. Default `25`. |
+| `CANARY_MIN_CREDIT_USD` | Credit floor below which the canary declines to create leases. Default **`0` (disabled)** — see the authorization-vs-balance note above for why. |
 
 ### ⚠️ One wallet means the canary and the smoke must not run at once
 
@@ -350,6 +350,20 @@ the hour, since the smoke runs at 07:00 and can run for 40 minutes.
 The cost is that a collection can queue behind a smoke run — up to ~70 minutes, once a day —
 and that cost is near-zero by design: the counters are cumulative, so a late collection loses
 timing precision and no events.
+
+### ⚠️ `balance --check` reports authorization headroom, NOT available balance
+
+Worth knowing before you read `free_usd` as money. Console issues this API key a
+**DepositAuthorization** with a spend limit; `balance --check` reports
+`granted − locked_in_escrow`, i.e. how much of *that authorization* is uncommitted. The
+account's available balance is a different, larger number and lives on the Console side —
+the on-chain `liquid` bank balance is empty, because the funds sit with the granter.
+
+Measured 2026-08-06: `free_usd` read **$2.31** while the Console account held **$573.38**,
+and a deploy at that moment succeeded on all three providers. A credit floor gating on
+`free_usd` was therefore blocking deploys that work, so it now defaults to **0 (disabled)**.
+The figure is still read and published every run — the information was never the problem,
+the blocking was.
 
 ### ⚠️ One wallet is also one budget
 
