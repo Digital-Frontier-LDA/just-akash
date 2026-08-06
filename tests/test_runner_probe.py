@@ -371,3 +371,60 @@ def test_provider_transport_noise_is_not_container_output(monkeypatch):
 def test_empty_log_output_is_not_a_started_pod(monkeypatch):
     monkeypatch.setattr(rp, "_run", lambda *a, **k: (0, "   \n"))
     assert rp._pod_started("1") is False
+
+
+# ==========================================================================
+# Registration tokens — full qualification without a long-lived PAT
+# ==========================================================================
+
+
+def test_a_registration_token_renders_as_RUNNER_TOKEN(tmp_path):
+    """myoung34/github-runner (the base image) accepts a pre-minted registration token.
+    Rendering it as ACCESS_TOKEN instead would make the runner try to MINT one from it
+    and fail — reporting POD_NO_REGISTER for a provider that was fine."""
+    import yaml as _yaml
+
+    body = rp.render_sdl(
+        tmp_path / "p.yaml",
+        cpu="4",
+        memory="16Gi",
+        storage="30Gi",
+        org="o",
+        token="ABC123",
+        label="l",
+        token_kind="RUNNER_TOKEN",
+    ).read_text()
+    env = _yaml.safe_load(body)["services"]["probe"]["env"]
+    assert "RUNNER_TOKEN=ABC123" in env
+    assert not any(e.startswith("ACCESS_TOKEN=") for e in env), "both would conflict"
+
+
+def test_a_pat_still_renders_as_ACCESS_TOKEN(tmp_path):
+    import yaml as _yaml
+
+    body = rp.render_sdl(
+        tmp_path / "p.yaml",
+        cpu="4",
+        memory="16Gi",
+        storage="30Gi",
+        org="o",
+        token="ghp_x",
+        label="l",
+    ).read_text()
+    env = _yaml.safe_load(body)["services"]["probe"]["env"]
+    assert "ACCESS_TOKEN=ghp_x" in env
+
+
+def test_minting_returns_empty_rather_than_a_bogus_token(monkeypatch):
+    """A failed mint must not yield a truthy string. Rendering junk as RUNNER_TOKEN
+    would make every provider report POD_NO_REGISTER and demote the whole fleet on
+    what is really our own credential failure."""
+    monkeypatch.setattr(rp, "_run", lambda *a, **k: (1, "gh: HTTP 403"))
+    assert rp.mint_registration_token("org") == ""
+    monkeypatch.setattr(rp, "_run", lambda *a, **k: (0, "  \n"))
+    assert rp.mint_registration_token("org") == ""
+
+
+def test_a_minted_token_is_returned_stripped(monkeypatch):
+    monkeypatch.setattr(rp, "_run", lambda *a, **k: (0, "AAABBB\n"))
+    assert rp.mint_registration_token("org") == "AAABBB"

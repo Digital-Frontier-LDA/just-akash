@@ -22,13 +22,21 @@
 # the proven reaper instead of adding a parallel one. The 1h threshold cannot kill an
 # in-flight probe: a pass completes in minutes, and a hang is exactly what we want reaped.
 #
-# NO REAL GITHUB TOKEN IS REQUIRED to answer the primary question. With a placeholder the
-# container still has to be SCHEDULED and started, which is the discriminator — it simply
-# fails to register afterwards. Supply a real ACCESS_TOKEN only for the stronger check
-# (registers, runs a no-op job), which the quorum requires before promoting a provider to
-# runner_host.
+# TWO WAYS TO AUTHENTICATE, and the second is why this can run without a PAT.
+# The base image is myoung34/github-runner, which accepts EITHER:
+#   ACCESS_TOKEN=<PAT>            it mints a registration token itself
+#   RUNNER_TOKEN=<registration>   a short-lived token minted by the caller
+# The second needs only `admin:org` on whatever credential the OPERATOR already holds
+# (`gh api -X POST /orgs/{org}/actions/runners/registration-token`), so a full
+# qualification no longer waits on someone provisioning a long-lived PAT — which matters
+# because a PAT expiry is silent and looks exactly like a provider fault.
 #
-# Placeholders substituted by the probe: {{CPU}} {{MEMORY}} {{STORAGE}} {{ACCESS_TOKEN}}
+# NO REAL TOKEN AT ALL still answers the primary question: with a placeholder the
+# container must still be SCHEDULED and started, which is the discriminator. It simply
+# fails to register afterwards. Supply a real one for the stronger check (registers, runs
+# a no-op job) that the quorum requires before promoting a provider to runner_host.
+#
+# Placeholders substituted by the probe: {{CPU}} {{MEMORY}} {{STORAGE}} {{TOKEN_ENV}}
 # {{ORG_NAME}} {{RUNNER_NAME_PREFIX}} {{LABELS}}
 
 version: "2.0"
@@ -37,7 +45,7 @@ services:
   probe:
     image: ghcr.io/akash-network/github-runner:latest
     env:
-      - ACCESS_TOKEN={{ACCESS_TOKEN}}
+      - {{TOKEN_ENV}}
       - ORG_NAME={{ORG_NAME}}
       - RUNNER_SCOPE=org
       - RUNNER_NAME_PREFIX={{RUNNER_NAME_PREFIX}}

@@ -216,8 +216,43 @@ def _run(cmd: list[str], timeout: int = 900) -> tuple[int, str]:
         return 127, str(exc)
 
 
+def mint_registration_token(org: str) -> str:
+    """A short-lived org runner-registration token.
+
+    This is what takes the long-lived PAT off the critical path. myoung34/github-runner
+    (the base image) accepts RUNNER_TOKEN directly, so an operator holding `admin:org` can
+    qualify providers without anyone provisioning a PAT first.
+
+    That matters beyond convenience: a PAT expiry is SILENT. It surfaces as "runner did not
+    come online" after a ~15-minute wait, indistinguishable from a provider fault — and an
+    expired PAT handed to this probe would report POD_NO_REGISTER and wrongly demote healthy
+    providers. Minting fresh each run cannot go stale, so it is the safer input as well as
+    the more available one.
+
+    Tokens expire in ~1h; an attempt takes minutes.
+    """
+    rc, out = _run(
+        [
+            "gh", "api", "-X", "POST",
+            f"/orgs/{org}/actions/runners/registration-token",
+            "--jq", ".token",
+        ],
+        timeout=60,
+    )
+    return out.strip() if rc == 0 and out.strip() else ""
+
+
 def render_sdl(
-    dest: Path, *, cpu: str, memory: str, storage: str, org: str, token: str, label: str
+    dest: Path,
+    *,
+    cpu: str,
+    memory: str,
+    storage: str,
+    org: str,
+    token: str,
+    label: str,
+    # noqa S107: an env var NAME chosen per auth mode, not a credential.
+    token_kind: str = "ACCESS_TOKEN",  # noqa: S107
 ) -> Path:
     """Substitute the probe SDL at the CALLER'S profile.
 
@@ -233,7 +268,7 @@ def render_sdl(
         "ORG_NAME": org,
         # A placeholder still forces the container to be SCHEDULED and started, which is
         # the discriminator. It simply fails to register afterwards.
-        "ACCESS_TOKEN": token or "probe-no-token",
+        "TOKEN_ENV": f"{token_kind}={token}" if token else "ACCESS_TOKEN=probe-no-token",
         "RUNNER_NAME_PREFIX": label,
         "LABELS": f"self-hosted,linux,akash,{label}",
     }.items():
@@ -401,6 +436,18 @@ def main(argv: list[str] | None = None) -> int:
         return 127
 
     token = os.environ.get("GH_RUNNER_PAT", "")
+    token_kind = "ACCESS_TOKEN"  # noqa: S105 - an env var NAME, not a credential
+    if not token:
+        # No PAT: mint a short-lived registration token instead. Full qualification then
+        # needs only `admin:org` on the operator's existing credential.
+        token = mint_registration_token(args.org) if args.org else ""
+        if token:
+            token_kind = "RUNNER_TOKEN"  # noqa: S105 - an env var NAME, not a credential
+            print(
+                f"::notice::minted an org registration token for {args.org} — "
+                "full qualification (registration + job) is available without a PAT",
+                file=sys.stderr,
+            )
     if not token:
         # Say so up front: without it the probe answers only the scheduling question,
         # and a silent downgrade would let a weaker pass read as a full qualification.
@@ -427,6 +474,7 @@ def main(argv: list[str] | None = None) -> int:
                 org=args.org,
                 token=token,
                 label=label,
+                token_kind=token_kind,
             )
             a = probe_once(
                 provider,
