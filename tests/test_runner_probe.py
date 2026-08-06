@@ -268,7 +268,6 @@ def _driver(
     registered=True,
 ):
     monkeypatch.setattr(rp, "_deploy", lambda *a, **k: (dseq, deploy_out))
-    monkeypatch.setattr(rp, "_lease_active", lambda d: state == "active")
     monkeypatch.setattr(rp, "_pod_started", lambda d: state == "active")
     monkeypatch.setattr(rp, "_destroy", lambda d: destroyed)
     monkeypatch.setattr(rp, "_registered", lambda *a, **k: registered)
@@ -321,7 +320,7 @@ def test_the_lease_is_destroyed_even_when_the_probe_raises(monkeypatch, tmp_path
     def boom(d):
         raise RuntimeError("console 500")
 
-    monkeypatch.setattr(rp, "_lease_active", boom)
+    monkeypatch.setattr(rp, "_pod_started", boom)
     with pytest.raises(RuntimeError):
         rp.probe_once(
             "akash1x", sdl=tmp_path, org="o", label="l", token="t", bid_wait=1, register_timeout=1
@@ -349,8 +348,7 @@ def test_an_active_lease_running_nothing_is_not_a_pass(monkeypatch, tmp_path):
     and would promote the worst providers in the fleet to runner_host.
     """
     monkeypatch.setattr(rp, "_deploy", lambda *a, **k: ("77", "  DSEQ: 77"))
-    monkeypatch.setattr(rp, "_lease_active", lambda d: True)  # lease IS active
-    monkeypatch.setattr(rp, "_pod_started", lambda d: False)  # ...running nothing
+    monkeypatch.setattr(rp, "_pod_started", lambda d: False)  # MEASURED: serving nothing
     monkeypatch.setattr(rp, "_destroy", lambda d: True)
     monkeypatch.setattr(rp.time, "sleep", lambda s: None)
     a = rp.probe_once(
@@ -359,18 +357,30 @@ def test_an_active_lease_running_nothing_is_not_a_pass(monkeypatch, tmp_path):
     assert a.outcome is rp.Outcome.LEASE_NO_POD
 
 
-def test_provider_transport_noise_is_not_container_output(monkeypatch):
-    """An unreachable provider returns an error on the logs channel. Counting that as
-    'the pod started' reads a broken host as healthy."""
-    monkeypatch.setattr(rp, "_run", lambda *a, **k: (0, "Error: no such pod"))
-    assert rp._pod_started("1") is False
-    monkeypatch.setattr(rp, "_run", lambda *a, **k: (0, "Runner listening for jobs"))
+def test_an_unreported_service_is_UNKNOWN_not_a_missing_pod(monkeypatch):
+    """The whole reason this is tri-state. Reading "not reported yet" as "no pod" is what
+    produced a LEASE_NO_POD verdict against the fleet's one production-proven host."""
+    monkeypatch.setattr("just_akash.smoke_providers._service_availability", lambda d: None)
+    assert rp._pod_started("1") is None
+
+
+def test_a_serving_replica_is_a_started_pod(monkeypatch):
+    monkeypatch.setattr("just_akash.smoke_providers._service_availability", lambda d: (1, 1))
     assert rp._pod_started("1") is True
 
 
-def test_empty_log_output_is_not_a_started_pod(monkeypatch):
-    monkeypatch.setattr(rp, "_run", lambda *a, **k: (0, "   \n"))
+def test_zero_available_of_a_REPORTED_service_is_a_measured_no(monkeypatch):
+    """Once the provider reports the service, 0 available is real evidence."""
+    monkeypatch.setattr("just_akash.smoke_providers._service_availability", lambda d: (0, 1))
     assert rp._pod_started("1") is False
+
+
+def test_a_read_error_is_UNKNOWN_never_a_missing_pod(monkeypatch):
+    def boom(d):
+        raise RuntimeError("console 500")
+
+    monkeypatch.setattr("just_akash.smoke_providers._service_availability", boom)
+    assert rp._pod_started("1") is None
 
 
 # ==========================================================================

@@ -346,44 +346,39 @@ def _deploy(sdl: Path, provider: str, bid_wait: int) -> tuple[str | None, str]:
     return (m.group(1) if m else None), out
 
 
-def _pod_started(dseq: str) -> bool:
-    """Did a CONTAINER actually start — not merely: is the deployment active?
+def _pod_started(dseq: str) -> bool | None:
+    """Is a CONTAINER actually serving? True / False / None where None means UNKNOWN.
 
-    `deployment_state == "active"` is the trap. It is true the moment the deployment
-    exists, and stays true for a lease that never schedules a thing: measured across
-    seven simultaneous leases on a provider already marked runner_deny, every one
-    reporting `active` while running nothing. A probe keyed on it would return PASS for
-    precisely the failure it exists to detect, and would then promote the worst
-    providers in the fleet to runner_host.
+    Delegates to smoke_providers._service_availability, which reads
+    `leases[].status.services[*].available|ready_replicas` — the field that reflects
+    whether the container is SERVING. This module is not the first place in the repo to
+    hit this: that function's own docstring records that the lease-level `status: ready`
+    "flips the moment a manifest is accepted, long before the pod is up".
 
-    Container logs are the discriminator: a pod that never started has none.
+    Two signals were tried here before this one and both were wrong in the same way:
+
+      deployment_state == "active"   true for a lease that schedules nothing — measured
+                                     across seven leases on a runner_deny provider
+      logs --service probe           returns "no active lease / provider hostUri ... yet"
+                                     for an un-propagated lease, indistinguishable from
+                                     one that will never schedule
+
+    Both collapsed "cannot tell yet" into "no pod", which is what produced a LEASE_NO_POD
+    verdict against the fleet's one production-proven host. The tri-state is the whole
+    point: None keeps the caller waiting instead of manufacturing a disqualification.
     """
-    rc, out = _run(["just-akash", "logs", "--dseq", dseq, "--service", "probe"], timeout=120)
-    if rc != 0:
-        return False
-    body = out.strip()
-    if not body:
-        return False
-    # Provider transport errors are not pod output; treating them as "started" would
-    # read an unreachable provider as healthy.
-    return not re.search(
-        r"no such (pod|service)|not found|connection refused|failed to", body, re.I
-    )
-
-
-def _lease_active(dseq: str) -> bool:
-    """A lease exists and is active — necessary, nowhere near sufficient."""
-    rc, out = _run(["just-akash", "lease-status", "--json"], timeout=120)
     try:
-        dec = json.JSONDecoder()
-        i = out.find("{")
-        obj, _ = dec.raw_decode(out, i)
-        for r in obj.get("leases", []):
-            if str(r.get("dseq")) == str(dseq):
-                return r.get("lease_count", 0) >= 1 and r.get("lease_state") == "active"
-    except Exception:
-        return False
-    return False
+        from .smoke_providers import _service_availability
+    except ImportError:
+        return None
+    try:
+        result = _service_availability(str(dseq))
+    except Exception:  # noqa: BLE001 - a read error means "unknown", never "no pod"
+        return None
+    if result is None:
+        return None  # no service reported yet — keep waiting, do not classify
+    available, _count = result
+    return available >= 1
 
 
 def _destroy(dseq: str) -> bool:
@@ -439,10 +434,13 @@ def probe_once(
         # Two stages, deliberately separate. A lease that never becomes active is a
         # market/provider condition; a lease that IS active while no container ever
         # starts is the disqualifying failure this tool exists to name.
+        # None is "not yet measurable" and must keep us waiting; only an explicit False
+        # after the deadline is evidence of anything.
         pod_running = False
         deadline = time.time() + register_timeout
         while time.time() < deadline:
-            if _lease_active(dseq) and _pod_started(dseq):
+            started = _pod_started(dseq)
+            if started is True:
                 pod_running = True
                 break
             time.sleep(10)
