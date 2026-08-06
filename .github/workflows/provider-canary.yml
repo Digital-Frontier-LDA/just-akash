@@ -148,6 +148,10 @@ jobs:
           echo "balance rc=$?"
           set -e
           cat credit.json 2>/dev/null || true
+          # FULL balance too — `--check` reports only granted-minus-escrow, which is
+          # the DepositAuthorization headroom, NOT the account's available balance.
+          echo '--- full balance ---'
+          uv run just-akash balance --json || true
           [ -s credit.err ] && cat credit.err || true
 
       - name: Deploy canaries for providers missing one
