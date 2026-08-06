@@ -24,6 +24,27 @@ from typing import Any
 # REST/LCD host. A public default matches how AKASH_NODE already defaults.
 DEFAULT_REST_URL = "https://akash-rest.publicnode.com"
 
+# Additional public LCDs, queried alongside the default when reading deploy credit.
+#
+# WHY: a single public LCD can lag, and a lagging node UNDER-reports a grant because
+# it has not yet seen the newest deposit. Measured 2026-08-06 on one account:
+#
+#     api.akashnet.net        407.85 ACT   (expiration 2036-08-04)
+#     akash-api.polkachu.com  407.85 ACT   (expiration 2036-08-04)
+#     akash-rest.publicnode.com  246.19 ACT   (expiration 2036-07-14)  <- default
+#
+# The default was $161 behind and still serving an expired-and-replaced grant. Any
+# caller gating on credit — `balance --check --min-usd`, the Prometheus credit gauge,
+# a CI preflight — would report a funded account as short and take the failure path.
+# In CI that means falling back to paid runners while the wallet is fine.
+#
+# Reconciled by MAX (see `deploy_credit`): staleness can only lose a deposit, never
+# invent one, so the highest reading is the freshest.
+DEFAULT_REST_FALLBACKS = (
+    "https://api.akashnet.net",
+    "https://akash-api.polkachu.com",
+)
+
 # Akash's own escrow authorization type (custom, not a generic cosmos SendAuthorization).
 _DEPOSIT_AUTH_TYPE = "/akash.escrow.v1.DepositAuthorization"
 
@@ -52,11 +73,24 @@ def rest_url() -> str:
     return url
 
 
-def _lcd_get(path: str, timeout: int = 15) -> dict[str, Any]:
+def rest_urls() -> list[str]:
+    """Every LCD to consult, most-trusted first.
+
+    An explicit ``AKASH_REST_URL`` is an operator decision and is honoured ALONE —
+    silently querying other hosts would defeat the point of pinning one (an
+    air-gapped or private LCD, a node under test). Only the default path fans out.
+    """
+    pinned = os.environ.get("AKASH_REST_URL")
+    if pinned:
+        return [rest_url()]
+    return [DEFAULT_REST_URL, *DEFAULT_REST_FALLBACKS]
+
+
+def _lcd_get(path: str, timeout: int = 15, base: str | None = None) -> dict[str, Any]:
     """GET a Cosmos REST path and return parsed JSON. Raises RuntimeError on any
     transport/HTTP/parse failure, with the endpoint in the message so a dead LCD is
     obvious (and swappable via AKASH_REST_URL)."""
-    url = f"{rest_url()}{path}"
+    url = f"{(base or rest_url()).rstrip('/')}{path}"
     req = urllib.request.Request(  # noqa: S310 — url built from a fixed https base
         url, headers={"Accept": "application/json", "User-Agent": "just-akash-balance/1.0"}
     )
@@ -100,7 +134,31 @@ def deploy_credit(address: str) -> dict[str, int]:
     their ``spend_limits``. An empty result means no credit grant exists (a fresh or
     fully-drained account). This is the authoritative "wallet balance" the Console
     API can't give us."""
-    data = _lcd_get(f"/cosmos/authz/v1beta1/grants/grantee/{address}")
+    per_endpoint: list[dict[str, int]] = []
+    errors: list[str] = []
+    for base in rest_urls():
+        try:
+            data = _lcd_get(f"/cosmos/authz/v1beta1/grants/grantee/{address}", base=base)
+        except RuntimeError as e:  # one dead LCD must not sink the reading
+            errors.append(f"{base}: {e}")
+            continue
+        per_endpoint.append(_sum_deposit_grants(data))
+    if not per_endpoint:
+        raise RuntimeError(
+            "no LCD endpoint could be reached for deploy credit: " + "; ".join(errors)
+        )
+    # MAX per denom: a lagging node under-reports, so the largest reading is the
+    # freshest. Never min/first — that lets one stale node declare a funded account
+    # empty, which is the whole reason this fans out.
+    totals: dict[str, int] = {}
+    for reading in per_endpoint:
+        for denom, amt in reading.items():
+            totals[denom] = max(totals.get(denom, 0), amt)
+    return totals
+
+
+def _sum_deposit_grants(data: dict[str, Any]) -> dict[str, int]:
+    """Sum uact spend_limits across DepositAuthorization grants in one LCD payload."""
     totals: dict[str, int] = {}
     for grant in data.get("grants", []) or []:
         auth = grant.get("authorization", {})
