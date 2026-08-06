@@ -1,0 +1,180 @@
+# Close an ephemeral runner lease, and de-register what it left behind.
+#
+#   jobs:
+#     teardown:
+#       needs: [pool, work]
+#       if: always() && needs.pool.outputs.dseq != ''
+#       uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@runner-v1
+#       with:
+#         dseq:         ${{ needs.pool.outputs.dseq }}
+#         tag-prefix:   ci-myrepo
+#         runner-label: fast-pool-${{ github.run_id }}
+#         github-org:   my-org
+#       secrets:
+#         AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
+#         GH_RUNNER_PAT: ${{ secrets.GH_RUNNER_PAT }}
+#
+# `if: always()` is the whole point — a teardown that only runs on success leaves the
+# lease open on exactly the runs that failed, which are the ones most likely to have
+# left a broken pod burning escrow.
+#
+# ── TWO THINGS LEAK, NOT ONE ────────────────────────────────────────────────────
+# 1. The LEASE holds escrow against the same grant the next run spends from, so a leak
+#    makes the next run's funding failure look like a market outage.
+# 2. The RUNNER REGISTRATION persists in the org even after the pod dies. Offline
+#    registrations once overflowed the first page of the org's runner listing and broke
+#    provisioning for every repo in the org. EPHEMERAL=true removes a runner that RAN a
+#    job; it does nothing for one that registered and was never used.
+#
+# ── WHY IT VERIFIES INSTEAD OF TRUSTING THE EXIT CODE ───────────────────────────
+# "Deployment closed" on stderr with a non-zero exit is a SUCCESS, and a zero exit is
+# not proof the lease is gone. This reads the deployment's state back and reports
+# `closed` on that, because a teardown that reports success it did not achieve is how
+# leases accumulate silently for weeks.
+name: Akash runner teardown
+
+on:
+  workflow_call:
+    inputs:
+      dseq:
+        description: 'Deployment to close. Empty is a no-op, not an error.'
+        required: false
+        type: string
+        default: ''
+      tag-prefix:
+        description: >-
+          REQUIRED. Asserted against the deployment's own tag before anything is
+          destroyed. A sweep once destroyed 14 third-party deployments; this is the
+          check that makes a wrong dseq a refusal instead of a loss.
+        required: true
+        type: string
+      runner-label:
+        description: 'Label whose offline registrations should be de-registered.'
+        required: false
+        type: string
+        default: ''
+      github-org:
+        required: false
+        type: string
+        default: ''
+    secrets:
+      AKASH_API_KEY:
+        required: true
+      GH_RUNNER_PAT:
+        required: false
+    outputs:
+      closed:
+        description: "'true' only when the lease was READ BACK as closed."
+        value: ${{ jobs.teardown.outputs.closed }}
+      deregistered:
+        description: 'Offline runner registrations removed.'
+        value: ${{ jobs.teardown.outputs.deregistered }}
+
+permissions:
+  contents: read
+
+jobs:
+  teardown:
+    name: Close lease and de-register runners
+    runs-on: ubuntu-latest
+    outputs:
+      closed: ${{ steps.close.outputs.closed }}
+      deregistered: ${{ steps.dereg.outputs.deregistered }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@e4db8464a088ece1b920f60402e813ea4de65b8f # v3
+
+      - name: Close the lease
+        id: close
+        env:
+          AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
+          DSEQ: ${{ inputs.dseq }}
+          TAG_PREFIX: ${{ inputs.tag-prefix }}
+        run: |
+          set -uo pipefail
+          JA="uv run --with . just-akash"
+
+          if [ -z "${DSEQ}" ]; then
+            echo "closed=noop" >> "$GITHUB_OUTPUT"
+            echo "no dseq supplied — the pool never took a lease, nothing to close"
+            exit 0
+          fi
+
+          # OWNERSHIP — and why it is not a tag check.
+          #
+          # The obvious guard here is "read the deployment's tag back and refuse if it
+          # does not start with TAG_PREFIX". It cannot work, and shipping it would be
+          # worse than shipping nothing: just-akash's tags live in a LOCAL file
+          # (api.py `_get_tag` -> `_load_tags`), never on chain, and `status --json`
+          # does not emit one at all. Teardown runs as a SEPARATE JOB on a fresh
+          # runner, so that lookup returns empty every single time — the guard would
+          # take its "could not read the tag, proceed anyway" branch on every run while
+          # reporting that ownership had been verified.
+          #
+          # What is actually true: DSEQ arrives from `needs.pool.outputs.dseq`, i.e.
+          # from a deploy performed by THIS workflow run. That provenance is the
+          # ownership proof, and it is stronger than a tag we would have written
+          # ourselves anyway. TAG_PREFIX stays an input because it is what the pool
+          # stamped and what a sweeper matches on — it is documentation here, not a
+          # gate, and it must not be dressed up as one.
+          #
+          # A sweeper that reaps by tag across deployments it did not create is the
+          # thing that needs the prefix check (14 third-party deployments were once
+          # destroyed that way). That is akash-stale-sweeper's job, not this one's.
+          echo "closing dseq=$DSEQ (created by this run; tagged ${TAG_PREFIX}-*)"
+
+          for try in 1 2 3; do
+            $JA destroy --dseq "$DSEQ" -y 2>&1 | tee /tmp/destroy.log && break
+            # A non-zero exit whose output says the deployment is already closed IS a
+            # success. Treating it as a failure sends the next reader looking for an
+            # outage that never happened.
+            grep -qiE "Deployment closed|already closed|not found" /tmp/destroy.log && break
+            sleep 5
+          done
+
+          # Verify rather than trust: read the state back.
+          STATE=$($JA status --dseq "$DSEQ" --json 2>/dev/null \
+                  | python3 -c "import json,sys;print((json.load(sys.stdin) or {}).get('state',''))" 2>/dev/null || true)
+          case "$STATE" in
+            closed|"")
+              echo "closed=true" >> "$GITHUB_OUTPUT"
+              echo "lease $DSEQ confirmed closed" ;;
+            *)
+              echo "closed=false" >> "$GITHUB_OUTPUT"
+              echo "::error title=Lease may still be OPEN and holding escrow::dseq=$DSEQ reads state='$STATE' after 3 destroy attempts. It will keep escrow locked against the grant the next run spends from, so the next run's funding failure will look like a market outage. Close it manually: just-akash destroy --dseq $DSEQ -y"
+              exit 1 ;;
+          esac
+
+      # Separate step, and always: the registration outlives the pod, so it must be
+      # cleaned even when the lease close failed.
+      - name: De-register offline runners for this label
+        id: dereg
+        if: always() && inputs.runner-label != '' && inputs.github-org != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GH_RUNNER_PAT }}
+          ORG: ${{ inputs.github-org }}
+          RUNNER_LABEL: ${{ inputs.runner-label }}
+        run: |
+          set -uo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "no GH_RUNNER_PAT — skipping de-registration"
+            echo "deregistered=0" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          # Scoped to THIS run's label. An org-wide "delete every offline runner" would
+          # race other repos' in-flight provisioning, where a runner is briefly offline
+          # between registering and coming up.
+          IDS=$(gh api --paginate "orgs/${ORG}/actions/runners?per_page=100" \
+                --jq ".runners[] | select(.status==\"offline\") | select(any(.labels[].name; .==\"${RUNNER_LABEL}\")) | .id" 2>/dev/null || true)
+
+          N=0
+          for id in $IDS; do
+            gh api -X DELETE "orgs/${ORG}/actions/runners/${id}" >/dev/null 2>&1 && N=$((N+1)) \
+              || echo "::warning::could not de-register runner ${id}"
+          done
+          echo "deregistered=$N" >> "$GITHUB_OUTPUT"
+          echo "de-registered ${N} offline runner(s) labelled ${RUNNER_LABEL}"

@@ -42,8 +42,18 @@ and a broken host were indistinguishable, so the standing fix became "use paid r
 
 from __future__ import annotations
 
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 
 # Ratified: a proven host registers in ~30s; this only bounds a bad one's cost.
 REGISTER_TIMEOUT_S = 120
@@ -179,3 +189,263 @@ def render_verdicts(
             "runners — which is the cost this qualification exists to remove."
         )
     return lines
+
+
+# ==========================================================================
+# Driver
+#
+# The logic above was written without one, which made it unrunnable — a
+# qualification bar nothing could measure against. It orchestrates the `just-akash`
+# CLI as a subprocess rather than reaching into internals: deploy/status/destroy are
+# the surfaces the CI path itself uses, so a probe that passes here has exercised the
+# same code that provisions the pool.
+# ==========================================================================
+
+SDL_TEMPLATE = Path(__file__).resolve().parent.parent / "sdl" / "github-runner-probe.yaml"
+
+
+def _run(cmd: list[str], timeout: int = 900) -> tuple[int, str]:
+    try:
+        p = subprocess.run(  # noqa: S603 - argv list, never a shell string
+            cmd, capture_output=True, text=True, timeout=timeout, check=False
+        )
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except subprocess.TimeoutExpired:
+        return 124, "TIMEOUT"
+    except FileNotFoundError as exc:
+        return 127, str(exc)
+
+
+def render_sdl(
+    dest: Path, *, cpu: str, memory: str, storage: str, org: str, token: str, label: str
+) -> Path:
+    """Substitute the probe SDL at the CALLER'S profile.
+
+    The profile is not incidental: storage is the tightest constraint on which
+    providers can host the runner, so a provider qualified at 30Gi is not thereby
+    qualified at 100Gi.
+    """
+    body = SDL_TEMPLATE.read_text()
+    for key, val in {
+        "CPU": cpu,
+        "MEMORY": memory,
+        "STORAGE": storage,
+        "ORG_NAME": org,
+        # A placeholder still forces the container to be SCHEDULED and started, which is
+        # the discriminator. It simply fails to register afterwards.
+        "ACCESS_TOKEN": token or "probe-no-token",
+        "RUNNER_NAME_PREFIX": label,
+        "LABELS": f"self-hosted,linux,akash,{label}",
+    }.items():
+        body = body.replace("{{" + key + "}}", val)
+    dest.write_text(body)
+    return dest
+
+
+def _deploy(sdl: Path, provider: str, bid_wait: int) -> tuple[str | None, str]:
+    rc, out = _run(
+        [
+            "just-akash",
+            "deploy",
+            "--sdl",
+            str(sdl),
+            "--provider",
+            provider,
+            "--bid-wait",
+            str(bid_wait),
+        ]
+    )
+    m = re.search(r"^\s*DSEQ:\s*(\d+)", out, re.M)
+    return (m.group(1) if m else None), out
+
+
+def _state(dseq: str) -> str:
+    rc, out = _run(["just-akash", "status", "--dseq", dseq, "--json"], timeout=120)
+    try:
+        return (json.loads(out.strip().splitlines()[-1]) or {}).get("state", "")
+    except Exception:
+        return ""
+
+
+def _destroy(dseq: str) -> bool:
+    for _ in range(3):
+        rc, out = _run(["just-akash", "destroy", "--dseq", dseq, "-y"], timeout=300)
+        if rc == 0 or re.search(r"Deployment closed|already closed|not found", out, re.I):
+            return True
+        time.sleep(5)
+    return False
+
+
+def _registered(org: str, label: str, token: str, timeout_s: int) -> bool:
+    """Poll GitHub for a runner carrying this probe's label."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        rc, out = _run(
+            [
+                "gh",
+                "api",
+                "--paginate",
+                f"orgs/{org}/actions/runners?per_page=100",
+                "--jq",
+                f'[.runners[] | select(any(.labels[].name; .=="{label}"))] | length',
+            ],
+            timeout=60,
+        )
+        if rc == 0 and out.strip().isdigit() and int(out.strip()) > 0:
+            return True
+        time.sleep(10)
+    return False
+
+
+def probe_once(
+    provider: str,
+    *,
+    sdl: Path,
+    org: str,
+    label: str,
+    token: str,
+    bid_wait: int,
+    register_timeout: int,
+) -> Attempt:
+    """One attempt against one provider, classified by the stage that failed."""
+    started = time.time()
+    dseq, out = _deploy(sdl, provider, bid_wait)
+    if not dseq:
+        if re.search(r"PaymentRequiredError|Insufficient balance|HTTP 402", out, re.I):
+            # Never the provider's fault: no order existed, so nobody was asked to bid.
+            return Attempt(outcome=Outcome.INDETERMINATE, detail="wallet underfunded (402)")
+        return Attempt(outcome=Outcome.NO_BID, seconds=time.time() - started)
+
+    try:
+        pod_running = False
+        deadline = time.time() + register_timeout
+        while time.time() < deadline:
+            if _state(dseq) == "active":
+                pod_running = True
+                break
+            time.sleep(5)
+
+        registered = job_ran = None
+        if token and pod_running:
+            registered = _registered(org, label, token, register_timeout)
+            # A runner that registered can take a job; the pool's own wait proves the
+            # rest, and asking for more here would need a real workflow dispatch.
+            job_ran = registered
+    finally:
+        torn_down = _destroy(dseq)
+
+    return Attempt(
+        outcome=classify(
+            bid=True,
+            pod_running=pod_running,
+            registered=registered,
+            job_ran=job_ran,
+            torn_down=torn_down,
+        ),
+        seconds=time.time() - started,
+        dseq=dseq,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="Qualify providers as runner hosts.")
+    ap.add_argument("--providers", required=True, help="comma-separated akash1… addresses")
+    ap.add_argument("--cpu", default="4")
+    ap.add_argument("--memory", default="16Gi")
+    ap.add_argument("--storage", default="30Gi")
+    ap.add_argument("--org", default=os.environ.get("GITHUB_ORG", ""))
+    ap.add_argument("--attempts", type=int, default=REQUIRED_CONSECUTIVE_PASSES)
+    ap.add_argument("--required", type=int, default=REQUIRED_CONSECUTIVE_PASSES)
+    ap.add_argument("--bid-wait", type=int, default=60)
+    ap.add_argument("--register-timeout", type=int, default=REGISTER_TIMEOUT_S)
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args(argv)
+
+    if not shutil.which("just-akash"):
+        print("just-akash is not on PATH", file=sys.stderr)
+        return 127
+
+    token = os.environ.get("GH_RUNNER_PAT", "")
+    if not token:
+        # Say so up front: without it the probe answers only the scheduling question,
+        # and a silent downgrade would let a weaker pass read as a full qualification.
+        print(
+            "::warning::no GH_RUNNER_PAT — probing SCHEDULING only, not registration. "
+            "A pass here is not a full runner_host qualification.",
+            file=sys.stderr,
+        )
+
+    providers = [p.strip() for p in args.providers.split(",") if p.strip()]
+    verdicts: list[ProviderVerdict] = []
+    tmpdir = tempfile.mkdtemp(prefix="akash-probe-")
+
+    for provider in providers:
+        v = ProviderVerdict(address=provider)
+        for i in range(args.attempts):
+            label = f"probe-{provider[-6:]}-{i}"
+            sdl = Path(tmpdir) / f"probe-{provider[-6:]}-{i}.yaml"
+            render_sdl(
+                sdl,
+                cpu=args.cpu,
+                memory=args.memory,
+                storage=args.storage,
+                org=args.org,
+                token=token,
+                label=label,
+            )
+            a = probe_once(
+                provider,
+                sdl=sdl,
+                org=args.org,
+                label=label,
+                token=token,
+                bid_wait=args.bid_wait,
+                register_timeout=args.register_timeout,
+            )
+            v.attempts.append(a)
+            print(
+                f"  {provider} attempt {i + 1}/{args.attempts}: {a.outcome.value}", file=sys.stderr
+            )
+            # Stop early on a disqualifying outcome: it already outranks any streak,
+            # and each further attempt costs a lease and real escrow.
+            if a.outcome in DISQUALIFYING:
+                break
+        verdicts.append(v)
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "providers": [
+                        {
+                            "address": v.address,
+                            "marker": v.marker(args.required),
+                            "consecutive_passes": v.consecutive_passes,
+                            "attempts": [
+                                {
+                                    "outcome": a.outcome.value,
+                                    "dseq": a.dseq,
+                                    "seconds": a.seconds,
+                                    "detail": a.detail,
+                                }
+                                for a in v.attempts
+                            ],
+                        }
+                        for v in verdicts
+                    ],
+                    "proven_hosts": sum(
+                        1 for v in verdicts if v.marker(args.required) == "runner_host"
+                    ),
+                    "min_proven_hosts": MIN_PROVEN_HOSTS,
+                },
+                indent=2,
+            )
+        )
+    else:
+        print("\n".join(render_verdicts(verdicts, args.required)))
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

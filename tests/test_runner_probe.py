@@ -198,3 +198,141 @@ def test_report_names_the_disqualifying_outcome():
 def test_required_passes_is_configurable_but_defaults_to_three():
     assert REQUIRED_CONSECUTIVE_PASSES == 3
     assert _v(Outcome.PASS, Outcome.PASS).marker(required=2) == "runner_host"
+
+
+# ==========================================================================
+# The driver — the logic above was unrunnable until this existed
+# ==========================================================================
+
+from just_akash import runner_probe as rp  # noqa: E402
+
+
+def test_the_sdl_template_ships_with_the_package():
+    """A driver pointing at a missing template fails only at probe time, on a real
+    provider, after a real lease."""
+    assert rp.SDL_TEMPLATE.exists(), rp.SDL_TEMPLATE
+
+
+def test_render_leaves_no_placeholder_behind(tmp_path):
+    """An unsubstituted {{STORAGE}} yields an SDL that no provider can price, which
+    would read as NO_BID — a broken probe blaming the market."""
+    out = rp.render_sdl(
+        tmp_path / "p.yaml",
+        cpu="4",
+        memory="16Gi",
+        storage="30Gi",
+        org="acme",
+        token="tok",
+        label="probe-x",
+    )
+    body = out.read_text()
+    assert "{{" not in body, "unsubstituted placeholder"
+    assert "30Gi" in body and "acme" in body
+
+
+def test_render_uses_a_placeholder_token_when_none_is_supplied(tmp_path):
+    """An empty ACCESS_TOKEN can make the container exit before it is scheduled, which
+    would report LEASE_NO_POD for a provider that is fine."""
+    body = rp.render_sdl(
+        tmp_path / "p.yaml",
+        cpu="4",
+        memory="16Gi",
+        storage="30Gi",
+        org="acme",
+        token="",
+        label="probe-x",
+    ).read_text()
+    assert "ACCESS_TOKEN=probe-no-token" in body
+
+
+def test_the_service_is_still_named_probe(tmp_path):
+    """cleanup_stale classifies by SERVICE SET: {probe} is reaped after 1h, anything
+    else is LEAVE and accumulates forever — holding escrow against the same grant CI
+    spends from. Renaming this service makes the qualification tool degrade the thing
+    it exists to fix."""
+    import yaml as _yaml
+
+    body = rp.render_sdl(
+        tmp_path / "p.yaml", cpu="4", memory="16Gi", storage="30Gi", org="a", token="t", label="l"
+    ).read_text()
+    assert set(_yaml.safe_load(body)["services"]) == {"probe"}
+
+
+def _driver(
+    monkeypatch,
+    *,
+    dseq="123",
+    deploy_out="  DSEQ: 123",
+    state="active",
+    destroyed=True,
+    registered=True,
+):
+    monkeypatch.setattr(rp, "_deploy", lambda *a, **k: (dseq, deploy_out))
+    monkeypatch.setattr(rp, "_state", lambda d: state)
+    monkeypatch.setattr(rp, "_destroy", lambda d: destroyed)
+    monkeypatch.setattr(rp, "_registered", lambda *a, **k: registered)
+    monkeypatch.setattr(rp.time, "sleep", lambda s: None)
+
+
+def test_a_clean_probe_passes(monkeypatch, tmp_path):
+    _driver(monkeypatch)
+    a = rp.probe_once(
+        "akash1x", sdl=tmp_path, org="o", label="l", token="t", bid_wait=1, register_timeout=1
+    )
+    assert a.outcome is rp.Outcome.PASS and a.dseq == "123"
+
+
+def test_a_lease_that_never_goes_active_is_the_disqualifying_outcome(monkeypatch, tmp_path):
+    """THE failure this tool exists to find."""
+    _driver(monkeypatch, state="pending")
+    a = rp.probe_once(
+        "akash1x", sdl=tmp_path, org="o", label="l", token="t", bid_wait=1, register_timeout=0
+    )
+    assert a.outcome is rp.Outcome.LEASE_NO_POD
+
+
+def test_a_402_is_indeterminate_not_a_provider_verdict(monkeypatch, tmp_path):
+    """No order existed, so no provider was ever asked. Recording NO_BID here would
+    blame the market for an empty wallet — the misdiagnosis that started all this."""
+    _driver(monkeypatch, dseq=None, deploy_out="PaymentRequiredError: HTTP 402")
+    a = rp.probe_once(
+        "akash1x", sdl=tmp_path, org="o", label="l", token="t", bid_wait=1, register_timeout=1
+    )
+    assert a.outcome is rp.Outcome.INDETERMINATE and "402" in a.detail
+
+
+def test_no_bid_is_not_confused_with_a_402(monkeypatch, tmp_path):
+    _driver(monkeypatch, dseq=None, deploy_out="no bids received")
+    a = rp.probe_once(
+        "akash1x", sdl=tmp_path, org="o", label="l", token="t", bid_wait=1, register_timeout=1
+    )
+    assert a.outcome is rp.Outcome.NO_BID
+
+
+def test_the_lease_is_destroyed_even_when_the_probe_raises(monkeypatch, tmp_path):
+    """A probe that leaks the lease it created holds escrow against the grant CI
+    spends from — the tool would then cause the failure it measures."""
+    seen = []
+    monkeypatch.setattr(rp, "_deploy", lambda *a, **k: ("999", "  DSEQ: 999"))
+    monkeypatch.setattr(rp, "_destroy", lambda d: seen.append(d) or True)
+    monkeypatch.setattr(rp.time, "sleep", lambda s: None)
+
+    def boom(d):
+        raise RuntimeError("console 500")
+
+    monkeypatch.setattr(rp, "_state", boom)
+    with pytest.raises(RuntimeError):
+        rp.probe_once(
+            "akash1x", sdl=tmp_path, org="o", label="l", token="t", bid_wait=1, register_timeout=1
+        )
+    assert seen == ["999"], "the lease must be closed on the failure path too"
+
+
+def test_without_a_token_registration_is_unasked_not_failed(monkeypatch, tmp_path):
+    """None != False. Reporting POD_NO_REGISTER when we never asked would demote a
+    provider on evidence we did not gather."""
+    _driver(monkeypatch, registered=False)
+    a = rp.probe_once(
+        "akash1x", sdl=tmp_path, org="o", label="l", token="", bid_wait=1, register_timeout=1
+    )
+    assert a.outcome is rp.Outcome.PASS
