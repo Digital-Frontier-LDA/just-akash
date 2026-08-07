@@ -597,7 +597,8 @@ def _run_probes(args, token: str, token_kind: str, tmpdir: str) -> list[Provider
             # demoted for OUR expired credential. That is the same silent-expiry trap
             # that made minting preferable to a PAT in the first place, reintroduced by
             # minting only once.
-            if token_kind == "RUNNER_TOKEN" and args.org:
+            # noqa S105: comparing an env var NAME, not a credential.
+            if token_kind == "RUNNER_TOKEN" and args.org:  # noqa: S105
                 fresh = mint_registration_token(args.org)
                 if fresh:
                     token = fresh
