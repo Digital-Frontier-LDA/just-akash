@@ -441,3 +441,42 @@ def test_an_unreadable_state_is_not_reported_as_closed():
         "sharing it with '' is how an unreadable state reported success"
     )
     assert "already closed|not found" in body, "only a provably-gone deployment may pass on ''"
+
+
+# --------------------------------------------------------------------------
+# A credential failure must never masquerade as a provider failure
+# --------------------------------------------------------------------------
+
+
+def test_the_pat_is_validated_BEFORE_provisioning():
+    """A PAT expiry is otherwise SILENT: the runner never registers, the pool times out
+    after ~15 minutes, and the run reports RUNNER_NEVER_REGISTERED — indistinguishable
+    from a provider that leases and never schedules. That reading sends the investigation
+    at Akash and ends in "switch back to hosted runners", which is the bill this workflow
+    exists to remove. One API call turns 15 silent minutes into a named failure."""
+    names = [s.get("name", "") for s in STEPS]
+    pat_i = next(i for i, n in enumerate(names) if "PAT must still be valid" in n)
+    prov_i = next(i for i, n in enumerate(names) if "Provision" in n)
+    assert pat_i < prov_i, "the PAT check must run before any lease is taken"
+
+
+def test_an_expired_pat_is_not_reported_as_a_provider_failure():
+    body = _step("PAT must still be valid")["run"]
+    assert "failure_reason=RUNNER_PAT_INVALID" in body
+    assert "RUNNER_NEVER_REGISTERED" in body, (
+        "the message must name the symptom it prevents, or the next reader will not "
+        "connect a 15-minute timeout to a credential"
+    )
+    assert "not a provider" in body.lower() and "rotate" in body.lower()
+
+
+def test_a_missing_pat_is_distinct_from_an_invalid_one():
+    """Never set and expired need different remedies — one is configuration, the other
+    is rotation."""
+    body = _step("PAT must still be valid")["run"]
+    assert "failure_reason=RUNNER_PAT_MISSING" in body
+
+
+def test_the_pat_failure_reason_reaches_the_caller():
+    assert "steps.pat.outputs.failure_reason" in DOC["jobs"]["pool"]["outputs"]["failure_reason"]
+    assert "RUNNER_PAT_INVALID" in OUTPUTS["failure_reason"]["description"]

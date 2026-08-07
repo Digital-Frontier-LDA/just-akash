@@ -148,9 +148,9 @@ on:
         value: ${{ jobs.pool.outputs.runner-targets }}
       failure_reason:
         description: >-
-          WHY a fallback happened, when it did. One of WALLET_UNDERFUNDED,
-          NO_ELIGIBLE_BIDDER, PROVIDER_CAPACITY, RUNNER_NEVER_REGISTERED,
-          INDETERMINATE — or empty on success. Each implies a different remedy, which
+          WHY a fallback happened, when it did. One of RUNNER_PAT_MISSING,
+          RUNNER_PAT_INVALID, WALLET_UNDERFUNDED, NO_ELIGIBLE_BIDDER,
+          PROVIDER_CAPACITY, RUNNER_NEVER_REGISTERED, INDETERMINATE — or empty on success. Each implies a different remedy, which
           is why they are not collapsed into "infra".
         value: ${{ jobs.pool.outputs.failure_reason }}
       wallet_free_usd:
@@ -173,7 +173,7 @@ jobs:
       dseq: ${{ steps.provision.outputs.dseq }}
       provision_healthy: ${{ steps.provision.outputs.provision_healthy }}
       runners_online: ${{ steps.provision.outputs.runners_online }}
-      failure_reason: ${{ steps.provision.outputs.failure_reason || steps.wallet.outputs.failure_reason || steps.candidates.outputs.failure_reason }}
+      failure_reason: ${{ steps.pat.outputs.failure_reason || steps.provision.outputs.failure_reason || steps.wallet.outputs.failure_reason || steps.candidates.outputs.failure_reason }}
       wallet_free_usd: ${{ steps.wallet.outputs.free_usd }}
       runner_hosts_proven: ${{ steps.candidates.outputs.proven_hosts }}
       runner-targets: ${{ steps.provision.outputs.runner_targets || '["ubuntu-latest"]' }}
@@ -189,6 +189,45 @@ jobs:
       # — measured at 165 of a 170.62 grant locked. This is the number that predicts a
       # 402, and reporting it is what stops "the wallet is empty" being filed as an
       # infra outage.
+      # A PAT EXPIRY MUST NOT BE SILENT. Without this the runner simply never registers,
+      # the pool times out after ~15 minutes, and the run reports RUNNER_NEVER_REGISTERED
+      # — indistinguishable from a provider that leases and never schedules. That reading
+      # sends the investigation at providers, or at Akash, and the standing fix becomes
+      # "switch back to hosted runners", which is the bill this workflow exists to remove.
+      #
+      # One API call turns 15 silent minutes into an immediate, named failure.
+      - name: Preflight — the runner PAT must still be valid
+        id: pat
+        env:
+          GH_TOKEN: ${{ secrets.GH_RUNNER_PAT }}
+          ORG: ${{ inputs.github-org }}
+        run: |
+          set -uo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "failure_reason=RUNNER_PAT_MISSING" >> "$GITHUB_OUTPUT"
+            echo "::error title=GH_RUNNER_PAT is not set::The pool cannot register runners without it. NOT a provider fault and NOT an Akash outage."
+            exit 1
+          fi
+          CODE=$(gh api "orgs/${ORG}/actions/runners?per_page=1" --silent -i 2>/dev/null | awk 'NR==1{print $2}')
+          if ! gh api "orgs/${ORG}/actions/runners?per_page=1" >/dev/null 2>&1; then
+            echo "failure_reason=RUNNER_PAT_INVALID" >> "$GITHUB_OUTPUT"
+            {
+              echo "## The runner PAT is expired or lacks org access"
+              echo
+              echo "**CI is not broken, Akash is fine, and no provider is at fault.**"
+              echo "\`GH_RUNNER_PAT\` cannot read \`orgs/${ORG}/actions/runners\` (HTTP ${CODE:-401})."
+              echo
+              echo "Without this check the runner would simply never register, the pool would"
+              echo "time out after ~15 minutes, and the run would report"
+              echo "\`RUNNER_NEVER_REGISTERED\` — which reads exactly like a broken provider."
+              echo
+              echo "**Fix:** rotate the PAT. It needs org runner-registration rights."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=GH_RUNNER_PAT expired or lacks org access (HTTP ${CODE:-401})::This is a CREDENTIAL failure, not a provider or Akash failure. Untreated it surfaces 15 minutes later as 'runner did not come online'. Rotate the PAT."
+            exit 1
+          fi
+          echo "runner PAT valid for ${ORG}"
+
       - name: Wallet — free credit after escrow
         id: wallet
         continue-on-error: true
