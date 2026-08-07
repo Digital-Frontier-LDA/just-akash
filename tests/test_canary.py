@@ -16,6 +16,7 @@ import canary.canary as agent
 from canary.collect import (
     extract_boot_id,
     load_json_mapping,
+    mark_absent_undeployed,
     merge,
     metrics_url,
     parse_exposition,
@@ -198,6 +199,40 @@ def test_a_scraped_provider_is_never_recorded_as_undeployed():
     assert st[ALPHA]["deployed"] == 1
     samples = parse_exposition(render(st, 1.0))
     assert samples[("akash_canary_active_deployments", ())] == 1.0
+
+
+def test_a_provider_that_drops_out_of_targets_stops_counting_as_deployed():
+    """State is durable by design, so a provider missing from THIS run's targets would keep
+    its last deployed=1 forever. active_deployments would then report a previous run's count
+    while last_collect_timestamp keeps advancing -- the freshness guard passes and
+    AkashCanaryNoDeployments cannot fire in the one scenario it exists for. Worse than a
+    frozen file: the file updates and the number is stale anyway.
+
+    The workflow reaches this on its own (`... || echo '{}' > targets.json`). Raised by
+    Copilot on #129."""
+    st = merge({}, ALPHA, "100", True, _body("aaa"), 0.1, 1000.0, deployed=True)
+    assert parse_exposition(render(st, 1.0))[("akash_canary_active_deployments", ())] == 1.0
+    # Targets goes empty -- the upstream failure that would also stop deployments.
+    st = mark_absent_undeployed(st, {})
+    samples = parse_exposition(render(st, 2.0))
+    assert samples[("akash_canary_active_deployments", ())] == 0.0
+    assert samples[("akash_canary_deployed", (("provider", ALPHA),))] == 0.0
+
+
+def test_dropping_out_of_targets_does_not_destroy_the_durable_counters():
+    """Pruning state was the suggested fix and would have cost the history. restarts_total
+    and lease_replacements_total are the reason durable state exists; a transient targets
+    glitch must not zero them."""
+    st = merge({}, ALPHA, "100", True, _body("aaa"), 0.1, 1000.0)
+    st = merge(st, ALPHA, "100", True, _body("bbb"), 0.1, 1100.0)  # a restart
+    st = merge(st, ALPHA, "200", True, _body("ccc"), 0.1, 1200.0)  # a lease replacement
+    assert st[ALPHA]["restarts_total"] == 1
+    assert st[ALPHA]["lease_replacements_total"] == 1
+    st = mark_absent_undeployed(st, {})
+    assert ALPHA in st, "the provider must not be pruned out of existence"
+    assert st[ALPHA]["restarts_total"] == 1, "history must survive a targets dropout"
+    assert st[ALPHA]["lease_replacements_total"] == 1
+    assert st[ALPHA]["deployed"] == 0, "only the current-run fact is cleared"
 
 
 def test_render_omits_missing_gauges_rather_than_emitting_none():

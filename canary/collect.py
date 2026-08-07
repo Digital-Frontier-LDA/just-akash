@@ -219,6 +219,32 @@ def merge(
     return {**prev, provider: p}
 
 
+def mark_absent_undeployed(state: dict, targets: dict) -> dict:
+    """Zero `deployed` for every provider missing from THIS run's targets.
+
+    `state` is durable BY DESIGN -- carrying cumulative counters across runs is the whole
+    reason this module exists -- so a provider that drops out of targets keeps its last
+    `deployed` value forever unless something clears it. active_deployments would then report
+    a count from a previous run while last_collect_timestamp_seconds keeps advancing, so the
+    freshness guard PASSES and AkashCanaryNoDeployments cannot fire in the one scenario it
+    was written for. That is worse than a frozen file: the file updates, `up` is 1, the
+    timestamp moves, and the number is stale anyway.
+
+    The workflow reaches this state on its own -- `cp prior/canary-targets.json targets.json
+    2>/dev/null || echo '{}' > targets.json` writes an EMPTY targets file whenever the prior
+    one is missing, which is exactly the upstream failure that would also stop deployments.
+
+    Pruning `state` to targets was the suggested fix and is rejected: restarts_total and
+    lease_replacements_total are the point of the durable state, and a transient targets
+    glitch would zero a provider's entire history. Only the current-run fact is cleared;
+    every counter is left intact. Raised by Copilot on #129.
+    """
+    for provider, p in state.items():
+        if provider not in targets:
+            p["deployed"] = 0
+    return state
+
+
 def render(
     state: dict,
     now: float,
@@ -438,6 +464,7 @@ def main() -> int:
             flush=True,
         )
 
+    state = mark_absent_undeployed(state, targets)
     sp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     credit_path = pathlib.Path(a.credit) if a.credit else None
     credit = load_json_mapping(credit_path) if credit_path else {}
