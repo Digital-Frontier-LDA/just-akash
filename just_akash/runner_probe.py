@@ -534,7 +534,9 @@ def probe_once(
     token: str,
     bid_wait: int,
     register_timeout: int,
-    job_repo: str = "Digital-Frontier-LDA/just-akash",
+    # No default: the only correct value is a PRIVATE repo the caller owns, and
+    # defaulting to the public one is what left the job queued forever.
+    job_repo: str = "",
     api_token: str = "",
 ) -> Attempt:
     """One attempt against one provider, classified by the stage that failed."""
@@ -580,7 +582,7 @@ def probe_once(
         registered = job_ran = None
         if token and pod_running:
             registered = _registered(org, label, api_token, register_timeout)
-            if registered:
+            if registered and job_repo:
                 # MEASURED, not inferred. `job_ran = registered` equated two different
                 # claims and left the bar's strongest step unchecked.
                 job_ran = _run_noop_job(org, label, job_repo, register_timeout, api_token)
@@ -667,6 +669,7 @@ def _run_probes(args, token: str, token_kind: str, tmpdir: str) -> list[Provider
                 token=token,
                 bid_wait=args.bid_wait,
                 register_timeout=args.register_timeout,
+                job_repo=args.job_repo,
                 # Only a PAT is an API credential. A registration token is rejected by
                 # the REST API, so forwarding it would break the very poll that decides
                 # whether the runner registered.
@@ -694,6 +697,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--required", type=int, default=REQUIRED_CONSECUTIVE_PASSES)
     ap.add_argument("--bid-wait", type=int, default=60)
     ap.add_argument("--register-timeout", type=int, default=REGISTER_TIMEOUT_S)
+    ap.add_argument(
+        "--job-repo",
+        default="",
+        help=(
+            "Repo hosting runner-probe-job.yml for the no-op job step. MUST be PRIVATE or "
+            "internal: GitHub refuses to assign org self-hosted runners to public repos "
+            "unless the runner group sets allows_public_repositories, so a public target "
+            "leaves the job queued forever and the step unmeasurable. Empty skips job "
+            "verification, which caps every attempt at SCHEDULED_ONLY."
+        ),
+    )
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
 

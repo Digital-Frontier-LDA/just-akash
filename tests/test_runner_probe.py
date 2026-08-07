@@ -303,9 +303,18 @@ def _driver(
 
 
 def test_a_clean_probe_passes(monkeypatch, tmp_path):
+    """A full PASS needs a job_repo: without one the job step is not attempted, and the
+    attempt correctly caps at SCHEDULED_ONLY rather than claiming an unmeasured stage."""
     _driver(monkeypatch)
     a = rp.probe_once(
-        "akash1x", sdl=tmp_path, org="o", label="l", token="t", bid_wait=1, register_timeout=1
+        "akash1x",
+        sdl=tmp_path,
+        org="o",
+        label="l",
+        token="t",
+        bid_wait=1,
+        register_timeout=1,
+        job_repo="o/private",
     )
     assert a.outcome is rp.Outcome.PASS and a.dseq == "123"
 
@@ -615,6 +624,7 @@ def test_the_registration_token_is_reminted_per_attempt(monkeypatch, tmp_path):
         cpu = memory = storage = "x"
         org = "acme"
         bid_wait = register_timeout = 1
+        job_repo = ""
 
     rp._run_probes(A(), "seed", "RUNNER_TOKEN", str(tmp_path))
     assert len(minted) == 6, f"expected one mint per attempt (2 providers x 3), got {len(minted)}"
@@ -636,6 +646,7 @@ def test_a_pat_is_not_reminted(monkeypatch, tmp_path):
         cpu = memory = storage = "x"
         org = "acme"
         bid_wait = register_timeout = 1
+        job_repo = ""
 
     rp._run_probes(A(), "ghp_real", "ACCESS_TOKEN", str(tmp_path))
     assert minted == [], "a PAT must not be replaced by a minted token"
@@ -662,6 +673,7 @@ def test_a_registration_token_is_never_used_as_an_api_credential(monkeypatch, tm
         cpu = memory = storage = "x"
         org = "acme"
         bid_wait = register_timeout = 1
+        job_repo = ""
 
     rp._run_probes(A(), "REGTOKEN", "RUNNER_TOKEN", str(tmp_path))
     assert seen["token"] == "REGTOKEN", "the SDL still needs the registration token"
@@ -685,6 +697,7 @@ def test_a_pat_IS_used_as_the_api_credential(monkeypatch, tmp_path):
         cpu = memory = storage = "x"
         org = "acme"
         bid_wait = register_timeout = 1
+        job_repo = ""
 
     rp._run_probes(A(), "ghp_real", "ACCESS_TOKEN", str(tmp_path))
     assert seen["api_token"] == "ghp_real"
@@ -725,6 +738,7 @@ def test_runner_labels_are_unique_per_run(monkeypatch, tmp_path):
         cpu = memory = storage = "x"
         org = "acme"
         bid_wait = register_timeout = 1
+        job_repo = ""
 
     rp._run_probes(A(), "t", "ACCESS_TOKEN", str(tmp_path))
     rp._run_probes(A(), "t", "ACCESS_TOKEN", str(tmp_path))
@@ -758,3 +772,14 @@ def test_a_job_that_STARTED_and_failed_is_a_real_failure(monkeypatch):
     monkeypatch.setattr(rp, "_run", fake)
     monkeypatch.setattr(rp.time, "sleep", lambda s: None)
     assert rp._run_noop_job("org", "label", "o/r", 0) is False
+
+
+def test_without_a_job_repo_the_attempt_cannot_reach_PASS(monkeypatch, tmp_path):
+    """No dispatch target means the job step is never attempted. That is unmeasured, and
+    unmeasured must not promote — a public job_repo left the job queued forever, so
+    silently skipping it had to cap the attempt rather than pass it."""
+    _driver(monkeypatch)
+    a = rp.probe_once(
+        "akash1x", sdl=tmp_path, org="o", label="l", token="t", bid_wait=1, register_timeout=1
+    )
+    assert a.outcome is rp.Outcome.SCHEDULED_ONLY
