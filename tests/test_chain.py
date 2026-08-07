@@ -177,3 +177,79 @@ class TestRestUrl:
     def test_defaults_to_public_lcd(self, monkeypatch):
         monkeypatch.delenv("AKASH_REST_URL", raising=False)
         assert chain.rest_url() == chain.DEFAULT_REST_URL
+
+
+class TestMultiEndpointCreditReconciliation:
+    """A lagging LCD must not be able to declare a funded account empty.
+
+    Measured 2026-08-06 against one live account:
+
+        api.akashnet.net           407.85 ACT   (expiration 2036-08-04)
+        akash-api.polkachu.com     407.85 ACT   (expiration 2036-08-04)
+        akash-rest.publicnode.com  246.19 ACT   (expiration 2036-07-14)   <- the default
+
+    The default was $161 behind and still serving a grant that had already been
+    replaced. Every credit gate — `balance --check --min-usd`, the Prometheus gauge,
+    a CI preflight — would have read the account as short and taken the failure path
+    while it held plenty. In CI that means paying for hosted runners with a funded
+    wallet.
+    """
+
+    @staticmethod
+    def _payload(uact):
+        return _grants(
+            {"@type": _DEPOSIT, "spend_limits": [{"denom": "uact", "amount": str(uact)}]}
+        )
+
+    def test_the_freshest_reading_wins(self):
+        """MAX, never min or first: staleness can only lose a deposit, not invent one."""
+        seen = []
+
+        def fake(path, timeout=15, base=None):
+            seen.append(base)
+            return self._payload(246_190_000 if "publicnode" in (base or "") else 407_850_000)
+
+        with patch.object(chain, "_lcd_get", side_effect=fake):
+            assert chain.deploy_credit("akash1me") == {"uact": 407_850_000}
+        assert len(seen) >= 2, "only one endpoint was consulted"
+
+    def test_a_dead_endpoint_does_not_sink_the_reading(self):
+        def fake(path, timeout=15, base=None):
+            if "publicnode" in (base or ""):
+                raise RuntimeError("connection refused")
+            return self._payload(407_850_000)
+
+        with patch.object(chain, "_lcd_get", side_effect=fake):
+            assert chain.deploy_credit("akash1me") == {"uact": 407_850_000}
+
+    def test_every_endpoint_down_raises_rather_than_reporting_zero(self):
+        """Zero credit and 'could not ask' are different claims. Reporting zero here
+        would make a network outage look like a drained wallet."""
+        with (
+            patch.object(chain, "_lcd_get", side_effect=RuntimeError("boom")),
+            pytest.raises(RuntimeError, match="no LCD endpoint"),
+        ):
+            chain.deploy_credit("akash1me")
+
+    def test_a_genuinely_empty_account_is_still_empty(self):
+        with patch.object(chain, "_lcd_get", return_value={"grants": []}):
+            assert chain.deploy_credit("akash1me") == {}
+
+
+class TestRestUrls:
+    def test_default_fans_out_beyond_the_single_public_node(self, monkeypatch):
+        monkeypatch.delenv("AKASH_REST_URL", raising=False)
+        urls = chain.rest_urls()
+        assert urls[0] == chain.DEFAULT_REST_URL, "the documented default stays first"
+        assert len(urls) > 1, "a single lagging node must not be the only source"
+
+    def test_an_explicit_pin_is_honoured_alone(self, monkeypatch):
+        """Pinning AKASH_REST_URL is an operator decision — an air-gapped LCD, a node
+        under test. Quietly querying public hosts anyway would defeat it."""
+        monkeypatch.setenv("AKASH_REST_URL", "https://my-private-lcd.internal")
+        assert chain.rest_urls() == ["https://my-private-lcd.internal"]
+
+    def test_pin_still_rejects_non_http_schemes(self, monkeypatch):
+        monkeypatch.setenv("AKASH_REST_URL", "file:///etc/passwd")
+        with pytest.raises(RuntimeError):
+            chain.rest_urls()

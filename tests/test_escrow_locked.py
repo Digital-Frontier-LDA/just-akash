@@ -92,3 +92,28 @@ class TestEscrowLocked:
     def test_tolerates_decimal_and_malformed_amounts(self):
         c = _client([_deployment(1, "5000000.000000"), _deployment(2, "notanumber")])
         assert escrow_locked(c)["locked_uact"] == 5_000_000
+
+
+class TestFundsNotTransferred:
+    """`funds` is what is still locked; `transferred` is what already went to the
+    provider. Summing `transferred` would overstate escrow and understate free
+    credit — and understating free is the direction that makes a funded wallet
+    look empty, which in CI means paying for hosted runners while credit sits idle.
+
+    The distinction is stated in `_reconcile_lease_row`'s docstring but was not
+    pinned for `escrow_locked` itself, so nothing failed if the field were swapped.
+    """
+
+    def test_transferred_is_ignored(self):
+        # Mutate the deployment the mock actually SERVES. `_client` wires
+        # get_deployment via side_effect, so `get_deployment.return_value` is an unused
+        # MagicMock — writing `transferred` there set the field on nothing, and this
+        # test passed without ever exercising the behaviour it names.
+        dep = _deployment(1, 5_000_000)
+        # Real payloads carry BOTH; only `funds` is the remaining balance.
+        dep["escrow_account"]["state"]["transferred"] = [
+            {"denom": "uact", "amount": "2789555.0000000000"}
+        ]
+        c = _client([dep])
+        r = escrow_locked(c)
+        assert r["locked_uact"] == 5_000_000, "transferred leaked into the locked total"
