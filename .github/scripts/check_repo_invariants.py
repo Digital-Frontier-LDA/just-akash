@@ -56,6 +56,38 @@ def secret_refs(text: str) -> set[str]:
     return names
 
 
+def declared_call_secrets(text: str) -> set[str]:
+    """Secret names a REUSABLE workflow declares under ``on.workflow_call.secrets``.
+
+    These are supplied by the CALLING repository and cannot live in this repo's SOPS
+    file even in principle: a caller brings its own Akash account and its own runner
+    PAT, and this repo must never hold either. `workflow_call` secrets are a typed
+    parameter list, not a stored credential — the exemption is the whole reason the
+    mechanism exists.
+
+    Deliberately narrow: only names DECLARED in that block are exempt, and only in a
+    file that actually has one. A reusable workflow reaching for some other
+    ``${{ secrets.X }}`` is still a violation, because that one WOULD have to come
+    from this repo.
+    """
+    try:
+        import yaml
+    except ImportError:  # keep the guard working without a yaml dependency
+        return set()
+    try:
+        doc = yaml.safe_load(text) or {}
+    except Exception:
+        return set()
+    on = doc.get("on") or doc.get(True) or {}
+    if not isinstance(on, dict):
+        return set()
+    call = on.get("workflow_call") or {}
+    if not isinstance(call, dict):
+        return set()
+    declared = call.get("secrets") or {}
+    return set(declared) if isinstance(declared, dict) else set()
+
+
 def check_secrets(root: Path) -> list[str]:
     """Every ``${{ secrets.X }}`` in CI config must name an allowed secret."""
     problems: list[str] = []
@@ -67,7 +99,8 @@ def check_secrets(root: Path) -> list[str]:
     )
     for path in targets:
         text = path.read_text(encoding="utf-8")
-        for name in sorted(secret_refs(text) - ALLOWED_SECRETS):
+        exempt = ALLOWED_SECRETS | declared_call_secrets(text)
+        for name in sorted(secret_refs(text) - exempt):
             # Report the line so the fix is obvious, not just the file.
             for lineno, line in enumerate(text.splitlines(), 1):
                 if f"secrets.{name}" in line:

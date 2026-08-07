@@ -1,0 +1,50 @@
+# The no-op job the runner-host qualification actually has to RUN.
+#
+# The ratified bar is: pod scheduled -> runner registers <=120s -> **a no-op job runs on
+# it** -> clean teardown, three consecutive times. The probe used to infer that last-but-one
+# step from registration (`job_ran = registered`), which is not the same claim: a runner can
+# register and still never pick up work — a wrong label set, a busy/offline flip, a broken
+# work directory. Inferring it meant the strongest part of the bar was never measured.
+#
+# So the probe dispatches THIS workflow onto the label it just registered and waits for a
+# real conclusion. Nothing here should ever be made "useful": its whole value is being the
+# smallest thing that proves a job was picked up and completed.
+#
+# workflow_dispatch only resolves on the DEFAULT BRANCH. Until this file is merged there,
+# the dispatch 404s, the probe records job execution as unverified, and the attempt is
+# SCHEDULED_ONLY rather than PASS — non-promotable. That is the honest failure mode: it
+# under-claims instead of qualifying a provider on a step nobody checked.
+name: Runner probe — no-op job
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner-label:
+        description: 'Label of the probe runner that must pick this up.'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  noop:
+    # Routed at the probe's ephemeral label, so ONLY the runner under test can claim it.
+    # A hosted runner picking this up would report success while proving nothing.
+    runs-on: ${{ inputs.runner-label }}
+    # Generous but bounded: the point is to prove a job was claimed and finished, not to
+    # measure speed. A hang must fail rather than hold the lease open indefinitely.
+    timeout-minutes: 10
+    steps:
+      - name: Prove this executed on the runner under test
+        # The label goes through ENV, never `${{ }}` interpolated into the script body.
+        # workflow_dispatch inputs are caller-controlled, so interpolating one directly
+        # into `run:` is shell injection: the value is spliced into the script before bash
+        # ever sees it, and this job runs on a runner that holds registration credentials.
+        # Via env it stays data — bash quotes it, and no interpolation happens.
+        env:
+          RUNNER_LABEL: ${{ inputs.runner-label }}
+        run: |
+          echo "runner-probe no-op job executed"
+          echo "  runner name : ${RUNNER_NAME:-<unset>}"
+          echo "  requested   : ${RUNNER_LABEL}"
