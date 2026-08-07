@@ -567,3 +567,30 @@ def test_a_failed_run_is_a_measured_failure(monkeypatch):
     monkeypatch.setattr(rp, "_run", fake)
     monkeypatch.setattr(rp.time, "sleep", lambda s: None)
     assert rp._run_noop_job("org", "label", "o/r", 30) is False
+
+
+def test_an_unmeasurable_pod_state_is_indeterminate_not_a_disqualification(monkeypatch, tmp_path):
+    """If _pod_started stays None for the whole window we never measured anything.
+    Reporting LEASE_NO_POD there would permanently runner_deny a provider on OUR failure
+    to read, which is exactly what the tri-state exists to prevent."""
+    monkeypatch.setattr(rp, "_deploy", lambda *a, **k: ("55", "  DSEQ: 55"))
+    monkeypatch.setattr(rp, "_pod_started", lambda d: None)  # never resolves
+    monkeypatch.setattr(rp, "_destroy", lambda d: True)
+    monkeypatch.setattr(rp.time, "sleep", lambda s: None)
+    a = rp.probe_once(
+        "akash1x", sdl=tmp_path, org="o", label="l", token="t", bid_wait=1, register_timeout=0
+    )
+    assert a.outcome is rp.Outcome.INDETERMINATE
+    assert "measurable" in a.detail
+
+
+def test_a_measured_false_still_disqualifies(monkeypatch, tmp_path):
+    """The escape hatch must not swallow a real LEASE_NO_POD."""
+    monkeypatch.setattr(rp, "_deploy", lambda *a, **k: ("55", "  DSEQ: 55"))
+    monkeypatch.setattr(rp, "_pod_started", lambda d: False)  # MEASURED: not serving
+    monkeypatch.setattr(rp, "_destroy", lambda d: True)
+    monkeypatch.setattr(rp.time, "sleep", lambda s: None)
+    a = rp.probe_once(
+        "akash1x", sdl=tmp_path, org="o", label="l", token="t", bid_wait=1, register_timeout=0
+    )
+    assert a.outcome is rp.Outcome.LEASE_NO_POD

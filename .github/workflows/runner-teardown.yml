@@ -140,10 +140,26 @@ jobs:
           # Verify rather than trust: read the state back.
           STATE=$("${JA[@]}" status --dseq "$DSEQ" --json 2>/dev/null \
                   | python3 -c "import json,sys;print((json.load(sys.stdin) or {}).get('state',''))" 2>/dev/null || true)
+          # "" means we could NOT READ the state — a transient API error, a non-zero
+          # exit, unparseable JSON. Reporting closed=true on that is the exact failure
+          # this step exists to prevent: a success we did not achieve, with the lease
+          # still holding escrow. Only a deployment the destroy said is GONE may pass on
+          # an empty read.
+          GONE=no
+          grep -qiE "already closed|not found" /tmp/destroy.log 2>/dev/null && GONE=yes
           case "$STATE" in
-            closed|"")
+            closed)
               echo "closed=true" >> "$GITHUB_OUTPUT"
               echo "lease $DSEQ confirmed closed" ;;
+            "")
+              if [ "$GONE" = yes ]; then
+                echo "closed=true" >> "$GITHUB_OUTPUT"
+                echo "lease $DSEQ no longer exists — treating as closed"
+              else
+                echo "closed=unknown" >> "$GITHUB_OUTPUT"
+                echo "::error title=Could not VERIFY the lease is closed::dseq=$DSEQ — the destroy ran but the state read back empty, so this is 'unverified', not 'closed'. If it is still open it holds escrow against the grant the next run spends from. Check: just-akash status --dseq $DSEQ"
+                exit 1
+              fi ;;
             *)
               echo "closed=false" >> "$GITHUB_OUTPUT"
               echo "::error title=Lease may still be OPEN and holding escrow::dseq=$DSEQ reads state='$STATE' after 3 destroy attempts. It will keep escrow locked against the grant the next run spends from, so the next run's funding failure will look like a market outage. Close it manually: just-akash destroy --dseq $DSEQ -y"

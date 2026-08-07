@@ -96,8 +96,11 @@ def test_a_discarded_lease_is_actually_destroyed():
     """Rejecting a pool without closing it holds escrow against the same grant the
     next attempt spends from — the failure compounds itself."""
     body = PROVISION["run"]
-    assert '"${JA[@]}" destroy' in body
-    assert body.index("discarding this lease") < body.index('"${JA[@]}" destroy')
+    # Scoped to the DISCARD branch. A whole-body index comparison broke the moment an
+    # earlier orphan-cleanup destroy was added — the guard was right, the assertion was
+    # positional. Assert the property, not the ordering of the first match.
+    discard = body[body.index("discarding this lease") :]
+    assert '"${JA[@]}" destroy --dseq "$DSEQ"' in discard[:900]
 
 
 # --------------------------------------------------------------------------
@@ -315,7 +318,6 @@ def test_the_guards_are_not_vacuous(label, mutate, tmp_path):
             "-m",
             "pytest",
             __file__,
-            "-x",
             "-q",
             "--no-header",
             "-p",
@@ -325,9 +327,17 @@ def test_the_guards_are_not_vacuous(label, mutate, tmp_path):
         capture_output=True,
         text=True,
     )
-    assert proc.returncode != 0, (
-        f"mutation {label!r} left the suite GREEN — the guard for it is decorative.\n"
-        f"{proc.stdout[-1500:]}"
+    out = proc.stdout + proc.stderr
+
+    # A non-zero exit is NOT enough. A collection error, an import failure or a crash all
+    # exit non-zero while proving nothing about the guard — that is precisely how this
+    # harness sat green while checking nothing. Require an actual test FAILURE.
+    assert "error during collection" not in out and "errors during collection" not in out, (
+        f"mutation {label!r}: the inner run failed to COLLECT, so no guard was "
+        f"evaluated.\n{out[-1500:]}"
+    )
+    assert re.search(r"\d+ failed", out), (
+        f"mutation {label!r} left the suite GREEN — the guard for it is decorative.\n{out[-1500:]}"
     )
 
 
@@ -335,7 +345,13 @@ def test_the_guards_are_not_vacuous(label, mutate, tmp_path):
 # runner-teardown.yml — two things leak, and only one of them is the lease
 # --------------------------------------------------------------------------
 
-TD_PATH = WF_PATH.parent / "runner-teardown.yml"
+# Resolved from the REPO, never from WF_PATH. Deriving it from WF_PATH.parent meant that
+# during the mutation pass — where WF_PATH points at a temp copy — this became
+# tmp_path/runner-teardown.yml, which does not exist. The module then raised
+# FileNotFoundError at import, the inner pytest exited non-zero during COLLECTION, and
+# `assert proc.returncode != 0` was satisfied by the import error for every mutation,
+# including ones whose guard checks nothing. The anti-vacuity harness was itself vacuous.
+TD_PATH = Path(__file__).resolve().parents[1] / ".github/workflows/runner-teardown.yml"
 TD_SRC = TD_PATH.read_text()
 TD = yaml.safe_load(TD_SRC)
 TD_STEPS = TD["jobs"]["teardown"]["steps"]
@@ -394,3 +410,34 @@ def test_teardown_does_not_claim_an_ownership_check_it_cannot_perform():
     body = TD_CLOSE["run"]
     assert "closed=refused" not in body, "a refusal path implies a gate that cannot fire"
     assert "get('tag'" not in body.replace('"', "'"), "status --json has no tag field"
+
+
+# --------------------------------------------------------------------------
+# Escrow leaks found in review — a lease we parsed but walked away from
+# --------------------------------------------------------------------------
+
+
+def test_a_dseq_without_a_provider_is_still_closed():
+    """`deploy` can emit a DSEQ with no `Provider:` line. Treating that identically to
+    "no deployment" walks away from a REAL lease: untagged, undestroyed, holding escrow
+    against the grant the next attempt spends from."""
+    body = PROVISION["run"]
+    assert '[ -n "$DSEQ" ] && [ -z "$PROVIDER" ]' in body, "the orphan branch is missing"
+    orphan = body[body.index('[ -n "$DSEQ" ] && [ -z "$PROVIDER" ]') :]
+    assert '"${JA[@]}" destroy --dseq "$DSEQ"' in orphan[:900], "an orphan dseq must be destroyed"
+
+
+def test_an_unreadable_state_is_not_reported_as_closed():
+    """An empty STATE means we could not READ it — a transient API error, a non-zero
+    exit, unparseable JSON. Reporting closed=true there is a success we did not achieve,
+    which is the precise failure this step exists to prevent."""
+    body = TD_CLOSE["run"]
+    assert "closed=unknown" in body, "an unverifiable close must not report success"
+    import re as _re
+
+    m = _re.search(r'case "\$STATE" in\s*\n\s*([^\n)]*)\)', body)
+    assert m and m.group(1).strip() == "closed", (
+        f"the first case arm must be 'closed' alone, not {m.group(1) if m else None!r} — "
+        "sharing it with '' is how an unreadable state reported success"
+    )
+    assert "already closed|not found" in body, "only a provably-gone deployment may pass on ''"

@@ -262,10 +262,15 @@ def render_verdicts(
 SDL_TEMPLATE = Path(__file__).resolve().parent.parent / "sdl" / "github-runner-probe.yaml"
 
 
-def _run(cmd: list[str], timeout: int = 900) -> tuple[int, str]:
+def _run(cmd: list[str], timeout: int = 900, env: dict[str, str] | None = None) -> tuple[int, str]:
     try:
         p = subprocess.run(  # noqa: S603 - argv list, never a shell string
-            cmd, capture_output=True, text=True, timeout=timeout, check=False
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env={**os.environ, **env} if env else None,
         )
         return p.returncode, (p.stdout or "") + (p.stderr or "")
     except subprocess.TimeoutExpired:
@@ -400,7 +405,7 @@ def _destroy(dseq: str) -> bool:
     return False
 
 
-def _run_noop_job(org: str, label: str, repo: str, timeout_s: int) -> bool | None:
+def _run_noop_job(org: str, label: str, repo: str, timeout_s: int, token: str = "") -> bool | None:
     """Dispatch the no-op workflow at this runner's label and wait for a conclusion.
 
     Returns True/False when a verdict was reached, and None when the job could not be
@@ -460,7 +465,14 @@ def _run_noop_job(org: str, label: str, repo: str, timeout_s: int) -> bool | Non
 
 
 def _registered(org: str, label: str, token: str, timeout_s: int) -> bool:
-    """Poll GitHub for a runner carrying this probe's label."""
+    """Poll GitHub for a runner carrying this probe's label.
+
+    The token is PASSED to gh, not merely accepted. It used to be an unused parameter, so
+    the call silently depended on an ambient GH_TOKEN: without one every poll fails, every
+    provider reports POD_NO_REGISTER, and the whole fleet is demoted for our own missing
+    credential rather than for anything a provider did.
+    """
+    env = {"GH_TOKEN": token} if token else None
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         rc, out = _run(
@@ -473,6 +485,7 @@ def _registered(org: str, label: str, token: str, timeout_s: int) -> bool:
                 f'[.runners[] | select(any(.labels[].name; .=="{label}"))] | length',
             ],
             timeout=60,
+            env=env,
         )
         if rc == 0 and out.strip().isdigit() and int(out.strip()) > 0:
             return True
@@ -507,15 +520,27 @@ def probe_once(
         # None is "not yet measurable" and must keep us waiting; only an explicit False
         # after the deadline is evidence of anything.
         pod_running = False
+        # Track whether we ever got an EXPLICIT answer. If _pod_started stayed None for
+        # the whole window we never measured anything, and reporting LEASE_NO_POD would
+        # permanently runner_deny a provider on an unmeasurable run — contradicting the
+        # tri-state this function exists to provide.
+        measured = False
         deadline = time.time() + register_timeout
-        while time.time() < deadline:
+        while True:
             # NOT `started` — that name holds this attempt's start TIME, and shadowing it
             # here silently broke the elapsed-seconds calculation. Caught by pyright,
             # which is the only gate that could have: the tests mock _pod_started, so the
             # shadowed value was never the timestamp during a test run.
             serving = _pod_started(dseq)
+            if serving is not None:
+                measured = True
             if serving is True:
                 pod_running = True
+                break
+            # ALWAYS take at least one reading before honouring the deadline. A zero or
+            # very short timeout must still mean "look once", not "never look" — the
+            # latter left every fast attempt unmeasured and therefore INDETERMINATE.
+            if time.time() >= deadline:
                 break
             time.sleep(10)
 
@@ -525,9 +550,18 @@ def probe_once(
             if registered:
                 # MEASURED, not inferred. `job_ran = registered` equated two different
                 # claims and left the bar's strongest step unchecked.
-                job_ran = _run_noop_job(org, label, job_repo, register_timeout)
+                job_ran = _run_noop_job(org, label, job_repo, register_timeout, token)
     finally:
         torn_down = _destroy(dseq)
+
+    if not pod_running and not measured:
+        # Never a verdict about the provider: our read never resolved.
+        return Attempt(
+            outcome=Outcome.INDETERMINATE,
+            seconds=time.time() - started,
+            dseq=dseq,
+            detail="pod state never became measurable",
+        )
 
     return Attempt(
         outcome=classify(
@@ -541,6 +575,51 @@ def probe_once(
         dseq=dseq,
         observed_pod=pod_running,
     )
+
+
+def _run_probes(args, token: str, token_kind: str, tmpdir: str) -> list[ProviderVerdict]:
+    """Probe every provider, rendering SDLs into a caller-owned temp dir.
+
+    The dir is caller-owned so main() can delete it: every rendered SDL contains a LIVE
+    credential (a PAT, or a registration token valid ~1h), and mkdtemp without cleanup
+    left those readable on disk after exit — on a shared or self-hosted runner a later
+    job could read them.
+    """
+    providers = [p.strip() for p in args.providers.split(",") if p.strip()]
+    verdicts: list[ProviderVerdict] = []
+    for provider in providers:
+        v = ProviderVerdict(address=provider)
+        for i in range(args.attempts):
+            label = f"probe-{provider[-6:]}-{i}"
+            sdl = Path(tmpdir) / f"probe-{provider[-6:]}-{i}.yaml"
+            render_sdl(
+                sdl,
+                cpu=args.cpu,
+                memory=args.memory,
+                storage=args.storage,
+                org=args.org,
+                token=token,
+                label=label,
+                token_kind=token_kind,
+            )
+            a = probe_once(
+                provider,
+                sdl=sdl,
+                org=args.org,
+                label=label,
+                token=token,
+                bid_wait=args.bid_wait,
+                register_timeout=args.register_timeout,
+            )
+            v.attempts.append(a)
+            print(
+                f"  {provider} attempt {i + 1}/{args.attempts}: {a.outcome.value}",
+                file=sys.stderr,
+            )
+            if a.outcome in DISQUALIFYING:
+                break
+        verdicts.append(v)
+    return verdicts
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -583,43 +662,13 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
 
-    providers = [p.strip() for p in args.providers.split(",") if p.strip()]
-    verdicts: list[ProviderVerdict] = []
-    tmpdir = tempfile.mkdtemp(prefix="akash-probe-")
-
-    for provider in providers:
-        v = ProviderVerdict(address=provider)
-        for i in range(args.attempts):
-            label = f"probe-{provider[-6:]}-{i}"
-            sdl = Path(tmpdir) / f"probe-{provider[-6:]}-{i}.yaml"
-            render_sdl(
-                sdl,
-                cpu=args.cpu,
-                memory=args.memory,
-                storage=args.storage,
-                org=args.org,
-                token=token,
-                label=label,
-                token_kind=token_kind,
-            )
-            a = probe_once(
-                provider,
-                sdl=sdl,
-                org=args.org,
-                label=label,
-                token=token,
-                bid_wait=args.bid_wait,
-                register_timeout=args.register_timeout,
-            )
-            v.attempts.append(a)
-            print(
-                f"  {provider} attempt {i + 1}/{args.attempts}: {a.outcome.value}", file=sys.stderr
-            )
-            # Stop early on a disqualifying outcome: it already outranks any streak,
-            # and each further attempt costs a lease and real escrow.
-            if a.outcome in DISQUALIFYING:
-                break
-        verdicts.append(v)
+    # TemporaryDirectory, not mkdtemp: every rendered SDL embeds a LIVE credential, and
+    # the previous mkdtemp was never cleaned up — leaving a PAT (valid until expiry) or a
+    # registration token (~1h) readable on disk after exit. On a shared or self-hosted
+    # runner a later job could read them.
+    with tempfile.TemporaryDirectory(prefix="akash-probe-") as tmpdir:
+        os.chmod(tmpdir, 0o700)
+        verdicts = _run_probes(args, token, token_kind, tmpdir)
 
     verdicts, control_warning = require_positive_control(verdicts)
     if control_warning:

@@ -3,6 +3,13 @@
 Two reusable workflows that run your CI on Akash instead of GitHub-hosted runners, and —
 more importantly — **tell you why** when they can't.
 
+> [!warning]
+> **`runner-v1` is not yet tagged.** The examples below use it because that is the ref you
+> will pin once it exists; until then a caller must pin a commit SHA, which is the safer
+> form anyway — a movable tag means every consumer's CI changes when it moves. The tag is
+> gated on three providers passing the full qualification bar; see *Which providers may
+> host a runner*.
+
 ```yaml
 jobs:
   pool:

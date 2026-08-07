@@ -331,6 +331,19 @@ jobs:
             DSEQ=$(awk -F': +' '/^[[:space:]]*DSEQ:/{print $2; exit}' /tmp/ja.log || true)
             PROVIDER=$(awk -F': +' '/^[[:space:]]*Provider:/{print $2; exit}' /tmp/ja.log || true)
 
+            # A DSEQ with no PROVIDER is a REAL deployment we would otherwise walk away
+            # from: untagged, undestroyed, holding escrow against the grant the next
+            # attempt spends from. Close it before treating the attempt as a non-event.
+            if [ -n "$DSEQ" ] && [ -z "$PROVIDER" ]; then
+              echo "::warning::attempt $attempt: dseq=$DSEQ exists but no Provider line was parsed — closing it so it cannot leak escrow"
+              "${JA[@]}" tag --dseq "$DSEQ" --name "${TAG_PREFIX}-${RUN_ID}" || true
+              for _try in 1 2 3; do
+                "${JA[@]}" destroy --dseq "$DSEQ" -y 2>&1 | tee /tmp/ja-orphan.log && break
+                grep -qi "Deployment closed" /tmp/ja-orphan.log && break
+                sleep 5
+              done
+            fi
+
             if [ -z "$DSEQ" ] || [ -z "$PROVIDER" ]; then
               # Classify BEFORE blaming the marketplace. A 402 is rejected before an
               # order exists, so no provider ever saw it — calling that "no bid" sends
