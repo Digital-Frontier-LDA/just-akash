@@ -594,3 +594,48 @@ def test_a_measured_false_still_disqualifies(monkeypatch, tmp_path):
         "akash1x", sdl=tmp_path, org="o", label="l", token="t", bid_wait=1, register_timeout=0
     )
     assert a.outcome is rp.Outcome.LEASE_NO_POD
+
+
+def test_the_registration_token_is_reminted_per_attempt(monkeypatch, tmp_path):
+    """A registration token lives ~1h and a 3x3 run can outlast it. A stale token fails
+    SILENTLY — the runner never registers, the attempt reports POD_NO_REGISTER, and
+    providers are demoted for our own expired credential."""
+    minted = []
+    monkeypatch.setattr(
+        rp, "mint_registration_token", lambda org: minted.append(org) or f"tok{len(minted)}"
+    )
+    monkeypatch.setattr(
+        rp, "probe_once", lambda *a, **k: Attempt(outcome=Outcome.PASS, observed_pod=True)
+    )
+    monkeypatch.setattr(rp, "render_sdl", lambda dest, **k: dest)
+
+    class A:
+        providers = "akash1a,akash1b"
+        attempts = 3
+        cpu = memory = storage = "x"
+        org = "acme"
+        bid_wait = register_timeout = 1
+
+    rp._run_probes(A(), "seed", "RUNNER_TOKEN", str(tmp_path))
+    assert len(minted) == 6, f"expected one mint per attempt (2 providers x 3), got {len(minted)}"
+
+
+def test_a_pat_is_not_reminted(monkeypatch, tmp_path):
+    """Only registration tokens expire on this timescale; a supplied PAT must be used
+    as given rather than replaced by a minted token."""
+    minted = []
+    monkeypatch.setattr(rp, "mint_registration_token", lambda org: minted.append(org) or "tok")
+    monkeypatch.setattr(
+        rp, "probe_once", lambda *a, **k: Attempt(outcome=Outcome.PASS, observed_pod=True)
+    )
+    monkeypatch.setattr(rp, "render_sdl", lambda dest, **k: dest)
+
+    class A:
+        providers = "akash1a"
+        attempts = 2
+        cpu = memory = storage = "x"
+        org = "acme"
+        bid_wait = register_timeout = 1
+
+    rp._run_probes(A(), "ghp_real", "ACCESS_TOKEN", str(tmp_path))
+    assert minted == [], "a PAT must not be replaced by a minted token"

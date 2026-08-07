@@ -590,6 +590,17 @@ def _run_probes(args, token: str, token_kind: str, tmpdir: str) -> list[Provider
     for provider in providers:
         v = ProviderVerdict(address=provider)
         for i in range(args.attempts):
+            # Re-mint PER ATTEMPT. A registration token lives ~1h, and a full run is
+            # providers x attempts x up to several minutes each — 3x3 can exceed the
+            # lifetime outright. A stale token does not fail loudly: the runner simply
+            # never registers, the attempt reports POD_NO_REGISTER, and providers are
+            # demoted for OUR expired credential. That is the same silent-expiry trap
+            # that made minting preferable to a PAT in the first place, reintroduced by
+            # minting only once.
+            if token_kind == "RUNNER_TOKEN" and args.org:
+                fresh = mint_registration_token(args.org)
+                if fresh:
+                    token = fresh
             label = f"probe-{provider[-6:]}-{i}"
             sdl = Path(tmpdir) / f"probe-{provider[-6:]}-{i}.yaml"
             render_sdl(
