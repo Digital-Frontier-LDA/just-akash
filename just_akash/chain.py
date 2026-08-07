@@ -14,6 +14,7 @@ backs the default ``AKASH_NODE`` RPC.
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import urllib.parse
@@ -80,8 +81,12 @@ def rest_urls() -> list[str]:
     silently querying other hosts would defeat the point of pinning one (an
     air-gapped or private LCD, a node under test). Only the default path fans out.
     """
+    # `is not None`, NOT truthiness. An explicitly-set-but-empty AKASH_REST_URL is a
+    # misconfiguration, and treating it as "not pinned" silently fans out to the public
+    # defaults — the exact opposite of what someone pinning an air-gapped or private LCD
+    # asked for. Defer to rest_url(), which raises on an empty value, so the two agree.
     pinned = os.environ.get("AKASH_REST_URL")
-    if pinned:
+    if pinned is not None:
         return [rest_url()]
     return [DEFAULT_REST_URL, *DEFAULT_REST_FALLBACKS]
 
@@ -136,13 +141,25 @@ def deploy_credit(address: str) -> dict[str, int]:
     API can't give us."""
     per_endpoint: list[dict[str, int]] = []
     errors: list[str] = []
-    for base in rest_urls():
+    bases = rest_urls()
+
+    def _one(base: str) -> tuple[str, dict[str, int] | None, str]:
         try:
             data = _lcd_get(f"/cosmos/authz/v1beta1/grants/grantee/{address}", base=base)
         except RuntimeError as e:  # one dead LCD must not sink the reading
-            errors.append(f"{base}: {e}")
-            continue
-        per_endpoint.append(_sum_deposit_grants(data))
+            return base, None, str(e)
+        return base, _sum_deposit_grants(data), ""
+
+    # CONCURRENT, because the timeouts add up. Queried in sequence, three dead endpoints
+    # at the 15s _lcd_get timeout block for ~45s — and this call sits in front of every
+    # deploy, so a slow reading looks like a hung CI job. Fanning out costs one thread
+    # each and bounds the wait at the slowest single endpoint.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(bases))) as pool:
+        for base, summed, err in pool.map(_one, bases):
+            if summed is None:
+                errors.append(f"{base}: {err}")
+            else:
+                per_endpoint.append(summed)
     if not per_endpoint:
         raise RuntimeError(
             "no LCD endpoint could be reached for deploy credit: " + "; ".join(errors)
