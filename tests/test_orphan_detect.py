@@ -29,9 +29,16 @@ def _classify(monkeypatch, readings, **kw):
         "just_akash.orphan_detect.live_orders_for",
         lambda dseq, owner, base: seq[int(base)],
     )
-    base = dict(deployment_state="active", lease_count=0, escrow_uact=5_000_000)
-    base.update(kw)
-    return classify_deployment("1", OWNER, bases=[str(i) for i in range(len(seq))], **base)
+    # Explicit parameters, not a **kwargs splat: a dict[str, object] defeats the type
+    # checker, and suppressing that would hide a real signature mismatch later.
+    return classify_deployment(
+        "1",
+        OWNER,
+        deployment_state=str(kw.get("deployment_state", "active")),
+        lease_count=int(kw.get("lease_count", 0)),
+        escrow_uact=int(kw.get("escrow_uact", 5_000_000)),
+        bases=[str(i) for i in range(len(seq))],
+    )
 
 
 # --------------------------------------------------------------------------
