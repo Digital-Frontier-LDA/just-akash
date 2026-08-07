@@ -1,35 +1,35 @@
 {
   "alphavps": {
     "boot_id": null,
-    "checks_total": 3,
+    "checks_total": 4,
     "dseq": null,
-    "last_collect": 1786025593.6494014,
+    "last_collect": 1786062276.0052874,
     "lease_replacements_total": 0,
     "reachable": 0,
     "restarts_total": 0,
     "scrape_seconds": 0.0,
-    "unreachable_checks_total": 3
+    "unreachable_checks_total": 4
   },
   "hetzner_hel": {
     "boot_id": null,
-    "checks_total": 3,
+    "checks_total": 4,
     "dseq": null,
-    "last_collect": 1786025593.6494014,
+    "last_collect": 1786062276.0052874,
     "lease_replacements_total": 0,
     "reachable": 0,
     "restarts_total": 0,
     "scrape_seconds": 0.0,
-    "unreachable_checks_total": 3
+    "unreachable_checks_total": 4
   },
   "onidc": {
     "boot_id": null,
-    "checks_total": 3,
+    "checks_total": 4,
     "dseq": null,
-    "last_collect": 1786025593.6494014,
+    "last_collect": 1786062276.0052874,
     "lease_replacements_total": 0,
     "reachable": 0,
     "restarts_total": 0,
     "scrape_seconds": 0.0,
-    "unreachable_checks_total": 3
+    "unreachable_checks_total": 4
   }
 }
