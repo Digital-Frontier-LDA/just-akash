@@ -30,10 +30,12 @@ from just_akash.runner_probe import (
 P = "akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z"
 
 
-def _ok(**kw):
-    base = dict(bid=True, pod_running=True, registered=True, job_ran=True, torn_down=True)
+def _ok(**kw) -> Outcome:
+    base: dict[str, object] = dict(
+        bid=True, pod_running=True, registered=True, job_ran=True, torn_down=True
+    )
     base.update(kw)
-    return classify(**base)
+    return classify(**base)  # pyright: ignore[reportArgumentType]
 
 
 # --------------------------------------------------------------------------
@@ -285,7 +287,7 @@ def test_the_service_is_still_named_probe(tmp_path):
 def _driver(
     monkeypatch,
     *,
-    dseq="123",
+    dseq: str | None = "123",
     deploy_out="  DSEQ: 123",
     state="active",
     destroyed=True,
