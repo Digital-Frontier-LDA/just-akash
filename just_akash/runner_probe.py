@@ -667,6 +667,12 @@ def main(argv: list[str] | None = None) -> int:
     # registration token (~1h) readable on disk after exit. On a shared or self-hosted
     # runner a later job could read them.
     with tempfile.TemporaryDirectory(prefix="akash-probe-") as tmpdir:
+        # nosemgrep: python.lang.security.audit.insecure-file-permissions
+        # The rule suggests 0o644 as "a good default" — it targets overly PERMISSIVE
+        # modes, and 0o700 is strictly more restrictive than its own suggestion. This
+        # directory holds rendered SDLs containing a LIVE credential (a PAT, or a
+        # registration token valid ~1h), so owner-only is the point. Loosening it to
+        # satisfy the rule would make world-readable exactly what must not be.
         os.chmod(tmpdir, 0o700)
         verdicts = _run_probes(args, token, token_kind, tmpdir)
 
