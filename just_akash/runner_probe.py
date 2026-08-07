@@ -436,7 +436,10 @@ def _run_noop_job(org: str, label: str, repo: str, timeout_s: int, token: str = 
         return None  # not dispatchable — unmeasured, never "failed"
 
     deadline = time.time() + timeout_s
-    while time.time() < deadline:
+    # Did the run ever leave `queued`? A run that never did was never assigned to any
+    # runner, which says nothing about the provider — see the return below.
+    ever_started = False
+    while True:
         rc, out = _run(
             [
                 "gh",
@@ -459,9 +462,24 @@ def _run_noop_job(org: str, label: str, repo: str, timeout_s: int, token: str = 
             except Exception:  # noqa: BLE001 - a bad read just means "keep waiting"
                 runs = []
             for r in runs:
+                if r.get("status") in ("in_progress", "completed"):
+                    ever_started = True
                 if r.get("status") == "completed":
                     return r.get("conclusion") == "success"
+        # Always take at least one reading before honouring the deadline: a zero or short
+        # timeout must mean "look once", not "never look".
+        if time.time() >= deadline:
+            break
         time.sleep(10)
+
+    # A run that NEVER left `queued` was never assigned to any runner, which is not a
+    # statement about the provider. The common cause is org policy: GitHub blocks
+    # org-level self-hosted runners from PUBLIC repositories unless the runner group sets
+    # allows_public_repositories (measured: just-akash is public and both groups have it
+    # false, so the job cannot be assigned no matter which provider hosts the runner).
+    # Reporting JOB_NOT_RUN here would blame a provider for OUR configuration.
+    if not ever_started:
+        return None
     return False
 
 

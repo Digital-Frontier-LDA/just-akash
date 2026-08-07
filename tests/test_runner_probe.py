@@ -729,3 +729,32 @@ def test_runner_labels_are_unique_per_run(monkeypatch, tmp_path):
     rp._run_probes(A(), "t", "ACCESS_TOKEN", str(tmp_path))
     rp._run_probes(A(), "t", "ACCESS_TOKEN", str(tmp_path))
     assert len(labels) == 2 and labels[0] != labels[1], f"labels collided across runs: {labels}"
+
+
+def test_a_job_that_never_leaves_queued_is_unmeasured_not_failed(monkeypatch):
+    """A run stuck in `queued` was never assigned to a runner. The usual cause is org
+    policy — GitHub blocks org self-hosted runners from PUBLIC repos unless the runner
+    group sets allows_public_repositories, and just-akash is public with it false. That
+    is OUR configuration, so reporting JOB_NOT_RUN would blame the provider for it."""
+
+    def fake(cmd, timeout=60, env=None):
+        if cmd[1] == "workflow":
+            return 0, ""
+        return 0, json.dumps([{"status": "queued", "conclusion": None}])
+
+    monkeypatch.setattr(rp, "_run", fake)
+    monkeypatch.setattr(rp.time, "sleep", lambda s: None)
+    assert rp._run_noop_job("org", "label", "o/r", 0) is None
+
+
+def test_a_job_that_STARTED_and_failed_is_a_real_failure(monkeypatch):
+    """Once a runner picked it up, the verdict is about the runner."""
+
+    def fake(cmd, timeout=60, env=None):
+        if cmd[1] == "workflow":
+            return 0, ""
+        return 0, json.dumps([{"status": "completed", "conclusion": "failure"}])
+
+    monkeypatch.setattr(rp, "_run", fake)
+    monkeypatch.setattr(rp.time, "sleep", lambda s: None)
+    assert rp._run_noop_job("org", "label", "o/r", 0) is False
