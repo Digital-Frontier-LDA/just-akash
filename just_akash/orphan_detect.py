@@ -156,7 +156,10 @@ def live_orders_for(dseq: str, owner: str, base: str) -> int | None:
         if not isinstance(entry, dict):
             continue
         # Node versions nest this differently; check both shapes rather than assuming.
-        order = entry.get("order") if isinstance(entry.get("order"), dict) else entry
+        # Read ONCE into a local: calling .get twice narrows nothing for a type checker,
+        # and the two calls are not guaranteed to return the same object.
+        nested = entry.get("order")
+        order = nested if isinstance(nested, dict) else entry
         state = str(order.get("state", "")).lower()
         if state in LIVE_ORDER_STATES:
             live += 1
