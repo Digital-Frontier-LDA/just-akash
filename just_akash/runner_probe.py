@@ -509,8 +509,12 @@ def probe_once(
         pod_running = False
         deadline = time.time() + register_timeout
         while time.time() < deadline:
-            started = _pod_started(dseq)
-            if started is True:
+            # NOT `started` — that name holds this attempt's start TIME, and shadowing it
+            # here silently broke the elapsed-seconds calculation. Caught by pyright,
+            # which is the only gate that could have: the tests mock _pod_started, so the
+            # shadowed value was never the timestamp during a test run.
+            serving = _pod_started(dseq)
+            if serving is True:
                 pod_running = True
                 break
             time.sleep(10)
