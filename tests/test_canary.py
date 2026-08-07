@@ -154,6 +154,39 @@ def test_render_emits_per_provider_series_and_is_parseable():
     assert ("akash_canary_last_collect_timestamp_seconds", ()) in samples
 
 
+def test_no_canary_deployed_is_distinct_from_deployed_but_unreachable():
+    """The failure that paged three innocent providers for a day. A provider with no
+    canary folded in exactly like one whose ingress was refusing connections, so the only
+    visible signal was a per-provider ingress alert and nothing said the real cause: no
+    canary was deployed at all. `deployed` separates the two."""
+    st = merge({}, ALPHA, "100", False, "", 0.0, 1000.0, deployed=True)
+    st = merge(st, "onidc", "300", False, "", 0.0, 1000.0, deployed=False)
+    samples = parse_exposition(render(st, 1.0))
+    # Both are unreachable...
+    assert samples[("akash_canary_reachable", (("provider", ALPHA),))] == 0.0
+    assert samples[("akash_canary_reachable", (("provider", "onidc"),))] == 0.0
+    # ...but only one of them was ever deployed to be reachable.
+    assert samples[("akash_canary_deployed", (("provider", ALPHA),))] == 1.0
+    assert samples[("akash_canary_deployed", (("provider", "onidc"),))] == 0.0
+    assert samples[("akash_canary_active_deployments", ())] == 1.0
+
+
+def test_active_deployments_is_emitted_even_when_no_canary_exists():
+    """The scalar must be PRESENT and zero, not absent -- an alert can only fire on a
+    series that exists, and "no canary anywhere" is the case that most needs to page."""
+    st = merge({}, ALPHA, "100", False, "", 0.0, 1000.0, deployed=False)
+    samples = parse_exposition(render(st, 1.0))
+    assert samples[("akash_canary_active_deployments", ())] == 0.0
+
+
+def test_deployed_defaults_to_reachable_for_callers_that_do_not_track_targets():
+    """merge() is called without a targets file by tests and other tooling. Reachable
+    implies deployed (main() skips the scrape when there is no URI), so the default is
+    sound -- and must never report a reachable provider as undeployed."""
+    st = merge({}, ALPHA, "100", True, _body("aaa"), 0.1, 1000.0)
+    assert st[ALPHA]["deployed"] == 1
+
+
 def test_render_omits_missing_gauges_rather_than_emitting_none():
     """A provider that has never been reachable has no inside-the-deployment values. It
     must be absent from those series, not published as a literal `None`, which would make
