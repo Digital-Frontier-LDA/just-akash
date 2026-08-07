@@ -276,6 +276,7 @@ stays up — one per provider, kept alive, measured from the inside.
 |---|---|
 | `canary/canary.py` | The agent that runs *inside* the lease. stdlib only, serves `/metrics`. |
 | `canary/collect.py` | Scrapes each canary's ingress and keeps the durable counters. |
+| `canary/details.py` | Fetches the per-deployment detail. Summary rows carry no leases. |
 | `canary/ensure.py` | Decides which providers still have a live canary. Never deploys. |
 | `sdl/canary.yaml` | The deployment. Minimal footprint, **not** throwaway. |
 | `.github/workflows/provider-canary.yml` | Keeps them alive, collects every 30m, publishes. |
@@ -293,7 +294,21 @@ stays up — one per provider, kept alive, measured from the inside.
 
 Published to the `telemetry` branch as `canary-metrics.prom`, next to the smoke data.
 
-### Three design points that are load-bearing
+### Four design points that are load-bearing
+
+**A canary is identified by its service set and its lease provider — never by local state.**
+`ensure.py` adopts a deployment whose services are exactly `{canary}` and whose lease is held
+by that provider. Both come off the deployment itself, so any runner can work it out. The
+first version matched `just-akash tag` names instead, which live in `.tags.json` in the
+working copy: a GitHub runner is wiped after each job, so the tag was gone by the next run,
+every provider read as missing, and with `CANARY_AUTODEPLOY` on that would have opened three
+fresh leases every thirty minutes — none of which any reaper collects.
+
+Two things follow, both deliberate. "No canary here" and "could not look" are kept apart: a
+failed API read marks the details document incomplete and nothing is deployed that run, and a
+lease reporting no services yet (how a canary looks for its first few minutes) also suppresses
+the deploy. Waiting 30 minutes is free; a duplicate lease bills until someone notices.
+
 
 **The agent cannot count its own restarts.** A restart wipes it, so a self-counter would
 always read zero. It emits a `boot_id` that changes every process start and the *collector*
@@ -392,8 +407,15 @@ way: rename the service to `probe`, or add `canary` to a stale rule, and the nex
 deletes it within the hour. The symptom would be *"the provider keeps closing our
 deployment"* — the canary masquerading as the very fault it measures.
 
-The `canary-<provider>` tag is separately load-bearing, but for **adoption**: it is how the
-next run finds the lease in `just-akash list` and knows which `dseq` it is looking at.
+The service name carries a **second** job: it is also how the next run recognises the lease
+as ours (service set `{canary}` + lease provider). So renaming it breaks two things at once
+and in opposite directions — the sweep deletes the lease, or `ensure.py` stops seeing it and
+deploys another alongside. Treat the name as an interface.
+
+The `canary-<provider>` tag is a local convenience only. `just-akash tag` writes
+`.tags.json` in the working copy, which a GitHub runner destroys with the job, so the tag
+cannot identify anything on the next run — it was the original matching key and that is
+exactly why every provider read as `NEEDS DEPLOY` forever.
 
 ## Logs
 
