@@ -1,0 +1,411 @@
+# Provision a pool of ephemeral GitHub Actions runners on Akash.
+#
+# Callers use it as:
+#
+#   jobs:
+#     pool:
+#       uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-pool.yml@runner-v1
+#       with:
+#         runner-label: fast-pool-${{ github.run_id }}
+#         tag-prefix:   ci-myrepo          # REQUIRED, must name YOUR repo — see below
+#         github-org:   my-org
+#         pool-size:    '4'
+#         min-pool-size: '2'
+#       secrets:
+#         AKASH_API_KEY:  ${{ secrets.AKASH_API_KEY }}
+#         GH_RUNNER_PAT:  ${{ secrets.GH_RUNNER_PAT }}
+#     work:
+#       needs: pool
+#       runs-on: ${{ fromJSON(needs.pool.outputs.runner-targets) }}
+#
+# `runner-targets` is the whole ergonomic point: it is the pool's label set when the
+# pool is healthy and ["ubuntu-latest"] when it is not, so a caller's `runs-on` degrades
+# to hosted runners instead of failing. That fallback COSTS MONEY, so this workflow works
+# hard to tell you WHY it happened — see the outputs.
+#
+# ── WHY IT REPORTS SO MUCH ──────────────────────────────────────────────────────
+# The predecessor printed "(infra)" for every failure. A funding problem, a market
+# outage and a provider that cannot host a runner were indistinguishable, so the
+# standing fix became "move more jobs to hosted runners" — which is the thing that
+# grows the bill. Every failure here names which world it came from.
+#
+# ── TAG-PREFIX IS REQUIRED AND HAS NO DEFAULT ───────────────────────────────────
+# Deployments are tagged `<tag-prefix>-<run_id>` so a sweeper can reap this run's lease
+# and NOTHING else. A shared default once caused a sibling repo's cleanup to destroy a
+# live deployment, because both used the same `ci-<id>` shape. Put your repo name in it.
+name: Akash runner pool
+
+on:
+  workflow_call:
+    inputs:
+      runner-label:
+        description: 'Unique label for this pool; carries run identity into runs-on.'
+        required: true
+        type: string
+      tag-prefix:
+        description: >-
+          REQUIRED, no default. Deployments are tagged `<tag-prefix>-<run_id>` and a
+          sweeper may only reap tags matching its own prefix. MUST include your repo
+          name: a shared default once let one repo's cleanup destroy another's live
+          deployment.
+        required: true
+        type: string
+      github-org:
+        description: 'GitHub org the runners register into.'
+        required: true
+        type: string
+      providers:
+        description: >-
+          Provider candidates as a JSON array carrying the markers that decide whether
+          a provider can host a RUNNER — a different question from whether it is healthy
+          or cheap:
+
+            [{"address":"akash1…","runner_host":true,"failover_priority":20},
+             {"address":"akash1…","runner_deny":true}]
+
+          runner_host  PROVEN to bring the runner online.
+          runner_deny  leases but NEVER schedules the runner pod — never tried.
+          ci_only      third-party; fine for a throwaway runner, not customers.
+
+          A flat comma-separated list is accepted; every entry is then UNMARKED
+          (unproven, but not denied). Empty falls back to just-akash's own defaults.
+
+          No default on purpose: the markers only mean anything against a specific
+          fleet's measurements, and a shared list would make one operator's trust
+          decision everyone's. Qualify your own with `just-akash runner-probe`.
+        required: false
+        type: string
+        default: ''
+      pool-size:
+        description: 'Replicas under the shared label (SDL count:N).'
+        required: false
+        type: string
+        default: '1'
+      min-pool-size:
+        description: >-
+          Minimum DISTINCT online runners that constitutes a USABLE pool. Empty means
+          pool-size (all-or-nothing).
+
+          All-or-nothing is not the conservative choice — it is the destructive one. A
+          provider that delivered 6 of 12 was rejected AND had its lease closed, which
+          removed the only provider actually serving us. Set this lower when your matrix
+          can make progress on fewer runners.
+        required: false
+        type: string
+        default: ''
+      cpu:
+        required: false
+        type: string
+        default: '4'
+      memory:
+        required: false
+        type: string
+        default: '16Gi'
+      storage:
+        description: >-
+          Ephemeral storage per replica. NOT free: storage is the tightest constraint on
+          which providers can host the runner at all, and lease-but-never-schedule
+          failures were recorded at 30Gi — a larger ask only narrows the eligible set.
+          Whatever you pass is the profile your providers must be qualified against.
+        required: false
+        type: string
+        default: '30Gi'
+      ephemeral:
+        description: >-
+          true de-registers each replica after one job. false keeps a shared pool alive
+          for several queued jobs — and then YOU must tear the lease down, and offline
+          registrations accumulate (they once overflowed an org's runner listing and
+          broke provisioning for every repo in it).
+        required: false
+        type: boolean
+        default: true
+      required-deposit-usd:
+        description: 'Free credit needed before attempting a deploy.'
+        required: false
+        type: string
+        default: '5'
+    secrets:
+      AKASH_API_KEY:
+        required: true
+        description: 'Akash Console API key. just-akash reads this name directly.'
+      GH_RUNNER_PAT:
+        required: true
+        description: 'Registers runners into the org and polls their status.'
+    outputs:
+      dseq:
+        description: 'Deployment sequence number; empty when no lease survived.'
+        value: ${{ jobs.pool.outputs.dseq }}
+      provision_healthy:
+        description: "'true' iff a usable pool came online. Key your fallback on this."
+        value: ${{ jobs.pool.outputs.provision_healthy }}
+      runners_online:
+        description: 'Distinct online runners as "K/N".'
+        value: ${{ jobs.pool.outputs.runners_online }}
+      runner-targets:
+        description: >-
+          JSON array for the caller's runs-on: the pool's labels when healthy, else
+          ["ubuntu-latest"]. Consume with fromJSON.
+        value: ${{ jobs.pool.outputs.runner-targets }}
+      failure_reason:
+        description: >-
+          WHY a fallback happened, when it did. One of WALLET_UNDERFUNDED,
+          NO_ELIGIBLE_BIDDER, PROVIDER_CAPACITY, RUNNER_NEVER_REGISTERED,
+          INDETERMINATE — or empty on success. Each implies a different remedy, which
+          is why they are not collapsed into "infra".
+        value: ${{ jobs.pool.outputs.failure_reason }}
+      wallet_free_usd:
+        description: 'Free credit after escrow at provision time.'
+        value: ${{ jobs.pool.outputs.wallet_free_usd }}
+      runner_hosts_proven:
+        description: >-
+          Supplied providers marked runner_host and not runner_deny. Below 3, one silent
+          provider takes the whole pool down.
+        value: ${{ jobs.pool.outputs.runner_hosts_proven }}
+
+permissions:
+  contents: read
+
+jobs:
+  pool:
+    name: Provision ephemeral runner pool on Akash
+    runs-on: ubuntu-latest
+    outputs:
+      dseq: ${{ steps.provision.outputs.dseq }}
+      provision_healthy: ${{ steps.provision.outputs.provision_healthy }}
+      runners_online: ${{ steps.provision.outputs.runners_online }}
+      failure_reason: ${{ steps.provision.outputs.failure_reason || steps.wallet.outputs.failure_reason || steps.candidates.outputs.failure_reason }}
+      wallet_free_usd: ${{ steps.wallet.outputs.free_usd }}
+      runner_hosts_proven: ${{ steps.candidates.outputs.proven_hosts }}
+      runner-targets: ${{ steps.provision.outputs.runner_targets || '["ubuntu-latest"]' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@e4db8464a088ece1b920f60402e813ea4de65b8f # v3
+
+      # FREE credit, not the grant. Every active deployment holds escrow against the
+      # same grant, so the grant alone reads healthy while Console already returns 402
+      # — measured at 165 of a 170.62 grant locked. This is the number that predicts a
+      # 402, and reporting it is what stops "the wallet is empty" being filed as an
+      # infra outage.
+      - name: Wallet — free credit after escrow
+        id: wallet
+        continue-on-error: true
+        env:
+          AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
+          MIN_USD: ${{ inputs.required-deposit-usd }}
+        run: |
+          set -uo pipefail
+          OUT=$(uv run --with . just-akash balance --check --min-usd "$MIN_USD" --json 2>/dev/null | tail -1 || true)
+          echo "$OUT"
+          FREE=$(printf '%s' "$OUT" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('free_usd',''))" 2>/dev/null || true)
+          STATUS=$(printf '%s' "$OUT" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('status',''))" 2>/dev/null || true)
+          echo "free_usd=${FREE}" >> "$GITHUB_OUTPUT"
+          if [ "$STATUS" = "LOW" ]; then
+            echo "failure_reason=WALLET_UNDERFUNDED" >> "$GITHUB_OUTPUT"
+            {
+              echo "## The Akash wallet is out of money"
+              echo
+              echo "**CI is not broken.** Free credit after escrow is \$${FREE}, below the"
+              echo "\$${MIN_USD} a deploy needs. Jobs will fall back to GitHub-hosted"
+              echo "runners and be billed to your Actions minutes."
+              echo
+              echo "**Fix:** top up the wallet, or close idle deployments to release escrow."
+              echo "Do **not** resolve this by moving more jobs to hosted runners."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=Akash wallet underfunded — jobs will bill GitHub minutes::Free \$${FREE} after escrow, need \$${MIN_USD}. NOT a code failure and NOT a provider outage."
+          fi
+
+      # runner_deny removed, proven hosts first. NOT continue-on-error: a malformed
+      # spec must not fall through to defaults and silently re-select a provider the
+      # operator recorded as unable to schedule the runner pod.
+      - name: Select providers
+        id: candidates
+        env:
+          AKASH_PROVIDERS_SPEC: ${{ inputs.providers }}
+        run: |
+          set -uo pipefail
+          if ! uv run --with . python -m just_akash.runner_candidates \
+                 --providers "${AKASH_PROVIDERS_SPEC:-}" --github-output; then
+            echo "failure_reason=NO_ELIGIBLE_BIDDER" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      - name: Render runner SDL
+        env:
+          GH_RUNNER_PAT: ${{ secrets.GH_RUNNER_PAT }}
+          ORG: ${{ inputs.github-org }}
+          RUNNER_LABEL: ${{ inputs.runner-label }}
+          POOL_SIZE: ${{ inputs.pool-size }}
+          CPU: ${{ inputs.cpu }}
+          MEMORY: ${{ inputs.memory }}
+          STORAGE: ${{ inputs.storage }}
+          EPHEMERAL: ${{ inputs.ephemeral }}
+        run: |
+          set -euo pipefail
+          # All N replicas share ONE label carrying run identity; the runner image
+          # randomises each replica's NAME from the prefix, so the wait loop counts
+          # DISTINCT online runners by label rather than by name.
+          cat > /tmp/runner-sdl.yaml <<SDL
+          version: "2.0"
+          services:
+            runner:
+              image: ghcr.io/akash-network/github-runner:latest
+              env:
+                - ACCESS_TOKEN=${GH_RUNNER_PAT}
+                - ORG_NAME=${ORG}
+                - RUNNER_SCOPE=org
+                - RUNNER_NAME_PREFIX=akash-${RUNNER_LABEL}
+                - LABELS=self-hosted,linux,akash,${RUNNER_LABEL}
+                - EPHEMERAL=${EPHEMERAL}
+                - DISABLE_AUTO_UPDATE=true
+                - RUNNER_WORKDIR=/_work
+                - RUN_AS_ROOT=true
+              expose:
+                - port: 80
+                  as: 80
+                  to:
+                    - global: true
+          profiles:
+            compute:
+              runner:
+                resources:
+                  cpu: { units: ${CPU} }
+                  memory: { size: ${MEMORY} }
+                  storage: { size: ${STORAGE} }
+            placement:
+              pool:
+                pricing:
+                  runner: { denom: uact, amount: 100000 }
+          deployment:
+            runner:
+              pool:
+                profile: runner
+                count: ${POOL_SIZE}
+          SDL
+          echo "--- rendered SDL (token redacted) ---"
+          grep -vE 'ACCESS_TOKEN' /tmp/runner-sdl.yaml
+
+      - name: Provision (retry down candidates, tag before waiting)
+        id: provision
+        env:
+          AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
+          GH_TOKEN: ${{ secrets.GH_RUNNER_PAT }}
+          CANDIDATES_CSV: ${{ steps.candidates.outputs.candidates }}
+          ORG: ${{ inputs.github-org }}
+          RUNNER_LABEL: ${{ inputs.runner-label }}
+          POOL_SIZE: ${{ inputs.pool-size }}
+          MIN_POOL_SIZE: ${{ inputs.min-pool-size }}
+          TAG_PREFIX: ${{ inputs.tag-prefix }}
+          RUN_ID: ${{ github.run_id }}
+          MAX_ATTEMPTS: '3'
+          RUNNER_WAIT_TRIES: '90'
+        run: |
+          set -uo pipefail
+          # An ARRAY, not a string. Both this and the provider list rely on word
+          # splitting, so quoting them breaks the command and NOT quoting them is SC2086.
+          # Arrays are the only form that is both correct and lint-clean.
+          JA=(uv run --with . just-akash)
+
+          MIN_POOL="${MIN_POOL_SIZE:-}"
+          case "$MIN_POOL" in ''|*[!0-9]*) MIN_POOL="$POOL_SIZE" ;; esac
+          [ "$MIN_POOL" -ge 1 ] 2>/dev/null || MIN_POOL="$POOL_SIZE"
+          [ "$MIN_POOL" -le "$POOL_SIZE" ] 2>/dev/null || MIN_POOL="$POOL_SIZE"
+
+          CANDIDATES=$(printf '%s' "${CANDIDATES_CSV:-}" | tr ',' '\n' | sed '/^$/d')
+          EXCLUDED=""
+          SAW_BID=0
+
+          for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
+            echo "::group::provision attempt $attempt/$MAX_ATTEMPTS"
+            PROV_ARGS=()
+            for p in $CANDIDATES; do
+              case " $EXCLUDED " in *" $p "*) continue ;; esac
+              PROV_ARGS+=(--provider "$p")
+            done
+
+            rm -f /tmp/ja.log
+            "${JA[@]}" deploy --sdl /tmp/runner-sdl.yaml --bid-wait 60 \
+              --bid-wait-retry 120 "${PROV_ARGS[@]}" 2>&1 | tee /tmp/ja.log || true
+            DSEQ=$(awk -F': +' '/^[[:space:]]*DSEQ:/{print $2; exit}' /tmp/ja.log || true)
+            PROVIDER=$(awk -F': +' '/^[[:space:]]*Provider:/{print $2; exit}' /tmp/ja.log || true)
+
+            # A DSEQ with no PROVIDER is a REAL deployment we would otherwise walk away
+            # from: untagged, undestroyed, holding escrow against the grant the next
+            # attempt spends from. Close it before treating the attempt as a non-event.
+            if [ -n "$DSEQ" ] && [ -z "$PROVIDER" ]; then
+              echo "::warning::attempt $attempt: dseq=$DSEQ exists but no Provider line was parsed — closing it so it cannot leak escrow"
+              "${JA[@]}" tag --dseq "$DSEQ" --name "${TAG_PREFIX}-${RUN_ID}" || true
+              for _try in 1 2 3; do
+                "${JA[@]}" destroy --dseq "$DSEQ" -y 2>&1 | tee /tmp/ja-orphan.log && break
+                grep -qi "Deployment closed" /tmp/ja-orphan.log && break
+                sleep 5
+              done
+            fi
+
+            if [ -z "$DSEQ" ] || [ -z "$PROVIDER" ]; then
+              # Classify BEFORE blaming the marketplace. A 402 is rejected before an
+              # order exists, so no provider ever saw it — calling that "no bid" sends
+              # the investigation at providers instead of at the balance.
+              if grep -qiE 'PaymentRequiredError|Insufficient balance|HTTP 402' /tmp/ja.log 2>/dev/null; then
+                echo "failure_reason=WALLET_UNDERFUNDED" >> "$GITHUB_OUTPUT"
+                echo "::error title=Akash rejected the deploy: INSUFFICIENT BALANCE::No order was created and no provider was asked to bid, so retrying cannot help. Top up the wallet."
+                echo "::endgroup::"; exit 1
+              fi
+              echo "::warning::attempt $attempt: no lease within the bid window"
+              echo "::endgroup::"; continue
+            fi
+            SAW_BID=1
+
+            # Tag FIRST: if this job is cancelled between deploy and teardown, only a
+            # tagged lease can be reaped by the caller's sweeper.
+            "${JA[@]}" tag --dseq "$DSEQ" --name "${TAG_PREFIX}-${RUN_ID}" \
+              || echo "::warning::tag failed for dseq=$DSEQ — a sweeper will not see it"
+
+            ONLINE=0
+            for i in $(seq 1 "$RUNNER_WAIT_TRIES"); do
+              ONLINE=$(gh api --paginate "orgs/${ORG}/actions/runners?per_page=100" \
+                --jq "[.runners[] | select(.status==\"online\") | select(any(.labels[].name; .==\"${RUNNER_LABEL}\"))] | length" 2>/dev/null || echo 0)
+              echo "  ${ONLINE:-0}/${POOL_SIZE} online (usable at ${MIN_POOL})"
+              [ "${ONLINE:-0}" -ge "${POOL_SIZE}" ] && break
+              sleep 5
+            done
+
+            if [ "${ONLINE:-0}" -lt "${MIN_POOL}" ]; then
+              echo "::warning::attempt $attempt: ${ONLINE:-0}/${POOL_SIZE} online on $PROVIDER (need >= ${MIN_POOL}) — discarding this lease"
+              # Escrow-critical, and deliberately a literal locally-parsed --dseq so a
+              # destroy-safety lint can prove this only tears down what this loop made.
+              for _try in 1 2 3; do
+                "${JA[@]}" destroy --dseq "$DSEQ" -y 2>&1 | tee /tmp/ja-destroy.log && break
+                grep -qi "Deployment closed" /tmp/ja-destroy.log && break
+                sleep 5
+              done
+              EXCLUDED="$EXCLUDED $PROVIDER"
+              echo "::endgroup::"; continue
+            fi
+
+            {
+              echo "dseq=$DSEQ"
+              echo "provider=$PROVIDER"
+              echo "runners_online=${ONLINE}/${POOL_SIZE}"
+              echo "provision_healthy=true"
+              echo "runner_targets=[\"self-hosted\",\"linux\",\"akash\",\"${RUNNER_LABEL}\"]"
+            } >> "$GITHUB_OUTPUT"
+            if [ "${ONLINE}" -lt "${POOL_SIZE}" ]; then
+              echo "::warning title=Partial pool accepted::${ONLINE}/${POOL_SIZE} online (min ${MIN_POOL}). Usable but smaller than requested — jobs will queue. Rejecting it would also destroy the working runners."
+            fi
+            echo "pool of ${ONLINE} online on ${PROVIDER} (dseq=${DSEQ})"
+            echo "::endgroup::"; exit 0
+          done
+
+          # Name the world this failure came from. "infra" for everything is what made
+          # the hosted-runner fallback invisible.
+          if [ "$SAW_BID" = "1" ]; then
+            echo "failure_reason=RUNNER_NEVER_REGISTERED" >> "$GITHUB_OUTPUT"
+            echo "::error title=Leases won, runners never registered::A provider took the lease but the runner never came online. That provider is a candidate for runner_deny — qualify it with 'just-akash runner-probe'."
+          else
+            echo "failure_reason=PROVIDER_CAPACITY" >> "$GITHUB_OUTPUT"
+            echo "::error title=No provider bid::No eligible provider bid within the window across ${MAX_ATTEMPTS} attempts. This is a market/capacity condition, not a code failure."
+          fi
+          exit 1
