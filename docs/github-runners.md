@@ -3,12 +3,18 @@
 Two reusable workflows that run your CI on Akash instead of GitHub-hosted runners, and —
 more importantly — **tell you why** when they can't.
 
-> [!warning]
-> **`runner-v1` is not yet tagged.** The examples below use it because that is the ref you
-> will pin once it exists; until then a caller must pin a commit SHA, which is the safer
-> form anyway — a movable tag means every consumer's CI changes when it moves. The tag is
-> gated on three providers passing the full qualification bar; see *Which providers may
-> host a runner*.
+> [!note]
+> **`runner-v1` is tagged** (2026-08-07). The gate: **three providers, each passing three
+> CONSECUTIVE full-bar attempts** — 9 of 9 overall, and 3/3 per provider, which is the
+> part that matters. Consecutive-per-provider is the bar; 9/9 in aggregate would also be
+> satisfied by one provider passing nine times, and that is not the same claim. Each
+> attempt was scheduled → registered → **ran a real dispatched job** → torn down cleanly.
+> See *Which providers may host a runner*.
+>
+> **`runner-v1` is MOVABLE.** Referencing it is not pinning: when the tag moves, every
+> consumer's CI changes with it, without a commit on their side. The examples below use
+> `@runner-v1` for readability — for reproducible CI, reference a **commit SHA**, which
+> is the only immutable form.
 
 ```yaml
 jobs:
