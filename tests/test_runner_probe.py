@@ -303,9 +303,18 @@ def _driver(
 
 
 def test_a_clean_probe_passes(monkeypatch, tmp_path):
+    """A full PASS needs a job_repo: without one the job step is not attempted, and the
+    attempt correctly caps at SCHEDULED_ONLY rather than claiming an unmeasured stage."""
     _driver(monkeypatch)
     a = rp.probe_once(
-        "akash1x", sdl=tmp_path, org="o", label="l", token="t", bid_wait=1, register_timeout=1
+        "akash1x",
+        sdl=tmp_path,
+        org="o",
+        label="l",
+        token="t",
+        bid_wait=1,
+        register_timeout=1,
+        job_repo="o/private",
     )
     assert a.outcome is rp.Outcome.PASS and a.dseq == "123"
 
@@ -547,11 +556,13 @@ def test_an_undispatchable_job_is_unmeasured_not_failed(monkeypatch):
 def test_a_successful_run_is_a_measured_pass(monkeypatch):
     calls = {"n": 0}
 
-    def fake(cmd, timeout=60):
+    def fake(cmd, timeout=60, env=None):
         calls["n"] += 1
         if cmd[1] == "workflow":
             return 0, ""
-        return 0, json.dumps([{"status": "completed", "conclusion": "success"}])
+        return 0, json.dumps(
+            [{"status": "completed", "conclusion": "success", "createdAt": "2999-01-01T00:00:00Z"}]
+        )
 
     monkeypatch.setattr(rp, "_run", fake)
     monkeypatch.setattr(rp.time, "sleep", lambda s: None)
@@ -559,10 +570,12 @@ def test_a_successful_run_is_a_measured_pass(monkeypatch):
 
 
 def test_a_failed_run_is_a_measured_failure(monkeypatch):
-    def fake(cmd, timeout=60):
+    def fake(cmd, timeout=60, env=None):
         if cmd[1] == "workflow":
             return 0, ""
-        return 0, json.dumps([{"status": "completed", "conclusion": "failure"}])
+        return 0, json.dumps(
+            [{"status": "completed", "conclusion": "failure", "createdAt": "2999-01-01T00:00:00Z"}]
+        )
 
     monkeypatch.setattr(rp, "_run", fake)
     monkeypatch.setattr(rp.time, "sleep", lambda s: None)
@@ -594,3 +607,224 @@ def test_a_measured_false_still_disqualifies(monkeypatch, tmp_path):
         "akash1x", sdl=tmp_path, org="o", label="l", token="t", bid_wait=1, register_timeout=0
     )
     assert a.outcome is rp.Outcome.LEASE_NO_POD
+
+
+def test_the_registration_token_is_reminted_per_attempt(monkeypatch, tmp_path):
+    """A registration token lives ~1h and a 3x3 run can outlast it. A stale token fails
+    SILENTLY — the runner never registers, the attempt reports POD_NO_REGISTER, and
+    providers are demoted for our own expired credential."""
+    minted = []
+    monkeypatch.setattr(
+        rp, "mint_registration_token", lambda org: minted.append(org) or f"tok{len(minted)}"
+    )
+    monkeypatch.setattr(
+        rp, "probe_once", lambda *a, **k: Attempt(outcome=Outcome.PASS, observed_pod=True)
+    )
+    monkeypatch.setattr(rp, "render_sdl", lambda dest, **k: dest)
+
+    class A:
+        providers = "akash1a,akash1b"
+        attempts = 3
+        cpu = memory = storage = "x"
+        org = "acme"
+        bid_wait = register_timeout = 1
+        job_repo = ""
+
+    rp._run_probes(A(), "seed", "RUNNER_TOKEN", str(tmp_path))
+    assert len(minted) == 6, f"expected one mint per attempt (2 providers x 3), got {len(minted)}"
+
+
+def test_a_pat_is_not_reminted(monkeypatch, tmp_path):
+    """Only registration tokens expire on this timescale; a supplied PAT must be used
+    as given rather than replaced by a minted token."""
+    minted = []
+    monkeypatch.setattr(rp, "mint_registration_token", lambda org: minted.append(org) or "tok")
+    monkeypatch.setattr(
+        rp, "probe_once", lambda *a, **k: Attempt(outcome=Outcome.PASS, observed_pod=True)
+    )
+    monkeypatch.setattr(rp, "render_sdl", lambda dest, **k: dest)
+
+    class A:
+        providers = "akash1a"
+        attempts = 2
+        cpu = memory = storage = "x"
+        org = "acme"
+        bid_wait = register_timeout = 1
+        job_repo = ""
+
+    rp._run_probes(A(), "ghp_real", "ACCESS_TOKEN", str(tmp_path))
+    assert minted == [], "a PAT must not be replaced by a minted token"
+
+
+def test_a_registration_token_is_never_used_as_an_api_credential(monkeypatch, tmp_path):
+    """A runner REGISTRATION token authenticates a runner joining the org and is rejected
+    by the REST API ("Bad credentials", verified live). Forwarding it as GH_TOKEN breaks
+    the poll that decides whether the runner registered — so the runner registers fine,
+    we never see it, and a healthy provider is demoted with POD_NO_REGISTER. Measured
+    against the production-proven host on attempt 1 of a real run."""
+    seen = {}
+    monkeypatch.setattr(rp, "mint_registration_token", lambda org: "REGTOKEN")
+    monkeypatch.setattr(rp, "render_sdl", lambda dest, **k: dest)
+    monkeypatch.setattr(
+        rp,
+        "probe_once",
+        lambda *a, **k: seen.update(k) or Attempt(outcome=Outcome.PASS, observed_pod=True),
+    )
+
+    class A:
+        providers = "akash1a"
+        attempts = 1
+        cpu = memory = storage = "x"
+        org = "acme"
+        bid_wait = register_timeout = 1
+        job_repo = ""
+
+    rp._run_probes(A(), "REGTOKEN", "RUNNER_TOKEN", str(tmp_path))
+    assert seen["token"] == "REGTOKEN", "the SDL still needs the registration token"
+    assert seen["api_token"] == "", "but it must NOT be offered to the REST API"
+
+
+def test_a_pat_IS_used_as_the_api_credential(monkeypatch, tmp_path):
+    """The original finding was real for a PAT: without forwarding it the poll depends on
+    an ambient credential that may not exist."""
+    seen = {}
+    monkeypatch.setattr(rp, "render_sdl", lambda dest, **k: dest)
+    monkeypatch.setattr(
+        rp,
+        "probe_once",
+        lambda *a, **k: seen.update(k) or Attempt(outcome=Outcome.PASS, observed_pod=True),
+    )
+
+    class A:
+        providers = "akash1a"
+        attempts = 1
+        cpu = memory = storage = "x"
+        org = "acme"
+        bid_wait = register_timeout = 1
+        job_repo = ""
+
+    rp._run_probes(A(), "ghp_real", "ACCESS_TOKEN", str(tmp_path))
+    assert seen["api_token"] == "ghp_real"
+
+
+def test_registration_counts_only_ONLINE_runners(monkeypatch):
+    """Offline leftovers must not read as a live runner.
+
+    Labels repeat across runs, so dead registrations from an earlier run matched the
+    current label. Without a status filter the probe believed a runner was up, dispatched
+    the no-op job at a label owned only by corpses, and the job queued until timeout —
+    JOB_NOT_RUN, blamed on the provider. Measured with 13 offline probe runners listed
+    and zero online.
+    """
+    seen = {}
+
+    def fake(cmd, timeout=60, env=None):
+        seen["jq"] = cmd[cmd.index("--jq") + 1]
+        return 0, "1"
+
+    monkeypatch.setattr(rp, "_run", fake)
+    rp._registered("org", "probe-x", "", 1)
+    assert '.status=="online"' in seen["jq"], "an offline leftover must not count as registered"
+
+
+def test_runner_labels_are_unique_per_run(monkeypatch, tmp_path):
+    """Two runs of the same provider+attempt must not share a label, or each run inherits
+    the previous run's dead registrations."""
+    labels = []
+    monkeypatch.setattr(rp, "render_sdl", lambda dest, **k: labels.append(k["label"]) or dest)
+    monkeypatch.setattr(
+        rp, "probe_once", lambda *a, **k: Attempt(outcome=Outcome.PASS, observed_pod=True)
+    )
+
+    class A:
+        providers = "akash1aaaaaa"
+        attempts = 1
+        cpu = memory = storage = "x"
+        org = "acme"
+        bid_wait = register_timeout = 1
+        job_repo = ""
+
+    rp._run_probes(A(), "t", "ACCESS_TOKEN", str(tmp_path))
+    rp._run_probes(A(), "t", "ACCESS_TOKEN", str(tmp_path))
+    assert len(labels) == 2 and labels[0] != labels[1], f"labels collided across runs: {labels}"
+
+
+def test_a_job_that_never_leaves_queued_is_unmeasured_not_failed(monkeypatch):
+    """A run stuck in `queued` was never assigned to a runner. The usual cause is org
+    policy — GitHub blocks org self-hosted runners from PUBLIC repos unless the runner
+    group sets allows_public_repositories, and just-akash is public with it false. That
+    is OUR configuration, so reporting JOB_NOT_RUN would blame the provider for it."""
+
+    def fake(cmd, timeout=60, env=None):
+        if cmd[1] == "workflow":
+            return 0, ""
+        return 0, json.dumps(
+            [{"status": "queued", "conclusion": None, "createdAt": "2999-01-01T00:00:00Z"}]
+        )
+
+    monkeypatch.setattr(rp, "_run", fake)
+    monkeypatch.setattr(rp.time, "sleep", lambda s: None)
+    assert rp._run_noop_job("org", "label", "o/r", 0) is None
+
+
+def test_a_job_that_STARTED_and_failed_is_a_real_failure(monkeypatch):
+    """Once a runner picked it up, the verdict is about the runner."""
+
+    def fake(cmd, timeout=60, env=None):
+        if cmd[1] == "workflow":
+            return 0, ""
+        return 0, json.dumps(
+            [{"status": "completed", "conclusion": "failure", "createdAt": "2999-01-01T00:00:00Z"}]
+        )
+
+    monkeypatch.setattr(rp, "_run", fake)
+    monkeypatch.setattr(rp.time, "sleep", lambda s: None)
+    assert rp._run_noop_job("org", "label", "o/r", 0) is False
+
+
+def test_without_a_job_repo_the_attempt_cannot_reach_PASS(monkeypatch, tmp_path):
+    """No dispatch target means the job step is never attempted. That is unmeasured, and
+    unmeasured must not promote — a public job_repo left the job queued forever, so
+    silently skipping it had to cap the attempt rather than pass it."""
+    _driver(monkeypatch)
+    a = rp.probe_once(
+        "akash1x", sdl=tmp_path, org="o", label="l", token="t", bid_wait=1, register_timeout=1
+    )
+    assert a.outcome is rp.Outcome.SCHEDULED_ONLY
+
+
+def test_a_run_from_an_EARLIER_attempt_is_ignored(monkeypatch):
+    """Attempt N must not read attempt N-1's success. Without a dispatch cutoff the poll
+    takes the first completed run it sees and passes without its own job finishing —
+    every attempt after the first becomes a false PASS the moment one job fails."""
+
+    def fake(cmd, timeout=60, env=None):
+        if cmd[1] == "workflow":
+            return 0, ""
+        # A stale success from before this dispatch.
+        return 0, json.dumps(
+            [{"status": "completed", "conclusion": "success", "createdAt": "2000-01-01T00:00:00Z"}]
+        )
+
+    monkeypatch.setattr(rp, "_run", fake)
+    monkeypatch.setattr(rp.time, "sleep", lambda s: None)
+    assert rp._run_noop_job("org", "label", "o/r", 0) is None, "a stale run must not count"
+
+
+def test_the_job_poll_is_authenticated_too(monkeypatch):
+    """PAT mode must authenticate BOTH the dispatch and the poll. Authenticating only the
+    dispatch leaves the attempt unmeasured whenever no ambient credential exists."""
+    envs = []
+
+    def fake(cmd, timeout=60, env=None):
+        envs.append(env)
+        if cmd[1] == "workflow":
+            return 0, ""
+        return 0, json.dumps(
+            [{"status": "completed", "conclusion": "success", "createdAt": "2999-01-01T00:00:00Z"}]
+        )
+
+    monkeypatch.setattr(rp, "_run", fake)
+    monkeypatch.setattr(rp.time, "sleep", lambda s: None)
+    rp._run_noop_job("org", "label", "o/r", 0, api_token="ghp_x")
+    assert all(e == {"GH_TOKEN": "ghp_x"} for e in envs), f"unauthenticated call: {envs}"

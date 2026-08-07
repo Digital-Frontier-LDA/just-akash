@@ -51,6 +51,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -405,7 +406,9 @@ def _destroy(dseq: str) -> bool:
     return False
 
 
-def _run_noop_job(org: str, label: str, repo: str, timeout_s: int, token: str = "") -> bool | None:
+def _run_noop_job(
+    org: str, label: str, repo: str, timeout_s: int, api_token: str = ""
+) -> bool | None:
     """Dispatch the no-op workflow at this runner's label and wait for a conclusion.
 
     Returns True/False when a verdict was reached, and None when the job could not be
@@ -418,6 +421,13 @@ def _run_noop_job(org: str, label: str, repo: str, timeout_s: int, token: str = 
     broken work directory — so inferring it left the strongest part of the ratified bar
     unmeasured while reporting it as met.
     """
+    env = {"GH_TOKEN": api_token} if api_token else None
+    # Anything created before this instant belongs to an EARLIER attempt. Without the
+    # cutoff the poll takes the first completed run it sees, so attempt N reads attempt
+    # N-1's success and passes without its own job ever finishing. Verified not to have
+    # produced a false verdict in the 2026-08-07 qualification — 10 dispatches, 10
+    # successes, exactly 1 smoke + 9 attempts — but it would the moment one job failed.
+    dispatched_after = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 5))
     rc, _ = _run(
         [
             "gh",
@@ -430,12 +440,16 @@ def _run_noop_job(org: str, label: str, repo: str, timeout_s: int, token: str = 
             f"runner-label={label}",
         ],
         timeout=60,
+        env=env,
     )
     if rc != 0:
         return None  # not dispatchable — unmeasured, never "failed"
 
     deadline = time.time() + timeout_s
-    while time.time() < deadline:
+    # Did the run ever leave `queued`? A run that never did was never assigned to any
+    # runner, which says nothing about the provider — see the return below.
+    ever_started = False
+    while True:
         rc, out = _run(
             [
                 "gh",
@@ -446,11 +460,12 @@ def _run_noop_job(org: str, label: str, repo: str, timeout_s: int, token: str = 
                 "--workflow",
                 "runner-probe-job.yml",
                 "--limit",
-                "5",
+                "10",
                 "--json",
                 "status,conclusion,createdAt",
             ],
             timeout=60,
+            env=env,
         )
         if rc == 0 and out.strip():
             try:
@@ -458,21 +473,45 @@ def _run_noop_job(org: str, label: str, repo: str, timeout_s: int, token: str = 
             except Exception:  # noqa: BLE001 - a bad read just means "keep waiting"
                 runs = []
             for r in runs:
+                # Only runs created by THIS dispatch count.
+                if str(r.get("createdAt", "")) < dispatched_after:
+                    continue
+                if r.get("status") in ("in_progress", "completed"):
+                    ever_started = True
                 if r.get("status") == "completed":
                     return r.get("conclusion") == "success"
+        # Always take at least one reading before honouring the deadline: a zero or short
+        # timeout must mean "look once", not "never look".
+        if time.time() >= deadline:
+            break
         time.sleep(10)
+
+    # A run that NEVER left `queued` was never assigned to any runner, which is not a
+    # statement about the provider. The common cause is org policy: GitHub blocks
+    # org-level self-hosted runners from PUBLIC repositories unless the runner group sets
+    # allows_public_repositories (measured: just-akash is public and both groups have it
+    # false, so the job cannot be assigned no matter which provider hosts the runner).
+    # Reporting JOB_NOT_RUN here would blame a provider for OUR configuration.
+    if not ever_started:
+        return None
     return False
 
 
-def _registered(org: str, label: str, token: str, timeout_s: int) -> bool:
+def _registered(org: str, label: str, api_token: str, timeout_s: int) -> bool:
     """Poll GitHub for a runner carrying this probe's label.
 
-    The token is PASSED to gh, not merely accepted. It used to be an unused parameter, so
-    the call silently depended on an ambient GH_TOKEN: without one every poll fails, every
-    provider reports POD_NO_REGISTER, and the whole fleet is demoted for our own missing
-    credential rather than for anything a provider did.
+    Takes an API credential, which is NOT the same thing as the token in the SDL.
+
+    A runner REGISTRATION token authenticates a runner joining the org; it is rejected by
+    the REST API ("Bad credentials", verified). Passing it here as GH_TOKEN breaks every
+    poll, so the runner registers fine and we never see it — the attempt reports
+    POD_NO_REGISTER and demotes a healthy provider. Measured exactly that against the
+    fleet's production-proven host on the first attempt of a run.
+
+    So: a PAT is forwarded, a registration token is NOT, and empty means fall back to the
+    ambient gh credential (which is what actually works in CI and locally).
     """
-    env = {"GH_TOKEN": token} if token else None
+    env = {"GH_TOKEN": api_token} if api_token else None
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         rc, out = _run(
@@ -482,7 +521,14 @@ def _registered(org: str, label: str, token: str, timeout_s: int) -> bool:
                 "--paginate",
                 f"orgs/{org}/actions/runners?per_page=100",
                 "--jq",
-                f'[.runners[] | select(any(.labels[].name; .=="{label}"))] | length',
+                # status=="online" is LOAD-BEARING. Without it this counts OFFLINE
+                # leftovers from earlier runs — and labels repeat across runs, so a dead
+                # registration made this return True instantly while no live runner
+                # existed. The job then dispatched at a label owned only by corpses and
+                # queued until timeout: JOB_NOT_RUN blamed on the provider. Measured with
+                # 13 offline probe runners listed and zero online.
+                f'[.runners[] | select(.status=="online") '
+                f'| select(any(.labels[].name; .=="{label}"))] | length',
             ],
             timeout=60,
             env=env,
@@ -502,7 +548,10 @@ def probe_once(
     token: str,
     bid_wait: int,
     register_timeout: int,
-    job_repo: str = "Digital-Frontier-LDA/just-akash",
+    # No default: the only correct value is a PRIVATE repo the caller owns, and
+    # defaulting to the public one is what left the job queued forever.
+    job_repo: str = "",
+    api_token: str = "",
 ) -> Attempt:
     """One attempt against one provider, classified by the stage that failed."""
     started = time.time()
@@ -546,11 +595,11 @@ def probe_once(
 
         registered = job_ran = None
         if token and pod_running:
-            registered = _registered(org, label, token, register_timeout)
-            if registered:
+            registered = _registered(org, label, api_token, register_timeout)
+            if registered and job_repo:
                 # MEASURED, not inferred. `job_ran = registered` equated two different
                 # claims and left the bar's strongest step unchecked.
-                job_ran = _run_noop_job(org, label, job_repo, register_timeout, token)
+                job_ran = _run_noop_job(org, label, job_repo, register_timeout, api_token)
     finally:
         torn_down = _destroy(dseq)
 
@@ -577,6 +626,17 @@ def probe_once(
     )
 
 
+def _run_id() -> str:
+    """A short per-run tag so runner labels cannot collide across runs.
+
+    Labels were `probe-<provider>-<attempt>`, identical on every run of the same
+    provider. Offline registrations from earlier runs then matched the current label —
+    see _registered — so the probe believed a runner was up when only dead ones shared
+    the name. Derived from the temp dir, which is already unique per run.
+    """
+    return uuid.uuid4().hex[:12]
+
+
 def _run_probes(args, token: str, token_kind: str, tmpdir: str) -> list[ProviderVerdict]:
     """Probe every provider, rendering SDLs into a caller-owned temp dir.
 
@@ -587,10 +647,26 @@ def _run_probes(args, token: str, token_kind: str, tmpdir: str) -> list[Provider
     """
     providers = [p.strip() for p in args.providers.split(",") if p.strip()]
     verdicts: list[ProviderVerdict] = []
-    for provider in providers:
+    run_id = _run_id()
+    for p_idx, provider in enumerate(providers):
         v = ProviderVerdict(address=provider)
         for i in range(args.attempts):
-            label = f"probe-{provider[-6:]}-{i}"
+            # Re-mint PER ATTEMPT. A registration token lives ~1h, and a full run is
+            # providers x attempts x up to several minutes each — 3x3 can exceed the
+            # lifetime outright. A stale token does not fail loudly: the runner simply
+            # never registers, the attempt reports POD_NO_REGISTER, and providers are
+            # demoted for OUR expired credential. That is the same silent-expiry trap
+            # that made minting preferable to a PAT in the first place, reintroduced by
+            # minting only once.
+            # noqa S105: comparing an env var NAME, not a credential.
+            if token_kind == "RUNNER_TOKEN" and args.org:  # noqa: S105
+                fresh = mint_registration_token(args.org)
+                if fresh:
+                    token = fresh
+            # provider[-6:] can collide between distinct providers, and a short run id
+            # narrows the space further. Either collision lets registration polling and
+            # job dispatch latch onto ANOTHER provider's runner.
+            label = f"probe-{run_id}-{p_idx}-{i}"
             sdl = Path(tmpdir) / f"probe-{provider[-6:]}-{i}.yaml"
             render_sdl(
                 sdl,
@@ -610,6 +686,11 @@ def _run_probes(args, token: str, token_kind: str, tmpdir: str) -> list[Provider
                 token=token,
                 bid_wait=args.bid_wait,
                 register_timeout=args.register_timeout,
+                job_repo=args.job_repo,
+                # Only a PAT is an API credential. A registration token is rejected by
+                # the REST API, so forwarding it would break the very poll that decides
+                # whether the runner registered.
+                api_token=token if token_kind == "ACCESS_TOKEN" else "",  # noqa: S105
             )
             v.attempts.append(a)
             print(
@@ -633,6 +714,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--required", type=int, default=REQUIRED_CONSECUTIVE_PASSES)
     ap.add_argument("--bid-wait", type=int, default=60)
     ap.add_argument("--register-timeout", type=int, default=REGISTER_TIMEOUT_S)
+    ap.add_argument(
+        "--job-repo",
+        default="",
+        help=(
+            "Repo hosting runner-probe-job.yml for the no-op job step. MUST be PRIVATE or "
+            "internal: GitHub refuses to assign org self-hosted runners to public repos "
+            "unless the runner group sets allows_public_repositories, so a public target "
+            "leaves the job queued forever and the step unmeasurable. Empty skips job "
+            "verification, which caps every attempt at SCHEDULED_ONLY."
+        ),
+    )
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
 
