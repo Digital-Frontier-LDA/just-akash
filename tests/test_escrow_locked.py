@@ -105,11 +105,15 @@ class TestFundsNotTransferred:
     """
 
     def test_transferred_is_ignored(self):
-        c = _client([_deployment(1, 5_000_000)])
-        detail = c.get_deployment.return_value
+        # Mutate the deployment the mock actually SERVES. `_client` wires
+        # get_deployment via side_effect, so `get_deployment.return_value` is an unused
+        # MagicMock — writing `transferred` there set the field on nothing, and this
+        # test passed without ever exercising the behaviour it names.
+        dep = _deployment(1, 5_000_000)
         # Real payloads carry BOTH; only `funds` is the remaining balance.
-        detail["escrow_account"]["state"]["transferred"] = [
+        dep["escrow_account"]["state"]["transferred"] = [
             {"denom": "uact", "amount": "2789555.0000000000"}
         ]
+        c = _client([dep])
         r = escrow_locked(c)
         assert r["locked_uact"] == 5_000_000, "transferred leaked into the locked total"
