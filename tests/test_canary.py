@@ -187,6 +187,19 @@ def test_deployed_defaults_to_reachable_for_callers_that_do_not_track_targets():
     assert st[ALPHA]["deployed"] == 1
 
 
+def test_a_scraped_provider_is_never_recorded_as_undeployed():
+    """reachable implies deployed, ENFORCED. Letting an explicit deployed=False win over a
+    successful scrape would under-count active_deployments for a provider we demonstrably
+    reached -- and fleet-wide that pages AkashCanaryNoDeployments critical while every
+    akash_canary_reachable reads 1, a page that contradicts the series next to it.
+    Raised by CodeRabbit on #129; unreachable from main() today, pinned so it stays that way."""
+    st = merge({}, ALPHA, "100", True, _body("aaa"), 0.1, 1000.0, deployed=False)
+    assert st[ALPHA]["reachable"] == 1
+    assert st[ALPHA]["deployed"] == 1
+    samples = parse_exposition(render(st, 1.0))
+    assert samples[("akash_canary_active_deployments", ())] == 1.0
+
+
 def test_render_omits_missing_gauges_rather_than_emitting_none():
     """A provider that has never been reachable has no inside-the-deployment values. It
     must be absent from those series, not published as a literal `None`, which would make

@@ -144,7 +144,8 @@ def merge(
     `reachable`: a provider with no canary is not an unreachable provider, it is a
     provider we never tried. Defaults to `reachable` because main() short-circuits the
     scrape when there is no URI, so reachable implies deployed, and that keeps every
-    caller which does not track targets itself correct.
+    caller which does not track targets itself correct. That implication is ENFORCED, not
+    assumed: a reachable provider is always recorded as deployed, whatever is passed here.
     """
     p = dict(prev.get(provider, {}))
     p.setdefault("restarts_total", 0)
@@ -156,7 +157,12 @@ def merge(
 
     p["checks_total"] += 1
     p["reachable"] = 1 if reachable else 0
-    p["deployed"] = 1 if (reachable if deployed is None else deployed) else 0
+    # reachable IMPLIES deployed, enforced here rather than left true by construction. Letting
+    # an explicit deployed=False win over a successful scrape would publish deployed=0 for a
+    # provider the collector demonstrably reached, so active_deployments would under-count it
+    # -- and fleet-wide that pages AkashCanaryNoDeployments critical while every reachable
+    # reads 1. A metric that can contradict its neighbour is the failure this change removes.
+    p["deployed"] = int(reachable or bool(deployed))
     p["scrape_seconds"] = round(elapsed, 4)
     p["last_collect"] = now
 
