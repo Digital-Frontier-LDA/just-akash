@@ -1,0 +1,96 @@
+---
+# Qualify a provider as a RUNNER HOST — a different question from "is it healthy".
+#
+# A provider can be online, have huge free capacity, bid, WIN — and never schedule the
+# runner pod. Recorded for three providers at BOTH 16Gi/30Gi and 32Gi/30Gi, so it is not
+# a memory-size problem; ephemeral storage and the port-80 global ingress below are the
+# live hypotheses. That failure is WORSE than no bid: the lease consumes the attempt,
+# holds escrow, and stalls to the timeout. One instance was traced to an 1800s stall.
+#
+# So this SDL exists to reproduce that failure deliberately, on ONE provider at a time,
+# at the caller's real profile — because a provider qualified at 30Gi is NOT thereby
+# qualified at 100Gi, and storage is the tightest constraint on eligibility.
+#
+# ⚠️ THE SERVICE IS NAMED `probe` ON PURPOSE, AND RENAMING IT LEAKS ESCROW.
+# cleanup_stale classifies by SERVICE SET, not by tag (just_akash/cleanup_stale.py:63):
+#     services == {probe}     -> STALE after 1h  -> reaped
+#     services == {backtest}  -> STALE after 48h -> reaped
+#     anything else           -> LEAVE (unclassifiable)
+# A distinctive name like `runner-probe` would fall into that last branch and accumulate
+# FOREVER, holding escrow against the same grant the CI pool spends from — i.e. this
+# qualification tool would degrade the thing it exists to fix. Reusing `probe` inherits
+# the proven reaper instead of adding a parallel one. The 1h threshold cannot kill an
+# in-flight probe: a pass completes in minutes, and a hang is exactly what we want reaped.
+#
+# TWO WAYS TO AUTHENTICATE, and the second is why this can run without a PAT.
+# The base image is myoung34/github-runner, which accepts EITHER:
+#   ACCESS_TOKEN=<PAT>            it mints a registration token itself
+#   RUNNER_TOKEN=<registration>   a short-lived token minted by the caller
+# The second needs only `admin:org` on whatever credential the OPERATOR already holds
+# (`gh api -X POST /orgs/{org}/actions/runners/registration-token`), so a full
+# qualification no longer waits on someone provisioning a long-lived PAT — which matters
+# because a PAT expiry is silent and looks exactly like a provider fault.
+#
+# NO REAL TOKEN AT ALL still answers the primary question: with a placeholder the
+# container must still be SCHEDULED and started, which is the discriminator. It simply
+# fails to register afterwards. Supply a real one for the stronger check (registers, runs
+# a no-op job) that the quorum requires before promoting a provider to runner_host.
+#
+# Placeholders substituted by the probe: {{CPU}} {{MEMORY}} {{STORAGE}} {{TOKEN_ENV}}
+# {{ORG_NAME}} {{RUNNER_NAME_PREFIX}} {{LABELS}}
+
+version: "2.0"
+
+services:
+  probe:
+    # Pinned by DIGEST, not :latest. A floating tag can change between the three fresh
+    # provisions a qualification requires, so the streak would be measuring different
+    # runner artifacts rather than one provider capability — and a provider promoted on
+    # one image would be trusted while running another. Requalify when this digest moves.
+    image: ghcr.io/akash-network/github-runner@sha256:030ae11a6b597c5db28b12375461e35f694d74ceb06a1b73c90545b1adef16da
+    env:
+      - {{TOKEN_ENV}}
+      - ORG_NAME={{ORG_NAME}}
+      - RUNNER_SCOPE=org
+      - RUNNER_NAME_PREFIX={{RUNNER_NAME_PREFIX}}
+      - LABELS={{LABELS}}
+      # EPHEMERAL=true so a probe that DOES register removes itself after one job
+      # rather than lingering as an offline registration. Offline registrations
+      # overflowed the org's runner-listing first page once and broke provisioning
+      # for every repo, so a qualification run must not contribute to that.
+      - EPHEMERAL=true
+      - DISABLE_AUTO_UPDATE=true
+      - RUNNER_WORKDIR=/_work
+      - RUN_AS_ROOT=true
+    expose:
+      # Port 80 global is part of what is being tested, not incidental: it is one of
+      # the two live hypotheses for the lease-but-never-schedule failures. Removing it
+      # would make the probe pass on providers the real runner cannot use.
+      - port: 80
+        as: 80
+        to:
+          - global: true
+
+profiles:
+  compute:
+    probe:
+      resources:
+        cpu:
+          units: {{CPU}}
+        memory:
+          size: {{MEMORY}}
+        storage:
+          size: {{STORAGE}}
+
+  placement:
+    probe:
+      pricing:
+        probe:
+          denom: uact
+          amount: 100000
+
+deployment:
+  probe:
+    probe:
+      profile: probe
+      count: 1
