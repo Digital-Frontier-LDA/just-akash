@@ -51,6 +51,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -488,7 +489,14 @@ def _registered(org: str, label: str, api_token: str, timeout_s: int) -> bool:
                 "--paginate",
                 f"orgs/{org}/actions/runners?per_page=100",
                 "--jq",
-                f'[.runners[] | select(any(.labels[].name; .=="{label}"))] | length',
+                # status=="online" is LOAD-BEARING. Without it this counts OFFLINE
+                # leftovers from earlier runs — and labels repeat across runs, so a dead
+                # registration made this return True instantly while no live runner
+                # existed. The job then dispatched at a label owned only by corpses and
+                # queued until timeout: JOB_NOT_RUN blamed on the provider. Measured with
+                # 13 offline probe runners listed and zero online.
+                f'[.runners[] | select(.status=="online") '
+                f'| select(any(.labels[].name; .=="{label}"))] | length',
             ],
             timeout=60,
             env=env,
@@ -584,6 +592,17 @@ def probe_once(
     )
 
 
+def _run_id() -> str:
+    """A short per-run tag so runner labels cannot collide across runs.
+
+    Labels were `probe-<provider>-<attempt>`, identical on every run of the same
+    provider. Offline registrations from earlier runs then matched the current label —
+    see _registered — so the probe believed a runner was up when only dead ones shared
+    the name. Derived from the temp dir, which is already unique per run.
+    """
+    return uuid.uuid4().hex[:6]
+
+
 def _run_probes(args, token: str, token_kind: str, tmpdir: str) -> list[ProviderVerdict]:
     """Probe every provider, rendering SDLs into a caller-owned temp dir.
 
@@ -594,6 +613,7 @@ def _run_probes(args, token: str, token_kind: str, tmpdir: str) -> list[Provider
     """
     providers = [p.strip() for p in args.providers.split(",") if p.strip()]
     verdicts: list[ProviderVerdict] = []
+    run_id = _run_id()
     for provider in providers:
         v = ProviderVerdict(address=provider)
         for i in range(args.attempts):
@@ -609,7 +629,7 @@ def _run_probes(args, token: str, token_kind: str, tmpdir: str) -> list[Provider
                 fresh = mint_registration_token(args.org)
                 if fresh:
                     token = fresh
-            label = f"probe-{provider[-6:]}-{i}"
+            label = f"probe-{run_id}-{provider[-6:]}-{i}"
             sdl = Path(tmpdir) / f"probe-{provider[-6:]}-{i}.yaml"
             render_sdl(
                 sdl,

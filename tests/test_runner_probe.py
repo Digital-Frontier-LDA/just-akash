@@ -688,3 +688,44 @@ def test_a_pat_IS_used_as_the_api_credential(monkeypatch, tmp_path):
 
     rp._run_probes(A(), "ghp_real", "ACCESS_TOKEN", str(tmp_path))
     assert seen["api_token"] == "ghp_real"
+
+
+def test_registration_counts_only_ONLINE_runners(monkeypatch):
+    """Offline leftovers must not read as a live runner.
+
+    Labels repeat across runs, so dead registrations from an earlier run matched the
+    current label. Without a status filter the probe believed a runner was up, dispatched
+    the no-op job at a label owned only by corpses, and the job queued until timeout —
+    JOB_NOT_RUN, blamed on the provider. Measured with 13 offline probe runners listed
+    and zero online.
+    """
+    seen = {}
+
+    def fake(cmd, timeout=60, env=None):
+        seen["jq"] = cmd[cmd.index("--jq") + 1]
+        return 0, "1"
+
+    monkeypatch.setattr(rp, "_run", fake)
+    rp._registered("org", "probe-x", "", 1)
+    assert '.status=="online"' in seen["jq"], "an offline leftover must not count as registered"
+
+
+def test_runner_labels_are_unique_per_run(monkeypatch, tmp_path):
+    """Two runs of the same provider+attempt must not share a label, or each run inherits
+    the previous run's dead registrations."""
+    labels = []
+    monkeypatch.setattr(rp, "render_sdl", lambda dest, **k: labels.append(k["label"]) or dest)
+    monkeypatch.setattr(
+        rp, "probe_once", lambda *a, **k: Attempt(outcome=Outcome.PASS, observed_pod=True)
+    )
+
+    class A:
+        providers = "akash1aaaaaa"
+        attempts = 1
+        cpu = memory = storage = "x"
+        org = "acme"
+        bid_wait = register_timeout = 1
+
+    rp._run_probes(A(), "t", "ACCESS_TOKEN", str(tmp_path))
+    rp._run_probes(A(), "t", "ACCESS_TOKEN", str(tmp_path))
+    assert len(labels) == 2 and labels[0] != labels[1], f"labels collided across runs: {labels}"
