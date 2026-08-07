@@ -7,6 +7,8 @@ ever say clean when it should not". Each test below is one way it could.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from just_akash.orphan_detect import (
@@ -213,3 +215,32 @@ def test_the_classifier_actually_discriminates(monkeypatch, readings, expected):
     everything would pass a single-case test — that is how an unvalidated detector got
     shipped here before."""
     assert _classify(monkeypatch, readings).classification is expected
+
+
+# --------------------------------------------------------------------------
+# It must be REACHABLE — a module with zero callers protects nothing
+# --------------------------------------------------------------------------
+
+
+def test_orphan_scan_is_wired_into_the_cli():
+    """This module was initially referenced only from its own tests. A detector nobody
+    can invoke is the 'ratified but never invoked' failure: it looks like the problem is
+    handled while no runtime path uses it."""
+    from just_akash import cli
+
+    src = Path(cli.__file__).read_text()
+    assert '"orphan-scan"' in src, "no subcommand registers it"
+    assert 'args.command == "orphan-scan"' in src, "no dispatch branch invokes it"
+    assert "classify_deployment(" in src, "the classifier is never actually called"
+
+
+def test_a_degraded_scan_does_not_exit_zero():
+    """A caller checking only the exit status must not read an incomplete scan as a
+    clean fleet — the same false-clean the classifier refuses one level down."""
+    from just_akash import cli
+
+    src = Path(cli.__file__).read_text()
+    block = src[
+        src.index('args.command == "orphan-scan"') : src.index('args.command == "lease-status"')
+    ]
+    assert "if report.is_degraded:" in block and "sys.exit(1)" in block
