@@ -406,7 +406,9 @@ def _destroy(dseq: str) -> bool:
     return False
 
 
-def _run_noop_job(org: str, label: str, repo: str, timeout_s: int, token: str = "") -> bool | None:
+def _run_noop_job(
+    org: str, label: str, repo: str, timeout_s: int, api_token: str = ""
+) -> bool | None:
     """Dispatch the no-op workflow at this runner's label and wait for a conclusion.
 
     Returns True/False when a verdict was reached, and None when the job could not be
@@ -419,6 +421,13 @@ def _run_noop_job(org: str, label: str, repo: str, timeout_s: int, token: str = 
     broken work directory — so inferring it left the strongest part of the ratified bar
     unmeasured while reporting it as met.
     """
+    env = {"GH_TOKEN": api_token} if api_token else None
+    # Anything created before this instant belongs to an EARLIER attempt. Without the
+    # cutoff the poll takes the first completed run it sees, so attempt N reads attempt
+    # N-1's success and passes without its own job ever finishing. Verified not to have
+    # produced a false verdict in the 2026-08-07 qualification — 10 dispatches, 10
+    # successes, exactly 1 smoke + 9 attempts — but it would the moment one job failed.
+    dispatched_after = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 5))
     rc, _ = _run(
         [
             "gh",
@@ -431,6 +440,7 @@ def _run_noop_job(org: str, label: str, repo: str, timeout_s: int, token: str = 
             f"runner-label={label}",
         ],
         timeout=60,
+        env=env,
     )
     if rc != 0:
         return None  # not dispatchable — unmeasured, never "failed"
@@ -450,11 +460,12 @@ def _run_noop_job(org: str, label: str, repo: str, timeout_s: int, token: str = 
                 "--workflow",
                 "runner-probe-job.yml",
                 "--limit",
-                "5",
+                "10",
                 "--json",
                 "status,conclusion,createdAt",
             ],
             timeout=60,
+            env=env,
         )
         if rc == 0 and out.strip():
             try:
@@ -462,6 +473,9 @@ def _run_noop_job(org: str, label: str, repo: str, timeout_s: int, token: str = 
             except Exception:  # noqa: BLE001 - a bad read just means "keep waiting"
                 runs = []
             for r in runs:
+                # Only runs created by THIS dispatch count.
+                if str(r.get("createdAt", "")) < dispatched_after:
+                    continue
                 if r.get("status") in ("in_progress", "completed"):
                     ever_started = True
                 if r.get("status") == "completed":
@@ -620,7 +634,7 @@ def _run_id() -> str:
     see _registered — so the probe believed a runner was up when only dead ones shared
     the name. Derived from the temp dir, which is already unique per run.
     """
-    return uuid.uuid4().hex[:6]
+    return uuid.uuid4().hex[:12]
 
 
 def _run_probes(args, token: str, token_kind: str, tmpdir: str) -> list[ProviderVerdict]:
@@ -634,7 +648,7 @@ def _run_probes(args, token: str, token_kind: str, tmpdir: str) -> list[Provider
     providers = [p.strip() for p in args.providers.split(",") if p.strip()]
     verdicts: list[ProviderVerdict] = []
     run_id = _run_id()
-    for provider in providers:
+    for p_idx, provider in enumerate(providers):
         v = ProviderVerdict(address=provider)
         for i in range(args.attempts):
             # Re-mint PER ATTEMPT. A registration token lives ~1h, and a full run is
@@ -649,7 +663,10 @@ def _run_probes(args, token: str, token_kind: str, tmpdir: str) -> list[Provider
                 fresh = mint_registration_token(args.org)
                 if fresh:
                     token = fresh
-            label = f"probe-{run_id}-{provider[-6:]}-{i}"
+            # provider[-6:] can collide between distinct providers, and a short run id
+            # narrows the space further. Either collision lets registration polling and
+            # job dispatch latch onto ANOTHER provider's runner.
+            label = f"probe-{run_id}-{p_idx}-{i}"
             sdl = Path(tmpdir) / f"probe-{provider[-6:]}-{i}.yaml"
             render_sdl(
                 sdl,

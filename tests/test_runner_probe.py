@@ -556,11 +556,13 @@ def test_an_undispatchable_job_is_unmeasured_not_failed(monkeypatch):
 def test_a_successful_run_is_a_measured_pass(monkeypatch):
     calls = {"n": 0}
 
-    def fake(cmd, timeout=60):
+    def fake(cmd, timeout=60, env=None):
         calls["n"] += 1
         if cmd[1] == "workflow":
             return 0, ""
-        return 0, json.dumps([{"status": "completed", "conclusion": "success"}])
+        return 0, json.dumps(
+            [{"status": "completed", "conclusion": "success", "createdAt": "2999-01-01T00:00:00Z"}]
+        )
 
     monkeypatch.setattr(rp, "_run", fake)
     monkeypatch.setattr(rp.time, "sleep", lambda s: None)
@@ -568,10 +570,12 @@ def test_a_successful_run_is_a_measured_pass(monkeypatch):
 
 
 def test_a_failed_run_is_a_measured_failure(monkeypatch):
-    def fake(cmd, timeout=60):
+    def fake(cmd, timeout=60, env=None):
         if cmd[1] == "workflow":
             return 0, ""
-        return 0, json.dumps([{"status": "completed", "conclusion": "failure"}])
+        return 0, json.dumps(
+            [{"status": "completed", "conclusion": "failure", "createdAt": "2999-01-01T00:00:00Z"}]
+        )
 
     monkeypatch.setattr(rp, "_run", fake)
     monkeypatch.setattr(rp.time, "sleep", lambda s: None)
@@ -754,7 +758,9 @@ def test_a_job_that_never_leaves_queued_is_unmeasured_not_failed(monkeypatch):
     def fake(cmd, timeout=60, env=None):
         if cmd[1] == "workflow":
             return 0, ""
-        return 0, json.dumps([{"status": "queued", "conclusion": None}])
+        return 0, json.dumps(
+            [{"status": "queued", "conclusion": None, "createdAt": "2999-01-01T00:00:00Z"}]
+        )
 
     monkeypatch.setattr(rp, "_run", fake)
     monkeypatch.setattr(rp.time, "sleep", lambda s: None)
@@ -767,7 +773,9 @@ def test_a_job_that_STARTED_and_failed_is_a_real_failure(monkeypatch):
     def fake(cmd, timeout=60, env=None):
         if cmd[1] == "workflow":
             return 0, ""
-        return 0, json.dumps([{"status": "completed", "conclusion": "failure"}])
+        return 0, json.dumps(
+            [{"status": "completed", "conclusion": "failure", "createdAt": "2999-01-01T00:00:00Z"}]
+        )
 
     monkeypatch.setattr(rp, "_run", fake)
     monkeypatch.setattr(rp.time, "sleep", lambda s: None)
@@ -783,3 +791,40 @@ def test_without_a_job_repo_the_attempt_cannot_reach_PASS(monkeypatch, tmp_path)
         "akash1x", sdl=tmp_path, org="o", label="l", token="t", bid_wait=1, register_timeout=1
     )
     assert a.outcome is rp.Outcome.SCHEDULED_ONLY
+
+
+def test_a_run_from_an_EARLIER_attempt_is_ignored(monkeypatch):
+    """Attempt N must not read attempt N-1's success. Without a dispatch cutoff the poll
+    takes the first completed run it sees and passes without its own job finishing —
+    every attempt after the first becomes a false PASS the moment one job fails."""
+
+    def fake(cmd, timeout=60, env=None):
+        if cmd[1] == "workflow":
+            return 0, ""
+        # A stale success from before this dispatch.
+        return 0, json.dumps(
+            [{"status": "completed", "conclusion": "success", "createdAt": "2000-01-01T00:00:00Z"}]
+        )
+
+    monkeypatch.setattr(rp, "_run", fake)
+    monkeypatch.setattr(rp.time, "sleep", lambda s: None)
+    assert rp._run_noop_job("org", "label", "o/r", 0) is None, "a stale run must not count"
+
+
+def test_the_job_poll_is_authenticated_too(monkeypatch):
+    """PAT mode must authenticate BOTH the dispatch and the poll. Authenticating only the
+    dispatch leaves the attempt unmeasured whenever no ambient credential exists."""
+    envs = []
+
+    def fake(cmd, timeout=60, env=None):
+        envs.append(env)
+        if cmd[1] == "workflow":
+            return 0, ""
+        return 0, json.dumps(
+            [{"status": "completed", "conclusion": "success", "createdAt": "2999-01-01T00:00:00Z"}]
+        )
+
+    monkeypatch.setattr(rp, "_run", fake)
+    monkeypatch.setattr(rp.time, "sleep", lambda s: None)
+    rp._run_noop_job("org", "label", "o/r", 0, api_token="ghp_x")
+    assert all(e == {"GH_TOKEN": "ghp_x"} for e in envs), f"unauthenticated call: {envs}"
