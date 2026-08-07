@@ -770,3 +770,26 @@ def test_a_non_dict_row_is_an_error_not_a_silent_skip():
     details, errors = fetch(_FakeClient({}), ["not-an-object", None])
     assert details == []
     assert len(errors) == 2 and all("not an object" in e for e in errors)
+
+
+def test_a_document_without_deployments_is_refused(tmp_path):
+    """`{"complete": true}` is the worst shape to accept: _as_list yields [], plan() reads
+    that as a genuine empty account, and every provider gets a duplicate canary. A
+    truncated write or a hand-edited file produces exactly this."""
+    p = _write(tmp_path, "details.json", {"complete": True})
+    try:
+        load_details(p)
+    except ValueError as exc:
+        assert "deployments" in str(exc)
+    else:
+        raise AssertionError("a document with no deployments list must be refused")
+
+
+def test_a_non_list_deployments_value_is_refused(tmp_path):
+    p = _write(tmp_path, "details.json", {"complete": True, "deployments": {"a": 1}})
+    try:
+        load_details(p)
+    except ValueError as exc:
+        assert "deployments" in str(exc)
+    else:
+        raise AssertionError("deployments must be a list")

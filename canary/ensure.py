@@ -140,19 +140,30 @@ def load_details(path: pathlib.Path) -> dict:
     the exact failure this module was rewritten to remove, so it must not be reachable by
     passing the wrong filename.
 
-    The `complete` key is what makes the document self-identifying: details.py always writes
-    it, and nothing else in the repo produces it. Requiring it here turns a silent
-    misinterpretation into a loud stop, which is the same trade `list_deployments` makes
-    when it refuses to report an unrecognised envelope as an empty account.
+    BOTH keys are required, not just `complete`. details.py always writes the pair, and
+    nothing else in the repo produces it, so demanding both is what makes the document
+    self-identifying. Checking only `complete` left `{"complete": true}` acceptable — and
+    that is the worst possible shape to accept: `_as_list` yields [], which plan() reads as
+    a genuine empty account and answers by deploying onto every provider. A truncated write
+    or a hand-edited file would do it.
+
+    Same trade `list_deployments` makes when it refuses to report an unrecognised envelope
+    as an empty account: loud beats plausible whenever the next step spends money.
     """
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict) or "complete" not in payload:
+    if not isinstance(payload, dict):
         kind = "a list" if isinstance(payload, list) else type(payload).__name__
         raise ValueError(
-            f"{path} is not a details document (parsed as {kind}, no 'complete' key). "
-            "Generate it with `python -m canary.details --listing ... --out ...`; passing "
-            "`just-akash list --json` output here would make every provider look like it "
-            "has no canary and deploy a duplicate onto each one."
+            f"{path} is not a details document (parsed as {kind}). Generate it with "
+            "`python -m canary.details --listing ... --out ...`; passing `just-akash list "
+            "--json` output here would make every provider look like it has no canary and "
+            "deploy a duplicate onto each one."
+        )
+    if "complete" not in payload or not isinstance(payload.get("deployments"), list):
+        raise ValueError(
+            f"{path} is missing 'complete' and/or a list-valued 'deployments' "
+            f"(keys: {sorted(payload)[:6]}). Refusing to read a half-written document as "
+            "an empty account — that would deploy a duplicate canary onto every provider."
         )
     return payload
 
