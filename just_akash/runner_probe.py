@@ -667,13 +667,18 @@ def main(argv: list[str] | None = None) -> int:
     # registration token (~1h) readable on disk after exit. On a shared or self-hosted
     # runner a later job could read them.
     with tempfile.TemporaryDirectory(prefix="akash-probe-") as tmpdir:
+        # The insecure-file-permissions rule reads 0o700 as "widely permissive" and
+        # recommends 0o644. That is exactly backwards for a DIRECTORY holding live
+        # credentials: 0o700 is owner-only, while the suggested 0o644 is world-READABLE and
+        # would hand any other user on the box the PAT this block exists to protect.
+        # Suppressed at the line rather than via the Justfile's --exclude-rule convention,
+        # which would disable the check for every future chmod in the package — including
+        # one that really is too permissive.
+        #
+        # The suppression MUST stay on the line directly above the call; semgrep only reads
+        # it there or trailing the match, so an explanatory block between the two silently
+        # does nothing (measured — the first attempt still failed CI).
         # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
-        # The rule reads 0o700 as "widely permissive" and recommends 0o644. That is exactly
-        # backwards for a DIRECTORY holding live credentials: 0o700 is owner-only, while the
-        # suggested 0o644 is world-READABLE and would hand any other user on the box the PAT
-        # this block exists to protect. Suppressed at the line rather than via the Justfile's
-        # --exclude-rule convention, which would disable the check for every future chmod in
-        # the package — including one that really is too permissive.
         os.chmod(tmpdir, 0o700)
         verdicts = _run_probes(args, token, token_kind, tmpdir)
 
