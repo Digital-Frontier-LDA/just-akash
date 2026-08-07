@@ -464,15 +464,21 @@ def _run_noop_job(org: str, label: str, repo: str, timeout_s: int, token: str = 
     return False
 
 
-def _registered(org: str, label: str, token: str, timeout_s: int) -> bool:
+def _registered(org: str, label: str, api_token: str, timeout_s: int) -> bool:
     """Poll GitHub for a runner carrying this probe's label.
 
-    The token is PASSED to gh, not merely accepted. It used to be an unused parameter, so
-    the call silently depended on an ambient GH_TOKEN: without one every poll fails, every
-    provider reports POD_NO_REGISTER, and the whole fleet is demoted for our own missing
-    credential rather than for anything a provider did.
+    Takes an API credential, which is NOT the same thing as the token in the SDL.
+
+    A runner REGISTRATION token authenticates a runner joining the org; it is rejected by
+    the REST API ("Bad credentials", verified). Passing it here as GH_TOKEN breaks every
+    poll, so the runner registers fine and we never see it — the attempt reports
+    POD_NO_REGISTER and demotes a healthy provider. Measured exactly that against the
+    fleet's production-proven host on the first attempt of a run.
+
+    So: a PAT is forwarded, a registration token is NOT, and empty means fall back to the
+    ambient gh credential (which is what actually works in CI and locally).
     """
-    env = {"GH_TOKEN": token} if token else None
+    env = {"GH_TOKEN": api_token} if api_token else None
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         rc, out = _run(
@@ -503,6 +509,7 @@ def probe_once(
     bid_wait: int,
     register_timeout: int,
     job_repo: str = "Digital-Frontier-LDA/just-akash",
+    api_token: str = "",
 ) -> Attempt:
     """One attempt against one provider, classified by the stage that failed."""
     started = time.time()
@@ -546,11 +553,11 @@ def probe_once(
 
         registered = job_ran = None
         if token and pod_running:
-            registered = _registered(org, label, token, register_timeout)
+            registered = _registered(org, label, api_token, register_timeout)
             if registered:
                 # MEASURED, not inferred. `job_ran = registered` equated two different
                 # claims and left the bar's strongest step unchecked.
-                job_ran = _run_noop_job(org, label, job_repo, register_timeout, token)
+                job_ran = _run_noop_job(org, label, job_repo, register_timeout, api_token)
     finally:
         torn_down = _destroy(dseq)
 
@@ -622,6 +629,10 @@ def _run_probes(args, token: str, token_kind: str, tmpdir: str) -> list[Provider
                 token=token,
                 bid_wait=args.bid_wait,
                 register_timeout=args.register_timeout,
+                # Only a PAT is an API credential. A registration token is rejected by
+                # the REST API, so forwarding it would break the very poll that decides
+                # whether the runner registered.
+                api_token=token if token_kind == "ACCESS_TOKEN" else "",  # noqa: S105
             )
             v.attempts.append(a)
             print(

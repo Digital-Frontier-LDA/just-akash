@@ -639,3 +639,52 @@ def test_a_pat_is_not_reminted(monkeypatch, tmp_path):
 
     rp._run_probes(A(), "ghp_real", "ACCESS_TOKEN", str(tmp_path))
     assert minted == [], "a PAT must not be replaced by a minted token"
+
+
+def test_a_registration_token_is_never_used_as_an_api_credential(monkeypatch, tmp_path):
+    """A runner REGISTRATION token authenticates a runner joining the org and is rejected
+    by the REST API ("Bad credentials", verified live). Forwarding it as GH_TOKEN breaks
+    the poll that decides whether the runner registered — so the runner registers fine,
+    we never see it, and a healthy provider is demoted with POD_NO_REGISTER. Measured
+    against the production-proven host on attempt 1 of a real run."""
+    seen = {}
+    monkeypatch.setattr(rp, "mint_registration_token", lambda org: "REGTOKEN")
+    monkeypatch.setattr(rp, "render_sdl", lambda dest, **k: dest)
+    monkeypatch.setattr(
+        rp,
+        "probe_once",
+        lambda *a, **k: seen.update(k) or Attempt(outcome=Outcome.PASS, observed_pod=True),
+    )
+
+    class A:
+        providers = "akash1a"
+        attempts = 1
+        cpu = memory = storage = "x"
+        org = "acme"
+        bid_wait = register_timeout = 1
+
+    rp._run_probes(A(), "REGTOKEN", "RUNNER_TOKEN", str(tmp_path))
+    assert seen["token"] == "REGTOKEN", "the SDL still needs the registration token"
+    assert seen["api_token"] == "", "but it must NOT be offered to the REST API"
+
+
+def test_a_pat_IS_used_as_the_api_credential(monkeypatch, tmp_path):
+    """The original finding was real for a PAT: without forwarding it the poll depends on
+    an ambient credential that may not exist."""
+    seen = {}
+    monkeypatch.setattr(rp, "render_sdl", lambda dest, **k: dest)
+    monkeypatch.setattr(
+        rp,
+        "probe_once",
+        lambda *a, **k: seen.update(k) or Attempt(outcome=Outcome.PASS, observed_pod=True),
+    )
+
+    class A:
+        providers = "akash1a"
+        attempts = 1
+        cpu = memory = storage = "x"
+        org = "acme"
+        bid_wait = register_timeout = 1
+
+    rp._run_probes(A(), "ghp_real", "ACCESS_TOKEN", str(tmp_path))
+    assert seen["api_token"] == "ghp_real"
