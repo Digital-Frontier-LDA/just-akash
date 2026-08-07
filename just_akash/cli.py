@@ -492,6 +492,21 @@ def main():
         "the set worth closing to stop escrow bleed.",
     )
 
+    # ── orphan-scan ────────────────────────────────────
+    orph_p = subparsers.add_parser(
+        "orphan-scan",
+        help="Find deployments that hold escrow and will NEVER get a lease, classified "
+        "from authoritative on-chain ORDER state (an open order is the only path to a "
+        "lease). Report-only: it destroys nothing.",
+    )
+    orph_p.add_argument("--json", action="store_true", help="Output in JSON format")
+    orph_p.add_argument(
+        "--reapable-only",
+        action="store_true",
+        help="Show only orphans confirmed by >=2 independent LCD endpoints — the set a "
+        "reaper could act on. A single endpoint is a reading, not a confirmation.",
+    )
+
     # ── capacity-probe ─────────────────────────────────
     cap_p = subparsers.add_parser(
         "capacity-probe",
@@ -980,6 +995,89 @@ def main():
                     exp = (grant.get("expiration") or "")[:10] or "no expiry"
                     print(f"  credit grant:   from {grant.get('granter')} (expires {exp})")
                 print(f"  source:         {chain.rest_url()}")
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    # ── orphan-scan ────────────────────────────────────
+    elif args.command == "orphan-scan":
+        import json
+
+        from .api import AkashConsoleAPI, lease_status
+        from .orphan_detect import Classification, FleetReport, classify_deployment
+
+        try:
+            client = AkashConsoleAPI(_require_api_key())
+            use_json = args.json or not sys.stdout.isatty()
+            owner = client.account_address()
+            rows = lease_status(client, active_only=True)
+
+            report = FleetReport()
+            for r in rows:
+                report.verdicts.append(
+                    classify_deployment(
+                        str(r.get("dseq")),
+                        owner,
+                        deployment_state=str(r.get("deployment_state", "")),
+                        lease_count=int(r.get("lease_count", 0) or 0),
+                        escrow_uact=int(r.get("escrow_remaining_uact", 0) or 0),
+                    )
+                )
+
+            # An UNKNOWN row is not a clean row. Surfacing it at fleet level stops a
+            # caller that reads only `orphaned` from treating a half-read fleet as
+            # healthy — the exact false-clean this command exists to refuse.
+            unread = [v for v in report.verdicts if v.classification is Classification.UNKNOWN]
+            if unread:
+                report.degraded.append(
+                    f"{len(unread)} deployment(s) could not be classified from the chain"
+                )
+
+            shown = (
+                [v for v in report.orphaned if v.reapable]
+                if args.reapable_only
+                else report.verdicts
+            )
+
+            if use_json:
+                print(
+                    json.dumps(
+                        {
+                            "account": owner,
+                            "degraded": report.is_degraded,
+                            "degraded_reasons": report.degraded,
+                            "orphaned_count": len(report.orphaned),
+                            "orphaned_escrow_uact": report.orphaned_escrow_uact,
+                            "unknown_count": len(report.unknown),
+                            "deployments": [
+                                {
+                                    "dseq": v.dseq,
+                                    "classification": v.classification.value,
+                                    "escrow_uact": v.escrow_uact,
+                                    "live_orders": v.live_orders,
+                                    "confirmations": v.confirmations,
+                                    "reapable": v.reapable,
+                                    "detail": v.detail,
+                                }
+                                for v in shown
+                            ],
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                for v in shown:
+                    flag = "  <- reapable" if v.reapable else ""
+                    print(
+                        f"  {v.classification.value:<12} {v.dseq}  "
+                        f"{v.escrow_uact / 1e6:>8.2f} ACT  {v.detail}{flag}"
+                    )
+                print(report.summary())
+
+            # A degraded report must NOT exit 0: a caller checking only the exit status
+            # would otherwise read an incomplete scan as a clean fleet.
+            if report.is_degraded:
+                sys.exit(1)
         except RuntimeError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
