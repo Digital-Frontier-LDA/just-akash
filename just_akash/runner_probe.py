@@ -668,9 +668,15 @@ def main(argv: list[str] | None = None) -> int:
     # runner a later job could read them.
     with tempfile.TemporaryDirectory(prefix="akash-probe-") as tmpdir:
         # The insecure-file-permissions rule reads 0o700 as "widely permissive" and
-        # recommends 0o644. That is exactly backwards for a DIRECTORY holding live
-        # credentials: 0o700 is owner-only, while the suggested 0o644 is world-READABLE and
-        # would hand any other user on the box the PAT this block exists to protect.
+        # recommends 0o644. Its premise is inverted here: 0o700 grants group and other
+        # NOTHING, so it is strictly tighter than the mode being recommended, and this is a
+        # DIRECTORY holding live credentials.
+        #
+        # 0o644 would also simply break it — a directory needs the execute bit to be
+        # traversed, so dropping owner +x makes the rendered SDLs unopenable by their own
+        # path, and the o+r it adds lets other users LIST the filenames. Neither half of
+        # that trade is one we want.
+        #
         # Suppressed at the line rather than via the Justfile's --exclude-rule convention,
         # which would disable the check for every future chmod in the package — including
         # one that really is too permissive.
