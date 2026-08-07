@@ -208,8 +208,14 @@ jobs:
             echo "::error title=GH_RUNNER_PAT is not set::The pool cannot register runners without it. NOT a provider fault and NOT an Akash outage."
             exit 1
           fi
-          CODE=$(gh api "orgs/${ORG}/actions/runners?per_page=1" --silent -i 2>/dev/null | awk 'NR==1{print $2}')
-          if ! gh api "orgs/${ORG}/actions/runners?per_page=1" >/dev/null 2>&1; then
+          # ONE request, not two. Calling it twice doubles the latency and the API
+          # spend, and lets the two disagree: the status line could come from a call
+          # that succeeded while the branch is taken on a call that failed, reporting a
+          # code that never belonged to the failure.
+          RESP=$(gh api "orgs/${ORG}/actions/runners?per_page=1" -i 2>&1)
+          RC=$?
+          CODE=$(printf '%s' "$RESP" | awk 'NR==1{print $2}')
+          if [ "$RC" -ne 0 ]; then
             echo "failure_reason=RUNNER_PAT_INVALID" >> "$GITHUB_OUTPUT"
             {
               echo "## The runner PAT is expired or lacks org access"

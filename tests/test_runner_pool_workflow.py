@@ -448,7 +448,7 @@ def test_an_unreadable_state_is_not_reported_as_closed():
 # --------------------------------------------------------------------------
 
 
-def test_the_pat_is_validated_BEFORE_provisioning():
+def test_the_pat_is_validated_before_provisioning():
     """A PAT expiry is otherwise SILENT: the runner never registers, the pool times out
     after ~15 minutes, and the run reports RUNNER_NEVER_REGISTERED — indistinguishable
     from a provider that leases and never schedules. That reading sends the investigation
