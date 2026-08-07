@@ -12,13 +12,18 @@
 # 48h, and {} is left alone as unclassifiable. This deployment's service is `canary`, so
 # it matches no stale rule and is not reaped.
 #
-# That protection is INCIDENTAL rather than declared, which makes it fragile in a specific
-# way worth knowing: rename this service to `probe`, or add `canary` to a stale rule, and
-# the next sweep deletes it within the hour. The symptom would be "the provider keeps
-# closing our deployment" — the canary masquerading as the very fault it measures.
+# The service name now carries a SECOND job: it is also how the next run recognises this
+# lease as ours. canary/ensure.py adopts a deployment whose service set is exactly {canary}
+# and whose lease is held by the provider in question. Both facts are read off the
+# deployment, so they work from any machine — unlike the `canary-<provider>` tag this used
+# to match on, which lives in .tags.json in the working copy and therefore did not survive
+# the ephemeral runner that wrote it.
 #
-# The `canary-<provider>` tag is separately load-bearing, but for ADOPTION: it is how the
-# next run finds this lease in `just-akash list` and knows which dseq it is looking at.
+# So renaming this service breaks TWO things at once, in opposite directions. Rename it to
+# `probe` and the sweep deletes the lease within the hour; rename it to anything else and
+# ensure.py stops recognising it and deploys another one alongside. Either way the symptom
+# reads as "the provider keeps closing our deployment" — the canary masquerading as the
+# very fault it measures. The name is load-bearing; treat it as an interface.
 #
 # THE IMAGE INSTALLS NOTHING AT BOOT, deliberately. The other SDLs `apt-get install` on
 # start; a canary must not. If this container needed a package mirror to come up, a PyPI
