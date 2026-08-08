@@ -119,10 +119,106 @@ class TestChangelogInvariant:
         assert inv.check_changelog(repo)  # a problem, not a traceback
 
 
+class TestWorkflowVarsInvariant:
+    """The outage this encodes: provider-canary.yml gated its deploy step on
+    vars.CANARY_AUTODEPLOY, which was never set. An unset repo variable is the empty
+    string and '' is falsy, so the step silently never ran and every scheduled run still
+    reported success -- for weeks, with no canary deployed anywhere (#129/#132)."""
+
+    def test_clean_repo_passes(self, repo):
+        assert inv.check_workflow_vars(repo) == []
+
+    def test_catches_an_undeclared_variable(self, repo):
+        (repo / ".github" / "workflows" / "canary.yml").write_text(
+            "on:\n  schedule: [{cron: '0 * * * *'}]\n"
+            "jobs:\n  a:\n    steps:\n      - name: Deploy\n"
+            "        if: ${{ vars.SOME_NEW_FLAG == 'true' }}\n        run: x\n"
+        )
+        problems = inv.check_workflow_vars(repo)
+        assert len(problems) == 1
+        assert "SOME_NEW_FLAG" in problems[0]
+        assert "canary.yml:7" in problems[0]  # points at the offending line
+        # and says WHY it is dangerous, not just that it is undeclared
+        assert "reports success" in problems[0]
+
+    def test_a_declared_variable_is_allowed(self, repo):
+        name = next(iter(inv.DECLARED_VARS))
+        (repo / ".github" / "workflows" / "canary.yml").write_text(
+            "jobs:\n  a:\n    steps:\n"
+            f"      - if: ${{{{ vars.{name} == 'true' }}}}\n        run: x\n"
+        )
+        assert inv.check_workflow_vars(repo) == []
+
+    def test_a_stale_declaration_is_caught_only_when_checking_this_repo(self, repo):
+        """The two arms are different kinds of statement. "no undeclared reference" holds
+        for any tree; "every declaration is used" is about THIS repo's table. Demanding the
+        second of a synthetic fixture is how a general checker acquires a private dependency
+        on one repo's content -- which is what the pre-existing TestMain fixture caught."""
+        assert inv.check_workflow_vars(repo) == []
+        strict = inv.check_workflow_vars(repo, declarations_must_be_used=True)
+        assert strict and "no workflow reads it any more" in strict[0]
+
+    def test_prose_beside_a_real_expression_is_not_reported(self, repo):
+        """The fixture above has no expression at all, so it never exercises the
+        line-reporting loop. THIS one does: the same name appears in a real ${{ }} and in a
+        run: line below it. Before the fix that yielded TWO problems, one pointing at the
+        prose -- a check that cries wolf on documentation is a check people learn to skip.
+        Raised by CodeRabbit on #132."""
+        (repo / ".github" / "workflows" / "canary.yml").write_text(
+            "jobs:\n  a:\n    steps:\n"
+            "      - if: ${{ vars.SOME_NEW_FLAG == 'true' }}\n"
+            "        run: echo 'set vars.SOME_NEW_FLAG to enable'\n"
+        )
+        problems = inv.check_workflow_vars(repo)
+        assert len(problems) == 1, problems
+        assert "canary.yml:4" in problems[0]  # the expression, not the prose on line 5
+
+    def test_a_multiline_expression_is_still_reported(self, repo):
+        """The precise pass is per-line, so a ${{ }} spanning lines matches nothing. It must
+        fall back to the substring scan rather than drop the finding -- losing a real
+        violation is worse than locating it imprecisely."""
+        (repo / ".github" / "workflows" / "wrap.yml").write_text(
+            "jobs:\n  a:\n    steps:\n      - if: >-\n"
+            "          ${{\n            vars.WRAPPED_FLAG == 'true'\n          }}\n"
+            "        run: x\n"
+        )
+        problems = inv.check_workflow_vars(repo)
+        assert problems and "WRAPPED_FLAG" in problems[0]
+
+    def test_a_reference_outside_an_expression_is_not_a_reference(self, repo):
+        """`vars.X` in prose or a run: line is not an Actions expression, and flagging it
+        would train people to ignore this check."""
+        (repo / ".github" / "workflows" / "doc.yml").write_text(
+            "jobs:\n  a:\n    steps:\n      - run: echo 'set vars.NOT_A_REF to enable'\n"
+        )
+        assert inv.check_workflow_vars(repo) == []
+
+
+class TestAnnotations:
+    def test_annotation_carries_file_and_line(self, repo, capsys):
+        """`::error::` alone puts the annotation at the top of the run. The comment beside it
+        has always claimed it lands on the offending line; file=/line= makes that true."""
+        (repo / ".github" / "workflows" / "canary.yml").write_text(
+            "jobs:\n  a:\n    steps:\n"
+            "      - if: ${{ vars.UNDECLARED_ONE == 'true' }}\n        run: x\n"
+        )
+        assert inv.main(["--root", str(repo)]) == 1
+        out = capsys.readouterr().out
+        assert "::error file=.github/workflows/canary.yml,line=4::" in out
+
+
 class TestMain:
     def test_exit_zero_when_clean(self, repo, capsys):
         assert inv.main(["--root", str(repo)]) == 0
         assert "OK" in capsys.readouterr().out
+
+    def test_success_line_does_not_claim_unchecked_coverage(self, repo, capsys):
+        """Non-strict runs skip the dead-declaration arm, so the summary must not say the
+        declarations were all referenced. Reporting coverage nobody verified is the exact
+        defect this checker exists to prevent -- it must not commit it in its own output.
+        Raised by CodeRabbit on #132."""
+        assert inv.main(["--root", str(repo)]) == 0
+        assert "usage unchecked" in capsys.readouterr().out
 
     def test_exit_one_and_annotates_on_failure(self, repo, capsys):
         (repo / "pyproject.toml").write_text('version = "9.9.9"\n')
@@ -137,4 +233,6 @@ class TestMain:
         this fails here rather than only in CI."""
         root = Path(__file__).resolve().parents[1]
         assert inv.check_secrets(root) == []
+        # Strict here: this IS the repo the table describes.
+        assert inv.check_workflow_vars(root, declarations_must_be_used=True) == []
         assert inv.check_changelog(root) == []
