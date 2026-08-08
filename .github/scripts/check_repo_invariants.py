@@ -42,8 +42,36 @@ ALLOWED_SECRETS = frozenset(
 # `secrets.NAME`, but only inside a ${{ }} expression — otherwise the detect-
 # secrets baseline FILENAME (`.secrets.baseline`, which appears in these
 # workflows) reads as a secret reference and the guard cries wolf.
+# Every ``vars.NAME`` a workflow reads, and -- the part that matters -- WHAT SILENTLY
+# HAPPENS WHEN IT IS UNSET.
+#
+# An unset repo variable is not an error at runtime. It evaluates to the empty string, and
+# `''` is falsy in an Actions expression, so a step gated on one simply does not run and the
+# job still reports success. There is nothing in the repo to read that says the variable was
+# ever expected to exist: the dependency lives in the GitHub UI, invisible to review, to git
+# log, and to anyone reading the workflow.
+#
+# That is not hypothetical. `provider-canary.yml` gated its deploy step on
+# `vars.CANARY_AUTODEPLOY`, which was never set. Every scheduled run skipped the deploy and
+# exited GREEN for weeks while no canary existed on any provider -- and the only visible
+# symptom was three unrelated-looking provider alerts paging critical for a day (#129).
+#
+# Declaring the variable here does not set it. It forces the CONSEQUENCE into the diff, where
+# a reviewer reads "when unset, no canary is ever deployed" and asks the question nobody asked
+# for weeks: is it actually set?
+DECLARED_VARS: dict[str, str] = {
+    "CANARY_AUTODEPLOY": (
+        "gates the canary deploy step in provider-canary.yml on SCHEDULED runs "
+        "(`inputs.deploy_missing` covers workflow_dispatch, and input defaults do NOT apply "
+        "to a schedule trigger). WHEN UNSET: no canary is ever deployed, every scheduled run "
+        "still reports success, and the fleet goes dark -- see akash_canary_active_deployments "
+        "and the AkashCanaryNoDeployments alert, which exist because of exactly this."
+    ),
+}
+
 _EXPR = re.compile(r"\$\{\{(.*?)\}\}", re.S)
 _SECRET_REF = re.compile(r"\bsecrets\.([A-Za-z_][A-Za-z_0-9]*)")
+_VARS_REF = re.compile(r"\bvars\.([A-Za-z_][A-Za-z_0-9]*)")
 _VERSION_HEADER = re.compile(r"^## \[(\d+)\.(\d+)\.(\d+)\]", re.M)
 _PYPROJECT_VERSION = re.compile(r'^version\s*=\s*"([^"]+)"', re.M)
 
@@ -112,6 +140,59 @@ def check_secrets(root: Path) -> list[str]:
     return problems
 
 
+def vars_refs(text: str) -> set[str]:
+    """Repo-variable names referenced from ``${{ }}`` expressions in ``text``."""
+    names: set[str] = set()
+    for expr in _EXPR.findall(text):
+        names.update(_VARS_REF.findall(expr))
+    return names
+
+
+def check_workflow_vars(root: Path, *, declarations_must_be_used: bool = False) -> list[str]:
+    """Every ``${{ vars.X }}`` is declared, and every declaration is still used.
+
+    Enforced in BOTH directions on purpose. Undeclared references are the bug this exists
+    for. Dead declarations matter just as much: a table that still lists a variable nobody
+    reads teaches the next reader that it is load-bearing, and a stale declaration is how a
+    guard becomes decoration.
+
+    The two arms are NOT the same kind of statement, which is why the second is opt-in.
+    "no undeclared reference" is a property of any tree. "every declaration is still used"
+    is a property of THIS repo's table -- pointed at a synthetic fixture it would demand
+    that the fixture reference our variables, which is how a general checker acquires a
+    private dependency on one repo's content. An existing test caught exactly that.
+    """
+    problems: list[str] = []
+    targets = sorted(
+        p
+        for d in (".github/workflows", ".github/actions")
+        for p in (root / d).rglob("*.y*ml")
+        if p.is_file()
+    )
+    used: set[str] = set()
+    for path in targets:
+        text = path.read_text(encoding="utf-8")
+        refs = vars_refs(text)
+        used |= refs
+        for name in sorted(refs - set(DECLARED_VARS)):
+            for lineno, line in enumerate(text.splitlines(), 1):
+                if f"vars.{name}" in line:
+                    problems.append(
+                        f"{path.relative_to(root)}:{lineno}: reads ${{{{ vars.{name} }}}} but "
+                        f"it is not declared in DECLARED_VARS. An unset repo variable is the "
+                        f"empty string, so this expression is silently FALSE and whatever it "
+                        f"gates never runs -- while the job still reports success. Declare it "
+                        f"with what breaks when it is missing."
+                    )
+    for name in sorted(set(DECLARED_VARS) - used) if declarations_must_be_used else []:
+        problems.append(
+            f"DECLARED_VARS lists {name!r} but no workflow reads it any more. Remove the "
+            f"entry -- a stale declaration reads as a live dependency and is how this table "
+            f"stops describing reality."
+        )
+    return problems
+
+
 def check_changelog(root: Path) -> list[str]:
     """Changelog versions descend strictly, are unique, and the newest matches
     the packaged version."""
@@ -156,13 +237,23 @@ def check_changelog(root: Path) -> list[str]:
     return problems
 
 
+# This script lives at <repo>/.github/scripts/, so its own repo root is two levels up.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--root", default=".", help="Repository root (default: cwd)")
     args = ap.parse_args(argv)
     root = Path(args.root).resolve()
 
-    problems = check_secrets(root) + check_changelog(root)
+    problems = (
+        check_secrets(root)
+        # Only demand that declarations still be USED when we are checking this repo --
+        # see check_workflow_vars' docstring for why the two arms differ.
+        + check_workflow_vars(root, declarations_must_be_used=(root == REPO_ROOT))
+        + check_changelog(root)
+    )
     if problems:
         print("Repo invariant check FAILED:\n", file=sys.stderr)
         for p in problems:
@@ -170,7 +261,10 @@ def main(argv: list[str] | None = None) -> int:
             # GitHub annotation so the failure lands on the offending line.
             print(f"::error::{p}")
         return 1
-    print("Repo invariants OK (SOPS-only secrets; changelog ordered and in sync).")
+    print(
+        f"Repo invariants OK (SOPS-only secrets; {len(DECLARED_VARS)} declared repo "
+        f"variable(s), all still referenced; changelog ordered and in sync)."
+    )
     return 0
 
 
