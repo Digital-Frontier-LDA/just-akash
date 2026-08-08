@@ -116,6 +116,24 @@ def declared_call_secrets(text: str) -> set[str]:
     return set(declared) if isinstance(declared, dict) else set()
 
 
+def _lines_referencing(text: str, name: str, token: str, extractor) -> list[int]:
+    """Line numbers where ``name`` is referenced FROM AN ACTIONS EXPRESSION.
+
+    A plain substring scan also reports PROSE. A `run:` line reading
+    ``echo 'set vars.X to enable'`` is documentation, not a reference, and reporting it as a
+    violation is how a check trains people to ignore it. Raised by CodeRabbit on #132 and
+    reproduced: a workflow with the expression on one line and the same name in a run: line
+    below yielded TWO problems, one pointing at the prose.
+
+    Falls back to the substring scan when the precise pass finds nothing, so a reference
+    inside a ${{ }} block that SPANS lines is still reported -- imprecisely located, but
+    never silently dropped. Losing a real finding is the worse failure of the two.
+    """
+    lines = text.splitlines()
+    hits = [n for n, line in enumerate(lines, 1) if name in extractor(line)]
+    return hits or [n for n, line in enumerate(lines, 1) if token in line]
+
+
 def check_secrets(root: Path) -> list[str]:
     """Every ``${{ secrets.X }}`` in CI config must name an allowed secret."""
     problems: list[str] = []
@@ -130,13 +148,12 @@ def check_secrets(root: Path) -> list[str]:
         exempt = ALLOWED_SECRETS | declared_call_secrets(text)
         for name in sorted(secret_refs(text) - exempt):
             # Report the line so the fix is obvious, not just the file.
-            for lineno, line in enumerate(text.splitlines(), 1):
-                if f"secrets.{name}" in line:
-                    problems.append(
-                        f"{path.relative_to(root)}:{lineno}: uses ${{{{ secrets.{name} }}}} "
-                        f"directly — put it in secrets/ci.sops.env and read it via "
-                        f"./.github/actions/sops-env"
-                    )
+            for lineno in _lines_referencing(text, name, f"secrets.{name}", secret_refs):
+                problems.append(
+                    f"{path.relative_to(root)}:{lineno}: uses ${{{{ secrets.{name} }}}} "
+                    f"directly — put it in secrets/ci.sops.env and read it via "
+                    f"./.github/actions/sops-env"
+                )
     return problems
 
 
@@ -183,15 +200,14 @@ def check_workflow_vars(root: Path, *, declarations_must_be_used: bool = False) 
         refs = vars_refs(text)
         used |= refs
         for name in sorted(refs - set(DECLARED_VARS)):
-            for lineno, line in enumerate(text.splitlines(), 1):
-                if f"vars.{name}" in line:
-                    problems.append(
-                        f"{path.relative_to(root)}:{lineno}: reads ${{{{ vars.{name} }}}} but "
-                        f"it is not declared in DECLARED_VARS. An unset repo variable is the "
-                        f"empty string, so this expression is silently FALSE and whatever it "
-                        f"gates never runs -- while the job still reports success. Declare it "
-                        f"with what breaks when it is missing."
-                    )
+            for lineno in _lines_referencing(text, name, f"vars.{name}", vars_refs):
+                problems.append(
+                    f"{path.relative_to(root)}:{lineno}: reads ${{{{ vars.{name} }}}} but "
+                    f"it is not declared in DECLARED_VARS. An unset repo variable is the "
+                    f"empty string, so this expression is silently FALSE and whatever it "
+                    f"gates never runs -- while the job still reports success. Declare it "
+                    f"with what breaks when it is missing."
+                )
     for name in sorted(set(DECLARED_VARS) - used) if declarations_must_be_used else []:
         problems.append(
             f"DECLARED_VARS lists {name!r} but no workflow reads it any more. Remove the "
@@ -248,6 +264,12 @@ def check_changelog(root: Path) -> list[str]:
 # This script lives at <repo>/.github/scripts/, so its own repo root is two levels up.
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+# Problems are formatted "<path>:<line>: ...". Pulling that back out lets the GitHub
+# annotation carry file=/line=, which is what makes it land ON the offending line instead
+# of at the top of the run. The comment below has always claimed that; until now it was not
+# true. Raised by CodeRabbit on #132.
+_PROBLEM_LOC = re.compile(r"^(?P<file>[^\s:]+):(?P<line>\d+): ")
+
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
@@ -266,13 +288,23 @@ def main(argv: list[str] | None = None) -> int:
         print("Repo invariant check FAILED:\n", file=sys.stderr)
         for p in problems:
             print(f"  {p}", file=sys.stderr)
-            # GitHub annotation so the failure lands on the offending line.
-            print(f"::error::{p}")
+            # GitHub annotation so the failure lands on the offending line -- with
+            # file=/line= it actually does. Problems with no location still annotate.
+            loc = _PROBLEM_LOC.match(p)
+            if loc:
+                print(f"::error file={loc['file']},line={loc['line']}::{p}")
+            else:
+                print(f"::error::{p}")
         return 1
-    print(
-        f"Repo invariants OK (SOPS-only secrets; {len(DECLARED_VARS)} declared repo "
-        f"variable(s), all still referenced; changelog ordered and in sync)."
+    # Say only what was actually checked. Outside this repo the dead-declaration arm does
+    # not run, so claiming "all still referenced" would report coverage nobody verified --
+    # which is the exact defect this whole check exists to make impossible.
+    declared = (
+        f"{len(DECLARED_VARS)} declared repo variable(s), all still referenced"
+        if root == REPO_ROOT
+        else f"{len(DECLARED_VARS)} declared repo variable(s) (usage unchecked: not this repo)"
     )
+    print(f"Repo invariants OK (SOPS-only secrets; {declared}; changelog ordered and in sync).")
     return 0
 
 
