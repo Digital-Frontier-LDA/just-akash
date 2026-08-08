@@ -127,9 +127,26 @@ def scrape(uri: str, timeout: float = SCRAPE_TIMEOUT) -> tuple[bool, str, float]
 
 
 def merge(
-    prev: dict, provider: str, dseq: str, reachable: bool, body: str, elapsed: float, now: float
+    prev: dict,
+    provider: str,
+    dseq: str,
+    reachable: bool,
+    body: str,
+    elapsed: float,
+    now: float,
+    *,
+    deployed: bool | None = None,
 ) -> dict:
-    """Fold one scrape into the durable per-provider state."""
+    """Fold one scrape into the durable per-provider state.
+
+    `deployed` is whether the targets file gave this provider an ingress URI at all --
+    i.e. whether a canary EXISTS to be scraped. It is deliberately distinct from
+    `reachable`: a provider with no canary is not an unreachable provider, it is a
+    provider we never tried. Defaults to `reachable` because main() short-circuits the
+    scrape when there is no URI, so reachable implies deployed, and that keeps every
+    caller which does not track targets itself correct. That implication is ENFORCED, not
+    assumed: a reachable provider is always recorded as deployed, whatever is passed here.
+    """
     p = dict(prev.get(provider, {}))
     p.setdefault("restarts_total", 0)
     p.setdefault("lease_replacements_total", 0)
@@ -140,6 +157,12 @@ def merge(
 
     p["checks_total"] += 1
     p["reachable"] = 1 if reachable else 0
+    # reachable IMPLIES deployed, enforced here rather than left true by construction. Letting
+    # an explicit deployed=False win over a successful scrape would publish deployed=0 for a
+    # provider the collector demonstrably reached, so active_deployments would under-count it
+    # -- and fleet-wide that pages AkashCanaryNoDeployments critical while every reachable
+    # reads 1. A metric that can contradict its neighbour is the failure this change removes.
+    p["deployed"] = int(reachable or bool(deployed))
     p["scrape_seconds"] = round(elapsed, 4)
     p["last_collect"] = now
 
@@ -196,6 +219,32 @@ def merge(
     return {**prev, provider: p}
 
 
+def mark_absent_undeployed(state: dict, targets: dict) -> dict:
+    """Zero `deployed` for every provider missing from THIS run's targets.
+
+    `state` is durable BY DESIGN -- carrying cumulative counters across runs is the whole
+    reason this module exists -- so a provider that drops out of targets keeps its last
+    `deployed` value forever unless something clears it. active_deployments would then report
+    a count from a previous run while last_collect_timestamp_seconds keeps advancing, so the
+    freshness guard PASSES and AkashCanaryNoDeployments cannot fire in the one scenario it
+    was written for. That is worse than a frozen file: the file updates, `up` is 1, the
+    timestamp moves, and the number is stale anyway.
+
+    The workflow reaches this state on its own -- `cp prior/canary-targets.json targets.json
+    2>/dev/null || echo '{}' > targets.json` writes an EMPTY targets file whenever the prior
+    one is missing, which is exactly the upstream failure that would also stop deployments.
+
+    Pruning `state` to targets was the suggested fix and is rejected: restarts_total and
+    lease_replacements_total are the point of the durable state, and a transient targets
+    glitch would zero a provider's entire history. Only the current-run fact is cleared;
+    every counter is left intact. Raised by Copilot on #129.
+    """
+    for provider, p in state.items():
+        if provider not in targets:
+            p["deployed"] = 0
+    return state
+
+
 def render(
     state: dict,
     now: float,
@@ -245,6 +294,27 @@ def render(
     add("# TYPE akash_canary_checks_total counter")
     for prov, p in sorted(state.items()):
         add(f'akash_canary_checks_total{{provider="{prov}"}} {p.get("checks_total", 0)}')
+    add(
+        "# HELP akash_canary_deployed 1 if this provider has a canary deployment with an "
+        "ingress to scrape at all. 0 means no canary EXISTS -- not that one is broken."
+    )
+    add("# TYPE akash_canary_deployed gauge")
+    for prov, p in sorted(state.items()):
+        add(f'akash_canary_deployed{{provider="{prov}"}} {p.get("deployed", 0)}')
+    # NOT redundant with sum(akash_canary_deployed). When no canary exists anywhere the
+    # per-provider gauge is all zeros -- and if state itself is empty it yields NO series,
+    # so a sum()-based rule has nothing to match and can never fire in precisely the case
+    # that most needs to page. This scalar is always present, so `== 0` is always evaluable.
+    add(
+        "# HELP akash_canary_active_deployments Providers with a live canary deployment. "
+        "0 means the canary fleet is not running, so every per-provider signal above it "
+        "is measuring nothing."
+    )
+    add("# TYPE akash_canary_active_deployments gauge")
+    add(
+        "akash_canary_active_deployments "
+        f"{sum(1 for _p in state.values() if _p.get('deployed', 0))}"
+    )
 
     # Pass-through of the inside-the-deployment view.
     passthrough = [
@@ -376,7 +446,16 @@ def main() -> int:
     for provider, t in sorted(targets.items()):
         uri = t.get("uri") or ""
         ok, body, elapsed = (False, "", 0.0) if not uri else scrape(uri, a.timeout)
-        state = merge(state, provider, str(t.get("dseq") or ""), ok, body, elapsed, now)
+        state = merge(
+            state,
+            provider,
+            str(t.get("dseq") or ""),
+            ok,
+            body,
+            elapsed,
+            now,
+            deployed=bool(uri),
+        )
         print(
             f"{provider:14} reachable={int(ok)} "
             f"restarts={state[provider]['restarts_total']} "
@@ -385,6 +464,7 @@ def main() -> int:
             flush=True,
         )
 
+    state = mark_absent_undeployed(state, targets)
     sp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     credit_path = pathlib.Path(a.credit) if a.credit else None
     credit = load_json_mapping(credit_path) if credit_path else {}

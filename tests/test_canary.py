@@ -16,6 +16,7 @@ import canary.canary as agent
 from canary.collect import (
     extract_boot_id,
     load_json_mapping,
+    mark_absent_undeployed,
     merge,
     metrics_url,
     parse_exposition,
@@ -152,6 +153,86 @@ def test_render_emits_per_provider_series_and_is_parseable():
     assert samples[("akash_canary_reachable", (("provider", ALPHA),))] == 1.0
     assert samples[("akash_canary_reachable", (("provider", "onidc"),))] == 0.0
     assert ("akash_canary_last_collect_timestamp_seconds", ()) in samples
+
+
+def test_no_canary_deployed_is_distinct_from_deployed_but_unreachable():
+    """The failure that paged three innocent providers for a day. A provider with no
+    canary folded in exactly like one whose ingress was refusing connections, so the only
+    visible signal was a per-provider ingress alert and nothing said the real cause: no
+    canary was deployed at all. `deployed` separates the two."""
+    st = merge({}, ALPHA, "100", False, "", 0.0, 1000.0, deployed=True)
+    st = merge(st, "onidc", "300", False, "", 0.0, 1000.0, deployed=False)
+    samples = parse_exposition(render(st, 1.0))
+    # Both are unreachable...
+    assert samples[("akash_canary_reachable", (("provider", ALPHA),))] == 0.0
+    assert samples[("akash_canary_reachable", (("provider", "onidc"),))] == 0.0
+    # ...but only one of them was ever deployed to be reachable.
+    assert samples[("akash_canary_deployed", (("provider", ALPHA),))] == 1.0
+    assert samples[("akash_canary_deployed", (("provider", "onidc"),))] == 0.0
+    assert samples[("akash_canary_active_deployments", ())] == 1.0
+
+
+def test_active_deployments_is_emitted_even_when_no_canary_exists():
+    """The scalar must be PRESENT and zero, not absent -- an alert can only fire on a
+    series that exists, and "no canary anywhere" is the case that most needs to page."""
+    st = merge({}, ALPHA, "100", False, "", 0.0, 1000.0, deployed=False)
+    samples = parse_exposition(render(st, 1.0))
+    assert samples[("akash_canary_active_deployments", ())] == 0.0
+
+
+def test_deployed_defaults_to_reachable_for_callers_that_do_not_track_targets():
+    """merge() is called without a targets file by tests and other tooling. Reachable
+    implies deployed (main() skips the scrape when there is no URI), so the default is
+    sound -- and must never report a reachable provider as undeployed."""
+    st = merge({}, ALPHA, "100", True, _body("aaa"), 0.1, 1000.0)
+    assert st[ALPHA]["deployed"] == 1
+
+
+def test_a_scraped_provider_is_never_recorded_as_undeployed():
+    """reachable implies deployed, ENFORCED. Letting an explicit deployed=False win over a
+    successful scrape would under-count active_deployments for a provider we demonstrably
+    reached -- and fleet-wide that pages AkashCanaryNoDeployments critical while every
+    akash_canary_reachable reads 1, a page that contradicts the series next to it.
+    Raised by CodeRabbit on #129; unreachable from main() today, pinned so it stays that way."""
+    st = merge({}, ALPHA, "100", True, _body("aaa"), 0.1, 1000.0, deployed=False)
+    assert st[ALPHA]["reachable"] == 1
+    assert st[ALPHA]["deployed"] == 1
+    samples = parse_exposition(render(st, 1.0))
+    assert samples[("akash_canary_active_deployments", ())] == 1.0
+
+
+def test_a_provider_that_drops_out_of_targets_stops_counting_as_deployed():
+    """State is durable by design, so a provider missing from THIS run's targets would keep
+    its last deployed=1 forever. active_deployments would then report a previous run's count
+    while last_collect_timestamp keeps advancing -- the freshness guard passes and
+    AkashCanaryNoDeployments cannot fire in the one scenario it exists for. Worse than a
+    frozen file: the file updates and the number is stale anyway.
+
+    The workflow reaches this on its own (`... || echo '{}' > targets.json`). Raised by
+    Copilot on #129."""
+    st = merge({}, ALPHA, "100", True, _body("aaa"), 0.1, 1000.0, deployed=True)
+    assert parse_exposition(render(st, 1.0))[("akash_canary_active_deployments", ())] == 1.0
+    # Targets goes empty -- the upstream failure that would also stop deployments.
+    st = mark_absent_undeployed(st, {})
+    samples = parse_exposition(render(st, 2.0))
+    assert samples[("akash_canary_active_deployments", ())] == 0.0
+    assert samples[("akash_canary_deployed", (("provider", ALPHA),))] == 0.0
+
+
+def test_dropping_out_of_targets_does_not_destroy_the_durable_counters():
+    """Pruning state was the suggested fix and would have cost the history. restarts_total
+    and lease_replacements_total are the reason durable state exists; a transient targets
+    glitch must not zero them."""
+    st = merge({}, ALPHA, "100", True, _body("aaa"), 0.1, 1000.0)
+    st = merge(st, ALPHA, "100", True, _body("bbb"), 0.1, 1100.0)  # a restart
+    st = merge(st, ALPHA, "200", True, _body("ccc"), 0.1, 1200.0)  # a lease replacement
+    assert st[ALPHA]["restarts_total"] == 1
+    assert st[ALPHA]["lease_replacements_total"] == 1
+    st = mark_absent_undeployed(st, {})
+    assert ALPHA in st, "the provider must not be pruned out of existence"
+    assert st[ALPHA]["restarts_total"] == 1, "history must survive a targets dropout"
+    assert st[ALPHA]["lease_replacements_total"] == 1
+    assert st[ALPHA]["deployed"] == 0, "only the current-run fact is cleared"
 
 
 def test_render_omits_missing_gauges_rather_than_emitting_none():
