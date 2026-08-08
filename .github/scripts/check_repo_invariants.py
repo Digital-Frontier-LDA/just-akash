@@ -148,13 +148,19 @@ def vars_refs(text: str) -> set[str]:
     return names
 
 
-def check_workflow_vars(root: Path) -> list[str]:
+def check_workflow_vars(root: Path, *, declarations_must_be_used: bool = False) -> list[str]:
     """Every ``${{ vars.X }}`` is declared, and every declaration is still used.
 
     Enforced in BOTH directions on purpose. Undeclared references are the bug this exists
     for. Dead declarations matter just as much: a table that still lists a variable nobody
     reads teaches the next reader that it is load-bearing, and a stale declaration is how a
     guard becomes decoration.
+
+    The two arms are NOT the same kind of statement, which is why the second is opt-in.
+    "no undeclared reference" is a property of any tree. "every declaration is still used"
+    is a property of THIS repo's table -- pointed at a synthetic fixture it would demand
+    that the fixture reference our variables, which is how a general checker acquires a
+    private dependency on one repo's content. An existing test caught exactly that.
     """
     problems: list[str] = []
     targets = sorted(
@@ -178,7 +184,7 @@ def check_workflow_vars(root: Path) -> list[str]:
                         f"gates never runs -- while the job still reports success. Declare it "
                         f"with what breaks when it is missing."
                     )
-    for name in sorted(set(DECLARED_VARS) - used):
+    for name in sorted(set(DECLARED_VARS) - used) if declarations_must_be_used else []:
         problems.append(
             f"DECLARED_VARS lists {name!r} but no workflow reads it any more. Remove the "
             f"entry -- a stale declaration reads as a live dependency and is how this table "
@@ -231,13 +237,23 @@ def check_changelog(root: Path) -> list[str]:
     return problems
 
 
+# This script lives at <repo>/.github/scripts/, so its own repo root is two levels up.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--root", default=".", help="Repository root (default: cwd)")
     args = ap.parse_args(argv)
     root = Path(args.root).resolve()
 
-    problems = check_secrets(root) + check_workflow_vars(root) + check_changelog(root)
+    problems = (
+        check_secrets(root)
+        # Only demand that declarations still be USED when we are checking this repo --
+        # see check_workflow_vars' docstring for why the two arms differ.
+        + check_workflow_vars(root, declarations_must_be_used=(root == REPO_ROOT))
+        + check_changelog(root)
+    )
     if problems:
         print("Repo invariant check FAILED:\n", file=sys.stderr)
         for p in problems:
@@ -245,8 +261,10 @@ def main(argv: list[str] | None = None) -> int:
             # GitHub annotation so the failure lands on the offending line.
             print(f"::error::{p}")
         return 1
-    print(f"Repo invariants OK (SOPS-only secrets; {len(DECLARED_VARS)} declared repo "
-        f"variable(s), all still referenced; changelog ordered and in sync).")
+    print(
+        f"Repo invariants OK (SOPS-only secrets; {len(DECLARED_VARS)} declared repo "
+        f"variable(s), all still referenced; changelog ordered and in sync)."
+    )
     return 0
 
 

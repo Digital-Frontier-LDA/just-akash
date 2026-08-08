@@ -119,6 +119,54 @@ class TestChangelogInvariant:
         assert inv.check_changelog(repo)  # a problem, not a traceback
 
 
+class TestWorkflowVarsInvariant:
+    """The outage this encodes: provider-canary.yml gated its deploy step on
+    vars.CANARY_AUTODEPLOY, which was never set. An unset repo variable is the empty
+    string and '' is falsy, so the step silently never ran and every scheduled run still
+    reported success -- for weeks, with no canary deployed anywhere (#129/#132)."""
+
+    def test_clean_repo_passes(self, repo):
+        assert inv.check_workflow_vars(repo) == []
+
+    def test_catches_an_undeclared_variable(self, repo):
+        (repo / ".github" / "workflows" / "canary.yml").write_text(
+            "on:\n  schedule: [{cron: '0 * * * *'}]\n"
+            "jobs:\n  a:\n    steps:\n      - name: Deploy\n"
+            "        if: ${{ vars.SOME_NEW_FLAG == 'true' }}\n        run: x\n"
+        )
+        problems = inv.check_workflow_vars(repo)
+        assert len(problems) == 1
+        assert "SOME_NEW_FLAG" in problems[0]
+        assert "canary.yml:7" in problems[0]  # points at the offending line
+        # and says WHY it is dangerous, not just that it is undeclared
+        assert "reports success" in problems[0]
+
+    def test_a_declared_variable_is_allowed(self, repo):
+        name = next(iter(inv.DECLARED_VARS))
+        (repo / ".github" / "workflows" / "canary.yml").write_text(
+            "jobs:\n  a:\n    steps:\n"
+            f"      - if: ${{{{ vars.{name} == 'true' }}}}\n        run: x\n"
+        )
+        assert inv.check_workflow_vars(repo) == []
+
+    def test_a_stale_declaration_is_caught_only_when_checking_this_repo(self, repo):
+        """The two arms are different kinds of statement. "no undeclared reference" holds
+        for any tree; "every declaration is used" is about THIS repo's table. Demanding the
+        second of a synthetic fixture is how a general checker acquires a private dependency
+        on one repo's content -- which is what the pre-existing TestMain fixture caught."""
+        assert inv.check_workflow_vars(repo) == []
+        strict = inv.check_workflow_vars(repo, declarations_must_be_used=True)
+        assert strict and "no workflow reads it any more" in strict[0]
+
+    def test_a_reference_outside_an_expression_is_not_a_reference(self, repo):
+        """`vars.X` in prose or a run: line is not an Actions expression, and flagging it
+        would train people to ignore this check."""
+        (repo / ".github" / "workflows" / "doc.yml").write_text(
+            "jobs:\n  a:\n    steps:\n      - run: echo 'set vars.NOT_A_REF to enable'\n"
+        )
+        assert inv.check_workflow_vars(repo) == []
+
+
 class TestMain:
     def test_exit_zero_when_clean(self, repo, capsys):
         assert inv.main(["--root", str(repo)]) == 0
@@ -137,4 +185,6 @@ class TestMain:
         this fails here rather than only in CI."""
         root = Path(__file__).resolve().parents[1]
         assert inv.check_secrets(root) == []
+        # Strict here: this IS the repo the table describes.
+        assert inv.check_workflow_vars(root, declarations_must_be_used=True) == []
         assert inv.check_changelog(root) == []
