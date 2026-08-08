@@ -169,6 +169,14 @@ def check_workflow_vars(root: Path, *, declarations_must_be_used: bool = False) 
         for p in (root / d).rglob("*.y*ml")
         if p.is_file()
     )
+    # On NAMES vs VALUES, because CodeQL flags the shared problem-printer in main() as
+    # clear-text logging of sensitive data (py/clear-text-logging-sensitive-data) once this
+    # check feeds it. Dismissed as a false positive on #132, recorded here rather than only
+    # in the Security tab: what reaches a problem string is a path, a line number, and the
+    # IDENTIFIER captured by _VARS_REF -- never a value. Variable and secret values live in
+    # GitHub and never enter this process, which only reads files from disk, and the name is
+    # already committed in cleartext in the very file being reported. If a future check ever
+    # puts a VALUE into a problem string, that alert is real and this note does not cover it.
     used: set[str] = set()
     for path in targets:
         text = path.read_text(encoding="utf-8")
