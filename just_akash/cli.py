@@ -1328,9 +1328,15 @@ def main():
             label = f"{dseq} ({tag})" if tag else dseq
             if args.on or args.off:
                 enabled = bool(args.on)
+                # set_auto_top_up reads the setting back and raises if it did not
+                # take, so reaching this line means the state was CONFIRMED, not asked
+                # for. Saying "verified" is the difference between reporting an outcome
+                # and reporting an intention -- this message used to be the latter while
+                # reading like the former.
                 client.set_auto_top_up(dseq, enabled)
                 print(
-                    f"Auto top-up {'enabled' if enabled else 'disabled'} for deployment {label}."
+                    f"Auto top-up {'enabled' if enabled else 'disabled'} "
+                    f"for deployment {label} (verified by read-back)."
                 )
             else:
                 settings = client.get_deployment_settings(dseq)

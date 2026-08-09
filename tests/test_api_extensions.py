@@ -147,12 +147,98 @@ class TestDeploymentSettings:
         )
 
 
+class TestSetAutoTopUpVerifies:
+    """The write is not evidence. Three canaries were created on 2026-08-08 with
+    "Auto top-up enabled" logged for each, and all three had expired 13-15h later on a
+    $2.00 escrow deposit -- and nothing could distinguish "on but insufficient" from
+    "never really on", because the only evidence was a message we printed ourselves."""
+
+    @patch.object(AkashConsoleAPI, "update_deployment_settings")
+    @patch.object(AkashConsoleAPI, "get_deployment_settings")
+    def test_raises_when_the_write_is_not_honoured(self, mock_get, mock_update):
+        """The server accepts the PATCH and still reports the setting off."""
+        mock_get.side_effect = [{"autoTopUpEnabled": False}, {"autoTopUpEnabled": False}]
+        client = AkashConsoleAPI("key")
+        with pytest.raises(RuntimeError, match="did not take"):
+            client.set_auto_top_up("12345", True)
+
+    @patch.object(AkashConsoleAPI, "update_deployment_settings")
+    @patch.object(AkashConsoleAPI, "get_deployment_settings")
+    def test_a_string_true_is_not_a_true(self, mock_get, mock_update):
+        """This API is known to answer with the STRING "false" where a boolean belongs.
+        A server loose enough to do that is not one whose "true" can be believed either,
+        and bool("false") is True -- the read path was already hardened against exactly
+        this. Consistency matters more than optimism here: an unparseable confirmation
+        is not a confirmation."""
+        mock_get.side_effect = [{"autoTopUpEnabled": False}, {"autoTopUpEnabled": "true"}]
+        client = AkashConsoleAPI("key")
+        with pytest.raises(RuntimeError, match="did not take"):
+            client.set_auto_top_up("12345", True)
+
+    @patch.object(AkashConsoleAPI, "update_deployment_settings")
+    @patch.object(AkashConsoleAPI, "get_deployment_settings")
+    def test_missing_settings_after_the_write_is_a_failure(self, mock_get, mock_update):
+        """No settings record at all after enabling is not "probably fine"."""
+        mock_get.side_effect = [{"autoTopUpEnabled": False}, {}]
+        client = AkashConsoleAPI("key")
+        with pytest.raises(RuntimeError, match="did not take"):
+            client.set_auto_top_up("12345", True)
+
+    @patch.object(AkashConsoleAPI, "update_deployment_settings")
+    @patch.object(AkashConsoleAPI, "get_deployment_settings")
+    def test_disabling_is_verified_too(self, mock_get, mock_update):
+        """--off that silently stays on keeps spending money."""
+        mock_get.side_effect = [{"autoTopUpEnabled": True}, {"autoTopUpEnabled": True}]
+        client = AkashConsoleAPI("key")
+        with pytest.raises(RuntimeError, match="did not take"):
+            client.set_auto_top_up("12345", False)
+        mock_get.side_effect = [{"autoTopUpEnabled": True}, {"autoTopUpEnabled": False}]
+        client.set_auto_top_up("12345", False)  # must not raise
+
+    @pytest.mark.parametrize("garbage", ["false", "true", None, 0, ""])
+    @patch.object(AkashConsoleAPI, "update_deployment_settings")
+    @patch.object(AkashConsoleAPI, "get_deployment_settings")
+    def test_disable_needs_a_real_false_not_merely_a_non_true(
+        self, mock_get, mock_update, garbage
+    ):
+        """The first version of the check demanded a real True to confirm an ENABLE but
+        accepted anything non-True as a confirmed DISABLE, so "false", "true" and None
+        all passed as verified. Same defect the method exists to remove, in the direction
+        nobody was looking."""
+        mock_get.side_effect = [{"autoTopUpEnabled": True}, {"autoTopUpEnabled": garbage}]
+        client = AkashConsoleAPI("key")
+        with pytest.raises(RuntimeError, match="did not take"):
+            client.set_auto_top_up("12345", False)
+
+    @patch.object(AkashConsoleAPI, "update_deployment_settings")
+    @patch.object(AkashConsoleAPI, "get_deployment_settings")
+    def test_the_message_names_the_right_consequence(self, mock_get, mock_update):
+        """A failed disable does not drain escrow -- it keeps spending. Reusing the enable
+        wording would send the reader after the wrong problem."""
+        mock_get.side_effect = [{"autoTopUpEnabled": True}, {"autoTopUpEnabled": True}]
+        client = AkashConsoleAPI("key")
+        with pytest.raises(RuntimeError, match="keep charging"):
+            client.set_auto_top_up("12345", False)
+        mock_get.side_effect = [{"autoTopUpEnabled": False}, {"autoTopUpEnabled": False}]
+        with pytest.raises(RuntimeError, match="escrow will drain"):
+            client.set_auto_top_up("12345", True)
+
+    @patch.object(AkashConsoleAPI, "update_deployment_settings")
+    @patch.object(AkashConsoleAPI, "get_deployment_settings")
+    def test_returns_the_write_result_when_verified(self, mock_get, mock_update):
+        mock_update.return_value = {"autoTopUpEnabled": True, "dseq": "12345"}
+        mock_get.side_effect = [{"autoTopUpEnabled": False}, {"autoTopUpEnabled": True}]
+        client = AkashConsoleAPI("key")
+        assert client.set_auto_top_up("12345", True)["autoTopUpEnabled"] is True
+
+
 class TestSetAutoTopUp:
     @patch.object(AkashConsoleAPI, "update_deployment_settings")
     @patch.object(AkashConsoleAPI, "create_deployment_settings")
     @patch.object(AkashConsoleAPI, "get_deployment_settings")
     def test_upsert_patches_when_settings_exist(self, mock_get, mock_create, mock_update):
-        mock_get.return_value = {"autoTopUpEnabled": False}
+        # Two GETs now: the existence probe, then the verification read-back.
+        mock_get.side_effect = [{"autoTopUpEnabled": False}, {"autoTopUpEnabled": True}]
         client = AkashConsoleAPI("key")
         client.set_auto_top_up("12345", True)
         mock_update.assert_called_once_with("12345", True)
@@ -162,7 +248,7 @@ class TestSetAutoTopUp:
     @patch.object(AkashConsoleAPI, "create_deployment_settings")
     @patch.object(AkashConsoleAPI, "get_deployment_settings")
     def test_upsert_creates_when_no_settings(self, mock_get, mock_create, mock_update):
-        mock_get.return_value = {}
+        mock_get.side_effect = [{}, {"autoTopUpEnabled": True}]
         client = AkashConsoleAPI("key")
         client.set_auto_top_up("12345", True)
         mock_create.assert_called_once_with("12345", True)
@@ -177,9 +263,14 @@ class TestSetAutoTopUp:
         # routes to PATCH (update an existing record) instead of POST (create).
         # The PATCH targets a settings record that does not exist -> wrong verb,
         # and on a real server a 404. The upsert must CREATE here.
+        gets = {"n": 0}
+
         def _route(method, endpoint, data=None):
             if method == "GET":
-                return {"data": None}  # "no settings yet"
+                gets["n"] += 1
+                # First GET is the existence probe ("no settings yet"); the second is
+                # the verification read-back, by which point the POST has landed.
+                return {"data": None} if gets["n"] == 1 else {"data": {"autoTopUpEnabled": True}}
             return {"data": {"autoTopUpEnabled": True}}
 
         mock_req.side_effect = _route

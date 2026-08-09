@@ -343,15 +343,54 @@ class AkashConsoleAPI:
         return _unwrap_data(response)
 
     def set_auto_top_up(self, dseq: str, enabled: bool) -> dict[str, Any]:
-        """Enable or disable auto top-up, upserting settings as needed.
+        """Enable or disable auto top-up, upserting settings, then VERIFY it took.
 
         Reads current settings: PATCHes if they already exist, otherwise POSTs
         to create them. Returns the resulting settings object.
+
+        NEVER TRUST THE WRITE. This used to return the write response and the caller
+        printed "Auto top-up enabled" on the strength of it, which is an assumption
+        reported as a fact. Two reasons that is not good enough here:
+
+        * This API is already known to answer with a STRING where a boolean belongs --
+          `autoTopUpEnabled: "false"` -- which the READ path was hardened against (see
+          test_show_does_not_lie_when_enabled_is_string_false). A server loose enough to
+          do that on read can accept a write without honouring it.
+        * The consequence is silent and expensive. On 2026-08-08 all three canaries were
+          created with "Auto top-up enabled" logged for each, and all three had expired
+          13-15h later on a $2.00 escrow deposit. Nothing in the pipeline could tell
+          "auto top-up is on and insufficient" from "auto top-up was never really on",
+          because the only evidence either way was a message we printed ourselves.
+
+        So the setting is read back and compared. Raising here is deliberate: the caller
+        in provider-canary.yml already has `|| echo "::warning::auto-topup could not be
+        enabled"`, which until now could never fire.
         """
         existing = self.get_deployment_settings(dseq)
         if existing:
-            return self.update_deployment_settings(dseq, enabled)
-        return self.create_deployment_settings(dseq, enabled)
+            result = self.update_deployment_settings(dseq, enabled)
+        else:
+            result = self.create_deployment_settings(dseq, enabled)
+
+        settings = self.get_deployment_settings(dseq) or {}
+        actual = settings.get("autoTopUpEnabled")
+        # IDENTITY, in BOTH directions. The first version of this check read
+        # `(actual is True) != enabled`, which demanded a real True to confirm an ENABLE
+        # but accepted anything non-True as a confirmed DISABLE -- so "false", "true" and
+        # None all passed as verified, and the CLI printed "(verified by read-back)" on an
+        # unparseable answer. That is the same defect this method exists to remove, in the
+        # direction nobody was looking. Raised independently by Copilot and CodeRabbit.
+        if actual is not enabled:
+            consequence = (
+                "The escrow will drain and the lease will close on its own."
+                if enabled
+                else "Top-ups may keep charging against the wallet."
+            )
+            raise RuntimeError(
+                f"auto top-up for deployment {dseq} did not take: asked for "
+                f"{enabled}, reads back {actual!r} after the write. {consequence}"
+            )
+        return result
 
     def close_deployment(self, dseq: str) -> dict[str, Any]:
         response = self._request("DELETE", f"/v1/deployments/{dseq}")
