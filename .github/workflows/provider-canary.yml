@@ -101,7 +101,15 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p prior
-          git fetch --depth=1 origin telemetry || exit 0
+          # Record WHY prior state may be missing. `|| exit 0` alone makes a transport or
+          # credential failure indistinguishable from a legitimate first run, and the
+          # consumer below then treats both as "no prior targets". Raised by CodeRabbit on
+          # #133 -- it is the same absent-input-is-not-evidence error one level up.
+          if ! git fetch --depth=1 origin telemetry; then
+            echo fetch-failed > prior/STATUS
+            exit 0
+          fi
+          echo fetched > prior/STATUS
           # `git show A:b > out` CREATES out BEFORE the command runs, so a missing file on
           # the branch leaves a ZERO-BYTE out rather than none — and the `cp ... || echo '{}'`
           # fallback downstream then copies the empty file happily. That is what broke the
@@ -135,10 +143,24 @@ jobs:
           # used to swallow the same condition with `|| echo '{}'`.
           if [ -f prior/canary-targets.json ]; then
             cp prior/canary-targets.json targets.json
-          else
+          elif [ "$(cat prior/STATUS 2>/dev/null || echo unknown)" = "fetched" ]; then
+            # Branch reachable, file genuinely not on it: a first run. Notable, not alarming.
             echo '{}' > targets.json
-            echo "::warning::no prior canary-targets.json - starting from an EMPTY target set. Legitimate on a first run. Otherwise the telemetry-branch fetch failed, and every live canary whose ingress has not propagated loses its remembered uri and will publish as unreachable."
-            echo "- :warning: **no prior canary-targets.json** - started from an empty target set" >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::telemetry branch has no canary-targets.json yet - starting from an empty target set. Expected on a FIRST run; if this repeats, prior state is not being published."
+            echo "- :information_source: no canary-targets.json on the telemetry branch yet (first run?)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            # Could not reach the branch at all. Prior state is UNKNOWN, not empty, and the
+            # difference matters: a live canary whose ingress has not propagated keeps its
+            # uri from prior targets, so proceeding without it publishes that provider as
+            # unreachable when it is not.
+            echo '{}' > targets.json
+            echo "::error::could NOT fetch prior canary state, so remembered ingress URIs are UNKNOWN rather than absent. Proceeding to keep telemetry flowing, but any 'unreachable' reading in THIS run may be self-inflicted - check the fetch step before believing it."
+            {
+              echo "### :rotating_light: prior canary state could not be fetched"
+              echo ""
+              echo "Remembered ingress URIs are **unknown**, not empty. An \`unreachable\`"
+              echo "reading in this run may be self-inflicted - see the fetch step above."
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
           uv run python -m canary.ensure \
             --details details.json \
@@ -305,6 +327,7 @@ jobs:
         if: always()
         env:
           DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
           # ABSENT INPUT IS NOT EVIDENCE OF HEALTH. The first draft of this step read
@@ -323,16 +346,25 @@ jobs:
           fi
           missing_n=$(wc -l < missing.txt | tr -d ' ')
           if [ "$DEPLOY_OUTCOME" = "skipped" ] && [ "${missing_n:-0}" -gt 0 ]; then
-            names=$(cut -f1 missing.txt | tr '\n' ' ')
-            echo "::error::${missing_n} provider(s) have NO canary and the deploy step was SKIPPED: ${names}- on a scheduled run that gate is vars.CANARY_AUTODEPLOY, which must equal the string 'true'. An unset variable is the empty string and reads as false, so this job will keep reporting success while the fleet has no canary at all."
+            # paste, not `tr '\n' ' '`: tr leaves a trailing space that ran into the next
+            # clause as "alphavps - on a scheduled run".
+            names=$(cut -f1 missing.txt | paste -sd' ' -)
+            # The gate differs by event, so the remedy differs. Naming the wrong knob is how
+            # the last diagnosis went to the providers instead of the workflow.
+            if [ "$EVENT" = "workflow_dispatch" ]; then
+              why="you dispatched this run with deploy_missing unchecked"
+            else
+              why="on a ${EVENT} run the gate is vars.CANARY_AUTODEPLOY, which must equal the string 'true' - an unset repo variable is the empty string and reads as false"
+            fi
+            echo "::error::${missing_n} provider(s) have NO canary and the deploy step was SKIPPED: ${names}. Cause: ${why}. This job will keep reporting success while the fleet has no canary at all."
             {
               echo "### :rotating_light: canaries missing, deploy skipped"
               echo ""
               echo "**${missing_n} provider(s) with no canary:** \`${names}\`"
               echo ""
-              echo "The deploy step was \`skipped\`. On a scheduled run it is gated on"
-              echo "\`vars.CANARY_AUTODEPLOY == 'true'\`; an unset repo variable is the empty"
-              echo "string and reads as false. Check the variable before suspecting a provider."
+              echo "Triggered by \`${EVENT}\`. ${why}."
+              echo ""
+              echo "Check that before suspecting a provider."
             } >> "$GITHUB_STEP_SUMMARY"
           elif [ "$DEPLOY_OUTCOME" = "skipped" ]; then
             echo "deploy skipped, and every provider already has a canary - nothing to do."
