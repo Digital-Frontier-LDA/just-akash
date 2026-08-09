@@ -1,0 +1,82 @@
+# Answer one question, cheaply and without spending anything: is auto top-up ACTUALLY on
+# for the deployments we believe it is on for?
+#
+# It matters because "Auto top-up enabled for deployment ..." was printed for all three
+# canaries on 2026-08-08 and all three had expired 13-15h later on a $2.00 escrow deposit
+# (lease_replacements_total reached 3 per provider before anyone attributed it correctly).
+# set_auto_top_up now verifies its own write, but that only covers deployments created
+# AFTER it merged -- this reads the live ones, which is the evidence that decides whether
+# the flag fails to persist at all, or persists and is simply not sufficient on its own
+# (estimatedTopUpAmount and topUpFrequencyMs are never set by any code path).
+#
+# STRICTLY READ-ONLY. `auto-topup --dseq X` with neither --on nor --off takes the show
+# branch, and nothing here creates, funds, or closes a deployment.
+name: Auto top-up audit
+
+on:
+  workflow_dispatch:
+
+# Same wallet as the canary and the smoke. Queue rather than race, and never cancel a
+# run that might be mid-deploy in a sibling workflow.
+concurrency:
+  group: akash-wallet
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: Read auto top-up state for every live deployment
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4
+        with:
+          enable-cache: true
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Load SOPS secrets
+        uses: ./.github/actions/sops-env
+        with:
+          age-key: ${{ secrets.SOPS_AGE_KEY }}
+
+      - name: Read auto top-up for every live deployment
+        run: |
+          set -euo pipefail
+          uv run just-akash list --json > listing.json
+          python3 - <<'PY' > dseqs.txt
+          import json
+          d = json.load(open("listing.json"))
+          rows = d if isinstance(d, list) else (d.get("data") or d.get("deployments") or [])
+          for r in rows:
+              for k in ("dseq", "id", "deploymentId"):
+                  v = r.get(k) if isinstance(r, dict) else None
+                  if isinstance(v, dict):
+                      v = v.get("dseq")
+                  if v:
+                      print(v); break
+          PY
+          echo "live deployments: $(wc -l < dseqs.txt)"
+          {
+            echo "### Auto top-up state"
+            echo ""
+            echo "| dseq | reported state |"
+            echo "| --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # A read failure for ONE deployment must not hide the others: this audit exists
+          # because a missing answer was mistaken for a good one.
+          while read -r dseq; do
+            [ -n "$dseq" ] || continue
+            out=$(uv run just-akash auto-topup --dseq "$dseq" 2>&1) || out="ERROR: $out"
+            echo "$out"
+            echo "| \`${dseq}\` | ${out//$'\n'/ } |" >> "$GITHUB_STEP_SUMMARY"
+          done < dseqs.txt
