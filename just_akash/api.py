@@ -374,13 +374,21 @@ class AkashConsoleAPI:
 
         settings = self.get_deployment_settings(dseq) or {}
         actual = settings.get("autoTopUpEnabled")
-        # `is True`, not truthiness -- the string "false" is truthy and is exactly what
-        # this API has been seen to return.
-        if (actual is True) != enabled:
+        # IDENTITY, in BOTH directions. The first version of this check read
+        # `(actual is True) != enabled`, which demanded a real True to confirm an ENABLE
+        # but accepted anything non-True as a confirmed DISABLE -- so "false", "true" and
+        # None all passed as verified, and the CLI printed "(verified by read-back)" on an
+        # unparseable answer. That is the same defect this method exists to remove, in the
+        # direction nobody was looking. Raised independently by Copilot and CodeRabbit.
+        if actual is not enabled:
+            consequence = (
+                "The escrow will drain and the lease will close on its own."
+                if enabled
+                else "Top-ups may keep charging against the wallet."
+            )
             raise RuntimeError(
                 f"auto top-up for deployment {dseq} did not take: asked for "
-                f"{enabled}, reads back {actual!r} after the write. The escrow will "
-                f"drain and the lease will close on its own."
+                f"{enabled}, reads back {actual!r} after the write. {consequence}"
             )
         return result
 

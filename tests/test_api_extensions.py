@@ -195,6 +195,34 @@ class TestSetAutoTopUpVerifies:
         mock_get.side_effect = [{"autoTopUpEnabled": True}, {"autoTopUpEnabled": False}]
         client.set_auto_top_up("12345", False)  # must not raise
 
+    @pytest.mark.parametrize("garbage", ["false", "true", None, 0, ""])
+    @patch.object(AkashConsoleAPI, "update_deployment_settings")
+    @patch.object(AkashConsoleAPI, "get_deployment_settings")
+    def test_disable_needs_a_real_false_not_merely_a_non_true(
+        self, mock_get, mock_update, garbage
+    ):
+        """The first version of the check demanded a real True to confirm an ENABLE but
+        accepted anything non-True as a confirmed DISABLE, so "false", "true" and None
+        all passed as verified. Same defect the method exists to remove, in the direction
+        nobody was looking."""
+        mock_get.side_effect = [{"autoTopUpEnabled": True}, {"autoTopUpEnabled": garbage}]
+        client = AkashConsoleAPI("key")
+        with pytest.raises(RuntimeError, match="did not take"):
+            client.set_auto_top_up("12345", False)
+
+    @patch.object(AkashConsoleAPI, "update_deployment_settings")
+    @patch.object(AkashConsoleAPI, "get_deployment_settings")
+    def test_the_message_names_the_right_consequence(self, mock_get, mock_update):
+        """A failed disable does not drain escrow -- it keeps spending. Reusing the enable
+        wording would send the reader after the wrong problem."""
+        mock_get.side_effect = [{"autoTopUpEnabled": True}, {"autoTopUpEnabled": True}]
+        client = AkashConsoleAPI("key")
+        with pytest.raises(RuntimeError, match="keep charging"):
+            client.set_auto_top_up("12345", False)
+        mock_get.side_effect = [{"autoTopUpEnabled": False}, {"autoTopUpEnabled": False}]
+        with pytest.raises(RuntimeError, match="escrow will drain"):
+            client.set_auto_top_up("12345", True)
+
     @patch.object(AkashConsoleAPI, "update_deployment_settings")
     @patch.object(AkashConsoleAPI, "get_deployment_settings")
     def test_returns_the_write_result_when_verified(self, mock_get, mock_update):
