@@ -1,14 +1,14 @@
 {
   "alphavps": {
-    "dseq": "1786239755382",
-    "uri": "sov5580h5h8rhc15rum1f74vfg.ingress.h6i-dedicated.eu-se-1.digitalfrontier.so"
+    "dseq": "1786277817169",
+    "uri": "06h08auh35bp1d70mco3e1fgj4.ingress.h6i-dedicated.eu-se-1.digitalfrontier.so"
   },
   "hetzner_hel": {
-    "dseq": "1786239838378",
-    "uri": "50r86q3eepc9td35tknpr7mllc.ingress.m3a.eu-n-3.digitalfrontier.network"
+    "dseq": "1786277900655",
+    "uri": "d5ktd78p95at381r15an62r738.ingress.m3a.eu-n-3.digitalfrontier.network"
   },
   "onidc": {
-    "dseq": "1786239667879",
-    "uri": "5f8l80nmplblvam8ktfrlav1fc.ingress.h4i-dedicated.eu-sw-2.digitalfrontier.so"
+    "dseq": "1786277736364",
+    "uri": "rmoejbhl35eu551tuvlfjd49m4.ingress.h4i-dedicated.eu-sw-2.digitalfrontier.so"
   }
 }
