@@ -101,7 +101,15 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p prior
-          git fetch --depth=1 origin telemetry || exit 0
+          # Record WHY prior state may be missing. `|| exit 0` alone makes a transport or
+          # credential failure indistinguishable from a legitimate first run, and the
+          # consumer below then treats both as "no prior targets". Raised by CodeRabbit on
+          # #133 -- it is the same absent-input-is-not-evidence error one level up.
+          if ! git fetch --depth=1 origin telemetry; then
+            echo fetch-failed > prior/STATUS
+            exit 0
+          fi
+          echo fetched > prior/STATUS
           # `git show A:b > out` CREATES out BEFORE the command runs, so a missing file on
           # the branch leaves a ZERO-BYTE out rather than none — and the `cp ... || echo '{}'`
           # fallback downstream then copies the empty file happily. That is what broke the
@@ -126,7 +134,34 @@ jobs:
           # list rows are SUMMARIES and carry no leases, so neither the service set nor the
           # provider address is on them. details.py fetches the real thing per dseq.
           uv run python -m canary.details --listing listing.json --out details.json
-          cp prior/canary-targets.json targets.json 2>/dev/null || echo '{}' > targets.json
+          # An EMPTY target set is not a neutral default. plan() matches on the live
+          # deployment, so it will not double-spend -- but a live canary whose ingress has
+          # not propagated yet keeps its uri from prior targets, and losing that makes
+          # collect.py publish it as unreachable. plan()'s own docstring calls that "a
+          # self-inflicted outage in the signal". The step above already hardened the
+          # PRODUCER of this file against a zero-byte write; this is the CONSUMER, and it
+          # used to swallow the same condition with `|| echo '{}'`.
+          if [ -f prior/canary-targets.json ]; then
+            cp prior/canary-targets.json targets.json
+          elif [ "$(cat prior/STATUS 2>/dev/null || echo unknown)" = "fetched" ]; then
+            # Branch reachable, file genuinely not on it: a first run. Notable, not alarming.
+            echo '{}' > targets.json
+            echo "::warning::telemetry branch has no canary-targets.json yet - starting from an empty target set. Expected on a FIRST run; if this repeats, prior state is not being published."
+            echo "- :information_source: no canary-targets.json on the telemetry branch yet (first run?)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            # Could not reach the branch at all. Prior state is UNKNOWN, not empty, and the
+            # difference matters: a live canary whose ingress has not propagated keeps its
+            # uri from prior targets, so proceeding without it publishes that provider as
+            # unreachable when it is not.
+            echo '{}' > targets.json
+            echo "::error::could NOT fetch prior canary state, so remembered ingress URIs are UNKNOWN rather than absent. Proceeding to keep telemetry flowing, but any 'unreachable' reading in THIS run may be self-inflicted - check the fetch step before believing it."
+            {
+              echo "### :rotating_light: prior canary state could not be fetched"
+              echo ""
+              echo "Remembered ingress URIs are **unknown**, not empty. An \`unreachable\`"
+              echo "reading in this run may be self-inflicted - see the fetch step above."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
           uv run python -m canary.ensure \
             --details details.json \
             --akash-providers "$AKASH_PROVIDERS" \
@@ -178,6 +213,7 @@ jobs:
           [ -s credit.err ] && cat credit.err || true
 
       - name: Deploy canaries for providers missing one
+        id: deploy
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_missing || vars.CANARY_AUTODEPLOY == 'true' }}
         env:
           # Same override the read step sees. Without this the two steps compute
@@ -274,6 +310,66 @@ jobs:
       # unreadable listing precisely so the reachability reading survives, and a `set -e`
       # step wrapping it would throw that away for any OTHER failure (a `list` timeout, or
       # ensure.py exiting 2 on a rejected document).
+      # THE STEP THIS WORKFLOW WAS MISSING. `vars.CANARY_AUTODEPLOY` was never set, so the
+      # deploy above skipped on EVERY scheduled run for weeks while the job reported success
+      # -- and the first anyone knew was three providers paging AkashCanaryNoIngress critical
+      # for a day (#129). A skipped step is invisible: no annotation, no summary, green tick.
+      #
+      # Every other refusal in this job already says so out loud (`::warning::` for low
+      # credit, unreadable credit, auto-topup, an unparsable dseq). The one path that
+      # silently did nothing was the one that mattered.
+      #
+      # Deliberately does NOT fail the job. Collect + publish run after this, and a non-zero
+      # exit here would stop the exposition file being written -- taking down the very
+      # signal (akash_canary_active_deployments) that is the durable backstop for this
+      # condition. Loud and continuing beats silent, and beats loud-but-blind.
+      - name: Say so if canaries are missing and we did not deploy
+        if: always()
+        env:
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          # ABSENT INPUT IS NOT EVIDENCE OF HEALTH. The first draft of this step read
+          # `wc -l < missing.txt || echo 0`, which turned a missing file into "0 providers
+          # missing" and printed "nothing to do" -- reporting health for a question it had
+          # not asked. That is the same defect this whole step exists to remove, so it is
+          # checked first rather than folded into a default.
+          if [ ! -f missing.txt ]; then
+            echo "::error::missing.txt was never written, so the resolve step did not finish and whether any provider lacks a canary is UNKNOWN. This is not the same as 'nothing to do'."
+            {
+              echo "### :warning: canary coverage UNKNOWN"
+              echo ""
+              echo "\`missing.txt\` was never produced - the resolve step did not complete."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          missing_n=$(wc -l < missing.txt | tr -d ' ')
+          if [ "$DEPLOY_OUTCOME" = "skipped" ] && [ "${missing_n:-0}" -gt 0 ]; then
+            # paste, not `tr '\n' ' '`: tr leaves a trailing space that ran into the next
+            # clause as "alphavps - on a scheduled run".
+            names=$(cut -f1 missing.txt | paste -sd' ' -)
+            # The gate differs by event, so the remedy differs. Naming the wrong knob is how
+            # the last diagnosis went to the providers instead of the workflow.
+            if [ "$EVENT" = "workflow_dispatch" ]; then
+              why="you dispatched this run with deploy_missing unchecked"
+            else
+              why="on a ${EVENT} run the gate is vars.CANARY_AUTODEPLOY, which must equal the string 'true' - an unset repo variable is the empty string and reads as false"
+            fi
+            echo "::error::${missing_n} provider(s) have NO canary and the deploy step was SKIPPED: ${names}. Cause: ${why}. This job will keep reporting success while the fleet has no canary at all."
+            {
+              echo "### :rotating_light: canaries missing, deploy skipped"
+              echo ""
+              echo "**${missing_n} provider(s) with no canary:** \`${names}\`"
+              echo ""
+              echo "Triggered by \`${EVENT}\`. ${why}."
+              echo ""
+              echo "Check that before suspecting a provider."
+            } >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$DEPLOY_OUTCOME" = "skipped" ]; then
+            echo "deploy skipped, and every provider already has a canary - nothing to do."
+          fi
+
       - name: Re-resolve targets after any deploy
         continue-on-error: true
         run: |
