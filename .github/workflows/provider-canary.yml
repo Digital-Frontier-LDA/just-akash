@@ -281,34 +281,34 @@ jobs:
             sed -e "s|PLACEHOLDER_CANARY_PY_B64|${CANARY_PY_B64}|" \
                 -e "s|PLACEHOLDER_PROVIDER|${provider}|" \
                 sdl/canary.yaml > "sdl-canary-${provider}.yaml"
+            # THE DEPOSIT MUST OUTLIVE THE AUTO TOP-UP INTERVAL, or auto top-up can
+            # never rescue the lease. That is a rule, not a magic number, and $2.00
+            # broke it for months.
+            #
+            # Measured 2026-08-09 by auditing the live deployments: auto top-up IS
+            # enabled on every one of them, with an estimatedTopUpAmount and
+            # topUpFrequencyMs of 86400000 -- every 24 HOURS. A $2.00 deposit is
+            # consumed at roughly $0.16/hour, so the lease expired at ~12.5h and died
+            # about twice over before auto top-up was ever due to fire. It was never
+            # broken and never disabled; it was never REACHED. Three canaries had
+            # each been replaced 3+ times, and akash_canary_lease_replacements_total
+            # was reading that churn as providers closing our deployments.
+            #
+            # $6.00 buys ~37.5h: auto top-up fires with ~13.5h to spare, which also
+            # absorbs a missed cycle or a GitHub scheduler stall (one of 1h45m was
+            # observed the same night). Raising the deposit does NOT raise the burn
+            # rate -- escrow is consumed at the same $/hour either way -- it raises
+            # LOCKED capital and, once top-up engages, should end the redeploy churn.
+            #
+            # If the burn rate turns out to differ per provider, resize from the rule
+            # rather than from this number. Stated in ONE unit, hours:
+            #
+            #     deposit_usd / burn_usd_per_hour  >  topUpFrequencyMs / 3600000
+            #
+            # Today: 6.00 / 0.16 = 37.5h  >  86400000 / 3600000 = 24h.  OK.
             uv run just-akash deploy \
               --sdl "sdl-canary-${provider}.yaml" \
               --provider "$address" \
-              # THE DEPOSIT MUST OUTLIVE THE AUTO TOP-UP INTERVAL, or auto top-up can
-              # never rescue the lease. That is a rule, not a magic number, and $2.00
-              # broke it for months.
-              #
-              # Measured 2026-08-09 by auditing the live deployments: auto top-up IS
-              # enabled on every one of them, with an estimatedTopUpAmount and
-              # topUpFrequencyMs of 86400000 -- every 24 HOURS. A $2.00 deposit is
-              # consumed at roughly $0.16/hour, so the lease expired at ~12.5h and died
-              # about twice over before auto top-up was ever due to fire. It was never
-              # broken and never disabled; it was never REACHED. Three canaries had
-              # each been replaced 3+ times, and akash_canary_lease_replacements_total
-              # was reading that churn as providers closing our deployments.
-              #
-              # $6.00 buys ~37.5h: auto top-up fires with ~13.5h to spare, which also
-              # absorbs a missed cycle or a GitHub scheduler stall (one of 1h45m was
-              # observed the same night). Raising the deposit does NOT raise the burn
-              # rate -- escrow is consumed at the same $/hour either way -- it raises
-              # LOCKED capital and, once top-up engages, should end the redeploy churn.
-              #
-              # If the burn rate turns out to differ per provider, resize from the rule
-              # rather than from this number. Stated in ONE unit, hours:
-              #
-              #     deposit_usd / burn_usd_per_hour  >  topUpFrequencyMs / 3600000
-              #
-              # Today: 6.00 / 0.16 = 37.5h  >  86400000 / 3600000 = 24h.  OK.
               --deposit "${CANARY_DEPOSIT_USD:-6.0}" \
             | tee "deploy-${provider}.log"
             dseq=$(grep -oE 'dseq[ =:]+[0-9]+' "deploy-${provider}.log" | grep -oE '[0-9]+' | head -1 || true)
