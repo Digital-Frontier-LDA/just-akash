@@ -304,7 +304,11 @@ jobs:
               # LOCKED capital and, once top-up engages, should end the redeploy churn.
               #
               # If the burn rate turns out to differ per provider, resize from the rule
-              # above rather than from this number: deposit_hours > topUpFrequencyMs.
+              # rather than from this number. Stated in ONE unit, hours:
+              #
+              #     deposit_usd / burn_usd_per_hour  >  topUpFrequencyMs / 3600000
+              #
+              # Today: 6.00 / 0.16 = 37.5h  >  86400000 / 3600000 = 24h.  OK.
               --deposit "${CANARY_DEPOSIT_USD:-6.0}" \
             | tee "deploy-${provider}.log"
             dseq=$(grep -oE 'dseq[ =:]+[0-9]+' "deploy-${provider}.log" | grep -oE '[0-9]+' | head -1 || true)
