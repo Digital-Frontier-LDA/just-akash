@@ -98,8 +98,9 @@ jobs:
   # secrets/ci.sops.env". Measured 2026-08-10: PRs #136/#137/#138 all sat at
   # fail=2 pass=11, identical and permanent.
   #
-  # That breaks the rule this org already wrote down (alerting-standard.md section 1:
-  # "a check must be able to fail -- AND to pass"). A check that can never go green
+  # That breaks the rule this org already wrote down -- df-wiki
+  # content/platform/alerting-standard.md section 1, "A check must be able to fail --
+  # and to pass" (it is NOT a file in this repo). A check that can never go green
   # does not add safety; it trains everyone to merge red, which is how a real failure
   # eventually walks through. Dependency bumps include SECURITY patches, so the cost
   # lands exactly where it hurts.
@@ -110,7 +111,7 @@ jobs:
   e2e-shell:
     name: E2E lease-shell transport
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -152,7 +153,7 @@ jobs:
     # other job's live deployment — surfacing as "manifest version validation
     # failed" (422) and "lease not active". Serializing keeps each job isolated.
     needs: e2e-shell
-    if: always() && (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'))
+    if: always() && (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -194,6 +195,14 @@ jobs:
       - name: Run E2E secrets test
         run: uv run python -m just_akash.test_secrets_e2e
 
+  # The predicate is the PR AUTHOR, not github.actor. github.actor is whoever triggered
+  # THIS RUN, so a human clicking "Re-run all jobs" on a red dependabot PR would flip the
+  # guard: the E2E jobs would run again, still without secrets, fail again -- and the
+  # note below would NOT run, so the tick would go back to being permanently red AND
+  # silent. Re-running a red check is the most likely human action here, so the guard has
+  # to survive it. github.event.pull_request.user.login stays dependabot[bot] across
+  # re-runs. Raised by Copilot on #140.
+  #
   # KNOWN GAP, pre-existing and deliberately not widened here: a FORK pull request is
   # excluded by the same-repo guard and gets no note either, so its green tick is
   # narrower in exactly the same way. It is left alone because fork PRs are governed by
@@ -206,7 +215,8 @@ jobs:
   dependabot-coverage-note:
     name: E2E coverage not exercised (dependabot)
     runs-on: ubuntu-latest
-    if: github.actor == 'dependabot[bot]'
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    permissions: {}
     steps:
       - name: Say what did not run
         run: |
