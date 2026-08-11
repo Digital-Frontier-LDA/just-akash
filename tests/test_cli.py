@@ -504,3 +504,39 @@ class TestCliNoBackupFallback:
         assert not mock_deploy.called, "deploy must not run on a contradictory invocation"
         err = capsys.readouterr().err
         assert "--no-backup-fallback" in err and "--backup-provider" in err
+
+    @patch("just_akash.deploy.deploy")
+    def test_flag_without_any_preferred_tier_refuses(self, mock_deploy, monkeypatch, capsys):
+        """The flag must not be able to INVERT its own promise.
+
+        deploy() computes has_allowlist = bool(preferred or backup). Emptying backup while
+        preferred is also empty makes that False, which means "no allowlist -- accept a bid
+        from ANY provider". A caller who set only AKASH_PROVIDERS_BACKUP would then find that
+        asking for "preferred or nothing" removed the only allowlist they had and let the
+        deploy land anywhere, spending escrow on a provider nobody named.
+        """
+        monkeypatch.delenv("AKASH_PROVIDERS", raising=False)
+        monkeypatch.setenv("AKASH_PROVIDERS_BACKUP", "akash1backup_a")
+        with pytest.raises(SystemExit) as exc_info:
+            _run_cli(
+                monkeypatch,
+                ["just-akash", "deploy", "--sdl", "x.yaml", "--no-backup-fallback"],
+            )
+        assert exc_info.value.code == 2
+        assert not mock_deploy.called, "deploy must not run without an allowlist"
+        assert "requires a preferred provider" in capsys.readouterr().err
+
+    @patch("just_akash.deploy.deploy")
+    def test_preferred_from_env_alone_is_enough(self, mock_deploy, monkeypatch):
+        """The guard resolves the tier, so AKASH_PROVIDERS satisfies it without --provider.
+
+        Testing args.preferred_providers directly would reject this valid invocation.
+        """
+        monkeypatch.setenv("AKASH_PROVIDERS", "akash1from_env")
+        with pytest.raises(SystemExit) as exc_info:
+            _run_cli(
+                monkeypatch,
+                ["just-akash", "deploy", "--sdl", "x.yaml", "--no-backup-fallback"],
+            )
+        assert exc_info.value.code == 0
+        assert mock_deploy.call_args.kwargs["backup_providers"] == []

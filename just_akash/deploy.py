@@ -1411,6 +1411,18 @@ def deploy_main():
             file=sys.stderr,
         )
         sys.exit(2)
+    # Without a preferred tier this flag inverts its own promise: has_allowlist becomes False
+    # and deploy() accepts a bid from ANY provider. Same guard as cli.py -- both entry points
+    # reach the same deploy(). Raised by Copilot on #145.
+    if args.no_backup_fallback and not _resolve_tier(args.preferred_providers, "AKASH_PROVIDERS"):
+        print(
+            "Error: --no-backup-fallback requires a preferred provider, and none is "
+            "configured. Pass --provider or set AKASH_PROVIDERS. Without one there is no "
+            "allowlist at all, so the deploy would accept a bid from ANY provider -- the "
+            "opposite of what this flag promises.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     logging.basicConfig(
         level=logging.DEBUG if os.environ.get("AKASH_DEBUG") else logging.INFO,
