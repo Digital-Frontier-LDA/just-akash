@@ -431,3 +431,78 @@ class TestCliInjectNoSsh:
         captured = capsys.readouterr()
         assert "SSH-enabled SDL" in captured.err
         assert "lease-shell" in captured.err
+
+
+class TestCliNoBackupFallback:
+    """--no-backup-fallback must reach deploy() as backup_providers=[], NOT as None.
+
+    This is the whole mechanism, and the distinction is invisible unless asserted.
+    _resolve_tier() consults AKASH_PROVIDERS_BACKUP only when the argument is None, so
+    passing None here would inherit the entire backup tier from the environment and the
+    flag would do nothing at all -- silently, on a path that spends real escrow.
+
+    That is not hypothetical: the per-provider canary never passed --backup-provider,
+    inherited 10 backups from the environment, and repeatedly landed on providers it had
+    not asked for. Each landing failed the per-provider identity check in canary/ensure.py
+    plan(), so the next run deployed again.
+    """
+
+    @patch("just_akash.deploy.deploy")
+    def test_flag_forces_empty_list_not_none(self, mock_deploy, monkeypatch):
+        monkeypatch.setenv("AKASH_PROVIDERS_BACKUP", "akash1backup_a,akash1backup_b")
+        with pytest.raises(SystemExit) as exc_info:
+            _run_cli(
+                monkeypatch,
+                [
+                    "just-akash",
+                    "deploy",
+                    "--sdl",
+                    "canary.yaml",
+                    "--provider",
+                    "akash1preferred",
+                    "--no-backup-fallback",
+                ],
+            )
+        assert exc_info.value.code == 0
+        kwargs = mock_deploy.call_args.kwargs
+        # [] and None are NOT interchangeable here -- see the docstring.
+        assert kwargs["backup_providers"] == [], kwargs["backup_providers"]
+        assert kwargs["backup_providers"] is not None
+        assert kwargs["preferred_providers"] == ["akash1preferred"]
+
+    @patch("just_akash.deploy.deploy")
+    def test_without_the_flag_env_is_still_honoured(self, mock_deploy, monkeypatch):
+        """The flag must be opt-in. Every other caller keeps the fallback it has today."""
+        monkeypatch.setenv("AKASH_PROVIDERS_BACKUP", "akash1backup_a")
+        with pytest.raises(SystemExit) as exc_info:
+            _run_cli(monkeypatch, ["just-akash", "deploy", "--sdl", "x.yaml"])
+        assert exc_info.value.code == 0
+        # None means "no opinion" -> deploy() reads the env var itself.
+        assert mock_deploy.call_args.kwargs["backup_providers"] is None
+
+    @patch("just_akash.deploy.deploy")
+    def test_contradiction_refuses_rather_than_picking_one(
+        self, mock_deploy, monkeypatch, capsys
+    ):
+        """Asking for 'no fallback' AND naming backups is a contradiction.
+
+        Resolving it silently in favour of either side tells the caller nothing about what
+        they are about to spend escrow on. Refuse and say which two flags disagree.
+        """
+        with pytest.raises(SystemExit) as exc_info:
+            _run_cli(
+                monkeypatch,
+                [
+                    "just-akash",
+                    "deploy",
+                    "--sdl",
+                    "x.yaml",
+                    "--no-backup-fallback",
+                    "--backup-provider",
+                    "akash1backup_a",
+                ],
+            )
+        assert exc_info.value.code == 2
+        assert not mock_deploy.called, "deploy must not run on a contradictory invocation"
+        err = capsys.readouterr().err
+        assert "--no-backup-fallback" in err and "--backup-provider" in err

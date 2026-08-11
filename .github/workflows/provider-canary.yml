@@ -316,9 +316,28 @@ jobs:
             # taking, escrow exhaustion), and every correction came from reading the
             # server's own state rather than reasoning from ours. When measuring escrow,
             # record the EFFECTIVE deposit -- CANARY_DEPOSIT_USD may override this default.
+            # --no-backup-fallback: THIS canary is only meaningful on THIS provider.
+            #
+            # The general deploy path bids in three phases -- preferred-only, preferred-grace,
+            # then BACKUP FALLBACK -- and this command never passed --backup-provider, so it
+            # inherited the whole backup tier from AKASH_PROVIDERS_BACKUP. When onidc stopped
+            # bidding on 2026-08-11 the deploy therefore SUCCEEDED on a backup provider. But
+            # canary/ensure.py plan() identifies a canary by service set AND the lease being
+            # held by THAT provider's address, so the result could never satisfy the check it
+            # was created for: three consecutive runs each opened a new onidc deployment, each
+            # reporting the same stale dseq, and two of them were still holding escrow that
+            # nothing reclaims.
+            #
+            # A canary on the wrong provider is worse than no canary. It measures a provider
+            # nobody asked about, it cannot answer the question the fleet exists to answer,
+            # and it costs escrow from the pool the daily smoke needs. With this flag the
+            # deploy fails instead, AkashCanaryNoIngress/NoDeployments page honestly, and the
+            # escrow is returned -- every no-selection path in deploy.py closes the deployment
+            # it opened before raising, including the foreign-bids-only path this now takes.
             uv run just-akash deploy \
               --sdl "sdl-canary-${provider}.yaml" \
               --provider "$address" \
+              --no-backup-fallback \
               --deposit "${CANARY_DEPOSIT_USD:-2.0}" \
             | tee "deploy-${provider}.log"
             dseq=$(grep -oE 'dseq[ =:]+[0-9]+' "deploy-${provider}.log" | grep -oE '[0-9]+' | head -1 || true)

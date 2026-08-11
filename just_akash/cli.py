@@ -204,6 +204,25 @@ def main():
         default=None,
         help="Backup provider address (repeatable; overrides AKASH_PROVIDERS_BACKUP)",
     )
+    # A caller that must land on ONE named provider or not at all. Omitting
+    # --backup-provider does NOT do this: _resolve_tier() only consults the arg when it is
+    # not None, so an absent flag falls through to AKASH_PROVIDERS_BACKUP and the deploy
+    # quietly gets the whole backup tier. That is exactly how the per-provider canary spent
+    # weeks measuring itself -- it never passed --backup-provider, inherited 10 backups from
+    # the environment, and landed on a provider it had not asked for.
+    #
+    # Clearing the env var in the caller would also work and is worse: it is invisible at the
+    # call site, and anything that later exports AKASH_PROVIDERS_BACKUP silently re-arms the
+    # fallback. The intent belongs in the command, where it can be read and tested.
+    deploy_p.add_argument(
+        "--no-backup-fallback",
+        action="store_true",
+        dest="no_backup_fallback",
+        help="Fail if no PREFERRED provider bids, instead of falling back to the backup "
+        "tier. Ignores AKASH_PROVIDERS_BACKUP entirely. For deployments whose identity "
+        "IS the provider (the per-provider canary): one landing anywhere else measures "
+        "nothing and is worse than a missing one, which at least alerts honestly.",
+    )
     deploy_p.add_argument(
         "--deposit",
         type=float,
@@ -548,6 +567,18 @@ def main():
     if args.command == "deploy":
         from .deploy import deploy
 
+        # Two flags that contradict each other must not resolve silently in favour of one.
+        # Ignoring the explicit --backup-provider would do the safer thing while telling the
+        # caller nothing, and a caller who wrote both does not know what they are getting.
+        if args.no_backup_fallback and args.backup_providers:
+            print(
+                "Error: --no-backup-fallback and --backup-provider contradict each other. "
+                f"--no-backup-fallback means 'the preferred provider or nothing', but "
+                f"{len(args.backup_providers)} backup provider(s) were also given. "
+                "Drop one.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
         try:
             deploy(
                 sdl_path=args.sdl,
@@ -557,7 +588,11 @@ def main():
                 bid_wait_retry=args.bid_wait_retry,
                 env_vars=args.deploy_env_vars,
                 preferred_providers=args.preferred_providers,
-                backup_providers=args.backup_providers,
+                # [] and None are NOT the same to _resolve_tier: [] means "no backups, do not
+                # look at the environment", None means "no opinion, read AKASH_PROVIDERS_BACKUP".
+                # The flag has to produce the former, which is why it cannot just leave the
+                # argument unset.
+                backup_providers=[] if args.no_backup_fallback else args.backup_providers,
                 deposit=args.deposit,
             )
             sys.exit(0)
