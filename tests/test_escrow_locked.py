@@ -117,3 +117,41 @@ class TestFundsNotTransferred:
         c = _client([dep])
         r = escrow_locked(c)
         assert r["locked_uact"] == 5_000_000, "transferred leaked into the locked total"
+
+
+class TestUnnameableDeploymentsAreCounted:
+    """A live deployment we cannot NAME still holds escrow. Dropping it silently
+    understates `locked`, and because free = grant - locked that OVERSTATES free -- the
+    number the deploy gate reads. The tally would say "healthy" at the exact moment it is
+    not, which is the failure escrow_locked's own docstring describes. Raised
+    independently by Copilot and CodeRabbit on #141."""
+
+    def test_a_deployment_without_a_dseq_is_counted_not_dropped(self):
+        c = _client(
+            [
+                {
+                    "dseq": "1",
+                    "escrow_account": {
+                        "state": {"funds": [{"denom": "uact", "amount": "5000000"}]}
+                    },
+                },
+                {"no_dseq_here": True},
+            ]
+        )
+        r = escrow_locked(c)
+        assert r["skipped_no_dseq"] == 1
+        assert r["deployments"] == 1, "only the nameable one is tallied"
+
+    def test_a_clean_run_reports_zero_for_both_skip_reasons(self):
+        c = _client(
+            [
+                {
+                    "dseq": "1",
+                    "escrow_account": {
+                        "state": {"funds": [{"denom": "uact", "amount": "5000000"}]}
+                    },
+                }
+            ]
+        )
+        r = escrow_locked(c)
+        assert r["skipped_no_dseq"] == 0 and r["unreadable"] == 0

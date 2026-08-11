@@ -31,6 +31,25 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # TRUSTED REF ONLY, and this runs BEFORE checkout on purpose. workflow_dispatch
+      # lets the operator pick any branch or tag, and checkout then executes code from it
+      # -- including ./.github/actions/sops-env and just_akash/api.py, both of which handle
+      # SOPS_AGE_KEY and AKASH_API_KEY. A pushed branch could rewrite either and dispatch
+      # this workflow to read the wallet key out. Nothing about auditing escrow needs a
+      # non-default ref, so the capability is removed rather than trusted. Raised by
+      # CodeRabbit on #141.
+      - name: Refuse to run from a non-default ref
+        env:
+          REF: ${{ github.ref_name }}
+          DEFAULT: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [ "$REF" != "$DEFAULT" ]; then
+            echo "::error::This workflow loads wallet secrets and may only run from '$DEFAULT' (got '$REF')."
+            exit 1
+          fi
+          echo "ref=$REF is the default branch"
+
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # Matches security.yml / runner-pool.yml / runner-teardown.yml. Nothing after
@@ -73,13 +92,14 @@ jobs:
               print(f"  {row['dseq']}: {row['escrow_uact']} uact = {act:.2f} ACT")
               lines.append(f"| `{row['dseq']}` | {row['escrow_uact']} | {act:.2f} |")
           tot = r["locked_uact"] / 1_000_000
-          print(f"  TOTAL {tot:.2f} ACT across {r['deployments']} deployment(s), {r['unreadable']} unreadable")
+          print(f"  TOTAL {tot:.2f} ACT across {r['deployments']} tallied, {r['unreadable']} unreadable, {r['skipped_no_dseq']} unnameable")
           lines += ["", f"**Total** {tot:.2f} ACT across {r['deployments']} deployment(s)."]
-          if r["unreadable"]:
+          omitted = r["unreadable"] + r["skipped_no_dseq"]
+          if omitted:
               # A skipped deployment makes the sum a LOWER BOUND. Saying so is the whole
               # point of this audit; a quiet subtotal reads as a complete one.
-              print(f"::warning::{r['unreadable']} deployment(s) could not be read - the total above is a LOWER BOUND, not a measurement.")
-              lines.append(f"> :warning: {r['unreadable']} deployment(s) unreadable - total is a lower bound.")
+              print(f"::warning::{omitted} deployment(s) omitted ({r['unreadable']} unreadable, {r['skipped_no_dseq']} with no extractable dseq) - the total above is a LOWER BOUND, not a measurement.")
+              lines.append(f"> :warning: {omitted} omitted ({r['unreadable']} unreadable, {r['skipped_no_dseq']} unnameable) - total is a lower bound.")
           pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a").write("\n".join(lines) + "\n")
           PY
 
