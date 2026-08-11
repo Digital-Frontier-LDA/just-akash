@@ -1391,8 +1391,38 @@ def deploy_main():
         default=None,
         help="Backup provider address (repeatable; overrides AKASH_PROVIDERS_BACKUP)",
     )
+    # Mirrors the flag on `just-akash deploy` (cli.py). Both entry points reach the same
+    # deploy(), so a flag on only one of them is a trap for whoever uses the other.
+    parser.add_argument(
+        "--no-backup-fallback",
+        action="store_true",
+        dest="no_backup_fallback",
+        help="Fail if no PREFERRED provider bids, instead of falling back to the backup "
+        "tier. Ignores AKASH_PROVIDERS_BACKUP entirely.",
+    )
 
     args = parser.parse_args()
+
+    if args.no_backup_fallback and args.backup_providers:
+        print(
+            "Error: --no-backup-fallback and --backup-provider contradict each other. "
+            f"--no-backup-fallback means 'the preferred provider or nothing', but "
+            f"{len(args.backup_providers)} backup provider(s) were also given. Drop one.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    # Without a preferred tier this flag inverts its own promise: has_allowlist becomes False
+    # and deploy() accepts a bid from ANY provider. Same guard as cli.py -- both entry points
+    # reach the same deploy(). Raised by Copilot on #145.
+    if args.no_backup_fallback and not _resolve_tier(args.preferred_providers, "AKASH_PROVIDERS"):
+        print(
+            "Error: --no-backup-fallback requires a preferred provider, and none is "
+            "configured. Pass --provider or set AKASH_PROVIDERS. Without one there is no "
+            "allowlist at all, so the deploy would accept a bid from ANY provider -- the "
+            "opposite of what this flag promises.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     logging.basicConfig(
         level=logging.DEBUG if os.environ.get("AKASH_DEBUG") else logging.INFO,
@@ -1408,7 +1438,9 @@ def deploy_main():
             bid_wait_retry=args.bid_wait_retry,
             env_vars=args.env_vars,
             preferred_providers=args.preferred_providers,
-            backup_providers=args.backup_providers,
+            # [] means "no backups, ignore the environment"; None means "read
+            # AKASH_PROVIDERS_BACKUP". See _resolve_tier.
+            backup_providers=[] if args.no_backup_fallback else args.backup_providers,
         )
         sys.exit(0)
     except RuntimeError as e:

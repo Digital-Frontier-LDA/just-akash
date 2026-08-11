@@ -316,11 +316,60 @@ jobs:
             # taking, escrow exhaustion), and every correction came from reading the
             # server's own state rather than reasoning from ours. When measuring escrow,
             # record the EFFECTIVE deposit -- CANARY_DEPOSIT_USD may override this default.
-            uv run just-akash deploy \
+            # --no-backup-fallback: THIS canary is only meaningful on THIS provider.
+            #
+            # The general deploy path bids in three phases -- preferred-only, preferred-grace,
+            # then BACKUP FALLBACK -- and this command never passed --backup-provider, so it
+            # inherited the whole backup tier from AKASH_PROVIDERS_BACKUP. When onidc stopped
+            # bidding on 2026-08-11 the deploy therefore SUCCEEDED on a backup provider. But
+            # canary/ensure.py plan() identifies a canary by service set AND the lease being
+            # held by THAT provider's address, so the result could never satisfy the check it
+            # was created for: three consecutive runs each opened a new onidc deployment, each
+            # reporting the same stale dseq, and two of them were still holding escrow that
+            # nothing reclaims.
+            #
+            # A canary on the wrong provider is worse than no canary. It measures a provider
+            # nobody asked about, it cannot answer the question the fleet exists to answer,
+            # and it costs escrow from the pool the daily smoke needs. With this flag the
+            # deploy fails instead, AkashCanaryNoIngress/NoDeployments page honestly, and the
+            # escrow is returned -- every no-selection path in deploy.py closes the deployment
+            # it opened before raising, including the foreign-bids-only path this now takes.
+            # A FAILED DEPLOY IS NOW AN EXPECTED OUTCOME, AND MUST NOT ABORT THE RUN.
+            #
+            # With --no-backup-fallback a provider that does not bid makes this command exit
+            # non-zero BY DESIGN. Under `set -euo pipefail` (and pipefail applies through the
+            # `| tee`) that would kill the whole step, which does two things this change
+            # exists to prevent:
+            #
+            #   1. the remaining providers in missing.txt never get a canary either, so one
+            #      quiet provider silently takes down the canaries for the whole fleet;
+            #   2. every later step -- re-resolve targets, collect, and PUBLISH TO THE
+            #      TELEMETRY BRANCH -- is skipped, because none of them carry if: always().
+            #
+            # (2) is the serious one. The .prom is scraped off the telemetry branch, so
+            # skipping publication leaves the PREVIOUS file in place, still reporting
+            # reachable=1 for a canary that no longer exists. akash_canary_ is in
+            # FREEZE_CAPABLE_PREFIXES in df-grafana's validate_observability.py for exactly
+            # this reason: a frozen file keeps every value it had, so AkashCanaryNoIngress and
+            # AkashCanaryNoDeployments would NOT fire. The missing canary would be invisible,
+            # which is the opposite of the honest page this flag was added to produce.
+            #
+            # So: warn, record it, and keep going. The run stays green because a provider that
+            # is not bidding is a measurement, not a workflow error -- turning the canary red
+            # every 30 minutes for a quiet provider is how a signal stops being read. The
+            # ALERT owns the paging, off telemetry that now actually gets published.
+            # Raised by CodeRabbit on #145.
+            if ! uv run just-akash deploy \
               --sdl "sdl-canary-${provider}.yaml" \
               --provider "$address" \
+              --no-backup-fallback \
               --deposit "${CANARY_DEPOSIT_USD:-2.0}" \
-            | tee "deploy-${provider}.log"
+            | tee "deploy-${provider}.log"; then
+              echo "::warning::${provider} did not bid, so no canary was created for it. This is --no-backup-fallback working: a canary on a backup provider cannot answer for ${provider}. AkashCanaryNoIngress/NoDeployments will report the gap from the telemetry this run still publishes."
+              echo "${provider}" >> not-deployed.txt
+              echo "::endgroup::"
+              continue
+            fi
             dseq=$(grep -oE 'dseq[ =:]+[0-9]+' "deploy-${provider}.log" | grep -oE '[0-9]+' | head -1 || true)
             if [ -n "$dseq" ]; then
               # A LOCAL CONVENIENCE ONLY — deliberately not how the next run finds this
@@ -403,6 +452,36 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           elif [ "$DEPLOY_OUTCOME" = "skipped" ]; then
             echo "deploy skipped, and every provider already has a canary - nothing to do."
+          fi
+
+          # ATTEMPTED-AND-REFUSED is a THIRD state, and the clauses above cover neither.
+          # They distinguish "deploy skipped" from "deploy ran", but --no-backup-fallback
+          # introduced a case where the deploy RAN, was correct to run, and deliberately
+          # created nothing because the provider did not bid. Left unreported that reads as a
+          # clean run: the step is green, the loop continued, and the only trace is a warning
+          # in a collapsed log group.
+          #
+          # The gap matters most exactly when it is least visible. A provider that stops
+          # bidding for days produces a quiet green canary run every 30 minutes, and the
+          # honest signal lives only in the alert. Say it here too, where someone reading the
+          # run can see it without knowing which alert to look for.
+          if [ -s not-deployed.txt ]; then
+            nd_n=$(wc -l < not-deployed.txt | tr -d ' ')
+            nd_names=$(paste -sd' ' - < not-deployed.txt)
+            echo "::warning::${nd_n} provider(s) did not bid, so no canary was created for them: ${nd_names}. The deploy was correct to refuse - a canary on a backup provider cannot answer for these. Telemetry WAS published, so AkashCanaryNoIngress/NoDeployments will report the gap."
+            {
+              echo "### :large_orange_diamond: canaries not created - provider did not bid"
+              echo ""
+              echo "**${nd_n} provider(s):** \`${nd_names}\`"
+              echo ""
+              echo "\`--no-backup-fallback\` refused to place these on a backup provider, which"
+              echo "is the intended behaviour: a canary on the wrong provider measures nothing"
+              echo "and still spends escrow. Telemetry was published, so the missing canary is"
+              echo "visible to \`AkashCanaryNoIngress\` / \`AkashCanaryNoDeployments\` rather than"
+              echo "hidden behind a frozen \`.prom\`."
+              echo ""
+              echo "Check the provider's on-chain bid status before treating this as our fault."
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Re-resolve targets after any deploy
