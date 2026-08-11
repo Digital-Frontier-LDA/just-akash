@@ -201,6 +201,45 @@ class TestIncompleteEscrowTally:
                 main()
         return exc.value.code
 
+    def test_unnameable_deployment_yields_UNKNOWN_not_OK(self, monkeypatch, capsys):
+        """The SAME hole, via the other skip reason. escrow_locked also omits a
+        deployment it cannot NAME (no extractable dseq), and that understates `locked`
+        identically -- so `free` is an upper bound and OK is a lie. Counting only
+        `unreadable` left this open. Raised by CodeRabbit on #141."""
+        code = self._with_escrow(
+            monkeypatch,
+            ["just-akash", "balance", "--check", "--min-usd", "50"],
+            {"uact": 170_000_000},
+            {
+                "locked_uact": 0,
+                "deployments": 1,
+                "unreadable": 0,
+                "skipped_no_dseq": 1,
+                "by_deployment": [],
+            },
+        )
+        verdict = json.loads(capsys.readouterr().out)
+        assert verdict["status"] == "UNKNOWN", "an unnameable deployment reported as OK"
+        assert verdict["escrow_unnameable_deployments"] == 1
+        assert code != 0, "exit 0 tells a gating caller it is safe to deploy"
+
+    def test_OK_requires_BOTH_counters_zero(self, monkeypatch, capsys):
+        code = self._with_escrow(
+            monkeypatch,
+            ["just-akash", "balance", "--check", "--min-usd", "50"],
+            {"uact": 170_000_000},
+            {
+                "locked_uact": 5_000_000,
+                "deployments": 1,
+                "unreadable": 0,
+                "skipped_no_dseq": 0,
+                "by_deployment": [],
+            },
+        )
+        verdict = json.loads(capsys.readouterr().out)
+        assert verdict["status"] == "OK"
+        assert code == 0
+
     def test_unreadable_deployment_yields_UNKNOWN_not_OK(self, monkeypatch, capsys):
         code = self._with_escrow(
             monkeypatch,

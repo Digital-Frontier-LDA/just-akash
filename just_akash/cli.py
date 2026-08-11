@@ -883,10 +883,18 @@ def main():
                 # 402, and blames the provider. UNKNOWN is a third answer, distinct
                 # from both OK and LOW, so a caller can tell "you are short" from
                 # "I could not finish counting".
+                # BOTH skip reasons make the tally incomplete. escrow_locked also skips a
+                # deployment it cannot NAME (no extractable dseq), and that omission has
+                # the identical consequence as an unreadable one: locked is understated,
+                # so free is overstated, so this prints OK on credit that may not exist.
+                # Counting only `unreadable` left the exact hole described two paragraphs
+                # up still open. Raised by CodeRabbit on #141.
                 unreadable = escrow.get("unreadable", 0)
+                unnameable = escrow.get("skipped_no_dseq", 0)
+                omitted = unreadable + unnameable
                 if low:
                     status = "LOW"
-                elif unreadable:
+                elif omitted:
                     status = "UNKNOWN"
                 else:
                     status = "OK"
@@ -905,6 +913,9 @@ def main():
                                 # >0 means the escrow tally is INCOMPLETE, so
                                 # free_usd is an upper bound, not a measurement.
                                 "escrow_unreadable_deployments": unreadable,
+                                # Same meaning, different cause: a deployment with no
+                                # extractable dseq is omitted from the tally too.
+                                "escrow_unnameable_deployments": unnameable,
                                 "min_usd": args.min_usd,
                             }
                         )
@@ -913,8 +924,9 @@ def main():
                     print(
                         f"CREDIT-CHECK status={status} free_usd={usd:.2f}"
                         + (
-                            f" (UPPER BOUND: {unreadable} deployment(s) unreadable)"
-                            if unreadable
+                            f" (UPPER BOUND: {omitted} deployment(s) omitted — "
+                            f"{unreadable} unreadable, {unnameable} unnameable)"
+                            if omitted
                             else ""
                         )
                         + f" (granted={granted_usd:.2f} locked_in_escrow={locked_usd:.2f}) "
@@ -924,7 +936,7 @@ def main():
                 # code is asking "is it safe to deploy?", and "I could not finish
                 # counting" is not a yes. Exiting 0 there is precisely how an
                 # over-reported balance becomes a 402 nobody predicted.
-                sys.exit(1 if (low or unreadable) else 0)
+                sys.exit(1 if (low or omitted) else 0)
 
             # Deploy credit is the real "wallet balance": Console holds the funds and
             # grants this account an escrow DepositAuthorization whose spend_limits is
@@ -980,10 +992,13 @@ def main():
                         f"  FREE to spend:  {chain.format_amount('uact', free_uact)}"
                         f"  (≈ ${free_usd:,.2f})"
                     )
-                    if locked_info["unreadable"]:
+                    _omitted = locked_info["unreadable"] + locked_info.get("skipped_no_dseq", 0)
+                    if _omitted:
                         print(
-                            f"                  note: {locked_info['unreadable']} deployment(s) "
-                            "unreadable — locked is a lower bound, free an upper bound"
+                            f"                  note: {_omitted} deployment(s) omitted "
+                            f"({locked_info['unreadable']} unreadable, "
+                            f"{locked_info.get('skipped_no_dseq', 0)} unnameable) "
+                            "— locked is a lower bound, free an upper bound"
                         )
                 else:
                     print("  deploy credit:  none (no DepositAuthorization grant found)")

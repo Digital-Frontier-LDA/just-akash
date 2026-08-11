@@ -40,12 +40,16 @@ jobs:
       # CodeRabbit on #141.
       - name: Refuse to run from a non-default ref
         env:
-          REF: ${{ github.ref_name }}
+          # github.ref, NOT github.ref_name: branches and tags share ref_name, so a TAG
+          # named after the default branch would pass a ref_name check and then have its
+          # code checked out with wallet secrets in scope. Comparing the full ref makes
+          # refs/tags/main fail. Raised by CodeRabbit on #141.
+          REF: ${{ github.ref }}
           DEFAULT: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          if [ "$REF" != "$DEFAULT" ]; then
-            echo "::error::This workflow loads wallet secrets and may only run from '$DEFAULT' (got '$REF')."
+          if [ "$REF" != "refs/heads/$DEFAULT" ]; then
+            echo "::error::This workflow loads wallet secrets and may only run from refs/heads/$DEFAULT (got '$REF')."
             exit 1
           fi
           echo "ref=$REF is the default branch"
