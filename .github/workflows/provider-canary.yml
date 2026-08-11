@@ -281,15 +281,14 @@ jobs:
             sed -e "s|PLACEHOLDER_CANARY_PY_B64|${CANARY_PY_B64}|" \
                 -e "s|PLACEHOLDER_PROVIDER|${provider}|" \
                 sdl/canary.yaml > "sdl-canary-${provider}.yaml"
-            # $6.00 rather than the old $2.00. THE ORIGINAL JUSTIFICATION FOR THIS NUMBER
-            # WAS WRONG, and the number is kept only because it is harmless -- do not
-            # rebuild a rule on top of it.
+            # DEFAULT $2.00, overridable via CANARY_DEPOSIT_USD. It was raised to $6.00 on
+            # 2026-08-10 and is being put back, because the reason for raising it was wrong
+            # and holding extra escrow is not free.
             #
-            # What was claimed (2026-08-10): a $2.00 deposit drained at ~$0.16/hour, so a
-            # lease died at ~12.5h and could never reach the 24h auto top-up. $6.00 was
-            # sized to buy ~37.5h so top-up could fire.
+            # What was claimed: a $2.00 deposit drained at ~$0.16/hour, so a lease died at
+            # ~12.5h and could never reach the 24h auto top-up; $6.00 would buy ~37.5h.
             #
-            # What was MEASURED (2026-08-11, by the escrow read-back the audit workflow
+            # What was MEASURED (2026-08-11, via the escrow read-back the audit workflow
             # now performs):
             #
             #     onidc        7.5h old   escrow remaining 6.00 of 6.00 ACT
@@ -297,26 +296,29 @@ jobs:
             #     hetzner_hel  3.8h old   escrow remaining 6.00 of 6.00 ACT
             #
             # escrow_account.state.funds is what is LEFT, and it does not move. Nothing
-            # drains. The $0.16/hour burn rate was inferred from assuming a dead lease had
-            # spent its deposit; it had not. hetzner_hel died at 12.7h holding a FULL 6.00
-            # ACT balance, so escrow exhaustion was never the cause and the deposit size
-            # is not what governs lease lifetime.
+            # drains. The burn rate was inferred from assuming a dead lease had spent its
+            # deposit; it had not. hetzner_hel died at 12.7h holding a FULL balance, so
+            # escrow exhaustion was never the cause and deposit size does not govern lease
+            # lifetime. "deposit_hours > topUpFrequencyMs" was a rule on a false premise.
             #
-            # The 24h-vs-12.7h arithmetic still holds as arithmetic -- a lease that dies at
-            # 12.7h cannot reach a 24h top-up -- but it explains nothing, because top-up was
-            # never needed: the money was still there.
+            # AND THE EXTRA ESCROW IS NOT HARMLESS -- this file says so 50 lines up: the
+            # canary holds escrow permanently, the smoke needs credit to deploy at all, and
+            # it is ONE POOL. $6.00 x 3 canaries locks 12 ACT of shared headroom more than
+            # $2.00 does, against a wallet already spending ~$10/day. Affordable today is
+            # not the same as costless, and the canary's own design rule is that it YIELDS
+            # to the smoke. Keeping an unjustified 3x on a shared budget contradicts that.
             #
-            # STILL UNEXPLAINED: leases end at a suspiciously consistent ~12.7h with funds
-            # untouched, which looks like a lease or deployment lifetime rather than a
-            # funding problem. akash_canary_lease_replacements_total counts those endings.
-            # Measure before theorising -- four hypotheses have already been wrong here
-            # (amount/frequency unset, the flag not persisting, the deposit not taking,
-            # escrow exhaustion), and every correction came from reading the server's own
-            # state rather than reasoning from ours.
+            # STILL UNEXPLAINED: leases end at a consistent ~12.7h with funds untouched,
+            # which looks like a lease or deployment lifetime rather than a funding problem.
+            # Raise this number again only against evidence. Four hypotheses have already
+            # been wrong (amount/frequency unset, the flag not persisting, the deposit not
+            # taking, escrow exhaustion), and every correction came from reading the
+            # server's own state rather than reasoning from ours. When measuring escrow,
+            # record the EFFECTIVE deposit -- CANARY_DEPOSIT_USD may override this default.
             uv run just-akash deploy \
               --sdl "sdl-canary-${provider}.yaml" \
               --provider "$address" \
-              --deposit "${CANARY_DEPOSIT_USD:-6.0}" \
+              --deposit "${CANARY_DEPOSIT_USD:-2.0}" \
             | tee "deploy-${provider}.log"
             dseq=$(grep -oE 'dseq[ =:]+[0-9]+' "deploy-${provider}.log" | grep -oE '[0-9]+' | head -1 || true)
             if [ -n "$dseq" ]; then
