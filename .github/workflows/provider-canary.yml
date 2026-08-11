@@ -12,7 +12,8 @@ name: Provider canary (persistent)
 # What it produces, on the `telemetry` branch for df-grafana to scrape:
 #   akash_canary_reachable                  the customer-visible up/down
 #   akash_canary_restarts_total             container restarts within the SAME lease
-#   akash_canary_lease_replacements_total   deployments closed/lapsed and recreated
+#   akash_canary_lease_replacements_total   the tracked lease changed and was recreated
+#   akash_canary_lease_closures_total       WHO ended it, read off the chain (cause=...)
 #   akash_canary_egress_fail_total          the workload could not reach the internet
 #   akash_canary_dns_fail_total             ...or could not resolve
 #   akash_canary_disk_write_seconds         fsync latency as the workload feels it
@@ -421,9 +422,20 @@ jobs:
         run: |
           set -euo pipefail
           cp prior/canary-state.json state.json 2>/dev/null || echo '{}' > state.json
+          # The owner wallet lets collect.py ask the chain WHO closed a replaced lease
+          # rather than leaving df-grafana to guess — it guessed "the provider", and the
+          # closures behind that page were all MsgCloseDeployment from this very wallet.
+          # Read from credit.json, which the balance step already wrote, so there is no
+          # second copy of the address to drift out of step. Empty is not fatal:
+          # attribution degrades to cause="unknown", which df-grafana alerts on rather
+          # than silently reading as a healthy fleet.
+          owner="$(python3 -c 'import json;print(json.load(open("credit.json")).get("account",""))' 2>/dev/null || true)"
+          if [ -z "$owner" ]; then
+            echo "::warning::no owner address in credit.json - lease closures will publish as cause=unknown"
+          fi
           uv run python -m canary.collect \
             --targets targets.json --state state.json --out canary-metrics.prom \
-            --credit credit.json
+            --credit credit.json --owner "$owner"
           echo "--- exposition ---"; cat canary-metrics.prom
 
       - name: Publish to the telemetry branch
