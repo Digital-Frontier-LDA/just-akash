@@ -19,6 +19,18 @@ redeploy and counted as `akash_canary_lease_replacements_total`, never as a rest
 provider closing our deployment and a provider restarting our container are different
 faults and must not land in the same number.
 
+NEITHER IS A REPLACEMENT AN ACCUSATION. `lease_replacements_total` says the dseq changed,
+which is a fact about our tracking — it rises identically whether a provider evicted the
+deployment or one of OUR jobs closed it. On 2026-08-11 df-grafana paged three providers
+critical off that number; the chain said every closure behind those pages was
+`MsgCloseDeployment` signed by our own wallet. So each replacement is now attributed via
+canary/closure.py and published as `akash_canary_lease_closures_total{cause}`, read off
+the chain rather than assumed. Attribution failures are their own cause (`unknown`) rather
+than being folded into anyone's fault.
+
+This also answers the question #142 left open — leases ending at a consistent ~12.7h with
+their escrow untouched. It was never funding: something of ours closes them.
+
 Cumulative counters are carried forward across runs so a workflow-cadence sample loses
 timing precision but never loses events.
 """
@@ -32,8 +44,10 @@ import re
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 
 from canary._state import load_json_mapping
+from canary.closure import UNKNOWN, VERDICTS, attribute
 
 # Reused from the exporter rather than re-implemented: _escape_label_value handles the
 # exposition-format escapes, and _is_number excludes bool (a bool IS an int, so a
@@ -136,8 +150,16 @@ def merge(
     now: float,
     *,
     deployed: bool | None = None,
+    owner: str = "",
+    attribute_closure: Callable[[str, str], str] | None = None,
 ) -> dict:
     """Fold one scrape into the durable per-provider state.
+
+    `attribute_closure(owner, old_dseq)` is INJECTED rather than called directly so this
+    function stays pure under test — the decision table in canary/closure.py has its own
+    fixtures, and this one must not need a live chain to exercise a counter. Omitting it
+    (or the owner) books every replacement as `unknown`, which is the honest reading: the
+    cause was not established.
 
     `deployed` is whether the targets file gave this provider an ingress URI at all --
     i.e. whether a canary EXISTS to be scraped. It is deliberately distinct from
@@ -154,6 +176,8 @@ def merge(
     p.setdefault("unreachable_checks_total", 0)
     p.setdefault("boot_id", None)
     p.setdefault("dseq", None)
+    closures = dict(p.get("closures") or {})
+    p["closures"] = closures
 
     p["checks_total"] += 1
     p["reachable"] = 1 if reachable else 0
@@ -182,6 +206,18 @@ def merge(
     if dseq_changed:
         # New lease: the container is new by construction. Not a restart.
         p["lease_replacements_total"] += 1
+        # Attribute the deployment we STOPPED watching, not the one we just found. Its
+        # dseq is the only handle the chain will answer about, and this is the last
+        # moment we hold it — the line below overwrites p["dseq"].
+        cause = UNKNOWN
+        if attribute_closure is not None and owner:
+            try:
+                cause = attribute_closure(owner, str(p["dseq"]))
+            except Exception:  # noqa: BLE001 — a broken attributor loses a cause, not a run
+                cause = UNKNOWN
+        if cause not in VERDICTS:
+            cause = UNKNOWN
+        closures[cause] = closures.get(cause, 0) + 1
     elif boot_changed:
         p["restarts_total"] += 1
 
@@ -272,7 +308,8 @@ def render(
         add(f'akash_canary_restarts_total{{provider="{prov}"}} {p.get("restarts_total", 0)}')
     add(
         "# HELP akash_canary_lease_replacements_total Times the lease had to be recreated "
-        "(dseq changed) — a deployment the provider closed or that lapsed."
+        "(dseq changed). Says NOTHING about whose fault it was — see "
+        "akash_canary_lease_closures_total for the cause."
     )
     add("# TYPE akash_canary_lease_replacements_total counter")
     for prov, p in sorted(state.items()):
@@ -280,6 +317,28 @@ def render(
             f'akash_canary_lease_replacements_total{{provider="{prov}"}} '
             f"{p.get('lease_replacements_total', 0)}"
         )
+    # WHO ended the previous lease, read off the chain by canary/closure.py. This is the
+    # series a rule may blame a provider on; lease_replacements_total above is not, and
+    # saying so cost three providers a critical page on 2026-08-11.
+    #
+    # EVERY cause is emitted for every provider, including zeros. An absent series makes
+    # increase() match nothing, so a rule gated on cause="provider" would be unable to fire
+    # in precisely the state where it matters, and would look healthy doing it. Same reason
+    # akash_canary_active_deployments is a scalar this file always writes.
+    add(
+        "# HELP akash_canary_lease_closures_total How the previous lease ENDED, by cause: "
+        "provider=the provider closed the lease (MsgCloseBid); self=we closed it "
+        "(MsgCloseDeployment from our own wallet); lapsed=escrow overdrawn, we underfunded "
+        "it; open=still live on chain, we orphaned it; unknown=the chain could not be read."
+    )
+    add("# TYPE akash_canary_lease_closures_total counter")
+    for prov, p in sorted(state.items()):
+        closures = p.get("closures") or {}
+        for cause in VERDICTS:
+            add(
+                f'akash_canary_lease_closures_total{{provider="{prov}",cause="{cause}"}} '
+                f"{closures.get(cause, 0)}"
+            )
     add(
         "# HELP akash_canary_unreachable_checks_total Checks where the canary could not "
         "be reached on its ingress."
@@ -436,6 +495,12 @@ def main() -> int:
     ap.add_argument("--out", required=True, help="Exposition file to write")
     ap.add_argument("--timeout", type=float, default=SCRAPE_TIMEOUT)
     ap.add_argument("--credit", help="`balance --check --json` output to republish")
+    ap.add_argument(
+        "--owner",
+        default="",
+        help="Wallet that owns the canary deployments. Needed to ask the chain WHO closed "
+        "a replaced lease; without it every replacement is published as cause=unknown.",
+    )
     a = ap.parse_args()
 
     targets = json.loads(pathlib.Path(a.targets).read_text(encoding="utf-8"))
@@ -455,11 +520,15 @@ def main() -> int:
             elapsed,
             now,
             deployed=bool(uri),
+            owner=a.owner,
+            attribute_closure=attribute,
         )
+        closures = {k: v for k, v in sorted((state[provider].get("closures") or {}).items()) if v}
         print(
             f"{provider:14} reachable={int(ok)} "
             f"restarts={state[provider]['restarts_total']} "
             f"lease_replacements={state[provider]['lease_replacements_total']} "
+            f"closures={closures or '-'} "
             f"({elapsed:.2f}s)",
             flush=True,
         )
