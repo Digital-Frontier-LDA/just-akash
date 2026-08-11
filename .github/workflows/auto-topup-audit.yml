@@ -53,6 +53,36 @@ jobs:
         with:
           age-key: ${{ secrets.SOPS_AGE_KEY }}
 
+      # WHAT THE DEPOSIT BECAME, not what we asked for. On 2026-08-11 the canary
+      # workflow logged "escrow deposit: 6.0 USD" for every deploy while the wallet held
+      # $6.00 locked across THREE deployments -- $2.00 each. The requested deposit was not
+      # what got locked, and hetzner_hel lived 12.7h on "$6.00", indistinguishable from the
+      # 12.5h it lived on $2.00. The log line was taken as the outcome; it was only the
+      # request. This reads escrow_account.state.funds back per deployment so the two are
+      # never confused again.
+      - name: Read the escrow ACTUALLY locked per deployment
+        run: |
+          set -euo pipefail
+          uv run python - <<'PY'
+          from just_akash.api import AkashConsoleAPI, escrow_locked
+          import os, pathlib
+          r = escrow_locked(AkashConsoleAPI(os.environ["AKASH_API_KEY"]))
+          lines = ["### Escrow actually locked", "", "| dseq | escrow (uact) | escrow (ACT) |", "| --- | --- | --- |"]
+          for row in r["by_deployment"]:
+              act = row["escrow_uact"] / 1_000_000
+              print(f"  {row['dseq']}: {row['escrow_uact']} uact = {act:.2f} ACT")
+              lines.append(f"| `{row['dseq']}` | {row['escrow_uact']} | {act:.2f} |")
+          tot = r["locked_uact"] / 1_000_000
+          print(f"  TOTAL {tot:.2f} ACT across {r['deployments']} deployment(s), {r['unreadable']} unreadable")
+          lines += ["", f"**Total** {tot:.2f} ACT across {r['deployments']} deployment(s)."]
+          if r["unreadable"]:
+              # A skipped deployment makes the sum a LOWER BOUND. Saying so is the whole
+              # point of this audit; a quiet subtotal reads as a complete one.
+              print(f"::warning::{r['unreadable']} deployment(s) could not be read - the total above is a LOWER BOUND, not a measurement.")
+              lines.append(f"> :warning: {r['unreadable']} deployment(s) unreadable - total is a lower bound.")
+          pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a").write("\n".join(lines) + "\n")
+          PY
+
       - name: Read auto top-up for every live deployment
         run: |
           set -euo pipefail
