@@ -93,17 +93,26 @@ def _escrow_state(info: dict) -> tuple[str, str | None]:
 def _closes_this_deployment(msg: dict, owner: str, dseq: str) -> str | None:
     """Verdict if `msg` closes exactly (owner, dseq), else None.
 
-    The dseq check is what keeps this honest: a block carries every chain's traffic, and
-    our canary closes have been observed sharing a block with unrelated deployments of
-    ours. Matching on message type alone would attribute whichever close landed first.
+    BOTH halves of the identity are checked, once, before the message type is looked at.
+    A deployment is identified by the PAIR (owner, dseq) — dseq is a per-owner sequence,
+    not a global one — so matching a close on dseq alone would let another account's
+    `MsgCloseBid` carrying the same dseq land on our provider's eviction counter. That is
+    a fabricated provider fault, which is the one outcome this module exists to prevent.
+    Raised independently by CodeRabbit and Copilot on #143, and they were right: the
+    owner check had been applied to the owner-close branch only.
+
+    Checking identity first also keeps this honest about blocks: a block carries the whole
+    chain's traffic, and our canary closes have been observed sharing one with unrelated
+    deployments of ours. Matching on message type alone would attribute whichever close
+    landed first.
     """
     ident = msg.get("id")
     if not isinstance(ident, dict):
         return None
-    if str(ident.get("dseq") or "") != str(dseq):
+    if str(ident.get("dseq") or "") != str(dseq) or str(ident.get("owner") or "") != owner:
         return None
     name = _msg_name(msg.get("@type"))
-    if name == _OWNER_CLOSE and str(ident.get("owner") or "") == owner:
+    if name == _OWNER_CLOSE:
         return SELF
     if name == _PROVIDER_CLOSE and ident.get("provider"):
         return PROVIDER

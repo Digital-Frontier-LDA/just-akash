@@ -52,10 +52,10 @@ def _owner_close(dseq=DSEQ, owner=OWNER, version="v1beta4"):
     }
 
 
-def _provider_close(dseq=DSEQ, version="v1beta5"):
+def _provider_close(dseq=DSEQ, owner=OWNER, version="v1beta5"):
     return {
         "@type": f"/akash.market.{version}.MsgCloseBid",
-        "id": {"owner": OWNER, "dseq": dseq, "gseq": 1, "oseq": 1, "provider": PROV_ADDR},
+        "id": {"owner": owner, "dseq": dseq, "gseq": 1, "oseq": 1, "provider": PROV_ADDR},
     }
 
 
@@ -99,9 +99,24 @@ def test_a_close_for_a_DIFFERENT_dseq_in_the_same_block_is_not_ours():
     assert classify(_info(), _block(_owner_close(dseq="999")), OWNER, DSEQ) == UNKNOWN
 
 
+OTHER_OWNER = "akash1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"  # pragma: allowlist secret
+
+
 def test_a_close_signed_by_someone_else_is_not_booked_as_ours():
-    other = "akash1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"  # pragma: allowlist secret
-    assert classify(_info(), _block(_owner_close(owner=other)), OWNER, DSEQ) == UNKNOWN
+    assert classify(_info(), _block(_owner_close(owner=OTHER_OWNER)), OWNER, DSEQ) == UNKNOWN
+
+
+def test_another_accounts_provider_close_cannot_blame_OUR_provider():
+    """dseq is a PER-OWNER sequence, so the same number exists under other accounts. A
+    MsgCloseBid against someone else's deployment must never land on our provider's
+    eviction counter — that would fabricate exactly the provider fault this module was
+    written to stop fabricating. Raised by CodeRabbit and Copilot on #143."""
+    assert classify(_info(), _block(_provider_close(owner=OTHER_OWNER)), OWNER, DSEQ) == UNKNOWN
+
+
+def test_the_owner_check_does_not_break_a_genuine_provider_eviction():
+    """The guard above must not be so tight that the real signal stops working."""
+    assert classify(_info(), _block(_provider_close()), OWNER, DSEQ) == PROVIDER
 
 
 def test_no_close_message_and_a_normally_closed_escrow_is_unknown():
