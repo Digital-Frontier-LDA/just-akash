@@ -481,9 +481,7 @@ class TestCliNoBackupFallback:
         assert mock_deploy.call_args.kwargs["backup_providers"] is None
 
     @patch("just_akash.deploy.deploy")
-    def test_contradiction_refuses_rather_than_picking_one(
-        self, mock_deploy, monkeypatch, capsys
-    ):
+    def test_contradiction_refuses_rather_than_picking_one(self, mock_deploy, monkeypatch, capsys):
         """Asking for 'no fallback' AND naming backups is a contradiction.
 
         Resolving it silently in favour of either side tells the caller nothing about what
