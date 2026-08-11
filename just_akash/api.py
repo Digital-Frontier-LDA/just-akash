@@ -918,17 +918,29 @@ def escrow_locked(client: "AkashConsoleAPI") -> dict[str, Any]:
     the exact moment deploys start failing; free = grant - locked is the actionable
     number.
 
-    Returns ``{"locked_uact", "deployments", "by_deployment"}``. Best-effort per
-    deployment: a deployment whose detail cannot be read is skipped rather than
-    aborting the whole tally (the sum is then a lower bound, flagged by
-    ``unreadable``).
+    Returns ``{"locked_uact", "deployments", "unreadable", "skipped_no_dseq",
+    "by_deployment"}``. Best-effort per deployment: one whose detail cannot be read, or
+    which carries no extractable dseq, is skipped rather than aborting the whole tally.
+
+    THE SUM IS THEN A LOWER BOUND, and both skip reasons say so. ``unreadable`` counts a
+    failed detail fetch; ``skipped_no_dseq`` counts a deployment we could not even name.
+    A caller that reports the total without checking both is claiming a completeness it
+    does not have -- and because ``free = grant - locked``, understating locked
+    OVERSTATES free, which is the number the deploy gate trusts.
     """
     locked = 0
     rows: list[dict[str, Any]] = []
     unreadable = 0
+    skipped_no_dseq = 0
     for d in client.list_deployments():
         dseq = _extract_dseq(d)
         if not dseq:
+            # A live deployment we cannot NAME still holds escrow. Dropping it silently
+            # understates `locked`, which overstates `free` -- and free is what the deploy
+            # gate reads, so the tally would say "healthy" at the exact moment it is not.
+            # That is the failure this function's own docstring describes. Counted, so the
+            # caller can say the total is a lower bound. Raised on #141.
+            skipped_no_dseq += 1
             continue
         try:
             detail = client.get_deployment(dseq)
@@ -950,6 +962,7 @@ def escrow_locked(client: "AkashConsoleAPI") -> dict[str, Any]:
         "locked_uact": locked,
         "deployments": len(rows),
         "unreadable": unreadable,
+        "skipped_no_dseq": skipped_no_dseq,
         "by_deployment": rows,
     }
 

@@ -77,9 +77,13 @@ def _credit_line(client: AkashConsoleAPI, address: str) -> str:
     granted = chain.deploy_credit(address).get("uact", 0)
     locked = escrow_locked(client)
     free = max(granted - locked["locked_uact"], 0)
+    # A tally that omitted a deployment makes FREE an upper bound, and this line is read
+    # before deciding what to tear down. Silence about it reads as a measurement.
+    omitted = locked.get("unreadable", 0) + locked.get("skipped_no_dseq", 0)
+    suffix = f" [UPPER BOUND: {omitted} omitted]" if omitted else ""
     return (
         f"granted={granted / 1e6:.2f} locked_in_escrow={locked['locked_uact'] / 1e6:.2f} "
-        f"FREE={free / 1e6:.2f} USD across {locked['deployments']} active deployments"
+        f"FREE={free / 1e6:.2f} USD across {locked['deployments']} active deployments{suffix}"
     )
 
 
