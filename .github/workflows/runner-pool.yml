@@ -124,6 +124,20 @@ on:
         required: false
         type: string
         default: '5'
+      runner-wait-tries:
+        description: >-
+          How many 5-second polls to wait for the pool to come online. 90 (7.5 min) is
+          tuned for a handful of replicas and is NOT free to raise: GitHub cannot filter
+          runners by label, so every poll pages the WHOLE org listing —
+          ceil(org_runners/100) requests each — against a PAT's 5,000/hour shared across
+          all of that user's tokens and repos.
+
+          Raise it when a large pool legitimately needs longer to register (N replicas
+          pull the runner image before any of them report in), and know that you are
+          spending request budget every other pool draws from. Lower it to fail fast.
+        required: false
+        type: string
+        default: '90'
     secrets:
       AKASH_API_KEY:
         required: true
@@ -149,9 +163,22 @@ on:
       failure_reason:
         description: >-
           WHY a fallback happened, when it did. One of RUNNER_PAT_MISSING,
-          RUNNER_PAT_INVALID, WALLET_UNDERFUNDED, NO_ELIGIBLE_BIDDER,
-          PROVIDER_CAPACITY, RUNNER_NEVER_REGISTERED, INDETERMINATE — or empty on success. Each implies a different remedy, which
-          is why they are not collapsed into "infra".
+          RUNNER_PAT_INVALID, WALLET_UNDERFUNDED, WALLET_TX_CONTENTION,
+          NO_ELIGIBLE_BIDDER, PROVIDER_CAPACITY, RUNNER_NEVER_REGISTERED,
+          GITHUB_API_UNAVAILABLE, INDETERMINATE — or empty on success. Each implies a
+          different remedy, which is why they are not collapsed into "infra".
+
+          Three of them are explicitly NOT statements about a provider, and each was
+          measured misreporting as one:
+
+          RUNNER_PAT_INVALID     our credential expired
+          GITHUB_API_UNAVAILABLE the runner listing was never readable, so the pool
+                                 was never observable — folding this into
+                                 RUNNER_NEVER_REGISTERED would runner_deny providers
+                                 for our own rate limit
+          WALLET_TX_CONTENTION   concurrent provisioners on one Cosmos account reject
+                                 each other; no order is created, so the market never
+                                 saw the request and PROVIDER_CAPACITY is fiction
         value: ${{ jobs.pool.outputs.failure_reason }}
       wallet_free_usd:
         description: 'Free credit after escrow at provision time.'
@@ -177,9 +204,38 @@ jobs:
       wallet_free_usd: ${{ steps.wallet.outputs.free_usd }}
       runner_hosts_proven: ${{ steps.candidates.outputs.proven_hosts }}
       runner-targets: ${{ steps.provision.outputs.runner_targets || '["ubuntu-latest"]' }}
+    # Every `run` below needs just-akash's OWN source, never the caller's checkout.
+    defaults:
+      run:
+        working-directory: .just-akash
     steps:
+      # CHECK OUT just-akash, NOT THE CALLER. A reusable workflow's job runs in the
+      # CALLER's context, so `github.repository` is THEIR repo and a bare checkout
+      # fetches THEIR code. `uv run --with .` then installs the caller's package (or
+      # fails outright when they have no pyproject.toml), `just-akash` is never on PATH,
+      # and `python -m just_akash.runner_candidates` raises ModuleNotFoundError. This
+      # workflow could therefore only ever have worked inside this repo — and nothing
+      # here calls it, so that was never exercised.
+      #
+      # `job.workflow_sha` / `job.workflow_repository` are the JOB context, not the
+      # github one, and that distinction is the whole fix: the `github` context is
+      # always the CALLER's, so `github.workflow_ref` here names their entry workflow.
+      # The job context is documented as referring to the REUSABLE workflow file for
+      # jobs defined in one, so this resolves to the exact commit of this file — the
+      # revision the caller pinned. Tracking a branch instead would let the
+      # classification tables, the SDL and the provider-qualification bar all change
+      # under a consumer whose pin never moved, which is the whole reason they pinned.
+      #
+      # It also follows forks: a fork's callers get the fork's CLI, not ours.
+      #
+      # `job.workflow_*` is unavailable on GitHub Enterprise Server, where both resolve
+      # empty. The literal fallback keeps that case on OUR repo's default branch —
+      # unpinned, but still just-akash rather than the caller's tree.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          repository: ${{ job.workflow_repository || 'Digital-Frontier-LDA/just-akash' }}
+          ref: ${{ job.workflow_sha }}
+          path: .just-akash
           persist-credentials: false
 
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -296,7 +352,13 @@ jobs:
           version: "2.0"
           services:
             runner:
-              image: ghcr.io/akash-network/github-runner:latest
+              # THE SAME DIGEST sdl/github-runner-probe.yaml qualifies against, and a
+              # test asserts they stay equal. A provider earns runner_host by scheduling
+              # the probe image three consecutive times; running a different image here
+              # means the pool trusts a measurement taken of something else. `:latest`
+              # made that gap permanent and silent — the tag can move between the
+              # qualification and the run that relies on it.
+              image: ghcr.io/akash-network/github-runner@sha256:030ae11a6b597c5db28b12375461e35f694d74ceb06a1b73c90545b1adef16da
               env:
                 - ACCESS_TOKEN=${GH_RUNNER_PAT}
                 - ORG_NAME=${ORG}
@@ -345,13 +407,18 @@ jobs:
           TAG_PREFIX: ${{ inputs.tag-prefix }}
           RUN_ID: ${{ github.run_id }}
           MAX_ATTEMPTS: '3'
-          RUNNER_WAIT_TRIES: '90'
+          RUNNER_WAIT_TRIES: ${{ inputs.runner-wait-tries }}
         run: |
           set -uo pipefail
           # An ARRAY, not a string. Both this and the provider list rely on word
           # splitting, so quoting them breaks the command and NOT quoting them is SC2086.
           # Arrays are the only form that is both correct and lint-clean.
           JA=(uv run --with . just-akash)
+
+          # A free-text input feeding `seq`: junk would make the wait loop a no-op and
+          # every pool instantly "never registered". Clamp like MIN_POOL below.
+          case "${RUNNER_WAIT_TRIES}" in ''|*[!0-9]*) RUNNER_WAIT_TRIES=90 ;; esac
+          [ "$RUNNER_WAIT_TRIES" -ge 1 ] 2>/dev/null || RUNNER_WAIT_TRIES=90
 
           MIN_POOL="${MIN_POOL_SIZE:-}"
           case "$MIN_POOL" in ''|*[!0-9]*) MIN_POOL="$POOL_SIZE" ;; esac
@@ -361,6 +428,7 @@ jobs:
           CANDIDATES=$(printf '%s' "${CANDIDATES_CSV:-}" | tr ',' '\n' | sed '/^$/d')
           EXCLUDED=""
           SAW_BID=0
+          SAW_SEQ_CONTENTION=0
 
           for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
             echo "::group::provision attempt $attempt/$MAX_ATTEMPTS"
@@ -398,6 +466,32 @@ jobs:
                 echo "::error title=Akash rejected the deploy: INSUFFICIENT BALANCE::No order was created and no provider was asked to bid, so retrying cannot help. Top up the wallet."
                 echo "::endgroup::"; exit 1
               fi
+
+              # ACCOUNT-SEQUENCE CONTENTION — the failure that spikes produce, and the
+              # one that lies most convincingly.
+              #
+              # AKASH_API_KEY is ONE Cosmos account, and a Cosmos account cannot have two
+              # transactions in flight: they share a sequence number, so the loser is
+              # rejected with an account-sequence mismatch. Nothing in just_akash retries
+              # it. This repo's own wallet-touching workflows are serialised under the
+              # `akash-wallet` concurrency group precisely for this — but a REUSABLE
+              # workflow cannot inherit that protection, because GitHub scopes
+              # concurrency groups PER REPOSITORY. Many repos sharing one key are
+              # therefore unserialisable by any group name written here.
+              #
+              # Without this branch the tx rejection falls through to "no lease within
+              # the bid window" and, after the attempt budget, to PROVIDER_CAPACITY —
+              # reporting a market outage that never happened, at exactly the moment
+              # (a spike) when the real cause is our own concurrency. Retrying at once
+              # just re-collides, so back off with jitter to break the lockstep.
+              if grep -qiE 'account sequence mismatch|incorrect account sequence|sequence mismatch' /tmp/ja.log 2>/dev/null; then
+                SAW_SEQ_CONTENTION=1
+                BACKOFF=$(( (RANDOM % 20) + 10 ))
+                echo "::warning::attempt $attempt: account-sequence contention on the shared wallet — backing off ${BACKOFF}s. NOT a market condition."
+                sleep "$BACKOFF"
+                echo "::endgroup::"; continue
+              fi
+
               echo "::warning::attempt $attempt: no lease within the bid window"
               echo "::endgroup::"; continue
             fi
@@ -408,14 +502,121 @@ jobs:
             "${JA[@]}" tag --dseq "$DSEQ" --name "${TAG_PREFIX}-${RUN_ID}" \
               || echo "::warning::tag failed for dseq=$DSEQ — a sweeper will not see it"
 
+            # COUNT LINES, NEVER `| length`. `gh api --paginate --jq` applies the jq
+            # filter to EACH PAGE SEPARATELY and concatenates the results, so an
+            # aggregating filter emits one number PER PAGE: an org with >100 runners
+            # returned "2\n1" here, not "3".
+            #
+            # That is not a cosmetic miscount, it inverts this job's verdict. Every
+            # `[ "$ONLINE" -ge ... ]` below then dies with "integer expression
+            # expected" and returns NON-ZERO, so the `-lt "${MIN_POOL}"` discard branch
+            # is never taken and the pool is declared HEALTHY with zero runners online
+            # — `runs-on` targets a label nothing answers to and the caller's jobs queue
+            # until timeout, which is strictly worse than the hosted-runner fallback
+            # this workflow exists to provide. It would also write a multi-line
+            # `runners_online` into $GITHUB_OUTPUT, corrupting every later output.
+            #
+            # >100 runners in an org is the NORMAL case here, not an exotic one:
+            # offline registrations accumulate (see the teardown's de-registration
+            # step) and once overflowed an org's runner listing outright.
+            #
+            # A per-match line survives page concatenation intact, so emit `.id` and
+            # count. `grep -c .` always prints exactly one integer, including 0 for
+            # empty input (a failed `gh` included), which is what `|| echo 0` did.
+            # `--slurp` would also work but only on gh >= 2.53; this needs no floor.
+            # A FAILED READ IS NOT ZERO RUNNERS, and at pool scale that distinction is
+            # the whole ballgame. `gh` exiting non-zero — a 403 secondary rate limit, a
+            # 5xx, an expired PAT — swallowed into 0 walks the entire "the provider
+            # never delivered" path below: the lease is destroyed, the provider is
+            # EXCLUDED from later attempts, and the run reports RUNNER_NEVER_REGISTERED,
+            # which names that provider a runner_deny candidate. Blaming a provider for
+            # OUR API budget is the precise misdiagnosis this workflow exists to remove.
+            #
+            # And the budget is small here. GitHub cannot filter runners by label
+            # server-side — `?name=` is EXACT-match (verified live: a 12-char prefix of
+            # a real runner's name returns 0) and the runner image randomises each
+            # replica's name — so every poll pages the WHOLE org listing:
+            # ceil(total_org_runners / 100) requests, every 5s, up to RUNNER_WAIT_TRIES
+            # times, per attempt. A PAT gets 5,000 requests/hour SHARED across all of
+            # that user's tokens and every repo using them, plus a 900-points/minute
+            # secondary limit. A 300-runner org polled for the full window is ~270
+            # requests per attempt, so a handful of concurrent pools reaches the ceiling
+            # in minutes. Being throttled is a NORMAL condition at this size, not an
+            # exotic one, and it has to be named rather than absorbed.
+            #
+            # gh also exits non-zero when a LATER page fails after earlier ones
+            # succeeded, so an unreadable listing can never be silently undercounted.
+            # BUDGETED BY WALL CLOCK, not by iteration count, because the two sleeps
+            # differ. Spending one of RUNNER_WAIT_TRIES per iteration meant an
+            # all-throttled run slept 15s x 90 = 22.5 MINUTES while the input, the docs
+            # and the error text all promised 7.5 — the caller's jobs sit behind that.
+            # A deadline keeps the promised window honest whatever mix of 5s and 15s
+            # waits actually happens.
             ONLINE=0
-            for i in $(seq 1 "$RUNNER_WAIT_TRIES"); do
-              ONLINE=$(gh api --paginate "orgs/${ORG}/actions/runners?per_page=100" \
-                --jq "[.runners[] | select(.status==\"online\") | select(any(.labels[].name; .==\"${RUNNER_LABEL}\"))] | length" 2>/dev/null || echo 0)
+            API_OK=0
+            WAIT_DEADLINE=$(( $(date +%s) + RUNNER_WAIT_TRIES * 5 ))
+            while [ "$(date +%s)" -lt "$WAIT_DEADLINE" ]; do
+              # THE LABEL IS DATA, NOT PROGRAM TEXT. It is a caller-supplied input, and
+              # splicing it into the filter meant a label containing `"` or `\` built an
+              # INVALID jq program: gh exits non-zero, which this loop reads as an
+              # unreadable listing, so a bad input arrives as GITHUB_API_UNAVAILABLE and
+              # a healthy lease is destroyed on every poll. `--arg` keeps it a value.
+              #
+              # `--paginate` without `--jq` emits one JSON object per page, and jq reads
+              # that concatenated stream natively — so the per-page filtering that makes
+              # a line-per-match correct across pages is unchanged.
+              RUNNER_IDS=$(gh api --paginate "orgs/${ORG}/actions/runners?per_page=100" 2>/tmp/gh-runners.err \
+                | jq -r --arg L "$RUNNER_LABEL" \
+                  '.runners[] | select(.status=="online") | select(any(.labels[].name; .==$L)) | .id')
+              GH_RC=$?
+              if [ "$GH_RC" -ne 0 ]; then
+                # Deliberately NOT the 5s cadence: if this is the secondary limit (a
+                # per-MINUTE budget) then retrying at 5s spends the recovery window.
+                echo "  runner listing unreadable (gh rc=${GH_RC}): $(tail -1 /tmp/gh-runners.err 2>/dev/null)"
+                sleep 15
+                continue
+              fi
+              API_OK=1
+              # COUNT LINES, NEVER `| length`. `gh api --paginate --jq` applies the jq
+              # filter to EACH PAGE SEPARATELY and concatenates the results, so an
+              # aggregating filter emits one number PER PAGE: an org with >100 runners
+              # returned "2\n1" here, not "3".
+              #
+              # That is not a cosmetic miscount, it inverts this job's verdict. Every
+              # `[ "$ONLINE" -ge ... ]` below then dies with "integer expression
+              # expected" and returns NON-ZERO, so the `-lt "${MIN_POOL}"` discard
+              # branch is never taken and the pool is declared HEALTHY with zero
+              # runners online — `runs-on` targets a label nothing answers to and the
+              # caller's jobs queue until timeout, which is strictly worse than the
+              # hosted-runner fallback this workflow exists to provide. It would also
+              # write a multi-line `runners_online` into $GITHUB_OUTPUT, corrupting
+              # every later output.
+              #
+              # A per-match line survives page concatenation intact, so emit `.id` and
+              # count. `grep -c .` always prints exactly one integer, 0 included.
+              # `--slurp` would also work but only on gh >= 2.53; this needs no floor.
+              ONLINE=$(printf '%s\n' "$RUNNER_IDS" | grep -c . || true)
               echo "  ${ONLINE:-0}/${POOL_SIZE} online (usable at ${MIN_POOL})"
               [ "${ONLINE:-0}" -ge "${POOL_SIZE}" ] && break
               sleep 5
             done
+
+            # Never read the listing at all: the pool may be perfectly healthy and we
+            # cannot see it. Close the lease (an unverifiable pool cannot be handed to
+            # the caller, and leaving it holds escrow), but do NOT exclude the provider
+            # and do NOT spend another attempt — re-selecting providers cannot fix
+            # GitHub's API, and a second attempt just doubles the request load that is
+            # the most likely cause.
+            if [ "$API_OK" = "0" ]; then
+              for _try in 1 2 3; do
+                "${JA[@]}" destroy --dseq "$DSEQ" -y 2>&1 | tee /tmp/ja-destroy.log && break
+                grep -qi "Deployment closed" /tmp/ja-destroy.log && break
+                sleep 5
+              done
+              echo "failure_reason=GITHUB_API_UNAVAILABLE" >> "$GITHUB_OUTPUT"
+              echo "::error title=Could not read the runner listing — this is NOT a provider fault::Every poll of orgs/${ORG}/actions/runners failed, so the pool was never observable. Do not runner_deny anyone over this. The usual cause at scale is the PAT's 5,000 req/hour (shared across ALL of that user's tokens and repos) or the 900 points/minute secondary limit: each poll costs ceil(org_runners/100) requests because GitHub cannot filter runners by label. Reduce concurrent pools, de-register offline runners to shrink the listing, or give this workflow its own credential."
+              echo "::endgroup::"; exit 1
+            fi
 
             if [ "${ONLINE:-0}" -lt "${MIN_POOL}" ]; then
               echo "::warning::attempt $attempt: ${ONLINE:-0}/${POOL_SIZE} online on $PROVIDER (need >= ${MIN_POOL}) — discarding this lease"
@@ -449,6 +650,13 @@ jobs:
           if [ "$SAW_BID" = "1" ]; then
             echo "failure_reason=RUNNER_NEVER_REGISTERED" >> "$GITHUB_OUTPUT"
             echo "::error title=Leases won, runners never registered::A provider took the lease but the runner never came online. That provider is a candidate for runner_deny — qualify it with 'just-akash runner-probe'."
+          elif [ "$SAW_SEQ_CONTENTION" = "1" ]; then
+            # Checked BEFORE the capacity verdict: no order was ever created, so no
+            # provider was asked to bid and the market said nothing. Reporting this as
+            # PROVIDER_CAPACITY is a fabricated outage, and it fires hardest during a
+            # spike — when many pools are the cause and the market is fine.
+            echo "failure_reason=WALLET_TX_CONTENTION" >> "$GITHUB_OUTPUT"
+            echo "::error title=The wallet could not carry the deploy: concurrent transactions::AKASH_API_KEY is ONE Cosmos account and cannot have two transactions in flight — the losers are rejected with an account-sequence mismatch, and nothing in just_akash retries it. This is NOT a market condition and NOT a provider fault. GitHub concurrency groups are scoped per repository, so they cannot serialise callers in different repos. At spike, give each concurrent provisioner its OWN Akash account, or funnel provisioning through one repo that serialises on the akash-wallet group."
           else
             echo "failure_reason=PROVIDER_CAPACITY" >> "$GITHUB_OUTPUT"
             echo "::error title=No provider bid::No eligible provider bid within the window across ${MAX_ATTEMPTS} attempts. This is a market/capacity condition, not a code failure."

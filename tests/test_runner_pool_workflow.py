@@ -48,6 +48,18 @@ def _step(fragment: str) -> dict:
 PROVISION = _step("Provision")
 
 
+def _code(body: str) -> str:
+    """A shell body with its comment lines removed.
+
+    These guards assert what the shell DOES, and matching raw text also matches the prose
+    explaining why. A comment that names the very construct it warns against — "never
+    `| length`" — then trips the guard forbidding it, and the cheapest way to go green is
+    to delete the explanation. That inverts the point of writing the reason down, so
+    strip comments and assert on code.
+    """
+    return "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("#"))
+
+
 # --------------------------------------------------------------------------
 # tag-prefix — a shared default destroyed another repo's live deployment
 # --------------------------------------------------------------------------
@@ -125,13 +137,147 @@ def test_min_pool_is_clamped_against_junk_and_out_of_range():
     degrade to pool-size rather than making the discard test meaningless."""
     body = PROVISION["run"]
     assert "*[!0-9]*" in body, "non-numeric input must be rejected"
-    assert "-ge 1" in body, "0 would accept an empty pool as healthy"
+    # Named, not bare "-ge 1": a second clamp elsewhere in the step (runner-wait-tries)
+    # satisfied the loose form and made this guard vacuous — caught by the anti-vacuity
+    # pass below, which is exactly the failure it exists to surface.
+    assert '[ "$MIN_POOL" -ge 1 ]' in body, "0 would accept an empty pool as healthy"
     assert '-le "$POOL_SIZE"' in body, "above pool-size the loop can never satisfy it"
 
 
 def test_accepting_a_partial_pool_is_announced():
     """Silently running at half capacity looks like a slow CI, not a degraded one."""
     assert "Partial pool accepted" in PROVISION["run"]
+
+
+# --------------------------------------------------------------------------
+# GitHub paginates — and an aggregating --jq silently inverts this job's verdict
+# --------------------------------------------------------------------------
+
+
+def test_the_online_count_survives_a_paginated_org():
+    """`gh api --paginate --jq` runs the filter against EACH PAGE and concatenates the
+    results, so an aggregating filter emits one value PER PAGE: an org with >100 runners
+    returned "2\\n1" instead of "3".
+
+    That is not a miscount, it inverts the verdict. `[ "$ONLINE" -ge N ]` on a
+    multi-line value exits NON-ZERO with "integer expression expected", so the
+    `-lt "${MIN_POOL}"` discard branch is never taken and a pool with ZERO online
+    runners is published as healthy — `runs-on` then targets a label nothing answers
+    to, which is worse than the hosted fallback this workflow exists to provide.
+
+    >100 runners is the normal case, not an exotic one: offline registrations
+    accumulate and once overflowed an org's runner listing outright.
+    """
+    code = _code(PROVISION["run"])
+    poll = code[code.index("gh api --paginate") : code.index("online (usable at")]
+    assert "| length" not in poll, (
+        "an aggregating jq filter emits one value per page under --paginate, and a "
+        "multi-line ONLINE makes every integer test below error-out into 'healthy'"
+    )
+    assert "grep -c" in poll or "--slurp" in poll, (
+        "the count must survive page concatenation — count matched LINES, or --slurp"
+    )
+
+
+def test_the_online_count_is_a_single_integer_on_every_path():
+    """ONLINE feeds three integer comparisons and $GITHUB_OUTPUT. Anything that can
+    return empty or multi-line corrupts all four — a multi-line value written to
+    $GITHUB_OUTPUT without a heredoc delimiter also breaks every LATER output in the
+    file, not just this one."""
+    code = _code(PROVISION["run"])
+    poll = code[code.index("gh api --paginate") : code.index("online (usable at")]
+    assert "grep -c ." in poll, "grep -c prints exactly one integer, 0 included"
+    assert "|| true" in poll or "|| echo 0" in poll, (
+        "grep -c exits 1 on zero matches; the assignment must not carry that outward"
+    )
+
+
+def test_a_failed_listing_query_is_not_counted_as_zero_runners():
+    """A throttled `gh` must not walk the 'the provider never delivered' path.
+
+    Swallowing a non-zero exit into 0 destroys the lease, EXCLUDES the provider from
+    later attempts, and reports RUNNER_NEVER_REGISTERED — which names that provider a
+    runner_deny candidate for what is our own API budget. That is the exact class of
+    misdiagnosis this workflow exists to remove.
+
+    It is also not a rare path at pool scale: GitHub cannot filter runners by label
+    server-side, so each poll costs ceil(org_runners/100) requests against a PAT's
+    5,000/hour, shared across every token and repo of that user."""
+    code = _code(PROVISION["run"])
+    poll = code[code.index("gh api --paginate") : code.index('if [ "$API_OK"')]
+    # Positive assertions: `2>/dev/null not in poll` would also forbid the legitimate
+    # suppression on the `tail` that reports the error, and a guard that forbids the
+    # remedy gets weakened rather than obeyed.
+    assert re.search(r"2>\s*/tmp/\S+\.err", poll), (
+        "gh's stderr must be captured, not discarded — it carries the 403 that explains "
+        "the failure, and discarding it is how a rate limit became 'zero runners'"
+    )
+    assert re.search(r"GH_RC=\$\?", poll), "the exit status must be captured, not ignored"
+    assert re.search(r"GH_RC.*-ne 0", poll), "a non-zero gh must take its own branch"
+    assert "API_OK" in poll, "the loop must record whether the listing was EVER readable"
+
+
+def test_an_unreadable_listing_is_its_own_failure_world():
+    """GITHUB_API_UNAVAILABLE exists because the remedy (API budget) has nothing to do
+    with Akash. Folding it into RUNNER_NEVER_REGISTERED sends the operator at providers
+    — and at runner_deny — for a GitHub rate limit."""
+    body = SRC
+    assert "failure_reason=GITHUB_API_UNAVAILABLE" in body
+    assert "GITHUB_API_UNAVAILABLE" in OUTPUTS["failure_reason"]["description"], (
+        "a reason the caller cannot find documented is a reason they will misread"
+    )
+    unreadable = body[body.index('if [ "$API_OK"') :]
+    assert "NOT a provider fault" in unreadable, "must say what it is not"
+
+
+def test_an_unreadable_listing_still_closes_the_lease_but_spares_the_provider():
+    """Two independent properties, and both are load-bearing.
+
+    The lease must close: an unverifiable pool cannot be handed to the caller, and
+    leaving it holds escrow against the grant the next run spends from.
+
+    The provider must NOT be excluded and no further attempt spent: re-selecting
+    providers cannot fix GitHub's API, and a retry doubles the request load that is the
+    most likely cause of the failure in the first place."""
+    body = PROVISION["run"]
+    unreadable = body[body.index('if [ "$API_OK"') : body.index('if [ "${ONLINE:-0}" -lt')]
+    assert '"${JA[@]}" destroy --dseq "$DSEQ"' in unreadable, "an unread lease still leaks"
+    assert "EXCLUDED=" not in unreadable, "a rate limit is not evidence about a provider"
+    assert "exit 1" in unreadable, "must not spend another attempt on an API failure"
+
+
+def test_a_throttled_poll_backs_off_further_than_the_healthy_cadence():
+    """The secondary limit is a per-MINUTE budget, so retrying a throttled read at the
+    healthy 5s cadence spends the window it is waiting for."""
+    body = PROVISION["run"]
+    poll = body[body.index("gh api --paginate") : body.index('if [ "$API_OK"')]
+    fail_branch = poll[poll.index("GH_RC") : poll.index("API_OK=1")]
+    assert re.search(r"sleep (1[0-9]|[2-9][0-9])", fail_branch), (
+        "the failure path must back off further than the 5s healthy poll"
+    )
+
+
+def test_the_wait_window_is_budgeted_by_time_not_iterations():
+    """The healthy poll sleeps 5s and the throttled poll sleeps 15s, but a
+    `seq 1 $RUNNER_WAIT_TRIES` loop spends one iteration on either — so an all-throttled
+    run waited 15 x 90 = 22.5 MINUTES while the input description, the docs and the
+    error text all promised 7.5. The caller's jobs sit behind that.
+
+    A wall-clock deadline keeps the promised window honest whatever mix of waits occurs.
+    """
+    code = _code(PROVISION["run"])
+    assert "WAIT_DEADLINE" in code, "the wait must be bounded by time, not iteration count"
+    assert not re.search(r"seq 1 \"\$RUNNER_WAIT_TRIES\"", code), (
+        "an iteration budget lets the 15s throttled sleep triple the promised window"
+    )
+
+
+def test_the_runner_query_is_still_paginated_at_all():
+    """Without --paginate the poll only ever sees the first 100 runners, so a pool whose
+    registrations land on page 2 reads as never having come online — RUNNER_NEVER_
+    REGISTERED against providers that did their job."""
+    poll = PROVISION["run"]
+    assert "--paginate" in poll and "per_page=100" in poll
 
 
 # --------------------------------------------------------------------------
@@ -151,6 +297,132 @@ def test_every_failure_world_has_its_own_reason():
     ):
         assert f"failure_reason={reason}" in body, f"{reason} is never emitted"
     assert "failure_reason" in OUTPUTS, "the caller cannot see why it fell back"
+
+
+def _checkout(steps: list) -> dict:
+    return next(s for s in steps if "actions/checkout" in s.get("uses", ""))
+
+
+def test_the_workflow_checks_out_just_akash_not_the_caller():
+    """A reusable workflow's job runs in the CALLER's context, so `github.repository` is
+    THEIR repo and a bare checkout fetches THEIR code. `uv run --with .` then installs
+    the caller's package — or fails outright when they have no pyproject.toml —
+    `just-akash` is never on PATH, and `python -m just_akash.runner_candidates` raises
+    ModuleNotFoundError.
+
+    This is the difference between "works in this repo" and "works for a consumer", and
+    nothing in this repo calls these workflows, so it was never exercised."""
+    for label, steps in (("pool", STEPS), ("teardown", TD_STEPS)):
+        with_ = _checkout(steps).get("with", {})
+        repo = str(with_.get("repository", ""))
+        assert repo, f"{label}: a bare checkout fetches the CALLER's repo, which has no just_akash"
+        assert "job.workflow_repository" in repo or repo.endswith("/just-akash"), (
+            f"{label}: repository={repo!r} does not name just-akash"
+        )
+        assert with_.get("path"), f"{label}: must not overwrite the caller's workspace root"
+
+
+def test_the_cli_source_is_pinned_to_the_ref_the_caller_pinned():
+    """Tracking a branch would let the classification tables, the SDL and the
+    provider-qualification bar change under a consumer whose pin never moved — which is
+    the entire reason they pinned a ref. `job.workflow_sha` is the commit of this
+    reusable workflow file, so the CLI always matches the workflow.
+
+    Note the context: `github.*` is always the CALLER's, so `github.workflow_ref` here
+    names their entry workflow, not ours. Only the `job` context refers to the reusable
+    workflow file. An undefined property evaluates to empty rather than erroring, so if
+    GitHub ever withdraws it the checkout degrades to just-akash's default branch —
+    unpinned, but still our source and not the caller's tree.
+    """
+    for label, steps in (("pool", STEPS), ("teardown", TD_STEPS)):
+        ref = str(_checkout(steps).get("with", {}).get("ref", ""))
+        assert "job.workflow_sha" in ref, (
+            f"{label}: ref={ref!r} — a floating ref breaks the guarantee a pin exists for"
+        )
+        assert "github.workflow_sha" not in ref, (
+            f"{label}: the github context is the CALLER's workflow, not this one"
+        )
+
+
+def test_every_uv_invocation_runs_from_the_just_akash_checkout():
+    """`uv run --with .` resolves `.` against the working directory, so checking the
+    source into a path without pointing the run steps at it reintroduces the same
+    failure one layer down."""
+    for label, doc, job in (("pool", DOC, "pool"), ("teardown", TD, "teardown")):
+        wd = doc["jobs"][job].get("defaults", {}).get("run", {}).get("working-directory", "")
+        assert wd, f"{label}: run steps still execute from the caller's workspace root"
+        path = _checkout(doc["jobs"][job]["steps"]).get("with", {}).get("path", "")
+        assert wd.strip("./") == path.strip("./"), (
+            f"{label}: working-directory {wd!r} does not match checkout path {path!r}"
+        )
+
+
+def test_the_pool_runs_the_image_providers_were_qualified_against():
+    """A provider earns runner_host by scheduling the PROBE image three consecutive
+    times. Running a different image in the pool means the pool is trusting a
+    measurement taken of something else — and `:latest` made that gap permanent and
+    silent, since the tag can move between the qualification and the run relying on it.
+
+    The probe SDL already explains why it pins a digest; this asserts the pool did not
+    quietly opt out of that reasoning."""
+    probe_sdl = (Path(__file__).resolve().parents[1] / "sdl/github-runner-probe.yaml").read_text()
+
+    def _image(text: str, what: str) -> str:
+        m = re.search(r"image:\s*(\S+)", text)
+        assert m, f"no image found in {what}"
+        return m.group(1)
+
+    probe_img = _image(probe_sdl, "the probe SDL")
+    pool_img = _image(_code(_step("Render runner SDL")["run"]), "the rendered pool SDL")
+
+    assert "@sha256:" in pool_img, f"the pool image must be digest-pinned, got {pool_img}"
+    assert pool_img == probe_img, (
+        f"pool runs {pool_img} but providers are qualified against {probe_img} — "
+        "the qualification measures a different artifact than the pool runs"
+    )
+
+
+def test_wallet_contention_is_not_reported_as_a_market_outage():
+    """AKASH_API_KEY is ONE Cosmos account, which cannot carry two transactions at once:
+    concurrent provisioners reject each other with account-sequence mismatches, and
+    nothing in just_akash retries that.
+
+    No order is created, so no provider is ever asked to bid — reporting PROVIDER_CAPACITY
+    is a fabricated market outage, and it fires hardest during a spike, when the cause is
+    our own concurrency and the market is fine. It must be checked BEFORE the capacity
+    verdict, since the capacity branch is the `else`.
+    """
+    code = _code(PROVISION["run"])
+    assert "failure_reason=WALLET_TX_CONTENTION" in code
+    assert re.search(r"account sequence mismatch|sequence mismatch", code, re.I), (
+        "the rejection has to be recognised before it can be classified"
+    )
+    # Anchored on the classification BRANCH, not the name. `code.index(
+    # "SAW_SEQ_CONTENTION")` found the `SAW_SEQ_CONTENTION=0` initialisation near the
+    # top of the step, which precedes the capacity verdict no matter where the branch
+    # moves — so the guard held even with the ordering it exists to lock reversed.
+    branch = code.index('elif [ "$SAW_SEQ_CONTENTION" = "1" ]')
+    assert branch < code.index("failure_reason=PROVIDER_CAPACITY"), (
+        "contention must be classified before falling through to a capacity verdict"
+    )
+
+
+def test_wallet_contention_backs_off_with_jitter_instead_of_recolliding():
+    """An immediate retry re-collides with whatever won the race — that is the definition
+    of the failure. Jitter is what breaks the lockstep between concurrent callers, so a
+    fixed sleep would just move the collision."""
+    code = _code(PROVISION["run"])
+    seq = code[code.index("SAW_SEQ_CONTENTION=1") : code.index("no lease within the bid window")]
+    assert "RANDOM" in seq, "a fixed backoff keeps concurrent callers in lockstep"
+    assert re.search(r"sleep\s+\"?\$", seq), "must actually wait before the next attempt"
+
+
+def test_wallet_contention_does_not_claim_a_bid_was_seen():
+    """SAW_BID drives the RUNNER_NEVER_REGISTERED verdict, which names a provider as a
+    runner_deny candidate. A transaction the chain rejected never reached a provider."""
+    code = _code(PROVISION["run"])
+    seq = code[code.index("SAW_SEQ_CONTENTION=1") : code.index("no lease within the bid window")]
+    assert "SAW_BID=1" not in seq, "a rejected transaction is not a bid"
 
 
 def test_a_402_is_not_reported_as_a_missing_bid():
@@ -288,6 +560,55 @@ MUTATIONS = [
     ),
     ("sdl token redacted", lambda s: s.replace("grep -vE 'ACCESS_TOKEN'", "cat")),
     (
+        "pool image matches the probe",
+        lambda s: s.replace(
+            "github-runner@sha256:030ae11a6b597c5db28b12375461e35f694d74ceb06a1b73c90545b1adef16da",
+            "github-runner:latest",
+        ),
+    ),
+    # The count must survive a multi-page org. Both shapes below are what a reader
+    # "tidying up" the jq would plausibly write, and each restores the bug.
+    ("online count is line-based", lambda s: s.replace("grep -c .", "head -1")),
+    ("no aggregating jq under paginate", lambda s: s.replace("| .id'", "] | length'")),
+    ("runner poll stays paginated", lambda s: s.replace("--paginate ", "")),
+    # A throttled read must never be absorbed into "the provider delivered nothing".
+    (
+        "failed listing is not zero",
+        lambda s: s.replace("2>/tmp/gh-runners.err", "2>/dev/null"),
+    ),
+    (
+        "api failure has its own reason",
+        lambda s: s.replace(
+            "failure_reason=GITHUB_API_UNAVAILABLE", "failure_reason=RUNNER_NEVER_REGISTERED"
+        ),
+    ),
+    ("throttle backs off", lambda s: s.replace("sleep 15", "sleep 5")),
+    (
+        "wait is time-budgeted",
+        lambda s: s.replace(
+            'while [ "$(date +%s)" -lt "$WAIT_DEADLINE" ]; do',
+            'for i in $(seq 1 "$RUNNER_WAIT_TRIES"); do',
+        ),
+    ),
+    # Wallet contention must not be laundered into a market verdict.
+    (
+        "contention is not capacity",
+        lambda s: s.replace(
+            "failure_reason=WALLET_TX_CONTENTION", "failure_reason=PROVIDER_CAPACITY"
+        ),
+    ),
+    ("contention backoff is jittered", lambda s: s.replace("(RANDOM % 20) + 10", "15")),
+    # The consumer-facing trio: fetch OUR source, at the ref they pinned, and run there.
+    (
+        "checkout names just-akash",
+        lambda s: re.sub(r"\n\s*repository: [^\n]*just-akash[^\n]*", "", s, count=1),
+    ),
+    ("cli ref is the pinned one", lambda s: s.replace("job.workflow_sha", "github.ref")),
+    (
+        "uv runs from our checkout",
+        lambda s: s.replace("working-directory: .just-akash", "working-directory: ."),
+    ),
+    (
         "checkout credentials",
         lambda s: s.replace("persist-credentials: false", "persist-credentials: true"),
     ),
@@ -398,8 +719,40 @@ def test_deregistration_is_scoped_to_this_runs_label():
     """An org-wide 'delete every offline runner' races other repos' provisioning,
     where a runner is briefly offline between registering and coming up."""
     body = TD_DEREG["run"]
-    assert '.==\\"${RUNNER_LABEL}\\"' in body or "${RUNNER_LABEL}" in body
+    assert "${RUNNER_LABEL}" in body
     assert 'select(.status=="offline")' in body.replace('\\"', '"')
+
+
+def test_deregistration_sees_every_page_of_the_org():
+    """This step is where pagination bites hardest, in both directions.
+
+    Without --paginate it only ever sees the first 100 runners, so the offline
+    registrations that overflowed page 1 — the exact ones that broke provisioning for
+    every repo in the org — are the ones it can never clean, and the leak is
+    self-sustaining.
+
+    And the filter must stay a STREAM of ids: `gh api --paginate --jq` runs the filter
+    per page and concatenates, so `.runners[] | ... | .id` yields a correct id list
+    across pages while any aggregating form yields one value per page.
+    """
+    body = TD_DEREG["run"]
+    assert "--paginate" in body, "page 1 only cannot drain a listing that overflowed"
+    assert "| length" not in body, "an aggregate emits one value per page, not one per runner"
+    assert re.search(r"\|\s*\.id", body), "must emit one id per line to survive concatenation"
+
+
+def test_an_unreadable_listing_is_not_reported_as_a_clean_sweep():
+    """Same conflation as the pool's poll, and worse here. `|| true` turned a throttled
+    `gh` into an empty IDS, and the step then published deregistered=0 AND
+    deregister_failed=0 — a clean sweep it never performed, over registrations it never
+    enumerated. That silence is exactly what lets the listing grow, which raises the
+    request cost of every later poll."""
+    body = TD_DEREG["run"]
+    assert "2>/dev/null || true" not in body, "discarding the failure reports a false zero"
+    assert re.search(r"GH_RC=\$\?", body), "the listing query's exit status must be captured"
+    assert "unmeasured" in body, (
+        "an unreadable listing needs a value distinct from 0 — they are different claims"
+    )
 
 
 def test_teardown_does_not_claim_an_ownership_check_it_cannot_perform():

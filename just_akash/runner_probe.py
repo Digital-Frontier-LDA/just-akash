@@ -459,8 +459,14 @@ def _run_noop_job(
                 repo,
                 "--workflow",
                 "runner-probe-job.yml",
+                # Not 10. Every concurrent probe dispatches THIS workflow, so at any
+                # fleet scale the run we just triggered is pushed off a 10-row window by
+                # other probes' runs — `ever_started` stays False, the attempt reports
+                # SCHEDULED_ONLY, and nothing can ever be promoted to runner_host. The
+                # createdAt filter below is what establishes identity; this window only
+                # has to be wide enough to contain our row.
                 "--limit",
-                "10",
+                "100",
                 "--json",
                 "status,conclusion,createdAt",
             ],
@@ -497,8 +503,22 @@ def _run_noop_job(
     return False
 
 
-def _registered(org: str, label: str, api_token: str, timeout_s: int) -> bool:
+def _registered(org: str, label: str, api_token: str, timeout_s: int) -> bool | None:
     """Poll GitHub for a runner carrying this probe's label.
+
+    Tri-state, like `_pod_started` and `_run_noop_job`: True registered, False measured
+    and absent, **None never measurable**. None is not pedantry — `classify` turns False
+    into POD_NO_REGISTER, which is a PERMANENT runner_deny that outranks any later
+    streak, so an unreadable listing must not reach it. It reaches SCHEDULED_ONLY
+    instead: non-promotable, non-demoting, which is the honest reading of "we never
+    looked successfully".
+
+    That path is reachable in normal operation, not only in outages. GitHub cannot
+    filter runners by label server-side (`?name=` is exact-match, verified live), so
+    every poll pages the entire org listing — ceil(org_runners/100) requests every 10s
+    against a PAT's 5,000/hour, shared across all of that user's tokens. A probe run is
+    providers x attempts x minutes, and at org scale it competes with the runner pools
+    themselves. Being throttled here used to demote whichever provider was under test.
 
     Takes an API credential, which is NOT the same thing as the token in the SDL.
 
@@ -513,7 +533,9 @@ def _registered(org: str, label: str, api_token: str, timeout_s: int) -> bool:
     """
     env = {"GH_TOKEN": api_token} if api_token else None
     deadline = time.time() + timeout_s
-    while time.time() < deadline:
+    # Did ANY poll come back readable? Only then does "no runner matched" mean anything.
+    measured = False
+    while True:
         rc, out = _run(
             [
                 "gh",
@@ -527,16 +549,43 @@ def _registered(org: str, label: str, api_token: str, timeout_s: int) -> bool:
                 # existed. The job then dispatched at a label owned only by corpses and
                 # queued until timeout: JOB_NOT_RUN blamed on the provider. Measured with
                 # 13 offline probe runners listed and zero online.
-                f'[.runners[] | select(.status=="online") '
-                f'| select(any(.labels[].name; .=="{label}"))] | length',
+                # ONE LINE PER MATCH, never an aggregating `| length`. With
+                # --paginate, gh applies this filter to EACH PAGE SEPARATELY and
+                # concatenates the outputs, so `| length` emits one number per page:
+                # an org with >100 runners produced "2\n1", whose `.isdigit()` is
+                # False, so this returned False for the whole window no matter how
+                # many runners were up. That reports POD_NO_REGISTER, which is a
+                # PERMANENT runner_deny (it outranks any later streak) against a
+                # provider that hosted the runner correctly — the single most
+                # expensive wrong verdict this module can reach, and one that only
+                # appears on the large orgs where a runner pool matters most.
+                #
+                # A stream of scalars survives page concatenation unchanged, so the
+                # count is line-based here rather than parsed out of jq.
+                # json.dumps, not an f-string quote. jq string literals are
+                # JSON-compatible, so this escapes `"` and `\` correctly. Splicing the
+                # label raw builds an INVALID jq program for such a label, gh exits
+                # non-zero, and the tri-state above reads that as "never measurable" —
+                # so a malformed label would silently make every provider
+                # non-promotable instead of reporting a bad input.
+                f'.runners[] | select(.status=="online") '
+                f"| select(any(.labels[].name; .=={json.dumps(label)})) | .id",
             ],
             timeout=60,
             env=env,
         )
-        if rc == 0 and out.strip().isdigit() and int(out.strip()) > 0:
-            return True
+        if rc == 0:
+            measured = True
+            if any(line.strip() for line in out.splitlines()):
+                return True
+        # ALWAYS take at least one reading before honouring the deadline, as _pod_started
+        # and _job_ran do. A zero or very short timeout must mean "look once", not "never
+        # look" — the latter returns None (unmeasurable) for every fast attempt and makes
+        # the whole run non-promotable.
+        if time.time() >= deadline:
+            break
         time.sleep(10)
-    return False
+    return False if measured else None
 
 
 def probe_once(
@@ -703,8 +752,12 @@ def _run_probes(args, token: str, token_kind: str, tmpdir: str) -> list[Provider
     return verdicts
 
 
-def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Qualify providers as runner hosts.")
+def main(argv: list[str] | None = None, prog: str = "") -> int:
+    # prog is set when dispatched from `just-akash runner-probe`, so the usage line
+    # names the command the operator actually typed rather than the bare binary.
+    ap = argparse.ArgumentParser(
+        prog=prog or None, description="Qualify providers as runner hosts."
+    )
     ap.add_argument("--providers", required=True, help="comma-separated akash1… addresses")
     ap.add_argument("--cpu", default="4")
     ap.add_argument("--memory", default="16Gi")
