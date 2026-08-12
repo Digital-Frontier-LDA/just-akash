@@ -47,7 +47,7 @@ import urllib.request
 from collections.abc import Callable
 
 from canary._state import load_json_mapping
-from canary.closure import UNKNOWN, VERDICTS, attribute
+from canary.closure import UNKNOWN, VERDICTS, attribute_detailed
 
 # Reused from the exporter rather than re-implemented: _escape_label_value handles the
 # exposition-format escapes, and _is_number excludes bool (a bool IS an int, so a
@@ -151,7 +151,7 @@ def merge(
     *,
     deployed: bool | None = None,
     owner: str = "",
-    attribute_closure: Callable[[str, str], str] | None = None,
+    attribute_closure: Callable[[str, str], str | tuple[str, float | None]] | None = None,
 ) -> dict:
     """Fold one scrape into the durable per-provider state.
 
@@ -206,18 +206,44 @@ def merge(
     if dseq_changed:
         # New lease: the container is new by construction. Not a restart.
         p["lease_replacements_total"] += 1
+        # DROP the previous lease's lifetime before measuring this one. This state is
+        # DURABLE across runs, so leaving it in place would republish the OLD lease's
+        # lifetime as though it belonged to the one that just ended -- and it would do so
+        # precisely when the chain could NOT be read, which is exactly when a stale number
+        # is most likely to be believed. "Publish nothing rather than guess" is the rule
+        # this metric exists to follow, and keeping the field would have broken it in the
+        # gauge's own failure mode. Raised independently by CodeRabbit and Copilot on #146.
+        p.pop("lease_lifetime_hours", None)
         # Attribute the deployment we STOPPED watching, not the one we just found. Its
         # dseq is the only handle the chain will answer about, and this is the last
         # moment we hold it — the line below overwrites p["dseq"].
         cause = UNKNOWN
+        lived: float | None = None
         if attribute_closure is not None and owner:
             try:
-                cause = attribute_closure(owner, str(p["dseq"]))
+                result = attribute_closure(owner, str(p["dseq"]))
             except Exception:  # noqa: BLE001 — a broken attributor loses a cause, not a run
-                cause = UNKNOWN
+                result = UNKNOWN
+            # The attributor may return the cause alone, or (cause, lifetime_hours). Both are
+            # accepted deliberately: canary/closure.attribute_detailed returns the pair, while
+            # the plain string is what every existing caller and fixture returns. Rejecting
+            # one shape would either churn tests unrelated to lifetime or, worse, silently
+            # store a tuple as the cause and send every closure to `unknown`.
+            if isinstance(result, tuple):
+                cause = str(result[0]) if result else UNKNOWN
+                raw_lifetime = result[1] if len(result) > 1 else None
+                lived = float(raw_lifetime) if isinstance(raw_lifetime, (int, float)) else None
+            else:
+                cause = result
         if cause not in VERDICTS:
             cause = UNKNOWN
         closures[cause] = closures.get(cause, 0) + 1
+        # Publish only a lifetime the CHAIN gave us. Falling back to a locally computed span
+        # would defeat the point: the whole reason this exists is that the obvious local
+        # source (uptime at last scrape) is a lower bound, and a lower bound published as a
+        # measurement is what produced a false "fixed ~13.7h timer" conclusion on 2026-08-12.
+        if isinstance(lived, (int, float)) and lived >= 0:
+            p["lease_lifetime_hours"] = float(lived)
     elif boot_changed:
         p["restarts_total"] += 1
 
@@ -339,6 +365,23 @@ def render(
                 f'akash_canary_lease_closures_total{{provider="{prov}",cause="{cause}"}} '
                 f"{closures.get(cause, 0)}"
             )
+    # Only providers whose last replacement was chain-measurable appear here. A provider with
+    # no series has not lost a lease since this shipped, or the chain could not be read for
+    # the one it lost -- both are "no measurement", and emitting 0 for them would publish a
+    # lifetime of zero hours as if it were observed.
+    add(
+        "# HELP akash_canary_lease_lifetime_hours How long the PREVIOUS lease lived, in "
+        "hours, measured entirely on chain: start from the dseq (epoch ms, minted by the "
+        "Console API), end from the header time of the block its escrow settled in. NOT "
+        "derived from akash_canary_uptime_seconds -- that is only as fresh as the last "
+        "successful scrape, so it is a LOWER BOUND, and reading it as a lifetime is wrong by "
+        "up to the collection interval."
+    )
+    add("# TYPE akash_canary_lease_lifetime_hours gauge")
+    for prov, p in sorted(state.items()):
+        lived = p.get("lease_lifetime_hours")
+        if isinstance(lived, (int, float)):
+            add(f'akash_canary_lease_lifetime_hours{{provider="{prov}"}} {float(lived):.4f}')
     add(
         "# HELP akash_canary_unreachable_checks_total Checks where the canary could not "
         "be reached on its ingress."
@@ -521,7 +564,7 @@ def main() -> int:
             now,
             deployed=bool(uri),
             owner=a.owner,
-            attribute_closure=attribute,
+            attribute_closure=attribute_detailed,
         )
         closures = {k: v for k, v in sorted((state[provider].get("closures") or {}).items()) if v}
         print(
