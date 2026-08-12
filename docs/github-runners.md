@@ -128,6 +128,54 @@ Practical levers, in order of effect:
 
 ---
 
+## One wallet cannot carry a spike, and GitHub cannot serialise it for you
+
+`AKASH_API_KEY` is a **single Cosmos account**. A Cosmos account cannot have two
+transactions in flight — they share a sequence number, so the loser is rejected with an
+account-sequence mismatch, and **nothing in `just_akash` retries that**. Every deploy,
+every destroy, every tag is such a transaction.
+
+This repo's own wallet-touching workflows are serialised under the `akash-wallet`
+concurrency group for exactly this reason. **A reusable workflow cannot inherit that
+protection**: GitHub scopes concurrency groups *per repository*, so a group named here
+creates one queue per calling repo and none at all across them. Many repos sharing one
+key are unserialisable by any group name written in this file.
+
+Untreated, the rejection looks like silence from the market: no DSEQ, no provider, and
+after the attempt budget a `PROVIDER_CAPACITY` verdict — a fabricated outage, produced
+hardest at spike, when the real cause is your own concurrency. It is now classified as
+`WALLET_TX_CONTENTION` and backed off with jitter (a fixed backoff keeps concurrent
+callers in lockstep and simply re-collides).
+
+Backoff buys headroom for a few overlapping callers. **It does not scale to a spike** —
+one sequence number means transactions from that account are inherently serial, so N
+concurrent provisioners spend most of their attempt budget queueing behind each other.
+
+**Escrow compounds it.** Every live lease holds its deposit against the same grant:
+
+```
+free = sum(grants) − escrow          ← what predicts a 402
+```
+
+At the default `required-deposit-usd: 5`, 25 concurrent pools lock ~$125 before a single
+job runs. A grant measured at $170.62 was once $165 locked. So a spike does not fail at
+the marginal deploy — it fails when the *aggregate* of everyone's live leases crosses the
+grant, and the callers that lose are whichever deployed last.
+
+Two shapes work at spike, and they are the same idea:
+
+1. **One Akash account per concurrent provisioner.** Separate `AKASH_API_KEY`s mean
+   separate sequence numbers and no contention at all. Escrow still has to be planned in
+   aggregate, but nothing serialises.
+2. **Funnel provisioning through one repo** that owns the wallet and serialises on the
+   `akash-wallet` group, handing labels back to callers. Simple, but the queue is the
+   throughput ceiling — the opposite of a spike.
+
+Ephemeral churn pushes toward (1): `EPHEMERAL=true` means a runner leaves after one job,
+so a spike is a continuous stream of create/destroy transactions, not a single burst.
+
+---
+
 ## Free credit is not the grant
 
 This is the single most expensive misreading in the history of this setup.

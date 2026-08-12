@@ -374,6 +374,7 @@ jobs:
           CANDIDATES=$(printf '%s' "${CANDIDATES_CSV:-}" | tr ',' '\n' | sed '/^$/d')
           EXCLUDED=""
           SAW_BID=0
+          SAW_SEQ_CONTENTION=0
 
           for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
             echo "::group::provision attempt $attempt/$MAX_ATTEMPTS"
@@ -411,6 +412,32 @@ jobs:
                 echo "::error title=Akash rejected the deploy: INSUFFICIENT BALANCE::No order was created and no provider was asked to bid, so retrying cannot help. Top up the wallet."
                 echo "::endgroup::"; exit 1
               fi
+
+              # ACCOUNT-SEQUENCE CONTENTION — the failure that spikes produce, and the
+              # one that lies most convincingly.
+              #
+              # AKASH_API_KEY is ONE Cosmos account, and a Cosmos account cannot have two
+              # transactions in flight: they share a sequence number, so the loser is
+              # rejected with an account-sequence mismatch. Nothing in just_akash retries
+              # it. This repo's own wallet-touching workflows are serialised under the
+              # `akash-wallet` concurrency group precisely for this — but a REUSABLE
+              # workflow cannot inherit that protection, because GitHub scopes
+              # concurrency groups PER REPOSITORY. Many repos sharing one key are
+              # therefore unserialisable by any group name written here.
+              #
+              # Without this branch the tx rejection falls through to "no lease within
+              # the bid window" and, after the attempt budget, to PROVIDER_CAPACITY —
+              # reporting a market outage that never happened, at exactly the moment
+              # (a spike) when the real cause is our own concurrency. Retrying at once
+              # just re-collides, so back off with jitter to break the lockstep.
+              if grep -qiE 'account sequence mismatch|incorrect account sequence|sequence mismatch' /tmp/ja.log 2>/dev/null; then
+                SAW_SEQ_CONTENTION=1
+                BACKOFF=$(( (RANDOM % 20) + 10 ))
+                echo "::warning::attempt $attempt: account-sequence contention on the shared wallet — backing off ${BACKOFF}s. NOT a market condition."
+                sleep "$BACKOFF"
+                echo "::endgroup::"; continue
+              fi
+
               echo "::warning::attempt $attempt: no lease within the bid window"
               echo "::endgroup::"; continue
             fi
@@ -553,6 +580,13 @@ jobs:
           if [ "$SAW_BID" = "1" ]; then
             echo "failure_reason=RUNNER_NEVER_REGISTERED" >> "$GITHUB_OUTPUT"
             echo "::error title=Leases won, runners never registered::A provider took the lease but the runner never came online. That provider is a candidate for runner_deny — qualify it with 'just-akash runner-probe'."
+          elif [ "$SAW_SEQ_CONTENTION" = "1" ]; then
+            # Checked BEFORE the capacity verdict: no order was ever created, so no
+            # provider was asked to bid and the market said nothing. Reporting this as
+            # PROVIDER_CAPACITY is a fabricated outage, and it fires hardest during a
+            # spike — when many pools are the cause and the market is fine.
+            echo "failure_reason=WALLET_TX_CONTENTION" >> "$GITHUB_OUTPUT"
+            echo "::error title=The wallet could not carry the deploy: concurrent transactions::AKASH_API_KEY is ONE Cosmos account and cannot have two transactions in flight — the losers are rejected with an account-sequence mismatch, and nothing in just_akash retries it. This is NOT a market condition and NOT a provider fault. GitHub concurrency groups are scoped per repository, so they cannot serialise callers in different repos. At spike, give each concurrent provisioner its OWN Akash account, or funnel provisioning through one repo that serialises on the akash-wallet group."
           else
             echo "failure_reason=PROVIDER_CAPACITY" >> "$GITHUB_OUTPUT"
             echo "::error title=No provider bid::No eligible provider bid within the window across ${MAX_ATTEMPTS} attempts. This is a market/capacity condition, not a code failure."

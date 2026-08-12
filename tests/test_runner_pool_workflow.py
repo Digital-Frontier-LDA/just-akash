@@ -281,6 +281,44 @@ def test_every_failure_world_has_its_own_reason():
     assert "failure_reason" in OUTPUTS, "the caller cannot see why it fell back"
 
 
+def test_wallet_contention_is_not_reported_as_a_market_outage():
+    """AKASH_API_KEY is ONE Cosmos account, which cannot carry two transactions at once:
+    concurrent provisioners reject each other with account-sequence mismatches, and
+    nothing in just_akash retries that.
+
+    No order is created, so no provider is ever asked to bid — reporting PROVIDER_CAPACITY
+    is a fabricated market outage, and it fires hardest during a spike, when the cause is
+    our own concurrency and the market is fine. It must be checked BEFORE the capacity
+    verdict, since the capacity branch is the `else`.
+    """
+    code = _code(PROVISION["run"])
+    assert "failure_reason=WALLET_TX_CONTENTION" in code
+    assert re.search(r"account sequence mismatch|sequence mismatch", code, re.I), (
+        "the rejection has to be recognised before it can be classified"
+    )
+    assert code.index("SAW_SEQ_CONTENTION") < code.index("failure_reason=PROVIDER_CAPACITY"), (
+        "contention must be classified before falling through to a capacity verdict"
+    )
+
+
+def test_wallet_contention_backs_off_with_jitter_instead_of_recolliding():
+    """An immediate retry re-collides with whatever won the race — that is the definition
+    of the failure. Jitter is what breaks the lockstep between concurrent callers, so a
+    fixed sleep would just move the collision."""
+    code = _code(PROVISION["run"])
+    seq = code[code.index("SAW_SEQ_CONTENTION=1") : code.index("no lease within the bid window")]
+    assert "RANDOM" in seq, "a fixed backoff keeps concurrent callers in lockstep"
+    assert re.search(r"sleep\s+\"?\$", seq), "must actually wait before the next attempt"
+
+
+def test_wallet_contention_does_not_claim_a_bid_was_seen():
+    """SAW_BID drives the RUNNER_NEVER_REGISTERED verdict, which names a provider as a
+    runner_deny candidate. A transaction the chain rejected never reached a provider."""
+    code = _code(PROVISION["run"])
+    seq = code[code.index("SAW_SEQ_CONTENTION=1") : code.index("no lease within the bid window")]
+    assert "SAW_BID=1" not in seq, "a rejected transaction is not a bid"
+
+
 def test_a_402_is_not_reported_as_a_missing_bid():
     """Insufficient balance is rejected BEFORE an order exists, so no provider ever
     saw it. Calling that 'no bid' sends the investigation at providers instead of at
@@ -432,6 +470,14 @@ MUTATIONS = [
         ),
     ),
     ("throttle backs off", lambda s: s.replace("sleep 15", "sleep 5")),
+    # Wallet contention must not be laundered into a market verdict.
+    (
+        "contention is not capacity",
+        lambda s: s.replace(
+            "failure_reason=WALLET_TX_CONTENTION", "failure_reason=PROVIDER_CAPACITY"
+        ),
+    ),
+    ("contention backoff is jittered", lambda s: s.replace("(RANDOM % 20) + 10", "15")),
     (
         "checkout credentials",
         lambda s: s.replace("persist-credentials: false", "persist-credentials: true"),
