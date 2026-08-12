@@ -113,6 +113,58 @@ def _lcd_get(path: str, timeout: int = 15, base: str | None = None) -> dict[str,
     return parsed
 
 
+# The akash module's CURRENT REST version. v1beta3 is gone: every configured endpoint
+# answers it with HTTP 501 "Not Implemented" while serving v1beta4 with a 200. That 501
+# is what this repo recorded as "public LCD nodes don't serve akash-module queries" — it
+# was a version mismatch, not a limitation of public nodes, and the difference matters:
+# one closes the door on reading chain-native deployment state, the other is a URL edit.
+#
+# Verified 2026-08-12 against all three configured endpoints (publicnode, akashnet,
+# polkachu): v1beta3 -> 501, v1beta4 -> 200.
+_DEPLOYMENT_API = "/akash/deployment/v1beta4"
+
+
+def deployment_group_names(owner: str, dseq: str) -> list[str]:
+    """``group_spec.name`` for every group of one deployment, read from chain.
+
+    This is the READ half of just_akash.provenance. The placement key an SDL declares
+    becomes ``group_spec.name`` inside ``MsgCreateDeployment`` — author-controlled,
+    written atomically, immutable afterwards — so reading it back is how a deployment
+    proves WHO created it. Nothing else on chain does: just-akash's tags live in a local
+    file, and the Console API exposes no tag at all.
+
+    Without this, ownership could only be inferred from shape (service names, age), which
+    is why `cleanup_stale --reap-runners` had to be an operator's assertion rather than a
+    check, and why a suspected orphan could only be reported and never acted on. A sweep
+    that reaps on shape alone once destroyed 14 third-party deployments.
+
+    Returns [] when the deployment cannot be read — from every endpoint, or because it no
+    longer exists. An empty list therefore means UNKNOWN, never "not ours", and a caller
+    that destroys things must treat it as such.
+    """
+    if not owner or not dseq:
+        return []
+    path = f"{_DEPLOYMENT_API}/deployments/info?id.owner={owner}&id.dseq={dseq}"
+    for base in rest_urls():
+        try:
+            data = _lcd_get(path, base=base)
+        except RuntimeError:
+            continue  # one dead or lagging endpoint must not answer for the whole chain
+        groups = data.get("groups")
+        if not isinstance(groups, list):
+            continue
+        names = [
+            n
+            for g in groups
+            if isinstance(g, dict)
+            for n in [(g.get("group_spec") or {}).get("name")]
+            if isinstance(n, str) and n
+        ]
+        if names:
+            return names
+    return []
+
+
 def _coins_map(coins: list[dict[str, Any]]) -> dict[str, int]:
     """Sum a list of {denom, amount} into {denom: int_amount}. Amounts arrive as
     integer strings; some nodes append a decimal suffix (``"170623558.000…"``), so

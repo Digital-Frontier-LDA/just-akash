@@ -16,11 +16,14 @@ disposable test residue; when in doubt, leave it and say so:
   * services == {backtest}  and older than 48h  -> STALE (leaked e2e workload;
     every e2e destroys its deployment in-run, so a 2-day-old one is a leak)
   * services == {runner}    and older than 6h   -> STALE **only with
-    --reap-runners**; otherwise LEAVE. Nothing on chain proves a `runner`
-    service is ours, so this is the operator asserting it about their own
-    account. 6h because a pool is long-lived by design (`ephemeral: false`
-    outlives one job, a slow matrix runs for hours), while the e2e's 48h would
-    let one cancelled run starve every other pool spending from the same grant
+    --reap-runners** AND only when the deployment's on-chain
+    ``group_spec.name`` carries this repo's provenance prefix. Ownership is
+    read from chain, not assumed: the shared wallet demonstrably hosts a
+    sibling repo's runners too. An unreadable provenance leaves it alone —
+    unreadable is not unowned. 6h because a pool is long-lived by design
+    (``ephemeral: false`` outlives one job, a slow matrix runs for hours),
+    while the e2e's 48h would let one cancelled run starve every other pool
+    spending from the same grant
   * services == {}           -> LEAVE (provider reported nothing: cannot classify)
   * anything else (node, runner, train, ...) -> LEAVE (real or unknown workload)
   * unknown age -> LEAVE (never mis-age and reap wrongly)
@@ -43,6 +46,7 @@ import time
 
 from . import chain
 from .api import AkashConsoleAPI, _extract_dseq, escrow_locked
+from .provenance import PLACEMENT_PREFIX
 from .smoke_providers import (
     MIN_ORPHAN_AGE_SECONDS,
     PROBE_SERVICE,
@@ -75,7 +79,11 @@ STALE_VERDICTS = ("STALE-probe", "STALE-e2e", "STALE-runner")
 
 
 def classify(
-    detail: dict, dseq: str, now: float | None = None, reap_runners: bool = False
+    detail: dict,
+    dseq: str,
+    now: float | None = None,
+    reap_runners: bool = False,
+    group_names: list[str] | None = None,
 ) -> tuple[str, list[str], float | None]:
     """(verdict, services, age_seconds) for one deployment detail."""
     services = sorted(_deployment_service_names(detail))
@@ -89,17 +97,27 @@ def classify(
             return "STALE-e2e", services, age
         return "LEAVE-recent-backtest", services, age
     if services == [RUNNER_SERVICE]:
-        # OPT-IN ONLY, and the default must stay off. `runner` is the service name
-        # runner-pool.yml renders, but NOTHING on chain proves a given `runner` service
-        # is ours: just-akash's tags live in a local file (see runner-teardown.yml), and
-        # `status --json` emits none, so a sweeper cannot check ownership. A sweep that
-        # reaped by shape alone once destroyed 14 third-party deployments.
+        # OWNERSHIP IS NOW PROVEN, NOT ASSERTED.
         #
-        # So this stays the operator's assertion about their OWN account rather than
-        # this module's inference — enable it where the Console account hosts nothing
-        # but your CI pools.
+        # This used to rest on the operator declaring that the Console account hosted
+        # nothing but their own pools. That declaration was measurably FALSE on the very
+        # wallet this ships against: a live read on 2026-08-12 found 11 active
+        # deployments, SIX of them `dfci-infra-runner` — a sibling repo's runners on the
+        # shared wallet. Reaping on shape plus an assertion would have destroyed them,
+        # which is the 14-third-party-deployments failure all over again.
+        #
+        # `group_spec.name` settles it: the placement key is author-controlled, written
+        # atomically inside MsgCreateDeployment and immutable after, so a deployment
+        # carrying our prefix was created by this repo and nothing else can claim it.
         if not reap_runners:
             return "LEAVE-real-or-unknown", services, age
+        if not group_names:
+            # UNREADABLE is not UNOWNED. Every endpoint may have failed, or the
+            # deployment may have closed under us. Destroying on a failed read is the
+            # same class of error as destroying on a guess.
+            return "LEAVE-unverified-runner", services, age
+        if not any(n.startswith(PLACEMENT_PREFIX) for n in group_names):
+            return "LEAVE-not-ours", services, age
         if age is not None and age >= STALE_RUNNER_AGE_SECONDS:
             return "STALE-runner", services, age
         return "LEAVE-recent-runner", services, age
@@ -147,7 +165,12 @@ def run(*, execute: bool = False, now: float | None = None, reap_runners: bool =
         except Exception as exc:  # noqa: BLE001 — one unreadable deployment must not stop the audit
             print(f"  {dseq}  ERROR reading detail: {exc} -> LEAVE")
             continue
-        verdict, services, age = classify(detail, dseq, now, reap_runners)
+        # Read provenance ONLY for the candidates it can decide, so a sweep does not
+        # spend a chain round-trip per deployment on an account of hundreds.
+        names: list[str] | None = None
+        if reap_runners and sorted(_deployment_service_names(detail)) == [RUNNER_SERVICE]:
+            names = chain.deployment_group_names(address, dseq)
+        verdict, services, age = classify(detail, dseq, now, reap_runners, names)
         age_str = f"{age / 86400:5.1f}d" if age is not None else "   ?  "
         print(f"  {dseq}  age={age_str}  services={services or '-'}  -> {verdict}")
         if verdict in STALE_VERDICTS:

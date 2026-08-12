@@ -1044,10 +1044,15 @@ def lease_status(client: "AkashConsoleAPI", active_only: bool = True) -> list[di
     ``provider``, and the escrow balance remaining — with a ``closeable`` flag.
 
     Sourced from the Console API (which proxies chain state), so it holds regardless of
-    what any single provider self-reports, and — unlike the raw akash-module LCD queries,
-    which public LCD nodes return 501 for — it actually works against the default
-    endpoints. ``list_deployments`` already carries the lease + escrow detail, so this is
-    one API round-trip. ``active_only=False`` includes closed/terminal deployments too.
+    what any single provider self-reports, and it needs one round-trip rather than one
+    per deployment.
+
+    (The note this once carried — that public LCDs return 501 for akash-module queries —
+    was a VERSION mismatch, not a limitation. Every configured endpoint 501s on
+    ``v1beta3`` and serves ``v1beta4`` with a 200; see ``chain.deployment_group_names``.)
+
+    ``list_deployments`` already carries the lease + escrow detail, so this is one API
+    round-trip. ``active_only=False`` includes closed/terminal deployments too.
 
     The ``closeable`` set is exactly what to ``destroy`` to stop escrow bleed — the
     authoritative answer to "which of my leases should I close", read from chain state
