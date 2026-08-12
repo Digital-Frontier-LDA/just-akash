@@ -75,6 +75,7 @@ Every failure here names which world it came from, via the `failure_reason` outp
 | `PROVIDER_CAPACITY` | Nobody bid within the window | Market condition — retry later or widen the pool |
 | `RUNNER_NEVER_REGISTERED` | A provider won the lease, the runner never came online | Qualify that provider; it is a `runner_deny` candidate |
 | `GITHUB_API_UNAVAILABLE` | The runner listing was never readable, so the pool was never observable | **Your GitHub API budget** — see below. Never a verdict about a provider. |
+| `WALLET_TX_CONTENTION` | Concurrent provisioners on one Cosmos account rejected each other | See below. **Detection is inferred, not yet observed** — if a deploy fails unclassified, its raw output is printed so the matcher can be fixed from a real string. |
 | `INDETERMINATE` | The tooling itself failed | Never a verdict about Akash |
 
 ---

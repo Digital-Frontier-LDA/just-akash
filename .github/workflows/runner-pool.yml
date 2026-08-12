@@ -492,7 +492,26 @@ jobs:
                 echo "::endgroup::"; continue
               fi
 
-              echo "::warning::attempt $attempt: no lease within the bid window"
+              # UNCLASSIFIED, and it must SAY so rather than defaulting to the market.
+              #
+              # The two matchers above are not equally evidenced. The 402 signature is
+              # observed. The account-sequence signature is INFERRED — from this repo's
+              # own reasoning about one Cosmos account (README, provider-canary.yml),
+              # not from a captured failure. The Console API proxies the chain, and the
+              # one concurrency-shaped failure actually on record surfaced as a bare
+              # `HTTP 500 {"error":"InternalServerError"}` with no Cosmos detail in it
+              # at all — so the mismatch text may never reach this log.
+              #
+              # A matcher that can never fire is worse than none: WALLET_TX_CONTENTION
+              # would read as a handled case while every occurrence fell through to
+              # PROVIDER_CAPACITY, which is the fabricated-outage verdict this whole
+              # workflow exists to stop reporting. Printing the raw output is what turns
+              # the next occurrence into evidence, so the matcher can be corrected from
+              # a real string instead of a plausible one.
+              echo "::group::unclassified deploy failure — raw output"
+              tail -40 /tmp/ja.log 2>/dev/null || echo "(no output captured)"
+              echo "::endgroup::"
+              echo "::warning::attempt $attempt: no lease within the bid window — cause NOT classified. The raw output is in the group above; if it names an account-sequence or transaction error, that string belongs in this workflow's matcher."
               echo "::endgroup::"; continue
             fi
             SAW_BID=1
