@@ -425,6 +425,30 @@ def test_wallet_contention_does_not_claim_a_bid_was_seen():
     assert "SAW_BID=1" not in seq, "a rejected transaction is not a bid"
 
 
+def test_an_unclassified_deploy_failure_prints_its_raw_output():
+    """The classifiers are not equally evidenced, and the workflow must not pretend they
+    are. The 402 signature is observed; the account-sequence signature is INFERRED from
+    this repo's reasoning about one Cosmos account, not from a captured failure — and the
+    one concurrency-shaped failure on record surfaced as a bare
+    `HTTP 500 {"error":"InternalServerError"}` with no Cosmos detail at all.
+
+    A matcher that can never fire is worse than none: WALLET_TX_CONTENTION would read as
+    a handled case while every occurrence fell through to PROVIDER_CAPACITY — the
+    fabricated-outage verdict this workflow exists to stop reporting. Printing the raw
+    output is what turns the next occurrence into evidence."""
+    code = _code(PROVISION["run"])
+    unclassified = code[code.index("unclassified deploy failure") :]
+    assert "tail -40 /tmp/ja.log" in unclassified, (
+        "an unclassified failure must surface what actually happened"
+    )
+    assert "NOT classified" in unclassified, (
+        "the warning must not read as a market verdict when nothing was classified"
+    )
+    # It has to come BEFORE the generic bid-window line, or the evidence is buried under
+    # a message that already claims to know the cause.
+    assert code.index("unclassified deploy failure") < code.index("no lease within the bid window")
+
+
 def test_a_402_is_not_reported_as_a_missing_bid():
     """Insufficient balance is rejected BEFORE an order exists, so no provider ever
     saw it. Calling that 'no bid' sends the investigation at providers instead of at
@@ -598,6 +622,7 @@ MUTATIONS = [
         ),
     ),
     ("contention backoff is jittered", lambda s: s.replace("(RANDOM % 20) + 10", "15")),
+    ("unclassified failures print evidence", lambda s: s.replace("tail -40 /tmp/ja.log", "true")),
     # The consumer-facing trio: fetch OUR source, at the ref they pinned, and run there.
     (
         "checkout names just-akash",
