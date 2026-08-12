@@ -40,12 +40,16 @@ from __future__ import annotations
 import json
 import sys
 
-_ESCAPE = str.maketrans({"\\": "\\\\", '"': '\\"', "\n": "\\n"})
+# Reused, not reimplemented. canary/collect.py:52-57 makes the same call and says why: a
+# second copy of the exposition escaping is a second thing to drift. Copilot flagged the
+# duplicate on #147 and was right -- two producers writing the same file must escape
+# identically or the file is malformed in ways only one of them can explain.
+from just_akash.prometheus_exporter import _escape_label_value
 
 
 def _label(value: str) -> str:
     """Escape a label value for the exposition format."""
-    return str(value).translate(_ESCAPE)
+    return _escape_label_value(str(value))
 
 
 def _uact(value: object) -> int:
