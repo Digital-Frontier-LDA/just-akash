@@ -71,7 +71,7 @@ profiles:
           - size: 512Mi
 
   placement:
-    akash:
+    just-akash-canary:
       pricing:
         canary:
           denom: uact
@@ -84,6 +84,6 @@ profiles:
 
 deployment:
   canary:
-    akash:
+    just-akash-canary:
       profile: canary
       count: 1

@@ -84,7 +84,7 @@ profiles:
               class: beta3
 
   placement:
-    akash:
+    just-akash-node:
       pricing:
         node:
           denom: uact
@@ -92,6 +92,6 @@ profiles:
 
 deployment:
   node:
-    akash:
+    just-akash-node:
       profile: node
       count: 1

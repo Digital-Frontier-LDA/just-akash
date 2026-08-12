@@ -47,7 +47,7 @@ profiles:
           - size: 5Gi
 
   placement:
-    akash:
+    just-akash-backtest:
       pricing:
         backtest:
           denom: uact
@@ -55,6 +55,6 @@ profiles:
 
 deployment:
   backtest:
-    akash:
+    just-akash-backtest:
       profile: backtest
       count: 1
