@@ -13,6 +13,8 @@ from __future__ import annotations
 from just_akash.provenance import (
     PLACEMENT_PREFIX,
     SIBLING_REAPED_PREFIX,
+    _heredocs,
+    inline_sdls,
     placement_keys,
     sdl_files,
 )
@@ -39,6 +41,112 @@ def test_every_sdl_stamps_the_repo_prefix():
                 f"{PLACEMENT_PREFIX!r}. Unstamped deployments are indistinguishable from a "
                 f"CI leak on the shared wallet and are closed after 12h."
             )
+
+
+# --------------------------------------------------------------------------
+# Not every SDL lives in sdl/ — the one deployed most often is rendered inline
+# --------------------------------------------------------------------------
+
+
+def test_the_inline_workflow_sdls_are_actually_found():
+    """Same anti-vacuity rule as `test_there_are_sdls_to_check`, one directory over.
+
+    `runner-pool.yml` renders its SDL with a heredoc rather than shipping a file, because
+    the pool's shape depends on caller inputs. So a guard globbing `sdl/*.yaml` could not
+    see the SDL this repo deploys most often — and if the extractor ever stops matching,
+    every assertion below passes while checking nothing."""
+    found = inline_sdls()
+    assert found, "no inline SDL extracted — the heredoc scanner has stopped matching"
+    assert any("runner-pool" in label for label, _ in found), [lbl for lbl, _ in found]
+
+
+def test_every_inline_sdl_stamps_the_repo_prefix():
+    """An unstamped runner pool is precisely what the sibling sweeper closes: non-GPU,
+    and with `ephemeral: false` legitimately older than 12h. The symptom is runners
+    vanishing mid-job, read back as RUNNER_NEVER_REGISTERED against a provider that did
+    nothing wrong — a fabricated provider fault, which is the failure this whole runner
+    stack exists to stop manufacturing."""
+    for label, text in inline_sdls():
+        keys = placement_keys(text)
+        assert keys, f"{label}: no placement key found in the rendered SDL"
+        for key in keys:
+            assert key.startswith(PLACEMENT_PREFIX), (
+                f"{label}: placement key {key!r} does not start with {PLACEMENT_PREFIX!r}. "
+                f"Unstamped deployments are indistinguishable from a CI leak on the "
+                f"shared wallet and are closed after 12h."
+            )
+
+
+def test_no_inline_sdl_wears_the_siblings_reaped_prefix():
+    for label, text in inline_sdls():
+        for key in placement_keys(text):
+            assert not key.startswith(SIBLING_REAPED_PREFIX), (
+                f"{label}: placement key {key!r} carries the sibling repo's prefix, "
+                f"which its leak sweeper closes on a 3-hourly cron."
+            )
+
+
+def test_the_heredoc_extractor_only_returns_sdls():
+    """A workflow writes plenty of files with heredocs. Returning a non-SDL would make
+    `test_every_inline_sdl_stamps_the_repo_prefix` fail on something that never reaches
+    Akash, and the cheapest way to green would be to weaken the guard."""
+    for label, text in inline_sdls():
+        assert "services:" in text and "profiles:" in text, label
+
+
+# --- heredoc termination follows the shell, because the guard's answer depends on it ---
+
+_SDL_BODY = "services:\n  a:\n    image: x\nprofiles:\n  placement:\n    just-akash-a:\n"
+
+
+def _wrap(opener: str, terminator: str) -> str:
+    return f"{opener}\n{_SDL_BODY}{terminator}\ntrailing: line\n"
+
+
+def test_a_plain_terminator_closes_the_heredoc():
+    assert len(_heredocs(_wrap("cat > /tmp/x.yaml <<SDL", "SDL"))) == 1
+
+
+def test_a_trailing_space_does_not_terminate_a_plain_heredoc():
+    """bash ends `<<WORD` only at a line that is exactly WORD. Accepting `SDL   ` would
+    close a heredoc the shell leaves open — the workflow's real behaviour and this
+    scanner's reading would then disagree, and the scanner is the half that decides
+    whether the provenance guard passes."""
+    assert _heredocs(_wrap("cat > /tmp/x.yaml <<SDL", "SDL   ")) == []
+
+
+def test_an_over_indented_terminator_does_not_close_it():
+    """The terminator must sit at the opener's indent. These bodies are read from RAW
+    workflow YAML, where the block scalar's indent is still present and uniform."""
+    assert _heredocs(_wrap("  cat > /tmp/x.yaml <<SDL", "      SDL")) == []
+
+
+def test_the_terminator_must_match_the_openers_indent():
+    body = "  cat > /tmp/x.yaml <<SDL\n" + _SDL_BODY + "  SDL\n"
+    assert len(_heredocs(body)) == 1
+
+
+def test_eof_before_the_terminator_yields_nothing():
+    """bash does not treat EOF as a completed heredoc, so neither may this. Otherwise a
+    truncated workflow produces a valid-looking SDL and the guard passes on a file that
+    would never run."""
+    assert _heredocs("cat > /tmp/x.yaml <<SDL\n" + _SDL_BODY) == []
+
+
+def test_a_body_line_that_merely_trims_to_the_marker_does_not_cut_it_short():
+    """The old `strip() == word` test would end the heredoc here and silently truncate
+    the SDL — losing whatever came after, including the placement block."""
+    body = "cat > /tmp/x.yaml <<SDL\n  SDL\n" + _SDL_BODY + "SDL\n"
+    found = _heredocs(body)
+    assert len(found) == 1
+    assert "just-akash-a" in found[0][1], "the SDL was truncated at a look-alike line"
+
+
+def test_dash_heredoc_allows_leading_tabs_only():
+    """`<<-WORD` strips leading TABS, which is the one case where extra whitespace is
+    legitimate."""
+    assert len(_heredocs("cat > /tmp/x.yaml <<-SDL\n" + _SDL_BODY + "\t\tSDL\n")) == 1
+    assert _heredocs("cat > /tmp/x.yaml <<-SDL\n" + _SDL_BODY + "  SDL\n") == []
 
 
 def test_no_sdl_wears_the_siblings_reaped_prefix():
