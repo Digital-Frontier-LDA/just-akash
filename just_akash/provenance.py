@@ -52,6 +52,7 @@ reference under ``deployment.<service>.<KEY>`` carry this marker.
 from __future__ import annotations
 
 import re
+import textwrap
 from pathlib import Path
 
 # Repo-scoped. Everything this repo puts on the shared wallet carries it.
@@ -152,3 +153,54 @@ def placement_keys(text: str) -> list[str]:
 
 def sdl_files() -> list[Path]:
     return sorted(p for p in _SDL_DIR.glob("*.yaml") if p.is_file())
+
+
+_WORKFLOW_DIR = Path(__file__).resolve().parent.parent / ".github/workflows"
+# `cat > <path> <<WORD` ... terminated by a line that is exactly WORD.
+_HEREDOC_RE = re.compile(
+    r"^\s*cat\s*>\s*(?P<path>\S+)\s*<<-?\s*'?(?P<word>[A-Za-z_][A-Za-z0-9_]*)'?\s*$"
+)
+
+
+def inline_sdls() -> list[tuple[str, str]]:
+    """(label, dedented text) for every SDL a WORKFLOW renders inline.
+
+    Not every SDL this repo deploys lives in ``sdl/``. ``runner-pool.yml`` writes its own
+    with a heredoc, because the pool's shape depends on caller inputs. A prefix guard that
+    globs ``sdl/*.yaml`` therefore could not see the one SDL that is deployed most often
+    and lives longest — and an unstamped runner pool is exactly what the sibling sweeper
+    closes: non-GPU, and with ``ephemeral: false`` legitimately older than 12h. The
+    symptom would be runners vanishing mid-job and reported as RUNNER_NEVER_REGISTERED
+    against a provider that did nothing wrong.
+
+    This module already refuses to silently skip files it cannot read. An SDL it never
+    looked at is the same failure, one directory over.
+
+    Dedented because the heredoc body is indented to sit inside the workflow YAML, while
+    :func:`placement_keys` anchors on ``profiles:`` at indent 0 — the real file written to
+    disk has no such indent, so this reconstructs what actually reaches Akash.
+    """
+    out: list[tuple[str, str]] = []
+    if not _WORKFLOW_DIR.is_dir():
+        return out
+    for wf in sorted(_WORKFLOW_DIR.glob("*.y*ml")):
+        lines = wf.read_text().split("\n")
+        i = 0
+        while i < len(lines):
+            m = _HEREDOC_RE.match(lines[i])
+            if not m:
+                i += 1
+                continue
+            word, body = m.group("word"), []
+            i += 1
+            while i < len(lines) and lines[i].strip() != word:
+                body.append(lines[i])
+                i += 1
+            text = textwrap.dedent("\n".join(body))
+            # Only heredocs that ARE an SDL — a workflow writes plenty of other files.
+            if re.search(r"^services:\s*$", text, re.M) and re.search(
+                r"^profiles:\s*$", text, re.M
+            ):
+                out.append((f"{wf.name}:{m.group('path')}", text))
+            i += 1
+    return out

@@ -381,13 +381,21 @@ jobs:
                   cpu: { units: ${CPU} }
                   memory: { size: ${MEMORY} }
                   storage: { size: ${STORAGE} }
+            # PROVENANCE — the placement key becomes `group_spec.name` on chain, and
+            # it is what stops a sibling repo's sweeper closing this pool mid-CI. Our
+            # Console wallet is shared, and Blazing-Back reaps any NON-GPU deployment
+            # older than 12h as a presumed leak; a runner pool is non-GPU, and with
+            # `ephemeral: false` it legitimately outlives 12h. Unstamped, it matched
+            # that filter — and the symptom would be runners vanishing mid-job, read
+            # back as RUNNER_NEVER_REGISTERED against a provider that did nothing wrong.
+            # See just_akash/provenance.py for why the key, and not an attribute.
             placement:
-              pool:
+              just-akash-runner:
                 pricing:
                   runner: { denom: uact, amount: 100000 }
           deployment:
             runner:
-              pool:
+              just-akash-runner:
                 profile: runner
                 count: ${POOL_SIZE}
           SDL
