@@ -447,8 +447,17 @@ def test_merge_accepts_both_the_tuple_and_the_bare_string():
     assert "lease_lifetime_hours" not in st2[ALPHA]
 
 
-def test_an_unmeasurable_lifetime_leaves_no_stale_value_behind():
-    """None must not overwrite, but must also never invent a zero."""
+def test_an_unmeasurable_lifetime_CLEARS_the_previous_one():
+    """The state is DURABLE, so this is the case that actually matters.
+
+    The first version of this test injected an unmeasurable replacement into a state that had
+    never held a lifetime, so it passed whether or not merge() cleared the field — it could
+    not detect the bug it was named after. Copilot caught that on #146.
+
+    Sequence it properly: measure one lease, then fail to measure the next. If merge() does
+    not drop the field, render() republishes the FIRST lease's lifetime as the second's, and
+    it does so exactly when the chain could not be read.
+    """
     st = merge({}, ALPHA, "100", True, _body("a"), 0.1, 1000.0)
     st = merge(
         st,
@@ -459,7 +468,78 @@ def test_an_unmeasurable_lifetime_leaves_no_stale_value_behind():
         0.1,
         1100.0,
         owner=OWNER,
+        attribute_closure=lambda *_: (SELF, 12.5),
+    )
+    assert st[ALPHA]["lease_lifetime_hours"] == 12.5, "precondition: a lifetime is recorded"
+
+    # ...now a replacement the chain cannot speak to.
+    st = merge(
+        st,
+        ALPHA,
+        "300",
+        True,
+        _body("c"),
+        0.1,
+        1200.0,
+        owner=OWNER,
         attribute_closure=lambda *_: (UNKNOWN, None),
     )
-    assert st[ALPHA]["closures"] == {UNKNOWN: 1}
+    assert "lease_lifetime_hours" not in st[ALPHA], (
+        "the previous lease's lifetime was republished as this one's"
+    )
+    assert st[ALPHA]["closures"] == {SELF: 1, UNKNOWN: 1}
+
+
+def test_a_failing_attributor_also_clears_the_previous_lifetime():
+    """Same requirement on the exception path, which is a separate branch."""
+    st = merge({}, ALPHA, "100", True, _body("a"), 0.1, 1000.0)
+    st = merge(
+        st,
+        ALPHA,
+        "200",
+        True,
+        _body("b"),
+        0.1,
+        1100.0,
+        owner=OWNER,
+        attribute_closure=lambda *_: (SELF, 9.0),
+    )
+    assert st[ALPHA]["lease_lifetime_hours"] == 9.0
+
+    def boom(*_):
+        raise RuntimeError("LCD down")
+
+    st = merge(
+        st,
+        ALPHA,
+        "300",
+        True,
+        _body("c"),
+        0.1,
+        1200.0,
+        owner=OWNER,
+        attribute_closure=boom,
+    )
     assert "lease_lifetime_hours" not in st[ALPHA]
+
+
+def test_a_malformed_block_envelope_does_not_raise():
+    """lifetime_hours() runs BEFORE attribute_detailed()'s handler, so an AttributeError here
+    would escape and crash the whole collection rather than costing one measurement.
+    Raised by CodeRabbit on #146."""
+    for bad in (
+        {"block": "invalid"},
+        {"block": {"header": "nope"}},
+        {"block": []},
+        {"block": {"header": []}},
+    ):
+        assert lifetime_hours(_DSEQ, bad) is None, bad
+
+    def fetch_info(owner, dseq):
+        return {"escrow_account": {"state": {"state": "closed", "settled_at": "1"}}}
+
+    cause, lived = attribute_detailed(
+        OWNER, _DSEQ, fetch_info=fetch_info, fetch_block=lambda _: {"block": "invalid"}
+    )
+    assert cause in VERDICTS
+    assert lived is None

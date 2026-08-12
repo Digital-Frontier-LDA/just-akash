@@ -206,6 +206,14 @@ def merge(
     if dseq_changed:
         # New lease: the container is new by construction. Not a restart.
         p["lease_replacements_total"] += 1
+        # DROP the previous lease's lifetime before measuring this one. This state is
+        # DURABLE across runs, so leaving it in place would republish the OLD lease's
+        # lifetime as though it belonged to the one that just ended -- and it would do so
+        # precisely when the chain could NOT be read, which is exactly when a stale number
+        # is most likely to be believed. "Publish nothing rather than guess" is the rule
+        # this metric exists to follow, and keeping the field would have broken it in the
+        # gauge's own failure mode. Raised independently by CodeRabbit and Copilot on #146.
+        p.pop("lease_lifetime_hours", None)
         # Attribute the deployment we STOPPED watching, not the one we just found. Its
         # dseq is the only handle the chain will answer about, and this is the last
         # moment we hold it — the line below overwrites p["dseq"].

@@ -166,7 +166,18 @@ def _block_time(block: dict | None) -> datetime | None:
     """The settling block's timestamp, or None if the shape is not what we expect."""
     if not isinstance(block, dict):
         return None
-    raw = ((block.get("block") or {}).get("header") or {}).get("time")
+    # Each level is checked for being a MAPPING, not merely truthy. `{"block": "invalid"}`
+    # would make `("invalid" or {}).get(...)` raise AttributeError, and that exception would
+    # ESCAPE: lifetime_hours() runs before attribute_detailed()'s try/except, so a malformed
+    # block envelope would crash the whole collection rather than costing one measurement.
+    # This module's contract is that it never raises. Raised by CodeRabbit on #146.
+    inner = block.get("block")
+    if not isinstance(inner, dict):
+        return None
+    header = inner.get("header")
+    if not isinstance(header, dict):
+        return None
+    raw = header.get("time")
     if not isinstance(raw, str) or not raw:
         return None
     try:
