@@ -47,6 +47,75 @@ def _log(level: int, msg: str):
         print(f"[{_ts()}] {msg}", flush=True)
 
 
+def _report_suspected_orphans(client, since_epoch_s: float) -> list[str]:
+    """Name deployments a FAILED create may nonetheless have brought into existence.
+
+    A create that raises is not proof that nothing was created. `POST /v1/deployments`
+    writes on-chain state, so a gateway 500, a proxy timeout or a dropped connection can
+    land *after* the transaction committed — measured shape: HTTP 500 returned 103
+    SECONDS into the request. The deployment then exists, holds its deposit in escrow
+    against the same grant every later run spends from, carries no tag, and nobody knows
+    its dseq. That is the most expensive kind of leak precisely because nothing reports
+    it: the next run's funding failure looks like a market outage.
+
+    Attribution uses two independent signals, and needs both:
+      * the dseq, which just-akash mints as a ms-epoch timestamp, is at or after the
+        moment this create was issued — so it cannot be a pre-existing workload;
+      * the deployment holds NO lease — one that won a lease is somebody's live
+        workload, not the residue of a request that failed before returning a dseq.
+
+    REPORT ONLY, and that restraint is the point. At spike many runs create deployments
+    concurrently, so a leaseless deployment inside this window may be ANOTHER run's
+    in-flight create. Closing on that inference is exactly how a sweep once destroyed 14
+    third-party deployments. Naming the dseq makes cleanup a single command; guessing
+    makes it a data-loss bug.
+
+    Never raises: this runs on an error path, and a failure to reconcile must not replace
+    the original error with its own.
+    """
+    since_ms = int(since_epoch_s * 1000)
+    try:
+        active = client.list_deployments(active_only=True)
+    except Exception as exc:  # noqa: BLE001 — diagnosis must never mask the real failure
+        _log(logging.WARNING, f"Could not check for an orphaned deployment: {exc}")
+        return []
+
+    suspects: list[str] = []
+    for dep in active or []:
+        if dep.get("leases") or dep.get("lease"):
+            continue
+        dseq = dep.get("dseq") or (dep.get("deployment") or {}).get("dseq")
+        try:
+            created_ms = int(dseq)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            # A dseq we cannot date is not evidence either way. Staying silent about it
+            # is right: this path exists to name what we can prove, not to raise alarms.
+            continue
+        # Compared in WHOLE MILLISECONDS, on purpose. `time.time()` carries sub-ms
+        # precision while a dseq is floored to its millisecond, so dividing the dseq
+        # back to seconds made a deployment minted in the SAME millisecond as the
+        # request compare as OLDER than it — i.e. the tightest true orphan, the one
+        # created by this very call, was the one most likely to be missed.
+        if created_ms >= since_ms:
+            suspects.append(str(dseq))
+
+    for dseq in suspects:
+        _log(
+            logging.ERROR,
+            f"POSSIBLE ORPHAN: deployment {dseq} was created during the failed request "
+            f"and holds no lease. The create reported failure, but the transaction may "
+            f"still have committed — it is holding escrow against the grant the next "
+            f"run spends from. Verify and close: just-akash status --dseq {dseq} && "
+            f"just-akash destroy --dseq {dseq} -y",
+        )
+        emit(
+            Code.DEPLOY_CREATE_ORPHAN_SUSPECTED,
+            "error",
+            f"deployment {dseq} may have been created by a create that reported failure",
+        )
+    return suspects
+
+
 def _fmt_price(bid) -> str:
     amount, denom = _extract_bid_price(bid)
     return f"{amount} {denom}"
@@ -406,6 +475,9 @@ def deploy(
         logging.INFO,
         f"STEP 2: Creating deployment via Console API (escrow deposit: {deposit} USD)...",
     )
+    # Stamped BEFORE the request so a deployment created by THIS call can be told from
+    # one that already existed. See _report_suspected_orphans.
+    _create_started = time.time()
     try:
         deployment_response = client.create_deployment(sdl_content, deposit=deposit)
     except RuntimeError as e:
@@ -437,12 +509,14 @@ def deploy(
                     "error",
                     f"create deployment failed after retry: {retry_err}",
                 )
+                _report_suspected_orphans(client, _create_started)
                 raise RuntimeError(
                     f"Failed to create deployment after retry: {retry_err}"
                 ) from retry_err
         else:
             _log(logging.ERROR, f"Create deployment FAILED: {e}")
             emit(Code.DEPLOY_CREATE_FAILED, "error", f"create deployment failed: {e}")
+            _report_suspected_orphans(client, _create_started)
             raise RuntimeError(f"Failed to create deployment: {e}") from e
 
     dseq = deployment_response.get("dseq")
@@ -1094,9 +1168,14 @@ def deploy(
                 "re-deploying, to avoid double escrow. Close it manually: "
                 f"just-akash destroy --dseq {dseq}"
             )
+        # Same ambiguity as the initial create, and the same escrow at stake — this
+        # path exists precisely because the first order went stale, so leaking a second
+        # one here doubles the cost of the failure it is trying to recover from.
+        _redeploy_started = time.time()
         try:
             redeploy_response = client.create_deployment(sdl_content, deposit=deposit)
         except RuntimeError as redeploy_err:
+            _report_suspected_orphans(client, _redeploy_started)
             raise RuntimeError(f"re-deploy create failed: {redeploy_err}") from redeploy_err
         new_dseq = redeploy_response.get("dseq")
         if new_dseq is None:
