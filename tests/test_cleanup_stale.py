@@ -55,6 +55,37 @@ class TestClassify:
             verdict, _, _ = cs.classify(_detail(services), _dseq(30 * 86400), NOW)
             assert verdict == "LEAVE-real-or-unknown", services
 
+    def test_a_runner_pool_is_only_reaped_when_the_operator_opts_in(self):
+        """`runner` is the service runner-pool.yml renders, so a pool cancelled between
+        deploy and teardown leaks its lease with nothing to collect it — and at spike that
+        escrow starves every other pool on the same grant.
+
+        But nothing on chain proves a `runner` service is OURS: just-akash's tags live in
+        a local file and `status --json` emits none, so ownership cannot be checked. A
+        sweep that reaped by shape alone once destroyed 14 third-party deployments. Hence
+        opt-in: the default above must stay LEAVE."""
+        old = _dseq(8 * 3600)
+        assert cs.classify(_detail(["runner"]), old, NOW)[0] == "LEAVE-real-or-unknown"
+        assert cs.classify(_detail(["runner"]), old, NOW, reap_runners=True)[0] == "STALE-runner"
+
+    def test_an_opted_in_runner_pool_is_still_spared_while_it_could_be_live(self):
+        """A pool is long-lived BY DESIGN — `ephemeral: false` outlives a single job and a
+        slow matrix runs for hours — so the probe's 1h threshold would reap running CI."""
+        for age in (600, 3 * 3600, 5 * 3600):
+            verdict, _, _ = cs.classify(_detail(["runner"]), _dseq(age), NOW, reap_runners=True)
+            assert verdict == "LEAVE-recent-runner", age
+
+    def test_an_unaged_runner_pool_is_never_reaped_even_when_opted_in(self):
+        """A dseq that yields no age must not be treated as ancient."""
+        verdict, _, _ = cs.classify(_detail(["runner"]), "not-a-dseq", NOW, reap_runners=True)
+        assert verdict == "LEAVE-recent-runner"
+
+    def test_opting_in_does_not_widen_the_blast_radius_to_other_services(self):
+        """The flag enables ONE service set. It must not become a general 'reap anything'."""
+        for services in (["node"], ["train"], ["app"], ["runner", "sidecar"]):
+            verdict, _, _ = cs.classify(_detail(services), _dseq(30 * 86400), NOW, True)
+            assert verdict == "LEAVE-real-or-unknown", services
+
     def test_empty_service_set_is_unclassifiable(self):
         verdict, _, _ = cs.classify(_detail([]), _dseq(30 * 86400), NOW)
         assert verdict == "LEAVE-unclassifiable"

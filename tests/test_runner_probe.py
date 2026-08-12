@@ -727,6 +727,127 @@ def test_registration_counts_only_ONLINE_runners(monkeypatch):
     assert '.status=="online"' in seen["jq"], "an offline leftover must not count as registered"
 
 
+def test_registration_survives_a_multi_page_org(monkeypatch):
+    """GitHub paginates `orgs/{org}/actions/runners`, and `gh api --paginate --jq`
+    applies the filter to EACH PAGE separately, concatenating the results.
+
+    So an aggregating filter (`[...] | length`) emits one number PER PAGE. On an org
+    with >100 runners this read back "2\\n1", whose `.isdigit()` is False — so the
+    probe reported the runner as never registered no matter how many were online.
+    That is POD_NO_REGISTER, i.e. a PERMANENT runner_deny (it outranks any later
+    streak) against a provider that hosted the runner correctly, and it only fires on
+    the large orgs where a runner pool is worth having.
+
+    The fix is shape, not parsing: one line per match survives concatenation.
+    """
+    monkeypatch.setattr(rp, "_run", lambda cmd, timeout=60, env=None: (0, "241\n578\n"))
+    assert rp._registered("org", "probe-x", "", 1) is True, (
+        "two pages of one matching runner each must read as registered"
+    )
+
+
+def test_registration_jq_emits_one_line_per_runner_not_a_count(monkeypatch):
+    """Locks the shape above. An aggregating filter is the natural thing to write here
+    and it is wrong specifically under --paginate."""
+    seen = {}
+
+    def fake(cmd, timeout=60, env=None):
+        seen["jq"] = cmd[cmd.index("--jq") + 1]
+        assert "--paginate" in cmd, "page 1 only cannot see a runner that landed on page 2"
+        return 0, "1"
+
+    monkeypatch.setattr(rp, "_run", fake)
+    rp._registered("org", "probe-x", "", 1)
+    assert "length" not in seen["jq"], "an aggregate emits one value per page"
+
+
+def test_an_unreadable_listing_is_None_not_absent(monkeypatch):
+    """A throttled or failing `gh` must never become POD_NO_REGISTER.
+
+    That outcome is a PERMANENT runner_deny which outranks any later streak, so a
+    provider that hosted the runner correctly would be struck off the fleet because OUR
+    API budget ran out. And this is reachable in normal operation: GitHub cannot filter
+    runners by label server-side (`?name=` is exact-match), so every poll pages the whole
+    org listing against a PAT's 5,000/hour shared across all of that user's tokens.
+
+    None routes to SCHEDULED_ONLY — non-promotable AND non-demoting, which is the honest
+    reading of "we never looked successfully".
+    """
+    # `_run` must actually have been called: with no poll at all `measured` is also
+    # False, so a bare `is None` cannot tell "read once and the read failed" from
+    # "never read", and only the first of those is what this test claims to cover.
+    calls = []
+
+    def fake(cmd, timeout=60, env=None):
+        calls.append(cmd)
+        return 1, ""
+
+    monkeypatch.setattr(rp, "_run", fake)
+    assert rp._registered("org", "probe-x", "", 0) is None
+    assert len(calls) == 1, "the listing must have been queried for None to mean anything"
+
+    assert (
+        rp.classify(bid=True, pod_running=True, registered=None, job_ran=None, torn_down=True)
+        is Outcome.SCHEDULED_ONLY
+    ), "an unmeasured registration must not promote"
+    assert (
+        rp.classify(bid=True, pod_running=True, registered=False, job_ran=None, torn_down=True)
+        is Outcome.POD_NO_REGISTER
+    ), "a MEASURED absence must still demote — the fix must not blunt the real signal"
+
+
+def test_one_good_read_makes_a_later_failure_meaningful(monkeypatch):
+    """The tri-state keys on 'was the listing EVER readable', not on the last poll. A run
+    that read the listing fine and simply never saw the runner has measured something,
+    and must still be able to report POD_NO_REGISTER."""
+    reads = iter([(0, ""), (1, ""), (1, "")])
+    # Deterministic clock: deadline is set from the first tick, so 0 -> deadline 10,
+    # one poll at t=5, then t=100 ends it. No real sleeping, no wall-clock flake.
+    ticks = iter([0.0, 5.0, 100.0])
+
+    monkeypatch.setattr(rp, "_run", lambda cmd, timeout=60, env=None: next(reads, (1, "")))
+    monkeypatch.setattr(rp.time, "time", lambda: next(ticks, 100.0))
+    monkeypatch.setattr(rp.time, "sleep", lambda *_: None)
+    assert rp._registered("org", "probe-x", "", 10) is False
+
+
+def test_no_matching_runner_is_still_not_registered(monkeypatch):
+    """The counterpart to the pagination fix: relaxing the parse must not make empty
+    output read as success. A false PASS promotes a provider on a bar nobody measured,
+    which is the failure SCHEDULED_ONLY exists to prevent.
+
+    A READABLE listing with no match is a real measurement, so it stays False and can
+    still demote."""
+
+    # Every scenario here asserts the query actually RAN. A timeout that lets the loop
+    # exit before its first poll would satisfy both verdicts below while measuring
+    # nothing — the tests would then be asserting the shape of a function they never
+    # called, which is the vacuity this module's anti-vacuity pass exists to catch.
+    def _poll(rc: int, out: str) -> tuple[bool | None, list]:
+        calls = []
+        # deadline = 0 + 10; the post-read check reads 100, so exactly one poll happens.
+        ticks = iter([0.0, 100.0])
+
+        def fake(cmd, timeout=60, env=None):
+            calls.append(cmd)
+            return rc, out
+
+        monkeypatch.setattr(rp, "_run", fake)
+        monkeypatch.setattr(rp.time, "time", lambda: next(ticks, 100.0))
+        monkeypatch.setattr(rp.time, "sleep", lambda *_: None)
+        return rp._registered("org", "probe-x", "", 10), calls
+
+    verdict, calls = _poll(0, "\n  \n")
+    assert len(calls) == 1, "the listing must actually be queried before any verdict"
+    assert verdict is False
+
+    # A non-zero `gh` is a THIRD answer, not this one. Output on a failed call is not
+    # evidence either way — see test_an_unreadable_listing_is_None_not_absent.
+    verdict, calls = _poll(1, "241\n")
+    assert len(calls) == 1, "the listing must actually be queried before any verdict"
+    assert verdict is None, "a failed gh is not evidence"
+
+
 def test_runner_labels_are_unique_per_run(monkeypatch, tmp_path):
     """Two runs of the same provider+attempt must not share a label, or each run inherits
     the previous run's dead registrations."""

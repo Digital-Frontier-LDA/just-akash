@@ -74,7 +74,105 @@ Every failure here names which world it came from, via the `failure_reason` outp
 | `NO_ELIGIBLE_BIDDER` | The provider spec was malformed or filtered to nothing | Fix the `providers` input |
 | `PROVIDER_CAPACITY` | Nobody bid within the window | Market condition — retry later or widen the pool |
 | `RUNNER_NEVER_REGISTERED` | A provider won the lease, the runner never came online | Qualify that provider; it is a `runner_deny` candidate |
+| `GITHUB_API_UNAVAILABLE` | The runner listing was never readable, so the pool was never observable | **Your GitHub API budget** — see below. Never a verdict about a provider. |
 | `INDETERMINATE` | The tooling itself failed | Never a verdict about Akash |
+
+---
+
+## The GitHub API budget is the real ceiling on pool size
+
+**GitHub cannot filter runners by label.** `GET /orgs/{org}/actions/runners` takes only
+`name`, and `name` is **exact-match** — verified live: a 12-character prefix of a real
+runner's name returns `0`. The runner image randomises each replica's name from
+`RUNNER_NAME_PREFIX`, so the names aren't known in advance and the filter is useless here.
+
+Every poll therefore pages the **entire org listing**:
+
+```
+requests per poll     = ceil(total_org_runners / 100)     ← all runners, not just yours
+requests per attempt  = that × RUNNER_WAIT_TRIES (90)
+```
+
+A 300-runner org polled for the full window is **~270 requests for one provision**, ×3
+attempts. Against:
+
+| Credential | Primary limit |
+|---|---|
+| PAT | **5,000 req/hour, shared across every token of that user and every repo using them** |
+| GitHub App (org) | 5,000/hr, scaling to 12,500 |
+| GitHub App (Enterprise Cloud) | 15,000/hr |
+
+plus a secondary limit of **900 points/minute** (GET = 1 point, DELETE = 5) and **100
+concurrent requests**. A handful of concurrent pools on one PAT reaches the ceiling in
+minutes.
+
+This is why `GITHUB_API_UNAVAILABLE` is its own failure world. A throttled read used to
+be counted as *zero runners online*, which destroyed the lease, excluded the provider,
+and reported `RUNNER_NEVER_REGISTERED` — naming a provider a `runner_deny` candidate for
+our own rate limit. The same conflation in `runner_probe` produced `POD_NO_REGISTER`,
+which is a **permanent** disqualification.
+
+**The listing shrinks or grows on its own.** Offline registrations accumulate, every one
+adds to the page count of every future poll, and once they overflow a page they are also
+harder to clean. Teardown de-registration isn't hygiene at this scale — it is what keeps
+the polling cost bounded. Skipping it is a compounding leak.
+
+Practical levers, in order of effect:
+
+1. **Give this workflow its own credential.** The PAT bucket is per-user, not per-repo.
+2. **Always run the teardown** (`if: always()`), so the listing stays small.
+3. **Fewer, larger pools** beat many small ones — the poll cost is per-provision and
+   scales with the whole org, not with your pool.
+4. **Raise `RUNNER_WAIT_TRIES`/`min-pool-size` deliberately**: waiting longer is more
+   requests, and 90 tries × 5s = 7.5 min is tuned for a handful of replicas.
+
+---
+
+## One wallet cannot carry a spike, and GitHub cannot serialise it for you
+
+`AKASH_API_KEY` is a **single Cosmos account**. A Cosmos account cannot have two
+transactions in flight — they share a sequence number, so the loser is rejected with an
+account-sequence mismatch, and **nothing in `just_akash` retries that**. Every deploy,
+every destroy, every tag is such a transaction.
+
+This repo's own wallet-touching workflows are serialised under the `akash-wallet`
+concurrency group for exactly this reason. **A reusable workflow cannot inherit that
+protection**: GitHub scopes concurrency groups *per repository*, so a group named here
+creates one queue per calling repo and none at all across them. Many repos sharing one
+key are unserialisable by any group name written in this file.
+
+Untreated, the rejection looks like silence from the market: no DSEQ, no provider, and
+after the attempt budget a `PROVIDER_CAPACITY` verdict — a fabricated outage, produced
+hardest at spike, when the real cause is your own concurrency. It is now classified as
+`WALLET_TX_CONTENTION` and backed off with jitter (a fixed backoff keeps concurrent
+callers in lockstep and simply re-collides).
+
+Backoff buys headroom for a few overlapping callers. **It does not scale to a spike** —
+one sequence number means transactions from that account are inherently serial, so N
+concurrent provisioners spend most of their attempt budget queueing behind each other.
+
+**Escrow compounds it.** Every live lease holds its deposit against the same grant:
+
+```
+free = sum(grants) − escrow          ← what predicts a 402
+```
+
+At the default `required-deposit-usd: 5`, 25 concurrent pools lock ~$125 before a single
+job runs. A grant measured at $170.62 was once $165 locked. So a spike does not fail at
+the marginal deploy — it fails when the *aggregate* of everyone's live leases crosses the
+grant, and the callers that lose are whichever deployed last.
+
+Two shapes work at spike, and they are the same idea:
+
+1. **One Akash account per concurrent provisioner.** Separate `AKASH_API_KEY`s mean
+   separate sequence numbers and no contention at all. Escrow still has to be planned in
+   aggregate, but nothing serialises.
+2. **Funnel provisioning through one repo** that owns the wallet and serialises on the
+   `akash-wallet` group, handing labels back to callers. Simple, but the queue is the
+   throughput ceiling — the opposite of a spike.
+
+Ephemeral churn pushes toward (1): `EPHEMERAL=true` means a runner leaves after one job,
+so a spike is a continuous stream of create/destroy transactions, not a single burst.
 
 ---
 
@@ -131,7 +229,7 @@ operator's trust decision everyone else's. Qualify your own:
 ```bash
 # No PAT needed. With `admin:org` on your existing credential the probe mints a
 # short-lived runner registration token itself, so full qualification is the default.
-python -m just_akash.runner_probe \
+just-akash runner-probe \
   --providers akash1…,akash1… \
   --cpu 4 --memory 16Gi --storage 30Gi \
   --org my-org --attempts 3 --json
@@ -207,8 +305,13 @@ when it accepts a partial pool, so degraded capacity doesn't masquerade as slow 
 
 ## `tag-prefix` is required and has no default
 
-Deployments are tagged `<tag-prefix>-<run_id>` so a sweeper reaps this run's lease and
-nothing else. A shared `ci-<id>` default once let one repo's cleanup **destroy a sibling
+Deployments are tagged `<tag-prefix>-<run_id>` so a sweeper that matches on tags reaps
+this run's lease and nothing else.
+
+Note the limit of that guarantee: just-akash's tags live in a **local file**, never on
+chain, so `--reap-runners` below cannot read them. It selects **every** old lone `runner`
+deployment on the account, not just ones matching your prefix. `tag-prefix` scopes a
+tag-matching sweeper; it does not scope that flag. A shared `ci-<id>` default once let one repo's cleanup **destroy a sibling
 repo's live deployment**. Put your repo name in it.
 
 ## Always run the teardown
@@ -221,6 +324,18 @@ Two things leak, and only one is the lease:
    registrations once overflowed the first page of an org's runner listing and broke
    provisioning for *every repo in the org*. `EPHEMERAL=true` removes a runner that **ran
    a job**; it does nothing for one that registered and was never used.
+
+**Nothing else reaps a runner lease by default.** `python -m just_akash.cleanup_stale`
+classifies by service set, and a pool's service is `runner`, which lands in
+`LEAVE-real-or-unknown` — nothing on chain proves a `runner` service is yours, and a
+sweep that reaped by shape alone once destroyed 14 third-party deployments. Pass
+`--reap-runners` to close lone `runner` services older than 6h; that flag is you
+asserting the Console account hosts nothing but your own pools. Six hours, not one,
+because `ephemeral: false` outlives a job and a slow matrix runs for hours.
+
+The teardown also reports `deregister_failed`. Treat non-zero as urgent rather than
+cosmetic: each surviving registration stays in the listing every future poll pages
+through, so it makes the next run slower and likelier to be throttled.
 
 `if: always()` matters: a teardown gated on success leaves the lease open on exactly the
 runs that failed — the ones most likely to have left something burning escrow. The

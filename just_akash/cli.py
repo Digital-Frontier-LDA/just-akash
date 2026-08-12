@@ -22,6 +22,7 @@ Subcommands:
   lease-status — Reconcile lease/deployment/escrow state; flag closeable leases
   capacity-probe — Probe if N×GPU will actually place (a real bid, not /status)
   export-metrics — Render smoke telemetry as Prometheus textfile metrics
+  runner-probe — Qualify providers as GitHub Actions runner HOSTS (takes real leases)
 """
 
 import argparse
@@ -159,9 +160,36 @@ def _require_ssh(client, dseq, key_arg):
 
 
 def main():
+    # ── runner-probe ───────────────────────────────────
+    # Dispatched BEFORE the main parser, and deliberately not as a subparser.
+    #
+    # docs/github-runners.md and runner-pool.yml's RUNNER_NEVER_REGISTERED error both
+    # tell the operator to run `just-akash runner-probe`, and it did not exist — the
+    # remedy printed at the moment of failure was a command that errors out. Only
+    # `python -m just_akash.runner_probe` worked, which nothing pointed at.
+    #
+    # Re-declaring its dozen flags here would put the real definition and a copy in two
+    # files and let them drift, and the drift is silent: a probe invoked with a stale
+    # default measures a different bar than the one documented. Handing argv straight to
+    # the module keeps ONE definition, so `runner-probe --help` is its own help.
+    if len(sys.argv) > 1 and sys.argv[1] == "runner-probe":
+        from .runner_probe import main as runner_probe_main
+
+        return sys.exit(runner_probe_main(sys.argv[2:], prog="just-akash runner-probe"))
+
     parser = argparse.ArgumentParser(
         prog="just-akash",
         description="CLI for deploying on Akash Network via the Console API",
+        # runner-probe is dispatched above rather than registered as a subparser, so
+        # argparse cannot list it. Without this it is invisible to `--help` — and the
+        # whole point of adding the subcommand was that the remedy printed on a
+        # RUNNER_NEVER_REGISTERED failure should be a command you can find and run.
+        epilog=(
+            "additional commands:\n"
+            "  runner-probe        Qualify providers as GitHub Actions runner HOSTS.\n"
+            "                      Takes REAL leases and spends REAL credit.\n"
+            "                      See `just-akash runner-probe --help`.\n"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
