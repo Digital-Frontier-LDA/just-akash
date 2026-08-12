@@ -515,6 +515,33 @@ jobs:
           uv run python -m canary.collect \
             --targets targets.json --state state.json --out canary-metrics.prom \
             --credit credit.json --owner "$owner"
+
+          # ORPHANED ESCROW, appended to the SAME exposition file.
+          #
+          # `orphan-scan` has always been able to find deployments that hold escrow and
+          # satisfy nothing; it printed them. A printed line is not a signal -- df-grafana
+          # scrapes this .prom off the telemetry branch and cannot alert on a workflow log --
+          # so an orphan was only ever noticed if somebody opened the run. Two onidc
+          # deployments held ~$4.00 for five days on exactly that basis.
+          #
+          # Appended here rather than published as a second file so it needs no new scrape
+          # target in df-grafana: distinct metric names concatenate cleanly in the exposition
+          # format, and it inherits this file's freshness guarantees for free.
+          #
+          # NON-FATAL BY DESIGN. A failed orphan scan must not cost us the canary metrics --
+          # those answer "is the fleet up", which is the more urgent question. The failure is
+          # visible as an absent akash_canary_orphan_scan_degraded series, which is a thing
+          # df-grafana can alert on, rather than as a silent zero.
+          if uv run just-akash orphan-scan --json > orphan-scan.json 2>orphan-scan.err; then
+            if uv run python -m canary.orphans < orphan-scan.json >> canary-metrics.prom; then
+              echo "orphan metrics appended"
+            else
+              echo "::warning::orphan-scan produced output that canary.orphans could not render; no orphan metrics this run"
+            fi
+          else
+            echo "::warning::orphan-scan failed; no orphan metrics this run (canary metrics are unaffected)"
+            sed 's/^/  /' orphan-scan.err | tail -5 || true
+          fi
           echo "--- exposition ---"; cat canary-metrics.prom
 
       - name: Publish to the telemetry branch
