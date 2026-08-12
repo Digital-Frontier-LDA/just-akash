@@ -69,29 +69,84 @@ _SDL_DIR = Path(__file__).resolve().parent.parent / "sdl"
 # `placement:` and the key one level beneath it. Deliberately a line scanner rather than a
 # YAML parse: sdl/github-runner-probe.yaml is templated and does not survive safe_load, and
 # a guard that silently skips the files it cannot read is not a guard.
-_PLACEMENT_RE = re.compile(r"^(?P<ind>\s*)placement:\s*$")
+_PROFILES_RE = re.compile(r"^profiles:\s*$")
+_PLACEMENT_RE = re.compile(r"^(?P<ind>\s{2})placement:\s*$")
 _KEY_RE = re.compile(r"^(?P<ind>\s*)(?P<key>[A-Za-z0-9._-]+):\s*$")
+# A block scalar opener: `key: |`, `- >-`, `args: |2` etc. Everything indented under one is
+# STRING CONTENT, not YAML structure.
+_BLOCK_OPEN_RE = re.compile(r":\s*[|>][0-9+-]*\s*$|^\s*-\s*[|>][0-9+-]*\s*$")
 
 
 def placement_keys(text: str) -> list[str]:
-    """Every `profiles.placement.<KEY>` key in one SDL document."""
+    """Every `profiles.placement.<KEY>` key in one SDL document.
+
+    STRUCTURE-AWARE, and it has to be. A bare `placement:` match anywhere would pick up
+    text that merely LOOKS like YAML — an SDL may embed a whole document inside a block
+    scalar, e.g.::
+
+        services:
+          app:
+            args:
+              - |
+                placement:
+                  just-akash-fake:
+
+    That is string content passed to a container, not a placement key, and treating it as
+    one would have this guard assert against a key that does not exist on chain. So:
+    `placement:` counts only at indent 2 directly under a top-level `profiles:`, and every
+    block-scalar body is skipped entirely. Raised by CodeRabbit on #150.
+
+    Still a line scanner rather than yaml.safe_load: sdl/github-runner-probe.yaml is
+    templated and does not parse, and a guard that silently skips the files it cannot read
+    is not a guard.
+    """
     keys: list[str] = []
     lines = text.split("\n")
-    for i, line in enumerate(lines):
-        m = _PLACEMENT_RE.match(line)
-        if not m:
+    in_profiles = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip())
+
+        # Skip the body of any block scalar — it is string content, not structure.
+        if stripped and _BLOCK_OPEN_RE.search(line):
+            body_min = indent + 1
+            i += 1
+            while i < len(lines):
+                nxt = lines[i]
+                if nxt.strip() and (len(nxt) - len(nxt.lstrip())) < body_min:
+                    break
+                i += 1
             continue
-        want = len(m.group("ind")) + 2
-        for nxt in lines[i + 1 :]:
-            if not nxt.strip():
-                continue
-            ind = len(nxt) - len(nxt.lstrip())
-            if ind < want:
-                break
-            if ind == want:
-                km = _KEY_RE.match(nxt)
-                if km:
-                    keys.append(km.group("key"))
+
+        if _PROFILES_RE.match(line):
+            in_profiles = True
+            i += 1
+            continue
+        # Any other top-level key ends the profiles block.
+        if stripped and indent == 0 and not _PROFILES_RE.match(line):
+            in_profiles = False
+
+        if in_profiles and _PLACEMENT_RE.match(line):
+            want = 4  # keys sit one level under `  placement:`
+            j = i + 1
+            while j < len(lines):
+                nxt = lines[j]
+                if not nxt.strip():
+                    j += 1
+                    continue
+                ind = len(nxt) - len(nxt.lstrip())
+                if ind < want:
+                    break
+                if ind == want:
+                    km = _KEY_RE.match(nxt)
+                    if km:
+                        keys.append(km.group("key"))
+                j += 1
+            i = j
+            continue
+        i += 1
     return keys
 
 

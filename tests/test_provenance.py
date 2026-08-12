@@ -52,14 +52,62 @@ def test_no_sdl_wears_the_siblings_reaped_prefix():
 
 
 def test_placement_keys_are_distinct_per_workload():
-    """The suffix is observability: it is what a human reads in the sweeper's alarm."""
+    """The suffix is observability: it is what a human reads in the sweeper's alarm.
+
+    Duplicates are rejected WITHIN one SDL as well as across them — the scanner returns a
+    list precisely because a document may declare several, and two groups sharing a name is
+    both invalid on chain (unique-within-deployment) and useless as a label. The first
+    version only compared across files. Raised by CodeRabbit on #150.
+    """
     seen: dict[str, str] = {}
     for path in sdl_files():
-        for key in placement_keys(path.read_text(encoding="utf-8")):
-            assert key not in seen or seen[key] == path.name, (
-                f"{key!r} is used by both {seen[key]} and {path.name}"
-            )
+        keys = placement_keys(path.read_text(encoding="utf-8"))
+        assert len(keys) == len(set(keys)), f"{path.name}: duplicate placement keys {keys}"
+        for key in keys:
+            assert key not in seen, f"{key!r} is used by both {seen[key]} and {path.name}"
             seen[key] = path.name
+
+
+# The exact service set each SDL must advertise. canary/ensure.py plan() identifies a canary
+# by the lease's service set being EXACTLY {"canary"}, so a rename there is not cosmetic — it
+# makes every canary unrecognisable and re-opens the redeploy loop #145 closed.
+EXPECTED_SERVICES = {
+    "canary.yaml": {"canary"},
+    "cpu-backtest-ssh.yaml": {"backtest"},
+    "akash-node.yaml": {"node"},
+    "github-runner-probe.yaml": {"probe"},
+}
+
+
+def _services(text: str) -> set[str]:
+    out: set[str] = set()
+    in_services = False
+    for line in text.split("\n"):
+        if line.startswith("services:"):
+            in_services = True
+            continue
+        if in_services and line and not line[0].isspace():
+            break
+        if in_services and len(line) - len(line.lstrip()) == 2 and line.strip().endswith(":"):
+            out.add(line.strip().rstrip(":"))
+    return out
+
+
+def test_service_sets_are_exactly_what_ensure_py_matches_on():
+    """Pins the SET, not just 'it differs from the placement key'.
+
+    The first version of this test only asserted the placement key was not a service name,
+    so renaming `canary` to anything else still passed — while its own docstring claimed to
+    protect the exact {"canary"} set that plan() matches. A guard that cannot fail for the
+    reason it names is the defect this repo keeps finding. Raised by CodeRabbit on #150.
+    """
+    for path in sdl_files():
+        expected = EXPECTED_SERVICES.get(path.name)
+        assert expected is not None, (
+            f"{path.name} has no entry in EXPECTED_SERVICES. A new SDL must declare its "
+            f"service set here deliberately — silence would let a rename through."
+        )
+        assert _services(path.read_text(encoding="utf-8")) == expected, path.name
 
 
 def test_placement_key_is_not_the_service_name():
@@ -126,3 +174,58 @@ def test_scanner_finds_multiple_placement_keys():
         "      pricing: {}\n"
     )
     assert placement_keys(sdl) == ["just-akash-a", "just-akash-b"]
+
+
+def test_a_placement_inside_a_block_scalar_is_not_a_key():
+    """CodeRabbit's counter-example on #150, verbatim.
+
+    An SDL may pass a whole YAML document to a container as an argument. That is STRING
+    CONTENT, not structure — treating it as a placement key would make this guard assert
+    against a key that never reaches the chain.
+    """
+    sdl = (
+        "services:\n"
+        "  app:\n"
+        "    args:\n"
+        "      - |\n"
+        "        placement:\n"
+        "          just-akash-fake:\n"
+        "profiles:\n"
+        "  placement:\n"
+        "    just-akash-real:\n"
+        "      pricing: {}\n"
+    )
+    assert placement_keys(sdl) == ["just-akash-real"]
+
+
+def test_a_placement_outside_profiles_is_not_a_key():
+    """`deployment.<svc>.<KEY>` REFERENCES the placement key; it does not declare one.
+    Only the declaration under `profiles:` becomes group_spec.name."""
+    sdl = (
+        "deployment:\n"
+        "  web:\n"
+        "    placement:\n"
+        "      not-a-declaration:\n"
+        "profiles:\n"
+        "  placement:\n"
+        "    just-akash-web:\n"
+        "      pricing: {}\n"
+    )
+    assert placement_keys(sdl) == ["just-akash-web"]
+
+
+def test_folded_block_scalars_are_skipped_too():
+    """`>` folds, `|` literals — both are string bodies."""
+    sdl = (
+        "services:\n"
+        "  app:\n"
+        "    args:\n"
+        "      - >-\n"
+        "        placement:\n"
+        "          just-akash-folded-fake:\n"
+        "profiles:\n"
+        "  placement:\n"
+        "    just-akash-only:\n"
+        "      pricing: {}\n"
+    )
+    assert placement_keys(sdl) == ["just-akash-only"]
