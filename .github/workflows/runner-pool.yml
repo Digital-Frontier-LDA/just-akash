@@ -546,9 +546,16 @@ jobs:
             #
             # gh also exits non-zero when a LATER page fails after earlier ones
             # succeeded, so an unreadable listing can never be silently undercounted.
+            # BUDGETED BY WALL CLOCK, not by iteration count, because the two sleeps
+            # differ. Spending one of RUNNER_WAIT_TRIES per iteration meant an
+            # all-throttled run slept 15s x 90 = 22.5 MINUTES while the input, the docs
+            # and the error text all promised 7.5 — the caller's jobs sit behind that.
+            # A deadline keeps the promised window honest whatever mix of 5s and 15s
+            # waits actually happens.
             ONLINE=0
             API_OK=0
-            for i in $(seq 1 "$RUNNER_WAIT_TRIES"); do
+            WAIT_DEADLINE=$(( $(date +%s) + RUNNER_WAIT_TRIES * 5 ))
+            while [ "$(date +%s)" -lt "$WAIT_DEADLINE" ]; do
               RUNNER_IDS=$(gh api --paginate "orgs/${ORG}/actions/runners?per_page=100" \
                 --jq ".runners[] | select(.status==\"online\") | select(any(.labels[].name; .==\"${RUNNER_LABEL}\")) | .id" \
                 2>/tmp/gh-runners.err)

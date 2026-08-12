@@ -257,6 +257,21 @@ def test_a_throttled_poll_backs_off_further_than_the_healthy_cadence():
     )
 
 
+def test_the_wait_window_is_budgeted_by_time_not_iterations():
+    """The healthy poll sleeps 5s and the throttled poll sleeps 15s, but a
+    `seq 1 $RUNNER_WAIT_TRIES` loop spends one iteration on either — so an all-throttled
+    run waited 15 x 90 = 22.5 MINUTES while the input description, the docs and the
+    error text all promised 7.5. The caller's jobs sit behind that.
+
+    A wall-clock deadline keeps the promised window honest whatever mix of waits occurs.
+    """
+    code = _code(PROVISION["run"])
+    assert "WAIT_DEADLINE" in code, "the wait must be bounded by time, not iteration count"
+    assert not re.search(r"seq 1 \"\$RUNNER_WAIT_TRIES\"", code), (
+        "an iteration budget lets the 15s throttled sleep triple the promised window"
+    )
+
+
 def test_the_runner_query_is_still_paginated_at_all():
     """Without --paginate the poll only ever sees the first 100 runners, so a pool whose
     registrations land on page 2 reads as never having come online — RUNNER_NEVER_
@@ -563,6 +578,13 @@ MUTATIONS = [
         ),
     ),
     ("throttle backs off", lambda s: s.replace("sleep 15", "sleep 5")),
+    (
+        "wait is time-budgeted",
+        lambda s: s.replace(
+            'while [ "$(date +%s)" -lt "$WAIT_DEADLINE" ]; do',
+            'for i in $(seq 1 "$RUNNER_WAIT_TRIES"); do',
+        ),
+    ),
     # Wallet contention must not be laundered into a market verdict.
     (
         "contention is not capacity",
@@ -712,6 +734,20 @@ def test_deregistration_sees_every_page_of_the_org():
     assert "--paginate" in body, "page 1 only cannot drain a listing that overflowed"
     assert "| length" not in body, "an aggregate emits one value per page, not one per runner"
     assert re.search(r"\|\s*\.id", body), "must emit one id per line to survive concatenation"
+
+
+def test_an_unreadable_listing_is_not_reported_as_a_clean_sweep():
+    """Same conflation as the pool's poll, and worse here. `|| true` turned a throttled
+    `gh` into an empty IDS, and the step then published deregistered=0 AND
+    deregister_failed=0 — a clean sweep it never performed, over registrations it never
+    enumerated. That silence is exactly what lets the listing grow, which raises the
+    request cost of every later poll."""
+    body = TD_DEREG["run"]
+    assert "2>/dev/null || true" not in body, "discarding the failure reports a false zero"
+    assert re.search(r"GH_RC=\$\?", body), "the listing query's exit status must be captured"
+    assert "unmeasured" in body, (
+        "an unreadable listing needs a value distinct from 0 — they are different claims"
+    )
 
 
 def test_teardown_does_not_claim_an_ownership_check_it_cannot_perform():

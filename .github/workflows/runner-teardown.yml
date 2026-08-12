@@ -71,10 +71,13 @@ on:
         value: ${{ jobs.teardown.outputs.deregistered }}
       deregister_failed:
         description: >-
-          Registrations that could NOT be removed. Non-zero is a compounding leak, not
-          a cosmetic one: each survivor stays in the org listing that every pool's
-          poll pages through, so it slows and destabilises later runs, and enough of
-          them overflow a page and break provisioning org-wide.
+          Registrations that could NOT be removed, or `unmeasured` when the listing
+          itself was unreadable — which is NOT the same as zero, and must never be
+          reported as a clean sweep.
+
+          Non-zero is a compounding leak rather than a cosmetic one: each survivor
+          stays in the org listing that every pool's poll pages through, so it raises
+          the request cost of every later run and makes the next throttle likelier.
         value: ${{ jobs.teardown.outputs.deregister_failed }}
 
 permissions:
@@ -214,8 +217,22 @@ jobs:
           # aggregate emits one value per page. This step is exactly where that matters:
           # de-registration is what keeps the org UNDER one page, so the first run that
           # needs it most is the one running against several.
+          # A FAILED LISTING IS NOT AN EMPTY ONE — the same conflation this PR fixes in
+          # the pool, and it is worse here. `|| true` turned a throttled or failing `gh`
+          # into an empty IDS, and the step then published deregistered=0 and
+          # deregister_failed=0: a clean sweep we never performed, for registrations we
+          # never even enumerated. Silence there is what lets the listing grow.
           IDS=$(gh api --paginate "orgs/${ORG}/actions/runners?per_page=100" \
-                --jq ".runners[] | select(.status==\"offline\") | select(any(.labels[].name; .==\"${RUNNER_LABEL}\")) | .id" 2>/dev/null || true)
+                --jq ".runners[] | select(.status==\"offline\") | select(any(.labels[].name; .==\"${RUNNER_LABEL}\")) | .id" 2>/tmp/gh-dereg.err)
+          GH_RC=$?
+          if [ "$GH_RC" -ne 0 ]; then
+            {
+              echo "deregistered=unmeasured"
+              echo "deregister_failed=unmeasured"
+            } >> "$GITHUB_OUTPUT"
+            echo "::warning title=Could not read the runner listing — de-registration did NOT run::gh rc=${GH_RC}: $(tail -1 /tmp/gh-dereg.err 2>/dev/null). Offline registrations for ${RUNNER_LABEL} are still in the org, and every pool's poll pages through them. Re-run this teardown once the API budget recovers."
+            exit 0
+          fi
 
           # A DELETE costs 5 points against GitHub's 900-points-per-minute secondary
           # limit (a GET costs 1), so a spike tearing down 100+ runners spends ~500 in
@@ -240,5 +257,5 @@ jobs:
           echo "deregister_failed=$FAILED" >> "$GITHUB_OUTPUT"
           echo "de-registered ${N} offline runner(s) labelled ${RUNNER_LABEL}"
           if [ "$FAILED" -gt 0 ]; then
-            echo "::warning title=${FAILED} runner registration(s) left behind::They stay in the org listing, which every pool's poll pages through — so this makes the NEXT run slower and likelier to be throttled, and enough of them overflow a page and break provisioning org-wide. Usual cause at spike is the 900-points/minute secondary limit (a DELETE costs 5). Re-run this teardown, or sweep offline runners for label ${RUNNER_LABEL}."
+            echo "::warning title=${FAILED} runner registration(s) left behind::They stay in the org listing, which every pool's poll pages through — so this raises the request cost of the NEXT run and makes the next throttle likelier. Usual cause at spike is the 900-points/minute secondary limit (a DELETE costs 5). Re-run this teardown, or sweep offline runners for label ${RUNNER_LABEL}."
           fi

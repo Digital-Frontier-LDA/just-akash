@@ -180,6 +180,16 @@ def main():
     parser = argparse.ArgumentParser(
         prog="just-akash",
         description="CLI for deploying on Akash Network via the Console API",
+        # runner-probe is dispatched above rather than registered as a subparser, so
+        # argparse cannot list it. Without this it is invisible to `--help` — and the
+        # whole point of adding the subcommand was that the remedy printed on a
+        # RUNNER_NEVER_REGISTERED failure should be a command you can find and run.
+        epilog=(
+            "additional commands:\n"
+            "  runner-probe        Qualify providers as GitHub Actions runner HOSTS.\n"
+            "                      Takes REAL leases and spends REAL credit.\n"
+            "                      See `just-akash runner-probe --help`.\n"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")

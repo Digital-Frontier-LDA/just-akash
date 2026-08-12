@@ -305,8 +305,13 @@ when it accepts a partial pool, so degraded capacity doesn't masquerade as slow 
 
 ## `tag-prefix` is required and has no default
 
-Deployments are tagged `<tag-prefix>-<run_id>` so a sweeper reaps this run's lease and
-nothing else. A shared `ci-<id>` default once let one repo's cleanup **destroy a sibling
+Deployments are tagged `<tag-prefix>-<run_id>` so a sweeper that matches on tags reaps
+this run's lease and nothing else.
+
+Note the limit of that guarantee: just-akash's tags live in a **local file**, never on
+chain, so `--reap-runners` below cannot read them. It selects **every** old lone `runner`
+deployment on the account, not just ones matching your prefix. `tag-prefix` scopes a
+tag-matching sweeper; it does not scope that flag. A shared `ci-<id>` default once let one repo's cleanup **destroy a sibling
 repo's live deployment**. Put your repo name in it.
 
 ## Always run the teardown
