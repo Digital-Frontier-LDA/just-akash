@@ -83,7 +83,7 @@ profiles:
           size: {{STORAGE}}
 
   placement:
-    probe:
+    just-akash-probe:
       pricing:
         probe:
           denom: uact
@@ -91,6 +91,6 @@ profiles:
 
 deployment:
   probe:
-    probe:
+    just-akash-probe:
       profile: probe
       count: 1
