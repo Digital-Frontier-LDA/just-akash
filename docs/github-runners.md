@@ -74,7 +74,57 @@ Every failure here names which world it came from, via the `failure_reason` outp
 | `NO_ELIGIBLE_BIDDER` | The provider spec was malformed or filtered to nothing | Fix the `providers` input |
 | `PROVIDER_CAPACITY` | Nobody bid within the window | Market condition — retry later or widen the pool |
 | `RUNNER_NEVER_REGISTERED` | A provider won the lease, the runner never came online | Qualify that provider; it is a `runner_deny` candidate |
+| `GITHUB_API_UNAVAILABLE` | The runner listing was never readable, so the pool was never observable | **Your GitHub API budget** — see below. Never a verdict about a provider. |
 | `INDETERMINATE` | The tooling itself failed | Never a verdict about Akash |
+
+---
+
+## The GitHub API budget is the real ceiling on pool size
+
+**GitHub cannot filter runners by label.** `GET /orgs/{org}/actions/runners` takes only
+`name`, and `name` is **exact-match** — verified live: a 12-character prefix of a real
+runner's name returns `0`. The runner image randomises each replica's name from
+`RUNNER_NAME_PREFIX`, so the names aren't known in advance and the filter is useless here.
+
+Every poll therefore pages the **entire org listing**:
+
+```
+requests per poll     = ceil(total_org_runners / 100)     ← all runners, not just yours
+requests per attempt  = that × RUNNER_WAIT_TRIES (90)
+```
+
+A 300-runner org polled for the full window is **~270 requests for one provision**, ×3
+attempts. Against:
+
+| Credential | Primary limit |
+|---|---|
+| PAT | **5,000 req/hour, shared across every token of that user and every repo using them** |
+| GitHub App (org) | 5,000/hr, scaling to 12,500 |
+| GitHub App (Enterprise Cloud) | 15,000/hr |
+
+plus a secondary limit of **900 points/minute** (GET = 1 point, DELETE = 5) and **100
+concurrent requests**. A handful of concurrent pools on one PAT reaches the ceiling in
+minutes.
+
+This is why `GITHUB_API_UNAVAILABLE` is its own failure world. A throttled read used to
+be counted as *zero runners online*, which destroyed the lease, excluded the provider,
+and reported `RUNNER_NEVER_REGISTERED` — naming a provider a `runner_deny` candidate for
+our own rate limit. The same conflation in `runner_probe` produced `POD_NO_REGISTER`,
+which is a **permanent** disqualification.
+
+**The listing shrinks or grows on its own.** Offline registrations accumulate, every one
+adds to the page count of every future poll, and once they overflow a page they are also
+harder to clean. Teardown de-registration isn't hygiene at this scale — it is what keeps
+the polling cost bounded. Skipping it is a compounding leak.
+
+Practical levers, in order of effect:
+
+1. **Give this workflow its own credential.** The PAT bucket is per-user, not per-repo.
+2. **Always run the teardown** (`if: always()`), so the listing stays small.
+3. **Fewer, larger pools** beat many small ones — the poll cost is per-provision and
+   scales with the whole org, not with your pool.
+4. **Raise `RUNNER_WAIT_TRIES`/`min-pool-size` deliberately**: waiting longer is more
+   requests, and 90 tries × 5s = 7.5 min is tuned for a handful of replicas.
 
 ---
 

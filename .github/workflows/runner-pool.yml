@@ -149,9 +149,22 @@ on:
       failure_reason:
         description: >-
           WHY a fallback happened, when it did. One of RUNNER_PAT_MISSING,
-          RUNNER_PAT_INVALID, WALLET_UNDERFUNDED, NO_ELIGIBLE_BIDDER,
-          PROVIDER_CAPACITY, RUNNER_NEVER_REGISTERED, INDETERMINATE — or empty on success. Each implies a different remedy, which
-          is why they are not collapsed into "infra".
+          RUNNER_PAT_INVALID, WALLET_UNDERFUNDED, WALLET_TX_CONTENTION,
+          NO_ELIGIBLE_BIDDER, PROVIDER_CAPACITY, RUNNER_NEVER_REGISTERED,
+          GITHUB_API_UNAVAILABLE, INDETERMINATE — or empty on success. Each implies a
+          different remedy, which is why they are not collapsed into "infra".
+
+          Three of them are explicitly NOT statements about a provider, and each was
+          measured misreporting as one:
+
+          RUNNER_PAT_INVALID     our credential expired
+          GITHUB_API_UNAVAILABLE the runner listing was never readable, so the pool
+                                 was never observable — folding this into
+                                 RUNNER_NEVER_REGISTERED would runner_deny providers
+                                 for our own rate limit
+          WALLET_TX_CONTENTION   concurrent provisioners on one Cosmos account reject
+                                 each other; no order is created, so the market never
+                                 saw the request and PROVIDER_CAPACITY is fiction
         value: ${{ jobs.pool.outputs.failure_reason }}
       wallet_free_usd:
         description: 'Free credit after escrow at provision time.'
@@ -430,15 +443,83 @@ jobs:
             # count. `grep -c .` always prints exactly one integer, including 0 for
             # empty input (a failed `gh` included), which is what `|| echo 0` did.
             # `--slurp` would also work but only on gh >= 2.53; this needs no floor.
+            # A FAILED READ IS NOT ZERO RUNNERS, and at pool scale that distinction is
+            # the whole ballgame. `gh` exiting non-zero — a 403 secondary rate limit, a
+            # 5xx, an expired PAT — swallowed into 0 walks the entire "the provider
+            # never delivered" path below: the lease is destroyed, the provider is
+            # EXCLUDED from later attempts, and the run reports RUNNER_NEVER_REGISTERED,
+            # which names that provider a runner_deny candidate. Blaming a provider for
+            # OUR API budget is the precise misdiagnosis this workflow exists to remove.
+            #
+            # And the budget is small here. GitHub cannot filter runners by label
+            # server-side — `?name=` is EXACT-match (verified live: a 12-char prefix of
+            # a real runner's name returns 0) and the runner image randomises each
+            # replica's name — so every poll pages the WHOLE org listing:
+            # ceil(total_org_runners / 100) requests, every 5s, up to RUNNER_WAIT_TRIES
+            # times, per attempt. A PAT gets 5,000 requests/hour SHARED across all of
+            # that user's tokens and every repo using them, plus a 900-points/minute
+            # secondary limit. A 300-runner org polled for the full window is ~270
+            # requests per attempt, so a handful of concurrent pools reaches the ceiling
+            # in minutes. Being throttled is a NORMAL condition at this size, not an
+            # exotic one, and it has to be named rather than absorbed.
+            #
+            # gh also exits non-zero when a LATER page fails after earlier ones
+            # succeeded, so an unreadable listing can never be silently undercounted.
             ONLINE=0
+            API_OK=0
             for i in $(seq 1 "$RUNNER_WAIT_TRIES"); do
-              ONLINE=$(gh api --paginate "orgs/${ORG}/actions/runners?per_page=100" \
+              RUNNER_IDS=$(gh api --paginate "orgs/${ORG}/actions/runners?per_page=100" \
                 --jq ".runners[] | select(.status==\"online\") | select(any(.labels[].name; .==\"${RUNNER_LABEL}\")) | .id" \
-                2>/dev/null | grep -c . || true)
+                2>/tmp/gh-runners.err)
+              GH_RC=$?
+              if [ "$GH_RC" -ne 0 ]; then
+                # Deliberately NOT the 5s cadence: if this is the secondary limit (a
+                # per-MINUTE budget) then retrying at 5s spends the recovery window.
+                echo "  runner listing unreadable (gh rc=${GH_RC}): $(tail -1 /tmp/gh-runners.err 2>/dev/null)"
+                sleep 15
+                continue
+              fi
+              API_OK=1
+              # COUNT LINES, NEVER `| length`. `gh api --paginate --jq` applies the jq
+              # filter to EACH PAGE SEPARATELY and concatenates the results, so an
+              # aggregating filter emits one number PER PAGE: an org with >100 runners
+              # returned "2\n1" here, not "3".
+              #
+              # That is not a cosmetic miscount, it inverts this job's verdict. Every
+              # `[ "$ONLINE" -ge ... ]` below then dies with "integer expression
+              # expected" and returns NON-ZERO, so the `-lt "${MIN_POOL}"` discard
+              # branch is never taken and the pool is declared HEALTHY with zero
+              # runners online — `runs-on` targets a label nothing answers to and the
+              # caller's jobs queue until timeout, which is strictly worse than the
+              # hosted-runner fallback this workflow exists to provide. It would also
+              # write a multi-line `runners_online` into $GITHUB_OUTPUT, corrupting
+              # every later output.
+              #
+              # A per-match line survives page concatenation intact, so emit `.id` and
+              # count. `grep -c .` always prints exactly one integer, 0 included.
+              # `--slurp` would also work but only on gh >= 2.53; this needs no floor.
+              ONLINE=$(printf '%s\n' "$RUNNER_IDS" | grep -c . || true)
               echo "  ${ONLINE:-0}/${POOL_SIZE} online (usable at ${MIN_POOL})"
               [ "${ONLINE:-0}" -ge "${POOL_SIZE}" ] && break
               sleep 5
             done
+
+            # Never read the listing at all: the pool may be perfectly healthy and we
+            # cannot see it. Close the lease (an unverifiable pool cannot be handed to
+            # the caller, and leaving it holds escrow), but do NOT exclude the provider
+            # and do NOT spend another attempt — re-selecting providers cannot fix
+            # GitHub's API, and a second attempt just doubles the request load that is
+            # the most likely cause.
+            if [ "$API_OK" = "0" ]; then
+              for _try in 1 2 3; do
+                "${JA[@]}" destroy --dseq "$DSEQ" -y 2>&1 | tee /tmp/ja-destroy.log && break
+                grep -qi "Deployment closed" /tmp/ja-destroy.log && break
+                sleep 5
+              done
+              echo "failure_reason=GITHUB_API_UNAVAILABLE" >> "$GITHUB_OUTPUT"
+              echo "::error title=Could not read the runner listing — this is NOT a provider fault::Every poll of orgs/${ORG}/actions/runners failed, so the pool was never observable. Do not runner_deny anyone over this. The usual cause at scale is the PAT's 5,000 req/hour (shared across ALL of that user's tokens and repos) or the 900 points/minute secondary limit: each poll costs ceil(org_runners/100) requests because GitHub cannot filter runners by label. Reduce concurrent pools, de-register offline runners to shrink the listing, or give this workflow its own credential."
+              echo "::endgroup::"; exit 1
+            fi
 
             if [ "${ONLINE:-0}" -lt "${MIN_POOL}" ]; then
               echo "::warning::attempt $attempt: ${ONLINE:-0}/${POOL_SIZE} online on $PROVIDER (need >= ${MIN_POOL}) — discarding this lease"

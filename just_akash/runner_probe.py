@@ -497,8 +497,22 @@ def _run_noop_job(
     return False
 
 
-def _registered(org: str, label: str, api_token: str, timeout_s: int) -> bool:
+def _registered(org: str, label: str, api_token: str, timeout_s: int) -> bool | None:
     """Poll GitHub for a runner carrying this probe's label.
+
+    Tri-state, like `_pod_started` and `_run_noop_job`: True registered, False measured
+    and absent, **None never measurable**. None is not pedantry — `classify` turns False
+    into POD_NO_REGISTER, which is a PERMANENT runner_deny that outranks any later
+    streak, so an unreadable listing must not reach it. It reaches SCHEDULED_ONLY
+    instead: non-promotable, non-demoting, which is the honest reading of "we never
+    looked successfully".
+
+    That path is reachable in normal operation, not only in outages. GitHub cannot
+    filter runners by label server-side (`?name=` is exact-match, verified live), so
+    every poll pages the entire org listing — ceil(org_runners/100) requests every 10s
+    against a PAT's 5,000/hour, shared across all of that user's tokens. A probe run is
+    providers x attempts x minutes, and at org scale it competes with the runner pools
+    themselves. Being throttled here used to demote whichever provider was under test.
 
     Takes an API credential, which is NOT the same thing as the token in the SDL.
 
@@ -513,7 +527,9 @@ def _registered(org: str, label: str, api_token: str, timeout_s: int) -> bool:
     """
     env = {"GH_TOKEN": api_token} if api_token else None
     deadline = time.time() + timeout_s
-    while time.time() < deadline:
+    # Did ANY poll come back readable? Only then does "no runner matched" mean anything.
+    measured = False
+    while True:
         rc, out = _run(
             [
                 "gh",
@@ -546,10 +562,18 @@ def _registered(org: str, label: str, api_token: str, timeout_s: int) -> bool:
             timeout=60,
             env=env,
         )
-        if rc == 0 and any(line.strip() for line in out.splitlines()):
-            return True
+        if rc == 0:
+            measured = True
+            if any(line.strip() for line in out.splitlines()):
+                return True
+        # ALWAYS take at least one reading before honouring the deadline, as _pod_started
+        # and _job_ran do. A zero or very short timeout must mean "look once", not "never
+        # look" — the latter returns None (unmeasurable) for every fast attempt and makes
+        # the whole run non-promotable.
+        if time.time() >= deadline:
+            break
         time.sleep(10)
-    return False
+    return False if measured else None
 
 
 def probe_once(

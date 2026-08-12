@@ -48,6 +48,18 @@ def _step(fragment: str) -> dict:
 PROVISION = _step("Provision")
 
 
+def _code(body: str) -> str:
+    """A shell body with its comment lines removed.
+
+    These guards assert what the shell DOES, and matching raw text also matches the prose
+    explaining why. A comment that names the very construct it warns against — "never
+    `| length`" — then trips the guard forbidding it, and the cheapest way to go green is
+    to delete the explanation. That inverts the point of writing the reason down, so
+    strip comments and assert on code.
+    """
+    return "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("#"))
+
+
 # --------------------------------------------------------------------------
 # tag-prefix — a shared default destroyed another repo's live deployment
 # --------------------------------------------------------------------------
@@ -153,8 +165,8 @@ def test_the_online_count_survives_a_paginated_org():
     >100 runners is the normal case, not an exotic one: offline registrations
     accumulate and once overflowed an org's runner listing outright.
     """
-    body = PROVISION["run"]
-    poll = body[body.index("gh api --paginate") : body.index("online (usable at")]
+    code = _code(PROVISION["run"])
+    poll = code[code.index("gh api --paginate") : code.index("online (usable at")]
     assert "| length" not in poll, (
         "an aggregating jq filter emits one value per page under --paginate, and a "
         "multi-line ONLINE makes every integer test below error-out into 'healthy'"
@@ -169,11 +181,76 @@ def test_the_online_count_is_a_single_integer_on_every_path():
     return empty or multi-line corrupts all four — a multi-line value written to
     $GITHUB_OUTPUT without a heredoc delimiter also breaks every LATER output in the
     file, not just this one."""
-    body = PROVISION["run"]
-    poll = body[body.index("gh api --paginate") : body.index("online (usable at")]
+    code = _code(PROVISION["run"])
+    poll = code[code.index("gh api --paginate") : code.index("online (usable at")]
     assert "grep -c ." in poll, "grep -c prints exactly one integer, 0 included"
     assert "|| true" in poll or "|| echo 0" in poll, (
         "grep -c exits 1 on zero matches; the assignment must not carry that outward"
+    )
+
+
+def test_a_failed_listing_query_is_not_counted_as_zero_runners():
+    """A throttled `gh` must not walk the 'the provider never delivered' path.
+
+    Swallowing a non-zero exit into 0 destroys the lease, EXCLUDES the provider from
+    later attempts, and reports RUNNER_NEVER_REGISTERED — which names that provider a
+    runner_deny candidate for what is our own API budget. That is the exact class of
+    misdiagnosis this workflow exists to remove.
+
+    It is also not a rare path at pool scale: GitHub cannot filter runners by label
+    server-side, so each poll costs ceil(org_runners/100) requests against a PAT's
+    5,000/hour, shared across every token and repo of that user."""
+    code = _code(PROVISION["run"])
+    poll = code[code.index("gh api --paginate") : code.index('if [ "$API_OK"')]
+    # Positive assertions: `2>/dev/null not in poll` would also forbid the legitimate
+    # suppression on the `tail` that reports the error, and a guard that forbids the
+    # remedy gets weakened rather than obeyed.
+    assert re.search(r"2>\s*/tmp/\S+\.err\)", poll), (
+        "gh's stderr must be captured, not discarded — it carries the 403 that explains "
+        "the failure, and discarding it is how a rate limit became 'zero runners'"
+    )
+    assert re.search(r"GH_RC=\$\?", poll), "the exit status must be captured, not ignored"
+    assert re.search(r"GH_RC.*-ne 0", poll), "a non-zero gh must take its own branch"
+    assert "API_OK" in poll, "the loop must record whether the listing was EVER readable"
+
+
+def test_an_unreadable_listing_is_its_own_failure_world():
+    """GITHUB_API_UNAVAILABLE exists because the remedy (API budget) has nothing to do
+    with Akash. Folding it into RUNNER_NEVER_REGISTERED sends the operator at providers
+    — and at runner_deny — for a GitHub rate limit."""
+    body = SRC
+    assert "failure_reason=GITHUB_API_UNAVAILABLE" in body
+    assert "GITHUB_API_UNAVAILABLE" in OUTPUTS["failure_reason"]["description"], (
+        "a reason the caller cannot find documented is a reason they will misread"
+    )
+    unreadable = body[body.index('if [ "$API_OK"') :]
+    assert "NOT a provider fault" in unreadable, "must say what it is not"
+
+
+def test_an_unreadable_listing_still_closes_the_lease_but_spares_the_provider():
+    """Two independent properties, and both are load-bearing.
+
+    The lease must close: an unverifiable pool cannot be handed to the caller, and
+    leaving it holds escrow against the grant the next run spends from.
+
+    The provider must NOT be excluded and no further attempt spent: re-selecting
+    providers cannot fix GitHub's API, and a retry doubles the request load that is the
+    most likely cause of the failure in the first place."""
+    body = PROVISION["run"]
+    unreadable = body[body.index('if [ "$API_OK"') : body.index('if [ "${ONLINE:-0}" -lt')]
+    assert '"${JA[@]}" destroy --dseq "$DSEQ"' in unreadable, "an unread lease still leaks"
+    assert "EXCLUDED=" not in unreadable, "a rate limit is not evidence about a provider"
+    assert "exit 1" in unreadable, "must not spend another attempt on an API failure"
+
+
+def test_a_throttled_poll_backs_off_further_than_the_healthy_cadence():
+    """The secondary limit is a per-MINUTE budget, so retrying a throttled read at the
+    healthy 5s cadence spends the window it is waiting for."""
+    body = PROVISION["run"]
+    poll = body[body.index("gh api --paginate") : body.index('if [ "$API_OK"')]
+    fail_branch = poll[poll.index("GH_RC") : poll.index("API_OK=1")]
+    assert re.search(r"sleep (1[0-9]|[2-9][0-9])", fail_branch), (
+        "the failure path must back off further than the 5s healthy poll"
     )
 
 
@@ -343,6 +420,18 @@ MUTATIONS = [
     ("online count is line-based", lambda s: s.replace("grep -c .", "head -1")),
     ("no aggregating jq under paginate", lambda s: s.replace('| .id"', '] | length"')),
     ("runner poll stays paginated", lambda s: s.replace("--paginate ", "")),
+    # A throttled read must never be absorbed into "the provider delivered nothing".
+    (
+        "failed listing is not zero",
+        lambda s: s.replace("2>/tmp/gh-runners.err", "2>/dev/null"),
+    ),
+    (
+        "api failure has its own reason",
+        lambda s: s.replace(
+            "failure_reason=GITHUB_API_UNAVAILABLE", "failure_reason=RUNNER_NEVER_REGISTERED"
+        ),
+    ),
+    ("throttle backs off", lambda s: s.replace("sleep 15", "sleep 5")),
     (
         "checkout credentials",
         lambda s: s.replace("persist-credentials: false", "persist-credentials: true"),

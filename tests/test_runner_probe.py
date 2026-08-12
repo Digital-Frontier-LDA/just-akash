@@ -761,14 +761,60 @@ def test_registration_jq_emits_one_line_per_runner_not_a_count(monkeypatch):
     assert "length" not in seen["jq"], "an aggregate emits one value per page"
 
 
+def test_an_unreadable_listing_is_None_not_absent(monkeypatch):
+    """A throttled or failing `gh` must never become POD_NO_REGISTER.
+
+    That outcome is a PERMANENT runner_deny which outranks any later streak, so a
+    provider that hosted the runner correctly would be struck off the fleet because OUR
+    API budget ran out. And this is reachable in normal operation: GitHub cannot filter
+    runners by label server-side (`?name=` is exact-match), so every poll pages the whole
+    org listing against a PAT's 5,000/hour shared across all of that user's tokens.
+
+    None routes to SCHEDULED_ONLY — non-promotable AND non-demoting, which is the honest
+    reading of "we never looked successfully".
+    """
+    monkeypatch.setattr(rp, "_run", lambda cmd, timeout=60, env=None: (1, ""))
+    assert rp._registered("org", "probe-x", "", 0) is None
+
+    assert (
+        rp.classify(bid=True, pod_running=True, registered=None, job_ran=None, torn_down=True)
+        is Outcome.SCHEDULED_ONLY
+    ), "an unmeasured registration must not promote"
+    assert (
+        rp.classify(bid=True, pod_running=True, registered=False, job_ran=None, torn_down=True)
+        is Outcome.POD_NO_REGISTER
+    ), "a MEASURED absence must still demote — the fix must not blunt the real signal"
+
+
+def test_one_good_read_makes_a_later_failure_meaningful(monkeypatch):
+    """The tri-state keys on 'was the listing EVER readable', not on the last poll. A run
+    that read the listing fine and simply never saw the runner has measured something,
+    and must still be able to report POD_NO_REGISTER."""
+    reads = iter([(0, ""), (1, ""), (1, "")])
+    # Deterministic clock: deadline is set from the first tick, so 0 -> deadline 10,
+    # one poll at t=5, then t=100 ends it. No real sleeping, no wall-clock flake.
+    ticks = iter([0.0, 5.0, 100.0])
+
+    monkeypatch.setattr(rp, "_run", lambda cmd, timeout=60, env=None: next(reads, (1, "")))
+    monkeypatch.setattr(rp.time, "time", lambda: next(ticks, 100.0))
+    monkeypatch.setattr(rp.time, "sleep", lambda *_: None)
+    assert rp._registered("org", "probe-x", "", 10) is False
+
+
 def test_no_matching_runner_is_still_not_registered(monkeypatch):
-    """The counterpart to the fix: relaxing the parse must not make empty output — or a
-    failed `gh` — read as success. A false PASS promotes a provider on a bar nobody
-    measured, which is the failure SCHEDULED_ONLY exists to prevent."""
+    """The counterpart to the pagination fix: relaxing the parse must not make empty
+    output read as success. A false PASS promotes a provider on a bar nobody measured,
+    which is the failure SCHEDULED_ONLY exists to prevent.
+
+    A READABLE listing with no match is a real measurement, so it stays False and can
+    still demote."""
     monkeypatch.setattr(rp, "_run", lambda cmd, timeout=60, env=None: (0, "\n  \n"))
     assert rp._registered("org", "probe-x", "", 0) is False
+
+    # A non-zero `gh` is a THIRD answer, not this one. Output on a failed call is not
+    # evidence either way — see test_an_unreadable_listing_is_None_not_absent.
     monkeypatch.setattr(rp, "_run", lambda cmd, timeout=60, env=None: (1, "241\n"))
-    assert rp._registered("org", "probe-x", "", 0) is False, "a failed gh is not evidence"
+    assert rp._registered("org", "probe-x", "", 0) is None, "a failed gh is not evidence"
 
 
 def test_runner_labels_are_unique_per_run(monkeypatch, tmp_path):
