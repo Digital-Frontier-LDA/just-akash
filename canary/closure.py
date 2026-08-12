@@ -44,6 +44,7 @@ that let the last incident run for a day.
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import UTC, datetime
 
 from just_akash.chain import _lcd_get
 
@@ -161,6 +162,101 @@ def _fetch_block(height: str) -> dict:
     return _lcd_get(f"/cosmos/tx/v1beta1/txs/block/{height}")
 
 
+def _block_time(block: dict | None) -> datetime | None:
+    """The settling block's timestamp, or None if the shape is not what we expect."""
+    if not isinstance(block, dict):
+        return None
+    raw = ((block.get("block") or {}).get("header") or {}).get("time")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        # Cosmos emits RFC3339 with a trailing Z and often nanosecond precision, which
+        # fromisoformat rejects before 3.11 and still dislikes at >6 digits.
+        text = raw.replace("Z", "+00:00")
+        if "." in text:
+            head, _, tail = text.partition(".")
+            frac, sign, off = tail.partition("+") if "+" in tail else tail.partition("-")
+            text = f"{head}.{frac[:6]}{sign}{off}" if sign else f"{head}.{frac[:6]}"
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def lifetime_hours(dseq: str, block: dict | None) -> float | None:
+    """EXACT lease lifetime in hours, or None if either end is unreadable.
+
+    WHY THIS IS NOT MEASURED FROM akash_canary_uptime_seconds, which looks like the obvious
+    source. That gauge is reported from INSIDE the lease and only reaches us on a successful
+    scrape, so the last value before a lease dies is a LOWER BOUND sampled at the collection
+    cadence — 30 minutes on a good day, and observed at 60-90 when GitHub's scheduler slips.
+    Reading it as the lifetime is wrong by up to an hour and a half.
+
+    That error is not academic. On 2026-08-12 two such lower bounds (13.79h and 13.69h) were
+    read as failure times, their closeness taken as evidence of a fixed timer, and a whole
+    hypothesis built on it. The chain then gave the real numbers for the same population --
+    11.91h, 12.06h, 14.23h -- a 2.3h spread with no timer in it at all.
+
+    Both ends of this measurement come from the chain and neither depends on our cadence:
+      * the START is encoded in the dseq itself, which the Console API mints as epoch
+        MILLISECONDS (a live deployment reads 1786498654528 -> 2026-08-12T05:37:34Z);
+      * the END is the header time of the block the escrow settled in.
+    """
+    if not dseq:
+        return None
+    end = _block_time(block)
+    if end is None:
+        return None
+    try:
+        start = datetime.fromtimestamp(int(dseq) / 1000, UTC)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+    hours = (end - start).total_seconds() / 3600.0
+    # A negative or absurd span means the dseq is not the millisecond timestamp this assumes
+    # (a chain upgrade, or a deployment created by something that mints dseq differently).
+    # Publish nothing rather than a number that would be read as a measurement.
+    if hours < 0 or hours > 24 * 365:
+        return None
+    return hours
+
+
+def attribute_detailed(
+    owner: str,
+    dseq: str,
+    *,
+    fetch_info: Callable[[str, str], dict] = _fetch_info,
+    fetch_block: Callable[[str], dict] = _fetch_block,
+) -> tuple[str, float | None]:
+    """(who ended it, how long it lived in hours). Never raises.
+
+    Both come out of the SAME two LCD reads `attribute()` already performed, so measuring the
+    lifetime costs no extra requests -- the settling block was being fetched anyway to read
+    who signed the close.
+    """
+    if not owner or not dseq:
+        return UNKNOWN, None
+    try:
+        info = fetch_info(owner, dseq)
+    except Exception:  # noqa: BLE001 — an unreadable chain is `unknown`, not a crash
+        return UNKNOWN, None
+    if not isinstance(info, dict):
+        return UNKNOWN, None
+
+    _, settled_at = _escrow_state(info)
+    block: dict | None = None
+    if settled_at:
+        try:
+            fetched = fetch_block(settled_at)
+            block = fetched if isinstance(fetched, dict) else None
+        except Exception:  # noqa: BLE001 — fall through to the escrow-only verdict
+            block = None
+    lived = lifetime_hours(str(dseq), block)
+    try:
+        return classify(info, block, owner, dseq), lived
+    except Exception:  # noqa: BLE001 — a surprise shape is unknown, never a false blame
+        return UNKNOWN, lived
+
+
 def attribute(
     owner: str,
     dseq: str,
@@ -171,26 +267,7 @@ def attribute(
     """Who ended (owner, dseq). One of VERDICTS; never raises.
 
     Two LCD reads, and only when a lease replacement was actually observed — a handful of
-    requests a day, not per collection.
+    requests a day, not per collection. Kept as the cause-only façade over
+    attribute_detailed() so callers that do not want the lifetime are unaffected.
     """
-    if not owner or not dseq:
-        return UNKNOWN
-    try:
-        info = fetch_info(owner, dseq)
-    except Exception:  # noqa: BLE001 — an unreadable chain is `unknown`, not a crash
-        return UNKNOWN
-    if not isinstance(info, dict):
-        return UNKNOWN
-
-    _, settled_at = _escrow_state(info)
-    block: dict | None = None
-    if settled_at:
-        try:
-            fetched = fetch_block(settled_at)
-            block = fetched if isinstance(fetched, dict) else None
-        except Exception:  # noqa: BLE001 — fall through to the escrow-only verdict
-            block = None
-    try:
-        return classify(info, block, owner, dseq)
-    except Exception:  # noqa: BLE001 — a surprise shape is unknown, never a false blame
-        return UNKNOWN
+    return attribute_detailed(owner, dseq, fetch_info=fetch_info, fetch_block=fetch_block)[0]

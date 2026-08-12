@@ -47,7 +47,7 @@ import urllib.request
 from collections.abc import Callable
 
 from canary._state import load_json_mapping
-from canary.closure import UNKNOWN, VERDICTS, attribute
+from canary.closure import UNKNOWN, VERDICTS, attribute_detailed
 
 # Reused from the exporter rather than re-implemented: _escape_label_value handles the
 # exposition-format escapes, and _is_number excludes bool (a bool IS an int, so a
@@ -210,14 +210,31 @@ def merge(
         # dseq is the only handle the chain will answer about, and this is the last
         # moment we hold it — the line below overwrites p["dseq"].
         cause = UNKNOWN
+        lived: float | None = None
         if attribute_closure is not None and owner:
             try:
-                cause = attribute_closure(owner, str(p["dseq"]))
+                result = attribute_closure(owner, str(p["dseq"]))
             except Exception:  # noqa: BLE001 — a broken attributor loses a cause, not a run
-                cause = UNKNOWN
+                result = UNKNOWN
+            # The attributor may return the cause alone, or (cause, lifetime_hours). Both are
+            # accepted deliberately: canary/closure.attribute_detailed returns the pair, while
+            # the plain string is what every existing caller and fixture returns. Rejecting
+            # one shape would either churn tests unrelated to lifetime or, worse, silently
+            # store a tuple as the cause and send every closure to `unknown`.
+            if isinstance(result, tuple):
+                cause = result[0] if result else UNKNOWN
+                lived = result[1] if len(result) > 1 else None
+            else:
+                cause = result
         if cause not in VERDICTS:
             cause = UNKNOWN
         closures[cause] = closures.get(cause, 0) + 1
+        # Publish only a lifetime the CHAIN gave us. Falling back to a locally computed span
+        # would defeat the point: the whole reason this exists is that the obvious local
+        # source (uptime at last scrape) is a lower bound, and a lower bound published as a
+        # measurement is what produced a false "fixed ~13.7h timer" conclusion on 2026-08-12.
+        if isinstance(lived, (int, float)) and lived >= 0:
+            p["lease_lifetime_hours"] = float(lived)
     elif boot_changed:
         p["restarts_total"] += 1
 
@@ -339,6 +356,23 @@ def render(
                 f'akash_canary_lease_closures_total{{provider="{prov}",cause="{cause}"}} '
                 f"{closures.get(cause, 0)}"
             )
+    # Only providers whose last replacement was chain-measurable appear here. A provider with
+    # no series has not lost a lease since this shipped, or the chain could not be read for
+    # the one it lost -- both are "no measurement", and emitting 0 for them would publish a
+    # lifetime of zero hours as if it were observed.
+    add(
+        "# HELP akash_canary_lease_lifetime_hours How long the PREVIOUS lease lived, in "
+        "hours, measured entirely on chain: start from the dseq (epoch ms, minted by the "
+        "Console API), end from the header time of the block its escrow settled in. NOT "
+        "derived from akash_canary_uptime_seconds -- that is only as fresh as the last "
+        "successful scrape, so it is a LOWER BOUND, and reading it as a lifetime is wrong by "
+        "up to the collection interval."
+    )
+    add("# TYPE akash_canary_lease_lifetime_hours gauge")
+    for prov, p in sorted(state.items()):
+        lived = p.get("lease_lifetime_hours")
+        if isinstance(lived, (int, float)):
+            add(f'akash_canary_lease_lifetime_hours{{provider="{prov}"}} {float(lived):.4f}')
     add(
         "# HELP akash_canary_unreachable_checks_total Checks where the canary could not "
         "be reached on its ingress."
@@ -521,7 +555,7 @@ def main() -> int:
             now,
             deployed=bool(uri),
             owner=a.owner,
-            attribute_closure=attribute,
+            attribute_closure=attribute_detailed,
         )
         closures = {k: v for k, v in sorted((state[provider].get("closures") or {}).items()) if v}
         print(

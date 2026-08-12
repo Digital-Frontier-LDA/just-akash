@@ -309,3 +309,157 @@ def test_render_emits_every_cause_including_zeros():
     assert cause(PROVIDER) == 1
     for c in (SELF, LAPSED, OPEN, UNKNOWN):
         assert cause(c) == 0
+
+
+# ── Lease lifetime, measured on chain ─────────────────────────────────────────────────
+#
+# WHY THESE EXIST. The obvious source for "how long did the lease live" is
+# akash_canary_uptime_seconds, and it is WRONG: that gauge only reaches us on a successful
+# scrape, so its last value before a lease dies is a LOWER BOUND at the collection cadence.
+# On 2026-08-12 two such bounds (13.79h, 13.69h) were read as failure times, their closeness
+# taken as proof of a fixed timer, and the hypothesis survived until the chain gave the real
+# numbers for the same leases: 11.91h, 12.06h, 14.23h. No timer, a 2.3h spread.
+#
+# So the property under test is that a lifetime is published ONLY when both ends came off the
+# chain, and that anything else publishes nothing rather than a plausible number.
+
+from canary.closure import (  # noqa: E402
+    VERDICTS,
+    _block_time,
+    attribute_detailed,
+    lifetime_hours,
+)
+
+# 1786422914704 ms -> 2026-08-11T04:35:14.704Z. Real dseq, from the hetzner_hel lease whose
+# chain-measured lifetime was 14.23h.
+_DSEQ = "1786422914704"
+
+
+def _blk(t: str) -> dict:
+    return {"block": {"header": {"time": t}}}
+
+
+def test_lifetime_is_measured_from_dseq_and_settling_block():
+    # Real values: created 2026-08-11T04:35:14Z, escrow settled in a block at 18:49:02Z.
+    got = lifetime_hours(_DSEQ, _blk("2026-08-11T18:49:02Z"))
+    assert got is not None
+    assert abs(got - 14.230) < 0.01, got
+
+
+def test_nanosecond_precision_and_offsets_parse():
+    """Cosmos emits RFC3339 with nanoseconds, which datetime.fromisoformat rejects."""
+    assert _block_time(_blk("2026-08-11T18:49:02.123456789Z")) is not None
+    assert _block_time(_blk("2026-08-11T18:49:02.123456789+00:00")) is not None
+    # ...and a naive timestamp must still come back tz-aware, or the subtraction raises.
+    bt = _block_time(_blk("2026-08-11T18:49:02"))
+    assert bt is not None and bt.tzinfo is not None
+
+
+def test_unreadable_ends_publish_NOTHING_rather_than_a_number():
+    assert lifetime_hours(_DSEQ, None) is None
+    assert lifetime_hours(_DSEQ, {}) is None
+    assert lifetime_hours(_DSEQ, _blk("")) is None
+    assert lifetime_hours(_DSEQ, _blk("not-a-time")) is None
+    assert lifetime_hours("", _blk("2026-08-11T18:49:02Z")) is None
+    assert lifetime_hours("not-a-dseq", _blk("2026-08-11T18:49:02Z")) is None
+
+
+def test_impossible_spans_are_refused():
+    """A dseq that is not epoch-ms (chain upgrade, foreign minter) must not publish."""
+    # Block BEFORE creation -> negative.
+    assert lifetime_hours(_DSEQ, _blk("2020-01-01T00:00:00Z")) is None
+    # A dseq that is a block height, not a timestamp -> absurd span.
+    assert lifetime_hours("28133888", _blk("2026-08-11T18:49:02Z")) is None
+
+
+def test_attribute_detailed_returns_cause_and_lifetime_from_one_pair_of_reads():
+    calls = {"info": 0, "block": 0}
+
+    def fetch_info(owner, dseq):
+        calls["info"] += 1
+        return {
+            "escrow_account": {
+                "state": {"state": "closed", "settled_at": "28126510"},
+            }
+        }
+
+    def fetch_block(height):
+        calls["block"] += 1
+        assert height == "28126510"
+        return {
+            "block": {
+                "header": {"time": "2026-08-11T18:49:02Z"},
+                "data": {},
+            },
+            "txs": [],
+        }
+
+    cause, lived = attribute_detailed(OWNER, _DSEQ, fetch_info=fetch_info, fetch_block=fetch_block)
+    assert cause in VERDICTS
+    assert lived is not None and abs(lived - 14.230) < 0.01
+    # The lifetime must cost NO extra chain reads -- the block was already being fetched to
+    # read who signed the close.
+    assert calls == {"info": 1, "block": 1}, calls
+
+
+def test_attribute_facade_still_returns_a_bare_cause():
+    """Existing callers must be untouched by the tuple-returning variant."""
+    got = attribute(OWNER, _DSEQ, fetch_info=lambda *_: {}, fetch_block=lambda *_: {})
+    assert isinstance(got, str) and got in VERDICTS
+
+
+def test_merge_accepts_both_the_tuple_and_the_bare_string():
+    """The shim is load-bearing and therefore tested in BOTH directions.
+
+    Every pre-existing fixture injects a bare cause string; the real attributor now returns
+    (cause, lifetime). If merge() mishandled the tuple it would store it AS the cause, fail
+    the VERDICTS check, and quietly book every closure as `unknown` -- turning a working
+    signal into a permanent shrug.
+    """
+    st = merge({}, ALPHA, "100", True, _body("a"), 0.1, 1000.0)
+    st = merge(
+        st,
+        ALPHA,
+        "200",
+        True,
+        _body("b"),
+        0.1,
+        1100.0,
+        owner=OWNER,
+        attribute_closure=lambda *_: (SELF, 12.5),
+    )
+    assert st[ALPHA]["closures"] == {SELF: 1}
+    assert st[ALPHA]["lease_lifetime_hours"] == 12.5
+
+    st2 = merge({}, ALPHA, "100", True, _body("a"), 0.1, 1000.0)
+    st2 = merge(
+        st2,
+        ALPHA,
+        "200",
+        True,
+        _body("b"),
+        0.1,
+        1100.0,
+        owner=OWNER,
+        attribute_closure=lambda *_: SELF,
+    )
+    assert st2[ALPHA]["closures"] == {SELF: 1}
+    assert "lease_lifetime_hours" not in st2[ALPHA]
+
+
+def test_an_unmeasurable_lifetime_leaves_no_stale_value_behind():
+    """None must not overwrite, but must also never invent a zero."""
+    st = merge({}, ALPHA, "100", True, _body("a"), 0.1, 1000.0)
+    st = merge(
+        st,
+        ALPHA,
+        "200",
+        True,
+        _body("b"),
+        0.1,
+        1100.0,
+        owner=OWNER,
+        attribute_closure=lambda *_: (UNKNOWN, None),
+    )
+    assert st[ALPHA]["closures"] == {UNKNOWN: 1}
+    assert "lease_lifetime_hours" not in st[ALPHA]
