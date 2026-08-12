@@ -808,13 +808,34 @@ def test_no_matching_runner_is_still_not_registered(monkeypatch):
 
     A READABLE listing with no match is a real measurement, so it stays False and can
     still demote."""
-    monkeypatch.setattr(rp, "_run", lambda cmd, timeout=60, env=None: (0, "\n  \n"))
-    assert rp._registered("org", "probe-x", "", 0) is False
+
+    # Every scenario here asserts the query actually RAN. A timeout that lets the loop
+    # exit before its first poll would satisfy both verdicts below while measuring
+    # nothing — the tests would then be asserting the shape of a function they never
+    # called, which is the vacuity this module's anti-vacuity pass exists to catch.
+    def _poll(rc: int, out: str) -> tuple[bool | None, list]:
+        calls = []
+        # deadline = 0 + 10; the post-read check reads 100, so exactly one poll happens.
+        ticks = iter([0.0, 100.0])
+
+        def fake(cmd, timeout=60, env=None):
+            calls.append(cmd)
+            return rc, out
+
+        monkeypatch.setattr(rp, "_run", fake)
+        monkeypatch.setattr(rp.time, "time", lambda: next(ticks, 100.0))
+        monkeypatch.setattr(rp.time, "sleep", lambda *_: None)
+        return rp._registered("org", "probe-x", "", 10), calls
+
+    verdict, calls = _poll(0, "\n  \n")
+    assert len(calls) == 1, "the listing must actually be queried before any verdict"
+    assert verdict is False
 
     # A non-zero `gh` is a THIRD answer, not this one. Output on a failed call is not
     # evidence either way — see test_an_unreadable_listing_is_None_not_absent.
-    monkeypatch.setattr(rp, "_run", lambda cmd, timeout=60, env=None: (1, "241\n"))
-    assert rp._registered("org", "probe-x", "", 0) is None, "a failed gh is not evidence"
+    verdict, calls = _poll(1, "241\n")
+    assert len(calls) == 1, "the listing must actually be queried before any verdict"
+    assert verdict is None, "a failed gh is not evidence"
 
 
 def test_runner_labels_are_unique_per_run(monkeypatch, tmp_path):

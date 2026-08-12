@@ -124,6 +124,20 @@ on:
         required: false
         type: string
         default: '5'
+      runner-wait-tries:
+        description: >-
+          How many 5-second polls to wait for the pool to come online. 90 (7.5 min) is
+          tuned for a handful of replicas and is NOT free to raise: GitHub cannot filter
+          runners by label, so every poll pages the WHOLE org listing —
+          ceil(org_runners/100) requests each — against a PAT's 5,000/hour shared across
+          all of that user's tokens and repos.
+
+          Raise it when a large pool legitimately needs longer to register (N replicas
+          pull the runner image before any of them report in), and know that you are
+          spending request budget every other pool draws from. Lower it to fail fast.
+        required: false
+        type: string
+        default: '90'
     secrets:
       AKASH_API_KEY:
         required: true
@@ -190,9 +204,38 @@ jobs:
       wallet_free_usd: ${{ steps.wallet.outputs.free_usd }}
       runner_hosts_proven: ${{ steps.candidates.outputs.proven_hosts }}
       runner-targets: ${{ steps.provision.outputs.runner_targets || '["ubuntu-latest"]' }}
+    # Every `run` below needs just-akash's OWN source, never the caller's checkout.
+    defaults:
+      run:
+        working-directory: .just-akash
     steps:
+      # CHECK OUT just-akash, NOT THE CALLER. A reusable workflow's job runs in the
+      # CALLER's context, so `github.repository` is THEIR repo and a bare checkout
+      # fetches THEIR code. `uv run --with .` then installs the caller's package (or
+      # fails outright when they have no pyproject.toml), `just-akash` is never on PATH,
+      # and `python -m just_akash.runner_candidates` raises ModuleNotFoundError. This
+      # workflow could therefore only ever have worked inside this repo — and nothing
+      # here calls it, so that was never exercised.
+      #
+      # `job.workflow_sha` / `job.workflow_repository` are the JOB context, not the
+      # github one, and that distinction is the whole fix: the `github` context is
+      # always the CALLER's, so `github.workflow_ref` here names their entry workflow.
+      # The job context is documented as referring to the REUSABLE workflow file for
+      # jobs defined in one, so this resolves to the exact commit of this file — the
+      # revision the caller pinned. Tracking a branch instead would let the
+      # classification tables, the SDL and the provider-qualification bar all change
+      # under a consumer whose pin never moved, which is the whole reason they pinned.
+      #
+      # It also follows forks: a fork's callers get the fork's CLI, not ours.
+      #
+      # `job.workflow_*` is unavailable on GitHub Enterprise Server, where both resolve
+      # empty. The literal fallback keeps that case on OUR repo's default branch —
+      # unpinned, but still just-akash rather than the caller's tree.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          repository: ${{ job.workflow_repository || 'Digital-Frontier-LDA/just-akash' }}
+          ref: ${{ job.workflow_sha }}
+          path: .just-akash
           persist-credentials: false
 
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -309,7 +352,13 @@ jobs:
           version: "2.0"
           services:
             runner:
-              image: ghcr.io/akash-network/github-runner:latest
+              # THE SAME DIGEST sdl/github-runner-probe.yaml qualifies against, and a
+              # test asserts they stay equal. A provider earns runner_host by scheduling
+              # the probe image three consecutive times; running a different image here
+              # means the pool trusts a measurement taken of something else. `:latest`
+              # made that gap permanent and silent — the tag can move between the
+              # qualification and the run that relies on it.
+              image: ghcr.io/akash-network/github-runner@sha256:030ae11a6b597c5db28b12375461e35f694d74ceb06a1b73c90545b1adef16da
               env:
                 - ACCESS_TOKEN=${GH_RUNNER_PAT}
                 - ORG_NAME=${ORG}
@@ -358,13 +407,18 @@ jobs:
           TAG_PREFIX: ${{ inputs.tag-prefix }}
           RUN_ID: ${{ github.run_id }}
           MAX_ATTEMPTS: '3'
-          RUNNER_WAIT_TRIES: '90'
+          RUNNER_WAIT_TRIES: ${{ inputs.runner-wait-tries }}
         run: |
           set -uo pipefail
           # An ARRAY, not a string. Both this and the provider list rely on word
           # splitting, so quoting them breaks the command and NOT quoting them is SC2086.
           # Arrays are the only form that is both correct and lint-clean.
           JA=(uv run --with . just-akash)
+
+          # A free-text input feeding `seq`: junk would make the wait loop a no-op and
+          # every pool instantly "never registered". Clamp like MIN_POOL below.
+          case "${RUNNER_WAIT_TRIES}" in ''|*[!0-9]*) RUNNER_WAIT_TRIES=90 ;; esac
+          [ "$RUNNER_WAIT_TRIES" -ge 1 ] 2>/dev/null || RUNNER_WAIT_TRIES=90
 
           MIN_POOL="${MIN_POOL_SIZE:-}"
           case "$MIN_POOL" in ''|*[!0-9]*) MIN_POOL="$POOL_SIZE" ;; esac

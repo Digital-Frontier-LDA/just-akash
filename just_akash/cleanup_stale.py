@@ -15,6 +15,12 @@ disposable test residue; when in doubt, leave it and say so:
   * services == {probe}     and older than 1h   -> STALE (leaked smoke probe)
   * services == {backtest}  and older than 48h  -> STALE (leaked e2e workload;
     every e2e destroys its deployment in-run, so a 2-day-old one is a leak)
+  * services == {runner}    and older than 6h   -> STALE **only with
+    --reap-runners**; otherwise LEAVE. Nothing on chain proves a `runner`
+    service is ours, so this is the operator asserting it about their own
+    account. 6h because a pool is long-lived by design (`ephemeral: false`
+    outlives one job, a slow matrix runs for hours), while the e2e's 48h would
+    let one cancelled run starve every other pool spending from the same grant
   * services == {}           -> LEAVE (provider reported nothing: cannot classify)
   * anything else (node, runner, train, ...) -> LEAVE (real or unknown workload)
   * unknown age -> LEAVE (never mis-age and reap wrongly)
@@ -51,11 +57,25 @@ from .smoke_providers import (
 E2E_SERVICE = "backtest"
 STALE_E2E_AGE_SECONDS = 48 * 3600
 
-STALE_VERDICTS = ("STALE-probe", "STALE-e2e")
+# runner-pool.yml renders an SDL whose sole service is `runner`, and nothing reaped it:
+# `runner` fell into LEAVE-real-or-unknown, so a pool cancelled between deploy and
+# teardown leaked its lease forever. docs/github-runners.md sells `tag-prefix` as the
+# thing that lets "a sweeper reap this run's lease", and runner-teardown.yml defers to
+# an "akash-stale-sweeper" that does not exist here — this is that sweeper.
+#
+# 6h, not the probe's 1h: a pool is a LONG-LIVED workload by design. `ephemeral: false`
+# keeps one alive across a queue of jobs, and a slow matrix on a small pool can legitimately
+# run for hours, so an hour would reap live CI. It is not the e2e's 48h either, because at
+# spike every leaked lease holds escrow against the same grant every other pool spends
+# from — two days of that is what turns one cancelled run into a fleet-wide 402.
+RUNNER_SERVICE = "runner"
+STALE_RUNNER_AGE_SECONDS = 6 * 3600
+
+STALE_VERDICTS = ("STALE-probe", "STALE-e2e", "STALE-runner")
 
 
 def classify(
-    detail: dict, dseq: str, now: float | None = None
+    detail: dict, dseq: str, now: float | None = None, reap_runners: bool = False
 ) -> tuple[str, list[str], float | None]:
     """(verdict, services, age_seconds) for one deployment detail."""
     services = sorted(_deployment_service_names(detail))
@@ -68,6 +88,21 @@ def classify(
         if age is not None and age >= STALE_E2E_AGE_SECONDS:
             return "STALE-e2e", services, age
         return "LEAVE-recent-backtest", services, age
+    if services == [RUNNER_SERVICE]:
+        # OPT-IN ONLY, and the default must stay off. `runner` is the service name
+        # runner-pool.yml renders, but NOTHING on chain proves a given `runner` service
+        # is ours: just-akash's tags live in a local file (see runner-teardown.yml), and
+        # `status --json` emits none, so a sweeper cannot check ownership. A sweep that
+        # reaped by shape alone once destroyed 14 third-party deployments.
+        #
+        # So this stays the operator's assertion about their OWN account rather than
+        # this module's inference — enable it where the Console account hosts nothing
+        # but your CI pools.
+        if not reap_runners:
+            return "LEAVE-real-or-unknown", services, age
+        if age is not None and age >= STALE_RUNNER_AGE_SECONDS:
+            return "STALE-runner", services, age
+        return "LEAVE-recent-runner", services, age
     if not services:
         return "LEAVE-unclassifiable", services, age
     return "LEAVE-real-or-unknown", services, age
@@ -87,7 +122,7 @@ def _credit_line(client: AkashConsoleAPI, address: str) -> str:
     )
 
 
-def run(*, execute: bool = False, now: float | None = None) -> int:
+def run(*, execute: bool = False, now: float | None = None, reap_runners: bool = False) -> int:
     api_key = os.environ.get("AKASH_API_KEY")
     if not api_key:
         print("Error: AKASH_API_KEY not set.", file=sys.stderr)
@@ -112,7 +147,7 @@ def run(*, execute: bool = False, now: float | None = None) -> int:
         except Exception as exc:  # noqa: BLE001 — one unreadable deployment must not stop the audit
             print(f"  {dseq}  ERROR reading detail: {exc} -> LEAVE")
             continue
-        verdict, services, age = classify(detail, dseq, now)
+        verdict, services, age = classify(detail, dseq, now, reap_runners)
         age_str = f"{age / 86400:5.1f}d" if age is not None else "   ?  "
         print(f"  {dseq}  age={age_str}  services={services or '-'}  -> {verdict}")
         if verdict in STALE_VERDICTS:
@@ -148,8 +183,17 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Actually close the stale deployments (default: dry-run report only).",
     )
+    ap.add_argument(
+        "--reap-runners",
+        action="store_true",
+        help=(
+            "Also treat a lone `runner` service older than 6h as stale. OFF by default: "
+            "nothing on chain proves a `runner` service is a just-akash CI pool, so this "
+            "is YOUR assertion that this Console account hosts nothing else."
+        ),
+    )
     args = ap.parse_args(argv)
-    return run(execute=args.execute)
+    return run(execute=args.execute, reap_runners=args.reap_runners)
 
 
 if __name__ == "__main__":

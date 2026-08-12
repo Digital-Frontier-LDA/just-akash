@@ -229,7 +229,7 @@ operator's trust decision everyone else's. Qualify your own:
 ```bash
 # No PAT needed. With `admin:org` on your existing credential the probe mints a
 # short-lived runner registration token itself, so full qualification is the default.
-python -m just_akash.runner_probe \
+just-akash runner-probe \
   --providers akash1…,akash1… \
   --cpu 4 --memory 16Gi --storage 30Gi \
   --org my-org --attempts 3 --json
@@ -319,6 +319,18 @@ Two things leak, and only one is the lease:
    registrations once overflowed the first page of an org's runner listing and broke
    provisioning for *every repo in the org*. `EPHEMERAL=true` removes a runner that **ran
    a job**; it does nothing for one that registered and was never used.
+
+**Nothing else reaps a runner lease by default.** `python -m just_akash.cleanup_stale`
+classifies by service set, and a pool's service is `runner`, which lands in
+`LEAVE-real-or-unknown` — nothing on chain proves a `runner` service is yours, and a
+sweep that reaped by shape alone once destroyed 14 third-party deployments. Pass
+`--reap-runners` to close lone `runner` services older than 6h; that flag is you
+asserting the Console account hosts nothing but your own pools. Six hours, not one,
+because `ephemeral: false` outlives a job and a slow matrix runs for hours.
+
+The teardown also reports `deregister_failed`. Treat non-zero as urgent rather than
+cosmetic: each surviving registration stays in the listing every future poll pages
+through, so it makes the next run slower and likelier to be throttled.
 
 `if: always()` matters: a teardown gated on success leaves the lease open on exactly the
 runs that failed — the ones most likely to have left something burning escrow. The

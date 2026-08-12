@@ -137,7 +137,10 @@ def test_min_pool_is_clamped_against_junk_and_out_of_range():
     degrade to pool-size rather than making the discard test meaningless."""
     body = PROVISION["run"]
     assert "*[!0-9]*" in body, "non-numeric input must be rejected"
-    assert "-ge 1" in body, "0 would accept an empty pool as healthy"
+    # Named, not bare "-ge 1": a second clamp elsewhere in the step (runner-wait-tries)
+    # satisfied the loose form and made this guard vacuous — caught by the anti-vacuity
+    # pass below, which is exactly the failure it exists to surface.
+    assert '[ "$MIN_POOL" -ge 1 ]' in body, "0 would accept an empty pool as healthy"
     assert '-le "$POOL_SIZE"' in body, "above pool-size the loop can never satisfy it"
 
 
@@ -279,6 +282,89 @@ def test_every_failure_world_has_its_own_reason():
     ):
         assert f"failure_reason={reason}" in body, f"{reason} is never emitted"
     assert "failure_reason" in OUTPUTS, "the caller cannot see why it fell back"
+
+
+def _checkout(steps: list) -> dict:
+    return next(s for s in steps if "actions/checkout" in s.get("uses", ""))
+
+
+def test_the_workflow_checks_out_just_akash_not_the_caller():
+    """A reusable workflow's job runs in the CALLER's context, so `github.repository` is
+    THEIR repo and a bare checkout fetches THEIR code. `uv run --with .` then installs
+    the caller's package — or fails outright when they have no pyproject.toml —
+    `just-akash` is never on PATH, and `python -m just_akash.runner_candidates` raises
+    ModuleNotFoundError.
+
+    This is the difference between "works in this repo" and "works for a consumer", and
+    nothing in this repo calls these workflows, so it was never exercised."""
+    for label, steps in (("pool", STEPS), ("teardown", TD_STEPS)):
+        with_ = _checkout(steps).get("with", {})
+        repo = str(with_.get("repository", ""))
+        assert repo, f"{label}: a bare checkout fetches the CALLER's repo, which has no just_akash"
+        assert "job.workflow_repository" in repo or repo.endswith("/just-akash"), (
+            f"{label}: repository={repo!r} does not name just-akash"
+        )
+        assert with_.get("path"), f"{label}: must not overwrite the caller's workspace root"
+
+
+def test_the_cli_source_is_pinned_to_the_ref_the_caller_pinned():
+    """Tracking a branch would let the classification tables, the SDL and the
+    provider-qualification bar change under a consumer whose pin never moved — which is
+    the entire reason they pinned a ref. `job.workflow_sha` is the commit of this
+    reusable workflow file, so the CLI always matches the workflow.
+
+    Note the context: `github.*` is always the CALLER's, so `github.workflow_ref` here
+    names their entry workflow, not ours. Only the `job` context refers to the reusable
+    workflow file. An undefined property evaluates to empty rather than erroring, so if
+    GitHub ever withdraws it the checkout degrades to just-akash's default branch —
+    unpinned, but still our source and not the caller's tree.
+    """
+    for label, steps in (("pool", STEPS), ("teardown", TD_STEPS)):
+        ref = str(_checkout(steps).get("with", {}).get("ref", ""))
+        assert "job.workflow_sha" in ref, (
+            f"{label}: ref={ref!r} — a floating ref breaks the guarantee a pin exists for"
+        )
+        assert "github.workflow_sha" not in ref, (
+            f"{label}: the github context is the CALLER's workflow, not this one"
+        )
+
+
+def test_every_uv_invocation_runs_from_the_just_akash_checkout():
+    """`uv run --with .` resolves `.` against the working directory, so checking the
+    source into a path without pointing the run steps at it reintroduces the same
+    failure one layer down."""
+    for label, doc, job in (("pool", DOC, "pool"), ("teardown", TD, "teardown")):
+        wd = doc["jobs"][job].get("defaults", {}).get("run", {}).get("working-directory", "")
+        assert wd, f"{label}: run steps still execute from the caller's workspace root"
+        path = _checkout(doc["jobs"][job]["steps"]).get("with", {}).get("path", "")
+        assert wd.strip("./") == path.strip("./"), (
+            f"{label}: working-directory {wd!r} does not match checkout path {path!r}"
+        )
+
+
+def test_the_pool_runs_the_image_providers_were_qualified_against():
+    """A provider earns runner_host by scheduling the PROBE image three consecutive
+    times. Running a different image in the pool means the pool is trusting a
+    measurement taken of something else — and `:latest` made that gap permanent and
+    silent, since the tag can move between the qualification and the run relying on it.
+
+    The probe SDL already explains why it pins a digest; this asserts the pool did not
+    quietly opt out of that reasoning."""
+    probe_sdl = (Path(__file__).resolve().parents[1] / "sdl/github-runner-probe.yaml").read_text()
+
+    def _image(text: str, what: str) -> str:
+        m = re.search(r"image:\s*(\S+)", text)
+        assert m, f"no image found in {what}"
+        return m.group(1)
+
+    probe_img = _image(probe_sdl, "the probe SDL")
+    pool_img = _image(_code(_step("Render runner SDL")["run"]), "the rendered pool SDL")
+
+    assert "@sha256:" in pool_img, f"the pool image must be digest-pinned, got {pool_img}"
+    assert pool_img == probe_img, (
+        f"pool runs {pool_img} but providers are qualified against {probe_img} — "
+        "the qualification measures a different artifact than the pool runs"
+    )
 
 
 def test_wallet_contention_is_not_reported_as_a_market_outage():
@@ -453,6 +539,13 @@ MUTATIONS = [
         lambda s: s.replace("failure_reason=WALLET_UNDERFUNDED", "failure_reason=INFRA"),
     ),
     ("sdl token redacted", lambda s: s.replace("grep -vE 'ACCESS_TOKEN'", "cat")),
+    (
+        "pool image matches the probe",
+        lambda s: s.replace(
+            "github-runner@sha256:030ae11a6b597c5db28b12375461e35f694d74ceb06a1b73c90545b1adef16da",
+            "github-runner:latest",
+        ),
+    ),
     # The count must survive a multi-page org. Both shapes below are what a reader
     # "tidying up" the jq would plausibly write, and each restores the bug.
     ("online count is line-based", lambda s: s.replace("grep -c .", "head -1")),
@@ -478,6 +571,16 @@ MUTATIONS = [
         ),
     ),
     ("contention backoff is jittered", lambda s: s.replace("(RANDOM % 20) + 10", "15")),
+    # The consumer-facing trio: fetch OUR source, at the ref they pinned, and run there.
+    (
+        "checkout names just-akash",
+        lambda s: re.sub(r"\n\s*repository: [^\n]*just-akash[^\n]*", "", s, count=1),
+    ),
+    ("cli ref is the pinned one", lambda s: s.replace("job.workflow_sha", "github.ref")),
+    (
+        "uv runs from our checkout",
+        lambda s: s.replace("working-directory: .just-akash", "working-directory: ."),
+    ),
     (
         "checkout credentials",
         lambda s: s.replace("persist-credentials: false", "persist-credentials: true"),

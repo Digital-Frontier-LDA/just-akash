@@ -459,8 +459,14 @@ def _run_noop_job(
                 repo,
                 "--workflow",
                 "runner-probe-job.yml",
+                # Not 10. Every concurrent probe dispatches THIS workflow, so at any
+                # fleet scale the run we just triggered is pushed off a 10-row window by
+                # other probes' runs — `ever_started` stays False, the attempt reports
+                # SCHEDULED_ONLY, and nothing can ever be promoted to runner_host. The
+                # createdAt filter below is what establishes identity; this window only
+                # has to be wide enough to contain our row.
                 "--limit",
-                "10",
+                "100",
                 "--json",
                 "status,conclusion,createdAt",
             ],
@@ -740,8 +746,12 @@ def _run_probes(args, token: str, token_kind: str, tmpdir: str) -> list[Provider
     return verdicts
 
 
-def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Qualify providers as runner hosts.")
+def main(argv: list[str] | None = None, prog: str = "") -> int:
+    # prog is set when dispatched from `just-akash runner-probe`, so the usage line
+    # names the command the operator actually typed rather than the bare binary.
+    ap = argparse.ArgumentParser(
+        prog=prog or None, description="Qualify providers as runner hosts."
+    )
     ap.add_argument("--providers", required=True, help="comma-separated akash1… addresses")
     ap.add_argument("--cpu", default="4")
     ap.add_argument("--memory", default="16Gi")

@@ -69,6 +69,13 @@ on:
       deregistered:
         description: 'Offline runner registrations removed.'
         value: ${{ jobs.teardown.outputs.deregistered }}
+      deregister_failed:
+        description: >-
+          Registrations that could NOT be removed. Non-zero is a compounding leak, not
+          a cosmetic one: each survivor stays in the org listing that every pool's
+          poll pages through, so it slows and destabilises later runs, and enough of
+          them overflow a page and break provisioning org-wide.
+        value: ${{ jobs.teardown.outputs.deregister_failed }}
 
 permissions:
   contents: read
@@ -80,9 +87,20 @@ jobs:
     outputs:
       closed: ${{ steps.close.outputs.closed }}
       deregistered: ${{ steps.dereg.outputs.deregistered }}
+      deregister_failed: ${{ steps.dereg.outputs.deregister_failed }}
+    defaults:
+      run:
+        working-directory: .just-akash
     steps:
+      # just-akash's OWN source, not the caller's — see the long note in
+      # runner-pool.yml. It bites harder here: this job's whole purpose is closing a
+      # lease, and a checkout that yields no `just-akash` binary fails the destroy while
+      # the lease keeps holding escrow against the grant the next run spends from.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          repository: ${{ job.workflow_repository || 'Digital-Frontier-LDA/just-akash' }}
+          ref: ${{ job.workflow_sha }}
+          path: .just-akash
           persist-credentials: false
 
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -123,9 +141,11 @@ jobs:
           # stamped and what a sweeper matches on — it is documentation here, not a
           # gate, and it must not be dressed up as one.
           #
-          # A sweeper that reaps by tag across deployments it did not create is the
-          # thing that needs the prefix check (14 third-party deployments were once
-          # destroyed that way). That is akash-stale-sweeper's job, not this one's.
+          # A sweeper that reaps deployments it did not create is the thing that needs
+          # an ownership check (14 third-party deployments were once destroyed that way),
+          # and it cannot have one for the same reason. So the sweeper for leaked pools is
+          # OPT-IN, not inference: `python -m just_akash.cleanup_stale --reap-runners`,
+          # where the operator asserts the account hosts nothing but their own pools.
           echo "closing dseq=$DSEQ (created by this run; tagged ${TAG_PREFIX}-*)"
 
           for _try in 1 2 3; do
@@ -197,10 +217,28 @@ jobs:
           IDS=$(gh api --paginate "orgs/${ORG}/actions/runners?per_page=100" \
                 --jq ".runners[] | select(.status==\"offline\") | select(any(.labels[].name; .==\"${RUNNER_LABEL}\")) | .id" 2>/dev/null || true)
 
+          # A DELETE costs 5 points against GitHub's 900-points-per-minute secondary
+          # limit (a GET costs 1), so a spike tearing down 100+ runners spends ~500 in
+          # one burst — and several teardowns landing together will be throttled.
+          #
+          # Failures here are not cosmetic, they COMPOUND: a registration that survives
+          # inflates the org listing, every future pool's poll pages that listing, and
+          # more polling makes the next throttle likelier. The listing is also what
+          # overflowed a page and broke provisioning for every repo in the org. So a
+          # throttled burst must be counted and reported, not left as N per-runner
+          # warnings nobody totals.
           N=0
+          FAILED=0
           for id in $IDS; do
-            gh api -X DELETE "orgs/${ORG}/actions/runners/${id}" >/dev/null 2>&1 && N=$((N+1)) \
-              || echo "::warning::could not de-register runner ${id}"
+            if gh api -X DELETE "orgs/${ORG}/actions/runners/${id}" >/dev/null 2>&1; then
+              N=$((N+1))
+            else
+              FAILED=$((FAILED+1))
+            fi
           done
           echo "deregistered=$N" >> "$GITHUB_OUTPUT"
+          echo "deregister_failed=$FAILED" >> "$GITHUB_OUTPUT"
           echo "de-registered ${N} offline runner(s) labelled ${RUNNER_LABEL}"
+          if [ "$FAILED" -gt 0 ]; then
+            echo "::warning title=${FAILED} runner registration(s) left behind::They stay in the org listing, which every pool's poll pages through — so this makes the NEXT run slower and likelier to be throttled, and enough of them overflow a page and break provisioning org-wide. Usual cause at spike is the 900-points/minute secondary limit (a DELETE costs 5). Re-run this teardown, or sweep offline runners for label ${RUNNER_LABEL}."
+          fi
