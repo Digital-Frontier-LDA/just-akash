@@ -408,10 +408,33 @@ jobs:
             "${JA[@]}" tag --dseq "$DSEQ" --name "${TAG_PREFIX}-${RUN_ID}" \
               || echo "::warning::tag failed for dseq=$DSEQ — a sweeper will not see it"
 
+            # COUNT LINES, NEVER `| length`. `gh api --paginate --jq` applies the jq
+            # filter to EACH PAGE SEPARATELY and concatenates the results, so an
+            # aggregating filter emits one number PER PAGE: an org with >100 runners
+            # returned "2\n1" here, not "3".
+            #
+            # That is not a cosmetic miscount, it inverts this job's verdict. Every
+            # `[ "$ONLINE" -ge ... ]` below then dies with "integer expression
+            # expected" and returns NON-ZERO, so the `-lt "${MIN_POOL}"` discard branch
+            # is never taken and the pool is declared HEALTHY with zero runners online
+            # — `runs-on` targets a label nothing answers to and the caller's jobs queue
+            # until timeout, which is strictly worse than the hosted-runner fallback
+            # this workflow exists to provide. It would also write a multi-line
+            # `runners_online` into $GITHUB_OUTPUT, corrupting every later output.
+            #
+            # >100 runners in an org is the NORMAL case here, not an exotic one:
+            # offline registrations accumulate (see the teardown's de-registration
+            # step) and once overflowed an org's runner listing outright.
+            #
+            # A per-match line survives page concatenation intact, so emit `.id` and
+            # count. `grep -c .` always prints exactly one integer, including 0 for
+            # empty input (a failed `gh` included), which is what `|| echo 0` did.
+            # `--slurp` would also work but only on gh >= 2.53; this needs no floor.
             ONLINE=0
             for i in $(seq 1 "$RUNNER_WAIT_TRIES"); do
               ONLINE=$(gh api --paginate "orgs/${ORG}/actions/runners?per_page=100" \
-                --jq "[.runners[] | select(.status==\"online\") | select(any(.labels[].name; .==\"${RUNNER_LABEL}\"))] | length" 2>/dev/null || echo 0)
+                --jq ".runners[] | select(.status==\"online\") | select(any(.labels[].name; .==\"${RUNNER_LABEL}\")) | .id" \
+                2>/dev/null | grep -c . || true)
               echo "  ${ONLINE:-0}/${POOL_SIZE} online (usable at ${MIN_POOL})"
               [ "${ONLINE:-0}" -ge "${POOL_SIZE}" ] && break
               sleep 5

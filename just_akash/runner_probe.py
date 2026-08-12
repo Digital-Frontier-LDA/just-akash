@@ -527,13 +527,26 @@ def _registered(org: str, label: str, api_token: str, timeout_s: int) -> bool:
                 # existed. The job then dispatched at a label owned only by corpses and
                 # queued until timeout: JOB_NOT_RUN blamed on the provider. Measured with
                 # 13 offline probe runners listed and zero online.
-                f'[.runners[] | select(.status=="online") '
-                f'| select(any(.labels[].name; .=="{label}"))] | length',
+                # ONE LINE PER MATCH, never an aggregating `| length`. With
+                # --paginate, gh applies this filter to EACH PAGE SEPARATELY and
+                # concatenates the outputs, so `| length` emits one number per page:
+                # an org with >100 runners produced "2\n1", whose `.isdigit()` is
+                # False, so this returned False for the whole window no matter how
+                # many runners were up. That reports POD_NO_REGISTER, which is a
+                # PERMANENT runner_deny (it outranks any later streak) against a
+                # provider that hosted the runner correctly — the single most
+                # expensive wrong verdict this module can reach, and one that only
+                # appears on the large orgs where a runner pool matters most.
+                #
+                # A stream of scalars survives page concatenation unchanged, so the
+                # count is line-based here rather than parsed out of jq.
+                f'.runners[] | select(.status=="online") '
+                f'| select(any(.labels[].name; .=="{label}")) | .id',
             ],
             timeout=60,
             env=env,
         )
-        if rc == 0 and out.strip().isdigit() and int(out.strip()) > 0:
+        if rc == 0 and any(line.strip() for line in out.splitlines()):
             return True
         time.sleep(10)
     return False

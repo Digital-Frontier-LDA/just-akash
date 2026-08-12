@@ -135,6 +135,57 @@ def test_accepting_a_partial_pool_is_announced():
 
 
 # --------------------------------------------------------------------------
+# GitHub paginates — and an aggregating --jq silently inverts this job's verdict
+# --------------------------------------------------------------------------
+
+
+def test_the_online_count_survives_a_paginated_org():
+    """`gh api --paginate --jq` runs the filter against EACH PAGE and concatenates the
+    results, so an aggregating filter emits one value PER PAGE: an org with >100 runners
+    returned "2\\n1" instead of "3".
+
+    That is not a miscount, it inverts the verdict. `[ "$ONLINE" -ge N ]` on a
+    multi-line value exits NON-ZERO with "integer expression expected", so the
+    `-lt "${MIN_POOL}"` discard branch is never taken and a pool with ZERO online
+    runners is published as healthy — `runs-on` then targets a label nothing answers
+    to, which is worse than the hosted fallback this workflow exists to provide.
+
+    >100 runners is the normal case, not an exotic one: offline registrations
+    accumulate and once overflowed an org's runner listing outright.
+    """
+    body = PROVISION["run"]
+    poll = body[body.index("gh api --paginate") : body.index("online (usable at")]
+    assert "| length" not in poll, (
+        "an aggregating jq filter emits one value per page under --paginate, and a "
+        "multi-line ONLINE makes every integer test below error-out into 'healthy'"
+    )
+    assert "grep -c" in poll or "--slurp" in poll, (
+        "the count must survive page concatenation — count matched LINES, or --slurp"
+    )
+
+
+def test_the_online_count_is_a_single_integer_on_every_path():
+    """ONLINE feeds three integer comparisons and $GITHUB_OUTPUT. Anything that can
+    return empty or multi-line corrupts all four — a multi-line value written to
+    $GITHUB_OUTPUT without a heredoc delimiter also breaks every LATER output in the
+    file, not just this one."""
+    body = PROVISION["run"]
+    poll = body[body.index("gh api --paginate") : body.index("online (usable at")]
+    assert "grep -c ." in poll, "grep -c prints exactly one integer, 0 included"
+    assert "|| true" in poll or "|| echo 0" in poll, (
+        "grep -c exits 1 on zero matches; the assignment must not carry that outward"
+    )
+
+
+def test_the_runner_query_is_still_paginated_at_all():
+    """Without --paginate the poll only ever sees the first 100 runners, so a pool whose
+    registrations land on page 2 reads as never having come online — RUNNER_NEVER_
+    REGISTERED against providers that did their job."""
+    poll = PROVISION["run"]
+    assert "--paginate" in poll and "per_page=100" in poll
+
+
+# --------------------------------------------------------------------------
 # Naming the failure — "(infra)" for everything is what grew the bill
 # --------------------------------------------------------------------------
 
@@ -287,6 +338,11 @@ MUTATIONS = [
         lambda s: s.replace("failure_reason=WALLET_UNDERFUNDED", "failure_reason=INFRA"),
     ),
     ("sdl token redacted", lambda s: s.replace("grep -vE 'ACCESS_TOKEN'", "cat")),
+    # The count must survive a multi-page org. Both shapes below are what a reader
+    # "tidying up" the jq would plausibly write, and each restores the bug.
+    ("online count is line-based", lambda s: s.replace("grep -c .", "head -1")),
+    ("no aggregating jq under paginate", lambda s: s.replace('| .id"', '] | length"')),
+    ("runner poll stays paginated", lambda s: s.replace("--paginate ", "")),
     (
         "checkout credentials",
         lambda s: s.replace("persist-credentials: false", "persist-credentials: true"),
@@ -400,6 +456,24 @@ def test_deregistration_is_scoped_to_this_runs_label():
     body = TD_DEREG["run"]
     assert '.==\\"${RUNNER_LABEL}\\"' in body or "${RUNNER_LABEL}" in body
     assert 'select(.status=="offline")' in body.replace('\\"', '"')
+
+
+def test_deregistration_sees_every_page_of_the_org():
+    """This step is where pagination bites hardest, in both directions.
+
+    Without --paginate it only ever sees the first 100 runners, so the offline
+    registrations that overflowed page 1 — the exact ones that broke provisioning for
+    every repo in the org — are the ones it can never clean, and the leak is
+    self-sustaining.
+
+    And the filter must stay a STREAM of ids: `gh api --paginate --jq` runs the filter
+    per page and concatenates, so `.runners[] | ... | .id` yields a correct id list
+    across pages while any aggregating form yields one value per page.
+    """
+    body = TD_DEREG["run"]
+    assert "--paginate" in body, "page 1 only cannot drain a listing that overflowed"
+    assert "| length" not in body, "an aggregate emits one value per page, not one per runner"
+    assert re.search(r"\|\s*\.id", body), "must emit one id per line to survive concatenation"
 
 
 def test_teardown_does_not_claim_an_ownership_check_it_cannot_perform():

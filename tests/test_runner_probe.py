@@ -727,6 +727,50 @@ def test_registration_counts_only_ONLINE_runners(monkeypatch):
     assert '.status=="online"' in seen["jq"], "an offline leftover must not count as registered"
 
 
+def test_registration_survives_a_multi_page_org(monkeypatch):
+    """GitHub paginates `orgs/{org}/actions/runners`, and `gh api --paginate --jq`
+    applies the filter to EACH PAGE separately, concatenating the results.
+
+    So an aggregating filter (`[...] | length`) emits one number PER PAGE. On an org
+    with >100 runners this read back "2\\n1", whose `.isdigit()` is False — so the
+    probe reported the runner as never registered no matter how many were online.
+    That is POD_NO_REGISTER, i.e. a PERMANENT runner_deny (it outranks any later
+    streak) against a provider that hosted the runner correctly, and it only fires on
+    the large orgs where a runner pool is worth having.
+
+    The fix is shape, not parsing: one line per match survives concatenation.
+    """
+    monkeypatch.setattr(rp, "_run", lambda cmd, timeout=60, env=None: (0, "241\n578\n"))
+    assert rp._registered("org", "probe-x", "", 1) is True, (
+        "two pages of one matching runner each must read as registered"
+    )
+
+
+def test_registration_jq_emits_one_line_per_runner_not_a_count(monkeypatch):
+    """Locks the shape above. An aggregating filter is the natural thing to write here
+    and it is wrong specifically under --paginate."""
+    seen = {}
+
+    def fake(cmd, timeout=60, env=None):
+        seen["jq"] = cmd[cmd.index("--jq") + 1]
+        assert "--paginate" in cmd, "page 1 only cannot see a runner that landed on page 2"
+        return 0, "1"
+
+    monkeypatch.setattr(rp, "_run", fake)
+    rp._registered("org", "probe-x", "", 1)
+    assert "length" not in seen["jq"], "an aggregate emits one value per page"
+
+
+def test_no_matching_runner_is_still_not_registered(monkeypatch):
+    """The counterpart to the fix: relaxing the parse must not make empty output — or a
+    failed `gh` — read as success. A false PASS promotes a provider on a bar nobody
+    measured, which is the failure SCHEDULED_ONLY exists to prevent."""
+    monkeypatch.setattr(rp, "_run", lambda cmd, timeout=60, env=None: (0, "\n  \n"))
+    assert rp._registered("org", "probe-x", "", 0) is False
+    monkeypatch.setattr(rp, "_run", lambda cmd, timeout=60, env=None: (1, "241\n"))
+    assert rp._registered("org", "probe-x", "", 0) is False, "a failed gh is not evidence"
+
+
 def test_runner_labels_are_unique_per_run(monkeypatch, tmp_path):
     """Two runs of the same provider+attempt must not share a label, or each run inherits
     the previous run's dead registrations."""

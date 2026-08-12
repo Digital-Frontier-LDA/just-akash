@@ -186,6 +186,14 @@ jobs:
           # Scoped to THIS run's label. An org-wide "delete every offline runner" would
           # race other repos' in-flight provisioning, where a runner is briefly offline
           # between registering and coming up.
+          #
+          # The filter emits ONE LINE PER RUNNER and that shape is load-bearing — do not
+          # "tidy" it into `[...] | .id` or any aggregating form. `gh api --paginate
+          # --jq` runs the filter against EACH PAGE SEPARATELY and concatenates the
+          # output, so a stream of ids stays a correct id list across pages while an
+          # aggregate emits one value per page. This step is exactly where that matters:
+          # de-registration is what keeps the org UNDER one page, so the first run that
+          # needs it most is the one running against several.
           IDS=$(gh api --paginate "orgs/${ORG}/actions/runners?per_page=100" \
                 --jq ".runners[] | select(.status==\"offline\") | select(any(.labels[].name; .==\"${RUNNER_LABEL}\")) | .id" 2>/dev/null || true)
 
