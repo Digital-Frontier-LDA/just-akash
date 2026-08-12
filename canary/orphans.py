@@ -56,10 +56,19 @@ def _uact(value: object) -> int:
     non-numeric escrow -- which in production would have taken out the whole exposition and,
     with it, every orphan signal. A malformed field must cost one number, not the file.
     """
-    try:
-        return int(value or 0)
-    except (TypeError, ValueError):
+    # bool BEFORE int, because a bool IS an int in Python: `escrow_uact: true` would
+    # otherwise publish as 1 uact, a plausible-looking number invented from a type error.
+    # canary/collect.py excludes bool from _is_number for the same reason.
+    if isinstance(value, bool):
         return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return 0
+    return 0
 
 
 def render(report: dict) -> str:

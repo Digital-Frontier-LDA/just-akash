@@ -145,3 +145,29 @@ def test_main_renders_to_stdout(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert 'akash_canary_orphan_escrow_uact{dseq="7"} 42' in out
     assert "akash_canary_orphans_total 1" in out
+
+
+def test_a_boolean_escrow_is_not_worth_one_uact():
+    """bool IS an int in Python, so `escrow_uact: true` would publish as 1 — a plausible
+    number invented from a type error. canary/collect.py excludes bool from _is_number for
+    exactly this reason. Caught by pyright, not by the original try/except."""
+    out = render(
+        _rep(deployments=[{"dseq": "1", "classification": "ORPHANED", "escrow_uact": True}])
+    )
+    assert 'akash_canary_orphan_escrow_uact{dseq="1"} 0' in out
+    assert "akash_canary_orphan_escrow_uact_total 0" in out
+
+
+def test_a_numeric_string_escrow_is_accepted():
+    """The LCD has been seen returning amounts as strings."""
+    out = render(
+        _rep(deployments=[{"dseq": "1", "classification": "ORPHANED", "escrow_uact": " 2000000 "}])
+    )
+    assert 'akash_canary_orphan_escrow_uact{dseq="1"} 2000000' in out
+
+
+def test_a_float_escrow_truncates_rather_than_crashing():
+    out = render(
+        _rep(deployments=[{"dseq": "1", "classification": "ORPHANED", "escrow_uact": 2000000.9}])
+    )
+    assert 'akash_canary_orphan_escrow_uact{dseq="1"} 2000000' in out
