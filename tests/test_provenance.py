@@ -13,6 +13,7 @@ from __future__ import annotations
 from just_akash.provenance import (
     PLACEMENT_PREFIX,
     SIBLING_REAPED_PREFIX,
+    _heredocs,
     inline_sdls,
     placement_keys,
     sdl_files,
@@ -91,6 +92,61 @@ def test_the_heredoc_extractor_only_returns_sdls():
     Akash, and the cheapest way to green would be to weaken the guard."""
     for label, text in inline_sdls():
         assert "services:" in text and "profiles:" in text, label
+
+
+# --- heredoc termination follows the shell, because the guard's answer depends on it ---
+
+_SDL_BODY = "services:\n  a:\n    image: x\nprofiles:\n  placement:\n    just-akash-a:\n"
+
+
+def _wrap(opener: str, terminator: str) -> str:
+    return f"{opener}\n{_SDL_BODY}{terminator}\ntrailing: line\n"
+
+
+def test_a_plain_terminator_closes_the_heredoc():
+    assert len(_heredocs(_wrap("cat > /tmp/x.yaml <<SDL", "SDL"))) == 1
+
+
+def test_a_trailing_space_does_not_terminate_a_plain_heredoc():
+    """bash ends `<<WORD` only at a line that is exactly WORD. Accepting `SDL   ` would
+    close a heredoc the shell leaves open — the workflow's real behaviour and this
+    scanner's reading would then disagree, and the scanner is the half that decides
+    whether the provenance guard passes."""
+    assert _heredocs(_wrap("cat > /tmp/x.yaml <<SDL", "SDL   ")) == []
+
+
+def test_an_over_indented_terminator_does_not_close_it():
+    """The terminator must sit at the opener's indent. These bodies are read from RAW
+    workflow YAML, where the block scalar's indent is still present and uniform."""
+    assert _heredocs(_wrap("  cat > /tmp/x.yaml <<SDL", "      SDL")) == []
+
+
+def test_the_terminator_must_match_the_openers_indent():
+    body = "  cat > /tmp/x.yaml <<SDL\n" + _SDL_BODY + "  SDL\n"
+    assert len(_heredocs(body)) == 1
+
+
+def test_eof_before_the_terminator_yields_nothing():
+    """bash does not treat EOF as a completed heredoc, so neither may this. Otherwise a
+    truncated workflow produces a valid-looking SDL and the guard passes on a file that
+    would never run."""
+    assert _heredocs("cat > /tmp/x.yaml <<SDL\n" + _SDL_BODY) == []
+
+
+def test_a_body_line_that_merely_trims_to_the_marker_does_not_cut_it_short():
+    """The old `strip() == word` test would end the heredoc here and silently truncate
+    the SDL — losing whatever came after, including the placement block."""
+    body = "cat > /tmp/x.yaml <<SDL\n  SDL\n" + _SDL_BODY + "SDL\n"
+    found = _heredocs(body)
+    assert len(found) == 1
+    assert "just-akash-a" in found[0][1], "the SDL was truncated at a look-alike line"
+
+
+def test_dash_heredoc_allows_leading_tabs_only():
+    """`<<-WORD` strips leading TABS, which is the one case where extra whitespace is
+    legitimate."""
+    assert len(_heredocs("cat > /tmp/x.yaml <<-SDL\n" + _SDL_BODY + "\t\tSDL\n")) == 1
+    assert _heredocs("cat > /tmp/x.yaml <<-SDL\n" + _SDL_BODY + "  SDL\n") == []
 
 
 def test_no_sdl_wears_the_siblings_reaped_prefix():

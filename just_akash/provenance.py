@@ -156,10 +156,61 @@ def sdl_files() -> list[Path]:
 
 
 _WORKFLOW_DIR = Path(__file__).resolve().parent.parent / ".github/workflows"
-# `cat > <path> <<WORD` ... terminated by a line that is exactly WORD.
+# `cat > <path> <<WORD` / `<<-WORD`, optionally quoted. The indent is captured because the
+# terminator must match it — see _heredocs.
 _HEREDOC_RE = re.compile(
-    r"^\s*cat\s*>\s*(?P<path>\S+)\s*<<-?\s*'?(?P<word>[A-Za-z_][A-Za-z0-9_]*)'?\s*$"
+    r"^(?P<indent>[ \t]*)cat\s*>\s*(?P<path>\S+)\s*<<(?P<dash>-?)\s*"
+    r"(?P<q>['\"]?)(?P<word>[A-Za-z_][A-Za-z0-9_]*)(?P=q)[ \t]*$"
 )
+
+
+def _heredocs(text: str) -> list[tuple[str, str]]:
+    """(target path, dedented body) for every heredoc in one shell-bearing document.
+
+    Terminator matching follows the SHELL, not convenience. `<<WORD` ends only at a line
+    that is exactly WORD — no leading and no trailing whitespace — and `<<-WORD` allows
+    leading TABS only. Accepting `strip() == WORD` was more permissive than bash in two
+    ways that both matter here:
+
+      * a body line that merely trims to the marker would cut the SDL short, and
+      * `WORD` with trailing spaces would end a heredoc the shell leaves open.
+
+    Either way the workflow's real behaviour and this scanner's reading diverge, and the
+    scanner is the half that decides whether the provenance guard passes. A guard that
+    green-lights a workflow whose heredoc semantics are broken is worse than no guard.
+
+    The indent is the opener's, because these bodies are read from RAW workflow YAML where
+    the block scalar's indentation is still present; the YAML parser strips it uniformly
+    before the shell ever sees it, so the opener and terminator share it.
+
+    EOF before the terminator yields NOTHING. Bash does not treat that as a completed
+    heredoc, so neither may this — otherwise a truncated workflow produces a
+    valid-looking SDL and the guard passes on a file that would not run.
+    """
+    out: list[tuple[str, str]] = []
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines):
+        m = _HEREDOC_RE.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        indent, dash, word = m.group("indent"), m.group("dash"), m.group("word")
+        body: list[str] = []
+        i += 1
+        closed = False
+        while i < len(lines):
+            line = lines[i]
+            rest = line[len(indent) :] if line.startswith(indent) else None
+            if rest is not None and (rest.lstrip("\t") == word if dash else rest == word):
+                closed = True
+                i += 1
+                break
+            body.append(line)
+            i += 1
+        if closed:
+            out.append((m.group("path"), textwrap.dedent("\n".join(body))))
+    return out
 
 
 def inline_sdls() -> list[tuple[str, str]]:
@@ -175,32 +226,15 @@ def inline_sdls() -> list[tuple[str, str]]:
 
     This module already refuses to silently skip files it cannot read. An SDL it never
     looked at is the same failure, one directory over.
-
-    Dedented because the heredoc body is indented to sit inside the workflow YAML, while
-    :func:`placement_keys` anchors on ``profiles:`` at indent 0 — the real file written to
-    disk has no such indent, so this reconstructs what actually reaches Akash.
     """
     out: list[tuple[str, str]] = []
     if not _WORKFLOW_DIR.is_dir():
         return out
     for wf in sorted(_WORKFLOW_DIR.glob("*.y*ml")):
-        lines = wf.read_text().split("\n")
-        i = 0
-        while i < len(lines):
-            m = _HEREDOC_RE.match(lines[i])
-            if not m:
-                i += 1
-                continue
-            word, body = m.group("word"), []
-            i += 1
-            while i < len(lines) and lines[i].strip() != word:
-                body.append(lines[i])
-                i += 1
-            text = textwrap.dedent("\n".join(body))
+        for path, text in _heredocs(wf.read_text(encoding="utf-8")):
             # Only heredocs that ARE an SDL — a workflow writes plenty of other files.
             if re.search(r"^services:\s*$", text, re.M) and re.search(
                 r"^profiles:\s*$", text, re.M
             ):
-                out.append((f"{wf.name}:{m.group('path')}", text))
-            i += 1
+                out.append((f"{wf.name}:{path}", text))
     return out
