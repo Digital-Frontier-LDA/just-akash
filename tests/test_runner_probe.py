@@ -773,8 +773,18 @@ def test_an_unreadable_listing_is_None_not_absent(monkeypatch):
     None routes to SCHEDULED_ONLY — non-promotable AND non-demoting, which is the honest
     reading of "we never looked successfully".
     """
-    monkeypatch.setattr(rp, "_run", lambda cmd, timeout=60, env=None: (1, ""))
+    # `_run` must actually have been called: with no poll at all `measured` is also
+    # False, so a bare `is None` cannot tell "read once and the read failed" from
+    # "never read", and only the first of those is what this test claims to cover.
+    calls = []
+
+    def fake(cmd, timeout=60, env=None):
+        calls.append(cmd)
+        return 1, ""
+
+    monkeypatch.setattr(rp, "_run", fake)
     assert rp._registered("org", "probe-x", "", 0) is None
+    assert len(calls) == 1, "the listing must have been queried for None to mean anything"
 
     assert (
         rp.classify(bid=True, pod_running=True, registered=None, job_ran=None, torn_down=True)

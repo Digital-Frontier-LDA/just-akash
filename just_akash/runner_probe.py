@@ -562,8 +562,14 @@ def _registered(org: str, label: str, api_token: str, timeout_s: int) -> bool | 
                 #
                 # A stream of scalars survives page concatenation unchanged, so the
                 # count is line-based here rather than parsed out of jq.
+                # json.dumps, not an f-string quote. jq string literals are
+                # JSON-compatible, so this escapes `"` and `\` correctly. Splicing the
+                # label raw builds an INVALID jq program for such a label, gh exits
+                # non-zero, and the tri-state above reads that as "never measurable" —
+                # so a malformed label would silently make every provider
+                # non-promotable instead of reporting a bad input.
                 f'.runners[] | select(.status=="online") '
-                f'| select(any(.labels[].name; .=="{label}")) | .id',
+                f"| select(any(.labels[].name; .=={json.dumps(label)})) | .id",
             ],
             timeout=60,
             env=env,

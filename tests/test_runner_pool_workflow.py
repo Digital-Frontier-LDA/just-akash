@@ -208,7 +208,7 @@ def test_a_failed_listing_query_is_not_counted_as_zero_runners():
     # Positive assertions: `2>/dev/null not in poll` would also forbid the legitimate
     # suppression on the `tail` that reports the error, and a guard that forbids the
     # remedy gets weakened rather than obeyed.
-    assert re.search(r"2>\s*/tmp/\S+\.err\)", poll), (
+    assert re.search(r"2>\s*/tmp/\S+\.err", poll), (
         "gh's stderr must be captured, not discarded — it carries the 403 that explains "
         "the failure, and discarding it is how a rate limit became 'zero runners'"
     )
@@ -397,7 +397,12 @@ def test_wallet_contention_is_not_reported_as_a_market_outage():
     assert re.search(r"account sequence mismatch|sequence mismatch", code, re.I), (
         "the rejection has to be recognised before it can be classified"
     )
-    assert code.index("SAW_SEQ_CONTENTION") < code.index("failure_reason=PROVIDER_CAPACITY"), (
+    # Anchored on the classification BRANCH, not the name. `code.index(
+    # "SAW_SEQ_CONTENTION")` found the `SAW_SEQ_CONTENTION=0` initialisation near the
+    # top of the step, which precedes the capacity verdict no matter where the branch
+    # moves — so the guard held even with the ordering it exists to lock reversed.
+    branch = code.index('elif [ "$SAW_SEQ_CONTENTION" = "1" ]')
+    assert branch < code.index("failure_reason=PROVIDER_CAPACITY"), (
         "contention must be classified before falling through to a capacity verdict"
     )
 
@@ -564,7 +569,7 @@ MUTATIONS = [
     # The count must survive a multi-page org. Both shapes below are what a reader
     # "tidying up" the jq would plausibly write, and each restores the bug.
     ("online count is line-based", lambda s: s.replace("grep -c .", "head -1")),
-    ("no aggregating jq under paginate", lambda s: s.replace('| .id"', '] | length"')),
+    ("no aggregating jq under paginate", lambda s: s.replace("| .id'", "] | length'")),
     ("runner poll stays paginated", lambda s: s.replace("--paginate ", "")),
     # A throttled read must never be absorbed into "the provider delivered nothing".
     (
@@ -714,7 +719,7 @@ def test_deregistration_is_scoped_to_this_runs_label():
     """An org-wide 'delete every offline runner' races other repos' provisioning,
     where a runner is briefly offline between registering and coming up."""
     body = TD_DEREG["run"]
-    assert '.==\\"${RUNNER_LABEL}\\"' in body or "${RUNNER_LABEL}" in body
+    assert "${RUNNER_LABEL}" in body
     assert 'select(.status=="offline")' in body.replace('\\"', '"')
 
 

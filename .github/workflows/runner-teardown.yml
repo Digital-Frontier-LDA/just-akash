@@ -222,8 +222,13 @@ jobs:
           # into an empty IDS, and the step then published deregistered=0 and
           # deregister_failed=0: a clean sweep we never performed, for registrations we
           # never even enumerated. Silence there is what lets the listing grow.
-          IDS=$(gh api --paginate "orgs/${ORG}/actions/runners?per_page=100" \
-                --jq ".runners[] | select(.status==\"offline\") | select(any(.labels[].name; .==\"${RUNNER_LABEL}\")) | .id" 2>/tmp/gh-dereg.err)
+          # `--arg`, not interpolation: the label is caller input, and splicing it into
+          # the filter lets a `"` or `\` build an invalid jq program whose non-zero exit
+          # this step now (correctly) reads as an unreadable listing — turning a bad
+          # input into "the API is down". See the same note in runner-pool.yml.
+          IDS=$(gh api --paginate "orgs/${ORG}/actions/runners?per_page=100" 2>/tmp/gh-dereg.err \
+                | jq -r --arg L "$RUNNER_LABEL" \
+                  '.runners[] | select(.status=="offline") | select(any(.labels[].name; .==$L)) | .id')
           GH_RC=$?
           if [ "$GH_RC" -ne 0 ]; then
             {

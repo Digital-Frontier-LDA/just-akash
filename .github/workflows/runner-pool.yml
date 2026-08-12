@@ -556,9 +556,18 @@ jobs:
             API_OK=0
             WAIT_DEADLINE=$(( $(date +%s) + RUNNER_WAIT_TRIES * 5 ))
             while [ "$(date +%s)" -lt "$WAIT_DEADLINE" ]; do
-              RUNNER_IDS=$(gh api --paginate "orgs/${ORG}/actions/runners?per_page=100" \
-                --jq ".runners[] | select(.status==\"online\") | select(any(.labels[].name; .==\"${RUNNER_LABEL}\")) | .id" \
-                2>/tmp/gh-runners.err)
+              # THE LABEL IS DATA, NOT PROGRAM TEXT. It is a caller-supplied input, and
+              # splicing it into the filter meant a label containing `"` or `\` built an
+              # INVALID jq program: gh exits non-zero, which this loop reads as an
+              # unreadable listing, so a bad input arrives as GITHUB_API_UNAVAILABLE and
+              # a healthy lease is destroyed on every poll. `--arg` keeps it a value.
+              #
+              # `--paginate` without `--jq` emits one JSON object per page, and jq reads
+              # that concatenated stream natively — so the per-page filtering that makes
+              # a line-per-match correct across pages is unchanged.
+              RUNNER_IDS=$(gh api --paginate "orgs/${ORG}/actions/runners?per_page=100" 2>/tmp/gh-runners.err \
+                | jq -r --arg L "$RUNNER_LABEL" \
+                  '.runners[] | select(.status=="online") | select(any(.labels[].name; .==$L)) | .id')
               GH_RC=$?
               if [ "$GH_RC" -ne 0 ]; then
                 # Deliberately NOT the 5s cadence: if this is the secondary limit (a
