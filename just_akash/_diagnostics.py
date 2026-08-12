@@ -63,6 +63,12 @@ class Code:
     BIDS_STALE = "BIDS_STALE"  # bids aged out of 'open'
     BIDS_MALFORMED = "BIDS_MALFORMED"  # all bid entries failed schema
     DEPLOY_CREATE_FAILED = "DEPLOY_CREATE_FAILED"
+    # A create that RAISED may still have created the deployment: the POST writes
+    # on-chain state, so a gateway 500 or timeout can land after the transaction
+    # committed. Measured: POST /v1/deployments -> HTTP 500 after 103 SECONDS.
+    # Such a deployment holds escrow, is untagged, and its dseq is unknown — the most
+    # expensive shape of leak, because nothing reports it.
+    DEPLOY_CREATE_ORPHAN_SUSPECTED = "DEPLOY_CREATE_ORPHAN_SUSPECTED"
     NO_DSEQ_RETURNED = "NO_DSEQ_RETURNED"
     LEASE_CREATE_FAILED = "LEASE_CREATE_FAILED"  # incl. the 404 "no lease for deployment" flake
     REDEPLOY_FAILED = "REDEPLOY_FAILED"
