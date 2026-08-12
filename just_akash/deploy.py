@@ -73,6 +73,7 @@ def _report_suspected_orphans(client, since_epoch_s: float) -> list[str]:
     Never raises: this runs on an error path, and a failure to reconcile must not replace
     the original error with its own.
     """
+    since_ms = int(since_epoch_s * 1000)
     try:
         active = client.list_deployments(active_only=True)
     except Exception as exc:  # noqa: BLE001 — diagnosis must never mask the real failure
@@ -85,12 +86,17 @@ def _report_suspected_orphans(client, since_epoch_s: float) -> list[str]:
             continue
         dseq = dep.get("dseq") or (dep.get("deployment") or {}).get("dseq")
         try:
-            created = int(dseq) / 1000.0  # type: ignore[arg-type]
+            created_ms = int(dseq)  # type: ignore[arg-type]
         except (TypeError, ValueError):
             # A dseq we cannot date is not evidence either way. Staying silent about it
             # is right: this path exists to name what we can prove, not to raise alarms.
             continue
-        if created >= since_epoch_s:
+        # Compared in WHOLE MILLISECONDS, on purpose. `time.time()` carries sub-ms
+        # precision while a dseq is floored to its millisecond, so dividing the dseq
+        # back to seconds made a deployment minted in the SAME millisecond as the
+        # request compare as OLDER than it — i.e. the tightest true orphan, the one
+        # created by this very call, was the one most likely to be missed.
+        if created_ms >= since_ms:
             suspects.append(str(dseq))
 
     for dseq in suspects:
@@ -1162,9 +1168,14 @@ def deploy(
                 "re-deploying, to avoid double escrow. Close it manually: "
                 f"just-akash destroy --dseq {dseq}"
             )
+        # Same ambiguity as the initial create, and the same escrow at stake — this
+        # path exists precisely because the first order went stale, so leaking a second
+        # one here doubles the cost of the failure it is trying to recover from.
+        _redeploy_started = time.time()
         try:
             redeploy_response = client.create_deployment(sdl_content, deposit=deposit)
         except RuntimeError as redeploy_err:
+            _report_suspected_orphans(client, _redeploy_started)
             raise RuntimeError(f"re-deploy create failed: {redeploy_err}") from redeploy_err
         new_dseq = redeploy_response.get("dseq")
         if new_dseq is None:

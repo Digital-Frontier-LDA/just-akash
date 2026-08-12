@@ -47,6 +47,20 @@ def test_a_leaseless_deployment_created_during_the_failed_call_is_named():
     assert _report_suspected_orphans(client, NOW) == [_dseq(+2)]
 
 
+def test_a_deployment_minted_in_the_same_millisecond_is_still_ours():
+    """The tightest true orphan is the one this very call created, and it was the one
+    most likely to be missed.
+
+    `time.time()` carries sub-ms precision while a dseq is floored to its millisecond, so
+    dividing the dseq back to seconds made `created < since_epoch_s` purely by
+    truncation. Compared in whole milliseconds it is caught."""
+    started = 1786543210.123456
+    same_ms = str(int(started * 1000))  # 1786543210123 — floor of the same instant
+    assert _report_suspected_orphans(_Client([{"dseq": same_ms, "leases": []}]), started) == [
+        same_ms
+    ]
+
+
 def test_a_deployment_that_predates_the_call_is_not_ours():
     """A create cannot have produced a deployment that already existed. Reporting one
     would send the operator to destroy a live workload."""
