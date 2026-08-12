@@ -151,7 +151,7 @@ def merge(
     *,
     deployed: bool | None = None,
     owner: str = "",
-    attribute_closure: Callable[[str, str], str] | None = None,
+    attribute_closure: Callable[[str, str], str | tuple[str, float | None]] | None = None,
 ) -> dict:
     """Fold one scrape into the durable per-provider state.
 
@@ -222,8 +222,9 @@ def merge(
             # one shape would either churn tests unrelated to lifetime or, worse, silently
             # store a tuple as the cause and send every closure to `unknown`.
             if isinstance(result, tuple):
-                cause = result[0] if result else UNKNOWN
-                lived = result[1] if len(result) > 1 else None
+                cause = str(result[0]) if result else UNKNOWN
+                raw_lifetime = result[1] if len(result) > 1 else None
+                lived = float(raw_lifetime) if isinstance(raw_lifetime, (int, float)) else None
             else:
                 cause = result
         if cause not in VERDICTS:

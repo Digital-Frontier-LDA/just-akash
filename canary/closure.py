@@ -44,7 +44,7 @@ that let the last incident run for a day.
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 from just_akash.chain import _lcd_get
 
@@ -180,7 +180,7 @@ def _block_time(block: dict | None) -> datetime | None:
         parsed = datetime.fromisoformat(text)
     except ValueError:
         return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def lifetime_hours(dseq: str, block: dict | None) -> float | None:
@@ -208,7 +208,7 @@ def lifetime_hours(dseq: str, block: dict | None) -> float | None:
     if end is None:
         return None
     try:
-        start = datetime.fromtimestamp(int(dseq) / 1000, UTC)
+        start = datetime.fromtimestamp(int(dseq) / 1000, timezone.utc)
     except (TypeError, ValueError, OSError, OverflowError):
         return None
     hours = (end - start).total_seconds() / 3600.0
