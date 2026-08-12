@@ -515,6 +515,45 @@ jobs:
           uv run python -m canary.collect \
             --targets targets.json --state state.json --out canary-metrics.prom \
             --credit credit.json --owner "$owner"
+
+          # ORPHANED ESCROW, appended to the SAME exposition file.
+          #
+          # `orphan-scan` has always been able to find deployments that hold escrow and
+          # satisfy nothing; it printed them. A printed line is not a signal -- df-grafana
+          # scrapes this .prom off the telemetry branch and cannot alert on a workflow log --
+          # so an orphan was only ever noticed if somebody opened the run. Two onidc
+          # deployments held ~$4.00 for five days on exactly that basis.
+          #
+          # Appended here rather than published as a second file so it needs no new scrape
+          # target in df-grafana: distinct metric names concatenate cleanly in the exposition
+          # format, and it inherits this file's freshness guarantees for free.
+          #
+          # NON-FATAL BY DESIGN. A failed orphan scan must not cost us the canary metrics --
+          # those answer "is the fleet up", which is the more urgent question. The failure is
+          # visible as an absent akash_canary_orphan_scan_degraded series, which is a thing
+          # df-grafana can alert on, rather than as a silent zero.
+          # A NON-ZERO EXIT DOES NOT MEAN "NO METRICS". `orphan-scan` exits 1 when the report
+          # is DEGRADED (cli.py: "a caller checking only the exit status would otherwise read
+          # an incomplete scan as a clean fleet") -- and a degraded scan is precisely the case
+          # this metric exists to publish. Gating the renderer on the exit status, as the
+          # first version of this did, meant akash_canary_orphan_scan_degraded=1 was the one
+          # value that could never be emitted: the series would simply be absent, which is
+          # indistinguishable from the feature not shipping. Caught by Copilot on #147.
+          #
+          # So: keep the status for the log, and decide what to publish from whether the JSON
+          # PARSES. canary.orphans itself exits non-zero on unparseable input, so the `if`
+          # below still distinguishes "scan produced a report" from "scan produced rubbish".
+          set +e
+          uv run just-akash orphan-scan --json > orphan-scan.json 2>orphan-scan.err
+          scan_rc=$?
+          set -e
+          if [ -s orphan-scan.json ] \
+             && uv run python -m canary.orphans < orphan-scan.json >> canary-metrics.prom; then
+            echo "orphan metrics appended (orphan-scan rc=${scan_rc}; rc=1 means degraded, which IS published)"
+          else
+            echo "::warning::orphan-scan produced no usable report (rc=${scan_rc}); no orphan metrics this run. Canary metrics are unaffected."
+            sed 's/^/  /' orphan-scan.err | tail -5 || true
+          fi
           echo "--- exposition ---"; cat canary-metrics.prom
 
       - name: Publish to the telemetry branch
