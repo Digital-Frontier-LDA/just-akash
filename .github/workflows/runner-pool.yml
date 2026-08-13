@@ -13,6 +13,7 @@
 #         min-pool-size: '2'
 #       secrets:
 #         AKASH_API_KEY:  ${{ secrets.AKASH_API_KEY }}
+#         AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}   # optional wallet pool
 #         GH_RUNNER_PAT:  ${{ secrets.GH_RUNNER_PAT }}
 #     work:
 #       needs: pool
@@ -142,6 +143,23 @@ on:
       AKASH_API_KEY:
         required: true
         description: 'Akash Console API key. just-akash reads this name directly.'
+      AKASH_API_KEYS:
+        required: false
+        description: >-
+          OPTIONAL wallet pool: several Console API keys, one per line. Each key is a
+          SEPARATE Cosmos account, and that is the entire point — one account cannot have
+          two transactions in flight, so concurrent provisioners on a single key reject
+          each other with account-sequence mismatches (see WALLET_TX_CONTENTION). Separate
+          accounts have separate sequence numbers and do not contend at all.
+
+          A wallet is chosen deterministically from `github.run_id`, so a re-run of the
+          same run picks the SAME account — which is what lets the teardown close what the
+          pool opened. The chosen account is published as `wallet_address`, and the
+          teardown REFUSES to destroy unless its own selection matches it.
+
+          Escrow is per account, so fund every key: the pool checks the balance of the one
+          it picked, not of the set. Empty or unset falls back to AKASH_API_KEY, which is
+          exactly today's behaviour.
       GH_RUNNER_PAT:
         required: true
         description: 'Registers runners into the org and polls their status.'
@@ -183,6 +201,22 @@ on:
       wallet_free_usd:
         description: 'Free credit after escrow at provision time.'
         value: ${{ jobs.pool.outputs.wallet_free_usd }}
+      wallet_index:
+        description: >-
+          Which wallet in AKASH_API_KEYS provisioned this pool (0-based; 0 when the pool
+          is a single key). INFORMATIONAL — for logs and dashboards. The teardown does not
+          take an index: it re-derives the same selection from `github.run_id` and proves
+          it with `wallet_address`, because an index only means anything against an
+          identical key set, which is the assumption most likely to be wrong.
+        value: ${{ jobs.pool.outputs.wallet_index }}
+      wallet_address:
+        description: >-
+          The Akash account that provisioned this pool. The teardown asserts its own
+          selection resolves to this address before destroying anything — an index alone
+          would silently select the wrong wallet if the key set differed between the two
+          jobs, and a destroy against the wrong account succeeds at doing nothing while
+          the real lease keeps holding escrow.
+        value: ${{ jobs.pool.outputs.wallet_address }}
       runner_hosts_proven:
         description: >-
           Supplied providers marked runner_host and not runner_deny. Below 3, one silent
@@ -203,6 +237,8 @@ jobs:
       failure_reason: ${{ steps.pat.outputs.failure_reason || steps.provision.outputs.failure_reason || steps.wallet.outputs.failure_reason || steps.candidates.outputs.failure_reason }}
       wallet_free_usd: ${{ steps.wallet.outputs.free_usd }}
       runner_hosts_proven: ${{ steps.candidates.outputs.proven_hosts }}
+      wallet_index: ${{ steps.wallet.outputs.wallet_index }}
+      wallet_address: ${{ steps.wallet.outputs.wallet_address }}
       runner-targets: ${{ steps.provision.outputs.runner_targets || '["ubuntu-latest"]' }}
     # Every `run` below needs just-akash's OWN source, never the caller's checkout.
     defaults:
@@ -290,16 +326,45 @@ jobs:
           fi
           echo "runner PAT valid for ${ORG}"
 
-      - name: Wallet — free credit after escrow
+      - name: Wallet — select an account, then free credit after escrow
         id: wallet
         continue-on-error: true
         env:
           AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
+          AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}
+          RUN_ID: ${{ github.run_id }}
           MIN_USD: ${{ inputs.required-deposit-usd }}
         run: |
           set -uo pipefail
+
+          # SELECT A WALLET. Each key is a separate Cosmos account, so N keys give N
+          # independent sequence numbers and concurrent provisioners stop rejecting one
+          # another. With one key this is a no-op and the behaviour is unchanged.
+          #
+          # Deterministic from run_id, NOT random: a re-run of the same run must land on
+          # the same account, or the teardown would try to close a lease from a wallet
+          # that never opened it — a destroy that succeeds at doing nothing while the real
+          # lease keeps holding escrow.
+          # tr -d '\r' FIRST: a multi-line GitHub secret pasted from Windows carries CRLF,
+          # and mapfile keeps the trailing \r on every key — producing a credential that
+          # looks right in the log and is rejected by the API.
+          mapfile -t KEYS < <(printf '%s\n' "${AKASH_API_KEYS:-}" | tr -d '\r' | sed '/^[[:space:]]*$/d')
+          if [ "${#KEYS[@]}" -gt 0 ]; then
+            IDX=$(( RUN_ID % ${#KEYS[@]} ))
+            AKASH_API_KEY="${KEYS[$IDX]}"
+            export AKASH_API_KEY
+            echo "wallet ${IDX} of ${#KEYS[@]}"
+          else
+            IDX=0
+            echo "single wallet (AKASH_API_KEYS unset)"
+          fi
+          echo "wallet_index=${IDX}" >> "$GITHUB_OUTPUT"
           OUT=$(uv run --with . just-akash balance --check --min-usd "$MIN_USD" --json 2>/dev/null | tail -1 || true)
           echo "$OUT"
+          # The ADDRESS is the durable identity of the wallet actually in use; the index
+          # only means something against an identical key set. The teardown checks this.
+          ADDR=$(printf '%s' "$OUT" | python3 -c "import json,sys;print(json.load(sys.stdin).get('account',''))" 2>/dev/null || true)
+          echo "wallet_address=${ADDR}" >> "$GITHUB_OUTPUT"
           FREE=$(printf '%s' "$OUT" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('free_usd',''))" 2>/dev/null || true)
           STATUS=$(printf '%s' "$OUT" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('status',''))" 2>/dev/null || true)
           echo "free_usd=${FREE}" >> "$GITHUB_OUTPUT"
@@ -406,6 +471,7 @@ jobs:
         id: provision
         env:
           AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
+          AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}
           GH_TOKEN: ${{ secrets.GH_RUNNER_PAT }}
           CANDIDATES_CSV: ${{ steps.candidates.outputs.candidates }}
           ORG: ${{ inputs.github-org }}
@@ -418,6 +484,22 @@ jobs:
           RUNNER_WAIT_TRIES: ${{ inputs.runner-wait-tries }}
         run: |
           set -uo pipefail
+
+          # RE-SELECT the same wallet the balance step picked. The selection is repeated
+          # rather than carried forward because the only thing worth carrying is the KEY
+          # itself, and a step output is the wrong place for a credential — outputs are
+          # persisted and surfaced to the caller. Steps do not share a shell, so the
+          # export cannot survive; the rule is deterministic, so recomputing it lands on
+          # the same account by construction.
+          # tr -d '\r' FIRST: a multi-line GitHub secret pasted from Windows carries CRLF,
+          # and mapfile keeps the trailing \r on every key — producing a credential that
+          # looks right in the log and is rejected by the API.
+          mapfile -t KEYS < <(printf '%s\n' "${AKASH_API_KEYS:-}" | tr -d '\r' | sed '/^[[:space:]]*$/d')
+          if [ "${#KEYS[@]}" -gt 0 ]; then
+            AKASH_API_KEY="${KEYS[$(( RUN_ID % ${#KEYS[@]} ))]}"
+            export AKASH_API_KEY
+          fi
+
           # An ARRAY, not a string. Both this and the provider list rely on word
           # splitting, so quoting them breaks the command and NOT quoting them is SC2086.
           # Arrays are the only form that is both correct and lint-clean.

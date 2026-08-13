@@ -780,14 +780,102 @@ def test_an_unreadable_listing_is_not_reported_as_a_clean_sweep():
     )
 
 
-def test_teardown_does_not_claim_an_ownership_check_it_cannot_perform():
-    """just-akash tags live in a LOCAL file and `status --json` emits no tag, so a
-    cross-job tag readback returns empty every time. A guard that always takes its
-    'could not verify, proceed anyway' branch while reporting verification is worse
-    than no guard — this asserts we did not ship one."""
+def test_the_wallet_pool_selection_is_deterministic_not_random():
+    """A re-run of the same run MUST land on the same account. The teardown re-derives the
+    selection from the same run_id, so a random pick would close a lease from a wallet
+    that never opened it — a destroy that succeeds trivially, reports success, and leaves
+    the real lease holding escrow."""
+    code = _code(PROVISION["run"]) + _code(_step("Wallet")["run"])
+    assert "RUN_ID %" in code, "selection must be derived from run_id"
+    assert "RANDOM" not in _code(_step("Wallet")["run"]), "a random wallet cannot be torn down"
+
+
+def test_the_wallet_key_never_leaves_via_an_output():
+    """Outputs are persisted and surfaced to the caller. The KEY is a credential; only the
+    index and the ADDRESS may travel."""
+    for name, val in OUTPUTS.items():
+        assert "AKASH_API_KEY" not in str(val.get("value", "")), name
+    assert "wallet_address" in OUTPUTS and "wallet_index" in OUTPUTS
+
+
+def test_both_steps_select_the_same_wallet():
+    """Steps do not share a shell, so the export cannot survive. Both the balance check
+    and the provision step must apply the SAME rule, or the pool would check one
+    account's credit and then deploy from another."""
+    wallet = _code(_step("Wallet")["run"])
+    prov = _code(PROVISION["run"])
+    for body, who in ((wallet, "wallet"), (prov, "provision")):
+        assert "AKASH_API_KEYS" in body, f"{who}: does not consult the pool"
+        assert "RUN_ID % " in body.replace("$(( ", "").replace("${#KEYS[@]} ))", ""), who
+
+
+def test_a_single_key_behaves_exactly_as_before():
+    """AKASH_API_KEYS is optional. An empty pool must fall through to AKASH_API_KEY with
+    no change in behaviour, or adding the input would break every existing caller."""
+    for body in (_code(_step("Wallet")["run"]), _code(PROVISION["run"])):
+        assert 'KEYS[@]}" -gt 0' in body or '${#KEYS[@]}" -gt 0' in body, (
+            "the pool path must be conditional on the pool being non-empty"
+        )
+    assert INPUTS.get("providers") is not None  # sanity: we are reading the right doc
+    assert CALL["secrets"]["AKASH_API_KEYS"]["required"] is False
+
+
+def test_the_teardown_refuses_a_wallet_mismatch_rather_than_closing_nothing():
+    """A destroy from an account that does not own the lease SUCCEEDS TRIVIALLY. Reporting
+    that as a close is the silent escrow leak this workflow exists to prevent."""
     body = TD_CLOSE["run"]
-    assert "closed=refused" not in body, "a refusal path implies a gate that cannot fire"
+    assert "closed=refused-wrong-wallet" in body
+    assert body.index("WANT_ADDR") < body.index('"${JA[@]}" destroy'), (
+        "the wallet must be checked BEFORE anything is destroyed"
+    )
+
+
+def test_a_wallet_pool_without_an_address_is_refused_not_silently_unchecked():
+    """The bypass. The mismatch assertion only runs when `wallet-address` is set, so a
+    caller who passes AKASH_API_KEYS and forgets it opts out of the one check standing
+    between a mismatched key set and a destroy that closes nothing — silently, and in the
+    exact configuration the check exists for."""
+    body = TD_CLOSE["run"]
+    assert "closed=refused-unverifiable" in body
+    assert body.index("refused-unverifiable") < body.index('"${JA[@]}" destroy'), (
+        "an unverifiable pool must be refused BEFORE anything is destroyed"
+    )
+
+
+def test_every_wallet_selection_strips_carriage_returns():
+    """A multi-line GitHub secret pasted from Windows carries CRLF, and mapfile keeps the
+    trailing \r on every key — producing a credential that looks correct in the log and is
+    rejected by the API. All three selection sites must strip it."""
+    bodies = [_code(_step("Wallet")["run"]), _code(PROVISION["run"]), _code(TD_CLOSE["run"])]
+    for body in bodies:
+        if "AKASH_API_KEYS" not in body:
+            continue
+        assert "mapfile" in body
+        m = body[body.index("mapfile") : body.index("mapfile") + 200]
+        assert "tr -d" in m, "keys must be stripped of CR before use"
+
+
+def test_teardown_does_not_claim_an_ownership_check_it_cannot_perform():
+    """The original form of this guard forbade a refusal path outright, because the
+    ownership check then on the table was a TAG readback: just-akash tags live in a local
+    file and `status --json` emits no tag, so a cross-job lookup returns empty every time
+    and the gate would take its 'could not verify, proceed anyway' branch on every run
+    while reporting that ownership had been verified.
+
+    A refusal path is now correct — but only because it rests on something that can
+    actually answer. The wallet check reads the account back from `balance --json` and
+    compares it to the address the pool published, so it has three real outcomes: match,
+    mismatch, unreadable. What must stay banned is the thing that never worked."""
+    body = TD_CLOSE["run"]
     assert "get('tag'" not in body.replace('"', "'"), "status --json has no tag field"
+    if "closed=refused" in body:
+        assert "WANT_ADDR" in body and "balance --json" in body, (
+            "a refusal path is only legitimate when backed by a check that can fail — "
+            "an address read back from the chain, not a tag that is never there"
+        )
+        # And it must not silently proceed when it could not check: an unreadable answer
+        # is the case the tag version got permanently stuck in.
+        assert "Could not identify the teardown wallet" in body
 
 
 # --------------------------------------------------------------------------

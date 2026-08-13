@@ -6,13 +6,15 @@
 #       if: always() && needs.pool.outputs.dseq != ''
 #       uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@runner-v1
 #       with:
-#         dseq:         ${{ needs.pool.outputs.dseq }}
-#         tag-prefix:   ci-myrepo
-#         runner-label: fast-pool-${{ github.run_id }}
-#         github-org:   my-org
+#         dseq:           ${{ needs.pool.outputs.dseq }}
+#         tag-prefix:     ci-myrepo
+#         runner-label:   fast-pool-${{ github.run_id }}
+#         github-org:     my-org
+#         wallet-address: ${{ needs.pool.outputs.wallet_address }}   # only with a pool
 #       secrets:
-#         AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
-#         GH_RUNNER_PAT: ${{ secrets.GH_RUNNER_PAT }}
+#         AKASH_API_KEY:  ${{ secrets.AKASH_API_KEY }}
+#         AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}              # only with a pool
+#         GH_RUNNER_PAT:  ${{ secrets.GH_RUNNER_PAT }}
 #
 # `if: always()` is the whole point — a teardown that only runs on success leaves the
 # lease open on exactly the runs that failed, which are the ones most likely to have
@@ -57,9 +59,25 @@ on:
         required: false
         type: string
         default: ''
+      wallet-address:
+        description: >-
+          The Akash account that provisioned the pool (`needs.pool.outputs.wallet_address`).
+          When set, this job REFUSES to destroy unless the wallet it selects resolves to
+          this address. Without that check a mismatched key set would silently close
+          nothing: a destroy against an account that does not own the lease succeeds
+          trivially, reports success, and leaves the real lease holding escrow.
+        required: false
+        type: string
+        default: ''
     secrets:
       AKASH_API_KEY:
         required: true
+      AKASH_API_KEYS:
+        required: false
+        description: >-
+          The same wallet pool the pool job was given. Selection is re-derived from
+          `github.run_id`, which is identical across jobs in one run, so both land on the
+          same account by construction — `wallet-address` is the check that this held.
       GH_RUNNER_PAT:
         required: false
     outputs:
@@ -112,10 +130,33 @@ jobs:
         id: close
         env:
           AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
+          AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}
+          RUN_ID: ${{ github.run_id }}
+          WANT_ADDR: ${{ inputs.wallet-address }}
           DSEQ: ${{ inputs.dseq }}
           TAG_PREFIX: ${{ inputs.tag-prefix }}
         run: |
           set -uo pipefail
+
+          # THE SAME WALLET THAT OPENED THE LEASE, or nothing at all.
+          #
+          # Selection is re-derived from run_id, which is identical across jobs in one
+          # run, so this lands on the account the pool used by construction. The address
+          # check is what makes that a fact rather than an assumption: if the caller
+          # passes a different AKASH_API_KEYS to the two jobs, the index resolves to
+          # ANOTHER account, and a destroy from an account that does not own the lease
+          # SUCCEEDS TRIVIALLY. It closes nothing, reports success, and the real lease
+          # keeps holding escrow against the grant the next run spends from — the exact
+          # silent leak this whole workflow exists to prevent, reintroduced by a config
+          # mismatch nobody would notice.
+          # tr -d '\r' FIRST: a multi-line GitHub secret pasted from Windows carries CRLF,
+          # and mapfile keeps the trailing \r on every key — producing a credential that
+          # looks right in the log and is rejected by the API.
+          mapfile -t KEYS < <(printf '%s\n' "${AKASH_API_KEYS:-}" | tr -d '\r' | sed '/^[[:space:]]*$/d')
+          if [ "${#KEYS[@]}" -gt 0 ]; then
+            AKASH_API_KEY="${KEYS[$(( RUN_ID % ${#KEYS[@]} ))]}"
+            export AKASH_API_KEY
+          fi
           # An ARRAY: the command is multiple words, so a quoted string breaks it and an
           # unquoted one is SC2086.
           JA=(uv run --with . just-akash)
@@ -124,6 +165,36 @@ jobs:
             echo "closed=noop" >> "$GITHUB_OUTPUT"
             echo "no dseq supplied — the pool never took a lease, nothing to close"
             exit 0
+          fi
+
+          # A POOL WITHOUT AN ADDRESS IS THE UNPROTECTED CASE, so refuse it outright.
+          # The assertion below only runs when WANT_ADDR is set, so a caller who passes
+          # AKASH_API_KEYS and forgets `wallet-address` silently opts out of the one check
+          # that stands between a mismatched key set and a destroy that closes nothing.
+          # Failing here costs a red job; not failing costs a leaked lease nobody sees.
+          if [ "${#KEYS[@]}" -gt 0 ] && [ -z "${WANT_ADDR}" ]; then
+            echo "closed=refused-unverifiable" >> "$GITHUB_OUTPUT"
+            echo "::error title=A wallet pool needs wallet-address::AKASH_API_KEYS was supplied but the `wallet-address` input was not, so this job cannot prove it selected the account that opened dseq=$DSEQ. A destroy from the wrong account succeeds while closing nothing. Pass wallet-address: \${{ needs.pool.outputs.wallet_address }}."
+            exit 1
+          fi
+
+          # Assert the selection landed on the account that opened the lease. Checked
+          # BEFORE any destroy, because the failure mode is a destroy that reports
+          # success while closing nothing.
+          if [ -n "${WANT_ADDR}" ]; then
+            HAVE_ADDR=$(uv run --with . just-akash balance --json 2>/dev/null \
+              | python3 -c "import json,sys;print(json.load(sys.stdin).get('account',''))" 2>/dev/null || true)
+            if [ -z "$HAVE_ADDR" ]; then
+              echo "closed=unknown" >> "$GITHUB_OUTPUT"
+              echo "::error title=Could not identify the teardown wallet::dseq=$DSEQ — the pool provisioned from ${WANT_ADDR} and this job could not read its own account back, so it cannot prove it would destroy from the right one. Refusing rather than closing nothing and reporting success. The lease is still open and holding escrow: just-akash destroy --dseq $DSEQ -y"
+              exit 1
+            fi
+            if [ "$HAVE_ADDR" != "${WANT_ADDR}" ]; then
+              echo "closed=refused-wrong-wallet" >> "$GITHUB_OUTPUT"
+              echo "::error title=WRONG WALLET — refusing to destroy::dseq=$DSEQ was opened by ${WANT_ADDR} but this job selected ${HAVE_ADDR}. A destroy from an account that does not own the lease succeeds trivially and closes NOTHING, so proceeding would report success while the lease keeps holding escrow. Cause is almost always a different AKASH_API_KEYS passed to the pool and teardown jobs — they must be identical. Close it by hand from the right account: just-akash destroy --dseq $DSEQ -y"
+              exit 1
+            fi
+            echo "wallet confirmed: ${HAVE_ADDR}"
           fi
 
           # OWNERSHIP — and why it is not a tag check.
