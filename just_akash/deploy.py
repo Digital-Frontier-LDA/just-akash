@@ -203,18 +203,22 @@ def _report_suspected_orphans(client, since_epoch_s: float, run_id: str = "") ->
             )
             continue
 
-        mine = bool(run_id) and any(run_id_of(n) == run_id for n in names)
-        if mine:
+        # The NAME THAT MATCHED, not names[0]. A deployment may carry several groups,
+        # and reporting the first one can print a foreign key beside a "this run" claim
+        # — the one line an operator reads to decide whether the tool is right.
+        mine_key = next((n for n in names if run_id and run_id_of(n) == run_id), "")
+        our_key = next((n for n in names if n.startswith(PLACEMENT_PREFIX)), "")
+        if mine_key:
             # PROVEN to be this call's residue. Close it rather than describing it.
-            if _close_proven_orphan(client, dseq, names[0]):
+            if _close_proven_orphan(client, dseq, mine_key):
                 continue
-            headline = f"ORPHAN (this run, group_spec.name={names[0]}) — COULD NOT CLOSE"
+            headline = f"ORPHAN (this run, group_spec.name={mine_key}) — COULD NOT CLOSE"
             proof = (
                 "Its provenance carries THIS run's id, so this call created it, and the "
                 "automatic close failed"
             )
-        elif ours:
-            headline = f"ORPHAN (confirmed ours, group_spec.name={names[0]})"
+        elif our_key:
+            headline = f"ORPHAN (confirmed ours, group_spec.name={our_key})"
             proof = "Its on-chain provenance carries this repo's prefix"
         elif names:
             headline = f"POSSIBLE ORPHAN (unattributed, group_spec.name={names[0]})"

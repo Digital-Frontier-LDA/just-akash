@@ -371,7 +371,10 @@ def test_both_copies_of_the_key_move_together():
         assert new_keys, f"{path.name}: nothing stamped"
         assert placement_keys(out) == new_keys, path.name
         for old, new in zip(original, new_keys, strict=True):
-            assert out.count(f"{new}:") == 2, f"{path.name}: {new} not rewritten in both places"
+            assert out.count(f"{new}:") >= 2, (
+                f"{path.name}: {new} must appear as the declaration AND at least one "
+                f"deployment reference — several services may share one placement group"
+            )
             assert not re.search(rf"(?m)^[ \t]+{re.escape(old)}:[ \t]*$", out), (
                 f"{path.name}: an unscoped {old} survives — the two copies disagree"
             )
@@ -424,3 +427,51 @@ def test_a_foreign_placement_key_is_never_rewritten():
     foreign = "services:\n  a:\n    image: x\nprofiles:\n  placement:\n    dcloud:\n"
     out, keys = stamp_run(foreign, RUN)
     assert out == foreign and keys == []
+
+
+def test_a_commented_key_line_is_rewritten_and_keeps_its_comment():
+    """The key appears twice, and a comment on only ONE of them — typically the
+    `deployment.<service>.<KEY>` reference, where "# picks the placement above" is a
+    natural note — would rewrite the declaration and leave the reference pointing at a
+    placement group that no longer exists. Akash rejects that SDL, so a comment in a
+    caller's file would break the deploy outright."""
+    sdl = (
+        "services:\n  a:\n    image: x\n"
+        "profiles:\n  placement:\n    just-akash-a:\n"
+        "deployment:\n  a:\n    just-akash-a:   # picks the placement above\n"
+        "      profile: a\n      count: 1\n"
+    )
+    out, keys = stamp_run(sdl, RUN)
+    assert keys == [f"just-akash-a.{RUN}"]
+    assert f"just-akash-a.{RUN}:   # picks the placement above" in out, "comment lost"
+    assert not re.search(r"(?m)^\s+just-akash-a:", out), (
+        "an unscoped reference survived — the SDL now names a placement group that does not exist"
+    )
+
+
+def test_a_placement_group_shared_by_several_services_is_fully_rewritten():
+    """Valid SDLs may point more than one service at the same placement group. Missing
+    one reference leaves that service selecting a group that no longer exists."""
+    sdl = (
+        "services:\n  a:\n    image: x\n  b:\n    image: y\n"
+        "profiles:\n  placement:\n    just-akash-a:\n"
+        "deployment:\n  a:\n    just-akash-a:\n      profile: a\n      count: 1\n"
+        "  b:\n    just-akash-a:\n      profile: b\n      count: 1\n"
+    )
+    out, _ = stamp_run(sdl, RUN)
+    assert out.count(f"just-akash-a.{RUN}:") == 3
+    assert not re.search(r"(?m)^\s+just-akash-a:", out)
+
+
+def test_the_key_is_not_rewritten_inside_a_comment_or_block_scalar():
+    """The counterpart risk: a bare substring replace would rewrite text that merely
+    MENTIONS the key, which is why this anchors to a whole key line."""
+    sdl = (
+        "services:\n  a:\n    image: x\n    args:\n      - |\n"
+        "        just-akash-a:\n"
+        "profiles:\n  placement:\n    just-akash-a:\n"
+        "# see just-akash-a: for the placement\n"
+    )
+    out, _ = stamp_run(sdl, RUN)
+    assert "        just-akash-a:" in out, "block scalar content was rewritten"
+    assert "# see just-akash-a: for the placement" in out, "a comment was rewritten"

@@ -157,6 +157,10 @@ def placement_keys(text: str) -> list[str]:
 # back. `_KEY_RE` already admits dots, and so does the on-chain name.
 RUN_SEPARATOR = "."
 _RUN_ID_RE = re.compile(r"^[a-f0-9]{6,32}$")
+# A whole key line, with any trailing comment captured so it can be kept.
+_SCOPE_LINE_RE = re.compile(
+    r"^(?P<ind>[ \t]+)(?P<key>[A-Za-z0-9._-]+):(?P<rest>[ \t]*(?:#[^\n]*)?)$"
+)
 
 
 def run_scoped(key: str, run_id: str) -> str:
@@ -202,18 +206,55 @@ def stamp_run(sdl_text: str, run_id: str) -> tuple[str, list[str]]:
     """
     if not run_id:
         return sdl_text, []
-    new_keys: list[str] = []
-    out = sdl_text
-    for key in placement_keys(sdl_text):
-        if not key.startswith(PLACEMENT_PREFIX) or run_id_of(key):
+    targets = {
+        key: run_scoped(key, run_id)
+        for key in placement_keys(sdl_text)
+        if key.startswith(PLACEMENT_PREFIX) and not run_id_of(key)
+    }
+    if not targets:
+        return sdl_text, []
+
+    # A LINE WALK, not a regex over the document, and for the same reason
+    # `placement_keys` is one: an SDL may embed a whole YAML document inside a block
+    # scalar, e.g. `args: - |` followed by indented text a container receives as an
+    # argument. That text is STRING CONTENT. A regex anchored to `^<indent><key>:`
+    # matches it perfectly well and would rewrite what a container is passed — silently
+    # changing the workload rather than the placement.
+    lines = sdl_text.split("\n")
+    out_lines: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip())
+
+        # Copy a block scalar's body through untouched.
+        if stripped and _BLOCK_OPEN_RE.search(line):
+            out_lines.append(line)
+            body_min = indent + 1
+            i += 1
+            while i < len(lines):
+                nxt = lines[i]
+                if nxt.strip() and (len(nxt) - len(nxt.lstrip())) < body_min:
+                    break
+                out_lines.append(nxt)
+                i += 1
             continue
-        scoped = run_scoped(key, run_id)
-        # Anchored to a whole key line: `<indent><key>:`. A bare substring replace would
-        # also rewrite the string inside a comment or a block scalar that merely mentions
-        # the key, and `placement_keys` is careful about exactly that distinction.
-        out = re.sub(rf"(?m)^([ 	]+){re.escape(key)}:[ 	]*$", rf"\1{scoped}:", out)
-        new_keys.append(scoped)
-    return out, new_keys
+
+        m = _SCOPE_LINE_RE.match(line)
+        if m and m.group("key") in targets:
+            # The trailing comment is preserved. The key appears twice, and a comment on
+            # only ONE of them — typically the `deployment.<service>.<KEY>` reference,
+            # where "# picks the placement above" is a natural note — would otherwise
+            # leave that reference pointing at a placement group that no longer exists.
+            # Akash rejects that SDL, so a comment in a caller's file would break the
+            # deploy outright.
+            out_lines.append(f"{m.group('ind')}{targets[m.group('key')]}:{m.group('rest')}")
+        else:
+            out_lines.append(line)
+        i += 1
+
+    return "\n".join(out_lines), list(targets.values())
 
 
 def sdl_files() -> list[Path]:
