@@ -85,10 +85,46 @@ def capacity_probe(
     The order is closed in a ``finally`` so a mid-probe error never leaks an open order
     (the escrow-leak the ad-hoc scripts kept producing).
     """
+    res = probe_order_sdl(
+        client,
+        build_probe_sdl(gpu_count, gpu_model),
+        wait_s=wait_s,
+        poll_s=poll_s,
+        provider=provider,
+        deposit=deposit,
+    )
+    return {"gpu_count": gpu_count, "gpu_model": gpu_model or "any-nvidia", **res}
+
+
+def probe_order_sdl(
+    client: Any,
+    sdl: str,
+    *,
+    wait_s: int = 45,
+    poll_s: int = 5,
+    provider: str | None = None,
+    deposit: float = 0.5,
+) -> dict[str, Any]:
+    """Order-only probe for an arbitrary SDL: create, watch bids, ALWAYS close.
+
+    The shape-agnostic core of :func:`capacity_probe`, extracted so the
+    bid-health probe (``bid_probe.py``) asks its question through the same
+    create/poll/close-in-``finally`` path rather than a second copy of it. The
+    cleanup discipline here is the whole reason this module exists — the ad-hoc
+    scripts it replaced leaked escrow every time they raised mid-probe — so
+    there must be exactly one implementation of it.
+
+    Returns ``{placeable, bidders, dseq, waited_s}``. Never creates a lease.
+    """
     from .api import _extract_bid_price, _extract_dseq, _extract_provider
     from .deploy import _is_open_bid
 
-    sdl = build_probe_sdl(gpu_count, gpu_model)
+    # poll_s must advance the clock. At 0 the loop sleeps for nothing, `waited`
+    # never reaches wait_s, and a genuinely un-bid order spins forever holding
+    # an open deployment — the escrow leak this module exists to prevent.
+    if poll_s <= 0 and wait_s > 0:
+        raise ValueError("poll_s must be > 0 when wait_s > 0")
+
     dep = client.create_deployment(sdl, deposit=deposit)
     dseq = _extract_dseq(dep)
     bidders: list[dict[str, Any]] = []
@@ -119,8 +155,6 @@ def capacity_probe(
             with contextlib.suppress(Exception):
                 client.close_deployment(dseq)
     return {
-        "gpu_count": gpu_count,
-        "gpu_model": gpu_model or "any-nvidia",
         "placeable": bool(bidders),
         "bidders": bidders,
         "dseq": dseq,
