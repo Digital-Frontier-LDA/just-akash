@@ -29,6 +29,18 @@ PROM_SRC="${PROM_SRC:-dl/bidprobe-metrics.prom}"
 JSONL_SRC="${JSONL_SRC:-dl/bidprobe.jsonl}"
 RUN_ID="${RUN_ID:-unknown}"
 
+# When the run actually began, captured by the runner's first step. NOT from
+# `github.run_started_at` — that property does not exist in the github context,
+# and referencing it yields an empty string, which would silently record no runs
+# at all while every step still reported success.
+RUN_STARTED_AT=""
+if [[ -s "${RUN_STARTED_FILE:-}" ]]; then
+  RUN_STARTED_AT="$(head -n1 "${RUN_STARTED_FILE}" | tr -d '[:space:]')"
+fi
+if [[ -z "$RUN_STARTED_AT" ]]; then
+  echo "WARN: no run-start marker at ${RUN_STARTED_FILE:-<unset>} — delivery/skew cannot be measured for this run" >&2
+fi
+
 # Hard-fail on a missing branch rather than letting the push create one.
 if ! git ls-remote --exit-code --heads origin telemetry >/dev/null 2>&1; then
   echo "ERROR: origin/telemetry not found — refusing to create it" >&2

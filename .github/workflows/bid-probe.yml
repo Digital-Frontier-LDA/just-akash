@@ -72,8 +72,26 @@ jobs:
     # every open order this run created.
     timeout-minutes: 45
     steps:
+      # FIRST step, before anything slow, so this is as close to "when the run
+      # actually began" as the runner can report. It exists because
+      # `github.run_started_at` is NOT a real property of the github context —
+      # referencing it yields an empty string, which would have silently written
+      # no run lines at all and left Stage 4 measuring nothing while looking
+      # like it worked.
+      # Written to RUNNER_TEMP, not the workspace: actions/checkout cleans the
+      # workspace, which would delete this before it could be uploaded.
+      - name: Record run start
+        run: date -u +%Y-%m-%dT%H:%M:%SZ > "$RUNNER_TEMP/bidprobe-run-started"
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Move it into the workspace now that checkout has finished cleaning.
+      # Every uploaded path must share one root: upload-artifact resolves the
+      # least common ancestor, so mixing RUNNER_TEMP and the workspace would
+      # silently re-root the whole artifact and break the accrue job's paths.
+      - name: Restore run-start marker
+        run: mv "$RUNNER_TEMP/bidprobe-run-started" "$GITHUB_WORKSPACE/"
 
       - name: Set up uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -139,6 +157,7 @@ jobs:
           path: |
             ${{ github.workspace }}/bidprobe-metrics.prom
             ${{ github.workspace }}/bidprobe.jsonl
+            ${{ github.workspace }}/bidprobe-run-started
           if-no-files-found: ignore
           retention-days: 90
 
@@ -185,6 +204,6 @@ jobs:
           # long as the branch exists.
           RUN_EVENT: ${{ github.event_name }}
           RUN_SCHEDULE: ${{ github.event.schedule }}
-          RUN_STARTED_AT: ${{ github.run_started_at }}
+          RUN_STARTED_FILE: dl/bidprobe-run-started
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: bash .github/scripts/accrue-bidprobe.sh

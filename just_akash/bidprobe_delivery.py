@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from datetime import datetime, timedelta
 
@@ -90,10 +91,17 @@ def analyze(rows: list[dict], interval_h: int = 3) -> dict:
     skews.sort()
 
     def pct(p: float) -> float:
+        """Nearest-rank percentile.
+
+        NOT `round(p * (n-1))`: Python rounds halves to even, so on an
+        even-sized sample p50 lands on the wrong element and the reported skew
+        is quietly off by one observation. This is a number the retirement
+        decision rests on, so it uses the unambiguous definition.
+        """
         if not skews:
             return 0.0
-        idx = min(int(round((len(skews) - 1) * p)), len(skews) - 1)
-        return round(skews[idx], 1)
+        idx = min(math.ceil(p * len(skews)) - 1, len(skews) - 1)
+        return round(skews[max(idx, 0)], 1)
 
     return {
         "scheduled_runs": len(parsed),
@@ -107,7 +115,7 @@ def analyze(rows: list[dict], interval_h: int = 3) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     ap.add_argument("--jsonl", default="bidprobe-runs.jsonl")
     ap.add_argument("--interval-hours", type=int, default=3)
     args = ap.parse_args(argv)
