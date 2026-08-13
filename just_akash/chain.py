@@ -151,15 +151,20 @@ def deployment_group_names(owner: str, dseq: str) -> list[str]:
         except RuntimeError:
             continue  # one dead or lagging endpoint must not answer for the whole chain
         groups = data.get("groups")
-        if not isinstance(groups, list):
+        if not isinstance(groups, list) or not groups:
             continue
-        names = [
-            n
-            for g in groups
-            if isinstance(g, dict)
-            for n in [(g.get("group_spec") or {}).get("name")]
-            if isinstance(n, str) and n
-        ]
+        # ALL-OR-NOTHING per response. A partial parse — three groups, two readable —
+        # would claim ownership from incomplete evidence, and the caller uses this to
+        # decide whether to DESTROY. Half an answer is not a weaker proof, it is a
+        # different deployment's proof. So an unnamed group makes the whole response
+        # unreadable and we try the next endpoint, which may simply be healthier.
+        names: list[str] = []
+        for g in groups:
+            name = (g.get("group_spec") or {}).get("name") if isinstance(g, dict) else None
+            if not isinstance(name, str) or not name:
+                names = []
+                break
+            names.append(name)
         if names:
             return names
     return []

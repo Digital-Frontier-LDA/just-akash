@@ -168,7 +168,7 @@ def run(*, execute: bool = False, now: float | None = None, reap_runners: bool =
         # Read provenance ONLY for the candidates it can decide, so a sweep does not
         # spend a chain round-trip per deployment on an account of hundreds.
         names: list[str] | None = None
-        if reap_runners and sorted(_deployment_service_names(detail)) == [RUNNER_SERVICE]:
+        if reap_runners and _deployment_service_names(detail) == {RUNNER_SERVICE}:
             names = chain.deployment_group_names(address, dseq)
         verdict, services, age = classify(detail, dseq, now, reap_runners, names)
         age_str = f"{age / 86400:5.1f}d" if age is not None else "   ?  "

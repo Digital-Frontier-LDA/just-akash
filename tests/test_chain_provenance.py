@@ -113,6 +113,39 @@ def test_a_malformed_or_empty_response_is_unknown_not_a_crash(monkeypatch, paylo
     assert chain.deployment_group_names(OWNER, DSEQ) == []
 
 
+def test_a_partially_readable_response_is_unknown_not_partial_ownership(monkeypatch):
+    """Three groups, two readable, is not a weaker proof — it is a different deployment's
+    proof. The caller decides whether to DESTROY on this, so an unnamed group makes the
+    whole response unreadable rather than yielding the names that did parse."""
+    payload = {
+        "groups": [
+            {"group_spec": {"name": "just-akash-runner"}},
+            {"group_spec": {}},
+        ]
+    }
+    monkeypatch.setattr(chain, "_lcd_get", lambda *a, **k: payload)
+    assert chain.deployment_group_names(OWNER, DSEQ) == []
+
+
+def test_a_partial_response_falls_through_to_a_healthier_endpoint(monkeypatch):
+    """Rejecting the partial answer must not end the search — the next endpoint may
+    simply be less lagged, and giving up would turn a readable deployment into an
+    unverifiable one."""
+    answers = [
+        {"groups": [{"group_spec": {"name": "just-akash-runner"}}, {"group_spec": {}}]},
+        {"groups": [{"group_spec": {"name": "just-akash-runner"}}]},
+    ]
+    calls = {"n": 0}
+
+    def staged(path, timeout=15, base=None):
+        calls["n"] += 1
+        return answers[min(calls["n"] - 1, len(answers) - 1)]
+
+    monkeypatch.setattr(chain, "_lcd_get", staged)
+    assert chain.deployment_group_names(OWNER, DSEQ) == ["just-akash-runner"]
+    assert calls["n"] >= 2
+
+
 @pytest.mark.parametrize("owner,dseq", [("", DSEQ), (OWNER, ""), ("", "")])
 def test_a_missing_identifier_never_reaches_the_network(monkeypatch, owner, dseq):
     """A blank owner would query the whole chain and return a stranger's group name as if
