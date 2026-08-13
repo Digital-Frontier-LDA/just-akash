@@ -26,12 +26,14 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import chain
 from ._diagnostics import Code, emit, enabled
 from .api import (
     AkashConsoleAPI,
     _extract_bid_price,
     _extract_provider,
 )
+from .provenance import PLACEMENT_PREFIX, SIBLING_REAPED_PREFIX
 from .sdl_validate import SDLValidationError, validate_sdl
 
 logger = logging.getLogger("akash.deploy")
@@ -58,17 +60,35 @@ def _report_suspected_orphans(client, since_epoch_s: float) -> list[str]:
     its dseq. That is the most expensive kind of leak precisely because nothing reports
     it: the next run's funding failure looks like a market outage.
 
-    Attribution uses two independent signals, and needs both:
+    Attribution uses three signals now, and the third changes who gets named:
       * the dseq, which just-akash mints as a ms-epoch timestamp, is at or after the
         moment this create was issued — so it cannot be a pre-existing workload;
       * the deployment holds NO lease — one that won a lease is somebody's live
-        workload, not the residue of a request that failed before returning a dseq.
+        workload, not the residue of a request that failed before returning a dseq;
+      * its on-chain ``group_spec.name`` carries this repo's provenance prefix.
 
-    REPORT ONLY, and that restraint is the point. At spike many runs create deployments
-    concurrently, so a leaseless deployment inside this window may be ANOTHER run's
-    in-flight create. Closing on that inference is exactly how a sweep once destroyed 14
-    third-party deployments. Naming the dseq makes cleanup a single command; guessing
-    makes it a data-loss bug.
+    THE THIRD SIGNAL REMOVES STRANGERS FROM THE REPORT. The shared Console wallet hosts
+    other repos' deployments — a live read found six ``dfci-infra-runner`` among eleven
+    active — and those are created concurrently, leaseless for a moment, inside exactly
+    this window. Without provenance they were named as POSSIBLE ORPHAN, which sends an
+    operator to destroy a sibling repo's live deployment. Naming the innocent is not a
+    lesser failure than missing the guilty; it is the one that loses data.
+
+    It suppresses only on POSITIVE foreign attribution — a known other-repo prefix — and
+    never on "does not carry ours". This command deploys ARBITRARY caller SDLs: a user's
+    own file may declare any placement key, and ``provenance.py``'s guard covers this
+    repo's ``sdl/`` only. Reading "not our prefix" as "not our problem" would silently
+    drop exactly the orphan whose SDL we never controlled.
+
+    STILL REPORT ONLY, because provenance proves the REPO and not the RUN. A concurrent
+    run of *this* repo also stamps ``just-akash-*``, is also leaseless mid-create, and
+    also lands in this window. Closing on that would destroy a healthy in-flight deploy
+    — the same class of error, one degree narrower. Naming the dseq makes cleanup a
+    single command; guessing makes it a data-loss bug.
+
+    Unreadable provenance keeps a deployment IN the report, marked unverified. Every LCD
+    may have failed, and a leak we cannot attribute is still a leak — silence there would
+    trade the loud failure for the expensive one.
 
     Never raises: this runs on an error path, and a failure to reconcile must not replace
     the original error with its own.
@@ -99,21 +119,66 @@ def _report_suspected_orphans(client, since_epoch_s: float) -> list[str]:
         if created_ms >= since_ms:
             suspects.append(str(dseq))
 
+    if not suspects:
+        return []
+
+    # The owner is needed to read provenance. Without it every suspect is unverified,
+    # which is the honest degradation — never a reason to drop the report.
+    try:
+        owner = client.account_address()
+    except Exception:  # noqa: BLE001 — diagnosis must never mask the real failure
+        owner = ""
+
+    reported: list[str] = []
     for dseq in suspects:
+        names = chain.deployment_group_names(owner, dseq) if owner else []
+        ours = any(n.startswith(PLACEMENT_PREFIX) for n in names)
+        foreign = (
+            bool(names) and not ours and all(n.startswith(SIBLING_REAPED_PREFIX) for n in names)
+        )
+        if foreign:
+            # Positively somebody else's. Do not name it: an operator handed this dseq
+            # would run `destroy` on a live deployment belonging to another repo.
+            _log(
+                logging.INFO,
+                f"  deployment {dseq} was created in this window but is not ours "
+                f"(group_spec.name={names}) — not reporting it",
+            )
+            continue
+
+        if ours:
+            headline = f"ORPHAN (confirmed ours, group_spec.name={names[0]})"
+            proof = "Its on-chain provenance carries this repo's prefix"
+        elif names:
+            headline = f"POSSIBLE ORPHAN (unattributed, group_spec.name={names[0]})"
+            proof = (
+                "Its provenance names no repo we recognise — it may be from a caller "
+                "SDL of ours, or another tenant's; check before destroying"
+            )
+        else:
+            headline = "POSSIBLE ORPHAN (ownership unverified)"
+            proof = (
+                "Its provenance could not be read, so this may belong to another repo "
+                "on the shared wallet — check before destroying"
+            )
         _log(
             logging.ERROR,
-            f"POSSIBLE ORPHAN: deployment {dseq} was created during the failed request "
-            f"and holds no lease. The create reported failure, but the transaction may "
-            f"still have committed — it is holding escrow against the grant the next "
-            f"run spends from. Verify and close: just-akash status --dseq {dseq} && "
+            f"{headline}: deployment {dseq} was created during the failed request and "
+            f"holds no lease. The create reported failure, but the transaction may still "
+            f"have committed — it is holding escrow against the grant the next run spends "
+            f"from. {proof}. Verify and close: just-akash status --dseq {dseq} && "
             f"just-akash destroy --dseq {dseq} -y",
         )
         emit(
             Code.DEPLOY_CREATE_ORPHAN_SUSPECTED,
             "error",
             f"deployment {dseq} may have been created by a create that reported failure",
+            dseq=dseq,
+            provenance=names or None,
+            owned=ours,
         )
-    return suspects
+        reported.append(dseq)
+    return reported
 
 
 def _fmt_price(bid) -> str:

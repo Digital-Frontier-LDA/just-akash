@@ -17,6 +17,7 @@ import time
 
 import pytest
 
+from just_akash import deploy as dep_mod
 from just_akash.deploy import _report_suspected_orphans
 
 NOW = time.time()
@@ -130,3 +131,111 @@ def test_it_does_not_close_anything():
 
     _report_suspected_orphans(_Closing([{"dseq": _dseq(+2), "leases": []}]), NOW)
     assert closed == [], "detection must not destroy what it cannot positively attribute"
+
+
+# --------------------------------------------------------------------------
+# Provenance: naming the innocent loses data, so strangers leave the report
+# --------------------------------------------------------------------------
+
+OWNER = "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee"
+
+
+class _OwnedClient(_Client):
+    def account_address(self) -> str:
+        return OWNER
+
+
+def _with_provenance(monkeypatch, mapping: dict[str, list[str]]):
+    monkeypatch.setattr(
+        dep_mod.chain, "deployment_group_names", lambda owner, dseq: mapping.get(dseq, [])
+    )
+
+
+def test_another_repos_deployment_in_the_window_is_not_reported(monkeypatch):
+    """The failure this prevents is worse than a miss. The shared Console wallet hosts
+    other repos' deployments — a live read found six `dfci-infra-runner` among eleven
+    active — created concurrently and leaseless for a moment, i.e. matching every
+    pre-provenance signal. Handing that dseq to an operator sends them to `destroy` a
+    sibling repo's LIVE deployment."""
+    d = _dseq(+2)
+    _with_provenance(monkeypatch, {d: ["dfci-infra-runner"]})
+    assert _report_suspected_orphans(_OwnedClient([{"dseq": d, "leases": []}]), NOW) == []
+
+
+def test_our_own_orphan_is_reported_and_named_as_confirmed(monkeypatch):
+    d = _dseq(+2)
+    _with_provenance(monkeypatch, {d: ["just-akash-runner"]})
+    assert _report_suspected_orphans(_OwnedClient([{"dseq": d, "leases": []}]), NOW) == [d]
+
+
+def test_unreadable_provenance_keeps_it_in_the_report(monkeypatch):
+    """Every LCD may have failed, and a leak we cannot attribute is still a leak.
+    Dropping it would trade the loud failure for the expensive one."""
+    d = _dseq(+2)
+    _with_provenance(monkeypatch, {})  # empty == could not read
+    assert _report_suspected_orphans(_OwnedClient([{"dseq": d, "leases": []}]), NOW) == [d]
+
+
+def test_an_unreadable_owner_degrades_to_unverified_not_to_silence(monkeypatch):
+    """If the account address cannot be fetched, provenance cannot be read for anything.
+    That must weaken the CLAIM, never suppress the report."""
+
+    class _NoAddress(_Client):
+        def account_address(self) -> str:
+            raise RuntimeError("console unreachable")
+
+    d = _dseq(+2)
+    _with_provenance(monkeypatch, {d: ["dfci-infra-runner"]})  # never consulted
+    assert _report_suspected_orphans(_NoAddress([{"dseq": d, "leases": []}]), NOW) == [d]
+
+
+def test_a_mixed_window_reports_only_ours(monkeypatch):
+    """The realistic spike shape: our failed create alongside a sibling's healthy one and
+    one we cannot read."""
+    ours, theirs, unknown = _dseq(+1), _dseq(+2), _dseq(+3)
+    _with_provenance(monkeypatch, {ours: ["just-akash-backtest"], theirs: ["dfci-infra-consul"]})
+    client = _OwnedClient(
+        [
+            {"dseq": ours, "leases": []},
+            {"dseq": theirs, "leases": []},
+            {"dseq": unknown, "leases": []},
+        ]
+    )
+    assert _report_suspected_orphans(client, NOW) == [ours, unknown]
+
+
+def test_provenance_is_read_only_for_suspects(monkeypatch):
+    """A chain round-trip per deployment would make an error path slow on an account of
+    hundreds — and every one of those deployments already failed the age or lease test."""
+    asked: list[str] = []
+    monkeypatch.setattr(
+        dep_mod.chain,
+        "deployment_group_names",
+        lambda owner, dseq: asked.append(dseq) or ["just-akash-x"],
+    )
+    suspect, old, leased = _dseq(+2), _dseq(-3600), _dseq(+3)
+    client = _OwnedClient(
+        [
+            {"dseq": suspect, "leases": []},
+            {"dseq": old, "leases": []},
+            {"dseq": leased, "leases": [{"id": {}}]},
+        ]
+    )
+    _report_suspected_orphans(client, NOW)
+    assert asked == [suspect], asked
+
+
+def test_confirmed_ownership_still_does_not_close_anything(monkeypatch):
+    """Provenance proves the REPO, not the RUN. A concurrent run of *this* repo also
+    stamps `just-akash-*`, is also leaseless mid-create, and also lands in this window —
+    so closing on a confirmed match would destroy a healthy in-flight deploy."""
+    closed = []
+
+    class _Closing(_OwnedClient):
+        def close_deployment(self, dseq):  # pragma: no cover - must never be called
+            closed.append(dseq)
+
+    d = _dseq(+2)
+    _with_provenance(monkeypatch, {d: ["just-akash-runner"]})
+    _report_suspected_orphans(_Closing([{"dseq": d, "leases": []}]), NOW)
+    assert closed == [], "proving the repo is not proving the run"
