@@ -53,8 +53,8 @@ Decisive evidence: the df-grafana paging rules `AkashCanaryUnreachable` and
 `absent()` rule exists on the canary per-provider series. Omitting those series therefore
 stops the page with no cross-repo change — verified, not assumed.
 
-Also ratified: entries written for never-deployed rostered providers; state pruned to the
-current target set before render; `akash_canary_providers_total` as the denominator; two
+Also ratified: entries written for never-deployed rostered providers; the RENDERED view
+scoped to the current roster; `akash_canary_providers_total` as the denominator; two
 tests driving `main()` (not `merge()`); and the existing assertion pinning
 `akash_canary_reachable{provider="onidc"} == 0` inverted to assert ABSENCE.
 
@@ -66,3 +66,22 @@ tests driving `main()` (not `merge()`); and the existing assertion pinning
 | copilot-1 | Enforce the gate structurally in render() | a persisted state entry would still leak reachable=0 after the flag flips |
 | claude-1 | main() passes deployed explicitly, never merge()'s default | makes the wiring visible and testable at the call site |
 | claude-minimax | Verify the grafana rule is `== 0` not `absent()` before relying on OMIT | an absent()-based rule would invert the fix into a new false page |
+
+## Implementation notes (deviations from the ratified text, and why)
+
+1. D3(b) said "prune state to the current target set before render". The implementation
+   does NOT delete: `mark_absent_undeployed()` zeroes `deployed` for a departed provider
+   so its cumulative counters and history survive, and `render(roster=...)` scopes the
+   published view instead. Same observable outcome — no stale `deployed 1`, no inflated
+   fleet scalars — without discarding durable data.
+
+2. D2 said `deployed=None` falls back to `reachable`. Implemented as `True`. Deferring to
+   `reachable` makes an unreachable scrape indistinguishable from a never-deployed
+   provider, so it takes the no-scrape-attempted branch and silently drops the outage it
+   was called to record. Caught by an existing test during implementation.
+
+3. Review (post-ratification) found two defects in the first cut, both fixed:
+   a partial listing rewrote a LEGACY targets entry as an explicit `live: false`, which
+   would persist a guess and silence a healthy canary for the rest of the rollout window;
+   and `providers_total` counted durable state rather than the current roster, so a
+   retired provider inflated the denominator forever.

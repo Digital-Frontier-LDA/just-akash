@@ -341,6 +341,7 @@ def render(
     now: float,
     credit: dict | None = None,
     credit_read_at: float | None = None,
+    roster: set[str] | None = None,
 ) -> str:
     """Emit the exposition file df-grafana scrapes off the telemetry branch."""
     L: list[str] = []
@@ -362,7 +363,14 @@ def render(
     # Checked: no absent()-based rule covers the canary PER-PROVIDER series; the absent()
     # rules there are on lease_closures_total, last_collect_timestamp_seconds and
     # orphans_total, none of which this gate touches.
-    live = [(prov, p) for prov, p in sorted(state.items()) if p.get("deployed", 0)]
+    # `state` is durable BY DESIGN — mark_absent_undeployed() zeroes a departed provider
+    # rather than deleting it, so its cumulative counters and history survive. That makes
+    # it the wrong basis for a FLEET view: a provider removed from AKASH_PROVIDERS months
+    # ago would keep inflating providers_total and keep emitting a retired deployment
+    # gauge, so active/total would under-read forever. The roster is this run's targets;
+    # the durable state stays whole on disk.
+    shown = {prov: p for prov, p in sorted(state.items()) if roster is None or prov in roster}
+    live = [(prov, p) for prov, p in shown.items() if p.get("deployed", 0)]
 
     add(
         "# HELP akash_canary_reachable 1 if the provider served the canary's /metrics on "
@@ -449,7 +457,7 @@ def render(
     add("# TYPE akash_canary_deployed gauge")
     # ALL providers, not just the live ones -- `deployed 0` is the entire point, and
     # gating this loop would turn "no canary here" back into silence.
-    for prov, p in sorted(state.items()):
+    for prov, p in shown.items():
         add(f'akash_canary_deployed{{provider="{prov}"}} {p.get("deployed", 0)}')
     # NOT redundant with sum(akash_canary_deployed). When no canary exists anywhere the
     # per-provider gauge is all zeros -- and if state itself is empty it yields NO series,
@@ -461,7 +469,7 @@ def render(
         "can only ever detect total loss."
     )
     add("# TYPE akash_canary_providers_total gauge")
-    add(f"akash_canary_providers_total {len(state)}")
+    add(f"akash_canary_providers_total {len(shown)}")
     add(
         "# HELP akash_canary_active_deployments Providers with a live canary deployment. "
         "0 means the canary fleet is not running, so every per-provider signal above it "
@@ -469,8 +477,7 @@ def render(
     )
     add("# TYPE akash_canary_active_deployments gauge")
     add(
-        "akash_canary_active_deployments "
-        f"{sum(1 for _p in state.values() if _p.get('deployed', 0))}"
+        f"akash_canary_active_deployments {len(live)}"
     )
 
     # Pass-through of the inside-the-deployment view.
@@ -587,7 +594,13 @@ def render(
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
-        "--targets", required=True, help='JSON: {"provider": {"uri": "http://...", "dseq": "123"}}'
+        "--targets",
+        required=True,
+        help=(
+            'JSON: {"provider": {"uri": "host:port", "dseq": "123", "live": true}}. '
+            "`live` is what ensure.py observed on chain; a missing `live` falls back to "
+            "the presence of a uri, for a file written before the key existed."
+        )
     )
     ap.add_argument("--state", required=True, help="Durable state JSON (read+write)")
     ap.add_argument("--out", required=True, help="Exposition file to write")
@@ -652,7 +665,9 @@ def main() -> int:
             credit_read_at = credit_path.stat().st_mtime
         except OSError:
             credit_read_at = None
-    pathlib.Path(a.out).write_text(render(state, now, credit, credit_read_at), encoding="utf-8")
+    pathlib.Path(a.out).write_text(
+        render(state, now, credit, credit_read_at, roster=set(targets)), encoding="utf-8"
+    )
     # Exit 0 even when a canary is down: an unreachable provider is the DATA, and a
     # non-zero exit here would fail the workflow and stop the file being published —
     # losing the very measurement we came for.

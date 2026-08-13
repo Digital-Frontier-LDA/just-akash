@@ -997,3 +997,46 @@ def test_a_successful_scrape_still_outranks_an_explicit_false():
     st = merge({}, ALPHA, "100", True, _body("aaa"), 0.1, 1000.0, deployed=False)
     assert st[ALPHA]["deployed"] == 1
     assert st[ALPHA]["reachable"] == 1
+
+
+def test_a_partial_listing_does_not_rewrite_a_legacy_target_as_not_live():
+    """The rollout-window regression, and it is a silencing one.
+
+    This branch WRITES the targets file, so a guess made here is PERSISTED. Defaulting a
+    legacy entry (no `live` key) to False during an incomplete chain read would store an
+    explicit `live: false`; collect.main() then sees a key present, skips its bool(uri)
+    migration fallback, and stops scraping a canary whose chain state was never
+    determined. One flaky listing would silence a healthy canary until the next complete
+    ensure run."""
+    prev = {ALPHA: {"uri": "old.example.com", "dseq": "50"}}  # legacy: no `live`
+    partial = {"complete": False, "deployments": []}
+    targets, missing, _ = plan(partial, ALPHA_ONLY, prev)
+    assert targets[ALPHA]["live"] is True, "a legacy entry with a uri must stay scrapeable"
+    assert missing == [], "an incomplete listing proves nothing is missing"
+
+
+def test_a_partial_listing_preserves_an_explicit_prior_false():
+    """The counterpart: an explicit False IS an observation from an earlier complete scan,
+    so it must survive a later incomplete one rather than reverting to the uri heuristic."""
+    prev = {ALPHA: {"uri": "stale.example.com", "dseq": "50", "live": False}}
+    partial = {"complete": False, "deployments": []}
+    targets, _, _ = plan(partial, ALPHA_ONLY, prev)
+    assert targets[ALPHA]["live"] is False
+
+
+def test_the_fleet_denominator_counts_the_roster_not_durable_history():
+    """`state` is durable by design — a departed provider is zeroed, not deleted, so its
+    counters survive. That makes it the wrong basis for a fleet view: a provider retired
+    from AKASH_PROVIDERS would inflate providers_total forever and keep emitting a retired
+    deployment gauge, so active/total would under-read for good."""
+    st = {
+        ALPHA: {"deployed": 1, "reachable": 1},
+        "retired": {"deployed": 0, "checks_total": 900},
+    }
+    samples = parse_exposition(render(st, 1.0, roster={ALPHA}))
+    assert samples[("akash_canary_providers_total", ())] == 1.0
+    assert samples[("akash_canary_active_deployments", ())] == 1.0
+    assert ("akash_canary_deployed", (("provider", "retired"),)) not in samples
+    # ...and with no roster (every existing caller) nothing changes.
+    all_samples = parse_exposition(render(st, 1.0))
+    assert all_samples[("akash_canary_providers_total", ())] == 2.0
