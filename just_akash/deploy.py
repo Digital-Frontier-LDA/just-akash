@@ -131,7 +131,12 @@ def _report_suspected_orphans(client, since_epoch_s: float) -> list[str]:
 
     reported: list[str] = []
     for dseq in suspects:
-        names = chain.deployment_group_names(owner, dseq) if owner else []
+        try:
+            names = chain.deployment_group_names(owner, dseq) if owner else []
+        except Exception:  # noqa: BLE001 — this function is documented as never raising
+            # An unreadable provenance must weaken the CLAIM, never replace the create
+            # failure with a lookup failure. The caller is already handling a real error.
+            names = []
         ours = any(n.startswith(PLACEMENT_PREFIX) for n in names)
         foreign = (
             bool(names) and not ours and all(n.startswith(SIBLING_REAPED_PREFIX) for n in names)
@@ -139,10 +144,14 @@ def _report_suspected_orphans(client, since_epoch_s: float) -> list[str]:
         if foreign:
             # Positively somebody else's. Do not name it: an operator handed this dseq
             # would run `destroy` on a live deployment belonging to another repo.
+            # DEBUG, not INFO: _log prints to stdout at INFO and above, and the whole
+            # point of suppressing this deployment is that its dseq must not appear in
+            # human-facing output next to `destroy` instructions. The trace stays
+            # available for diagnosing a wrong suppression.
             _log(
-                logging.INFO,
-                f"  deployment {dseq} was created in this window but is not ours "
-                f"(group_spec.name={names}) — not reporting it",
+                logging.DEBUG,
+                f"  deployment {dseq} was created in this window but belongs to another "
+                f"repo (group_spec.name={names}) — suppressed",
             )
             continue
 

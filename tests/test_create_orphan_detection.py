@@ -239,3 +239,28 @@ def test_confirmed_ownership_still_does_not_close_anything(monkeypatch):
     _with_provenance(monkeypatch, {d: ["just-akash-runner"]})
     _report_suspected_orphans(_Closing([{"dseq": d, "leases": []}]), NOW)
     assert closed == [], "proving the repo is not proving the run"
+
+
+def test_a_provenance_lookup_that_RAISES_does_not_replace_the_create_failure(monkeypatch):
+    """This function is documented as never raising: it runs on an error path, and the
+    caller is already handling a real failure. Introducing a chain lookup must not turn a
+    create failure into a lookup failure — the original error is the one that explains
+    what happened."""
+
+    def boom(owner, dseq):
+        raise RuntimeError("every endpoint refused")
+
+    monkeypatch.setattr(dep_mod.chain, "deployment_group_names", boom)
+    d = _dseq(+2)
+    # Still reported, as unverified — a leak we cannot attribute is still a leak.
+    assert _report_suspected_orphans(_OwnedClient([{"dseq": d, "leases": []}]), NOW) == [d]
+
+
+def test_a_suppressed_dseq_never_reaches_stdout(capsys, monkeypatch):
+    """_log prints to stdout at INFO and above. The entire point of suppressing a
+    sibling's deployment is that its dseq must not sit in human-facing output next to
+    `destroy` instructions, where it can be copied."""
+    theirs = _dseq(+2)
+    _with_provenance(monkeypatch, {theirs: ["dfci-infra-runner"]})
+    assert _report_suspected_orphans(_OwnedClient([{"dseq": theirs, "leases": []}]), NOW) == []
+    assert theirs not in capsys.readouterr().out
