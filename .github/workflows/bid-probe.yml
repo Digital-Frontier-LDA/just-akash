@@ -7,12 +7,30 @@ name: Bid probe
 # replacement for the autobidder's in-cluster synthetic probe; see
 # just_akash/bid_probe.py for why each property is the way it is.
 #
-# STAGE 1: dispatch-only, deliberately. Nothing consumes the metrics yet and the
-# in-cluster probe remains the primary bid-health signal. The schedule is added
-# only after manual dispatches prove the pinning works and leak zero orders, and
-# the in-cluster probe is not retired until the two have agreed for weeks.
+# STAGE 4: scheduled every 3h, MEASURING. Stage 1's dispatches proved the
+# pinning works and leaked zero orders (4 runs, 9/9 pairs bid, reaper clean), so
+# the schedule is on — but nothing pages from it yet. The per-cluster alert rules
+# exist and ship PAUSED, and the in-cluster synthetic probe is still the primary
+# bid-health signal until the two have been compared for weeks.
+#
+# WHY 3h, AND WHAT IT COSTS. It matches the in-cluster probe's cadence, but the
+# tail does not: GitHub's cron is best-effort, and this repo's own history shows
+# 69-92% delivery with 24-211 minutes of skew (a 3h31m delay on 2026-08-03 alone
+# exceeded a full interval). Expected MTTD is therefore ~2.2h median but ~9.5h
+# worst case, against ~1.6h/3.1h for the in-cluster probe. That regression is
+# accepted deliberately; bidprobe-stale is what keeps a MISSED run visible
+# rather than silent. Measure before trusting: bidprobe-runs.jsonl on the
+# telemetry branch records every run's scheduled-vs-actual so delivery and skew
+# are computed from data, not assumed.
+#
+# 9 pairs/run x 8 runs/day = 72 orders/day, ~$36/day of escrow CHURN (each
+# deposit returns on close) against a grant that has been fully locked once
+# before. The other cost is wall-clock in the shared akash-wallet concurrency
+# group; the first fleet run measured 3m23s.
 
 on:
+  schedule:
+    - cron: "0 */3 * * *" # every 3h. Revert = comment this line out.
   workflow_dispatch:
     inputs:
       cluster:
@@ -91,18 +109,25 @@ jobs:
           RETRY_DELAY_INPUT: ${{ inputs.retry_delay }}
         run: |
           set -euo pipefail
+          # Normalise FIRST. On a scheduled run there are no inputs at all, so
+          # both arrive as empty strings; using ${VAR:-default} only at the point
+          # of validation while passing the raw VAR to the CLI would hand argparse
+          # `--retry-delay ""` and fail every cron run.
+          CLUSTER="${CLUSTER_INPUT:-all}"
+          RETRY="${RETRY_DELAY_INPUT:-60}"
+
           args=()
-          if [[ "${CLUSTER_INPUT:-all}" != "all" ]]; then
-            args+=(--cluster "$CLUSTER_INPUT")
+          if [[ "$CLUSTER" != "all" ]]; then
+            args+=(--cluster "$CLUSTER")
           fi
           # Reject anything that is not a plain integer rather than passing it on.
-          if [[ ! "${RETRY_DELAY_INPUT:-60}" =~ ^[0-9]+$ ]]; then
-            echo "retry_delay must be a non-negative integer" >&2
+          if [[ ! "$RETRY" =~ ^[0-9]+$ ]]; then
+            echo "retry_delay must be a non-negative integer, got: $RETRY" >&2
             exit 2
           fi
           uv run python -m just_akash.bid_probe \
             "${args[@]}" \
-            --retry-delay "$RETRY_DELAY_INPUT" \
+            --retry-delay "$RETRY" \
             --prom-out "$BIDPROBE_PROM" \
             --jsonl-out "$BIDPROBE_JSONL"
 
@@ -153,4 +178,13 @@ jobs:
           PROM_SRC: dl/bidprobe-metrics.prom
           JSONL_SRC: dl/bidprobe.jsonl
           RUN_ID: ${{ github.run_id }}
+          # Delivery instrumentation. Stage 4's whole purpose is to MEASURE
+          # whether a GitHub cron is fit to be the fleet's only bid-health
+          # trigger, and the Actions API ages runs out — so scheduled-vs-actual
+          # is recorded in the telemetry branch, where it accumulates for as
+          # long as the branch exists.
+          RUN_EVENT: ${{ github.event_name }}
+          RUN_SCHEDULE: ${{ github.event.schedule }}
+          RUN_STARTED_AT: ${{ github.run_started_at }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: bash .github/scripts/accrue-bidprobe.sh
