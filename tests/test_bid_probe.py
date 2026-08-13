@@ -8,6 +8,8 @@ is silent and looks exactly like health. That contract is asserted here.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from just_akash.bid_probe import (
@@ -88,7 +90,7 @@ def test_injection_refuses_an_unexpected_sdl_shape():
     # The in-cluster original warned and submitted anyway, which produces the
     # exact false NO-BID the pinning exists to prevent.
     with pytest.raises(ValueError, match="placement block"):
-        inject_placement_attributes("version: \"2.0\"\n", {"region": "eu-west"})
+        inject_placement_attributes('version: "2.0"\n', {"region": "eu-west"})
 
 
 # --------------------------------------------------------------------------
@@ -122,19 +124,22 @@ class FakeClient:
 
 
 def _bid_from(provider):
-    return [{
-        "id": {"provider": provider},
-        "price": {"denom": "uact", "amount": "1200"},
-        "state": "open",
-    }]
+    return [
+        {
+            "id": {"provider": provider},
+            "price": {"denom": "uact", "amount": "1200"},
+            "state": "open",
+        }
+    ]
 
 
 def test_our_bid_is_recorded_and_the_order_is_always_closed(monkeypatch):
     client = FakeClient([_bid_from(HETZNER.wallet)])
     recs = run_probe(
         client,
-        providers=[ProviderTarget("hetzner_hel", HETZNER.wallet,
-                                  frozenset({"cpu"}), HETZNER.attributes)],
+        providers=[
+            ProviderTarget("hetzner_hel", HETZNER.wallet, frozenset({"cpu"}), HETZNER.attributes)
+        ],
         sleep=lambda _s: None,
         wait_s=0,
     )
@@ -144,16 +149,15 @@ def test_our_bid_is_recorded_and_the_order_is_always_closed(monkeypatch):
 
 
 def test_no_bid_is_confirmed_by_a_retry_before_being_believed(monkeypatch):
-    monkeypatch.setattr(
-        "just_akash.smoke_providers._chain_bids_exist", lambda dseq: False
-    )
+    monkeypatch.setattr("just_akash.smoke_providers._chain_bids_exist", lambda dseq: False)
     # First poll empty, retry finds our bid -> a flake must not page.
     client = FakeClient([[], _bid_from(HETZNER.wallet)])
     slept = []
     recs = run_probe(
         client,
-        providers=[ProviderTarget("hetzner_hel", HETZNER.wallet,
-                                  frozenset({"cpu"}), HETZNER.attributes)],
+        providers=[
+            ProviderTarget("hetzner_hel", HETZNER.wallet, frozenset({"cpu"}), HETZNER.attributes)
+        ],
         sleep=slept.append,
         wait_s=0,
     )
@@ -164,14 +168,13 @@ def test_no_bid_is_confirmed_by_a_retry_before_being_believed(monkeypatch):
 
 
 def test_sustained_no_bid_survives_the_retry(monkeypatch):
-    monkeypatch.setattr(
-        "just_akash.smoke_providers._chain_bids_exist", lambda dseq: False
-    )
+    monkeypatch.setattr("just_akash.smoke_providers._chain_bids_exist", lambda dseq: False)
     client = FakeClient([[], []])
     recs = run_probe(
         client,
-        providers=[ProviderTarget("hetzner_hel", HETZNER.wallet,
-                                  frozenset({"cpu"}), HETZNER.attributes)],
+        providers=[
+            ProviderTarget("hetzner_hel", HETZNER.wallet, frozenset({"cpu"}), HETZNER.attributes)
+        ],
         sleep=lambda _s: None,
         wait_s=0,
     )
@@ -181,14 +184,13 @@ def test_sustained_no_bid_survives_the_retry(monkeypatch):
 
 def test_index_lag_is_a_skip_not_a_provider_fault(monkeypatch):
     # Console returned no bids but the chain says bids exist: our index lied.
-    monkeypatch.setattr(
-        "just_akash.smoke_providers._chain_bids_exist", lambda dseq: True
-    )
+    monkeypatch.setattr("just_akash.smoke_providers._chain_bids_exist", lambda dseq: True)
     client = FakeClient([[], []])
     recs = run_probe(
         client,
-        providers=[ProviderTarget("hetzner_hel", HETZNER.wallet,
-                                  frozenset({"cpu"}), HETZNER.attributes)],
+        providers=[
+            ProviderTarget("hetzner_hel", HETZNER.wallet, frozenset({"cpu"}), HETZNER.attributes)
+        ],
         sleep=lambda _s: None,
         wait_s=0,
     )
@@ -214,9 +216,7 @@ def test_probe_error_is_a_skip_and_does_not_abort_the_run(monkeypatch):
     # The second pair reaches the no-bid path, which cross-checks the chain.
     # Without this stub the test would make live calls to the public LCD
     # endpoints — slow, flaky, and dependent on someone else's uptime.
-    monkeypatch.setattr(
-        "just_akash.smoke_providers._chain_bids_exist", lambda dseq: False
-    )
+    monkeypatch.setattr("just_akash.smoke_providers._chain_bids_exist", lambda dseq: False)
 
     class FlakyClient(FakeClient):
         def create_deployment(self, sdl, deposit=0.5):
@@ -228,8 +228,9 @@ def test_probe_error_is_a_skip_and_does_not_abort_the_run(monkeypatch):
     client = FlakyClient([[], _bid_from(ONIDC.wallet)])
     recs = run_probe(
         client,
-        providers=[ProviderTarget("onidc", ONIDC.wallet,
-                                  frozenset({"cpu", "gpu"}), ONIDC.attributes)],
+        providers=[
+            ProviderTarget("onidc", ONIDC.wallet, frozenset({"cpu", "gpu"}), ONIDC.attributes)
+        ],
         sleep=lambda _s: None,
         wait_s=0,
     )
@@ -283,21 +284,43 @@ def test_bid_price_is_absent_rather_than_zero_when_there_was_no_bid():
 
 
 def test_every_metric_family_is_declared_before_use():
-    recs = [ProbeRecord("onidc", ONIDC.wallet, "cpu", OUTCOME_BID,
-                        price_amount=1200, price_denom="uact", ts=100)]
+    recs = [
+        ProbeRecord(
+            "onidc",
+            ONIDC.wallet,
+            "cpu",
+            OUTCOME_BID,
+            price_amount=1200,
+            price_denom="uact",
+            ts=100,
+        )
+    ]
     out = render_prom(recs, run_ts=100)
     declared = {ln.split()[2] for ln in out.splitlines() if ln.startswith("# TYPE ")}
-    used = {ln.split("{")[0].split()[0] for ln in out.splitlines()
-            if ln and not ln.startswith("#")}
+    used = {
+        ln.split("{")[0].split()[0] for ln in out.splitlines() if ln and not ln.startswith("#")
+    }
     assert used <= declared, f"undeclared families: {used - declared}"
 
 
 def test_a_non_finite_price_is_omitted_rather_than_poisoning_the_scrape():
     # _extract_bid_price falls back to float('inf') on a malformed bid, and an
     # `inf` sample is a parse error that drops EVERY series in the document.
-    for bad in (float("inf"), float("nan"), None, "not-a-number"):
-        recs = [ProbeRecord("onidc", ONIDC.wallet, "cpu", OUTCOME_BID,
-                            price_amount=bad, price_denom="uact", ts=100)]
+    # Typed Any deliberately: the point is that a value the type system says
+    # cannot arrive here does arrive here, from _extract_bid_price's fallback.
+    bad_values: list[Any] = [float("inf"), float("nan"), None, "not-a-number"]
+    for bad in bad_values:
+        recs = [
+            ProbeRecord(
+                "onidc",
+                ONIDC.wallet,
+                "cpu",
+                OUTCOME_BID,
+                price_amount=bad,
+                price_denom="uact",
+                ts=100,
+            )
+        ]
         out = render_prom(recs, run_ts=100)
         assert "just_akash_bidprobe_bid_price{" not in out, f"rendered {bad!r}"
         # The verdict itself must still be published — the price is incidental.
@@ -313,14 +336,13 @@ def test_carriage_returns_cannot_split_a_sample_line():
 def test_retry_delay_zero_disables_the_retry_entirely(monkeypatch):
     # The CLI documents 0 as "disables the retry", so it must not merely make
     # the confirming re-probe instant — that doubles the orders on every no-bid.
-    monkeypatch.setattr(
-        "just_akash.smoke_providers._chain_bids_exist", lambda dseq: False
-    )
+    monkeypatch.setattr("just_akash.smoke_providers._chain_bids_exist", lambda dseq: False)
     client = FakeClient([[], []])
     recs = run_probe(
         client,
-        providers=[ProviderTarget("hetzner_hel", HETZNER.wallet,
-                                  frozenset({"cpu"}), HETZNER.attributes)],
+        providers=[
+            ProviderTarget("hetzner_hel", HETZNER.wallet, frozenset({"cpu"}), HETZNER.attributes)
+        ],
         sleep=lambda _s: None,
         wait_s=0,
         retry_delay_s=0,
@@ -333,16 +355,20 @@ def test_retry_delay_zero_disables_the_retry_entirely(monkeypatch):
 def test_an_unknown_capability_fails_loudly_instead_of_probing_nothing():
     # A typo'd capability silently drops that order shape from the sweep and the
     # series simply never appears, which reads as health forever.
-    bad = ProviderTarget("onidc", ONIDC.wallet, frozenset({"gpu", "presistent-beta3"}),
-                         ONIDC.attributes)
+    bad = ProviderTarget(
+        "onidc", ONIDC.wallet, frozenset({"gpu", "presistent-beta3"}), ONIDC.attributes
+    )
     with pytest.raises(ValueError, match="presistent-beta3"):
         eligible_pairs([bad])
 
 
-@pytest.mark.parametrize("msg", [
-    "order 402318 could not be created",
-    "read 402 bytes then failed",
-])
+@pytest.mark.parametrize(
+    "msg",
+    [
+        "order 402318 could not be created",
+        "read 402 bytes then failed",
+    ],
+)
 def test_a_bare_402_in_prose_is_not_a_credit_verdict(msg):
     # A credit verdict aborts every remaining pair, so a false positive blinds
     # the whole fleet for the run.
@@ -351,8 +377,9 @@ def test_a_bare_402_in_prose_is_not_a_credit_verdict(msg):
             raise RuntimeError(msg)
 
     recs = run_probe(Client([]), providers=PROVIDERS, sleep=lambda _s: None, wait_s=0)
-    assert all(r.outcome == OUTCOME_ERROR for r in recs), \
+    assert all(r.outcome == OUTCOME_ERROR for r in recs), (
         "a coincidental 402 must not be read as credit exhaustion"
+    )
     assert len(recs) == len(eligible_pairs())
 
 
@@ -370,9 +397,18 @@ def test_exposition_survives_the_consumer_allowlist_shape():
     malformed line, so every line must match the strict sample grammar."""
     import re
 
-    recs = [ProbeRecord("onidc", ONIDC.wallet, "cpu", OUTCOME_BID,
-                        price_amount=1200, price_denom="uact", ts=100),
-            ProbeRecord("onidc", ONIDC.wallet, "gpu", OUTCOME_ERROR, ts=100)]
+    recs = [
+        ProbeRecord(
+            "onidc",
+            ONIDC.wallet,
+            "cpu",
+            OUTCOME_BID,
+            price_amount=1200,
+            price_denom="uact",
+            ts=100,
+        ),
+        ProbeRecord("onidc", ONIDC.wallet, "gpu", OUTCOME_ERROR, ts=100),
+    ]
     sample = re.compile(
         r'^just_akash_[A-Za-z0-9_]+(\{[A-Za-z_][A-Za-z0-9_]*="[^"\\]*"'
         r'(,[A-Za-z_][A-Za-z0-9_]*="[^"\\]*")*\})? -?\d+(\.\d+)?$'

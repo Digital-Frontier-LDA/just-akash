@@ -195,10 +195,7 @@ def run(
             names = chain.deployment_group_names(address, dseq)
         verdict, services, age = classify(detail, dseq, now, reap_runners, names)
         age_str = f"{age / 86400:5.1f}d" if age is not None else "   ?  "
-        filtered = (
-            only_service is not None
-            and set(services or []) != {only_service}
-        )
+        filtered = only_service is not None and set(services or []) != {only_service}
         suffix = f" (skipped: not services=={{{only_service}}})" if filtered else ""
         print(f"  {dseq}  age={age_str}  services={services or '-'}  -> {verdict}{suffix}")
         if verdict in STALE_VERDICTS and not filtered:

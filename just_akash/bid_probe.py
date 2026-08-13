@@ -268,13 +268,13 @@ class ProviderTarget:
 PROVIDERS: tuple[ProviderTarget, ...] = (
     ProviderTarget(
         cluster="alphavps",
-        wallet="akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z",
+        wallet="akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z",  # pragma: allowlist secret
         capabilities=frozenset({"cpu", "persistent-beta3", "ip-lease"}),
         attributes={"region": "eu-east", "organization": "digital frontier"},
     ),
     ProviderTarget(
         cluster="onidc",
-        wallet="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",
+        wallet="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",  # pragma: allowlist secret
         capabilities=frozenset({"cpu", "gpu", "persistent-beta3", "ip-lease"}),
         attributes={
             "region": "eu-west",
@@ -284,7 +284,7 @@ PROVIDERS: tuple[ProviderTarget, ...] = (
     ),
     ProviderTarget(
         cluster="hetzner_hel",
-        wallet="akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x",
+        wallet="akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x",  # pragma: allowlist secret
         capabilities=frozenset({"cpu", "persistent-beta3"}),
         attributes={"region": "eu-north", "organization": "digital frontier"},
     ),
@@ -336,9 +336,7 @@ def inject_placement_attributes(sdl_text: str, attrs: dict[str, str]) -> str:
     if not attrs:
         raise ValueError("refusing to submit an unpinned probe order: no attributes")
     attrs_yaml = (
-        "      attributes:\n"
-        + "\n".join(f"        {k}: {v}" for k, v in attrs.items())
-        + "\n"
+        "      attributes:\n" + "\n".join(f"        {k}: {v}" for k, v in attrs.items()) + "\n"
     )
     needle = "  placement:\n    akash:\n      pricing:"
     if needle not in sdl_text:
@@ -551,8 +549,13 @@ def run_probe(
 
         try:
             rec = probe_pair(
-                client, target, scenario,
-                wait_s=wait_s, poll_s=poll_s, deposit=deposit, now=now(),
+                client,
+                target,
+                scenario,
+                wait_s=wait_s,
+                poll_s=poll_s,
+                deposit=deposit,
+                now=now(),
             )
         except Exception as exc:  # noqa: BLE001 - credit only, per probe_pair
             credit_exhausted_note = f"{type(exc).__name__}: {exc}"[:300]
@@ -576,8 +579,13 @@ def run_probe(
             sleep(retry_delay_s)
             try:
                 confirm = probe_pair(
-                    client, target, scenario,
-                    wait_s=wait_s, poll_s=poll_s, deposit=deposit, now=now(),
+                    client,
+                    target,
+                    scenario,
+                    wait_s=wait_s,
+                    poll_s=poll_s,
+                    deposit=deposit,
+                    now=now(),
                 )
                 confirm.retried = True
                 rec = confirm
@@ -615,12 +623,7 @@ def _esc(v: str) -> str:
     # \r matters as much as \n: the consumers parse line-by-line and a stray
     # carriage return splits one sample into two malformed ones, which drops the
     # WHOLE document at the allowlist.
-    return (
-        v.replace("\\", "\\\\")
-        .replace('"', '\\"')
-        .replace("\n", " ")
-        .replace("\r", " ")
-    )
+    return v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ").replace("\r", " ")
 
 
 def _finite(value: Any) -> float | None:
@@ -664,8 +667,7 @@ def render_prom(records: list[ProbeRecord], *, run_ts: float | None = None) -> s
     out.append(f"# HELP {M_RESULT} 1 if our provider bid on this order shape, 0 if it did not")
     out.append(f"# TYPE {M_RESULT} gauge")
     out.append(
-        f"# HELP {M_SKIPPED} 1 if the pair could not be tested this run"
-        " (never a provider fault)"
+        f"# HELP {M_SKIPPED} 1 if the pair could not be tested this run (never a provider fault)"
     )
     out.append(f"# TYPE {M_SKIPPED} gauge")
     out.append(f"# HELP {M_PAIR_TS} Unix time this pair last produced a real answer")
@@ -704,16 +706,27 @@ def render_prom(records: list[ProbeRecord], *, run_ts: float | None = None) -> s
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Probe whether our providers still bid.")
-    ap.add_argument("--cluster", action="append", default=[],
-                    help="limit to these clusters (repeatable); default all")
+    ap.add_argument(
+        "--cluster",
+        action="append",
+        default=[],
+        help="limit to these clusters (repeatable); default all",
+    )
     ap.add_argument("--wait", type=int, default=45, help="seconds to wait for a bid")
     ap.add_argument("--deposit", type=float, default=0.5, help="order deposit (ACT)")
-    ap.add_argument("--retry-delay", type=int, default=60,
-                    help="seconds before confirming a NO-BID; 0 disables the retry")
+    ap.add_argument(
+        "--retry-delay",
+        type=int,
+        default=60,
+        help="seconds before confirming a NO-BID; 0 disables the retry",
+    )
     ap.add_argument("--prom-out", default="", help="write the exposition here")
     ap.add_argument("--jsonl-out", default="", help="append raw records here")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="print the eligible pairs and exit without spending anything")
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the eligible pairs and exit without spending anything",
+    )
     args = ap.parse_args(argv)
 
     targets = [p for p in PROVIDERS if not args.cluster or p.cluster in args.cluster]
