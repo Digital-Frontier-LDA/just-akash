@@ -210,7 +210,14 @@ def test_credit_exhaustion_marks_every_remaining_pair_skipped():
     assert all(r.skipped for r in recs)
 
 
-def test_probe_error_is_a_skip_and_does_not_abort_the_run():
+def test_probe_error_is_a_skip_and_does_not_abort_the_run(monkeypatch):
+    # The second pair reaches the no-bid path, which cross-checks the chain.
+    # Without this stub the test would make live calls to the public LCD
+    # endpoints — slow, flaky, and dependent on someone else's uptime.
+    monkeypatch.setattr(
+        "just_akash.smoke_providers._chain_bids_exist", lambda dseq: False
+    )
+
     class FlakyClient(FakeClient):
         def create_deployment(self, sdl, deposit=0.5):
             self.created += 1
@@ -283,6 +290,79 @@ def test_every_metric_family_is_declared_before_use():
     used = {ln.split("{")[0].split()[0] for ln in out.splitlines()
             if ln and not ln.startswith("#")}
     assert used <= declared, f"undeclared families: {used - declared}"
+
+
+def test_a_non_finite_price_is_omitted_rather_than_poisoning_the_scrape():
+    # _extract_bid_price falls back to float('inf') on a malformed bid, and an
+    # `inf` sample is a parse error that drops EVERY series in the document.
+    for bad in (float("inf"), float("nan"), None, "not-a-number"):
+        recs = [ProbeRecord("onidc", ONIDC.wallet, "cpu", OUTCOME_BID,
+                            price_amount=bad, price_denom="uact", ts=100)]
+        out = render_prom(recs, run_ts=100)
+        assert "just_akash_bidprobe_bid_price{" not in out, f"rendered {bad!r}"
+        # The verdict itself must still be published — the price is incidental.
+        assert _samples(out, M_RESULT), f"{bad!r} suppressed the verdict too"
+
+
+def test_carriage_returns_cannot_split_a_sample_line():
+    recs = [ProbeRecord("oni\rdc", ONIDC.wallet, "cpu", OUTCOME_BID, ts=100)]
+    body = [ln for ln in render_prom(recs, run_ts=100).splitlines() if ln]
+    assert all("\r" not in ln for ln in body)
+
+
+def test_retry_delay_zero_disables_the_retry_entirely(monkeypatch):
+    # The CLI documents 0 as "disables the retry", so it must not merely make
+    # the confirming re-probe instant — that doubles the orders on every no-bid.
+    monkeypatch.setattr(
+        "just_akash.smoke_providers._chain_bids_exist", lambda dseq: False
+    )
+    client = FakeClient([[], []])
+    recs = run_probe(
+        client,
+        providers=[ProviderTarget("hetzner_hel", HETZNER.wallet,
+                                  frozenset({"cpu"}), HETZNER.attributes)],
+        sleep=lambda _s: None,
+        wait_s=0,
+        retry_delay_s=0,
+    )
+    assert recs[0].outcome == OUTCOME_NO_BID
+    assert recs[0].retried is False
+    assert client.created == 1, "retry_delay=0 must not submit a second order"
+
+
+def test_an_unknown_capability_fails_loudly_instead_of_probing_nothing():
+    # A typo'd capability silently drops that order shape from the sweep and the
+    # series simply never appears, which reads as health forever.
+    bad = ProviderTarget("onidc", ONIDC.wallet, frozenset({"gpu", "presistent-beta3"}),
+                         ONIDC.attributes)
+    with pytest.raises(ValueError, match="presistent-beta3"):
+        eligible_pairs([bad])
+
+
+@pytest.mark.parametrize("msg", [
+    "order 402318 could not be created",
+    "read 402 bytes then failed",
+])
+def test_a_bare_402_in_prose_is_not_a_credit_verdict(msg):
+    # A credit verdict aborts every remaining pair, so a false positive blinds
+    # the whole fleet for the run.
+    class Client(FakeClient):
+        def create_deployment(self, sdl, deposit=0.5):
+            raise RuntimeError(msg)
+
+    recs = run_probe(Client([]), providers=PROVIDERS, sleep=lambda _s: None, wait_s=0)
+    assert all(r.outcome == OUTCOME_ERROR for r in recs), \
+        "a coincidental 402 must not be read as credit exhaustion"
+    assert len(recs) == len(eligible_pairs())
+
+
+def test_a_real_credit_error_still_aborts_the_sweep():
+    class Client(FakeClient):
+        def create_deployment(self, sdl, deposit=0.5):
+            raise RuntimeError("Console API returned HTTP 402: payment required")
+
+    recs = run_probe(Client([]), providers=PROVIDERS, sleep=lambda _s: None, wait_s=0)
+    assert all(r.outcome == OUTCOME_NO_CREDIT for r in recs)
 
 
 def test_exposition_survives_the_consumer_allowlist_shape():

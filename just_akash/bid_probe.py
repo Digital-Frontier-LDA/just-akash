@@ -297,9 +297,23 @@ def eligible_pairs(
     """Every (provider, scenario) this fleet can legitimately be asked about.
 
     Order is stable so a run's output is diffable against the previous run.
+
+    An unknown capability is a hard error, not a silent no-op. A capability
+    that matches no scenario means that order shape is never probed, and the
+    exported series simply never appears — which reads as "nothing wrong"
+    forever. That exact failure (a cluster missing from the capability map)
+    left hetzner_hel's in-cluster probe dead for 18 days while its metric sat
+    frozen green.
     """
     pairs: list[tuple[ProviderTarget, Scenario]] = []
     for p in providers:
+        unknown = sorted(p.capabilities - set(SCENARIOS))
+        if unknown:
+            raise ValueError(
+                f"{p.cluster}: capabilities {unknown} match no scenario "
+                f"(known: {sorted(SCENARIOS)}). A typo here silently stops "
+                "probing that order shape."
+            )
         for name, scenario in SCENARIOS.items():
             if name in p.capabilities:
                 pairs.append((p, scenario))
@@ -390,7 +404,20 @@ class ProbeRecord:
         }
 
 
-_CREDIT_MARKERS = ("402", "insufficient credit", "insufficient balance", "payment required")
+# Deliberately narrow. A credit verdict aborts probing for EVERY remaining pair,
+# so a false positive blinds the whole fleet for the run. A bare "402" matched
+# anywhere would do that on any message that happens to contain those digits —
+# a dseq, a byte count, a timestamp — so the HTTP status must look like a status
+# and the prose markers must be unambiguous.
+_CREDIT_MARKERS = (
+    "insufficient credit",
+    "insufficient balance",
+    "payment required",
+    "http 402",
+    "status 402",
+    "status_code=402",
+    "(402)",
+)
 
 
 def _is_credit_error(exc: BaseException) -> bool:
@@ -541,7 +568,7 @@ def run_probe(
             )
             continue
 
-        if rec.outcome == OUTCOME_NO_BID:
+        if rec.outcome == OUTCOME_NO_BID and retry_delay_s > 0:
             print(
                 f"  {target.cluster}/{scenario.name}: no bid — confirming in {retry_delay_s}s",
                 file=sys.stderr,
@@ -585,7 +612,33 @@ M_SKIP_INFO = "just_akash_bidprobe_skip_info"
 
 
 def _esc(v: str) -> str:
-    return v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+    # \r matters as much as \n: the consumers parse line-by-line and a stray
+    # carriage return splits one sample into two malformed ones, which drops the
+    # WHOLE document at the allowlist.
+    return (
+        v.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", " ")
+        .replace("\r", " ")
+    )
+
+
+def _finite(value: Any) -> float | None:
+    """Return ``value`` as a float only if it is a real, finite number.
+
+    ``_extract_bid_price`` falls back to ``float('inf')`` on a malformed bid
+    payload, and Prometheus exposition has no representation for that: an
+    ``inf`` sample is a parse error, and one bad line makes the consumers drop
+    every series in the file — including the no-bid signal this exists to
+    carry. A price we cannot render is simply omitted; the alert never reads it.
+    """
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f in (float("inf"), float("-inf")):  # NaN or ±inf
+        return None
+    return f
 
 
 def render_prom(records: list[ProbeRecord], *, run_ts: float | None = None) -> str:
@@ -635,9 +688,10 @@ def render_prom(records: list[ProbeRecord], *, run_ts: float | None = None) -> s
             continue
         out.append(f"{M_RESULT}{{{lbl}}} {1 if r.bid else 0}")
         out.append(f"{M_PAIR_TS}{{{lbl}}} {r.ts:.0f}")
-        if r.bid and r.price_amount is not None:
+        price = _finite(r.price_amount) if r.bid else None
+        if price is not None:
             denom = _esc(r.price_denom or "")
-            out.append(f'{M_PRICE}{{{lbl},denom="{denom}"}} {r.price_amount}')
+            out.append(f'{M_PRICE}{{{lbl},denom="{denom}"}} {price}')
 
     out.append(f"{M_RUN_TS} {ts:.0f}")
     return "\n".join(out) + "\n"

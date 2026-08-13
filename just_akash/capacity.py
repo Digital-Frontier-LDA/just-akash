@@ -119,6 +119,12 @@ def probe_order_sdl(
     from .api import _extract_bid_price, _extract_dseq, _extract_provider
     from .deploy import _is_open_bid
 
+    # poll_s must advance the clock. At 0 the loop sleeps for nothing, `waited`
+    # never reaches wait_s, and a genuinely un-bid order spins forever holding
+    # an open deployment — the escrow leak this module exists to prevent.
+    if poll_s <= 0 and wait_s > 0:
+        raise ValueError("poll_s must be > 0 when wait_s > 0")
+
     dep = client.create_deployment(sdl, deposit=deposit)
     dseq = _extract_dseq(dep)
     bidders: list[dict[str, Any]] = []

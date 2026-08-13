@@ -16,10 +16,12 @@ on:
   workflow_dispatch:
     inputs:
       cluster:
-        description: "Limit to one cluster (blank = all three)"
+        description: "Limit to one cluster"
         type: choice
-        default: ""
-        options: ["", "alphavps", "onidc", "hetzner_hel"]
+        default: all
+        # "all" rather than an empty string: actionlint rejects an empty option
+        # value, and the workflow would not render in the UI at all.
+        options: [all, alphavps, onidc, hetzner_hel]
       retry_delay:
         description: "Seconds before confirming a NO-BID (0 disables the retry)"
         type: string
@@ -73,17 +75,34 @@ jobs:
         with:
           age-key: ${{ secrets.SOPS_AGE_KEY }}
 
-      # 9 eligible pairs x ~40s happy / ~75s all-no-bid = 6-12 min. 25m leaves
-      # room for the confirming retries without reaching the job backstop.
+      # Worst case is every pair no-bidding AND being retried:
+      # 9 x (45s wait + 60s confirm delay + 45s retry wait) = 1350s = 22.5 min,
+      # plus order create/close overhead. 25m would clip that, so 35m — still
+      # well inside the 45m job backstop so the always()-reap step always runs.
       - name: Run bid probe
-        timeout-minutes: 25
+        timeout-minutes: 35
         env:
           BIDPROBE_PROM: ${{ github.workspace }}/bidprobe-metrics.prom
           BIDPROBE_JSONL: ${{ github.workspace }}/bidprobe.jsonl
+          # Dispatch inputs reach the shell as ENV, never as ${{ }} interpolated
+          # into the script body: GitHub substitutes those before bash parses,
+          # so a crafted input would be executed as source, not read as data.
+          CLUSTER_INPUT: ${{ inputs.cluster }}
+          RETRY_DELAY_INPUT: ${{ inputs.retry_delay }}
         run: |
+          set -euo pipefail
+          args=()
+          if [[ "${CLUSTER_INPUT:-all}" != "all" ]]; then
+            args+=(--cluster "$CLUSTER_INPUT")
+          fi
+          # Reject anything that is not a plain integer rather than passing it on.
+          if [[ ! "${RETRY_DELAY_INPUT:-60}" =~ ^[0-9]+$ ]]; then
+            echo "retry_delay must be a non-negative integer" >&2
+            exit 2
+          fi
           uv run python -m just_akash.bid_probe \
-            ${{ inputs.cluster && format('--cluster {0}', inputs.cluster) || '' }} \
-            --retry-delay "${{ inputs.retry_delay }}" \
+            "${args[@]}" \
+            --retry-delay "$RETRY_DELAY_INPUT" \
             --prom-out "$BIDPROBE_PROM" \
             --jsonl-out "$BIDPROBE_JSONL"
 
