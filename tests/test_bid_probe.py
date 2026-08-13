@@ -392,6 +392,43 @@ def test_a_real_credit_error_still_aborts_the_sweep():
     assert all(r.outcome == OUTCOME_NO_CREDIT for r in recs)
 
 
+def test_a_scoped_run_refuses_to_publish_a_partial_fleet_exposition(tmp_path, monkeypatch):
+    """The .prom is overwritten wholesale, so a one-cluster run publishing it
+    would delete every other cluster's series — measured live on 2026-08-13."""
+    from just_akash import bid_probe
+
+    prom = tmp_path / "out.prom"
+    jsonl = tmp_path / "out.jsonl"
+    monkeypatch.setenv("AKASH_API_KEY", "x")
+    monkeypatch.setattr(
+        bid_probe,
+        "run_probe",
+        lambda *a, **k: [ProbeRecord("onidc", ONIDC.wallet, "cpu", OUTCOME_BID, ts=100)],
+    )
+    monkeypatch.setattr("just_akash.api.AkashConsoleAPI", lambda key: object())
+
+    rc = bid_probe.main(["--cluster", "onidc", "--prom-out", str(prom), "--jsonl-out", str(jsonl)])
+    assert rc == 0
+    assert not prom.exists(), "a scoped run must not overwrite the fleet exposition"
+    assert jsonl.exists(), "the append-only audit trail must still record it"
+
+
+def test_a_fleet_run_does_publish(tmp_path, monkeypatch):
+    from just_akash import bid_probe
+
+    prom = tmp_path / "out.prom"
+    monkeypatch.setenv("AKASH_API_KEY", "x")
+    monkeypatch.setattr(
+        bid_probe,
+        "run_probe",
+        lambda *a, **k: [ProbeRecord("onidc", ONIDC.wallet, "cpu", OUTCOME_BID, ts=100)],
+    )
+    monkeypatch.setattr("just_akash.api.AkashConsoleAPI", lambda key: object())
+
+    assert bid_probe.main(["--prom-out", str(prom)]) == 0
+    assert M_RESULT in prom.read_text()
+
+
 def test_exposition_survives_the_consumer_allowlist_shape():
     """The autobidder/df-grafana consumers drop the WHOLE document on one
     malformed line, so every line must match the strict sample grammar."""

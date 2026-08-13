@@ -757,7 +757,23 @@ def main(argv: list[str] | None = None) -> int:
         sleep=(lambda _s: None) if args.retry_delay <= 0 else time.sleep,
     )
 
-    if args.prom_out:
+    # A SCOPED run must not publish an exposition. The published .prom is
+    # overwritten wholesale each run, so a one-cluster run would delete every
+    # other cluster's series — and each of those clusters' Prometheus would
+    # watch its own metrics vanish because somebody was debugging a third one.
+    # Measured on 2026-08-13: three consecutive scoped dispatches left the
+    # published file describing alphavps alone.
+    #
+    # The JSONL is still appended: it is the audit trail and is append-only, so
+    # a scoped run adds to it without erasing anything.
+    if args.prom_out and args.cluster:
+        print(
+            f"NOT writing {args.prom_out}: this run covered only "
+            f"{sorted(set(args.cluster))}, and publishing it would drop every "
+            "other cluster's series. Run without --cluster to publish.",
+            file=sys.stderr,
+        )
+    elif args.prom_out:
         with open(args.prom_out, "w", encoding="utf-8") as fh:
             fh.write(render_prom(records, run_ts=started))
         print(f"wrote {args.prom_out}")
