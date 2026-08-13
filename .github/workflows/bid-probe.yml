@@ -1,0 +1,156 @@
+name: Bid probe
+
+# Does each of OUR providers still bid, on every order shape we sell?
+#
+# Submits a real, provider-pinned order per (provider, scenario), waits for our
+# bid, and closes the order without ever leasing. This is the outside-in
+# replacement for the autobidder's in-cluster synthetic probe; see
+# just_akash/bid_probe.py for why each property is the way it is.
+#
+# STAGE 1: dispatch-only, deliberately. Nothing consumes the metrics yet and the
+# in-cluster probe remains the primary bid-health signal. The schedule is added
+# only after manual dispatches prove the pinning works and leak zero orders, and
+# the in-cluster probe is not retired until the two have agreed for weeks.
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster:
+        description: "Limit to one cluster"
+        type: choice
+        default: all
+        # "all" rather than an empty string: actionlint rejects an empty option
+        # value, and the workflow would not render in the UI at all.
+        options: [all, alphavps, onidc, hetzner_hel]
+      retry_delay:
+        description: "Seconds before confirming a NO-BID (0 disables the retry)"
+        type: string
+        default: "60"
+
+# ⚠️ SHARED WITH provider-smoke.yml, provider-canary.yml, cleanup-stale.yml and
+# auto-topup-audit.yml, and that is REQUIRED, not incidental: every one of them
+# spends from the same Console wallet, which is a single Cosmos account. Two
+# concurrent deploys share a sequence number and one fails with an
+# account-sequence mismatch — and just-akash has no sequence-contention retry.
+# Renaming this group silently un-serialises them.
+#
+# The cost is real and must be measured before this workflow is ever scheduled:
+# GitHub keeps at most ONE pending run per group, so a third arrival while one
+# runs and one waits DISCARDS the waiting run. At 8 runs/day this workflow
+# becomes the group's heaviest user.
+concurrency:
+  group: akash-wallet
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Probe provider bid health
+    runs-on: ubuntu-latest
+    # Backstop only. The real bound is the step timeout below: a JOB timeout
+    # cancels the whole job and the always()-reap step would never run, leaking
+    # every open order this run created.
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Load SOPS secrets
+        uses: ./.github/actions/sops-env
+        with:
+          age-key: ${{ secrets.SOPS_AGE_KEY }}
+
+      # Worst case is every pair no-bidding AND being retried:
+      # 9 x (45s wait + 60s confirm delay + 45s retry wait) = 1350s = 22.5 min,
+      # plus order create/close overhead. 25m would clip that, so 35m — still
+      # well inside the 45m job backstop so the always()-reap step always runs.
+      - name: Run bid probe
+        timeout-minutes: 35
+        env:
+          BIDPROBE_PROM: ${{ github.workspace }}/bidprobe-metrics.prom
+          BIDPROBE_JSONL: ${{ github.workspace }}/bidprobe.jsonl
+          # Dispatch inputs reach the shell as ENV, never as ${{ }} interpolated
+          # into the script body: GitHub substitutes those before bash parses,
+          # so a crafted input would be executed as source, not read as data.
+          CLUSTER_INPUT: ${{ inputs.cluster }}
+          RETRY_DELAY_INPUT: ${{ inputs.retry_delay }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [[ "${CLUSTER_INPUT:-all}" != "all" ]]; then
+            args+=(--cluster "$CLUSTER_INPUT")
+          fi
+          # Reject anything that is not a plain integer rather than passing it on.
+          if [[ ! "${RETRY_DELAY_INPUT:-60}" =~ ^[0-9]+$ ]]; then
+            echo "retry_delay must be a non-negative integer" >&2
+            exit 2
+          fi
+          uv run python -m just_akash.bid_probe \
+            "${args[@]}" \
+            --retry-delay "$RETRY_DELAY_INPUT" \
+            --prom-out "$BIDPROBE_PROM" \
+            --jsonl-out "$BIDPROBE_JSONL"
+
+      - name: Upload bid-probe telemetry
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bidprobe-${{ github.run_id }}
+          path: |
+            ${{ github.workspace }}/bidprobe-metrics.prom
+            ${{ github.workspace }}/bidprobe.jsonl
+          if-no-files-found: ignore
+          retention-days: 90
+
+      # Reap INSIDE this run, not from a separate scheduled workflow. A separate
+      # workflow would queue on the same akash-wallet group and can be discarded
+      # outright when two runs are already ahead of it — so the escrow reaper
+      # would be the first thing dropped exactly when the group is busiest. Here
+      # it inherits this run's already-granted slot and cannot be superseded.
+      #
+      # --only-service probe is load-bearing: it confines the reaper to the
+      # short-lived class this workflow creates. The 48h `backtest` class can be
+      # a live e2e run, and an unattended reaper must never be licensed to close
+      # something it does not understand.
+      - name: Reap leaked probe orders
+        if: always()
+        timeout-minutes: 10
+        run: uv run python -m just_akash.cleanup_stale --only-service probe --execute
+
+  # Publish to the telemetry branch from a separate job, so the privileged
+  # contents:write token never runs alongside the code holding the API key.
+  accrue:
+    name: Publish bid-probe telemetry
+    needs: probe
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true # a crashed probe job may have produced no artifact
+        with:
+          name: bidprobe-${{ github.run_id }}
+          path: dl
+      - name: Append to telemetry branch
+        env:
+          PROM_SRC: dl/bidprobe-metrics.prom
+          JSONL_SRC: dl/bidprobe.jsonl
+          RUN_ID: ${{ github.run_id }}
+        run: bash .github/scripts/accrue-bidprobe.sh
