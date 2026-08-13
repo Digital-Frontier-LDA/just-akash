@@ -264,3 +264,87 @@ def test_a_suppressed_dseq_never_reaches_stdout(capsys, monkeypatch):
     _with_provenance(monkeypatch, {theirs: ["dfci-infra-runner"]})
     assert _report_suspected_orphans(_OwnedClient([{"dseq": theirs, "leases": []}]), NOW) == []
     assert theirs not in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# Run-scoped provenance: the one case where closing is proof, not a guess
+# --------------------------------------------------------------------------
+
+RUN = "deadbeef"
+
+
+class _ClosingClient(_OwnedClient):
+    def __init__(self, deployments, fail=False):
+        super().__init__(deployments)
+        self.closed: list[str] = []
+        self._fail = fail
+
+    def close_deployment(self, dseq):
+        if self._fail:
+            raise RuntimeError("console rejected the close")
+        self.closed.append(str(dseq))
+        return {}
+
+
+def test_this_runs_own_orphan_is_CLOSED_not_merely_named(monkeypatch):
+    """The whole point of run-scoping. A key carrying THIS process's run id cannot belong
+    to a sibling repo or to a concurrent run of our own, and the create that produced it
+    already raised — so nothing will ever claim it. Leaving it open means escrow held
+    against the grant every later run spends from, under a dseq nobody knows to look for.
+    """
+    d = _dseq(+2)
+    _with_provenance(monkeypatch, {d: [f"just-akash-backtest.{RUN}"]})
+    client = _ClosingClient([{"dseq": d, "leases": []}])
+    reported = _report_suspected_orphans(client, NOW, RUN)
+    assert client.closed == [d], "a proven orphan must be closed, not described"
+    assert reported == [], "a closed orphan needs no operator action"
+
+
+def test_a_DIFFERENT_runs_orphan_is_reported_never_closed(monkeypatch):
+    """A concurrent run of this same repo stamps the same prefix, is also leaseless
+    mid-create, and lands in the same window. Closing on the prefix would destroy a
+    healthy in-flight deploy — narrower than before is still not proof."""
+    d = _dseq(+2)
+    _with_provenance(monkeypatch, {d: ["just-akash-backtest.feedface"]})
+    client = _ClosingClient([{"dseq": d, "leases": []}])
+    assert _report_suspected_orphans(client, NOW, RUN) == [d]
+    assert client.closed == [], "another run's deploy is not ours to close"
+
+
+def test_an_unscoped_key_is_reported_never_closed(monkeypatch):
+    """Deployments minted before run-scoping carry a bare repo key. They are
+    repo-attributable but not run-attributable, which is exactly what they are."""
+    d = _dseq(+2)
+    _with_provenance(monkeypatch, {d: ["just-akash-backtest"]})
+    client = _ClosingClient([{"dseq": d, "leases": []}])
+    assert _report_suspected_orphans(client, NOW, RUN) == [d]
+    assert client.closed == []
+
+
+def test_a_failed_close_is_reported_not_swallowed(monkeypatch):
+    """A close we did not achieve must never read as one — the same rule
+    runner-teardown.yml applies to its own destroy. The dseq goes back to the operator
+    with the manual command."""
+    d = _dseq(+2)
+    _with_provenance(monkeypatch, {d: [f"just-akash-runner.{RUN}"]})
+    client = _ClosingClient([{"dseq": d, "leases": []}], fail=True)
+    assert _report_suspected_orphans(client, NOW, RUN) == [d]
+    assert client.closed == []
+
+
+def test_without_a_run_id_nothing_is_ever_closed(monkeypatch):
+    """Callers that do not pass a run id (and every pre-existing one) keep the previous
+    report-only behaviour exactly."""
+    d = _dseq(+2)
+    _with_provenance(monkeypatch, {d: [f"just-akash-runner.{RUN}"]})
+    client = _ClosingClient([{"dseq": d, "leases": []}])
+    assert _report_suspected_orphans(client, NOW) == [d]
+    assert client.closed == []
+
+
+def test_a_siblings_deployment_is_never_closed_even_with_a_run_id(monkeypatch):
+    d = _dseq(+2)
+    _with_provenance(monkeypatch, {d: ["dfci-infra-runner"]})
+    client = _ClosingClient([{"dseq": d, "leases": []}])
+    assert _report_suspected_orphans(client, NOW, RUN) == []
+    assert client.closed == []

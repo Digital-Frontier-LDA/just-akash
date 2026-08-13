@@ -10,13 +10,18 @@ gets deleted every ~12 hours and a metric that lies about whose fault it was.
 
 from __future__ import annotations
 
+import re
+
 from just_akash.provenance import (
     PLACEMENT_PREFIX,
     SIBLING_REAPED_PREFIX,
     _heredocs,
     inline_sdls,
     placement_keys,
+    run_id_of,
+    run_scoped,
     sdl_files,
+    stamp_run,
 )
 
 
@@ -337,3 +342,136 @@ def test_folded_block_scalars_are_skipped_too():
         "      pricing: {}\n"
     )
     assert placement_keys(sdl) == ["just-akash-only"]
+
+
+# --------------------------------------------------------------------------
+# Run scoping — the key must still match by prefix, and both copies must move
+# --------------------------------------------------------------------------
+
+RUN = "deadbeef"
+
+
+def test_the_prefix_still_matches_after_scoping():
+    """Everything that consumes this marker uses startswith — the sibling sweeper, this
+    module's guard, cleanup_stale. A suffix that broke prefix matching would put every
+    deployment back on the sweeper's reap list, which is what #150 exists to prevent."""
+    scoped = run_scoped("just-akash-runner", RUN)
+    assert scoped.startswith(PLACEMENT_PREFIX)
+    assert not scoped.startswith(SIBLING_REAPED_PREFIX)
+
+
+def test_both_copies_of_the_key_move_together():
+    """The key appears twice: `profiles.placement.<KEY>` and the
+    `deployment.<service>.<KEY>` reference that selects it. Rewriting one leaves an SDL
+    naming a placement group that does not exist, which Akash rejects."""
+    for path in sdl_files():
+        text = path.read_text(encoding="utf-8")
+        original = placement_keys(text)
+        out, new_keys = stamp_run(text, RUN)
+        assert new_keys, f"{path.name}: nothing stamped"
+        assert placement_keys(out) == new_keys, path.name
+        for old, new in zip(original, new_keys, strict=True):
+            assert out.count(f"{new}:") >= 2, (
+                f"{path.name}: {new} must appear as the declaration AND at least one "
+                f"deployment reference — several services may share one placement group"
+            )
+            assert not re.search(rf"(?m)^[ \t]+{re.escape(old)}:[ \t]*$", out), (
+                f"{path.name}: an unscoped {old} survives — the two copies disagree"
+            )
+
+
+def test_a_scoped_sdl_still_passes_the_prefix_guard():
+    """The guard runs against files on disk, but the stamped text is what reaches Akash."""
+    for path in sdl_files():
+        out, _ = stamp_run(path.read_text(encoding="utf-8"), RUN)
+        for key in placement_keys(out):
+            assert key.startswith(PLACEMENT_PREFIX), (path.name, key)
+
+
+def test_the_run_id_reads_back():
+    assert run_id_of(run_scoped("just-akash-runner", RUN)) == RUN
+
+
+def test_an_unscoped_or_foreign_key_reports_no_run():
+    """Reading a run id out of a key that has none must return "", never a guess — a
+    caller uses this to decide whether to DESTROY."""
+    for key in ("just-akash-runner", "dfci-infra-runner.abc123", "dcloud", "akash", ""):
+        assert run_id_of(key) == "", key
+
+
+def test_a_non_hex_tail_is_not_a_run_id():
+    """Workload names may contain dots. `just-akash-my.service` must not read as a
+    deployment belonging to run `service`."""
+    assert run_id_of("just-akash-my.service") == ""
+
+
+def test_stamping_is_idempotent():
+    """A re-deploy path may transform the same SDL twice; a second stamp must not append
+    a second run id."""
+    once, keys1 = stamp_run(sdl_files()[0].read_text(encoding="utf-8"), RUN)
+    twice, keys2 = stamp_run(once, RUN)
+    assert twice == once and keys2 == []
+    assert all(run_id_of(k) == RUN for k in keys1)
+
+
+def test_an_empty_run_id_leaves_the_sdl_untouched():
+    """No run id means the previous behaviour exactly — a bare repo key."""
+    text = sdl_files()[0].read_text(encoding="utf-8")
+    out, keys = stamp_run(text, "")
+    assert out == text and keys == []
+
+
+def test_a_foreign_placement_key_is_never_rewritten():
+    """`deploy` runs arbitrary caller SDLs. Stamping someone else's document would claim
+    authorship we did not have, and the marker must only say what it can prove."""
+    foreign = "services:\n  a:\n    image: x\nprofiles:\n  placement:\n    dcloud:\n"
+    out, keys = stamp_run(foreign, RUN)
+    assert out == foreign and keys == []
+
+
+def test_a_commented_key_line_is_rewritten_and_keeps_its_comment():
+    """The key appears twice, and a comment on only ONE of them — typically the
+    `deployment.<service>.<KEY>` reference, where "# picks the placement above" is a
+    natural note — would rewrite the declaration and leave the reference pointing at a
+    placement group that no longer exists. Akash rejects that SDL, so a comment in a
+    caller's file would break the deploy outright."""
+    sdl = (
+        "services:\n  a:\n    image: x\n"
+        "profiles:\n  placement:\n    just-akash-a:\n"
+        "deployment:\n  a:\n    just-akash-a:   # picks the placement above\n"
+        "      profile: a\n      count: 1\n"
+    )
+    out, keys = stamp_run(sdl, RUN)
+    assert keys == [f"just-akash-a.{RUN}"]
+    assert f"just-akash-a.{RUN}:   # picks the placement above" in out, "comment lost"
+    assert not re.search(r"(?m)^\s+just-akash-a:", out), (
+        "an unscoped reference survived — the SDL now names a placement group that does not exist"
+    )
+
+
+def test_a_placement_group_shared_by_several_services_is_fully_rewritten():
+    """Valid SDLs may point more than one service at the same placement group. Missing
+    one reference leaves that service selecting a group that no longer exists."""
+    sdl = (
+        "services:\n  a:\n    image: x\n  b:\n    image: y\n"
+        "profiles:\n  placement:\n    just-akash-a:\n"
+        "deployment:\n  a:\n    just-akash-a:\n      profile: a\n      count: 1\n"
+        "  b:\n    just-akash-a:\n      profile: b\n      count: 1\n"
+    )
+    out, _ = stamp_run(sdl, RUN)
+    assert out.count(f"just-akash-a.{RUN}:") == 3
+    assert not re.search(r"(?m)^\s+just-akash-a:", out)
+
+
+def test_the_key_is_not_rewritten_inside_a_comment_or_block_scalar():
+    """The counterpart risk: a bare substring replace would rewrite text that merely
+    MENTIONS the key, which is why this anchors to a whole key line."""
+    sdl = (
+        "services:\n  a:\n    image: x\n    args:\n      - |\n"
+        "        just-akash-a:\n"
+        "profiles:\n  placement:\n    just-akash-a:\n"
+        "# see just-akash-a: for the placement\n"
+    )
+    out, _ = stamp_run(sdl, RUN)
+    assert "        just-akash-a:" in out, "block scalar content was rewritten"
+    assert "# see just-akash-a: for the placement" in out, "a comment was rewritten"
