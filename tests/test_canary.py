@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 
 import canary.canary as agent
+import canary.collect as collect_mod
 from canary.collect import (
     extract_boot_id,
     load_json_mapping,
@@ -163,13 +164,32 @@ def test_no_canary_deployed_is_distinct_from_deployed_but_unreachable():
     st = merge({}, ALPHA, "100", False, "", 0.0, 1000.0, deployed=True)
     st = merge(st, "onidc", "300", False, "", 0.0, 1000.0, deployed=False)
     samples = parse_exposition(render(st, 1.0))
-    # Both are unreachable...
+
+    # The DEPLOYED one is unreachable and says so. This is the real customer-visible
+    # fault and it must keep its teeth.
     assert samples[("akash_canary_reachable", (("provider", ALPHA),))] == 0.0
-    assert samples[("akash_canary_reachable", (("provider", "onidc"),))] == 0.0
-    # ...but only one of them was ever deployed to be reachable.
     assert samples[("akash_canary_deployed", (("provider", ALPHA),))] == 1.0
+
+    # The undeployed one publishes NO reachability at all. Not 0 -- ABSENT.
+    #
+    # This assertion is what decides whether the incident is actually fixed, and it is
+    # the inverse of what this test asserted before. df-grafana's AkashCanaryUnreachable
+    # and AkashCanaryScrapeTimingOut are both left-gated on akash_canary_scrape_seconds
+    # and then match `on(provider) akash_canary_reachable == 0`. Publishing 0 here keeps
+    # both firing for a provider that never had a canary, until somebody edits the alert
+    # in another repo. An absent series matches nothing, so the page stops on its own.
+    for metric in (
+        "akash_canary_reachable",
+        "akash_canary_scrape_seconds",
+        "akash_canary_checks_total",
+        "akash_canary_unreachable_checks_total",
+    ):
+        assert (metric, (("provider", "onidc"),)) not in samples, metric
+
+    # ...but it is not silent either: it states that nothing was deployed.
     assert samples[("akash_canary_deployed", (("provider", "onidc"),))] == 0.0
     assert samples[("akash_canary_active_deployments", ())] == 1.0
+    assert samples[("akash_canary_providers_total", ())] == 2.0
 
 
 def test_active_deployments_is_emitted_even_when_no_canary_exists():
@@ -337,8 +357,11 @@ def test_plan_finds_live_canaries_and_flags_missing_ones():
         _dep(ADDR_ONIDC, "200", "b.example.com"),
     ]
     targets, missing, _ = plan(details, ALL_PAIRS)
-    assert targets[ALPHA] == {"uri": "a.example.com", "dseq": "100"}
+    assert targets[ALPHA] == {"uri": "a.example.com", "dseq": "100", "live": True}
     assert missing == ["hetzner_hel"]
+    # The provider with no canary still gets an entry, marked not-live, so the collector
+    # can publish `deployed 0` for it rather than emitting no series at all.
+    assert targets["hetzner_hel"]["live"] is False
 
 
 def test_plan_ignores_deployments_that_are_not_canaries():
@@ -347,7 +370,11 @@ def test_plan_ignores_deployments_that_are_not_canaries():
     details = [_dep(ADDR_ALPHAVPS, "999", "x.example.com", services=("probe",))]
     targets, missing, _ = plan(details, ALPHA_ONLY)
     assert missing == [ALPHA]
-    assert ALPHA not in targets
+    # It gets an entry now (so `deployed 0` is publishable instead of silence), but the
+    # probe's identity must never be adopted into it -- that is what this guards.
+    assert targets[ALPHA]["live"] is False
+    assert targets[ALPHA]["uri"] == ""
+    assert targets[ALPHA]["dseq"] == ""
 
 
 def test_plan_ignores_a_canary_on_someone_elses_provider():
@@ -387,7 +414,7 @@ def test_live_canary_without_ingress_yet_keeps_previous_uri():
     provider as unreachable."""
     prev = {ALPHA: {"uri": "old.example.com", "dseq": "50"}}
     targets, _, _ = plan([_dep(ADDR_ALPHAVPS, "100")], ALPHA_ONLY, prev)
-    assert targets[ALPHA] == {"uri": "old.example.com", "dseq": "100"}
+    assert targets[ALPHA] == {"uri": "old.example.com", "dseq": "100", "live": True}
 
 
 def test_plan_accepts_a_wrapped_details_object():
@@ -874,3 +901,142 @@ def test_a_non_list_deployments_value_is_refused(tmp_path):
         assert "deployments" in str(exc)
     else:
         raise AssertionError("deployments must be a list")
+
+
+# --------------------------------------------------------------------------
+# The WIRING. Every test above drives merge() directly with an explicit deployed=,
+# so the one thing that actually ships -- main() reading the targets file -- was
+# never exercised, and `deployed=bool(uri)` shipped green.
+# --------------------------------------------------------------------------
+
+
+def _run_collect(tmp_path, targets: dict, monkeypatch, state: dict | None = None) -> dict:
+    """Drive collect.main() end to end and return the parsed exposition."""
+    t, st, out = (tmp_path / n for n in ("targets.json", "state.json", "out.prom"))
+    t.write_text(json.dumps(targets), encoding="utf-8")
+    st.write_text(json.dumps(state or {}), encoding="utf-8")
+    scraped: list[str] = []
+
+    def _fake_scrape(uri, timeout=0):
+        scraped.append(uri)
+        return (True, _body("boot-x"), 0.1)
+
+    monkeypatch.setattr(collect_mod, "scrape", _fake_scrape)
+    monkeypatch.setattr(
+        "sys.argv", ["collect", "--targets", str(t), "--state", str(st), "--out", str(out)]
+    )
+    assert collect_mod.main() == 0
+    samples = parse_exposition(out.read_text(encoding="utf-8"))
+    samples["__scraped__"] = scraped  # type: ignore[assignment]
+    return samples
+
+
+def test_main_reads_live_from_targets_not_the_presence_of_a_uri(tmp_path, monkeypatch):
+    """The retained-stale-URI shape -- the whole reason this signal exists.
+
+    ensure.plan() deliberately carries the previous uri forward for a canary that is GONE,
+    so the entry still looks scrapeable. `deployed=bool(uri)` therefore reports deployed=1
+    for exactly that provider, AND scrapes the dead endpoint, producing a real
+    scrape_seconds with reachable=0 -- which is what AkashCanaryUnreachable pages on.
+
+    So: read `live`, do not scrape, and publish no reachability at all."""
+    samples = _run_collect(
+        tmp_path,
+        {"onidc": {"uri": "stale.example.com", "dseq": "1", "live": False}},
+        monkeypatch,
+    )
+    assert samples["__scraped__"] == [], "a canary known to be gone must not be scraped"
+    assert samples[("akash_canary_deployed", (("provider", "onidc"),))] == 0.0
+    for metric in (
+        "akash_canary_reachable",
+        "akash_canary_scrape_seconds",
+        "akash_canary_checks_total",
+        "akash_canary_unreachable_checks_total",
+    ):
+        assert (metric, (("provider", "onidc"),)) not in samples, metric
+    assert samples[("akash_canary_active_deployments", ())] == 0.0
+    assert samples[("akash_canary_providers_total", ())] == 1.0
+
+
+def test_main_still_scrapes_and_reports_a_live_target(tmp_path, monkeypatch):
+    """The other half: `live: true` must reach a real reading, or the gate above would
+    'fix' the page by silencing everything."""
+    samples = _run_collect(
+        tmp_path, {ALPHA: {"uri": "a.example.com", "dseq": "100", "live": True}}, monkeypatch
+    )
+    assert samples["__scraped__"] == ["a.example.com"]
+    assert samples[("akash_canary_deployed", (("provider", ALPHA),))] == 1.0
+    assert samples[("akash_canary_reachable", (("provider", ALPHA),))] == 1.0
+    assert samples[("akash_canary_active_deployments", ())] == 1.0
+
+
+def test_main_falls_back_to_uri_for_a_targets_file_written_before_live_existed(
+    tmp_path, monkeypatch
+):
+    """Migration: the first collect run after this ships reads a targets.json ensure has
+    not rewritten yet. Those entries have no `live` key, and bool(uri) reproduces the old
+    behaviour rather than blanking the whole fleet to deployed=0."""
+    samples = _run_collect(tmp_path, {ALPHA: {"uri": "a.example.com", "dseq": "100"}}, monkeypatch)
+    assert samples[("akash_canary_deployed", (("provider", ALPHA),))] == 1.0
+
+
+def test_deployed_flips_back_to_zero_when_the_canary_disappears():
+    """Kills a `p.setdefault("deployed", ...)` implementation, which would latch the first
+    value forever and still pass every test that sets it once."""
+    st = merge({}, ALPHA, "100", True, _body("aaa"), 0.1, 1000.0, deployed=True)
+    assert st[ALPHA]["deployed"] == 1
+    st = merge(st, ALPHA, "100", False, "", 0.0, 2000.0, deployed=False)
+    assert st[ALPHA]["deployed"] == 0, "a canary that disappeared must stop reading as 1"
+    assert st[ALPHA]["unreachable_checks_total"] == 0, "no scrape was attempted"
+
+
+def test_a_successful_scrape_still_outranks_an_explicit_false():
+    """The implication that must survive: if we reached it, it exists. Letting deployed=
+    False win over a successful scrape would publish deployed=0 for a provider that is
+    serving, and fleet-wide that pages AkashCanaryNoDeployments while every canary answers."""
+    st = merge({}, ALPHA, "100", True, _body("aaa"), 0.1, 1000.0, deployed=False)
+    assert st[ALPHA]["deployed"] == 1
+    assert st[ALPHA]["reachable"] == 1
+
+
+def test_a_partial_listing_does_not_rewrite_a_legacy_target_as_not_live():
+    """The rollout-window regression, and it is a silencing one.
+
+    This branch WRITES the targets file, so a guess made here is PERSISTED. Defaulting a
+    legacy entry (no `live` key) to False during an incomplete chain read would store an
+    explicit `live: false`; collect.main() then sees a key present, skips its bool(uri)
+    migration fallback, and stops scraping a canary whose chain state was never
+    determined. One flaky listing would silence a healthy canary until the next complete
+    ensure run."""
+    prev = {ALPHA: {"uri": "old.example.com", "dseq": "50"}}  # legacy: no `live`
+    partial = {"complete": False, "deployments": []}
+    targets, missing, _ = plan(partial, ALPHA_ONLY, prev)
+    assert targets[ALPHA]["live"] is True, "a legacy entry with a uri must stay scrapeable"
+    assert missing == [], "an incomplete listing proves nothing is missing"
+
+
+def test_a_partial_listing_preserves_an_explicit_prior_false():
+    """The counterpart: an explicit False IS an observation from an earlier complete scan,
+    so it must survive a later incomplete one rather than reverting to the uri heuristic."""
+    prev = {ALPHA: {"uri": "stale.example.com", "dseq": "50", "live": False}}
+    partial = {"complete": False, "deployments": []}
+    targets, _, _ = plan(partial, ALPHA_ONLY, prev)
+    assert targets[ALPHA]["live"] is False
+
+
+def test_the_fleet_denominator_counts_the_roster_not_durable_history():
+    """`state` is durable by design — a departed provider is zeroed, not deleted, so its
+    counters survive. That makes it the wrong basis for a fleet view: a provider retired
+    from AKASH_PROVIDERS would inflate providers_total forever and keep emitting a retired
+    deployment gauge, so active/total would under-read for good."""
+    st = {
+        ALPHA: {"deployed": 1, "reachable": 1},
+        "retired": {"deployed": 0, "checks_total": 900},
+    }
+    samples = parse_exposition(render(st, 1.0, roster={ALPHA}))
+    assert samples[("akash_canary_providers_total", ())] == 1.0
+    assert samples[("akash_canary_active_deployments", ())] == 1.0
+    assert ("akash_canary_deployed", (("provider", "retired"),)) not in samples
+    # ...and with no roster (every existing caller) nothing changes.
+    all_samples = parse_exposition(render(st, 1.0))
+    assert all_samples[("akash_canary_providers_total", ())] == 2.0

@@ -344,7 +344,8 @@ def plan(
                 "close the others by hand, no reaper will."
             )
         if not deps:
-            if provider in unclassifiable:
+            starting = provider in unclassifiable
+            if starting:
                 notes.append(
                     f"{provider}: a lease here reports no services yet - cannot tell a "
                     "starting canary from none, so NOT deploying this run."
@@ -353,12 +354,49 @@ def plan(
                 missing.append(provider)
             # Keep the last known target so the collector still records the outage
             # against the right endpoint instead of losing the provider entirely.
-            if provider in prev:
-                targets[provider] = prev[provider]
+            #
+            # `live` is what makes that retention safe. Because the uri survives, the
+            # collector CANNOT infer liveness from it -- a dead canary keeps a
+            # real-looking endpoint by design -- so state explicitly what was observed.
+            # This is the only place that knows: `missing` never reaches the targets file.
+            #
+            #   starting        -> True   a LEASE EXISTS, it just has not reported its
+            #                             services yet. A lease existing IS a deployment
+            #                             existing, so this is an observation and not a
+            #                             guess; flipping it False would publish
+            #                             deployed=0 through every normal lease startup,
+            #                             the false transition the note above avoids.
+            #   complete scan   -> False  the listing was whole and this canary is not in
+            #                             it. Proven gone.
+            #   partial listing -> carry  we did not observe enough to claim either way,
+            #                             and inventing False here would page on a flaky
+            #                             provider listing rather than on a real outage.
+            prior = prev.get(provider) or {}
+            if starting:
+                live = True
+            elif complete:
+                live = False
+            elif "live" in prior:
+                # An explicit prior value is a real observation; preserve it, False included.
+                live = bool(prior["live"])
+            else:
+                # A LEGACY entry, written before this key existed. Defaulting it to False
+                # here would be far worse than it looks: this branch WRITES the targets
+                # file, so the guess is persisted as an explicit `live: false`, and
+                # collect.main() then sees a key present, skips its bool(uri) migration
+                # fallback, and stops scraping a canary whose chain state we never
+                # determined. One incomplete listing during the rollout window would
+                # silence a healthy canary. Fall back to the legacy heuristic instead.
+                live = bool(prior.get("uri"))
+            entry = dict(prev.get(provider) or {})
+            entry.setdefault("uri", "")
+            entry.setdefault("dseq", "")
+            entry["live"] = live
+            targets[provider] = entry
             continue
         dep = _newest(deps)
         uri = ingress_uri(dep) or (prev.get(provider, {}) or {}).get("uri", "")
-        targets[provider] = {"uri": uri, "dseq": _dseq_of(dep)}
+        targets[provider] = {"uri": uri, "dseq": _dseq_of(dep), "live": True}
     return targets, missing, notes
 
 
