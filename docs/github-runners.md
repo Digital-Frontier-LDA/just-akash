@@ -182,6 +182,16 @@ Two shapes work at spike, and they are the same idea:
        AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}  # MUST be the same set
    ```
 
+   Keys separate on **newlines, commas or semicolons**, and are **de-duplicated**. That
+   last part is not tidiness: selection is `run_id % N`, so a key repeated across two
+   variables makes two of the N slots the same account — the runs landing on them contend
+   on one sequence number exactly as before, while the operator believes they have N.
+   The failure is invisible, which is why it is collapsed rather than trusted.
+
+   The separators match how these keys are already stored org-wide: `AKASH_CONSOLE` plus
+   `AKASH_CONSOLE_2..9`, where any one variable may itself hold a list. Concatenate them
+   and paste.
+
    Each key is a separate Cosmos account, so N keys give N independent sequence numbers
    and concurrent provisioners stop rejecting one another. A wallet is chosen
    deterministically from `github.run_id` — **not randomly**, because the teardown

@@ -348,7 +348,20 @@ jobs:
           # tr -d '\r' FIRST: a multi-line GitHub secret pasted from Windows carries CRLF,
           # and mapfile keeps the trailing \r on every key — producing a credential that
           # looks right in the log and is rejected by the API.
-          mapfile -t KEYS < <(printf '%s\n' "${AKASH_API_KEYS:-}" | tr -d '\r' | sed '/^[[:space:]]*$/d')
+          # Separators: newline, COMMA and SEMICOLON. The org's Console keys live as
+          # AKASH_CONSOLE / AKASH_CONSOLE_2..9, and a single one of those variables may
+          # itself hold a comma- or semicolon-separated list — so a caller pasting that
+          # value must not have it read as one absurdly long key.
+          #
+          # DEDUPED, preserving first position, and that is not tidiness. This selects by
+          # `run_id % N`: if the same key appears twice, two of the N slots are the SAME
+          # account, so the runs landing on them contend on one sequence number exactly as
+          # before — while the operator believes they have N. A duplicate is a realistic
+          # slip, not an exotic one; the sibling repo carries a regression test for the
+          # same key appearing under two variables.
+          mapfile -t KEYS < <(printf '%s\n' "${AKASH_API_KEYS:-}" \
+            | tr -d '\r' | tr ',;' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+            | sed '/^$/d' | awk '!seen[$0]++')
           if [ "${#KEYS[@]}" -gt 0 ]; then
             IDX=$(( RUN_ID % ${#KEYS[@]} ))
             AKASH_API_KEY="${KEYS[$IDX]}"
@@ -494,7 +507,20 @@ jobs:
           # tr -d '\r' FIRST: a multi-line GitHub secret pasted from Windows carries CRLF,
           # and mapfile keeps the trailing \r on every key — producing a credential that
           # looks right in the log and is rejected by the API.
-          mapfile -t KEYS < <(printf '%s\n' "${AKASH_API_KEYS:-}" | tr -d '\r' | sed '/^[[:space:]]*$/d')
+          # Separators: newline, COMMA and SEMICOLON. The org's Console keys live as
+          # AKASH_CONSOLE / AKASH_CONSOLE_2..9, and a single one of those variables may
+          # itself hold a comma- or semicolon-separated list — so a caller pasting that
+          # value must not have it read as one absurdly long key.
+          #
+          # DEDUPED, preserving first position, and that is not tidiness. This selects by
+          # `run_id % N`: if the same key appears twice, two of the N slots are the SAME
+          # account, so the runs landing on them contend on one sequence number exactly as
+          # before — while the operator believes they have N. A duplicate is a realistic
+          # slip, not an exotic one; the sibling repo carries a regression test for the
+          # same key appearing under two variables.
+          mapfile -t KEYS < <(printf '%s\n' "${AKASH_API_KEYS:-}" \
+            | tr -d '\r' | tr ',;' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+            | sed '/^$/d' | awk '!seen[$0]++')
           if [ "${#KEYS[@]}" -gt 0 ]; then
             AKASH_API_KEY="${KEYS[$(( RUN_ID % ${#KEYS[@]} ))]}"
             export AKASH_API_KEY
