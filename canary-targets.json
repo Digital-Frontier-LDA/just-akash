@@ -1,14 +1,17 @@
 {
   "alphavps": {
     "dseq": "1786599460649",
+    "live": true,
     "uri": "hj8dt69qfhbr34oirsngomcuus.ingress.h6i-dedicated.eu-se-1.digitalfrontier.so"
   },
   "hetzner_hel": {
     "dseq": "1786614982518",
+    "live": true,
     "uri": "540fvl8lghei9b9d6srqvpkpe8.ingress.m3a.eu-n-3.digitalfrontier.network"
   },
   "onidc": {
     "dseq": "1786614905053",
+    "live": true,
     "uri": "uj8vb9ucmhbrn1r2ssjvja2r8k.ingress.h4i-dedicated.eu-sw-2.digitalfrontier.so"
   }
 }
