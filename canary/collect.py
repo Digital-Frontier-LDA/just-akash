@@ -476,9 +476,7 @@ def render(
         "is measuring nothing."
     )
     add("# TYPE akash_canary_active_deployments gauge")
-    add(
-        f"akash_canary_active_deployments {len(live)}"
-    )
+    add(f"akash_canary_active_deployments {len(live)}")
 
     # Pass-through of the inside-the-deployment view.
     passthrough = [
@@ -600,7 +598,7 @@ def main() -> int:
             'JSON: {"provider": {"uri": "host:port", "dseq": "123", "live": true}}. '
             "`live` is what ensure.py observed on chain; a missing `live` falls back to "
             "the presence of a uri, for a file written before the key existed."
-        )
+        ),
     )
     ap.add_argument("--state", required=True, help="Durable state JSON (read+write)")
     ap.add_argument("--out", required=True, help="Exposition file to write")
