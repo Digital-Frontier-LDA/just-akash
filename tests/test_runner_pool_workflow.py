@@ -842,6 +842,27 @@ def test_a_wallet_pool_without_an_address_is_refused_not_silently_unchecked():
     )
 
 
+def _wallet_selection_bodies() -> list[tuple[str, str]]:
+    """(label, code) for every place a wallet is selected.
+
+    NAMED and asserted present, never skipped. An earlier form of these guards did
+    `if "AKASH_API_KEYS" not in body: continue`, so a regression that REMOVED selection
+    from a step made the guard pass by skipping it — the exact shape of a test that
+    reports safety it never checked.
+    """
+    bodies = [
+        ("pool:wallet", _code(_step("Wallet")["run"])),
+        ("pool:provision", _code(PROVISION["run"])),
+        ("teardown:close", _code(TD_CLOSE["run"])),
+    ]
+    for label, body in bodies:
+        assert "AKASH_API_KEYS" in body, (
+            f"{label} no longer selects a wallet — the pool is not applied there, and "
+            f"skipping it here would have hidden that"
+        )
+    return bodies
+
+
 def test_duplicate_keys_are_collapsed_before_selection():
     """Selection is `run_id % N`. If the same key appears twice, two of the N slots are
     the SAME Cosmos account, so runs landing on them contend on one sequence number
@@ -850,32 +871,27 @@ def test_duplicate_keys_are_collapsed_before_selection():
 
     Not exotic either. The org's keys live as AKASH_CONSOLE / AKASH_CONSOLE_2..9 and the
     sibling repo carries a regression test for one key appearing under two variables."""
-    for body in (_code(_step("Wallet")["run"]), _code(PROVISION["run"]), _code(TD_CLOSE["run"])):
-        if "AKASH_API_KEYS" not in body:
-            continue
-        assert "seen[$0]++" in body, "duplicate keys must collapse, or N slots are not N accounts"
+    for label, body in _wallet_selection_bodies():
+        assert "seen[$0]++" in body, (
+            f"{label}: duplicate keys must collapse, or N slots are not N accounts"
+        )
 
 
 def test_commas_and_semicolons_separate_keys_too():
     """A single AKASH_CONSOLE* variable may itself hold a comma- or semicolon-separated
     list, so a caller pasting one must not have it read as one absurdly long key."""
-    for body in (_code(_step("Wallet")["run"]), _code(PROVISION["run"]), _code(TD_CLOSE["run"])):
-        if "AKASH_API_KEYS" not in body:
-            continue
-        assert "tr ',;'" in body, "newline cannot be the only separator"
+    for label, body in _wallet_selection_bodies():
+        assert "tr ',;'" in body, f"{label}: newline cannot be the only separator"
 
 
 def test_every_wallet_selection_strips_carriage_returns():
     """A multi-line GitHub secret pasted from Windows carries CRLF, and mapfile keeps the
     trailing \r on every key — producing a credential that looks correct in the log and is
     rejected by the API. All three selection sites must strip it."""
-    bodies = [_code(_step("Wallet")["run"]), _code(PROVISION["run"]), _code(TD_CLOSE["run"])]
-    for body in bodies:
-        if "AKASH_API_KEYS" not in body:
-            continue
-        assert "mapfile" in body
-        m = body[body.index("mapfile") : body.index("mapfile") + 200]
-        assert "tr -d" in m, "keys must be stripped of CR before use"
+    for label, body in _wallet_selection_bodies():
+        assert "mapfile" in body, label
+        m = body[body.index("mapfile") : body.index("mapfile") + 400]
+        assert "tr -d" in m, f"{label}: keys must be stripped of CR before use"
 
 
 def test_teardown_does_not_claim_an_ownership_check_it_cannot_perform():
