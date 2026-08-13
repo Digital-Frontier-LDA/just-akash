@@ -165,9 +165,37 @@ grant, and the callers that lose are whichever deployed last.
 
 Two shapes work at spike, and they are the same idea:
 
-1. **One Akash account per concurrent provisioner.** Separate `AKASH_API_KEY`s mean
-   separate sequence numbers and no contention at all. Escrow still has to be planned in
-   aggregate, but nothing serialises.
+1. **One Akash account per concurrent provisioner** — supported directly. Pass several
+   Console API keys, one per line, as the optional `AKASH_API_KEYS` secret:
+
+   ```yaml
+   pool:
+     uses: .../runner-pool.yml@runner-v1
+     secrets:
+       AKASH_API_KEY:  ${{ secrets.AKASH_API_KEY }}   # still required, the fallback
+       AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}  # the pool
+   teardown:
+     with:
+       wallet-address: ${{ needs.pool.outputs.wallet_address }}
+     secrets:
+       AKASH_API_KEY:  ${{ secrets.AKASH_API_KEY }}   # still required here too
+       AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}  # MUST be the same set
+   ```
+
+   Each key is a separate Cosmos account, so N keys give N independent sequence numbers
+   and concurrent provisioners stop rejecting one another. A wallet is chosen
+   deterministically from `github.run_id` — **not randomly**, because the teardown
+   re-derives the same choice and a destroy from the wrong account succeeds trivially
+   while closing nothing.
+
+   Two things this does not do for you. **Escrow is per account**, so every key must be
+   funded; the pool checks the balance of the one it picked, not of the set, and an
+   unfunded key reports `WALLET_UNDERFUNDED` for the runs that land on it. And the two
+   jobs **must be given the identical key set** — the pool publishes `wallet_address` and
+   the teardown refuses to destroy unless its own selection resolves to it, so a mismatch
+   fails loudly instead of leaking a lease.
+
+   With no `AKASH_API_KEYS`, everything behaves exactly as before.
 2. **Funnel provisioning through one repo** that owns the wallet and serialises on the
    `akash-wallet` group, handing labels back to callers. Simple, but the queue is the
    throughput ceiling — the opposite of a spike.
