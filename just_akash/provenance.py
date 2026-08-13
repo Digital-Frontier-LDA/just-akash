@@ -151,6 +151,71 @@ def placement_keys(text: str) -> list[str]:
     return keys
 
 
+# Separates the workload part of a key from the per-run part: `just-akash-runner.a1b2c3`.
+# A DOT, not a hyphen: workload names already contain hyphens (`just-akash-runner`), so a
+# hyphen would make "where does the run id start" ambiguous for anything reading the key
+# back. `_KEY_RE` already admits dots, and so does the on-chain name.
+RUN_SEPARATOR = "."
+_RUN_ID_RE = re.compile(r"^[a-f0-9]{6,32}$")
+
+
+def run_scoped(key: str, run_id: str) -> str:
+    """`just-akash-runner` + `a1b2c3` -> `just-akash-runner.a1b2c3`.
+
+    PREFIX MATCHING IS UNAFFECTED, which is what makes this safe to add after the fact:
+    the sibling sweeper, this module's guard and cleanup_stale all use ``startswith``, so
+    a suffix changes nothing they rely on. Nothing in this repo compares a placement key
+    for equality — verified — and ``canary/ensure.py`` matches SERVICE names, so a key
+    that changes per run cannot trigger the redeploy loop #145 exists to prevent.
+    """
+    if not run_id or not key:
+        return key
+    return f"{key}{RUN_SEPARATOR}{run_id}"
+
+
+def run_id_of(key: str) -> str:
+    """The per-run part of a placement key, or "" when it carries none.
+
+    Returns "" rather than guessing for keys minted before run-scoping existed, so an
+    older deployment reads as "repo-attributable, not run-attributable" — which is
+    exactly what it is.
+    """
+    head, sep, tail = key.rpartition(RUN_SEPARATOR)
+    if not sep or not head.startswith(PLACEMENT_PREFIX):
+        return ""
+    return tail if _RUN_ID_RE.match(tail) else ""
+
+
+def stamp_run(sdl_text: str, run_id: str) -> tuple[str, list[str]]:
+    """Rewrite every OWNED placement key to carry ``run_id``. Returns (sdl, new keys).
+
+    Only keys already carrying this repo's prefix are touched. A caller may pass their
+    own SDL declaring any placement key, and rewriting that would claim provenance over
+    a document we do not control — the deployment is ours to account for either way, but
+    the marker should say what it can prove, and `just-akash-` on someone else's SDL
+    would assert authorship we did not have.
+
+    The key appears TWICE and both must move together: `profiles.placement.<KEY>` and the
+    `deployment.<service>.<KEY>` reference that selects it. Rewriting one leaves an SDL
+    that names a placement group which does not exist, which Akash rejects — so this
+    rewrites by exact key line and returns the new keys for the caller to verify.
+    """
+    if not run_id:
+        return sdl_text, []
+    new_keys: list[str] = []
+    out = sdl_text
+    for key in placement_keys(sdl_text):
+        if not key.startswith(PLACEMENT_PREFIX) or run_id_of(key):
+            continue
+        scoped = run_scoped(key, run_id)
+        # Anchored to a whole key line: `<indent><key>:`. A bare substring replace would
+        # also rewrite the string inside a comment or a block scalar that merely mentions
+        # the key, and `placement_keys` is careful about exactly that distinction.
+        out = re.sub(rf"(?m)^([ 	]+){re.escape(key)}:[ 	]*$", rf"\1{scoped}:", out)
+        new_keys.append(scoped)
+    return out, new_keys
+
+
 def sdl_files() -> list[Path]:
     return sorted(p for p in _SDL_DIR.glob("*.yaml") if p.is_file())
 

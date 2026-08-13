@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,10 +34,15 @@ from .api import (
     _extract_bid_price,
     _extract_provider,
 )
-from .provenance import PLACEMENT_PREFIX, SIBLING_REAPED_PREFIX
+from .provenance import PLACEMENT_PREFIX, SIBLING_REAPED_PREFIX, run_id_of, stamp_run
 from .sdl_validate import SDLValidationError, validate_sdl
 
 logger = logging.getLogger("akash.deploy")
+
+# One per PROCESS, not per call: a single `deploy` run may create an order, fail, and
+# re-create (the issue-#19 re-deploy round), and both are the same run's residue. Hex so
+# it survives `_KEY_RE`'s charset and reads back through provenance.run_id_of.
+_RUN_ID = uuid.uuid4().hex[:12]
 
 
 def _ts() -> str:
@@ -49,7 +55,42 @@ def _log(level: int, msg: str):
         print(f"[{_ts()}] {msg}", flush=True)
 
 
-def _report_suspected_orphans(client, since_epoch_s: float) -> list[str]:
+def _close_proven_orphan(client, dseq: str, key: str) -> bool:
+    """Close a deployment proven to be this call's, reporting honestly either way.
+
+    Only reached when the on-chain placement key carries THIS process's run id, so the
+    deployment cannot belong to a sibling repo or to a concurrent run of our own. The
+    create that produced it already raised, so nothing will ever claim it.
+
+    Returns False on any failure, and the caller then reports the dseq the old way — a
+    close we did not achieve must never be reported as one, which is the same rule
+    runner-teardown.yml applies to its own destroy.
+    """
+    try:
+        client.close_deployment(str(dseq))
+    except Exception as exc:  # noqa: BLE001 — an error path must not raise a second error
+        _log(logging.WARNING, f"could not close orphan {dseq} ({key}): {exc}")
+        return False
+    _log(
+        logging.ERROR,
+        f"ORPHAN CLOSED: deployment {dseq} carried this run's provenance ({key}) and no "
+        f"lease. The create reported failure but the transaction had committed, so it was "
+        f"holding escrow under a dseq nobody would have known to look for. Closed "
+        f"automatically; no action needed.",
+    )
+    emit(
+        Code.DEPLOY_CREATE_ORPHAN_SUSPECTED,
+        "error",
+        f"deployment {dseq} was created by a failed create and has been closed",
+        dseq=str(dseq),
+        provenance=[key],
+        owned=True,
+        closed=True,
+    )
+    return True
+
+
+def _report_suspected_orphans(client, since_epoch_s: float, run_id: str = "") -> list[str]:
     """Name deployments a FAILED create may nonetheless have brought into existence.
 
     A create that raises is not proof that nothing was created. `POST /v1/deployments`
@@ -80,11 +121,18 @@ def _report_suspected_orphans(client, since_epoch_s: float) -> list[str]:
     repo's ``sdl/`` only. Reading "not our prefix" as "not our problem" would silently
     drop exactly the orphan whose SDL we never controlled.
 
-    STILL REPORT ONLY, because provenance proves the REPO and not the RUN. A concurrent
-    run of *this* repo also stamps ``just-akash-*``, is also leaseless mid-create, and
-    also lands in this window. Closing on that would destroy a healthy in-flight deploy
-    — the same class of error, one degree narrower. Naming the dseq makes cleanup a
-    single command; guessing makes it a data-loss bug.
+    IT CLOSES WHAT IT CAN PROVE, AND ONLY THAT. The placement key is run-scoped, so a
+    deployment carrying THIS process's run id was created by this very call — not by a
+    sibling repo, and not by a concurrent run of our own. That create already raised, so
+    the caller is abandoning it: a deployment we cannot return is by definition
+    unclaimed, and leaving it open means escrow held against the grant every later run
+    spends from, under a dseq nobody knows.
+
+    Everything short of that proof is still REPORT ONLY. Repo-level provenance cannot
+    single out one create's residue — a concurrent run of *this* repo stamps the same
+    prefix, is also leaseless mid-create, and lands in the same window — so closing on it
+    would destroy a healthy in-flight deploy. Naming the dseq makes cleanup a single
+    command; guessing makes it a data-loss bug.
 
     Unreadable provenance keeps a deployment IN the report, marked unverified. Every LCD
     may have failed, and a leak we cannot attribute is still a leak — silence there would
@@ -155,7 +203,17 @@ def _report_suspected_orphans(client, since_epoch_s: float) -> list[str]:
             )
             continue
 
-        if ours:
+        mine = bool(run_id) and any(run_id_of(n) == run_id for n in names)
+        if mine:
+            # PROVEN to be this call's residue. Close it rather than describing it.
+            if _close_proven_orphan(client, dseq, names[0]):
+                continue
+            headline = f"ORPHAN (this run, group_spec.name={names[0]}) — COULD NOT CLOSE"
+            proof = (
+                "Its provenance carries THIS run's id, so this call created it, and the "
+                "automatic close failed"
+            )
+        elif ours:
             headline = f"ORPHAN (confirmed ours, group_spec.name={names[0]})"
             proof = "Its on-chain provenance carries this repo's prefix"
         elif names:
@@ -388,6 +446,19 @@ def _prepare_sdl_content(
         sdl_content = f.read()
     _log(logging.DEBUG, f"SDL content length: {len(sdl_content)} bytes")
 
+    # RUN-SCOPE THE PROVENANCE KEY. The repo prefix proves which repo created a
+    # deployment; this makes it prove which RUN. That is the difference between
+    # reporting a suspected orphan and being able to close it: a concurrent run of THIS
+    # repo also stamps `just-akash-*`, is also leaseless mid-create, and also lands in
+    # the same window, so repo-level provenance can never single out one create's
+    # residue. See _report_suspected_orphans.
+    #
+    # Stamped BEFORE validation so a bad rewrite fails here, against our own validator,
+    # rather than as an opaque rejection from the Console API.
+    sdl_content, _run_keys = stamp_run(sdl_content, _RUN_ID)
+    if _run_keys:
+        _log(logging.DEBUG, f"provenance keys for this run: {_run_keys}")
+
     try:
         validate_sdl(sdl_content)
     except SDLValidationError as e:
@@ -583,14 +654,14 @@ def deploy(
                     "error",
                     f"create deployment failed after retry: {retry_err}",
                 )
-                _report_suspected_orphans(client, _create_started)
+                _report_suspected_orphans(client, _create_started, _RUN_ID)
                 raise RuntimeError(
                     f"Failed to create deployment after retry: {retry_err}"
                 ) from retry_err
         else:
             _log(logging.ERROR, f"Create deployment FAILED: {e}")
             emit(Code.DEPLOY_CREATE_FAILED, "error", f"create deployment failed: {e}")
-            _report_suspected_orphans(client, _create_started)
+            _report_suspected_orphans(client, _create_started, _RUN_ID)
             raise RuntimeError(f"Failed to create deployment: {e}") from e
 
     dseq = deployment_response.get("dseq")
@@ -1249,7 +1320,7 @@ def deploy(
         try:
             redeploy_response = client.create_deployment(sdl_content, deposit=deposit)
         except RuntimeError as redeploy_err:
-            _report_suspected_orphans(client, _redeploy_started)
+            _report_suspected_orphans(client, _redeploy_started, _RUN_ID)
             raise RuntimeError(f"re-deploy create failed: {redeploy_err}") from redeploy_err
         new_dseq = redeploy_response.get("dseq")
         if new_dseq is None:
