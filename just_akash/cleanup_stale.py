@@ -140,7 +140,30 @@ def _credit_line(client: AkashConsoleAPI, address: str) -> str:
     )
 
 
-def run(*, execute: bool = False, now: float | None = None, reap_runners: bool = False) -> int:
+def run(
+    *,
+    execute: bool = False,
+    now: float | None = None,
+    reap_runners: bool = False,
+    only_service: str | None = None,
+) -> int:
+    """Audit (and optionally close) stale test deployments.
+
+    ``only_service`` narrows the closable set to deployments whose service set
+    is exactly that one service — e.g. ``probe``. An unattended, scheduled
+    reaper must be able to reap the short-lived class it understands WITHOUT
+    also being licensed to close the 48h ``backtest`` class, which can legally
+    be a live e2e run, or the ``runner`` class whose ownership has to be proven
+    on chain first. Without this the only options were "close everything stale"
+    or "close nothing", so the scheduled sweep could not be enabled at all.
+    Deployments outside the filter are still reported, just never closed.
+
+    It composes with ``reap_runners`` rather than replacing it: that flag opens
+    a class up for reaping, this one narrows which classes a given invocation is
+    allowed to act on. Passing ``--only-service probe`` makes runner provenance
+    moot for that run, which is the point — the bid-probe's own sweep has no
+    business deciding anything about a runner pool.
+    """
     api_key = os.environ.get("AKASH_API_KEY")
     if not api_key:
         print("Error: AKASH_API_KEY not set.", file=sys.stderr)
@@ -172,8 +195,13 @@ def run(*, execute: bool = False, now: float | None = None, reap_runners: bool =
             names = chain.deployment_group_names(address, dseq)
         verdict, services, age = classify(detail, dseq, now, reap_runners, names)
         age_str = f"{age / 86400:5.1f}d" if age is not None else "   ?  "
-        print(f"  {dseq}  age={age_str}  services={services or '-'}  -> {verdict}")
-        if verdict in STALE_VERDICTS:
+        filtered = (
+            only_service is not None
+            and set(services or []) != {only_service}
+        )
+        suffix = f" (skipped: not services=={{{only_service}}})" if filtered else ""
+        print(f"  {dseq}  age={age_str}  services={services or '-'}  -> {verdict}{suffix}")
+        if verdict in STALE_VERDICTS and not filtered:
             stale.append(dseq)
 
     print(f"\nstale (closable): {len(stale)}")
@@ -215,8 +243,23 @@ def main(argv: list[str] | None = None) -> int:
             "is YOUR assertion that this Console account hosts nothing else."
         ),
     )
+    ap.add_argument(
+        "--only-service",
+        default=None,
+        metavar="NAME",
+        help=(
+            f"Only close deployments whose service set is exactly {{NAME}} "
+            f"(e.g. {PROBE_SERVICE}). Everything else is reported but left alone. "
+            "Use this for unattended/scheduled sweeps so the reaper can never "
+            "close a long-lived class it does not understand."
+        ),
+    )
     args = ap.parse_args(argv)
-    return run(execute=args.execute, reap_runners=args.reap_runners)
+    return run(
+        execute=args.execute,
+        reap_runners=args.reap_runners,
+        only_service=args.only_service,
+    )
 
 
 if __name__ == "__main__":
