@@ -55,35 +55,75 @@ class TestClassify:
             verdict, _, _ = cs.classify(_detail(services), _dseq(30 * 86400), NOW)
             assert verdict == "LEAVE-real-or-unknown", services
 
-    def test_a_runner_pool_is_only_reaped_when_the_operator_opts_in(self):
-        """`runner` is the service runner-pool.yml renders, so a pool cancelled between
-        deploy and teardown leaks its lease with nothing to collect it — and at spike that
-        escrow starves every other pool on the same grant.
+    def test_a_runner_pool_needs_BOTH_the_flag_and_proven_ownership(self):
+        """Opting in is necessary and NOT sufficient.
 
-        But nothing on chain proves a `runner` service is OURS: just-akash's tags live in
-        a local file and `status --json` emits none, so ownership cannot be checked. A
-        sweep that reaped by shape alone once destroyed 14 third-party deployments. Hence
-        opt-in: the default above must stay LEAVE."""
+        The flag used to stand alone, resting on the operator declaring that the Console
+        account hosted nothing but their own pools. That declaration was measurably false
+        on the very wallet this ships against: a live read on 2026-08-12 found 11 active
+        deployments, SIX of them `dfci-infra-runner` — a sibling repo's runners on the
+        shared wallet. Reaping on shape plus an assertion would have destroyed them.
+        """
         old = _dseq(8 * 3600)
+        ours = ["just-akash-runner"]
         assert cs.classify(_detail(["runner"]), old, NOW)[0] == "LEAVE-real-or-unknown"
-        assert cs.classify(_detail(["runner"]), old, NOW, reap_runners=True)[0] == "STALE-runner"
+        assert (
+            cs.classify(_detail(["runner"]), old, NOW, reap_runners=True, group_names=ours)[0]
+            == "STALE-runner"
+        )
 
-    def test_an_opted_in_runner_pool_is_still_spared_while_it_could_be_live(self):
+    def test_another_repos_runner_on_the_shared_wallet_is_left_alone(self):
+        """The concrete deployment this protects: `dfci-infra-runner`, six of them live
+        on our wallet when this was written. Same service set, same age, not ours."""
+        old = _dseq(8 * 3600)
+        for foreign in (["dfci-infra-runner"], ["dfci-infra-consul"], ["akash"], ["dcloud"]):
+            verdict, _, _ = cs.classify(
+                _detail(["runner"]), old, NOW, reap_runners=True, group_names=foreign
+            )
+            assert verdict == "LEAVE-not-ours", foreign
+
+    def test_unreadable_provenance_is_not_unowned(self):
+        """Every endpoint may have failed, or the deployment may have closed under us.
+        Destroying on a failed read is the same class of error as destroying on a guess —
+        and this one would be silent, because a dead LCD looks like an empty answer."""
+        old = _dseq(8 * 3600)
+        for unknown in (None, []):
+            verdict, _, _ = cs.classify(
+                _detail(["runner"]), old, NOW, reap_runners=True, group_names=unknown
+            )
+            assert verdict == "LEAVE-unverified-runner", unknown
+
+    def test_an_owned_runner_pool_is_still_spared_while_it_could_be_live(self):
         """A pool is long-lived BY DESIGN — `ephemeral: false` outlives a single job and a
-        slow matrix runs for hours — so the probe's 1h threshold would reap running CI."""
+        slow matrix runs for hours — so the probe's 1h threshold would reap running CI.
+        Proving it is ours does not make it disposable."""
         for age in (600, 3 * 3600, 5 * 3600):
-            verdict, _, _ = cs.classify(_detail(["runner"]), _dseq(age), NOW, reap_runners=True)
+            verdict, _, _ = cs.classify(
+                _detail(["runner"]),
+                _dseq(age),
+                NOW,
+                reap_runners=True,
+                group_names=["just-akash-runner"],
+            )
             assert verdict == "LEAVE-recent-runner", age
 
-    def test_an_unaged_runner_pool_is_never_reaped_even_when_opted_in(self):
+    def test_an_unaged_runner_pool_is_never_reaped_even_when_owned(self):
         """A dseq that yields no age must not be treated as ancient."""
-        verdict, _, _ = cs.classify(_detail(["runner"]), "not-a-dseq", NOW, reap_runners=True)
+        verdict, _, _ = cs.classify(
+            _detail(["runner"]),
+            "not-a-dseq",
+            NOW,
+            reap_runners=True,
+            group_names=["just-akash-runner"],
+        )
         assert verdict == "LEAVE-recent-runner"
 
     def test_opting_in_does_not_widen_the_blast_radius_to_other_services(self):
         """The flag enables ONE service set. It must not become a general 'reap anything'."""
         for services in (["node"], ["train"], ["app"], ["runner", "sidecar"]):
-            verdict, _, _ = cs.classify(_detail(services), _dseq(30 * 86400), NOW, True)
+            verdict, _, _ = cs.classify(
+                _detail(services), _dseq(30 * 86400), NOW, True, ["just-akash-runner"]
+            )
             assert verdict == "LEAVE-real-or-unknown", services
 
     def test_empty_service_set_is_unclassifiable(self):
