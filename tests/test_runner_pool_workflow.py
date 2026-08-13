@@ -842,6 +842,29 @@ def test_a_wallet_pool_without_an_address_is_refused_not_silently_unchecked():
     )
 
 
+def test_duplicate_keys_are_collapsed_before_selection():
+    """Selection is `run_id % N`. If the same key appears twice, two of the N slots are
+    the SAME Cosmos account, so runs landing on them contend on one sequence number
+    exactly as before — while the operator believes they have N independent wallets. The
+    failure is invisible: more wallets configured, same contention.
+
+    Not exotic either. The org's keys live as AKASH_CONSOLE / AKASH_CONSOLE_2..9 and the
+    sibling repo carries a regression test for one key appearing under two variables."""
+    for body in (_code(_step("Wallet")["run"]), _code(PROVISION["run"]), _code(TD_CLOSE["run"])):
+        if "AKASH_API_KEYS" not in body:
+            continue
+        assert "seen[$0]++" in body, "duplicate keys must collapse, or N slots are not N accounts"
+
+
+def test_commas_and_semicolons_separate_keys_too():
+    """A single AKASH_CONSOLE* variable may itself hold a comma- or semicolon-separated
+    list, so a caller pasting one must not have it read as one absurdly long key."""
+    for body in (_code(_step("Wallet")["run"]), _code(PROVISION["run"]), _code(TD_CLOSE["run"])):
+        if "AKASH_API_KEYS" not in body:
+            continue
+        assert "tr ',;'" in body, "newline cannot be the only separator"
+
+
 def test_every_wallet_selection_strips_carriage_returns():
     """A multi-line GitHub secret pasted from Windows carries CRLF, and mapfile keeps the
     trailing \r on every key — producing a credential that looks correct in the log and is
