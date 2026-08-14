@@ -5,13 +5,13 @@
     "uri": "lreblupbbhcgdaheqtsn3fllmk.ingress.h6i-dedicated.eu-se-1.digitalfrontier.so"
   },
   "hetzner_hel": {
-    "dseq": "1786657951096",
+    "dseq": "1786701272815",
     "live": true,
-    "uri": "pokqr07eot87lcl88p872nigh0.ingress.m3a.eu-n-3.digitalfrontier.network"
+    "uri": "pj2rlupc1dfl12j1b9hs6qi9q0.ingress.m3a.eu-n-3.digitalfrontier.network"
   },
   "onidc": {
-    "dseq": "1786657873914",
+    "dseq": "1786701198893",
     "live": true,
-    "uri": "tmlvu5kb31ehd71r9cb07nnol0.ingress.h4i-dedicated.eu-sw-2.digitalfrontier.so"
+    "uri": "5v4a9pvrhpcc3cn9rr420n71t0.ingress.h4i-dedicated.eu-sw-2.digitalfrontier.so"
   }
 }
