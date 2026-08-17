@@ -93,7 +93,19 @@ jobs:
       - name: Restore run-start marker
         run: mv "$RUNNER_TEMP/bidprobe-run-started" "$GITHUB_WORKSPACE/"
 
+      # Retried: a transient "operation was aborted due to timeout" here on
+      # 2026-08-17 lost the whole 15:07 slot, which at a 3h cadence put the
+      # gap between results at ~6h and paged bidprobe-stale. Losing a slot to
+      # a flaky action download is not worth a critical page.
       - name: Set up uv
+        id: uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+        continue-on-error: true
+
+      - name: Set up uv (retry)
+        if: steps.uv.outcome == 'failure'
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
@@ -171,10 +183,15 @@ jobs:
       # short-lived class this workflow creates. The 48h `backtest` class can be
       # a live e2e run, and an unattended reaper must never be licensed to close
       # something it does not understand.
+      # `if: always()` means this runs even when setup failed — in which case
+      # `uv` does not exist and the step exited 127, reddening a run that had
+      # created nothing to reap. Skip cleanly instead: no uv means no probe ran.
       - name: Reap leaked probe orders
         if: always()
         timeout-minutes: 10
-        run: uv run python -m just_akash.cleanup_stale --only-service probe --execute
+        run: |
+          command -v uv >/dev/null || { echo "uv absent — setup failed, so no orders were created"; exit 0; }
+          uv run python -m just_akash.cleanup_stale --only-service probe --execute
 
   # Publish to the telemetry branch from a separate job, so the privileged
   # contents:write token never runs alongside the code holding the API key.
