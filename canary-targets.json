@@ -10,8 +10,8 @@
     "uri": "98ffr9c9fhbo5eaek63g5j4jpc.ingress.m3a.eu-n-3.digitalfrontier.network"
   },
   "onidc": {
-    "dseq": "1786841607581",
-    "live": false,
-    "uri": "kc2v9tffst8mnerq7k73a6ktqs.ingress.h4i-dedicated.eu-sw-2.digitalfrontier.so"
+    "dseq": "1786975940216",
+    "live": true,
+    "uri": "iale2l4vlp8kramvst7r4qfb0g.ingress.h4i-dedicated.eu-sw-2.digitalfrontier.so"
   }
 }
