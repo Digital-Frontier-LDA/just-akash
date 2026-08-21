@@ -41,48 +41,48 @@ just_akash_smoke_outcome_total{provider="akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="connect",outcome="fail"} 2
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="connect",outcome="lease-down"} 3
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="connect",outcome="pass"} 110
-just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="connect",outcome="unreached"} 6
+just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="connect",outcome="unreached"} 7
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="deploy",outcome="fail"} 1
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="deploy",outcome="no-bid"} 2
-just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="deploy",outcome="no-credit"} 2
+just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="deploy",outcome="no-credit"} 3
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="deploy",outcome="no-room"} 1
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="deploy",outcome="pass"} 115
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="events",outcome="fail"} 2
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="events",outcome="lease-down"} 3
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="events",outcome="pass"} 110
-just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="events",outcome="unreached"} 6
+just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="events",outcome="unreached"} 7
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="exec",outcome="fail"} 3
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="exec",outcome="lease-down"} 3
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="exec",outcome="pass"} 109
-just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="exec",outcome="unreached"} 6
+just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="exec",outcome="unreached"} 7
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="ingress",outcome="fail"} 4
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="ingress",outcome="lease-down"} 3
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="ingress",outcome="pass"} 108
-just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="ingress",outcome="unreached"} 6
+just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="ingress",outcome="unreached"} 7
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="inject",outcome="fail"} 4
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="inject",outcome="lease-down"} 3
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="inject",outcome="pass"} 108
-just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="inject",outcome="unreached"} 6
+just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="inject",outcome="unreached"} 7
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="logs",outcome="fail"} 2
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="logs",outcome="lease-down"} 3
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="logs",outcome="pass"} 110
-just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="logs",outcome="unreached"} 6
+just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="logs",outcome="unreached"} 7
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="ready",outcome="fail"} 2
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="ready",outcome="lease-down"} 3
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="ready",outcome="pass"} 110
-just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="ready",outcome="unreached"} 6
+just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="ready",outcome="unreached"} 7
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="ssh",outcome="fail"} 2
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="ssh",outcome="lease-down"} 3
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="ssh",outcome="pass"} 110
-just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="ssh",outcome="unreached"} 6
+just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="ssh",outcome="unreached"} 7
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="status",outcome="fail"} 2
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="status",outcome="lease-down"} 3
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="status",outcome="pass"} 110
-just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="status",outcome="unreached"} 6
+just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="status",outcome="unreached"} 7
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="update",outcome="fail"} 13
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="update",outcome="lease-down"} 3
 just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="update",outcome="pass"} 99
-just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="update",outcome="unreached"} 6
+just_akash_smoke_outcome_total{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="update",outcome="unreached"} 7
 just_akash_smoke_outcome_total{provider="akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x",feature="connect",outcome="lease-down"} 1
 just_akash_smoke_outcome_total{provider="akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x",feature="connect",outcome="pass"} 50
 just_akash_smoke_outcome_total{provider="akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x",feature="connect",outcome="unreached"} 34
@@ -131,17 +131,17 @@ just_akash_smoke_latest_outcome_info{provider="akash1aaul837r7en7hpk9wv2svg8u78f
 just_akash_smoke_latest_outcome_info{provider="akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z",feature="ssh",outcome="pass"} 1
 just_akash_smoke_latest_outcome_info{provider="akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z",feature="status",outcome="pass"} 1
 just_akash_smoke_latest_outcome_info{provider="akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z",feature="update",outcome="pass"} 1
-just_akash_smoke_latest_outcome_info{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="connect",outcome="pass"} 1
-just_akash_smoke_latest_outcome_info{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="deploy",outcome="pass"} 1
-just_akash_smoke_latest_outcome_info{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="events",outcome="pass"} 1
-just_akash_smoke_latest_outcome_info{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="exec",outcome="pass"} 1
-just_akash_smoke_latest_outcome_info{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="ingress",outcome="pass"} 1
-just_akash_smoke_latest_outcome_info{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="inject",outcome="pass"} 1
-just_akash_smoke_latest_outcome_info{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="logs",outcome="pass"} 1
-just_akash_smoke_latest_outcome_info{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="ready",outcome="pass"} 1
-just_akash_smoke_latest_outcome_info{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="ssh",outcome="pass"} 1
-just_akash_smoke_latest_outcome_info{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="status",outcome="pass"} 1
-just_akash_smoke_latest_outcome_info{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="update",outcome="pass"} 1
+just_akash_smoke_latest_outcome_info{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="connect",outcome="unreached"} 1
+just_akash_smoke_latest_outcome_info{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="deploy",outcome="no-credit"} 1
+just_akash_smoke_latest_outcome_info{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="events",outcome="unreached"} 1
+just_akash_smoke_latest_outcome_info{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="exec",outcome="unreached"} 1
+just_akash_smoke_latest_outcome_info{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="ingress",outcome="unreached"} 1
+just_akash_smoke_latest_outcome_info{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="inject",outcome="unreached"} 1
+just_akash_smoke_latest_outcome_info{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="logs",outcome="unreached"} 1
+just_akash_smoke_latest_outcome_info{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="ready",outcome="unreached"} 1
+just_akash_smoke_latest_outcome_info{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="ssh",outcome="unreached"} 1
+just_akash_smoke_latest_outcome_info{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="status",outcome="unreached"} 1
+just_akash_smoke_latest_outcome_info{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",feature="update",outcome="unreached"} 1
 just_akash_smoke_latest_outcome_info{provider="akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x",feature="connect",outcome="pass"} 1
 just_akash_smoke_latest_outcome_info{provider="akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x",feature="deploy",outcome="pass"} 1
 just_akash_smoke_latest_outcome_info{provider="akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x",feature="events",outcome="pass"} 1
@@ -291,7 +291,7 @@ just_akash_smoke_latest_latency_ms{provider="akash1z9nr23cgweu45g2jktfx95v7g2xp8
 just_akash_smoke_latest_latency_ms{provider="akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x",feature="update"} 18744
 # HELP just_akash_smoke_last_run_timestamp Unix time of the most recent smoke run.
 # TYPE just_akash_smoke_last_run_timestamp gauge
-just_akash_smoke_last_run_timestamp 1787210176.851761
+just_akash_smoke_last_run_timestamp 1787296621.545856
 # HELP just_akash_bench_cpu_events_per_s Single-threaded CPU benchmark rate (events/s) from the latest complete grade.
 # TYPE just_akash_bench_cpu_events_per_s gauge
 just_akash_bench_cpu_events_per_s{provider="akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z"} 765.71
@@ -344,4 +344,4 @@ just_akash_bench_last_run_timestamp{provider="akash1hgulk6aekakqzc0v6wukrd3dy9n9
 just_akash_bench_last_run_timestamp{provider="akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x"} 1787210176.851761
 # HELP just_akash_deploy_credit_usd Remaining Console deploy credit in USD (uact is USD-pegged).
 # TYPE just_akash_deploy_credit_usd gauge
-just_akash_deploy_credit_usd{account="akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee"} 202.16
+just_akash_deploy_credit_usd{account="akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee"} 0
