@@ -2,7 +2,7 @@
 
 Exit-code contract: 0 when deploy credit >= --min-usd, 1 when below (so a
 scheduled job can flag a low wallet BEFORE deploys start 402ing), 2 on misuse.
-chain.deploy_credit is mocked; chain.usd_estimate runs for real (uact is
+chain.granted_uact is mocked; chain.usd_estimate runs for real (uact is
 USD-pegged, 1e6 uact = $1), so the USD math is exercised end-to-end.
 """
 
@@ -26,7 +26,7 @@ def _run_balance_check(monkeypatch, argv, credit):
     monkeypatch.setattr(sys, "argv", argv)
     with (
         patch("just_akash.api.AkashConsoleAPI") as MockAPI,
-        patch("just_akash.chain.deploy_credit", return_value=credit),
+        patch("just_akash.chain.granted_uact", return_value=credit.get("uact")),
     ):
         MockAPI.return_value.account_address.return_value = "akash1me"
         from just_akash.cli import main
@@ -63,15 +63,15 @@ class TestBalanceCheck:
         assert verdict["status"] == "LOW"
         assert verdict["deploy_credit_usd"] == 10.0
 
-    def test_empty_credit_grant_is_low(self, monkeypatch, capsys):
-        # No DepositAuthorization grant -> $0 -> LOW below any positive threshold.
+    def test_empty_credit_grant_is_unknown(self, monkeypatch, capsys):
+        # No readable DepositAuthorization grant is UNKNOWN, never a measured zero.
         code = _run_balance_check(
             monkeypatch,
             ["just-akash", "balance", "--check", "--min-usd", "5"],
             {},
         )
         assert code == 1
-        assert json.loads(capsys.readouterr().out)["deploy_credit_usd"] == 0.0
+        assert json.loads(capsys.readouterr().out)["status"] == "UNKNOWN"
 
     def test_machine_readable_text_verdict_when_tty(self, monkeypatch, capsys):
         """With a real TTY (forced here) the verdict is a stable grep-able line."""
@@ -118,7 +118,7 @@ class TestCheckGatesOnFreeNotGrant:
         monkeypatch.setattr(sys, "argv", argv)
         with (
             patch("just_akash.api.AkashConsoleAPI") as MockAPI,
-            patch("just_akash.chain.deploy_credit", return_value=credit),
+            patch("just_akash.chain.granted_uact", return_value=credit.get("uact")),
         ):
             client = MockAPI.return_value
             client.account_address.return_value = "akash1me"
@@ -191,7 +191,7 @@ class TestIncompleteEscrowTally:
         monkeypatch.setattr(sys, "argv", argv)
         with (
             patch("just_akash.api.AkashConsoleAPI") as MockAPI,
-            patch("just_akash.chain.deploy_credit", return_value=credit),
+            patch("just_akash.chain.granted_uact", return_value=credit.get("uact")),
             patch("just_akash.api.escrow_locked", return_value=escrow),
         ):
             MockAPI.return_value.account_address.return_value = "akash1me"
