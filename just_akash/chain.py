@@ -238,12 +238,11 @@ def _sum_deposit_grants(data: dict[str, Any]) -> dict[str, int]:
         auth = grant.get("authorization", {})
         if auth.get("@type") != _DEPOSIT_AUTH_TYPE:
             continue
-        # Newer chains report a list under "spend_limits"; tolerate a single
-        # "spend_limit" object too. A zero-amount uakt entry rides alongside the real
-        # uact limit — _coins_map keeps it, and formatting drops zero denoms.
+        # The chain carries a singular `spend_limit` uakt decoy alongside the
+        # plural DepositAuthorization allowance. Never fall back to the singular
+        # field: treating it as a list reports zero deploy credit for a funded
+        # Console AUTHZ grantee.
         limits = auth.get("spend_limits")
-        if limits is None and isinstance(auth.get("spend_limit"), dict):
-            limits = [auth["spend_limit"]]
         for denom, amt in _coins_map(limits or []).items():
             totals[denom] = totals.get(denom, 0) + amt
     return totals

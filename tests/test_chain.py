@@ -46,10 +46,10 @@ class TestDeployCredit:
             # Only the escrow DepositAuthorization counts — the SendAuthorization is skipped.
             assert chain.deploy_credit("akash1me") == {"uact": 500}
 
-    def test_tolerates_singular_spend_limit(self):
+    def test_rejects_singular_spend_limit_decoy(self):
         payload = _grants({"@type": _DEPOSIT, "spend_limit": {"denom": "uact", "amount": "42"}})
         with patch.object(chain, "_lcd_get", return_value=payload):
-            assert chain.deploy_credit("akash1me") == {"uact": 42}
+            assert chain.deploy_credit("akash1me") == {}
 
     def test_no_grant_returns_empty(self):
         with patch.object(chain, "_lcd_get", return_value={"grants": []}):
