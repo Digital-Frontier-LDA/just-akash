@@ -91,17 +91,21 @@ def rest_urls() -> list[str]:
     return [DEFAULT_REST_URL, *DEFAULT_REST_FALLBACKS]
 
 
-def _lcd_get(path: str, timeout: int = 15, base: str | None = None) -> dict[str, Any]:
+def _lcd_get(
+    path: str, timeout: int = 15, base: str | None = None, height: int | None = None
+) -> dict[str, Any]:
     """GET a Cosmos REST path and return parsed JSON. Raises RuntimeError on any
     transport/HTTP/parse failure, with the endpoint in the message so a dead LCD is
     obvious (and swappable via AKASH_REST_URL)."""
     url = f"{(base or rest_url()).rstrip('/')}{path}"
-    req = urllib.request.Request(  # noqa: S310 — url built from a fixed https base
-        url, headers={"Accept": "application/json", "User-Agent": "just-akash-balance/1.0"}
-    )
+    headers = {"Accept": "application/json", "User-Agent": "just-akash-balance/1.0"}
+    if height is not None:
+        headers["x-cosmos-block-height"] = str(height)
+    req = urllib.request.Request(url, headers=headers)  # noqa: S310 — fixed base
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
             body = resp.read().decode("utf-8")
+            echoed = getattr(resp, "headers", {}).get("x-cosmos-block-height")
     except Exception as e:  # noqa: BLE001 — normalize every failure to one error type
         raise RuntimeError(f"chain query failed ({url}): {type(e).__name__}: {e}") from e
     try:
@@ -110,6 +114,12 @@ def _lcd_get(path: str, timeout: int = 15, base: str | None = None) -> dict[str,
         raise RuntimeError(f"chain query returned non-JSON ({url}): {body[:200]}") from e
     if not isinstance(parsed, dict):
         raise RuntimeError(f"chain query returned unexpected shape ({url}): {type(parsed)}")
+    if height is not None:
+        try:
+            if echoed is None or int(echoed) != height:
+                raise RuntimeError(f"chain query did not echo pinned height ({url})")
+        except (TypeError, ValueError) as e:
+            raise RuntimeError(f"chain query returned invalid pinned height ({url})") from e
     return parsed
 
 
@@ -231,6 +241,50 @@ def deploy_credit(address: str) -> dict[str, int]:
     return totals
 
 
+def granted_uact(
+    address: str, *, quorum: tuple[str, ...] | None = None, height: int | None = None
+) -> int | None:
+    """Canonical uact accessor for callers that need an explicit quorum contract.
+
+    ``deploy_credit`` remains the backwards-compatible rich result. This narrow API
+    returns only plural ``spend_limits[uact]`` and never converts an unreadable grant
+    into zero. The optional arguments are retained as the integration seam for the
+    pinned-height reader used by CI selectors.
+    """
+    bases = list(quorum or tuple(rest_urls()))
+    if not bases:
+        return None
+    if height is None:
+        try:
+            tip = int(
+                _lcd_get("/cosmos/base/tendermint/v1beta1/blocks/latest", base=bases[0])["block"][
+                    "header"
+                ]["height"]
+            )
+        except (RuntimeError, KeyError, TypeError, ValueError):
+            return None
+        height = tip - 3
+    if height <= 0:
+        return None
+    readings: list[int] = []
+    for base in bases:
+        try:
+            value = _sum_deposit_grants(
+                _lcd_get(
+                    f"/cosmos/authz/v1beta1/grants/grantee/{address}", base=base, height=height
+                )
+            ).get("uact")
+        except RuntimeError:
+            continue
+        if value is not None:
+            readings.append(value)
+    if not readings:
+        return None
+    counts = {value: readings.count(value) for value in set(readings)}
+    agreeing = [value for value, count in counts.items() if count >= 2]
+    return max(agreeing) if agreeing else None
+
+
 def _sum_deposit_grants(data: dict[str, Any]) -> dict[str, int]:
     """Sum uact spend_limits across DepositAuthorization grants in one LCD payload."""
     totals: dict[str, int] = {}
@@ -238,12 +292,11 @@ def _sum_deposit_grants(data: dict[str, Any]) -> dict[str, int]:
         auth = grant.get("authorization", {})
         if auth.get("@type") != _DEPOSIT_AUTH_TYPE:
             continue
-        # Newer chains report a list under "spend_limits"; tolerate a single
-        # "spend_limit" object too. A zero-amount uakt entry rides alongside the real
-        # uact limit — _coins_map keeps it, and formatting drops zero denoms.
+        # The chain carries a singular `spend_limit` uakt decoy alongside the
+        # plural DepositAuthorization allowance. Never fall back to the singular
+        # field: treating it as a list reports zero deploy credit for a funded
+        # Console AUTHZ grantee.
         limits = auth.get("spend_limits")
-        if limits is None and isinstance(auth.get("spend_limit"), dict):
-            limits = [auth["spend_limit"]]
         for denom, amt in _coins_map(limits or []).items():
             totals[denom] = totals.get(denom, 0) + amt
     return totals
