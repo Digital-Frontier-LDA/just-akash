@@ -49,10 +49,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 
 # Providers with no explicit ordering sort after those that have one.
 DEFAULT_PRIORITY = 10_000
+AKASH_ADDRESS_RE = re.compile(r"^akash1[0-9a-z]{38}$")
 
 
 class ProviderSpecError(ValueError):
@@ -93,9 +95,11 @@ def _normalise(entry, index: int) -> dict:
         raise ProviderSpecError(f"providers[{index}] must be an object or an address string")
 
     addr = entry.get("address")
-    if not isinstance(addr, str) or not addr.startswith("akash1"):
+    if not isinstance(addr, str) or AKASH_ADDRESS_RE.fullmatch(addr) is None:
         # A typo'd address silently never bids, which reads as a market outage.
-        raise ProviderSpecError(f"providers[{index}].address is not an akash1… address: {addr!r}")
+        raise ProviderSpecError(
+            f"providers[{index}].address is not a complete Akash address: {addr!r}"
+        )
 
     prio = entry.get("failover_priority", DEFAULT_PRIORITY)
     try:

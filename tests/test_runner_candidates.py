@@ -129,8 +129,16 @@ def test_malformed_json_raises_rather_than_degrading():
 
 def test_a_typo_address_is_rejected_loudly():
     """A bad address silently never bids, which reads as a market outage."""
-    with pytest.raises(rc.ProviderSpecError, match="akash1"):
+    with pytest.raises(rc.ProviderSpecError, match="Akash address"):
         rc.parse_providers('[{"address":"aaksh1typo"}]')
+
+
+@pytest.mark.parametrize("suffix", [",akash1injected", "\nakash1injected", " ", "-bad"])
+def test_provider_address_cannot_inject_an_extra_csv_candidate(suffix):
+    """GitHub outputs are CSV; delimiters or controls in one JSON address must
+    not become another provider argument in the workflow shell."""
+    with pytest.raises(rc.ProviderSpecError, match="Akash address"):
+        rc.parse_providers(__import__("json").dumps([{"address": A + suffix}]))
 
 
 def test_contradictory_markers_are_not_guessed():
@@ -233,7 +241,8 @@ def test_outputs_carry_the_ordered_candidates(tmp_path, monkeypatch, capsys):
     rc.main(["--providers", _j.dumps(FLEET), "--github-output"])
     body = out.read_text()
     assert f"candidates={A},{T}" in body, body
-    assert f"preferred_candidates={A}" in body, body
-    assert f"fallback_candidates={T}" in body, body
+    output_lines = body.splitlines()
+    assert f"preferred_candidates={A}" in output_lines, body
+    assert f"fallback_candidates={T}" in output_lines, body
     assert "proven_hosts=1" in body
     assert "denied=2" in body
