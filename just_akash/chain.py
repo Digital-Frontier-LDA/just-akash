@@ -91,17 +91,21 @@ def rest_urls() -> list[str]:
     return [DEFAULT_REST_URL, *DEFAULT_REST_FALLBACKS]
 
 
-def _lcd_get(path: str, timeout: int = 15, base: str | None = None) -> dict[str, Any]:
+def _lcd_get(
+    path: str, timeout: int = 15, base: str | None = None, height: int | None = None
+) -> dict[str, Any]:
     """GET a Cosmos REST path and return parsed JSON. Raises RuntimeError on any
     transport/HTTP/parse failure, with the endpoint in the message so a dead LCD is
     obvious (and swappable via AKASH_REST_URL)."""
     url = f"{(base or rest_url()).rstrip('/')}{path}"
-    req = urllib.request.Request(  # noqa: S310 — url built from a fixed https base
-        url, headers={"Accept": "application/json", "User-Agent": "just-akash-balance/1.0"}
-    )
+    headers = {"Accept": "application/json", "User-Agent": "just-akash-balance/1.0"}
+    if height is not None:
+        headers["x-cosmos-block-height"] = str(height)
+    req = urllib.request.Request(url, headers=headers)  # noqa: S310 — fixed base
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
             body = resp.read().decode("utf-8")
+            echoed = getattr(resp, "headers", {}).get("x-cosmos-block-height")
     except Exception as e:  # noqa: BLE001 — normalize every failure to one error type
         raise RuntimeError(f"chain query failed ({url}): {type(e).__name__}: {e}") from e
     try:
@@ -110,6 +114,12 @@ def _lcd_get(path: str, timeout: int = 15, base: str | None = None) -> dict[str,
         raise RuntimeError(f"chain query returned non-JSON ({url}): {body[:200]}") from e
     if not isinstance(parsed, dict):
         raise RuntimeError(f"chain query returned unexpected shape ({url}): {type(parsed)}")
+    if height is not None:
+        try:
+            if echoed is None or int(echoed) != height:
+                raise RuntimeError(f"chain query did not echo pinned height ({url})")
+        except (TypeError, ValueError) as e:
+            raise RuntimeError(f"chain query returned invalid pinned height ({url})") from e
     return parsed
 
 
@@ -241,15 +251,28 @@ def granted_uact(
     into zero. The optional arguments are retained as the integration seam for the
     pinned-height reader used by CI selectors.
     """
-    del height  # the legacy rich reader is still used until the transport seam lands
     bases = list(quorum or tuple(rest_urls()))
     if not bases:
+        return None
+    if height is None:
+        try:
+            tip = int(
+                _lcd_get("/cosmos/base/tendermint/v1beta1/blocks/latest", base=bases[0])["block"][
+                    "header"
+                ]["height"]
+            )
+        except (RuntimeError, KeyError, TypeError, ValueError):
+            return None
+        height = tip - 3
+    if height <= 0:
         return None
     readings: list[int] = []
     for base in bases:
         try:
             value = _sum_deposit_grants(
-                _lcd_get(f"/cosmos/authz/v1beta1/grants/grantee/{address}", base=base)
+                _lcd_get(
+                    f"/cosmos/authz/v1beta1/grants/grantee/{address}", base=base, height=height
+                )
             ).get("uact")
         except RuntimeError:
             continue

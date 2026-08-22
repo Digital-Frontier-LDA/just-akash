@@ -57,7 +57,7 @@ class TestDeployCredit:
 
     def test_granted_uact_returns_none_when_quorum_is_missing(self):
         with patch.object(chain, "_lcd_get", side_effect=RuntimeError("offline")):
-            assert chain.granted_uact("akash1me", quorum=("a", "b", "c")) is None
+            assert chain.granted_uact("akash1me", quorum=("a", "b", "c"), height=100) is None
 
     def test_granted_uact_uses_max_agreeing_reading(self):
         payloads = [
@@ -93,7 +93,7 @@ class TestDeployCredit:
             },
         ]
         with patch.object(chain, "_lcd_get", side_effect=payloads):
-            assert chain.granted_uact("akash1me", quorum=("a", "b", "c")) == 10
+            assert chain.granted_uact("akash1me", quorum=("a", "b", "c"), height=100) == 10
 
 
 class TestCreditGrantDetail:
