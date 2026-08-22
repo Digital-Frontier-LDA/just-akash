@@ -119,8 +119,9 @@ class TestServiceFlagReachesTheTransport:
             return _FakeTransport()
 
         monkeypatch.setattr("just_akash.transport.make_transport", _fake_make_transport)
-        monkeypatch.setattr(cli, "_require_api_key", lambda: "key")
-        monkeypatch.setattr(cli, "_resolve_deployment", lambda _c, d: d or "123")
+        monkeypatch.setattr(
+            cli, "_resolve_deployment_client", lambda d: (_FakeClient(), d or "123")
+        )
         monkeypatch.setattr(cli, "_enrich_deployment_with_provider", lambda _c, d: d)
 
         class _FakeClient:
@@ -128,8 +129,6 @@ class TestServiceFlagReachesTheTransport:
 
             def get_deployment(self, _dseq):
                 return {"leases": [{}]}
-
-        monkeypatch.setattr("just_akash.api.AkashConsoleAPI", lambda _k: _FakeClient())
 
         argv = ["just-akash", subcommand, "--dseq", "123", "--service", "runner"]
         if subcommand == "exec":

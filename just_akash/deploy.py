@@ -5,13 +5,9 @@ Multi-step Akash deployment orchestrator.
 Workflow:
 1. Read SDL file
 2. Create deployment via Console API
-3. Poll for bids using a 3-phase tiered selection state machine:
-   - Phase 1 (preferred-only patience, [0, T1]): collect bids; pick cheapest
-     preferred at end of window if any.
-   - Phase 2 (preferred-grace, [T1, T1+T2]): continue collecting; the moment a
-     preferred bid appears, accept it immediately (first-wins).
-   - Phase 3 (backup fallback): pick cheapest backup from bids collected across
-     phases 1+2.
+3. Collect bids for one bounded equal-opportunity window (default 60 seconds),
+   then use the shared auction core to choose cheapest preferred or, when no
+   preferred provider bid, cheapest eligible fallback.
 4. Create lease with the selected provider.
 5. Return deployment DSEQ and lease details.
 """
@@ -26,6 +22,8 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+
+from akash_lease_core import Auction, AuctionPolicy, AuctionStatus, BidObservation
 
 from . import chain
 from ._diagnostics import Code, emit, enabled
@@ -329,6 +327,60 @@ def _classify_bid(provider: str | None, preferred: list[str], backup: list[str])
     return "FOREIGN"
 
 
+def _select_auction_bid(
+    bids: list,
+    *,
+    preferred: list[str],
+    backup: list[str],
+    collection_window_seconds: float,
+):
+    """Normalize Console bids and delegate the decision to the shared core.
+
+    The caller owns polling and clocks.  This adapter owns only translation
+    between Console's response shape and the transport-neutral auction schema.
+    """
+    has_allowlist = bool(preferred or backup)
+    eligible = frozenset(preferred + backup) if has_allowlist else None
+    auction = Auction(
+        AuctionPolicy(
+            collection_window_seconds=collection_window_seconds,
+            preferred_providers=frozenset(preferred),
+            eligible_providers=eligible,
+        ),
+        started_at=0,
+    )
+    raw_by_key = {}
+    for index, raw_bid in enumerate(bids):
+        if not isinstance(raw_bid, dict):
+            continue
+        provider = _extract_provider(raw_bid)
+        if not provider:
+            continue
+        amount, denom = _extract_bid_price(raw_bid)
+        bid_key = f"{provider}:{index}"
+        try:
+            observation = BidObservation(
+                bid_key=bid_key,
+                provider=provider,
+                price=amount,
+                denom=denom or "uakt",
+                observed_at=collection_window_seconds,
+                # Console's legacy/partial bid shape omits state.  This adapter
+                # has always treated that shape as leasable; normalize the
+                # transport quirk here rather than teaching the core about it.
+                state="open" if _is_open_bid(raw_bid) else _bid_state(raw_bid),
+            )
+        except (TypeError, ValueError):
+            continue
+        auction.observe(observation)
+        raw_by_key[bid_key] = raw_bid
+
+    result = auction.evaluate(now=collection_window_seconds)
+    if result.status is not AuctionStatus.DECIDED or result.selected is None:
+        return None, result
+    return raw_by_key[result.selected.bid_key], result
+
+
 def _cheapest_bid(pool: list, exclude: frozenset[str] = frozenset()):
     """Cheapest bid in ``pool`` whose provider is named and not in ``exclude``.
 
@@ -583,19 +635,28 @@ def deploy(
     backup_providers: list[str] | None = None,
     deposit: float = 5.0,
 ) -> dict:
-    api_key = os.environ.get("AKASH_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "AKASH_API_KEY environment variable not set. "
-            "Please set your API key: export AKASH_API_KEY='your-key'"
-        )
-
     # deposit is user-controlled (--deposit); reject non-finite/non-positive
     # values before they reach json.dumps (which would emit invalid NaN/Infinity).
     if not math.isfinite(deposit) or deposit <= 0:
         raise RuntimeError(f"Invalid deposit {deposit!r}: must be a positive, finite USD amount.")
 
-    client = AkashConsoleAPI(api_key)
+    # Validate before creating anything on-chain.  ``bid_wait_retry`` remains in
+    # the public CLI signature for compatibility but the former second phase is
+    # intentionally gone: one bounded window now governs every deployment path.
+    AuctionPolicy(collection_window_seconds=bid_wait)
+
+    from .wallet_pool import select_client_for_create
+
+    required_uact = math.ceil(deposit * 1_000_000)
+    wallet = select_client_for_create(required_uact, client_factory=AkashConsoleAPI)
+    client = wallet.client
+    if wallet.configured_keys > 1:
+        _log(
+            logging.INFO,
+            f"WALLET policy={wallet.policy_version} selected_account={wallet.account} "
+            f"available_uact={wallet.available_uact} distinct_accounts="
+            f"{wallet.distinct_accounts}/{wallet.configured_keys}",
+        )
 
     preferred = _resolve_tier(preferred_providers, "AKASH_PROVIDERS")
     backup = _resolve_tier(backup_providers, "AKASH_PROVIDERS_BACKUP")
@@ -604,7 +665,7 @@ def deploy(
     _log(
         logging.INFO,
         f"CONFIG  sdl={sdl_path}  gpu={gpu}  image={image or '(default)'}  "
-        f"bid_wait={bid_wait}s  bid_wait_retry={bid_wait_retry}s",
+        f"auction_window={bid_wait}s  bid_wait_retry={bid_wait_retry}s (deprecated/ignored)",
     )
     if preferred:
         _log(logging.INFO, f"PREFERRED_PROVIDERS ({len(preferred)}): {preferred}")
@@ -694,30 +755,15 @@ def deploy(
         f"Full deployment response: {json.dumps(deployment_response, default=str)[:500]}",
     )
 
-    # Step 3: 3-phase bid polling and selection.
+    # Step 3: one equal-opportunity bid collection window, then one shared decision.
     _log(
         logging.INFO,
-        f"STEP 3: Polling for bids (3-phase: preferred-only [{bid_wait}s] → "
-        f"preferred-grace [{bid_wait_retry}s] → backup fallback)...",
+        f"STEP 3: Collecting bids for {bid_wait}s before preferred/fallback selection...",
     )
     start_time = time.time()
     bids: list = []
     poll_count = 0
     last_bid_count = -1
-
-    def _has_open_tier_bid(current: list, tier: str) -> bool:
-        return any(
-            isinstance(b, dict)
-            and _is_open_bid(b)
-            and _classify_bid(_extract_provider(b) or "", preferred, backup) == tier
-            for b in current
-        )
-
-    def _has_preferred_bid(current: list) -> bool:
-        return _has_open_tier_bid(current, "PREFERRED")
-
-    def _has_any_valid_bid(current: list) -> bool:
-        return any(isinstance(b, dict) and _is_open_bid(b) for b in current)
 
     def _do_poll() -> None:
         """Performs one poll, updates `bids`, prints progress + diff log line."""
@@ -775,16 +821,11 @@ def deploy(
                 return
             time.sleep(5)
 
-    phase1_deadline = start_time + bid_wait
-    phase2_deadline = phase1_deadline + bid_wait_retry
+    collection_deadline = start_time + bid_wait
 
-    # Phase 1: preferred-only patience — collect bids for full T1 window.
-    _log(logging.INFO, f"  Phase 1 (preferred-only patience): waiting up to {bid_wait}s...")
-    _poll_until(phase1_deadline)
+    _log(logging.INFO, f"  Equal-opportunity collection: waiting {bid_wait}s...")
+    _poll_until(collection_deadline)
     print()
-
-    selected_bid = None
-    selection_phase = 0
 
     def _filter_tier(current: list, tier: str) -> list:
         """Bids of a tier that are still leasable (state filter — issue #14)."""
@@ -806,78 +847,20 @@ def deploy(
             )
         return pool
 
-    if has_allowlist:
-        preferred_phase1 = _filter_tier(bids, "PREFERRED")
-        if preferred_phase1:
-            selected_bid = min(preferred_phase1, key=lambda b: _extract_bid_price(b)[0])
-            selection_phase = 1
-    else:
-        accepted_phase1 = _filter_tier(bids, "ACCEPTED")
-        if accepted_phase1:
-            selected_bid = min(accepted_phase1, key=lambda b: _extract_bid_price(b)[0])
-            selection_phase = 1
-
-    # Phase 2: preferred-grace — only enter if no selection yet AND
-    # (backup tier configured OR no bids at all in phase 1). The "no bids"
-    # condition preserves today's retry behavior when backup is unset.
-    if selected_bid is None:
-        enter_phase2 = bool(backup) or len(bids) == 0
-        if enter_phase2:
-            label = "preferred-grace" if has_allowlist else "retry"
-            _log(
-                logging.WARNING,
-                f"  Phase 2 ({label}): no preferred bid yet — "
-                f"waiting up to {bid_wait_retry}s for first preferred...",
-            )
-            if has_allowlist and backup:
-                # Akash bids expire ~5 min after the order opens. If the full
-                # grace outlasts that, phase 3 can only ever see stale backup
-                # bids (issue #14) — so once open backup bids exist, stop
-                # waiting for a preferred bid at the fallback safety mark.
-                fallback_after = start_time + _backup_fallback_grace_s()
-                fallback_cut = False
-
-                def _phase2_exit(current: list) -> bool:
-                    nonlocal fallback_cut
-                    if _has_preferred_bid(current):
-                        return True
-                    if time.time() >= fallback_after and _has_open_tier_bid(current, "BACKUP"):
-                        if not fallback_cut:
-                            fallback_cut = True
-                            _log(
-                                logging.WARNING,
-                                f"  Cutting preferred-grace short at "
-                                f"{int(time.time() - start_time)}s: open BACKUP bid(s) "
-                                f"available and bids expire ~5min after order creation",
-                            )
-                        return True
-                    return False
-
-                early_exit = _phase2_exit
-            elif has_allowlist:
-                early_exit = _has_preferred_bid
-            else:
-                early_exit = _has_any_valid_bid
-            _poll_until(phase2_deadline, early_exit=early_exit)
-            print()
-
-            if has_allowlist:
-                preferred_now = _filter_tier(bids, "PREFERRED")
-                if preferred_now:
-                    selected_bid = min(preferred_now, key=lambda b: _extract_bid_price(b)[0])
-                    selection_phase = 2
-            else:
-                accepted_now = _filter_tier(bids, "ACCEPTED")
-                if accepted_now:
-                    selected_bid = min(accepted_now, key=lambda b: _extract_bid_price(b)[0])
-                    selection_phase = 2
-
-    # Phase 3: cheapest backup fallback (across bids collected in phases 1+2).
-    if selected_bid is None and backup:
-        backup_bids_all = _filter_tier(bids, "BACKUP")
-        if backup_bids_all:
-            selected_bid = min(backup_bids_all, key=lambda b: _extract_bid_price(b)[0])
-            selection_phase = 3
+    selected_bid, auction_result = _select_auction_bid(
+        bids,
+        preferred=preferred,
+        backup=backup,
+        collection_window_seconds=bid_wait,
+    )
+    selection_phase = (
+        1 if auction_result.selection_reason == "cheapest_preferred" or not has_allowlist else 3
+    )
+    _log(
+        logging.INFO,
+        f"  Auction policy={auction_result.policy_version} "
+        f"result={auction_result.selection_reason}",
+    )
 
     elapsed_total = int(time.time() - start_time)
 
@@ -994,7 +977,7 @@ def deploy(
             emit(
                 Code.NO_BIDS_RECEIVED,
                 "error",
-                f"no bids received after {bid_wait + bid_wait_retry}s",
+                f"no bids received after {bid_wait}s",
                 dseq=str(dseq),
                 poll_count=poll_count,
                 elapsed_s=elapsed_total,
@@ -1003,7 +986,7 @@ def deploy(
                 backup=backup,
             )
             raise RuntimeError(
-                f"No bids received within {bid_wait + bid_wait_retry}s. "
+                f"No bids received within {bid_wait}s. "
                 "Your SDL may be unsatisfiable or all providers are busy."
             )
         # Bids exist but none from preferred or backup tiers.
@@ -1022,6 +1005,13 @@ def deploy(
                 dseq=str(dseq),
             )
             raise RuntimeError("No valid bids received — all bid entries were malformed.")
+        if valid_bids and not any(_extract_provider(b) for b in valid_bids):
+            _log(logging.INFO, f"Cleaning up deployment {dseq} (bids have no provider)...")
+            try:
+                client.close_deployment(str(dseq))
+            except Exception as cleanup_err:
+                _log(logging.ERROR, f"Cleanup of deployment {dseq} failed: {cleanup_err}")
+            raise RuntimeError("Selected bid has no provider address")
         # Bids from our own providers exist, but every one has aged out of the
         # 'open' state (issue #14). Without this branch the failure below would
         # misreport it as "non-allowed providers", which misleads operators —
@@ -1131,13 +1121,17 @@ def deploy(
 
     # Step 5: announce selection (already chosen by state machine).
     phase_label = {
-        1: "phase 1: cheapest preferred",
-        2: "phase 2: first preferred (grace)",
-        3: "phase 3: cheapest backup (fallback)",
+        1: "cheapest preferred after collection window",
+        3: "cheapest eligible fallback after collection window",
     }
+    selection_label = (
+        phase_label[selection_phase]
+        if has_allowlist
+        else "cheapest eligible bid after collection window"
+    )
     _log(
         logging.INFO,
-        f"STEP 5: Selection made via {phase_label[selection_phase]}",
+        f"STEP 5: Selection made via {selection_label}",
     )
     # Show a compact ranking of the tier from which the winner came.
     if selection_phase == 3:
@@ -1171,8 +1165,7 @@ def deploy(
 
     _log(
         logging.INFO,
-        f"SELECTED  provider={provider}  price={price_amount} {price_denom}  "
-        f"({phase_label[selection_phase]})",
+        f"SELECTED  provider={provider}  price={price_amount} {price_denom}  ({selection_label})",
     )
 
     # Step 6: Create lease (with stale-bid retry — issue #14).
@@ -1506,6 +1499,18 @@ def deploy(
     print(f"  DSEQ: {dseq}")
     print(f"  Provider: {provider}")
     print(f"  Price: {price_amount} {price_denom}")
+    wallet_account = wallet.account
+    if wallet_account is None:
+        try:
+            resolved_account = client.account_address()
+            wallet_account = resolved_account if isinstance(resolved_account, str) else None
+        except RuntimeError:
+            # Identity is lifecycle metadata, not a reason to fail a lease that already exists.
+            wallet_account = None
+    if wallet_account:
+        print(f"  Wallet: {wallet_account}")
+    if wallet.available_uact is not None:
+        print(f"  Wallet available: {wallet.available_uact} uact")
     print(f"\nUse 'just-akash status --dseq {dseq}' to check deployment status")
 
     return {
@@ -1514,6 +1519,8 @@ def deploy(
         "price": price_amount,
         "price_denom": price_denom,
         "lease": lease_response,
+        "wallet_account": wallet_account,
+        "wallet_policy": wallet.policy_version,
     }
 
 
@@ -1522,6 +1529,7 @@ def update(
     sdl_path: str,
     image: str | None = None,
     env_vars: list[str] | None = None,
+    api_key: str | None = None,
 ) -> dict:
     """Update an active deployment in place with a revised SDL.
 
@@ -1529,11 +1537,10 @@ def update(
     overrides) then PUTs to the Console API. The DSEQ and existing lease are
     preserved — no re-bid or new lease is created.
     """
-    api_key = os.environ.get("AKASH_API_KEY")
+    api_key = api_key or os.environ.get("AKASH_API_KEY")
     if not api_key:
         raise RuntimeError(
-            "AKASH_API_KEY environment variable not set. "
-            "Please set your API key: export AKASH_API_KEY='your-key'"
+            "AKASH_API_KEY environment variable not set. Set AKASH_API_KEY before calling update."
         )
 
     client = AkashConsoleAPI(api_key)
@@ -1590,13 +1597,13 @@ def deploy_main():
         "--bid-wait",
         type=int,
         default=60,
-        help="Phase 1 (preferred-only) window seconds (default: 60)",
+        help="Equal-opportunity auction window, 0-60 seconds (default: 60)",
     )
     parser.add_argument(
         "--bid-wait-retry",
         type=int,
         default=120,
-        help="Phase 2 (preferred-grace) window seconds (default: 120)",
+        help="Deprecated compatibility option; ignored",
     )
     parser.add_argument(
         "--env",

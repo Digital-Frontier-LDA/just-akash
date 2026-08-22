@@ -218,21 +218,28 @@ just inject 12345 .env.secrets ssh      # force SSH
 
 ## Bid Selection
 
-Deployments use a three-phase tiered bid-selection state machine. Bids stream
-in from `t=0` regardless of tier (Akash's auction is open; the tier is a
-client-side filter).
+Deployments use one bounded equal-opportunity bid window. Bids stream from
+`t=0` regardless of tier (Akash's auction is open; tiers are a client-side
+eligibility policy). `--bid-wait` configures the complete window from 0 to 60
+seconds and defaults to 60.
 
-| Phase | Window | Behavior on bid arrival | Decision at window end |
-|---|---|---|---|
-| 1. Preferred-only patience | `[0, T1]` (`--bid-wait`, default 60s) | Collect all bids; do not select yet | If any **preferred** bid collected → pick **cheapest preferred** and stop |
-| 2. Preferred-grace | `[T1, T1+T2]` (`--bid-wait-retry`, default 120s) | Continue collecting; the moment a **preferred** bid appears, accept it **immediately** (first-wins) | If still no preferred → fall through |
-| 3. Backup fallback | end of phase 2 | — | Pick **cheapest backup** from bids collected across phases 1+2 |
+At the deadline:
+
+1. if any open preferred bid exists, select the cheapest preferred bid;
+2. otherwise select the cheapest open eligible backup bid;
+3. with no allowlist, select the cheapest open bid from any provider.
+
+The decision is implemented by the shared, sans-I/O `akash-lease-core` package,
+which is also consumed by Digital Frontier's Console and wallet deployment paths.
+`--bid-wait-retry` remains accepted for command-line compatibility but is ignored;
+there is no longer a second first-wins grace phase.
 
 Properties:
 
 - **Cheapest-when-healthy.** Preferred providers responsive → cheapest preferred wins.
-- **Bounded patience.** Preferred slow but alive → wait at most `T1+T2`, then snap to first preferred.
-- **Graceful degradation.** Preferred fully down → cheapest backup wins, no extra round trip.
+- **Equal opportunity.** An early bidder cannot pre-empt a cheaper provider arriving later in-window.
+- **Bounded patience.** Selection happens once, after no more than 60 seconds.
+- **Graceful degradation.** Preferred fully down → cheapest eligible backup wins at the same deadline.
 
 ### Tiered providers
 
@@ -254,7 +261,37 @@ single-tier allowlist (zero regression). With no allowlist at all (neither
 preferred nor backup), the cheapest bid from any provider wins.
 
 Each bid is tagged in the log as `[PREFERRED]`, `[BACKUP]`, or `[FOREIGN]`,
-and the selection log line names which phase chose the winner.
+and the selection log line records the shared policy version and decision reason.
+
+## Console wallet pool
+
+`AKASH_API_KEYS` enables native multi-wallet selection. Separate keys with newlines,
+commas, or semicolons; the existing `AKASH_API_KEY` remains a compatible single-key
+fallback and is included when both variables are set.
+
+For a new deployment, `just-akash` resolves the distinct Console accounts, reads their
+on-chain `spend_limits[uact]` at one height with a two-endpoint quorum, and chooses the
+richest account that can fund the requested deposit. A stale or height-unprovable LCD
+does not get a vote, and two keys resolving to one account count once.
+
+For commands against an existing DSEQ—including `status`, `update`, `exec`, and
+`destroy`—the CLI probes the configured pool and uses the account that positively reads
+that deployment. It never re-runs the richest-wallet decision for cleanup: balances can
+change after creation, and closing with a different account returns 404 while leaving
+escrow behind.
+
+```bash
+export AKASH_API_KEYS=$'key-for-wallet-a\nkey-for-wallet-b'
+just-akash deploy --sdl deploy.yml
+just-akash destroy --dseq 123456789 -y  # automatically finds the owning wallet
+```
+
+Independent concurrent CI runs can still choose the same richest account at once. The
+reusable runner workflow classifies and retries sequence contention, but GitHub
+concurrency groups are repository-scoped and cannot reserve a wallet across repositories.
+A future organization-level provisioning broker may add that reservation; native ranking
+remains the authoritative funding decision and DSEQ ownership remains authoritative for
+cleanup.
 
 ## Persistent provider canary
 

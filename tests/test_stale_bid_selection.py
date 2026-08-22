@@ -154,14 +154,13 @@ class TestSelectionSkipsStaleBids:
         client.create_lease.assert_not_called()
 
 
-class TestPhase2GraceCut:
+class TestSingleWindowIgnoresLegacyGraceCut:
     @patch("just_akash.deploy.time")
     @patch("just_akash.deploy.AkashConsoleAPI")
-    def test_grace_cut_short_when_backup_bid_open(
+    def test_backup_selected_at_window_end_without_legacy_grace(
         self, MockAPI, mock_time, tmp_path, monkeypatch, capsys
     ):
-        """With no preferred bid and an open backup bid, phase 2 stops at the
-        fallback safety mark instead of burning the full grace window."""
+        """A backup is selected at the one deadline; phase-2 tuning is ignored."""
         monkeypatch.setenv("JUST_AKASH_BACKUP_FALLBACK_S", "10")
         client, sdl = _setup(
             MockAPI,
@@ -176,7 +175,8 @@ class TestPhase2GraceCut:
         result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=500)
         assert result["provider"] == "akash1back"
         out = capsys.readouterr().out
-        assert "Cutting preferred-grace short" in out
+        assert "Cutting preferred-grace short" not in out
+        assert "cheapest eligible fallback after collection window" in out
 
     @patch("just_akash.deploy.time")
     @patch("just_akash.deploy.AkashConsoleAPI")

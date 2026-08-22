@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.43.0] — 2026-08-22
+
+### Changed
+
+- **Every normal deployment now gives bidders one equal-opportunity window before choosing a provider.** The former three-phase path could accept a preferred provider during a first-wins grace phase, so an early Sofia or Helsinki bid could pre-empt a cheaper Lisbon bid that arrived within the intended grace period. `deploy` now collects for one bounded window (`--bid-wait`, default and maximum 60 seconds), then delegates the decision to `akash-lease-core` v0.6.0: cheapest open preferred bid when one exists, otherwise cheapest open eligible fallback. `--bid-wait-retry` remains accepted for command-line compatibility but no longer creates a second selection phase.
+- **Provider-auction semantics are no longer owned by this repository.** `just-akash` now pins the immutable `akash-lease-core` v0.6.0 release wheel and acts as its Console/clock/workflow adapter. The same core contract can therefore govern DigitalFrontier-infra's Console and wallet paths without copying the winner-selection algorithm.
+- **Multi-key Console wallet selection is native instead of workflow-local shell.** Set `AKASH_API_KEYS` (newline, comma, or semicolon separated) with the existing `AKASH_API_KEY` as an optional fallback. Before a create, `just-akash` resolves distinct accounts and uses the shared `akash-lease-core` v0.6.0 ranking to choose the richest account that can fund the requested deposit. Multiple keys for one account count once. DSEQ operations can positively locate the owning account, so cleanup does not re-run a changing balance decision and accidentally close with the wrong key.
+
 ## [1.42.0] — 2026-07-28
 
 ### Added

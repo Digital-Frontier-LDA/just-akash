@@ -82,6 +82,42 @@ def _resolve_deployment(client, dseq_arg):
     return dseq
 
 
+def _resolve_deployment_client(dseq_arg):
+    """Resolve a DSEQ and the configured Console wallet that positively owns it."""
+
+    from .api import AkashConsoleAPI, _extract_dseq, _interactive_pick, _resolve_dseq
+    from .wallet_pool import configured_api_keys, select_client_for_dseq
+
+    dseq = _resolve_dseq(dseq_arg)
+    if dseq:
+        return select_client_for_dseq(dseq, client_factory=AkashConsoleAPI), dseq
+
+    deployments = []
+    owner_by_dseq = {}
+    for key in configured_api_keys():
+        client = AkashConsoleAPI(key)
+        try:
+            rows = client.list_deployments()
+        except RuntimeError:
+            continue
+        for row in rows or []:
+            found = _extract_dseq(row) if isinstance(row, dict) else None
+            if found and found not in owner_by_dseq:
+                owner_by_dseq[found] = client
+                deployments.append(row)
+    if not deployments:
+        print("No active deployments across the configured Console wallet pool.")
+        sys.exit(1)
+    dseq = (
+        _extract_dseq(deployments[0])
+        if len(deployments) == 1
+        else _interactive_pick(deployments, next(iter(owner_by_dseq.values())))
+    )
+    if not dseq or dseq not in owner_by_dseq:
+        raise RuntimeError("No deployment selected")
+    return owner_by_dseq[dseq], dseq
+
+
 def _enrich_deployment_with_provider(client, deployment: dict) -> dict:
     """Inject provider hostUri into each lease so lease_shell transport can find it.
 
@@ -203,13 +239,13 @@ def main():
         "--bid-wait",
         type=int,
         default=60,
-        help="Phase 1 (preferred-only) window seconds (default: 60)",
+        help="Equal-opportunity auction window, 0-60 seconds (default: 60)",
     )
     deploy_p.add_argument(
         "--bid-wait-retry",
         type=int,
         default=120,
-        help="Phase 2 (preferred-grace) window seconds (default: 120)",
+        help="Deprecated compatibility option; ignored",
     )
     deploy_p.add_argument(
         "--env",
@@ -651,17 +687,16 @@ def main():
 
     # ── update ─────────────────────────────────────────
     elif args.command == "update":
-        from .api import AkashConsoleAPI
         from .deploy import update
 
         try:
-            client = AkashConsoleAPI(_require_api_key())
-            dseq = _resolve_deployment(client, args.dseq)
+            client, dseq = _resolve_deployment_client(args.dseq)
             update(
                 dseq=dseq,
                 sdl_path=args.sdl,
                 image=args.image,
                 env_vars=args.update_env_vars,
+                api_key=client.api_key,
             )
             sys.exit(0)
         except RuntimeError as e:
@@ -670,11 +705,8 @@ def main():
 
     # ── connect ────────────────────────────────────────
     elif args.command == "connect":
-        from .api import AkashConsoleAPI
-
         try:
-            client = AkashConsoleAPI(_require_api_key())
-            dseq = _resolve_deployment(client, args.dseq)
+            client, dseq = _resolve_deployment_client(args.dseq)
             use_lease_shell = args.transport == "lease-shell"
             if use_lease_shell:
                 from .transport import make_transport
@@ -707,11 +739,8 @@ def main():
 
     # ── exec ───────────────────────────────────────────
     elif args.command == "exec":
-        from .api import AkashConsoleAPI
-
         try:
-            client = AkashConsoleAPI(_require_api_key())
-            dseq = _resolve_deployment(client, args.dseq)
+            client, dseq = _resolve_deployment_client(args.dseq)
             use_lease_shell = args.transport == "lease-shell"
             if use_lease_shell:
                 from .transport import make_transport
@@ -762,8 +791,7 @@ def main():
         )
 
         try:
-            client = AkashConsoleAPI(_require_api_key())
-            dseq = _resolve_deployment(client, args.dseq)
+            client, dseq = _resolve_deployment_client(args.dseq)
             from .transport import make_transport
 
             deployment = _enrich_deployment_with_provider(client, client.get_deployment(dseq))
@@ -825,11 +853,8 @@ def main():
             sys.exit(1)
 
     elif args.command == "inject":
-        from .api import AkashConsoleAPI
-
         try:
-            client = AkashConsoleAPI(_require_api_key())
-            dseq = _resolve_deployment(client, args.dseq)
+            client, dseq = _resolve_deployment_client(args.dseq)
 
             env_lines: list[str] = []
             for pair in args.env_vars:
@@ -1288,7 +1313,6 @@ def main():
     # ── status ─────────────────────────────────────────
     elif args.command == "status":
         from .api import (
-            AkashConsoleAPI,
             _extract_forwarded_ports,
             _extract_lease_provider,
             _extract_ssh_info,
@@ -1297,9 +1321,8 @@ def main():
         )
 
         try:
-            client = AkashConsoleAPI(_require_api_key())
+            client, dseq = _resolve_deployment_client(args.dseq)
             use_json = args.json or not sys.stdout.isatty()
-            dseq = _resolve_deployment(client, args.dseq)
 
             deployment = client.get_deployment(dseq)
             dep = deployment.get("deployment", deployment)
@@ -1344,8 +1367,6 @@ def main():
 
     # ── logs ───────────────────────────────────────────
     elif args.command == "logs":
-        from .api import AkashConsoleAPI
-
         try:
             if args.tail < 0:
                 print("Error: --tail must be >= 0.", file=sys.stderr)
@@ -1355,8 +1376,7 @@ def main():
             ):
                 print("Error: --duration must be a finite number > 0.", file=sys.stderr)
                 sys.exit(1)
-            client = AkashConsoleAPI(_require_api_key())
-            dseq = _resolve_deployment(client, args.dseq)
+            client, dseq = _resolve_deployment_client(args.dseq)
             transport = _make_lease_shell(client, dseq)
             try:
                 transport.stream_logs(
@@ -1373,16 +1393,13 @@ def main():
 
     # ── events ─────────────────────────────────────────
     elif args.command == "events":
-        from .api import AkashConsoleAPI
-
         try:
             if args.duration is not None and (
                 not math.isfinite(args.duration) or args.duration <= 0
             ):
                 print("Error: --duration must be a finite number > 0.", file=sys.stderr)
                 sys.exit(1)
-            client = AkashConsoleAPI(_require_api_key())
-            dseq = _resolve_deployment(client, args.dseq)
+            client, dseq = _resolve_deployment_client(args.dseq)
             transport = _make_lease_shell(client, dseq)
             try:
                 transport.stream_events(duration=args.duration)
@@ -1394,7 +1411,7 @@ def main():
 
     # ── add-funds ──────────────────────────────────────
     elif args.command == "add-funds":
-        from .api import AkashConsoleAPI, _confirm, _get_tag
+        from .api import _confirm, _get_tag
 
         try:
             if not math.isfinite(args.deposit):
@@ -1403,8 +1420,7 @@ def main():
             if args.deposit < 0.5:
                 print("Error: minimum deposit is 0.5 USD.", file=sys.stderr)
                 sys.exit(1)
-            client = AkashConsoleAPI(_require_api_key())
-            dseq = _resolve_deployment(client, args.dseq)
+            client, dseq = _resolve_deployment_client(args.dseq)
             tag = _get_tag(dseq)
             label = f"{dseq} ({tag})" if tag else dseq
             if _confirm(f"Add {args.deposit} USD to deployment {label}? (y/N) ", yes=args.yes):
@@ -1418,11 +1434,10 @@ def main():
 
     # ── auto-topup ─────────────────────────────────────
     elif args.command == "auto-topup":
-        from .api import AkashConsoleAPI, _get_tag
+        from .api import _get_tag
 
         try:
-            client = AkashConsoleAPI(_require_api_key())
-            dseq = _resolve_deployment(client, args.dseq)
+            client, dseq = _resolve_deployment_client(args.dseq)
             tag = _get_tag(dseq)
             label = f"{dseq} ({tag})" if tag else dseq
             if args.on or args.off:
@@ -1456,7 +1471,6 @@ def main():
     # ── destroy ────────────────────────────────────────
     elif args.command == "destroy":
         from .api import (
-            AkashConsoleAPI,
             _confirm,
             _get_tag,
             _load_tags,
@@ -1464,8 +1478,7 @@ def main():
         )
 
         try:
-            client = AkashConsoleAPI(_require_api_key())
-            dseq = _resolve_deployment(client, args.dseq)
+            client, dseq = _resolve_deployment_client(args.dseq)
             tag = _get_tag(dseq)
             label = f"{dseq} ({tag})" if tag else dseq
             if _confirm(f"Destroy deployment {label}? (y/N) ", yes=args.yes):
@@ -1530,11 +1543,10 @@ def main():
 
     # ── lease-remaining ────────────────────────────────
     elif args.command == "lease-remaining":
-        from .api import AkashConsoleAPI, _json_output, compute_lease_runway
+        from .api import _json_output, compute_lease_runway
 
         try:
-            client = AkashConsoleAPI(_require_api_key())
-            dseq = _resolve_deployment(client, args.dseq)
+            client, dseq = _resolve_deployment_client(args.dseq)
             block_time = (
                 args.block_time
                 if args.block_time is not None

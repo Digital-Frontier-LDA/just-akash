@@ -33,19 +33,14 @@ Two surfaces sit on top of one Python package:
 
 ## The deploy state machine (`deploy.py`)
 
-The core of the tool. A deployment is a 6-step orchestration; step 3 is a
-three-phase tiered bid-selection state machine.
+The core of the tool. A deployment is a 6-step orchestration; step 3 delegates
+its final provider decision to the shared `akash-lease-core` auction state machine.
 
 ```text
 1. prepare SDL     read → validate (sdl_validate) → image/SSH-key/env overrides
 2. create deploy   POST /v1/deployments (recovers from "already exists")
-3. select bid      ┌─ Phase 1: preferred-only patience  [0, T1]  (default 60s)
-                   │  collect all bids; at T1 pick cheapest PREFERRED if any
-                   ├─ Phase 2: preferred-grace         [T1, T1+T2] (default 120s)
-                   │  the instant a PREFERRED bid appears, accept it (first-wins)
-                   │  cut short once open BACKUP bids exist + grace nears 5min
-                   └─ Phase 3: backup fallback
-                      cheapest BACKUP from bids collected in phases 1+2
+3. select bid      collect for one [0, T] window (default/max 60s)
+                   at T: cheapest PREFERRED, else cheapest eligible BACKUP
 4. tier tables     log PREFERRED / BACKUP / FOREIGN breakdown
 5. announce        which phase chose the winner + a ranked tier view
 6. create lease    POST /v1/leases — with stale-bid retry + one bounded re-deploy
@@ -54,9 +49,23 @@ three-phase tiered bid-selection state machine.
 Properties (each pinned by a test in `tests/test_deploy.py`):
 
 - **Cheapest-when-healthy.** Preferred responsive → cheapest preferred wins.
-- **Bounded patience.** Preferred slow → wait ≤ T1+T2, then snap to first preferred.
+- **Equal opportunity.** No bid is accepted before the configured deadline.
+- **Bounded patience.** The complete collection window is at most 60 seconds.
 - **Graceful degradation.** Preferred fully down → cheapest backup, no extra round trip.
 - **Zero regression.** No backup tier configured → behaves as the single-tier allowlist.
+
+## Wallet selection and ownership
+
+`wallet_pool.py` is the Console I/O adapter for the shared `akash-lease-core` wallet
+ranking contract. Create-time selection and later DSEQ routing are intentionally separate:
+
+1. **Create:** measure distinct accounts at a height-pinned LCD quorum and choose the
+   richest account above the requested deposit floor.
+2. **Operate/close:** query the configured pool and use the account that positively owns
+   the DSEQ. Never infer ownership from current balance or key position.
+
+This split prevents rotation-blind cleanup: a deployment created under wallet 2 cannot be
+closed under wallet 1 merely because wallet 1 later becomes the richest.
 
 Tiers come from env (`AKASH_PROVIDERS`, `AKASH_PROVIDERS_BACKUP`) or repeatable CLI
 flags (`--provider`, `--backup-provider`); CLI overrides env per-tier. With no

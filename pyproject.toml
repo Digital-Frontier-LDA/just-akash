@@ -1,6 +1,6 @@
 [project]
 name = "just-akash"
-version = "1.42.0"
+version = "1.43.0"
 description = "Justfile recipes + Python CLI for deploying on Akash Network via the Console API"
 readme = "README.md"
 license = "MIT"
@@ -15,12 +15,12 @@ dependencies = [
     "websockets>=16.0",
     "pexpect>=4.9.0",
     "pyyaml>=6.0",
-    # Shared sans-I/O core for the lease-shell wire protocol — the same package
-    # the DigitalFrontier control plane consumes, so the frame codec, proxy
-    # envelope and exec result semantics have exactly ONE implementation.
+    # Shared sans-I/O core for lease-shell and provider-auction semantics — the
+    # same package the DigitalFrontier control plane consumes, so protocol and
+    # provider-selection decisions have exactly ONE implementation.
     # Pinned to a release wheel (not a branch) so the protocol cannot shift
     # under an installed CLI.
-    "akash-lease-core @ https://github.com/Digital-Frontier-LDA/akash-lease-core/releases/download/v0.2.0/akash_lease_core-0.2.0-py3-none-any.whl#sha256=eda7e7a51284c61941ca64b3c4d429791a5c9248a8b118d3da50b36ffcd2fec0",
+    "akash-lease-core @ https://github.com/Digital-Frontier-LDA/akash-lease-core/releases/download/v0.6.0/akash_lease_core-0.6.0-py3-none-any.whl#sha256=cf8b411f1604b3b59df93f12ba44886d2d67acd8db75c352853b212cb257d208",
 ]
 
 [project.scripts]
