@@ -97,26 +97,46 @@ def run(*, dseqs: list[str], execute: bool = False) -> int:
     # ONE round-trip for the active set, then index it. Asking per-dseq would be N calls and
     # would still not tell us whether a dseq is absent because it closed or because the
     # listing failed — a listing we hold entire answers both.
-    rows = {str(r.get("dseq")): r for r in lease_status(client, active_only=True)}
+    #
+    # A row with no dseq is DROPPED rather than keyed as "None": one malformed record would
+    # otherwise collide with the next and quietly make the index answer for the wrong
+    # deployment, and this index is what decides whether a close is permitted.
+    rows: dict[str, dict] = {}
+    for r in lease_status(client, active_only=True):
+        key = r.get("dseq")
+        if key is None:
+            continue
+        rows[str(key)] = r
 
     reapable: list[str] = []
     for dseq in dseqs:
         row = rows.get(dseq)
         if row is None:
-            print(f"  {dseq}  not in the active set -> SKIP (already closed, or not ours)")
+            # `active_only=True` filters on deployment.state == "active", so absence means
+            # closed OR any other non-active state OR never ours. Naming only the first
+            # would send an operator reconciling a list looking for the wrong thing.
+            print(f"  {dseq}  not in the active set -> SKIP (closed, not active, or not ours)")
             continue
+        # The classifier's parameter is called `lease_count`, but the value it must receive
+        # is the ACTIVE count — passing the raw one is precisely the bug this module exists
+        # downstream of. Named here so the mismatch is visible rather than inferred.
+        active_leases = int(row.get("active_lease_count", 0) or 0)
+        # None means the record omitted `funds` — UNKNOWN, not zero. Coercing it to 0 for
+        # the classifier is fine (it does not decide on escrow), but printing "$0.00" would
+        # tell the operator this deployment holds nothing while it may hold plenty.
+        raw_escrow = row.get("escrow_remaining_uact")
+        held = "unknown" if raw_escrow is None else f"${int(raw_escrow) / 1e6:.2f}"
         verdict = classify_deployment(
             dseq,
             address,
             deployment_state=str(row.get("deployment_state", "")),
-            lease_count=int(row.get("active_lease_count", 0) or 0),
-            escrow_uact=int(row.get("escrow_remaining_uact", 0) or 0),
+            lease_count=active_leases,
+            escrow_uact=int(raw_escrow or 0),
         )
-        held = verdict.escrow_uact / 1e6
         if verdict.reapable:
             reapable.append(dseq)
             print(
-                f"  {dseq}  {verdict.classification.value}  ${held:.2f}  "
+                f"  {dseq}  {verdict.classification.value}  {held}  "
                 f"confirmations={verdict.confirmations} -> CLOSE"
             )
         else:
@@ -126,7 +146,7 @@ def run(*, dseqs: list[str], execute: bool = False) -> int:
                 # ORPHANED but not reapable means too few endpoints agreed. Say so: that is
                 # a read problem rather than a verdict, and it clears on its own.
                 extra = f" (only {verdict.confirmations} endpoint(s) agreed)"
-            print(f"  {dseq}  {verdict.classification.value}  ${held:.2f} -> REFUSE: {why}{extra}")
+            print(f"  {dseq}  {verdict.classification.value}  {held} -> REFUSE: {why}{extra}")
 
     print(f"\nverified orphans (closable): {len(reapable)} of {len(dseqs)} requested")
     if not execute:

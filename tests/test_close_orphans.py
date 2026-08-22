@@ -190,3 +190,46 @@ def test_close_read_back_terminal_succeeds(_wired):
 def test_missing_api_key_refuses_before_touching_anything(monkeypatch):
     monkeypatch.delenv("AKASH_API_KEY", raising=False)
     assert close_orphans.run(dseqs=["1"], execute=True) == 2
+
+
+# --------------------------------------------------------------------------
+# A missing field must not read as a measurement
+# --------------------------------------------------------------------------
+def test_unknown_escrow_prints_unknown_not_zero(_wired, capsys):
+    """`escrow_remaining_uact` is None when the record omits `funds`.
+
+    Printing "$0.00" there tells the operator this deployment holds nothing, while it may
+    be holding plenty — the same false-clean shape as the orphan count this PR fixes.
+    """
+    row = _row("1")
+    del row["escrow_account"]["state"]["funds"]
+    _wired([row], {"1": _verdict("1", Classification.ORPHANED)})
+    close_orphans.run(dseqs=["1"], execute=False)
+    out = capsys.readouterr().out
+    assert "unknown" in out
+    assert "$0.00" not in out
+
+
+def test_known_zero_escrow_still_prints_a_number(_wired, capsys):
+    """Zero is a measurement and must stay distinguishable from unknown."""
+    _wired([_row("1", escrow=0)], {"1": _verdict("1", Classification.ORPHANED, escrow=0)})
+    close_orphans.run(dseqs=["1"], execute=False)
+    out = capsys.readouterr().out
+    assert "$0.00" in out
+    assert "unknown" not in out
+
+
+def test_row_without_a_dseq_cannot_collide_in_the_index(_wired, capsys):
+    """Two malformed records must not key to "None" and answer for each other.
+
+    This index decides whether a close is permitted, so a collision here could hand one
+    deployment's verdict to a different deployment.
+    """
+    bad_a = _row("x")
+    bad_b = _row("y")
+    del bad_a["deployment"]["id"]["dseq"]
+    del bad_b["deployment"]["id"]["dseq"]
+    client = _wired([bad_a, bad_b, _row("1")], {"1": _verdict("1", Classification.ORPHANED)})
+    assert close_orphans.run(dseqs=["None"], execute=True) == 0
+    assert client.closed == []
+    assert "not in the active set" in capsys.readouterr().out

@@ -66,11 +66,17 @@ jobs:
         uses: ./.github/actions/sops-env
         with:
           age-key: ${{ secrets.SOPS_AGE_KEY }}
-      # The dseq list goes through the environment, not the command line, so a value
-      # containing shell metacharacters cannot reach the shell as syntax.
+      # EVERY input reaches this step through the environment, never through `${{ }}`
+      # interpolation into the `run:` body. `dseqs` is operator-supplied text, and while
+      # `execute` is a boolean that cannot carry syntax, interpolating one and not the
+      # other leaves the habit in place for whoever edits this next. Quoting "$DSEQS"
+      # means shell metacharacters in it are an argument, not syntax.
       - name: Close orphans
         env:
           DSEQS: ${{ inputs.dseqs }}
+          EXECUTE: ${{ inputs.execute }}
         run: |
-          uv run python -m just_akash.close_orphans \
-            --dseq "$DSEQS" ${{ inputs.execute && '--execute' || '' }}
+          set -euo pipefail
+          ARGS=(--dseq "$DSEQS")
+          if [ "$EXECUTE" = "true" ]; then ARGS+=(--execute); fi
+          uv run python -m just_akash.close_orphans "${ARGS[@]}"
