@@ -19,11 +19,17 @@ every objection was verified in this repo's own source:
 
 3. THE CHAIN ANSWERS IT DIRECTLY. An OPEN ORDER is the only path to a future lease. So:
 
-       active + lease_count == 0 + NO open order   -> orphan NOW
-       active + lease_count == 0 + an open order   -> legitimately waiting for a bid
+       active + no active lease + NO open order   -> orphan NOW
+       active + no active lease + an open order   -> legitimately waiting for a bid
 
    That is exactly the distinction the sampling was a workaround for. No persistence, no
    counter, no storage to silently stop working.
+
+   BOTH halves are read from the chain. The lease half was originally taken from the
+   Console record and gated the whole function before it ever made a chain call, which
+   made this module's central claim untrue for the one input it trusted. Console reports
+   closed leases as active and does so inconsistently between reads (see
+   `classify_deployment`), so a real orphan read as LEASED at random.
 
 WHAT THIS MODULE WILL NOT DO
 
@@ -166,33 +172,138 @@ def live_orders_for(dseq: str, owner: str, base: str) -> int | None:
     return live
 
 
+def active_leases_for(dseq: str, owner: str, base: str) -> int | None:
+    """Count ACTIVE leases for `dseq` from ONE endpoint.
+
+    Returns None when the endpoint could not be read or returned something unparseable.
+    None is not zero, for the same reason `live_orders_for` says so: reporting zero here is
+    what turns an unreachable node into a destroyed deployment.
+
+    The state filter is applied server-side AND re-checked here. That is not belt-and-braces
+    for its own sake — this repo has already been bitten by an endpoint that accepts
+    `filters.state` on one module's list endpoint and ignores it on another's, and a node
+    that ignores it would otherwise return closed leases that count as active.
+    """
+    path = (
+        f"{MARKET_API}/leases/list?filters.owner={owner}&filters.dseq={dseq}"
+        "&filters.state=active&pagination.limit=50"
+    )
+    try:
+        payload = _lcd_get(path, base=base)
+    except Exception:  # noqa: BLE001 - any read failure is UNKNOWN, never "no leases"
+        return None
+    leases = payload.get("leases")
+    if not isinstance(leases, list):
+        return None
+    active = 0
+    for entry in leases:
+        if not isinstance(entry, dict):
+            continue
+        # Same nesting caveat as live_orders_for: node versions differ, so check both
+        # shapes rather than assuming one.
+        nested = entry.get("lease")
+        lease = nested if isinstance(nested, dict) else entry
+        if str(lease.get("state", "")).lower() == "active":
+            active += 1
+    return active
+
+
 def classify_deployment(
     dseq: str,
     owner: str,
     *,
     deployment_state: str,
-    lease_count: int,
+    console_lease_count: int,
     escrow_uact: int = 0,
     bases: list[str] | None = None,
 ) -> DeploymentVerdict:
-    """Classify ONE deployment from authoritative on-chain order state.
+    """Classify ONE deployment from authoritative on-chain lease AND order state.
 
     Queries every endpoint CONCURRENTLY and counts how many independently agree, because
     a single lagging node reporting zero orders is indistinguishable from a real orphan
     until a second node confirms it.
-    """
-    if lease_count > 0:
-        return DeploymentVerdict(
-            dseq=dseq, classification=Classification.LEASED, escrow_uact=escrow_uact
-        )
 
+    ``console_lease_count`` is ADVISORY and is used only when the chain cannot be read.
+    It used to be the gate — `if lease_count > 0: return LEASED`, decided before this
+    function ever spoke to a chain — and that was wrong twice over. The count came from the
+    Console record, and MEASURED 2026-08-22 the Console API reports leases as ``active``
+    that the chain says are ``closed``, differently on reads four minutes apart: the same
+    9 dseqs classified 9 ORPHANED then 2 ORPHANED / 7 LEASED, while the chain said no
+    active lease for any of them across both runs and a per-dseq read showed one lease,
+    ``state: closed``, closed ~15h earlier. So the first gate of the orphan classifier was
+    a coin flip, and a real orphan read as healthy on any run where Console happened to say
+    active. That is the module docstring's own point — THE CHAIN ANSWERS IT DIRECTLY —
+    applied to the half that never asked it.
+
+    It fails safe in both directions: a positive lease reading from any endpoint wins
+    (never close something that might be running), and an unreadable chain falls back to
+    the Console count rather than to "orphan".
+    """
     endpoints = bases if bases is not None else rest_urls()
     if not endpoints:
+        # Nothing to verify against. Defer to the caller's count in the SAFE direction
+        # only: "Console says leased" blocks a close, "Console says nothing" is not
+        # permission to call this an orphan.
+        if console_lease_count > 0:
+            return DeploymentVerdict(
+                dseq=dseq,
+                classification=Classification.LEASED,
+                escrow_uact=escrow_uact,
+                detail="no LCD endpoint available; Console reports a lease",
+            )
         return DeploymentVerdict(
             dseq=dseq,
             classification=Classification.UNKNOWN,
             escrow_uact=escrow_uact,
             detail="no LCD endpoint available",
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(endpoints))) as pool:
+        lease_readings = list(pool.map(lambda b: active_leases_for(dseq, owner, b), endpoints))
+
+    answered_leases = [r for r in lease_readings if r is not None]
+    # "No lease" has to be CONFIRMED, not merely read once — this gate is the only thing
+    # standing between the classifier and closing a running workload, and the module's own
+    # rule is that a verdict from one endpoint is a reading. Without this floor a
+    # deployment could reach `reapable` on two ORDER confirmations while just one endpoint
+    # had managed to answer "no lease".
+    #
+    # Capped at the number of endpoints actually configured so a single-endpoint setup
+    # degrades to UNKNOWN rather than becoming unsatisfiable — it still cannot reap,
+    # because `reapable` independently requires MIN_CONFIRMATIONS.
+    needed = min(MIN_CONFIRMATIONS, len(endpoints))
+    if len(answered_leases) < needed:
+        if console_lease_count > 0:
+            return DeploymentVerdict(
+                dseq=dseq,
+                classification=Classification.LEASED,
+                escrow_uact=escrow_uact,
+                detail=(
+                    f"lease query answered by {len(answered_leases)} of {needed} required "
+                    "endpoint(s); Console reports a lease"
+                ),
+            )
+        return DeploymentVerdict(
+            dseq=dseq,
+            classification=Classification.UNKNOWN,
+            escrow_uact=escrow_uact,
+            detail=(
+                f"lease query answered by only {len(answered_leases)} of {needed} required "
+                "endpoint(s) — unread, not orphaned"
+            ),
+        )
+
+    # Trust the POSITIVE, exactly as the order check below does. A node that sees an active
+    # lease has information a node that sees none does not, and being wrong in this
+    # direction costs a delay while being wrong the other way destroys a running workload.
+    saw_lease = sum(1 for r in answered_leases if r > 0)
+    if saw_lease:
+        return DeploymentVerdict(
+            dseq=dseq,
+            classification=Classification.LEASED,
+            escrow_uact=escrow_uact,
+            confirmations=saw_lease,
+            detail=f"an active lease exists on {saw_lease} endpoint(s)",
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(endpoints))) as pool:

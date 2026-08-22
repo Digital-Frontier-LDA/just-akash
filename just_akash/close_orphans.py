@@ -117,9 +117,11 @@ def run(*, dseqs: list[str], execute: bool = False) -> int:
             # would send an operator reconciling a list looking for the wrong thing.
             print(f"  {dseq}  not in the active set -> SKIP (closed, not active, or not ours)")
             continue
-        # The classifier's parameter is called `lease_count`, but the value it must receive
-        # is the ACTIVE count — passing the raw one is precisely the bug this module exists
-        # downstream of. Named here so the mismatch is visible rather than inferred.
+        # ADVISORY ONLY. Since #173 the classifier reads lease state from the chain and
+        # uses this Console-derived count solely as a fallback when the chain cannot be
+        # read — and then only in the safe direction (it can block a close, never permit
+        # one). Still the ACTIVE count rather than the raw one: Console reports closed
+        # leases as active, so the raw count would block closes at random.
         active_leases = int(row.get("active_lease_count", 0) or 0)
         # None means the record omitted `funds` — UNKNOWN, not zero. Coercing it to 0 for
         # the classifier is fine (it does not decide on escrow), but printing "$0.00" would
@@ -130,7 +132,7 @@ def run(*, dseqs: list[str], execute: bool = False) -> int:
             dseq,
             address,
             deployment_state=str(row.get("deployment_state", "")),
-            lease_count=active_leases,
+            console_lease_count=active_leases,
             escrow_uact=int(raw_escrow or 0),
         )
         if verdict.reapable:

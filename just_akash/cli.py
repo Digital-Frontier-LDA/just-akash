@@ -1153,7 +1153,7 @@ def main():
                         # 0 with `..._scan_degraded` 0 — a clean, complete, WRONG
                         # all-clear of exactly the kind canary/orphans.py was written
                         # to refuse.
-                        lease_count=int(r.get("active_lease_count", 0) or 0),
+                        console_lease_count=int(r.get("active_lease_count", 0) or 0),
                         escrow_uact=int(r.get("escrow_remaining_uact", 0) or 0),
                     )
                 )
