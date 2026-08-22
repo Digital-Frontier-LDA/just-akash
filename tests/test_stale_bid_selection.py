@@ -154,13 +154,13 @@ class TestSelectionSkipsStaleBids:
         client.create_lease.assert_not_called()
 
 
-class TestSingleWindowIgnoresLegacyGraceCut:
+class TestBoundedTwoWindowSelection:
     @patch("just_akash.deploy.time")
     @patch("just_akash.deploy.AkashConsoleAPI")
-    def test_backup_selected_at_window_end_without_legacy_grace(
+    def test_already_observed_backup_selected_at_preferred_deadline(
         self, MockAPI, mock_time, tmp_path, monkeypatch, capsys
     ):
-        """A backup is selected at the one deadline; phase-2 tuning is ignored."""
+        """A fallback already observed in phase one is selectable at its boundary."""
         monkeypatch.setenv("JUST_AKASH_BACKUP_FALLBACK_S", "10")
         client, sdl = _setup(
             MockAPI,
@@ -172,11 +172,13 @@ class TestSingleWindowIgnoresLegacyGraceCut:
         )
         client.get_bids.return_value = [_make_bid("akash1back", 20)]
 
-        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=500)
+        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=125)
         assert result["provider"] == "akash1back"
         out = capsys.readouterr().out
         assert "Cutting preferred-grace short" not in out
-        assert "cheapest eligible fallback after collection window" in out
+        assert "first eligible fallback after preferred window" in out
+        assert "BACKUP rank[1]" in out
+        assert "<-- SELECTED" in out
 
     @patch("just_akash.deploy.time")
     @patch("just_akash.deploy.AkashConsoleAPI")

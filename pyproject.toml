@@ -1,6 +1,6 @@
 [project]
 name = "just-akash"
-version = "1.43.0"
+version = "1.43.1"
 description = "Justfile recipes + Python CLI for deploying on Akash Network via the Console API"
 readme = "README.md"
 license = "MIT"
@@ -20,7 +20,7 @@ dependencies = [
     # provider-selection decisions have exactly ONE implementation.
     # Pinned to a release wheel (not a branch) so the protocol cannot shift
     # under an installed CLI.
-    "akash-lease-core @ https://github.com/Digital-Frontier-LDA/akash-lease-core/releases/download/v0.6.0/akash_lease_core-0.6.0-py3-none-any.whl#sha256=cf8b411f1604b3b59df93f12ba44886d2d67acd8db75c352853b212cb257d208",
+    "akash-lease-core @ https://github.com/Digital-Frontier-LDA/akash-lease-core/releases/download/v0.7.0/akash_lease_core-0.7.0-py3-none-any.whl#sha256=65318a871ef04b8204f0665617acca05d5c514386dd86615f2a8c1976623cf55",
 ]
 
 [project.scripts]

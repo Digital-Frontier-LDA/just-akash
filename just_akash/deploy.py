@@ -333,6 +333,9 @@ def _select_auction_bid(
     preferred: list[str],
     backup: list[str],
     collection_window_seconds: float,
+    fallback_window_seconds: float = 0,
+    evaluated_at: float | None = None,
+    observed_at_by_provider: dict[str, float] | None = None,
 ):
     """Normalize Console bids and delegate the decision to the shared core.
 
@@ -344,6 +347,7 @@ def _select_auction_bid(
     auction = Auction(
         AuctionPolicy(
             collection_window_seconds=collection_window_seconds,
+            fallback_window_seconds=fallback_window_seconds,
             preferred_providers=frozenset(preferred),
             eligible_providers=eligible,
         ),
@@ -364,7 +368,9 @@ def _select_auction_bid(
                 provider=provider,
                 price=amount,
                 denom=denom or "uakt",
-                observed_at=collection_window_seconds,
+                observed_at=(observed_at_by_provider or {}).get(
+                    provider, collection_window_seconds
+                ),
                 # Console's legacy/partial bid shape omits state.  This adapter
                 # has always treated that shape as leasable; normalize the
                 # transport quirk here rather than teaching the core about it.
@@ -375,7 +381,9 @@ def _select_auction_bid(
         auction.observe(observation)
         raw_by_key[bid_key] = raw_bid
 
-    result = auction.evaluate(now=collection_window_seconds)
+    result = auction.evaluate(
+        now=collection_window_seconds if evaluated_at is None else evaluated_at
+    )
     if result.status is not AuctionStatus.DECIDED or result.selected is None:
         return None, result
     return raw_by_key[result.selected.bid_key], result
@@ -640,10 +648,16 @@ def deploy(
     if not math.isfinite(deposit) or deposit <= 0:
         raise RuntimeError(f"Invalid deposit {deposit!r}: must be a positive, finite USD amount.")
 
-    # Validate before creating anything on-chain.  ``bid_wait_retry`` remains in
-    # the public CLI signature for compatibility but the former second phase is
-    # intentionally gone: one bounded window now governs every deployment path.
-    AuctionPolicy(collection_window_seconds=bid_wait)
+    if bid_wait_retry < bid_wait:
+        raise ValueError(
+            "bid_wait_retry is the total auction deadline and must be greater than "
+            "or equal to bid_wait"
+        )
+    fallback_wait = bid_wait_retry - bid_wait
+    AuctionPolicy(
+        collection_window_seconds=bid_wait,
+        fallback_window_seconds=fallback_wait,
+    )
 
     from .wallet_pool import select_client_for_create
 
@@ -665,7 +679,7 @@ def deploy(
     _log(
         logging.INFO,
         f"CONFIG  sdl={sdl_path}  gpu={gpu}  image={image or '(default)'}  "
-        f"auction_window={bid_wait}s  bid_wait_retry={bid_wait_retry}s (deprecated/ignored)",
+        f"preferred_window={bid_wait}s  fallback_deadline={bid_wait_retry}s total",
     )
     if preferred:
         _log(logging.INFO, f"PREFERRED_PROVIDERS ({len(preferred)}): {preferred}")
@@ -764,6 +778,7 @@ def deploy(
     bids: list = []
     poll_count = 0
     last_bid_count = -1
+    first_seen_by_provider: dict[str, float] = {}
 
     def _do_poll() -> None:
         """Performs one poll, updates `bids`, prints progress + diff log line."""
@@ -798,6 +813,8 @@ def deploy(
                     if not isinstance(b, dict):
                         continue
                     p = _extract_provider(b) or "unknown"
+                    if p != "unknown":
+                        first_seen_by_provider.setdefault(p, float(elapsed))
                     s = _bid_state(b)
                     tag = _classify_bid(p, preferred, backup)
                     _log(
@@ -852,9 +869,40 @@ def deploy(
         preferred=preferred,
         backup=backup,
         collection_window_seconds=bid_wait,
+        fallback_window_seconds=fallback_wait,
+        evaluated_at=bid_wait,
+        observed_at_by_provider=first_seen_by_provider,
     )
+    if auction_result.status is AuctionStatus.COLLECTING:
+        fallback_deadline = start_time + bid_wait_retry
+        _log(
+            logging.INFO,
+            "  No preferred bid in the collection window; waiting for the first "
+            f"eligible fallback until {bid_wait_retry}s total...",
+        )
+
+        def _eligible_open(current: list) -> bool:
+            return any(
+                isinstance(item, dict)
+                and _is_open_bid(item)
+                and _classify_bid(_extract_provider(item), preferred, backup)
+                in ("PREFERRED", "BACKUP", "ACCEPTED")
+                for item in current
+            )
+
+        _poll_until(fallback_deadline, early_exit=_eligible_open)
+        elapsed_for_decision = min(time.time() - start_time, float(bid_wait_retry))
+        selected_bid, auction_result = _select_auction_bid(
+            bids,
+            preferred=preferred,
+            backup=backup,
+            collection_window_seconds=bid_wait,
+            fallback_window_seconds=fallback_wait,
+            evaluated_at=elapsed_for_decision,
+            observed_at_by_provider=first_seen_by_provider,
+        )
     selection_phase = (
-        1 if auction_result.selection_reason == "cheapest_preferred" or not has_allowlist else 3
+        1 if auction_result.selection_reason == "cheapest_preferred" or not has_allowlist else 2
     )
     _log(
         logging.INFO,
@@ -1122,24 +1170,22 @@ def deploy(
     # Step 5: announce selection (already chosen by state machine).
     phase_label = {
         1: "cheapest preferred after collection window",
-        3: "cheapest eligible fallback after collection window",
+        2: "first eligible fallback after preferred window",
     }
     selection_label = (
         phase_label[selection_phase]
         if has_allowlist
-        else "cheapest eligible bid after collection window"
+        else "first eligible bid after preferred window"
     )
     _log(
         logging.INFO,
         f"STEP 5: Selection made via {selection_label}",
     )
     # Show a compact ranking of the tier from which the winner came.
-    if selection_phase == 3:
-        ranking_pool = _filter_tier(bids, "BACKUP")
-        ranking_label = "BACKUP"
-    elif has_allowlist:
-        ranking_pool = _filter_tier(bids, "PREFERRED")
-        ranking_label = "PREFERRED"
+    if has_allowlist:
+        winner_tier = _classify_bid(_extract_provider(selected_bid), preferred, backup)
+        ranking_pool = _filter_tier(bids, winner_tier)
+        ranking_label = winner_tier
     else:
         ranking_pool = [b for b in bids if isinstance(b, dict)]
         ranking_label = "ALL"

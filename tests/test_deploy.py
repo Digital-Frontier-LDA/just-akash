@@ -78,6 +78,10 @@ class TestDeployMissingApiKey:
         with pytest.raises(RuntimeError, match="AKASH_API_KEY"):
             deploy(sdl_path=str(tmp_path / "fake.yaml"))
 
+    def test_rejects_total_deadline_shorter_than_preferred_window(self, tmp_path):
+        with pytest.raises(ValueError, match="total auction deadline"):
+            deploy(sdl_path=str(tmp_path / "fake.yaml"), bid_wait=60, bid_wait_retry=30)
+
 
 class TestDeploySdlNotFound:
     def test_raises_for_missing_sdl(self, monkeypatch):
@@ -607,9 +611,8 @@ class TestPreferredArrivesLateWithinWindow:
 class TestPhase3BackupFallback:
     @patch("just_akash.deploy.time")
     @patch("just_akash.deploy.AkashConsoleAPI")
-    def test_cheapest_backup_when_no_preferred(self, MockAPI, mock_time, tmp_path, monkeypatch):
-        """AC: when no preferred bid arrives by end of phase 2, cheapest backup
-        from phases 1+2 is accepted."""
+    def test_first_backup_when_no_preferred(self, MockAPI, mock_time, tmp_path, monkeypatch):
+        """After the preferred window, the first observed eligible backup wins."""
         monkeypatch.setenv("AKASH_API_KEY", "test-key")
         monkeypatch.setenv("AKASH_PROVIDERS", "akash1pref")
         monkeypatch.setenv("AKASH_PROVIDERS_BACKUP", "akash1back1,akash1back2")
@@ -619,8 +622,8 @@ class TestPhase3BackupFallback:
         client = MockAPI.return_value
         client.create_deployment.return_value = {"dseq": "12345", "manifest": "abc"}
         client.get_bids.return_value = [
-            _make_bid("akash1back1", 120),
-            _make_bid("akash1back2", 70),  # cheapest backup -> wins
+            _make_bid("akash1back1", 120),  # first observed fallback -> wins
+            _make_bid("akash1back2", 70),
             _make_bid("akash1foreign", 30),  # absolute cheapest, but FOREIGN
         ]
         client.create_lease.return_value = {"data": {"lease": "created"}}
@@ -630,8 +633,8 @@ class TestPhase3BackupFallback:
         mock_time.sleep.return_value = None
 
         result = deploy(sdl_path=str(sdl_file), bid_wait=10, bid_wait_retry=10)
-        assert result["provider"] == "akash1back2"
-        assert result["price"] == 70.0
+        assert result["provider"] == "akash1back1"
+        assert result["price"] == 120.0
 
 
 class TestForeignOnlyWithBackupSet:
@@ -1127,7 +1130,7 @@ class TestEmptyListOverrideIsExplicit:
         # If env IS consulted (bug), only "akash1env_pref" is allowed → the
         # cheaper "akash1other" bid would be FOREIGN and the run would fail.
         # If [] correctly means "no allowlist", every bid is ACCEPTED and the
-        # cheaper one wins.
+        # first observed one wins.
         client.get_bids.return_value = [
             _make_bid("akash1env_pref", 200),
             _make_bid("akash1other", 50),
@@ -1145,12 +1148,12 @@ class TestEmptyListOverrideIsExplicit:
             preferred_providers=[],
             backup_providers=[],
         )
-        # No allowlist → cheapest bid wins regardless of env value.
-        assert result["provider"] == "akash1other"
-        assert result["price"] == 50.0
+        # No allowlist → first eligible bid wins regardless of env value.
+        assert result["provider"] == "akash1env_pref"
+        assert result["price"] == 200.0
         assert result["wallet_account"] == "akash1single"
         output = capsys.readouterr().out
-        assert "cheapest eligible bid after collection window" in output
+        assert "first eligible bid after preferred window" in output
         assert "cheapest preferred after collection window" not in output
         assert "Wallet: akash1single" in output
 
@@ -1175,8 +1178,8 @@ class TestWhitespaceOnlyEnvValueTreatedAsUnset:
 
         client = MockAPI.return_value
         client.create_deployment.return_value = {"dseq": "12345", "manifest": "abc"}
-        # Two arbitrary bids. With proper trim+drop, no allowlist → cheapest
-        # wins. If parsing leaks empty strings into the allowlist, the
+        # Two arbitrary bids. With proper trim+drop, no allowlist → first
+        # eligible wins. If parsing leaks empty strings into the allowlist, the
         # has_allowlist flag flips True and these would be FOREIGN-rejected.
         client.get_bids.return_value = [
             _make_bid("akash1one", 99),
@@ -1189,19 +1192,16 @@ class TestWhitespaceOnlyEnvValueTreatedAsUnset:
         mock_time.sleep.return_value = None
 
         result = deploy(sdl_path=str(sdl_file), bid_wait=10, bid_wait_retry=10)
-        assert result["provider"] == "akash1two"
-        assert result["price"] == 33.0
+        assert result["provider"] == "akash1one"
+        assert result["price"] == 99.0
 
 
 class TestBackupOnlyAllowlistAcceptsBackupBid:
     """Preferred is empty, backup is set, only a backup bid arrives. The
     state machine should:
-      - Phase 1: no PREFERRED can match → no selection.
-      - Phase 2: enters because backup is configured. early_exit looks for
-        a PREFERRED bid that can NEVER appear → polls full T2.
-      - Phase 3: cheapest backup wins.
-    This probes the gap where 'preferred can't ever arrive' still wastes a
-    full T2 wait, and confirms the eventual selection still completes."""
+      - preserve the configured preferred grace boundary;
+      - select the first eligible backup already observed at that boundary.
+    """
 
     @patch("just_akash.deploy.time")
     @patch("just_akash.deploy.AkashConsoleAPI")

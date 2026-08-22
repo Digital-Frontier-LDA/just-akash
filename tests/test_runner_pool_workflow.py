@@ -496,10 +496,21 @@ def test_providers_input_has_no_default_fleet():
 def test_the_provision_step_reads_the_filtered_list_only():
     """If the raw spec reached the provision step it could bypass the deny filter."""
     env = PROVISION.get("env", {})
-    assert "steps.candidates.outputs.candidates" in env.get("CANDIDATES_CSV", "")
+    assert "steps.candidates.outputs.preferred_candidates" in env.get(
+        "PREFERRED_CANDIDATES_CSV", ""
+    )
+    assert "steps.candidates.outputs.fallback_candidates" in env.get("FALLBACK_CANDIDATES_CSV", "")
     assert not any("inputs.providers" in str(v) for v in env.values()), (
         "the unfiltered provider spec must not be in scope where the deploy happens"
     )
+
+
+def test_proven_and_unproven_candidates_reach_distinct_auction_tiers():
+    """Sorting a CSV is not a preference contract: if every address is passed with
+    --provider, the auction sees one tier and a cheaper unproven host can win."""
+    body = PROVISION["run"]
+    assert 'PROV_ARGS+=(--provider "$p")' in body
+    assert 'PROV_ARGS+=(--backup-provider "$p")' in body
 
 
 # --------------------------------------------------------------------------

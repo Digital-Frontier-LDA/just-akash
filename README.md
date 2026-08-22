@@ -218,28 +218,31 @@ just inject 12345 .env.secrets ssh      # force SSH
 
 ## Bid Selection
 
-Deployments use one bounded equal-opportunity bid window. Bids stream from
+Deployments use a bounded preferred window followed, only when necessary, by a
+bounded first-eligible fallback window. Bids stream from
 `t=0` regardless of tier (Akash's auction is open; tiers are a client-side
 eligibility policy). `--bid-wait` configures the complete window from 0 to 60
 seconds and defaults to 60.
 
-At the deadline:
+At the preferred deadline:
 
 1. if any open preferred bid exists, select the cheapest preferred bid;
-2. otherwise select the cheapest open eligible backup bid;
-3. with no allowlist, select the cheapest open bid from any provider.
+2. otherwise select the first eligible backup bid already observed, or continue
+   polling until the first eligible bid arrives;
+3. with no allowlist, the same fallback rule applies to any non-excluded provider.
 
 The decision is implemented by the shared, sans-I/O `akash-lease-core` package,
 which is also consumed by Digital Frontier's Console and wallet deployment paths.
-`--bid-wait-retry` remains accepted for command-line compatibility but is ignored;
-there is no longer a second first-wins grace phase.
+`--bid-wait-retry` is the total bounded deadline (120 seconds by default), so the
+fallback phase cannot hang indefinitely or leak an unclosed deployment.
 
 Properties:
 
 - **Cheapest-when-healthy.** Preferred providers responsive → cheapest preferred wins.
 - **Equal opportunity.** An early bidder cannot pre-empt a cheaper provider arriving later in-window.
-- **Bounded patience.** Selection happens once, after no more than 60 seconds.
-- **Graceful degradation.** Preferred fully down → cheapest eligible backup wins at the same deadline.
+- **Bounded patience.** Preferred waits at most 60 seconds; total selection stays
+  within the configured retry deadline.
+- **Graceful degradation.** Preferred fully down → first eligible fallback wins.
 
 ### Tiered providers
 
@@ -258,7 +261,7 @@ uv run just-akash deploy \
 
 When `AKASH_PROVIDERS_BACKUP` is unset, deploy behaves identically to the
 single-tier allowlist (zero regression). With no allowlist at all (neither
-preferred nor backup), the cheapest bid from any provider wins.
+preferred nor backup), the first eligible bid at or after the preferred deadline wins.
 
 Each bid is tagged in the log as `[PREFERRED]`, `[BACKUP]`, or `[FOREIGN]`,
 and the selection log line records the shared policy version and decision reason.
