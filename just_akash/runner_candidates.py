@@ -215,8 +215,12 @@ def main(argv: list[str] | None = None) -> int:
 
     out = os.environ.get("GITHUB_OUTPUT")
     if args.github_output and out:
+        preferred = [p for p in ordered if p.get("runner_host")]
+        fallback = [p for p in ordered if not p.get("runner_host")]
         with open(out, "a") as fh:
             fh.write("candidates=" + ",".join(p["address"] for p in ordered) + "\n")
+            fh.write("preferred_candidates=" + ",".join(p["address"] for p in preferred) + "\n")
+            fh.write("fallback_candidates=" + ",".join(p["address"] for p in fallback) + "\n")
             fh.write(f"proven_hosts={proven_host_count(providers)}\n")
             fh.write(f"denied={len(denied)}\n")
 

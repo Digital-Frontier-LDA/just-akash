@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.43.1] — 2026-08-22
+
+### Fixed
+
+- Preserve `runner_host` as the provider auction's preferred tier and send
+  unproven-but-eligible runner providers through the backup tier. Sorting a
+  single preferred list did not enforce preference: a cheaper unproven bidder
+  could still beat a proven runner host during the shared 60-second auction.
+
 ## [1.43.0] — 2026-08-22
 
 ### Changed

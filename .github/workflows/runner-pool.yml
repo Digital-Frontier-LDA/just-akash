@@ -398,7 +398,8 @@ jobs:
           AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
           AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}
           GH_TOKEN: ${{ secrets.GH_RUNNER_PAT }}
-          CANDIDATES_CSV: ${{ steps.candidates.outputs.candidates }}
+          PREFERRED_CANDIDATES_CSV: ${{ steps.candidates.outputs.preferred_candidates }}
+          FALLBACK_CANDIDATES_CSV: ${{ steps.candidates.outputs.fallback_candidates }}
           ORG: ${{ inputs.github-org }}
           RUNNER_LABEL: ${{ inputs.runner-label }}
           POOL_SIZE: ${{ inputs.pool-size }}
@@ -430,7 +431,8 @@ jobs:
           [ "$MIN_POOL" -ge 1 ] 2>/dev/null || MIN_POOL="$POOL_SIZE"
           [ "$MIN_POOL" -le "$POOL_SIZE" ] 2>/dev/null || MIN_POOL="$POOL_SIZE"
 
-          CANDIDATES=$(printf '%s' "${CANDIDATES_CSV:-}" | tr ',' '\n' | sed '/^$/d')
+          PREFERRED_CANDIDATES=$(printf '%s' "${PREFERRED_CANDIDATES_CSV:-}" | tr ',' '\n' | sed '/^$/d')
+          FALLBACK_CANDIDATES=$(printf '%s' "${FALLBACK_CANDIDATES_CSV:-}" | tr ',' '\n' | sed '/^$/d')
           EXCLUDED=""
           SAW_BID=0
           SAW_SEQ_CONTENTION=0
@@ -438,9 +440,18 @@ jobs:
           for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
             echo "::group::provision attempt $attempt/$MAX_ATTEMPTS"
             PROV_ARGS=()
-            for p in $CANDIDATES; do
+            # Keep measured runner hosts in the auction's preferred tier. Merely
+            # sorting one --provider list is ineffective: the shared auction chooses
+            # the cheapest member of that tier, so a cheaper unproven host can still
+            # capture the lease. --backup-provider is eligible only when no proven
+            # host bids during the complete collection window.
+            for p in $PREFERRED_CANDIDATES; do
               case " $EXCLUDED " in *" $p "*) continue ;; esac
               PROV_ARGS+=(--provider "$p")
+            done
+            for p in $FALLBACK_CANDIDATES; do
+              case " $EXCLUDED " in *" $p "*) continue ;; esac
+              PROV_ARGS+=(--backup-provider "$p")
             done
 
             rm -f /tmp/ja.log

@@ -233,5 +233,7 @@ def test_outputs_carry_the_ordered_candidates(tmp_path, monkeypatch, capsys):
     rc.main(["--providers", _j.dumps(FLEET), "--github-output"])
     body = out.read_text()
     assert f"candidates={A},{T}" in body, body
+    assert f"preferred_candidates={A}" in body, body
+    assert f"fallback_candidates={T}" in body, body
     assert "proven_hosts=1" in body
     assert "denied=2" in body
