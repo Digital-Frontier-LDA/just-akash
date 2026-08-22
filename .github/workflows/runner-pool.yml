@@ -64,7 +64,10 @@ on:
             [{"address":"akash1…","runner_host":true,"failover_priority":20},
              {"address":"akash1…","runner_deny":true}]
 
-          runner_host  PROVEN to bring the runner online.
+          preferred    Operator-owned/preferred provider auction tier.
+          runner_host  PROVEN to bring the runner online. Legacy specs without
+                       `preferred` treat this as preferred; explicit false keeps
+                       a qualified third-party host in fallback.
           runner_deny  leases but NEVER schedules the runner pod — never tried.
           ci_only      third-party; fine for a throwaway runner, not customers.
 
@@ -400,6 +403,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_RUNNER_PAT }}
           PREFERRED_CANDIDATES_CSV: ${{ steps.candidates.outputs.preferred_candidates }}
           FALLBACK_CANDIDATES_CSV: ${{ steps.candidates.outputs.fallback_candidates }}
+          STANDING_EXCLUDED_CSV: ${{ steps.candidates.outputs.excluded_candidates }}
           ORG: ${{ inputs.github-org }}
           RUNNER_LABEL: ${{ inputs.runner-label }}
           POOL_SIZE: ${{ inputs.pool-size }}
@@ -433,14 +437,17 @@ jobs:
 
           PREFERRED_CANDIDATES=$(printf '%s' "${PREFERRED_CANDIDATES_CSV:-}" | tr ',' '\n' | sed '/^$/d')
           FALLBACK_CANDIDATES=$(printf '%s' "${FALLBACK_CANDIDATES_CSV:-}" | tr ',' '\n' | sed '/^$/d')
-          EXCLUDED=""
+          # Standing exclusions and runtime failures share one exclusion input.
+          # The former arrive from runner_deny; the latter are appended below.
+          EXCLUDED=$(printf '%s' "${STANDING_EXCLUDED_CSV:-}" | tr ',' ' ')
           SAW_BID=0
           SAW_SEQ_CONTENTION=0
 
           for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
             echo "::group::provision attempt $attempt/$MAX_ATTEMPTS"
             PROV_ARGS=()
-            # Keep measured runner hosts in the auction's preferred tier. Merely
+            # Keep operator-preferred and measured runner hosts in the auction's
+            # preferred tier. Merely
             # sorting one --provider list is ineffective: the shared auction chooses
             # the cheapest member of that tier, so a cheaper unproven host can still
             # capture the lease. --backup-provider is eligible only when no proven
@@ -453,6 +460,14 @@ jobs:
               case " $EXCLUDED " in *" $p "*) continue ;; esac
               PROV_ARGS+=(--backup-provider "$p")
             done
+
+            # Never degrade an exhausted/denied allowlist into unrestricted
+            # marketplace selection; that would re-admit every standing trap.
+            if [ "${#PROV_ARGS[@]}" -eq 0 ]; then
+              echo "failure_reason=NO_ELIGIBLE_BIDDER" >> "$GITHUB_OUTPUT"
+              echo "::error title=No eligible provider remains::All configured preferred and fallback providers are standing-denied or failed during this run."
+              echo "::endgroup::"; exit 1
+            fi
 
             rm -f /tmp/ja.log
             "${JA[@]}" deploy --sdl /tmp/runner-sdl.yaml --deposit "$REQUIRED_DEPOSIT_USD" --bid-wait 60 \

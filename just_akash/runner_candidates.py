@@ -25,7 +25,8 @@ and it is the reason a failure gets misread as "the marketplace had no capacity"
 
 Hence three markers, taken from the fleet's own curation file:
 
-    runner_host: true   PROVEN to bring the runner online (measured, ~30s)
+    preferred:   true   operator-owned/preferred auction tier
+    runner_host: true   PROVEN to bring the runner online (also preferred)
     runner_deny: true   leases but never schedules the runner pod — NEVER try it
     ci_only:     true   reputable third-party; fine for a throwaway CI runner,
                         never for customer workloads
@@ -109,14 +110,23 @@ def _normalise(entry, index: int) -> dict:
             f"providers[{index}].failover_priority must be an integer, got {prio!r}"
         ) from None
 
-    if entry.get("runner_host") and entry.get("runner_deny"):
+    if (entry.get("runner_host") or entry.get("preferred")) and entry.get("runner_deny"):
         # Contradictory markers must not be resolved silently — whichever way we
         # guessed would either strand the runner or discard a proven host.
-        raise ProviderSpecError(f"providers[{index}] ({addr}) is both runner_host and runner_deny")
+        raise ProviderSpecError(
+            f"providers[{index}] ({addr}) is preferred/runner_host and runner_deny"
+        )
+
+    # Old structured documents did not have a separate preference marker and
+    # used runner_host as the tier signal. Preserve that behavior only when the
+    # new marker is absent; an explicit preferred:false lets a proven third-party
+    # runner remain fallback-only.
+    preferred = bool(entry.get("preferred", entry.get("runner_host", False)))
 
     return {
         "address": addr,
         "runner_host": bool(entry.get("runner_host")),
+        "preferred": preferred,
         "runner_deny": bool(entry.get("runner_deny")),
         "ci_only": bool(entry.get("ci_only")),
         "failover_priority": prio,
@@ -140,7 +150,7 @@ def select_candidates(providers: list[dict]) -> tuple[list[dict], list[dict]]:
     ordered = sorted(
         usable,
         key=lambda p: (
-            not p.get("runner_host"),
+            not (p.get("preferred") or p.get("runner_host")),
             int(p.get("failover_priority", DEFAULT_PRIORITY)),
             p.get("address", ""),
         ),
@@ -219,12 +229,13 @@ def main(argv: list[str] | None = None) -> int:
 
     out = os.environ.get("GITHUB_OUTPUT")
     if args.github_output and out:
-        preferred = [p for p in ordered if p.get("runner_host")]
-        fallback = [p for p in ordered if not p.get("runner_host")]
+        preferred = [p for p in ordered if p.get("preferred")]
+        fallback = [p for p in ordered if not p.get("preferred")]
         with open(out, "a") as fh:
             fh.write("candidates=" + ",".join(p["address"] for p in ordered) + "\n")
             fh.write("preferred_candidates=" + ",".join(p["address"] for p in preferred) + "\n")
             fh.write("fallback_candidates=" + ",".join(p["address"] for p in fallback) + "\n")
+            fh.write("excluded_candidates=" + ",".join(p["address"] for p in denied) + "\n")
             fh.write(f"proven_hosts={proven_host_count(providers)}\n")
             fh.write(f"denied={len(denied)}\n")
 

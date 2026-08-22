@@ -245,7 +245,7 @@ def main():
         "--bid-wait-retry",
         type=int,
         default=120,
-        help="Deprecated compatibility option; ignored",
+        help="Total deadline for first-bid fallback after the preferred window",
     )
     deploy_p.add_argument(
         "--env",

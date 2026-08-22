@@ -15,6 +15,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   single preferred list did not enforce preference: a cheaper unproven bidder
   could still beat a proven runner host during the shared 60-second auction.
 
+### Changed
+
+- Adopt `akash-lease-core` v0.7.0's two-window contract: collect all preferred
+  bids for up to 60 seconds and select the cheapest preferred; if none bids,
+  continue only until the first eligible fallback arrives, bounded by
+  `--bid-wait-retry` (120 seconds total by default).
+- Structured runner provider specs now separate operator preference from
+  measured `runner_host` capability. `runner_deny` entries are removed before
+  either tier reaches the deploy command, and preferred/denied overlap is a
+  configuration error.
+
 ## [1.43.0] — 2026-08-22
 
 ### Changed
