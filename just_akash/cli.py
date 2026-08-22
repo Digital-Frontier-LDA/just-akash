@@ -1143,7 +1143,17 @@ def main():
                         str(r.get("dseq")),
                         owner,
                         deployment_state=str(r.get("deployment_state", "")),
-                        lease_count=int(r.get("lease_count", 0) or 0),
+                        # ACTIVE leases only. `lease_count` counts every lease on the
+                        # record INCLUDING closed ones, and a deployment whose lease
+                        # closed while the deployment stayed open is precisely the
+                        # orphan this scan exists to find — so passing the raw count
+                        # classified it LEASED and reported zero orphans. Measured
+                        # 2026-08-22: 26 deployments, no active lease, no open order,
+                        # $104.33 held for ~45h, and `akash_canary_orphans_total` read
+                        # 0 with `..._scan_degraded` 0 — a clean, complete, WRONG
+                        # all-clear of exactly the kind canary/orphans.py was written
+                        # to refuse.
+                        lease_count=int(r.get("active_lease_count", 0) or 0),
                         escrow_uact=int(r.get("escrow_remaining_uact", 0) or 0),
                     )
                 )

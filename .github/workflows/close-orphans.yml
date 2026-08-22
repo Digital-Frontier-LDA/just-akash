@@ -1,0 +1,76 @@
+name: Close orphaned deployments
+
+# Release escrow held by deployments that have no active lease and no open order.
+#
+# `cleanup-stale.yml` cannot do this and is not broken: an orphan has no lease, so no
+# provider, so the provider reports no services, so its classifier returns
+# `LEAVE-unclassifiable`. Measured 2026-08-22 across 84 active deployments — 26 orphans
+# holding $104.33, `stale (closable): 0`. This workflow is the operator-driven path for
+# exactly that set, and the ONLY one in the repo that can close a dseq you name.
+#
+# The key is why this has to run in CI at all: AKASH_API_KEY lives in secrets/ci.sops.env
+# and the age key that decrypts it is a GitHub secret, so an operator without SOPS_AGE_KEY
+# has no way to close a deployment locally. The wallet is Console-custodied — there is no
+# local signing key either.
+#
+# SAFETY IS IN THE MODULE, NOT IN THIS FILE. `close_orphans` re-verifies every dseq at
+# close time through `orphan_detect.classify_deployment` and closes only what comes back
+# `reapable` (ORPHANED + agreement from MIN_CONFIRMATIONS independent LCD endpoints). A
+# dseq that is leased, waiting on a bid, unreadable, or simply not in the active set is
+# reported and skipped. So a wrong entry in `dseqs` is a refusal, not somebody else's
+# outage — which matters on this account, because the wallet is shared (`just-akash-*`,
+# `dfci-infra-*` and `borduas` placements were all live on it on 2026-08-22).
+#
+# Dry-run by default. Dispatch once with execute=false, read the verdict table, then
+# dispatch again with execute=true and the SAME dseq list.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dseqs:
+        description: "Deployment(s) to close — comma or space separated. Required."
+        type: string
+        required: true
+      execute:
+        description: "Actually close the verified orphans (false = dry-run report)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Same group as cleanup-stale and the smoke/canary: all of them spend from ONE Console
+# wallet, a single Cosmos account whose sequence number cannot carry two transactions at
+# once. `cancel-in-progress: false` because cancelling a half-finished close is worse than
+# queueing behind one.
+concurrency:
+  group: akash-wallet
+  cancel-in-progress: false
+
+jobs:
+  close:
+    name: ${{ inputs.execute && 'Close verified orphans' || 'Dry-run orphan report' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: uv sync
+      - name: Load SOPS secrets
+        uses: ./.github/actions/sops-env
+        with:
+          age-key: ${{ secrets.SOPS_AGE_KEY }}
+      # The dseq list goes through the environment, not the command line, so a value
+      # containing shell metacharacters cannot reach the shell as syntax.
+      - name: Close orphans
+        env:
+          DSEQS: ${{ inputs.dseqs }}
+        run: |
+          uv run python -m just_akash.close_orphans \
+            --dseq "$DSEQS" ${{ inputs.execute && '--execute' || '' }}

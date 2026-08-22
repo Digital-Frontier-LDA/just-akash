@@ -972,6 +972,13 @@ def _reconcile_lease_row(d: dict[str, Any]) -> dict[str, Any]:
     ``deployment.state``, the (active) lease's ``state`` + ``provider``, and the escrow
     balance remaining (uact) — with a ``closeable`` flag.
 
+    Two lease counts, deliberately: ``lease_count`` is every lease on the record and
+    ``active_lease_count`` only those in state ``active``. They differ for a deployment
+    whose lease closed while the deployment itself stayed open — which holds escrow and
+    delivers nothing, i.e. the orphan case. A caller asking "is anything running here?"
+    wants the active count; only a caller asking "was there ever a lease?" wants the raw
+    one. See ``orphan_detect.classify_deployment``.
+
     ``closeable`` is True when the deployment or lease is in a terminal state, the escrow
     is closed/overdrawn, or the escrow has drained to zero uact. A healthy active/open
     deployment with funds left is never flagged. The escrow balance comes from
@@ -1012,10 +1019,13 @@ def _reconcile_lease_row(d: dict[str, Any]) -> dict[str, Any]:
         leases = []
     lease_state = None
     lease_count = 0
+    active_lease_count = 0
     for lease in leases:
         if not isinstance(lease, dict):
             continue
         lease_count += 1
+        if lease.get("state") == "active":
+            active_lease_count += 1
         if lease_state is None or lease.get("state") == "active":
             lease_state = lease.get("state")
     provider = _extract_lease_provider(d)
@@ -1031,6 +1041,7 @@ def _reconcile_lease_row(d: dict[str, Any]) -> dict[str, Any]:
         "deployment_state": dep_state,
         "lease_state": lease_state,
         "lease_count": lease_count,
+        "active_lease_count": active_lease_count,
         "provider": provider,
         "escrow_state": escrow_state,
         "escrow_remaining_uact": escrow_uact,

@@ -89,6 +89,28 @@ class TestReconcileLeaseRow:
         assert row["lease_count"] == 0
         assert row["provider"] is None
 
+    def test_closed_lease_does_not_count_as_active(self):
+        """The orphan case: the lease closed, the deployment did not.
+
+        `lease_count` counts every lease on the record, so it stays 1 here — and passing
+        THAT to `classify_deployment` returns LEASED and reports the fleet clean. This is
+        the field an orphan scan must read. Measured 2026-08-22: 26 such deployments held
+        $104.33 for ~45h while `akash_canary_orphans_total` read 0.
+        """
+        row = api._reconcile_lease_row(_dep("8", lease_state="closed"))
+        assert row["lease_count"] == 1
+        assert row["active_lease_count"] == 0
+
+    def test_active_lease_counts_as_active(self):
+        row = api._reconcile_lease_row(_dep("9", lease_state="active"))
+        assert row["lease_count"] == 1
+        assert row["active_lease_count"] == 1
+
+    def test_no_lease_counts_zero_both_ways(self):
+        row = api._reconcile_lease_row(_dep("10", lease_state=None))
+        assert row["lease_count"] == 0
+        assert row["active_lease_count"] == 0
+
     def test_only_uact_funds_counted(self):
         row = api._reconcile_lease_row(_dep("7", funds=(("uakt", "999"), ("uact", "10"))))
         assert row["escrow_remaining_uact"] == 10
