@@ -648,7 +648,12 @@ def deploy(
     if not math.isfinite(deposit) or deposit <= 0:
         raise RuntimeError(f"Invalid deposit {deposit!r}: must be a positive, finite USD amount.")
 
-    fallback_wait = max(0, bid_wait_retry - bid_wait)
+    if bid_wait_retry < bid_wait:
+        raise ValueError(
+            "bid_wait_retry is the total auction deadline and must be greater than "
+            "or equal to bid_wait"
+        )
+    fallback_wait = bid_wait_retry - bid_wait
     AuctionPolicy(
         collection_window_seconds=bid_wait,
         fallback_window_seconds=fallback_wait,
@@ -1177,12 +1182,10 @@ def deploy(
         f"STEP 5: Selection made via {selection_label}",
     )
     # Show a compact ranking of the tier from which the winner came.
-    if selection_phase == 3:
-        ranking_pool = _filter_tier(bids, "BACKUP")
-        ranking_label = "BACKUP"
-    elif has_allowlist:
-        ranking_pool = _filter_tier(bids, "PREFERRED")
-        ranking_label = "PREFERRED"
+    if has_allowlist:
+        winner_tier = _classify_bid(_extract_provider(selected_bid), preferred, backup)
+        ranking_pool = _filter_tier(bids, winner_tier)
+        ranking_label = winner_tier
     else:
         ranking_pool = [b for b in bids if isinstance(b, dict)]
         ranking_label = "ALL"

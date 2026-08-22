@@ -177,6 +177,8 @@ class TestBoundedTwoWindowSelection:
         out = capsys.readouterr().out
         assert "Cutting preferred-grace short" not in out
         assert "first eligible fallback after preferred window" in out
+        assert "BACKUP rank[1]" in out
+        assert "<-- SELECTED" in out
 
     @patch("just_akash.deploy.time")
     @patch("just_akash.deploy.AkashConsoleAPI")

@@ -261,7 +261,7 @@ uv run just-akash deploy \
 
 When `AKASH_PROVIDERS_BACKUP` is unset, deploy behaves identically to the
 single-tier allowlist (zero regression). With no allowlist at all (neither
-preferred nor backup), the cheapest bid from any provider wins.
+preferred nor backup), the first eligible bid at or after the preferred deadline wins.
 
 Each bid is tagged in the log as `[PREFERRED]`, `[BACKUP]`, or `[FOREIGN]`,
 and the selection log line records the shared policy version and decision reason.

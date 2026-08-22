@@ -78,6 +78,10 @@ class TestDeployMissingApiKey:
         with pytest.raises(RuntimeError, match="AKASH_API_KEY"):
             deploy(sdl_path=str(tmp_path / "fake.yaml"))
 
+    def test_rejects_total_deadline_shorter_than_preferred_window(self, tmp_path):
+        with pytest.raises(ValueError, match="total auction deadline"):
+            deploy(sdl_path=str(tmp_path / "fake.yaml"), bid_wait=60, bid_wait_retry=30)
+
 
 class TestDeploySdlNotFound:
     def test_raises_for_missing_sdl(self, monkeypatch):
