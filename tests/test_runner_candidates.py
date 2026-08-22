@@ -162,6 +162,11 @@ def test_a_typo_address_is_rejected_loudly():
         rc.parse_providers('[{"address":"aaksh1typo"}]')
 
 
+def test_non_bech32_payload_character_is_rejected():
+    with pytest.raises(rc.ProviderSpecError, match="Akash address"):
+        rc.parse_providers('[{"address":"akash1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]')
+
+
 @pytest.mark.parametrize("suffix", [",akash1injected", "\nakash1injected", " ", "-bad"])
 def test_provider_address_cannot_inject_an_extra_csv_candidate(suffix):
     """GitHub outputs are CSV; delimiters or controls in one JSON address must

@@ -55,7 +55,7 @@ import sys
 
 # Providers with no explicit ordering sort after those that have one.
 DEFAULT_PRIORITY = 10_000
-AKASH_ADDRESS_RE = re.compile(r"^akash1[0-9a-z]{38}$")
+AKASH_ADDRESS_RE = re.compile(r"^akash1[023456789acdefghjklmnpqrstuvwxyz]{38}$")
 
 
 class ProviderSpecError(ValueError):
