@@ -54,6 +54,19 @@ Properties (each pinned by a test in `tests/test_deploy.py`):
 - **Graceful degradation.** Preferred fully down → cheapest backup, no extra round trip.
 - **Zero regression.** No backup tier configured → behaves as the single-tier allowlist.
 
+## Wallet selection and ownership
+
+`wallet_pool.py` is the Console I/O adapter for the shared `akash-lease-core` wallet
+ranking contract. Create-time selection and later DSEQ routing are intentionally separate:
+
+1. **Create:** measure distinct accounts at a height-pinned LCD quorum and choose the
+   richest account above the requested deposit floor.
+2. **Operate/close:** query the configured pool and use the account that positively owns
+   the DSEQ. Never infer ownership from current balance or key position.
+
+This split prevents rotation-blind cleanup: a deployment created under wallet 2 cannot be
+closed under wallet 1 merely because wallet 1 later becomes the richest.
+
 Tiers come from env (`AKASH_PROVIDERS`, `AKASH_PROVIDERS_BACKUP`) or repeatable CLI
 flags (`--provider`, `--backup-provider`); CLI overrides env per-tier. With no
 allowlist at all, the cheapest bid from any provider wins. See `README.md` § Bid

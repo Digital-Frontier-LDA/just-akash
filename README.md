@@ -263,6 +263,36 @@ preferred nor backup), the cheapest bid from any provider wins.
 Each bid is tagged in the log as `[PREFERRED]`, `[BACKUP]`, or `[FOREIGN]`,
 and the selection log line records the shared policy version and decision reason.
 
+## Console wallet pool
+
+`AKASH_API_KEYS` enables native multi-wallet selection. Separate keys with newlines,
+commas, or semicolons; the existing `AKASH_API_KEY` remains a compatible single-key
+fallback and is included when both variables are set.
+
+For a new deployment, `just-akash` resolves the distinct Console accounts, reads their
+on-chain `spend_limits[uact]` at one height with a two-endpoint quorum, and chooses the
+richest account that can fund the requested deposit. A stale or height-unprovable LCD
+does not get a vote, and two keys resolving to one account count once.
+
+For commands against an existing DSEQ—including `status`, `update`, `exec`, and
+`destroy`—the CLI probes the configured pool and uses the account that positively reads
+that deployment. It never re-runs the richest-wallet decision for cleanup: balances can
+change after creation, and closing with a different account returns 404 while leaving
+escrow behind.
+
+```bash
+export AKASH_API_KEYS=$'key-for-wallet-a\nkey-for-wallet-b'
+just-akash deploy --sdl deploy.yml
+just-akash destroy --dseq 123456789 -y  # automatically finds the owning wallet
+```
+
+Independent concurrent CI runs can still choose the same richest account at once. The
+reusable runner workflow classifies and retries sequence contention, but GitHub
+concurrency groups are repository-scoped and cannot reserve a wallet across repositories.
+A future organization-level provisioning broker may add that reservation; native ranking
+remains the authoritative funding decision and DSEQ ownership remains authoritative for
+cleanup.
+
 ## Persistent provider canary
 
 The smoke test answers **"can I deploy right now?"** — it runs once a day and then

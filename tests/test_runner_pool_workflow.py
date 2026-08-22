@@ -470,10 +470,10 @@ def test_a_402_does_not_retry():
 def test_the_underfunded_message_says_it_is_not_a_ci_defect():
     """The whole point: an agent reading this must not 'fix' it by switching to paid
     runners, which is the cost this exists to remove."""
-    wallet = _step("Wallet")["run"]
-    assert "CI is not broken" in wallet
-    assert "bill" in wallet.lower() and "top up" in wallet.lower()
-    assert "::error title=" in wallet, "a step summary alone is missed in a red run"
+    provision = PROVISION["run"]
+    assert "No order was created" in provision
+    assert "Top up the wallet" in provision
+    assert "::error title=" in provision, "a step summary alone is missed in a red run"
 
 
 # --------------------------------------------------------------------------
@@ -780,14 +780,12 @@ def test_an_unreadable_listing_is_not_reported_as_a_clean_sweep():
     )
 
 
-def test_the_wallet_pool_selection_is_deterministic_not_random():
-    """A re-run of the same run MUST land on the same account. The teardown re-derives the
-    selection from the same run_id, so a random pick would close a lease from a wallet
-    that never opened it — a destroy that succeeds trivially, reports success, and leaves
-    the real lease holding escrow."""
-    code = _code(PROVISION["run"]) + _code(_step("Wallet")["run"])
-    assert "RUN_ID %" in code, "selection must be derived from run_id"
-    assert "RANDOM" not in _code(_step("Wallet")["run"]), "a random wallet cannot be torn down"
+def test_wallet_policy_is_not_reimplemented_in_workflow_shell():
+    """Balance ranking and DSEQ ownership belong to just-akash, not copied shell."""
+    code = _code(PROVISION["run"]) + _code(TD_CLOSE["run"])
+    assert "RUN_ID %" not in code
+    assert "mapfile -t KEYS" not in code
+    assert "richest funded account" in PROVISION["run"]
 
 
 def test_the_wallet_key_never_leaves_via_an_output():
@@ -798,100 +796,38 @@ def test_the_wallet_key_never_leaves_via_an_output():
     assert "wallet_address" in OUTPUTS and "wallet_index" in OUTPUTS
 
 
-def test_both_steps_select_the_same_wallet():
-    """Steps do not share a shell, so the export cannot survive. Both the balance check
-    and the provision step must apply the SAME rule, or the pool would check one
-    account's credit and then deploy from another."""
-    wallet = _code(_step("Wallet")["run"])
-    prov = _code(PROVISION["run"])
-    for body, who in ((wallet, "wallet"), (prov, "provision")):
-        assert "AKASH_API_KEYS" in body, f"{who}: does not consult the pool"
-        assert "RUN_ID % " in body.replace("$(( ", "").replace("${#KEYS[@]} ))", ""), who
+def test_pool_and_teardown_pass_the_complete_wallet_pool_to_just_akash():
+    assert PROVISION["env"]["AKASH_API_KEYS"]
+    assert TD_CLOSE["env"]["AKASH_API_KEYS"]
+    assert '"${JA[@]}" deploy' in _code(PROVISION["run"])
+    assert '"${JA[@]}" destroy --dseq "$DSEQ"' in _code(TD_CLOSE["run"])
+
+
+def test_required_deposit_drives_native_wallet_funding_floor():
+    assert PROVISION["env"]["REQUIRED_DEPOSIT_USD"] == "${{ inputs.required-deposit-usd }}"
+    assert '--deposit "$REQUIRED_DEPOSIT_USD"' in _code(PROVISION["run"])
 
 
 def test_a_single_key_behaves_exactly_as_before():
     """AKASH_API_KEYS is optional. An empty pool must fall through to AKASH_API_KEY with
     no change in behaviour, or adding the input would break every existing caller."""
-    for body in (_code(_step("Wallet")["run"]), _code(PROVISION["run"])):
-        assert 'KEYS[@]}" -gt 0' in body or '${#KEYS[@]}" -gt 0' in body, (
-            "the pool path must be conditional on the pool being non-empty"
-        )
     assert INPUTS.get("providers") is not None  # sanity: we are reading the right doc
     assert CALL["secrets"]["AKASH_API_KEYS"]["required"] is False
+    assert CALL["secrets"]["AKASH_API_KEY"]["required"] is True
 
 
-def test_the_teardown_refuses_a_wallet_mismatch_rather_than_closing_nothing():
-    """A destroy from an account that does not own the lease SUCCEEDS TRIVIALLY. Reporting
-    that as a close is the silent escrow leak this workflow exists to prevent."""
+def test_teardown_routes_by_dseq_instead_of_wallet_position():
+    """The CLI must receive the DSEQ and full pool; it resolves the owner internally."""
     body = TD_CLOSE["run"]
-    assert "closed=refused-wrong-wallet" in body
-    assert body.index("WANT_ADDR") < body.index('"${JA[@]}" destroy'), (
-        "the wallet must be checked BEFORE anything is destroyed"
-    )
+    assert "positively reads" in body
+    assert '"${JA[@]}" destroy --dseq "$DSEQ"' in body
+    assert "WANT_ADDR" not in body
 
 
-def test_a_wallet_pool_without_an_address_is_refused_not_silently_unchecked():
-    """The bypass. The mismatch assertion only runs when `wallet-address` is set, so a
-    caller who passes AKASH_API_KEYS and forgets it opts out of the one check standing
-    between a mismatched key set and a destroy that closes nothing — silently, and in the
-    exact configuration the check exists for."""
-    body = TD_CLOSE["run"]
-    assert "closed=refused-unverifiable" in body
-    assert body.index("refused-unverifiable") < body.index('"${JA[@]}" destroy'), (
-        "an unverifiable pool must be refused BEFORE anything is destroyed"
-    )
-
-
-def _wallet_selection_bodies() -> list[tuple[str, str]]:
-    """(label, code) for every place a wallet is selected.
-
-    NAMED and asserted present, never skipped. An earlier form of these guards did
-    `if "AKASH_API_KEYS" not in body: continue`, so a regression that REMOVED selection
-    from a step made the guard pass by skipping it — the exact shape of a test that
-    reports safety it never checked.
-    """
-    bodies = [
-        ("pool:wallet", _code(_step("Wallet")["run"])),
-        ("pool:provision", _code(PROVISION["run"])),
-        ("teardown:close", _code(TD_CLOSE["run"])),
-    ]
-    for label, body in bodies:
-        assert "AKASH_API_KEYS" in body, (
-            f"{label} no longer selects a wallet — the pool is not applied there, and "
-            f"skipping it here would have hidden that"
-        )
-    return bodies
-
-
-def test_duplicate_keys_are_collapsed_before_selection():
-    """Selection is `run_id % N`. If the same key appears twice, two of the N slots are
-    the SAME Cosmos account, so runs landing on them contend on one sequence number
-    exactly as before — while the operator believes they have N independent wallets. The
-    failure is invisible: more wallets configured, same contention.
-
-    Not exotic either. The org's keys live as AKASH_CONSOLE / AKASH_CONSOLE_2..9 and the
-    sibling repo carries a regression test for one key appearing under two variables."""
-    for label, body in _wallet_selection_bodies():
-        assert "seen[$0]++" in body, (
-            f"{label}: duplicate keys must collapse, or N slots are not N accounts"
-        )
-
-
-def test_commas_and_semicolons_separate_keys_too():
-    """A single AKASH_CONSOLE* variable may itself hold a comma- or semicolon-separated
-    list, so a caller pasting one must not have it read as one absurdly long key."""
-    for label, body in _wallet_selection_bodies():
-        assert "tr ',;'" in body, f"{label}: newline cannot be the only separator"
-
-
-def test_every_wallet_selection_strips_carriage_returns():
-    """A multi-line GitHub secret pasted from Windows carries CRLF, and mapfile keeps the
-    trailing \r on every key — producing a credential that looks correct in the log and is
-    rejected by the API. All three selection sites must strip it."""
-    for label, body in _wallet_selection_bodies():
-        assert "mapfile" in body, label
-        m = body[body.index("mapfile") : body.index("mapfile") + 400]
-        assert "tr -d" in m, f"{label}: keys must be stripped of CR before use"
+def test_wallet_address_is_optional_compatibility_data_not_a_safety_dependency():
+    td_call = (TD.get("on") or TD.get(True))["workflow_call"]
+    assert td_call["inputs"]["wallet-address"]["required"] is False
+    assert "Deprecated compatibility" in td_call["inputs"]["wallet-address"]["description"]
 
 
 def test_teardown_does_not_claim_an_ownership_check_it_cannot_perform():

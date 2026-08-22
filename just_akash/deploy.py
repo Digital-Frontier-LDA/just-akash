@@ -635,13 +635,6 @@ def deploy(
     backup_providers: list[str] | None = None,
     deposit: float = 5.0,
 ) -> dict:
-    api_key = os.environ.get("AKASH_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "AKASH_API_KEY environment variable not set. "
-            "Please set your API key: export AKASH_API_KEY='your-key'"
-        )
-
     # deposit is user-controlled (--deposit); reject non-finite/non-positive
     # values before they reach json.dumps (which would emit invalid NaN/Infinity).
     if not math.isfinite(deposit) or deposit <= 0:
@@ -652,7 +645,18 @@ def deploy(
     # intentionally gone: one bounded window now governs every deployment path.
     AuctionPolicy(collection_window_seconds=bid_wait)
 
-    client = AkashConsoleAPI(api_key)
+    from .wallet_pool import select_client_for_create
+
+    required_uact = math.ceil(deposit * 1_000_000)
+    wallet = select_client_for_create(required_uact, client_factory=AkashConsoleAPI)
+    client = wallet.client
+    if wallet.configured_keys > 1:
+        _log(
+            logging.INFO,
+            f"WALLET policy={wallet.policy_version} selected_account={wallet.account} "
+            f"available_uact={wallet.available_uact} distinct_accounts="
+            f"{wallet.distinct_accounts}/{wallet.configured_keys}",
+        )
 
     preferred = _resolve_tier(preferred_providers, "AKASH_PROVIDERS")
     backup = _resolve_tier(backup_providers, "AKASH_PROVIDERS_BACKUP")
@@ -1491,6 +1495,10 @@ def deploy(
     print(f"  DSEQ: {dseq}")
     print(f"  Provider: {provider}")
     print(f"  Price: {price_amount} {price_denom}")
+    if wallet.account:
+        print(f"  Wallet: {wallet.account}")
+    if wallet.available_uact is not None:
+        print(f"  Wallet available: {wallet.available_uact} uact")
     print(f"\nUse 'just-akash status --dseq {dseq}' to check deployment status")
 
     return {
@@ -1499,6 +1507,8 @@ def deploy(
         "price": price_amount,
         "price_denom": price_denom,
         "lease": lease_response,
+        "wallet_account": wallet.account,
+        "wallet_policy": wallet.policy_version,
     }
 
 
@@ -1507,6 +1517,7 @@ def update(
     sdl_path: str,
     image: str | None = None,
     env_vars: list[str] | None = None,
+    api_key: str | None = None,
 ) -> dict:
     """Update an active deployment in place with a revised SDL.
 
@@ -1514,7 +1525,7 @@ def update(
     overrides) then PUTs to the Console API. The DSEQ and existing lease are
     preserved — no re-bid or new lease is created.
     """
-    api_key = os.environ.get("AKASH_API_KEY")
+    api_key = api_key or os.environ.get("AKASH_API_KEY")
     if not api_key:
         raise RuntimeError(
             "AKASH_API_KEY environment variable not set. "
