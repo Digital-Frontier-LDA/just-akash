@@ -98,7 +98,20 @@ def test_dseq_operations_use_the_owner_not_the_richest_wallet(monkeypatch):
     monkeypatch.delenv("AKASH_API_KEY", raising=False)
     clients = {key: MagicMock(api_key=key) for key in ("rich", "owner")}
     clients["rich"].get_deployment.side_effect = RuntimeError("API Error (404): not yours")
-    clients["owner"].get_deployment.return_value = {"deployment": {"dseq": "123"}}
+    clients["owner"].get_deployment.return_value = {"deployment": {"id": {"dseq": "123"}}}
+
+    client = select_client_for_dseq("123", client_factory=lambda key: clients[key])
+
+    assert client is clients["owner"]
+
+
+def test_dseq_owner_requires_positive_matching_identity(monkeypatch):
+    monkeypatch.setenv("AKASH_API_KEYS", "empty,wrong,owner")
+    monkeypatch.delenv("AKASH_API_KEY", raising=False)
+    clients = {key: MagicMock(api_key=key) for key in ("empty", "wrong", "owner")}
+    clients["empty"].get_deployment.return_value = {}
+    clients["wrong"].get_deployment.return_value = {"deployment": {"id": {"dseq": "999"}}}
+    clients["owner"].get_deployment.return_value = {"dseq": "123"}
 
     client = select_client_for_dseq("123", client_factory=lambda key: clients[key])
 

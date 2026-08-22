@@ -15,7 +15,7 @@ from decimal import Decimal
 from akash_lease_core import WalletCandidate, WalletPolicy, rank_wallets
 
 from . import chain
-from .api import AkashConsoleAPI
+from .api import AkashConsoleAPI, _extract_dseq
 
 
 @dataclass(frozen=True)
@@ -199,7 +199,7 @@ def select_client_for_dseq(
             deployment = client.get_deployment(str(dseq))
         except RuntimeError:
             continue
-        if isinstance(deployment, dict):
+        if isinstance(deployment, dict) and _extract_dseq(deployment) == str(dseq):
             return client
     raise RuntimeError(
         f"deployment {dseq} was not readable under any of {len(keys)} configured Console wallets"
