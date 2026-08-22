@@ -262,19 +262,35 @@ def classify_deployment(
         lease_readings = list(pool.map(lambda b: active_leases_for(dseq, owner, b), endpoints))
 
     answered_leases = [r for r in lease_readings if r is not None]
-    if not answered_leases:
+    # "No lease" has to be CONFIRMED, not merely read once — this gate is the only thing
+    # standing between the classifier and closing a running workload, and the module's own
+    # rule is that a verdict from one endpoint is a reading. Without this floor a
+    # deployment could reach `reapable` on two ORDER confirmations while just one endpoint
+    # had managed to answer "no lease".
+    #
+    # Capped at the number of endpoints actually configured so a single-endpoint setup
+    # degrades to UNKNOWN rather than becoming unsatisfiable — it still cannot reap,
+    # because `reapable` independently requires MIN_CONFIRMATIONS.
+    needed = min(MIN_CONFIRMATIONS, len(endpoints))
+    if len(answered_leases) < needed:
         if console_lease_count > 0:
             return DeploymentVerdict(
                 dseq=dseq,
                 classification=Classification.LEASED,
                 escrow_uact=escrow_uact,
-                detail="lease query unread on every endpoint; Console reports a lease",
+                detail=(
+                    f"lease query answered by {len(answered_leases)} of {needed} required "
+                    "endpoint(s); Console reports a lease"
+                ),
             )
         return DeploymentVerdict(
             dseq=dseq,
             classification=Classification.UNKNOWN,
             escrow_uact=escrow_uact,
-            detail="no endpoint answered the lease query — unread, not orphaned",
+            detail=(
+                f"lease query answered by only {len(answered_leases)} of {needed} required "
+                "endpoint(s) — unread, not orphaned"
+            ),
         )
 
     # Trust the POSITIVE, exactly as the order check below does. A node that sees an active

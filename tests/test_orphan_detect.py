@@ -346,3 +346,37 @@ class TestActiveLeasesFor:
         active_leases_for("77", OWNER, "b")
         assert "filters.state=active" in seen["path"]
         assert "filters.dseq=77" in seen["path"]
+
+
+class TestLeaseGateNeedsConfirmation:
+    """ "No lease" read once is a reading, not a confirmation.
+
+    Without a floor here a deployment could reach `reapable` on two ORDER confirmations
+    while only one endpoint had answered the lease query — and the lease gate is the only
+    thing preventing a close of something still running.
+    """
+
+    def test_single_lease_answer_across_three_endpoints_is_UNKNOWN(self, monkeypatch):
+        v = _classify(
+            monkeypatch, [0, 0, 0], lease_readings=[0, None, None], console_lease_count=0
+        )
+        assert v.classification is Classification.UNKNOWN
+        assert v.reapable is False
+
+    def test_two_lease_answers_across_three_endpoints_is_enough(self, monkeypatch):
+        v = _classify(monkeypatch, [0, 0, 0], lease_readings=[0, 0, None], console_lease_count=0)
+        assert v.classification is Classification.ORPHANED
+        assert v.reapable is True
+
+    def test_thin_lease_evidence_still_defers_to_console_in_the_safe_direction(self, monkeypatch):
+        v = _classify(
+            monkeypatch, [0, 0, 0], lease_readings=[0, None, None], console_lease_count=1
+        )
+        assert v.classification is Classification.LEASED
+        assert v.reapable is False
+
+    def test_single_endpoint_setup_degrades_to_a_reading_not_a_reap(self, monkeypatch):
+        """One configured endpoint answering is not unsatisfiable — but cannot reap."""
+        v = _classify(monkeypatch, [0], lease_readings=[0], console_lease_count=0)
+        assert v.classification is Classification.ORPHANED
+        assert v.reapable is False  # MIN_CONFIRMATIONS still unmet on the order check
