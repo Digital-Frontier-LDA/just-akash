@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.43.0] — 2026-08-22
+
+### Changed
+
+- **Every normal deployment now gives bidders one equal-opportunity window before choosing a provider.** The former three-phase path could accept a preferred provider during a first-wins grace phase, so an early Sofia or Helsinki bid could pre-empt a cheaper Lisbon bid that arrived within the intended grace period. `deploy` now collects for one bounded window (`--bid-wait`, default and maximum 60 seconds), then delegates the decision to `akash-lease-core` v0.5.0: cheapest open preferred bid when one exists, otherwise cheapest open eligible fallback. `--bid-wait-retry` remains accepted for command-line compatibility but no longer creates a second selection phase.
+- **Provider-auction semantics are no longer owned by this repository.** `just-akash` now pins the immutable `akash-lease-core` v0.5.0 release wheel and acts as its Console/clock/workflow adapter. The same core contract can therefore govern DigitalFrontier-infra's Console and wallet paths without copying the winner-selection algorithm.
+
 ## [1.42.0] — 2026-07-28
 
 ### Added

@@ -203,13 +203,13 @@ def main():
         "--bid-wait",
         type=int,
         default=60,
-        help="Phase 1 (preferred-only) window seconds (default: 60)",
+        help="Equal-opportunity auction window, 0-60 seconds (default: 60)",
     )
     deploy_p.add_argument(
         "--bid-wait-retry",
         type=int,
         default=120,
-        help="Phase 2 (preferred-grace) window seconds (default: 120)",
+        help="Deprecated compatibility option; ignored",
     )
     deploy_p.add_argument(
         "--env",

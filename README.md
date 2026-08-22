@@ -218,21 +218,28 @@ just inject 12345 .env.secrets ssh      # force SSH
 
 ## Bid Selection
 
-Deployments use a three-phase tiered bid-selection state machine. Bids stream
-in from `t=0` regardless of tier (Akash's auction is open; the tier is a
-client-side filter).
+Deployments use one bounded equal-opportunity bid window. Bids stream from
+`t=0` regardless of tier (Akash's auction is open; tiers are a client-side
+eligibility policy). `--bid-wait` configures the complete window from 0 to 60
+seconds and defaults to 60.
 
-| Phase | Window | Behavior on bid arrival | Decision at window end |
-|---|---|---|---|
-| 1. Preferred-only patience | `[0, T1]` (`--bid-wait`, default 60s) | Collect all bids; do not select yet | If any **preferred** bid collected → pick **cheapest preferred** and stop |
-| 2. Preferred-grace | `[T1, T1+T2]` (`--bid-wait-retry`, default 120s) | Continue collecting; the moment a **preferred** bid appears, accept it **immediately** (first-wins) | If still no preferred → fall through |
-| 3. Backup fallback | end of phase 2 | — | Pick **cheapest backup** from bids collected across phases 1+2 |
+At the deadline:
+
+1. if any open preferred bid exists, select the cheapest preferred bid;
+2. otherwise select the cheapest open eligible backup bid;
+3. with no allowlist, select the cheapest open bid from any provider.
+
+The decision is implemented by the shared, sans-I/O `akash-lease-core` package,
+which is also consumed by Digital Frontier's Console and wallet deployment paths.
+`--bid-wait-retry` remains accepted for command-line compatibility but is ignored;
+there is no longer a second first-wins grace phase.
 
 Properties:
 
 - **Cheapest-when-healthy.** Preferred providers responsive → cheapest preferred wins.
-- **Bounded patience.** Preferred slow but alive → wait at most `T1+T2`, then snap to first preferred.
-- **Graceful degradation.** Preferred fully down → cheapest backup wins, no extra round trip.
+- **Equal opportunity.** An early bidder cannot pre-empt a cheaper provider arriving later in-window.
+- **Bounded patience.** Selection happens once, after no more than 60 seconds.
+- **Graceful degradation.** Preferred fully down → cheapest eligible backup wins at the same deadline.
 
 ### Tiered providers
 
@@ -254,7 +261,7 @@ single-tier allowlist (zero regression). With no allowlist at all (neither
 preferred nor backup), the cheapest bid from any provider wins.
 
 Each bid is tagged in the log as `[PREFERRED]`, `[BACKUP]`, or `[FOREIGN]`,
-and the selection log line names which phase chose the winner.
+and the selection log line records the shared policy version and decision reason.
 
 ## Persistent provider canary
 

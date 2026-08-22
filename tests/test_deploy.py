@@ -493,13 +493,13 @@ class TestLogBidTableTierTags:
         assert "[ACCEPTED]" not in captured.out
 
 
-class TestPhase2NoAllowlist:
+class TestLateArrivalWithinWindowNoAllowlist:
     """No allowlist + no bids in phase 1 + bid arrives in phase 2 → phase-2
     selection branch (the no-allowlist mirror of phase 2 grace)."""
 
     @patch("just_akash.deploy.time")
     @patch("just_akash.deploy.AkashConsoleAPI")
-    def test_no_allowlist_phase2_selects_first_bid(
+    def test_no_allowlist_selects_bid_arriving_late_in_window(
         self, MockAPI, mock_time, tmp_path, monkeypatch
     ):
         monkeypatch.setenv("AKASH_API_KEY", "test-key")
@@ -511,13 +511,12 @@ class TestPhase2NoAllowlist:
         client = MockAPI.return_value
         client.create_deployment.return_value = {"dseq": "12345", "manifest": "abc"}
 
-        # Force phase 1 to be entirely empty so phase 2 grace selects.
+        # The bid appears late, but still inside the one collection window.
         call_count = [0]
 
         def bids_side(dseq):
             call_count[0] += 1
-            # Phase 1 polls (~5 calls) all empty.
-            if call_count[0] <= 6:
+            if call_count[0] <= 3:
                 return []
             return [_make_bid("akash1late", 42)]
 
@@ -565,15 +564,13 @@ class TestPhase1CheapestPreferred:
         assert result["price"] == 90.0
 
 
-class TestPhase2GraceFirstPreferred:
+class TestPreferredArrivesLateWithinWindow:
     @patch("just_akash.deploy.time")
     @patch("just_akash.deploy.AkashConsoleAPI")
-    def test_first_preferred_in_phase2_wins_over_existing_backup(
+    def test_late_preferred_wins_over_existing_backup(
         self, MockAPI, mock_time, tmp_path, monkeypatch
     ):
-        """AC: when no preferred in phase 1 but a preferred arrives in phase 2,
-        accept it immediately even if a cheaper backup already bid in phase 1.
-        """
+        """A preferred arriving before the deadline beats a cheaper fallback."""
         monkeypatch.setenv("AKASH_API_KEY", "test-key")
         monkeypatch.setenv("AKASH_PROVIDERS", "akash1pref")
         monkeypatch.setenv("AKASH_PROVIDERS_BACKUP", "akash1back")
@@ -583,13 +580,12 @@ class TestPhase2GraceFirstPreferred:
         client = MockAPI.return_value
         client.create_deployment.return_value = {"dseq": "12345", "manifest": "abc"}
 
-        # First several polls (phase 1): only a cheap backup is present.
-        # Later polls (phase 2): a more expensive preferred arrives.
+        # Early polls: only a cheap backup. A preferred arrives later in-window.
         call_count = [0]
 
         def bids_side(dseq):
             call_count[0] += 1
-            if call_count[0] <= 5:
+            if call_count[0] <= 3:
                 return [_make_bid("akash1back", 40)]
             return [
                 _make_bid("akash1back", 40),
@@ -929,13 +925,12 @@ class TestStaleDeploymentRecovery:
             deploy(sdl_path=str(sdl_file))
 
 
-class TestPhase2NonDictBidSkipped:
-    """Phase-2 grace iterates incoming bids; defensive guard skips non-dict
-    entries when checking for a preferred bid (line 281)."""
+class TestLateNonDictBidSkipped:
+    """The final snapshot defensively ignores non-dict entries."""
 
     @patch("just_akash.deploy.time")
     @patch("just_akash.deploy.AkashConsoleAPI")
-    def test_non_dict_in_phase2_then_preferred_arrives(
+    def test_non_dict_then_preferred_arrives_within_window(
         self, MockAPI, mock_time, tmp_path, monkeypatch
     ):
         monkeypatch.setenv("AKASH_API_KEY", "test-key")
@@ -947,13 +942,12 @@ class TestPhase2NonDictBidSkipped:
         client = MockAPI.return_value
         client.create_deployment.return_value = {"dseq": "12345", "manifest": "abc"}
 
-        # Phase 1: only backup (forces phase 2).
-        # Phase 2: non-dict + preferred bid (defensive skip path then accept).
+        # A later in-window snapshot contains a non-dict entry and a preferred bid.
         call_count = [0]
 
         def bids_side(dseq):
             call_count[0] += 1
-            if call_count[0] <= 5:
+            if call_count[0] <= 3:
                 return [_make_bid("akash1back", 40)]
             return [
                 None,
@@ -1229,15 +1223,12 @@ class TestBackupOnlyAllowlistAcceptsBackupBid:
         assert result["price"] == 75.0
 
 
-class TestPhase2SimultaneousPreferredAndBackup:
-    """In phase 2, a single poll reveals BOTH a new preferred AND a new
-    backup. Preferred MUST win immediately (first-wins on PREFERRED, not on
-    'any new bid'). If the early-exit predicate accidentally treats backup
-    as terminal, this would break."""
+class TestSimultaneousPreferredAndBackupWithinWindow:
+    """A snapshot before the deadline reveals preferred and fallback together."""
 
     @patch("just_akash.deploy.time")
     @patch("just_akash.deploy.AkashConsoleAPI")
-    def test_simultaneous_arrival_in_phase2_preferred_wins(
+    def test_simultaneous_arrival_within_window_preferred_wins(
         self, MockAPI, mock_time, tmp_path, monkeypatch
     ):
         monkeypatch.setenv("AKASH_API_KEY", "test-key")
@@ -1253,10 +1244,10 @@ class TestPhase2SimultaneousPreferredAndBackup:
 
         def bids_side(dseq):
             call_count[0] += 1
-            # Phase 1: nothing at all (forces phase 2).
-            if call_count[0] <= 5:
+            # Nothing at first; both bids appear before the window closes.
+            if call_count[0] <= 3:
                 return []
-            # Phase 2: same poll surfaces preferred AND backup. The cheaper
+            # The same poll surfaces preferred AND backup. The cheaper
             # bid is the backup, but tier rules say preferred wins.
             return [
                 _make_bid("akash1back", 5),
