@@ -231,6 +231,37 @@ def deploy_credit(address: str) -> dict[str, int]:
     return totals
 
 
+def granted_uact(
+    address: str, *, quorum: tuple[str, ...] | None = None, height: int | None = None
+) -> int | None:
+    """Canonical uact accessor for callers that need an explicit quorum contract.
+
+    ``deploy_credit`` remains the backwards-compatible rich result. This narrow API
+    returns only plural ``spend_limits[uact]`` and never converts an unreadable grant
+    into zero. The optional arguments are retained as the integration seam for the
+    pinned-height reader used by CI selectors.
+    """
+    del height  # the legacy rich reader is still used until the transport seam lands
+    bases = list(quorum or tuple(rest_urls()))
+    if not bases:
+        return None
+    readings: list[int] = []
+    for base in bases:
+        try:
+            value = _sum_deposit_grants(
+                _lcd_get(f"/cosmos/authz/v1beta1/grants/grantee/{address}", base=base)
+            ).get("uact")
+        except RuntimeError:
+            continue
+        if value is not None:
+            readings.append(value)
+    if not readings:
+        return None
+    counts = {value: readings.count(value) for value in set(readings)}
+    agreeing = [value for value, count in counts.items() if count >= 2]
+    return max(agreeing) if agreeing else None
+
+
 def _sum_deposit_grants(data: dict[str, Any]) -> dict[str, int]:
     """Sum uact spend_limits across DepositAuthorization grants in one LCD payload."""
     totals: dict[str, int] = {}
