@@ -13,10 +13,10 @@ import pytest
 
 from just_akash.orphan_detect import (
     MIN_CONFIRMATIONS,
-    active_leases_for,
     Classification,
     DeploymentVerdict,
     FleetReport,
+    active_leases_for,
     classify_deployment,
     enumeration_is_complete,
     live_orders_for,
@@ -123,9 +123,7 @@ def test_a_non_active_deployment_is_UNKNOWN_not_orphaned(monkeypatch):
 
 
 def test_no_endpoints_configured_is_UNKNOWN():
-    v = classify_deployment(
-        "1", OWNER, deployment_state="active", console_lease_count=0, bases=[]
-    )
+    v = classify_deployment("1", OWNER, deployment_state="active", console_lease_count=0, bases=[])
     assert v.classification is Classification.UNKNOWN
 
 
@@ -287,17 +285,13 @@ class TestLeaseStateComesFromTheChain:
         v = _classify(monkeypatch, [0, 0, 0], lease_readings=[0, 0, 2], console_lease_count=0)
         assert v.classification is Classification.LEASED
 
-    def test_unreadable_lease_query_falls_back_to_console_in_the_safe_direction(
-        self, monkeypatch
-    ):
+    def test_unreadable_lease_query_falls_back_to_console_in_the_safe_direction(self, monkeypatch):
         """Chain unreadable + Console says leased -> LEASED, never orphan."""
         v = _classify(monkeypatch, [0, 0], lease_readings=[None, None], console_lease_count=1)
         assert v.classification is Classification.LEASED
         assert v.reapable is False
 
-    def test_unreadable_lease_query_with_no_console_lease_is_UNKNOWN_not_orphan(
-        self, monkeypatch
-    ):
+    def test_unreadable_lease_query_with_no_console_lease_is_UNKNOWN_not_orphan(self, monkeypatch):
         """Absence of evidence is not evidence of absence — the module's whole premise."""
         v = _classify(monkeypatch, [0, 0], lease_readings=[None, None], console_lease_count=0)
         assert v.classification is Classification.UNKNOWN
