@@ -13,6 +13,7 @@ import pytest
 
 from just_akash.orphan_detect import (
     MIN_CONFIRMATIONS,
+    active_leases_for,
     Classification,
     DeploymentVerdict,
     FleetReport,
@@ -24,12 +25,24 @@ from just_akash.orphan_detect import (
 OWNER = "akash14n4rkmz64rn0tey0r5g07l8q5x0fh2h4hu44kt"
 
 
-def _classify(monkeypatch, readings, **kw):
-    """Drive classify_deployment with a fixed reading per endpoint."""
+def _classify(monkeypatch, readings, lease_readings=None, **kw):
+    """Drive classify_deployment with a fixed order reading per endpoint.
+
+    `lease_readings` is the per-endpoint ACTIVE-LEASE count and defaults to 0 everywhere,
+    i.e. "the chain says nothing is leased" — the precondition for every order-based case
+    below. Pass it explicitly to exercise the lease gate itself. It must be stubbed rather
+    than left live: the bases here are "0", "1", ... not URLs, so a real call would fail to
+    a None reading and every test would collapse to UNKNOWN.
+    """
     seq = list(readings)
+    lseq = list(lease_readings) if lease_readings is not None else [0] * len(seq)
     monkeypatch.setattr(
         "just_akash.orphan_detect.live_orders_for",
         lambda dseq, owner, base: seq[int(base)],
+    )
+    monkeypatch.setattr(
+        "just_akash.orphan_detect.active_leases_for",
+        lambda dseq, owner, base: lseq[int(base)],
     )
     # Explicit parameters, not a **kwargs splat: a dict[str, object] defeats the type
     # checker, and suppressing that would hide a real signature mismatch later.
@@ -37,7 +50,7 @@ def _classify(monkeypatch, readings, **kw):
         "1",
         OWNER,
         deployment_state=str(kw.get("deployment_state", "active")),
-        lease_count=int(kw.get("lease_count", 0)),
+        console_lease_count=int(kw.get("console_lease_count", 0)),
         escrow_uact=int(kw.get("escrow_uact", 5_000_000)),
         bases=[str(i) for i in range(len(seq))],
     )
@@ -110,7 +123,9 @@ def test_a_non_active_deployment_is_UNKNOWN_not_orphaned(monkeypatch):
 
 
 def test_no_endpoints_configured_is_UNKNOWN():
-    v = classify_deployment("1", OWNER, deployment_state="active", lease_count=0, bases=[])
+    v = classify_deployment(
+        "1", OWNER, deployment_state="active", console_lease_count=0, bases=[]
+    )
     assert v.classification is Classification.UNKNOWN
 
 
@@ -244,3 +259,96 @@ def test_a_degraded_scan_does_not_exit_zero():
         src.index('args.command == "orphan-scan"') : src.index('args.command == "lease-status"')
     ]
     assert "if report.is_degraded:" in block and "sys.exit(1)" in block
+
+
+# --------------------------------------------------------------------------
+# The lease half must come from the CHAIN, not from Console
+#
+# Measured 2026-08-22: the Console API reported leases as `active` that the chain said
+# were `closed`, and gave different answers four minutes apart for the same 9 dseqs
+# (9 ORPHANED, then 2 ORPHANED / 7 LEASED) while the chain said no active lease for any
+# of them on both reads. `console_lease_count` used to gate this function before it made
+# a single chain call, so a real orphan read as healthy at random.
+# --------------------------------------------------------------------------
+class TestLeaseStateComesFromTheChain:
+    def test_console_says_leased_but_chain_says_no_lease_is_still_an_orphan(self, monkeypatch):
+        """The exact production false-negative: Console lies, the chain does not."""
+        v = _classify(monkeypatch, [0, 0], lease_readings=[0, 0], console_lease_count=1)
+        assert v.classification is Classification.ORPHANED
+        assert v.reapable is True
+
+    def test_chain_says_leased_wins_even_when_console_says_nothing(self, monkeypatch):
+        """Trust the positive. Never close something an endpoint reports as running."""
+        v = _classify(monkeypatch, [0, 0], lease_readings=[1, 0], console_lease_count=0)
+        assert v.classification is Classification.LEASED
+        assert v.reapable is False
+
+    def test_one_endpoint_seeing_a_lease_is_enough_to_refuse(self, monkeypatch):
+        v = _classify(monkeypatch, [0, 0, 0], lease_readings=[0, 0, 2], console_lease_count=0)
+        assert v.classification is Classification.LEASED
+
+    def test_unreadable_lease_query_falls_back_to_console_in_the_safe_direction(
+        self, monkeypatch
+    ):
+        """Chain unreadable + Console says leased -> LEASED, never orphan."""
+        v = _classify(monkeypatch, [0, 0], lease_readings=[None, None], console_lease_count=1)
+        assert v.classification is Classification.LEASED
+        assert v.reapable is False
+
+    def test_unreadable_lease_query_with_no_console_lease_is_UNKNOWN_not_orphan(
+        self, monkeypatch
+    ):
+        """Absence of evidence is not evidence of absence — the module's whole premise."""
+        v = _classify(monkeypatch, [0, 0], lease_readings=[None, None], console_lease_count=0)
+        assert v.classification is Classification.UNKNOWN
+        assert v.reapable is False
+
+    def test_a_live_order_still_beats_orphan_once_the_lease_gate_passes(self, monkeypatch):
+        """The order check must still run after the lease check clears."""
+        v = _classify(monkeypatch, [1, 0], lease_readings=[0, 0], console_lease_count=0)
+        assert v.classification is Classification.WAITING
+
+    def test_no_endpoints_and_console_says_leased_refuses_rather_than_UNKNOWN(self):
+        v = classify_deployment(
+            "1", OWNER, deployment_state="active", console_lease_count=1, bases=[]
+        )
+        assert v.classification is Classification.LEASED
+        assert v.reapable is False
+
+
+class TestActiveLeasesFor:
+    def test_counts_only_active_leases(self, monkeypatch):
+        payload = {
+            "leases": [
+                {"lease": {"state": "active"}},
+                {"lease": {"state": "closed"}},
+                {"state": "active"},  # un-nested shape, some node versions
+            ]
+        }
+        monkeypatch.setattr("just_akash.orphan_detect._lcd_get", lambda p, base: payload)
+        assert active_leases_for("1", OWNER, "b") == 2
+
+    def test_read_failure_is_None_not_zero(self, monkeypatch):
+        def boom(p, base):
+            raise RuntimeError("endpoint down")
+
+        monkeypatch.setattr("just_akash.orphan_detect._lcd_get", boom)
+        assert active_leases_for("1", OWNER, "b") is None
+
+    def test_unparseable_payload_is_None_not_zero(self, monkeypatch):
+        monkeypatch.setattr(
+            "just_akash.orphan_detect._lcd_get", lambda p, base: {"leases": "nope"}
+        )
+        assert active_leases_for("1", OWNER, "b") is None
+
+    def test_query_filters_state_server_side(self, monkeypatch):
+        seen = {}
+
+        def capture(path, base):
+            seen["path"] = path
+            return {"leases": []}
+
+        monkeypatch.setattr("just_akash.orphan_detect._lcd_get", capture)
+        active_leases_for("77", OWNER, "b")
+        assert "filters.state=active" in seen["path"]
+        assert "filters.dseq=77" in seen["path"]

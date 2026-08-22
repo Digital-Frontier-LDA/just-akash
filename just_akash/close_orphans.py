@@ -130,7 +130,7 @@ def run(*, dseqs: list[str], execute: bool = False) -> int:
             dseq,
             address,
             deployment_state=str(row.get("deployment_state", "")),
-            lease_count=active_leases,
+            console_lease_count=active_leases,
             escrow_uact=int(raw_escrow or 0),
         )
         if verdict.reapable:
