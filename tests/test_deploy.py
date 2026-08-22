@@ -1111,7 +1111,7 @@ class TestEmptyListOverrideIsExplicit:
     @patch("just_akash.deploy.time")
     @patch("just_akash.deploy.AkashConsoleAPI")
     def test_empty_list_override_does_not_consult_env(
-        self, MockAPI, mock_time, tmp_path, monkeypatch
+        self, MockAPI, mock_time, tmp_path, monkeypatch, capsys
     ):
         monkeypatch.setenv("AKASH_API_KEY", "test-key")
         # Env says only "akash1env_pref" is preferred; explicit [] override
@@ -1122,6 +1122,7 @@ class TestEmptyListOverrideIsExplicit:
         sdl_file.write_text(SDL_YAML)
 
         client = MockAPI.return_value
+        client.account_address.return_value = "akash1single"
         client.create_deployment.return_value = {"dseq": "12345", "manifest": "abc"}
         # If env IS consulted (bug), only "akash1env_pref" is allowed → the
         # cheaper "akash1other" bid would be FOREIGN and the run would fail.
@@ -1147,6 +1148,11 @@ class TestEmptyListOverrideIsExplicit:
         # No allowlist → cheapest bid wins regardless of env value.
         assert result["provider"] == "akash1other"
         assert result["price"] == 50.0
+        assert result["wallet_account"] == "akash1single"
+        output = capsys.readouterr().out
+        assert "cheapest eligible bid after collection window" in output
+        assert "cheapest preferred after collection window" not in output
+        assert "Wallet: akash1single" in output
 
 
 class TestWhitespaceOnlyEnvValueTreatedAsUnset:

@@ -3,11 +3,17 @@ from unittest.mock import MagicMock
 import pytest
 
 from just_akash.wallet_pool import (
+    _http_endpoint,
     _quorum_uact,
     configured_api_keys,
     select_client_for_create,
     select_client_for_dseq,
 )
+
+
+def test_wallet_lcd_boundary_rejects_non_http_schemes():
+    with pytest.raises(RuntimeError, match="must use http or https"):
+        _http_endpoint("file:///etc/passwd")
 
 
 def test_wallet_allowance_requires_two_matching_height_pinned_readings():

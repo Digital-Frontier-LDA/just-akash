@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -45,8 +45,19 @@ def configured_api_keys() -> list[str]:
     return result
 
 
-def _candidate_id(key: str) -> str:
-    return hashlib.sha256(key.encode()).hexdigest()[:12]
+def _candidate_id(index: int) -> str:
+    """Opaque in-process identity; never derive an identifier from a credential."""
+
+    return f"wallet-{index}"
+
+
+def _http_endpoint(endpoint: str) -> str:
+    """Validate again at the urllib boundary, even though chain.rest_urls does too."""
+
+    normalized = endpoint.rstrip("/")
+    if urllib.parse.urlparse(normalized).scheme.lower() not in {"http", "https"}:
+        raise RuntimeError("Akash LCD endpoint must use http or https")
+    return normalized
 
 
 def _default_credit_reader(account: str) -> int:
@@ -70,7 +81,7 @@ def _default_credit_reader(account: str) -> int:
 
 def _chain_height(endpoints: list[str]) -> int:
     for endpoint in endpoints:
-        url = f"{endpoint.rstrip('/')}/cosmos/base/tendermint/v1beta1/blocks/latest"
+        url = f"{_http_endpoint(endpoint)}/cosmos/base/tendermint/v1beta1/blocks/latest"
         request = urllib.request.Request(  # noqa: S310 — configured http(s) LCD endpoints
             url, headers={"Accept": "application/json", "User-Agent": "just-akash-wallet/1.0"}
         )
@@ -84,7 +95,7 @@ def _chain_height(endpoints: list[str]) -> int:
 
 
 def _credit_at(endpoint: str, account: str, height: int) -> int | None:
-    url = f"{endpoint.rstrip('/')}/cosmos/authz/v1beta1/grants/grantee/{account}"
+    url = f"{_http_endpoint(endpoint)}/cosmos/authz/v1beta1/grants/grantee/{account}"
     request = urllib.request.Request(  # noqa: S310 — configured http(s) LCD endpoints
         url,
         headers={
@@ -129,8 +140,8 @@ def select_client_for_create(
     clients: dict[str, AkashConsoleAPI] = {}
     candidates: list[WalletCandidate] = []
     errors = 0
-    for key in keys:
-        candidate_id = _candidate_id(key)
+    for index, key in enumerate(keys):
+        candidate_id = _candidate_id(index)
         client = client_factory(key)
         clients[candidate_id] = client
         try:

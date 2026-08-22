@@ -1124,9 +1124,14 @@ def deploy(
         1: "cheapest preferred after collection window",
         3: "cheapest eligible fallback after collection window",
     }
+    selection_label = (
+        phase_label[selection_phase]
+        if has_allowlist
+        else "cheapest eligible bid after collection window"
+    )
     _log(
         logging.INFO,
-        f"STEP 5: Selection made via {phase_label[selection_phase]}",
+        f"STEP 5: Selection made via {selection_label}",
     )
     # Show a compact ranking of the tier from which the winner came.
     if selection_phase == 3:
@@ -1160,8 +1165,7 @@ def deploy(
 
     _log(
         logging.INFO,
-        f"SELECTED  provider={provider}  price={price_amount} {price_denom}  "
-        f"({phase_label[selection_phase]})",
+        f"SELECTED  provider={provider}  price={price_amount} {price_denom}  ({selection_label})",
     )
 
     # Step 6: Create lease (with stale-bid retry — issue #14).
@@ -1495,8 +1499,16 @@ def deploy(
     print(f"  DSEQ: {dseq}")
     print(f"  Provider: {provider}")
     print(f"  Price: {price_amount} {price_denom}")
-    if wallet.account:
-        print(f"  Wallet: {wallet.account}")
+    wallet_account = wallet.account
+    if wallet_account is None:
+        try:
+            resolved_account = client.account_address()
+            wallet_account = resolved_account if isinstance(resolved_account, str) else None
+        except RuntimeError:
+            # Identity is lifecycle metadata, not a reason to fail a lease that already exists.
+            wallet_account = None
+    if wallet_account:
+        print(f"  Wallet: {wallet_account}")
     if wallet.available_uact is not None:
         print(f"  Wallet available: {wallet.available_uact} uact")
     print(f"\nUse 'just-akash status --dseq {dseq}' to check deployment status")
@@ -1507,7 +1519,7 @@ def deploy(
         "price": price_amount,
         "price_denom": price_denom,
         "lease": lease_response,
-        "wallet_account": wallet.account,
+        "wallet_account": wallet_account,
         "wallet_policy": wallet.policy_version,
     }
 
@@ -1528,8 +1540,7 @@ def update(
     api_key = api_key or os.environ.get("AKASH_API_KEY")
     if not api_key:
         raise RuntimeError(
-            "AKASH_API_KEY environment variable not set. "
-            "Please set your API key: export AKASH_API_KEY='your-key'"
+            "AKASH_API_KEY environment variable not set. Set AKASH_API_KEY before calling update."
         )
 
     client = AkashConsoleAPI(api_key)
