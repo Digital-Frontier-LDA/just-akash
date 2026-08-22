@@ -141,8 +141,10 @@ on:
         default: '90'
     secrets:
       AKASH_API_KEY:
-        required: true
-        description: 'Akash Console API key. just-akash reads this name directly.'
+        required: false
+        description: >-
+          Single-key compatibility credential. At least one of AKASH_API_KEY or
+          AKASH_API_KEYS must be supplied.
       AKASH_API_KEYS:
         required: false
         description: >-

@@ -813,7 +813,7 @@ def test_a_single_key_behaves_exactly_as_before():
     no change in behaviour, or adding the input would break every existing caller."""
     assert INPUTS.get("providers") is not None  # sanity: we are reading the right doc
     assert CALL["secrets"]["AKASH_API_KEYS"]["required"] is False
-    assert CALL["secrets"]["AKASH_API_KEY"]["required"] is True
+    assert CALL["secrets"]["AKASH_API_KEY"]["required"] is False
 
 
 def test_teardown_routes_by_dseq_instead_of_wallet_position():
