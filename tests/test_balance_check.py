@@ -65,12 +65,30 @@ class TestBalanceCheck:
 
     def test_empty_credit_grant_is_unknown(self, monkeypatch, capsys):
         # No readable DepositAuthorization grant is UNKNOWN, never a measured zero.
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
         code = _run_balance_check(
             monkeypatch,
             ["just-akash", "balance", "--check", "--min-usd", "5"],
             {},
         )
         assert code == 1
+        out = capsys.readouterr().out
+        assert out.strip() == (
+            "CREDIT-CHECK UNKNOWN reason=canonical spend_limits quorum unavailable "
+            "min_usd=5.00 account=akash1me"
+        )
+
+    def test_normal_balance_unknown_is_nonfatal_json(self, monkeypatch, capsys):
+        monkeypatch.setenv("AKASH_API_KEY", "test-key")
+        monkeypatch.setattr(sys, "argv", ["just-akash", "balance"])
+        with (
+            patch("just_akash.api.AkashConsoleAPI") as MockAPI,
+            patch("just_akash.chain.granted_uact", return_value=None),
+        ):
+            MockAPI.return_value.account_address.return_value = "akash1me"
+            from just_akash.cli import main
+
+            main()
         assert json.loads(capsys.readouterr().out)["status"] == "UNKNOWN"
 
     def test_machine_readable_text_verdict_when_tty(self, monkeypatch, capsys):

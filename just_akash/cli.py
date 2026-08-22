@@ -973,17 +973,21 @@ def main():
                     sys.exit(2)
                 granted_uact = chain.granted_uact(address)
                 if granted_uact is None:
-                    print(
-                        json.dumps(
-                            {
-                                "check": "deploy_credit",
-                                "status": "UNKNOWN",
-                                "account": address,
-                                "reason": "canonical spend_limits quorum unavailable",
-                                "min_usd": args.min_usd,
-                            }
+                    unknown = {
+                        "check": "deploy_credit",
+                        "status": "UNKNOWN",
+                        "account": address,
+                        "reason": "canonical spend_limits quorum unavailable",
+                        "min_usd": args.min_usd,
+                    }
+                    if use_json:
+                        print(json.dumps(unknown))
+                    else:
+                        print(
+                            "CREDIT-CHECK UNKNOWN"
+                            f" reason={unknown['reason']} min_usd={args.min_usd:.2f}"
+                            f" account={address}"
                         )
-                    )
                     sys.exit(1)
                 # Check FREE credit, not the grant. Every active deployment holds a
                 # deposit in escrow against the same grant, so the grant alone reads
@@ -1066,9 +1070,20 @@ def main():
             # the grant, not AKT). Both are read straight from the public chain.
             granted_uact_value = chain.granted_uact(address)
             if granted_uact_value is None:
-                raise RuntimeError(
-                    "canonical DepositAuthorization spend_limits quorum unavailable"
-                )
+                reason = "canonical spend_limits quorum unavailable"
+                if use_json:
+                    print(
+                        json.dumps(
+                            {
+                                "account": address,
+                                "status": "UNKNOWN",
+                                "reason": reason,
+                            }
+                        )
+                    )
+                else:
+                    print(f"CREDIT-CHECK UNKNOWN reason={reason} account={address}")
+                return
             granted = {"uact": granted_uact_value}
             credit = chain.describe_coins(granted)
             liquid = chain.describe_coins(chain.bank_balances(address))
