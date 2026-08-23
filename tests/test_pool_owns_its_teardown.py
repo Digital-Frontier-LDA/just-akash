@@ -133,7 +133,15 @@ def test_teardown_receives_usable_inputs_not_empty_context_lookups():
         expr = str(expr)
         if expr.startswith("${{"):
             inner = expr[3:-3].strip()
-            ok = inner.startswith(("inputs.", "needs.", "env.", "github.run_id", "github.repository_owner", "github.event."))
+            known = (
+                "inputs.",
+                "needs.",
+                "env.",
+                "github.run_id",
+                "github.repository_owner",
+                "github.event.",
+            )
+            ok = inner.startswith(known)
             assert ok, (
                 f"teardown input {key}={expr!r} does not name a known context "
                 f"property — invalid ones resolve to EMPTY STRING silently"
