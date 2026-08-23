@@ -94,7 +94,8 @@ def _configured_prefixes() -> list[str]:
 def test_the_emitters_are_actually_found() -> None:
     emitted = _emitted_prefixes()
     assert len(emitted) >= 2, (
-        f"expected at least two name-prefix emitters (the pool SDL and the probe), found {emitted}. "
+        f"expected at least two name-prefix emitters (the pool SDL and the probe), "
+        f"found {emitted}. "
         "If an emitter moved, every assertion below passes over an empty set."
     )
 
