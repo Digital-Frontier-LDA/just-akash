@@ -1191,13 +1191,28 @@ def deploy(
             backup=backup,
             received_from=foreign,
         )
+        # ⚠ DO NOT restore "check that your providers are online and have capacity" here.
+        # A BID IS PROOF OF BOTH. A provider that bids has seen the order, is online, and
+        # has declared it can serve that shape — so the one thing this failure can never
+        # mean is that the providers are down or full. It means OUR allow-list rejected
+        # what arrived.
+        #
+        # That advice sent at least four investigations to look at provider health.
+        # Measured in Blazing-Back#1274 across 42 consecutive rejection rounds: a DFC-owned
+        # `tier: preferred` provider had bid in 42 of 42 (one of two specific addresses in
+        # 93% and 50% of rounds respectively). The providers were online, had capacity, and
+        # bid — every single round. The advice was misleading in 100% of observed uses, and
+        # the fix it eventually pointed to (Blazing-Back#1350) was to the ALLOW-LIST.
         raise RuntimeError(
-            f"Received {len(bids)} bid(s) but NONE from our providers.\n"
+            f"{len(bids)} bid(s) arrived and OUR ALLOW-LIST rejected every one.\n"
             f"  Preferred: {preferred}\n"
             f"  Backup:    {backup}\n"
-            f"  Received from: {foreign}\n"
-            "Check that your providers are online and have capacity. "
-            f"Allowed total: {allowed_all}"
+            f"  Bid, but not allowed: {foreign}\n"
+            f"  Allowed total: {allowed_all}\n"
+            "This is NOT a capacity or liveness problem — a bid is proof the provider was "
+            "online and had capacity for this order shape. The mismatch is between the "
+            "bidders above and the allow-list above. Widen the allow-list, or place the "
+            "order somewhere a permitted provider will bid."
         )
 
     # Selection success — log full bid table & per-tier breakdown.
