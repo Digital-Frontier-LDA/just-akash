@@ -351,7 +351,7 @@ jobs:
               # means the pool trusts a measurement taken of something else. `:latest`
               # made that gap permanent and silent — the tag can move between the
               # qualification and the run that relies on it.
-              image: ghcr.io/akash-network/github-runner@sha256:030ae11a6b597c5db28b12375461e35f694d74ceb06a1b73c90545b1adef16da
+              image: ghcr.io/akash-network/github-runner@sha256:7509763af8209796f3e7fde5fb536c742075ec1a59ad1b36e3c9c27bc3bafc67
               env:
                 - ACCESS_TOKEN=${GH_RUNNER_PAT}
                 - ORG_NAME=${ORG}
@@ -359,7 +359,32 @@ jobs:
                 - RUNNER_NAME_PREFIX=akash-${RUNNER_LABEL}
                 - LABELS=self-hosted,linux,akash,${RUNNER_LABEL}
                 - EPHEMERAL=${EPHEMERAL}
-                - DISABLE_AUTO_UPDATE=true
+                # DISABLE_AUTO_UPDATE is ABSENT ON PURPOSE — the entrypoint tests
+                # PRESENCE, so `=false` still disables it. Pinning the digest AND freezing
+                # the runner is what stranded this pool on 2.334.0, which GitHub now
+                # refuses to dispatch to.
+                #
+                # A deprecated runner exits 0 by default, so the failure reports as
+                # success. This makes it exit non-zero instead.
+                #
+                # ⚠ Do NOT justify this from the image's config blob. The blob answers
+                # "what was CONFIGURED", never "what RUNS": its `Cmd` is the ARGUMENT to
+                # entrypoint.sh, not the process that replaces it. Read from the extracted
+                # layer instead — `entrypoint.sh` (sha256:9908c4865cb09cc6…, BYTE-IDENTICAL
+                # in this image and in myoung34/github-runner) ends in `gosu runner "$@"`
+                # with NO `exec`, so entrypoint.sh stays PID 1 and the listener is its
+                # CHILD. It installs `trap … deregister_runner EXIT` plus SIGINT/QUIT/TERM
+                # (:262-263), gated on _DISABLE_AUTOMATIC_DEREGISTRATION which defaults
+                # false — so an exiting runner DOES de-register itself.
+                #
+                # ⇒ Registration accumulation is therefore NOT caused by the runner
+                # version, and this bump does not close that class. Measured on
+                # Blazing-Back run 32578577304: registration ids kept RISING under one run
+                # id after the run had completed, because its Akash deployment was never
+                # closed. The trap fires on exit; a container whose lease is still open
+                # never exits. The leak is LEASE LIFETIME. Deleting registrations does not
+                # kill the container minting them.
+                - ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE=1
                 - RUNNER_WORKDIR=/_work
                 - RUN_AS_ROOT=true
               expose:
