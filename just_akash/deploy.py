@@ -1203,6 +1203,21 @@ def deploy(
         # 93% and 50% of rounds respectively). The providers were online, had capacity, and
         # bid — every single round. The advice was misleading in 100% of observed uses, and
         # the fix it eventually pointed to (Blazing-Back#1350) was to the ALLOW-LIST.
+        # ⚠ The stale-bid branch above runs only when `allowed_bids` is NON-EMPTY, and it
+        # is empty BY CONSTRUCTION whenever every bid is foreign — so an all-CLOSED foreign
+        # set lands here, where "widen the allow-list" is true but NOT SUFFICIENT: those
+        # specific bids can never be leased no matter who is allowed. Saying only "widen"
+        # sends an operator to change config and re-run against an order whose bids have
+        # already expired. Raised by CodeRabbit on #188 and confirmed against the branch.
+        stale_note = (
+            ""
+            if any(_is_open_bid(b) for b in bids)
+            else (
+                " ALSO: every bid above has ALREADY EXPIRED (none is still open), so "
+                "widening the allow-list is necessary but NOT sufficient — none of these "
+                "bids can be leased. Widen it AND re-run to solicit fresh bids."
+            )
+        )
         raise RuntimeError(
             # ⛔ KEEP "NONE from our providers" — smoke_providers.py:943 CLASSIFIES on it
             # (`none from our providers` in its no-bid regex). Drop the phrase and an
@@ -1216,7 +1231,7 @@ def deploy(
             "This is NOT a capacity or liveness problem — a bid is proof the provider was "
             "online and had capacity for this order shape. The mismatch is between the "
             "bidders above and the allow-list above. Widen the allow-list, or place the "
-            "order somewhere a permitted provider will bid."
+            "order somewhere a permitted provider will bid." + stale_note
         )
 
     # Selection success — log full bid table & per-tier breakdown.

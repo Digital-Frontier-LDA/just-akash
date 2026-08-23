@@ -172,3 +172,68 @@ def test_the_classifier_regexes_here_still_match_smoke_providers():
     src = (Path(__file__).resolve().parents[1] / "just_akash" / "smoke_providers.py").read_text()
     assert NO_BID_RE.pattern in src, "no-bid regex drifted from smoke_providers.py"
     assert POSITIVE_EVIDENCE_RE.pattern in src, "positive-evidence regex drifted"
+
+
+# ---------------------------------------------------------------------------
+# An ALL-CLOSED foreign set reaches this message. Raised by CodeRabbit on #188 and
+# confirmed against the branch: the stale-bid handler at deploy.py runs only when
+# `allowed_bids` is non-empty, and that list is empty by construction when every bid
+# is foreign. So "widen the allow-list" — true on its own terms — is INSUFFICIENT
+# advice for a set of bids that can no longer be leased by anyone.
+# ---------------------------------------------------------------------------
+
+EXPIRED = "ALREADY EXPIRED"
+
+
+@patch("just_akash.deploy.time")
+@patch("just_akash.deploy.AkashConsoleAPI")
+def test_all_closed_foreign_bids_say_widening_is_not_enough(
+    MockAPI, mock_time, tmp_path, monkeypatch
+):
+    client, sdl = _setup(MockAPI, mock_time, tmp_path, monkeypatch, providers="akash1pref")
+    client.get_bids.return_value = [
+        _make_bid("akash1foreign") | {"state": "closed"},
+        _make_bid("akash1other") | {"state": "closed"},
+    ]
+    with pytest.raises(RuntimeError) as err:
+        deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+    msg = str(err.value)
+
+    assert EXPIRED in msg, (
+        "an all-closed foreign set cannot be leased by widening the allow-list; the "
+        f"message must say a re-run is also required:\n{msg}"
+    )
+    assert "re-run" in msg, f"the required action must be named:\n{msg}"
+    # It is still fundamentally an allow-list failure, so the classifier contract holds.
+    assert NO_BID_RE.search(msg), f"must still classify as no-bid:\n{msg}"
+
+
+@patch("just_akash.deploy.time")
+@patch("just_akash.deploy.AkashConsoleAPI")
+def test_an_OPEN_foreign_bid_does_NOT_claim_expiry(MockAPI, mock_time, tmp_path, monkeypatch):
+    """⛔ The control. Without it the note could be unconditional — which would tell every
+    operator to re-run when widening the allow-list alone would in fact have worked."""
+    client, sdl = _setup(MockAPI, mock_time, tmp_path, monkeypatch, providers="akash1pref")
+    client.get_bids.return_value = [_make_bid("akash1foreign")]  # open
+    with pytest.raises(RuntimeError) as err:
+        deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+    assert EXPIRED not in str(err.value), (
+        "these bids are leasable the moment the allow-list permits them — claiming "
+        f"expiry would send the operator to re-run needlessly:\n{err.value}"
+    )
+
+
+@patch("just_akash.deploy.time")
+@patch("just_akash.deploy.AkashConsoleAPI")
+def test_a_MIXED_set_with_one_open_bid_does_NOT_claim_expiry(
+    MockAPI, mock_time, tmp_path, monkeypatch
+):
+    """One leasable bid is enough for widening alone to fix it — the note is about the SET."""
+    client, sdl = _setup(MockAPI, mock_time, tmp_path, monkeypatch, providers="akash1pref")
+    client.get_bids.return_value = [
+        _make_bid("akash1foreign") | {"state": "closed"},
+        _make_bid("akash1other"),  # open
+    ]
+    with pytest.raises(RuntimeError) as err:
+        deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+    assert EXPIRED not in str(err.value), f"one open bid makes widening sufficient:\n{err.value}"
