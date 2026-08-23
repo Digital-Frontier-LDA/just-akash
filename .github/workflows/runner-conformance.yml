@@ -16,6 +16,6 @@ permissions:
 jobs:
   pool:
     name: runner-pool
-    uses: Digital-Frontier-LDA/df-cicd/.github/workflows/reusable-akash-runner-conformance.yml@v2.7.1
+    uses: Digital-Frontier-LDA/df-cicd/.github/workflows/reusable-akash-runner-conformance.yml@13ba1b441cf9b7a2406d8df813d579729c1f0890 # df-cicd main 2026-08-23
     with:
       workflow: .github/workflows/runner-pool.yml
