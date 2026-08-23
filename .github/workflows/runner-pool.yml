@@ -757,7 +757,14 @@ jobs:
       dseq: ${{ needs.pool.outputs.dseq }}
       tag-prefix: ${{ inputs.tag-prefix }}
       runner-label: ${{ inputs.runner-label }}
-      github-org: ${{ github.organization }}
+      # ⭐ inputs.github-org, NOT github.organization — that context property DOES NOT
+      # EXIST and evaluates to EMPTY STRING silently (caught by sentinel + CodeRabbit
+      # review on #182; all six required checks were green on the broken form). The
+      # teardown de-registers via `orgs/${ORG}/actions/runners`, and the runners
+      # registered into inputs.github-org (the pool's own ORG env at :280/:332/:407),
+      # so the teardown MUST name the same org the registration used — guaranteed
+      # consistent by reading the SAME input, not by reconstructing it from context.
+      github-org: ${{ inputs.github-org }}
     secrets:
       AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
       AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}

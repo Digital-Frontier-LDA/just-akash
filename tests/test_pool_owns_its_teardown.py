@@ -108,6 +108,38 @@ def test_teardown_forwards_the_secrets_the_close_needs():
         assert name in secrets, f"teardown does not forward {name}: {secrets!r}"
 
 
+def test_teardown_receives_usable_inputs_not_empty_context_lookups():
+    """★★ THE REVIEW CATCH (sentinel x2 + CodeRabbit on #182): the first wiring passed
+    `github-org: ${{ github.organization }}` — a context property that DOES NOT EXIST
+    and evaluates to EMPTY STRING silently. All six required checks were green on that
+    form: ruff, pyright, tests, gitleaks, semgrep, CVE — none of them read workflow
+    expressions. The teardown would have run faithfully on every failure and been
+    UNABLE TO DE-REGISTER, because it did not know which org the runners were in:
+    reachable-but-inert, the same defect class as the dseq-publication bug this PR
+    fixes — the value's AVAILABILITY, not the call's reachability.
+    The pin: every input the teardown consumes must name the SAME source the pool's
+    own steps use (its own inputs), never an invented context property."""
+    td = JOBS.get("teardown", {})
+    withs = td.get("with", {}) or {}
+    assert withs.get("github-org") == "${{ inputs.github-org }}", (
+        f"teardown's github-org does not read the pool's own input: "
+        f"{withs.get('github-org')!r} — a non-existent context property (e.g. github."
+        f"organization) resolves to EMPTY silently and the de-registration no-ops"
+    )
+    # And the generalizable half of the pin: NO teardown input may name a context
+    # property that GitHub does not define. The three real ones used here are
+    # inputs.* and needs.*; anything else in a `with:` must be audited by hand.
+    for key, expr in withs.items():
+        expr = str(expr)
+        if expr.startswith("${{"):
+            inner = expr[3:-3].strip()
+            ok = inner.startswith(("inputs.", "needs.", "env.", "github.run_id", "github.repository_owner", "github.event."))
+            assert ok, (
+                f"teardown input {key}={expr!r} does not name a known context "
+                f"property — invalid ones resolve to EMPTY STRING silently"
+            )
+
+
 def test_teardown_label_wiring_uses_the_pools_own_label():
     """De-registration must be scoped to THIS pool's label (an org-wide offline sweep
     races other repos' in-flight provisioning). The label comes from the pool's own
