@@ -14,6 +14,8 @@ was to the ALLOW-LIST.
 These are behavioural — they drive `deploy()` to the real raise site, not a source scan.
 """
 
+import re
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -81,7 +83,7 @@ def test_the_message_blames_the_allowlist_and_names_who_bid(
         deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
     msg = str(err.value)
 
-    assert "ALLOW-LIST rejected" in msg, f"the cause must be named, not implied:\n{msg}"
+    assert "mismatch is between the" in msg, f"the cause must be named, not implied:\n{msg}"
     # The reader needs BOTH sides of the mismatch to act on it.
     assert "akash1foreign" in msg, f"who bid must be shown:\n{msg}"
     assert "akash1pref" in msg, f"what was allowed must be shown:\n{msg}"
@@ -120,3 +122,53 @@ def test_control_an_allowed_bidder_still_succeeds(MockAPI, mock_time, tmp_path, 
 
     result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
     assert result["provider"] == "akash1pref"
+
+
+# ---------------------------------------------------------------------------
+# ⛔ THE CONTRACT THAT NEARLY BROKE. This message is not only prose — it is a
+# MACHINE INTERFACE. `smoke_providers._classify` matches on it to decide whether an
+# outcome is `no-bid` (a market/allow-list condition, provider not at fault) or
+# `deploy-failed` (a PROVIDER FAIL).
+#
+# The first version of this fix rewrote the headline to "N bid(s) arrived and OUR
+# ALLOW-LIST rejected every one" — which deleted the phrase the classifier matches.
+# Every allow-list rejection would then have scored as a provider failure: the exact
+# mis-attribution this whole change exists to stop, re-created one layer down, by the
+# change meant to fix it. Nothing in the deploy-side tests could see it.
+# ---------------------------------------------------------------------------
+
+NO_BID_RE = re.compile(r"no bids?\b|none from our providers|foreign bids", re.IGNORECASE)
+POSITIVE_EVIDENCE_RE = re.compile(
+    r"none from our providers|foreign bids|no bid from", re.IGNORECASE
+)
+
+
+@patch("just_akash.deploy.time")
+@patch("just_akash.deploy.AkashConsoleAPI")
+def test_the_message_is_still_classified_as_NO_BID_not_provider_fail(
+    MockAPI, mock_time, tmp_path, monkeypatch
+):
+    """The literal `smoke_providers` regexes, applied to the real raised message."""
+    client, sdl = _setup(MockAPI, mock_time, tmp_path, monkeypatch, providers="akash1pref")
+    client.get_bids.return_value = [_make_bid("akash1foreign")]
+    with pytest.raises(RuntimeError) as err:
+        deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+    msg = str(err.value)
+
+    assert NO_BID_RE.search(msg), (
+        "smoke_providers.py:943 would fall through to 'deploy-failed' and score OUR "
+        f"allow-list rejection as a PROVIDER FAIL:\n{msg}"
+    )
+    assert POSITIVE_EVIDENCE_RE.search(msg), (
+        "smoke_providers.py:950 uses this second match to skip the on-chain cross-check, "
+        "because these variants carry POSITIVE evidence that order flow worked. Losing it "
+        f"turns a definite no-bid into 'no-bid-unverified':\n{msg}"
+    )
+
+
+def test_the_classifier_regexes_here_still_match_smoke_providers():
+    """⛔ A copied regex rots. Pin these against the source they were copied from, so this
+    file cannot keep asserting a contract the other side has already changed."""
+    src = (Path(__file__).resolve().parents[1] / "just_akash" / "smoke_providers.py").read_text()
+    assert NO_BID_RE.pattern in src, "no-bid regex drifted from smoke_providers.py"
+    assert POSITIVE_EVIDENCE_RE.pattern in src, "positive-evidence regex drifted"

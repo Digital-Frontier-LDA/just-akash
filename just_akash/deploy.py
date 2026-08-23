@@ -1204,10 +1204,14 @@ def deploy(
         # bid — every single round. The advice was misleading in 100% of observed uses, and
         # the fix it eventually pointed to (Blazing-Back#1350) was to the ALLOW-LIST.
         raise RuntimeError(
-            f"{len(bids)} bid(s) arrived and OUR ALLOW-LIST rejected every one.\n"
+            # ⛔ KEEP "NONE from our providers" — smoke_providers.py:943 CLASSIFIES on it
+            # (`none from our providers` in its no-bid regex). Drop the phrase and an
+            # allow-list rejection falls through to "deploy-failed", scoring OUR filter as
+            # a PROVIDER FAIL — the exact mis-attribution this message is being fixed for.
+            f"Received {len(bids)} bid(s) but NONE from our providers.\n"
             f"  Preferred: {preferred}\n"
             f"  Backup:    {backup}\n"
-            f"  Bid, but not allowed: {foreign}\n"
+            f"  Received from: {foreign}\n"
             f"  Allowed total: {allowed_all}\n"
             "This is NOT a capacity or liveness problem — a bid is proof the provider was "
             "online and had capacity for this order shape. The mismatch is between the "
