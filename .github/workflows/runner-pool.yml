@@ -488,6 +488,17 @@ jobs:
             "${JA[@]}" deploy --sdl /tmp/runner-sdl.yaml --deposit "$REQUIRED_DEPOSIT_USD" --bid-wait 60 \
               --bid-wait-retry 120 "${PROV_ARGS[@]}" 2>&1 | tee /tmp/ja.log || true
             DSEQ=$(awk -F': +' '/^[[:space:]]*DSEQ:/{print $2; exit}' /tmp/ja.log || true)
+            # ⭐ PUBLISH THE DSEQ THE MOMENT IT EXISTS — before tagging, before the
+            # registration wait, before anything can fail or be cancelled. The
+            # success block below also writes it, but a run that dies mid-wait
+            # (cancellation, timeout, registration failure) never reaches that
+            # block, and the internalised teardown job would then have NO identity
+            # to close — which is exactly how leases outlived their runs for 23.5h
+            # (census 2026-08-23: 13 × just-akash-runner.<hash> = 65 ACT). Each
+            # round overwrites this, so the surviving value names the CURRENT lease;
+            # an already-closed round's dseq is a harmless no-op for the teardown
+            # ("already closed|not found" → verified-closed). (#1439 pattern.)
+            echo "dseq=$DSEQ" >> "$GITHUB_OUTPUT"
             PROVIDER=$(awk -F': +' '/^[[:space:]]*Provider:/{print $2; exit}' /tmp/ja.log || true)
             WALLET=$(awk -F': +' '/^[[:space:]]*Wallet:/{print $2; exit}' /tmp/ja.log || true)
             WALLET_UACT=$(awk '/^[[:space:]]*Wallet available:/{print $(NF-1); exit}' /tmp/ja.log || true)
@@ -780,3 +791,43 @@ jobs:
             echo "::error title=No provider bid::No eligible provider bid within the window across ${MAX_ATTEMPTS} attempts. This is a market/capacity condition, not a code failure."
           fi
           exit 1
+
+  # ── THE POOL CLOSES ITS OWN LEASE ──────────────────────────────────────────────
+  #
+  # ⭐ INTERNALISED TEARDOWN (2026-08-23). runner-teardown.yml existed, was correct,
+  # and was called by ZERO workflows — the pool→work→teardown pairing lived only in
+  # its own docstring, so every pool run abandoned its lease at job end. Measured:
+  # 13 × just-akash-runner.<hash> held 65 ACT for up to 23.5h; eleven were created
+  # in eight minutes (2026-08-22 14:16-14:24Z) by runs whose teardown never existed.
+  #
+  # This job makes teardown a PROPERTY OF THE POOL rather than a duty of the caller.
+  # The docstring's consumer-assembled protocol assumed every caller remembers the
+  # three-job shape; internalising removes that assumption — a future caller cannot
+  # forget what it never had to add. (Same inversion #1439/#1390 applied to
+  # close-follows-creation; also a correction to the C5 addendum's standard.)
+  #
+  # `if: always()` UNCONDITIONALLY — no result gate, no dseq precondition. A pool
+  # that fails before leasing produces an EMPTY dseq, and runner-teardown.yml treats
+  # empty as a successful no-op ("nothing to close"). Gating here would re-train the
+  # success-gating this job exists to remove.
+  teardown:
+    name: Close lease and de-register runners (the pool owns this)
+    needs: [pool]
+    if: always()
+    uses: ./.github/workflows/runner-teardown.yml
+    with:
+      dseq: ${{ needs.pool.outputs.dseq }}
+      tag-prefix: ${{ inputs.tag-prefix }}
+      runner-label: ${{ inputs.runner-label }}
+      # ⭐ inputs.github-org, NOT github.organization — that context property DOES NOT
+      # EXIST and evaluates to EMPTY STRING silently (caught by sentinel + CodeRabbit
+      # review on #182; all six required checks were green on the broken form). The
+      # teardown de-registers via `orgs/${ORG}/actions/runners`, and the runners
+      # registered into inputs.github-org (the pool's own ORG env at :280/:332/:407),
+      # so the teardown MUST name the same org the registration used — guaranteed
+      # consistent by reading the SAME input, not by reconstructing it from context.
+      github-org: ${{ inputs.github-org }}
+    secrets:
+      AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
+      AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}
+      GH_RUNNER_PAT: ${{ secrets.GH_RUNNER_PAT }}
