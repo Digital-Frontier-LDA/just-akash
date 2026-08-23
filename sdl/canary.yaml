@@ -1,4 +1,15 @@
 ---
+# just-akash: bid-window = 60s (uniform across every SDL in this directory).
+#
+# The Akash SDL spec has no native `bid_timeout` field; the bounded window
+# is enforced client-side by the deploy CLI (--bid-wait, default 60s) and
+# pinned by AuctionPolicy.collection_window_seconds in the shared
+# akash-lease-core package (pyproject.toml). Keep this annotation block
+# unchanged across every SDL in this directory so the project-wide audit
+# in tests/test_sdl_validate.py and C5 tracking issue #178 can confirm
+# uniformity without re-reading deploy.py. A new SDL that omits this
+# comment will fail validation.
+#
 # Persistent per-provider canary — the deployment that STAYS UP.
 #
 # Unlike every other SDL here this one is NOT throwaway. provider-smoke.yml deploys,

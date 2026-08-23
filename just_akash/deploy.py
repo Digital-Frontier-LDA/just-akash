@@ -47,6 +47,67 @@ def _ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _fmt_window_deadline(deadline_epoch: float) -> str:
+    """Format the absolute deadline of the equal-opportunity bid window.
+
+    Surfaces a wall-clock UTC timestamp so the operator sees *when the window
+    will close*, not just *how long the wait has been*. Without this, the
+    poll output reads as "still waiting, still waiting" — silence that
+    operators interpret as "nothing is happening" (C5 review item 3,
+    just-akash tracking issue #178). The deadline is shown in the same UTC
+    format as the rest of the deploy log so a CI run that scrapes the log
+    can correlate the deadline with the orchestrator's clock.
+    """
+    return datetime.fromtimestamp(deadline_epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _fmt_window_progress_bar(elapsed: int, total: int, width: int = 20) -> str:
+    """A 20-char ASCII progress bar for the bid collection window.
+
+    Cheap, terminal-safe (no Unicode box-drawing), and color-free — the
+    output has to land in the same log as the rest of the deploy
+    diagnostics, which CI pipelines grep without ANSI handling. The bar is
+    informational only; it does not gate the actual selection deadline
+    (that lives in `collection_deadline = start_time + bid_wait`). The width
+    is fixed so successive log lines align.
+    """
+    total = max(total, 1)
+    fraction = min(max(elapsed / total, 0.0), 1.0)
+    filled = int(fraction * width)
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+
+def _fmt_window_status_line(
+    *,
+    elapsed: int,
+    total: int,
+    deadline_iso: str,
+    poll_count: int,
+    bid_count: int,
+    bar: str,
+) -> str:
+    """Format the per-poll status line for the bid collection window.
+
+    Single source of truth for the format string so a future change lands in
+    one place. Shows:
+
+      - elapsed/total seconds and percent,
+      - the absolute UTC deadline,
+      - the ASCII progress bar,
+      - the number of bids received so far,
+      - the poll counter.
+
+    Replaces the prior "Waiting for bids... {elapsed}s (poll #{poll_count})"
+    line that read as silence during the window (C5 review item 3).
+    """
+    pct = min(int(elapsed * 100 / max(total, 1)), 100)
+    return (
+        f"  {bar} {elapsed:>3}/{total}s ({pct:>3}%)  "
+        f"deadline={deadline_iso}  "
+        f"bids={bid_count}  poll=#{poll_count}"
+    )
+
+
 def _log(level: int, msg: str):
     logger.log(level, f"[{_ts()}] {msg}")
     if level >= logging.INFO:
@@ -770,11 +831,14 @@ def deploy(
     )
 
     # Step 3: one equal-opportunity bid collection window, then one shared decision.
+    start_time = time.time()
+    collection_deadline = start_time + bid_wait
+    deadline_iso = _fmt_window_deadline(collection_deadline)
     _log(
         logging.INFO,
-        f"STEP 3: Collecting bids for {bid_wait}s before preferred/fallback selection...",
+        f"STEP 3: Collecting bids for {bid_wait}s window "
+        f"(deadline={deadline_iso}, --bid-wait / AuctionPolicy.collection_window_seconds).",
     )
-    start_time = time.time()
     bids: list = []
     poll_count = 0
     last_bid_count = -1
@@ -785,6 +849,15 @@ def deploy(
         nonlocal poll_count, last_bid_count, bids
         poll_count += 1
         elapsed = int(time.time() - start_time)
+        bar = _fmt_window_progress_bar(elapsed, bid_wait)
+        status_line = _fmt_window_status_line(
+            elapsed=elapsed,
+            total=bid_wait,
+            deadline_iso=deadline_iso,
+            poll_count=poll_count,
+            bid_count=0,  # updated below when known
+            bar=bar,
+        )
         try:
             bids = client.get_bids(str(dseq))
         except RuntimeError as e:
@@ -792,11 +865,7 @@ def deploy(
                 logging.WARNING,
                 f"  poll #{poll_count} @ {elapsed}s: API error: {e}",
             )
-            print(
-                f"\r  Waiting for bids... {elapsed}s (poll #{poll_count})",
-                end="",
-                flush=True,
-            )
+            print(f"\r{status_line}  api_error=1", end="", flush=True)
             return
 
         current_count = len(bids)
@@ -822,14 +891,18 @@ def deploy(
                         f"    bid[{i}] provider={p}  price={_fmt_price(b)}  state={s}  [{tag}]",
                     )
 
+        status_line = _fmt_window_status_line(
+            elapsed=elapsed,
+            total=bid_wait,
+            deadline_iso=deadline_iso,
+            poll_count=poll_count,
+            bid_count=current_count,
+            bar=bar,
+        )
         if current_count > 0:
-            print(f"\r  {current_count} bid(s) received after {elapsed}s", flush=True)
+            print(f"\r{status_line}  WAITING_FOR_LATE_BIDDERS_UNTIL_DEADLINE", flush=True)
         else:
-            print(
-                f"\r  Waiting for bids... {elapsed}s (poll #{poll_count})",
-                end="",
-                flush=True,
-            )
+            print(f"\r{status_line}  WAITING_FOR_FIRST_BID", end="", flush=True)
 
     def _poll_until(deadline: float, early_exit=None) -> None:
         while time.time() < deadline:
@@ -838,9 +911,6 @@ def deploy(
                 return
             time.sleep(5)
 
-    collection_deadline = start_time + bid_wait
-
-    _log(logging.INFO, f"  Equal-opportunity collection: waiting {bid_wait}s...")
     _poll_until(collection_deadline)
     print()
 
@@ -1121,13 +1191,47 @@ def deploy(
             backup=backup,
             received_from=foreign,
         )
+        # ⚠ DO NOT restore "check that your providers are online and have capacity" here.
+        # A BID IS PROOF OF BOTH. A provider that bids has seen the order, is online, and
+        # has declared it can serve that shape — so the one thing this failure can never
+        # mean is that the providers are down or full. It means OUR allow-list rejected
+        # what arrived.
+        #
+        # That advice sent at least four investigations to look at provider health.
+        # Measured in Blazing-Back#1274 across 42 consecutive rejection rounds: a DFC-owned
+        # `tier: preferred` provider had bid in 42 of 42 (one of two specific addresses in
+        # 93% and 50% of rounds respectively). The providers were online, had capacity, and
+        # bid — every single round. The advice was misleading in 100% of observed uses, and
+        # the fix it eventually pointed to (Blazing-Back#1350) was to the ALLOW-LIST.
+        # ⚠ The stale-bid branch above runs only when `allowed_bids` is NON-EMPTY, and it
+        # is empty BY CONSTRUCTION whenever every bid is foreign — so an all-CLOSED foreign
+        # set lands here, where "widen the allow-list" is true but NOT SUFFICIENT: those
+        # specific bids can never be leased no matter who is allowed. Saying only "widen"
+        # sends an operator to change config and re-run against an order whose bids have
+        # already expired. Raised by CodeRabbit on #188 and confirmed against the branch.
+        stale_note = (
+            ""
+            if any(_is_open_bid(b) for b in bids)
+            else (
+                " ALSO: every bid above has ALREADY EXPIRED (none is still open), so "
+                "widening the allow-list is necessary but NOT sufficient — none of these "
+                "bids can be leased. Widen it AND re-run to solicit fresh bids."
+            )
+        )
         raise RuntimeError(
+            # ⛔ KEEP "NONE from our providers" — smoke_providers.py:943 CLASSIFIES on it
+            # (`none from our providers` in its no-bid regex). Drop the phrase and an
+            # allow-list rejection falls through to "deploy-failed", scoring OUR filter as
+            # a PROVIDER FAIL — the exact mis-attribution this message is being fixed for.
             f"Received {len(bids)} bid(s) but NONE from our providers.\n"
             f"  Preferred: {preferred}\n"
             f"  Backup:    {backup}\n"
             f"  Received from: {foreign}\n"
-            "Check that your providers are online and have capacity. "
-            f"Allowed total: {allowed_all}"
+            f"  Allowed total: {allowed_all}\n"
+            "This is NOT a capacity or liveness problem — a bid is proof the provider was "
+            "online and had capacity for this order shape. The mismatch is between the "
+            "bidders above and the allow-list above. Widen the allow-list, or place the "
+            "order somewhere a permitted provider will bid." + stale_note
         )
 
     # Selection success — log full bid table & per-tier breakdown.
