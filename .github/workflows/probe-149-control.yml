@@ -1,0 +1,27 @@
+# ⚠ PROBE — df-cicd#149. TEMPORARY; delete with this branch.
+#
+# CONTROL ARM for "why does runner-conformance.yml fail with jobs=0?".
+#
+# Held constant vs runner-conformance.yml: same caller repo, same org, same
+# df-cicd commit pin, same event, same permissions.
+# CHANGED: this calls a reusable with NO local `./` action reference.
+#
+#   reusable-akash-runner-conformance.yml  -> `uses: ./.github/actions/akash-runner-conformance`
+#   reusable-verify-pins.yml               -> no `./` action  (1 of 11 df-cicd reusables has one)
+#
+# READ THE JOB COUNT, NOT THE CONCLUSION. A failing job still proves the workflow
+# graph RESOLVED. jobs=0 means it never built.
+#   jobs>0 here + jobs=0 there -> the local `./` action is the cause
+#   jobs=0 here                -> cause is general (access/resolution), `./` is a red herring
+name: Probe 149 control (no local action)
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  control:
+    name: control-no-local-action
+    uses: Digital-Frontier-LDA/df-cicd/.github/workflows/reusable-verify-pins.yml@13ba1b441cf9b7a2406d8df813d579729c1f0890
