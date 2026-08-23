@@ -82,7 +82,7 @@ def _run_verdict(http_status: str | None) -> dict[str, str]:
 
     out_file = os.path.join(tmp, "gh_output")
     open(out_file, "w").close()
-    script = 'set -uo pipefail\nSAW_BID=1\nSAW_SEQ_CONTENTION=0\n' + _verdict_block()
+    script = "set -uo pipefail\nSAW_BID=1\nSAW_SEQ_CONTENTION=0\n" + _verdict_block()
     subprocess.run(
         ["bash", "-c", script],
         env={
@@ -117,7 +117,11 @@ def test_the_block_is_actually_extracted() -> None:
 
 @pytest.mark.parametrize(
     "status,expected",
-    [("401", "RUNNER_PAT_INVALID"), ("403", "GITHUB_API_UNAVAILABLE"), ("429", "GITHUB_API_UNAVAILABLE")],
+    [
+        ("401", "RUNNER_PAT_INVALID"),
+        ("403", "GITHUB_API_UNAVAILABLE"),
+        ("429", "GITHUB_API_UNAVAILABLE"),
+    ],
 )
 def test_a_dead_credential_is_never_reported_as_a_provider_failure(status, expected) -> None:
     out = _run_verdict(status)
@@ -156,7 +160,9 @@ def test_a_live_credential_still_names_the_provider(tmp_path) -> None:
 def test_every_reason_this_block_emits_is_already_declared_as_an_output() -> None:
     """No new vocabulary: a caller keying on failure_reason must not meet a surprise."""
     doc = yaml.safe_load(WORKFLOW.read_text())
-    declared = str(((doc.get("on") or doc.get(True))["workflow_call"]["outputs"])["failure_reason"])
+    declared = str(
+        ((doc.get("on") or doc.get(True))["workflow_call"]["outputs"])["failure_reason"]
+    )
     emitted = {
         line.split("failure_reason=")[1].split('"')[0]
         for line in _verdict_block().splitlines()
