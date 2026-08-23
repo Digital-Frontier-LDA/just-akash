@@ -1,0 +1,21 @@
+# Akash runner CI conformance — dogfoods the DF-CICD reusable conformance check
+# against this repo's own runner-pool.yml (the canonical reusable that every
+# downstream consumer `uses:`). Pinned to v2.7.1 (immutable).
+#
+# Self-test: if the canonical pool workflow doesn't satisfy the contract, the
+# conformance check fails on this repo's own PRs — exactly the failure mode
+# the standard exists to prevent propagating downstream.
+name: Runner Conformance
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pool:
+    name: runner-pool
+    uses: Digital-Frontier-LDA/df-cicd/.github/workflows/reusable-akash-runner-conformance.yml@v2.7.1
+    with:
+      workflow: .github/workflows/runner-pool.yml
