@@ -12,6 +12,16 @@ name: Cleanup stale deployments
 # table in the log, then dispatch again with execute=true.
 
 on:
+  # ⭐ SCHEDULED since 2026-08-23 — a manual backstop is no backstop. The close plane
+  # was entirely dispatch-only when 13 just-akash-runner leases held 65 ACT for 23.5h;
+  # this workflow existed, was correct, and never ran. The cron observes ONLY (the
+  # workflow is dry-run by default; a scheduled run has no inputs and inherits
+  # execute=false), so the dispatch-once-execute=true promotion protocol is unchanged —
+  # the schedule adds eyes, not hands. Minute 23: bid-probe fires at 0 */3, canary at
+  # 5,35 — a third cron on :00 would stack API burst against the 5000/hr core budget
+  # that has already blinded this ecosystem's provisioners.
+  schedule:
+    - cron: "23 0,6,12,18 * * *"  # every 6h at :23 — bounds a standing bleed at one interval
   workflow_dispatch:
     inputs:
       execute:
