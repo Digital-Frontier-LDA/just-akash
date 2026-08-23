@@ -1,0 +1,13 @@
+# ⚠ PROBE — df-cicd#149. TEMPORARY; delete with this branch.
+# ARM C: a reusable workflow in THIS repo. Callee visibility = public (same repo).
+# If this yields jobs>0 while both df-cicd arms yield jobs=0, the reusable
+# machinery works and the discriminator is the CALLEE, not the caller.
+name: Probe 149 arm C (same-repo reusable)
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  local:
+    name: arm-c-same-repo
+    uses: ./.github/workflows/probe-149-callee.yml
