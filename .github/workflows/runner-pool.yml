@@ -356,7 +356,22 @@ jobs:
                 - ACCESS_TOKEN=${GH_RUNNER_PAT}
                 - ORG_NAME=${ORG}
                 - RUNNER_SCOPE=org
-                - RUNNER_NAME_PREFIX=akash-${RUNNER_LABEL}
+                # ⛔ `just-akash-`, NOT the shared `akash-`. This name prefix is the ONLY
+                # thing a de-registration backstop can scope itself by — GitHub cannot
+                # filter runners by label — so a prefix shared with another repo's
+                # producers means either repo's reaper deletes the other's registrations.
+                # Blazing-Back/akash-runner.yml and blazing/akash-runner.yml both emit
+                # `akash-*` today. `just-akash-` matches this repo's own Akash placement
+                # convention (just-akash-runner.*, just-akash-canary.*, just-akash-backtest.*),
+                # so it is adopted, not invented.
+                #
+                # ⚠ SAFE TO RENAME, VERIFIED not assumed: no site selects runners by NAME.
+                # All three selectors key on status + LABEL —
+                #   runner-pool.yml:622      select(.status=="online")  + .labels[].name
+                #   runner-teardown.yml:253  select(.status=="offline") + .labels[].name
+                #   runner_probe.py:571      select(.status=="online")  + .labels[].name
+                # A rename that broke one of those would strand leases silently.
+                - RUNNER_NAME_PREFIX=just-akash-${RUNNER_LABEL}
                 - LABELS=self-hosted,linux,akash,${RUNNER_LABEL}
                 - EPHEMERAL=${EPHEMERAL}
                 - DISABLE_AUTO_UPDATE=true
@@ -704,6 +719,53 @@ jobs:
           # Name the world this failure came from. "infra" for everything is what made
           # the hosted-runner fallback invisible.
           if [ "$SAW_BID" = "1" ]; then
+            # ⛔ RE-CHECK THE CREDENTIAL BEFORE NAMING A PROVIDER. This is the ONE
+            # instant where the two causes are still distinguishable, and the verdict
+            # below is the only one in this workflow that writes a durable accusation
+            # about a third party: runner_candidates.py documents `runner_deny` as
+            # "leases but never schedules the runner pod — NEVER try it".
+            #
+            # The preflight at the top of this job already fails fast on a PAT that is
+            # invalid BEFORE provisioning, and the poll loop already refuses to fold an
+            # unreadable listing into "zero runners" (see GITHUB_API_UNAVAILABLE above).
+            # Neither covers the remaining case: a credential that stops working DURING
+            # the ~15-minute window while the listing itself still reads. The runner
+            # container mints its own registration token with this same PAT, so it 403s
+            # and crash-loops while our polls keep succeeding and keep reporting zero.
+            # From here that is byte-identical to a provider that leased and never
+            # scheduled — and the provider is the one that gets the record.
+            #
+            # ⚠ This adds ONE request, on a path that has already failed. It cannot slow
+            # a healthy run because a healthy run exits at the `exit 0` above.
+            #
+            # ⛔ ONE request, not two — same reason the preflight says so: two calls can
+            # disagree, and reporting a status line from a call that succeeded while
+            # branching on one that failed names a code that never belonged to the failure.
+            VERDICT_RESP=$(gh api "orgs/${ORG}/actions/runners?per_page=1" -i 2>&1) || true
+            VERDICT_CODE=$(printf '%s' "$VERDICT_RESP" | awk 'NR==1{print $2}')
+            case "${VERDICT_CODE:-000}" in
+              200)
+                : ;;   # the credential still works, so the provider verdict below stands
+              401)
+                echo "failure_reason=RUNNER_PAT_INVALID" >> "$GITHUB_OUTPUT"
+                echo "::error title=The runner PAT died mid-run — this is NOT a provider fault::Bids were won and the lease was taken, but GH_RUNNER_PAT no longer authenticates (HTTP 401) at the moment of the verdict. The runner container mints its registration token with this same credential, so it could never have registered no matter which provider hosted it. ⛔ Do NOT runner_deny anyone on this run. Rotate the PAT."
+                exit 1 ;;
+              403|429)
+                # The reason GITHUB_API_UNAVAILABLE exists, in this output's own words:
+                # folding it into RUNNER_NEVER_REGISTERED "would runner_deny providers
+                # for our own rate limit".
+                echo "failure_reason=GITHUB_API_UNAVAILABLE" >> "$GITHUB_OUTPUT"
+                echo "::error title=Our API budget was exhausted mid-run — this is NOT a provider fault::Bids were won and the lease was taken, but GH_RUNNER_PAT is rate-limited (HTTP ${VERDICT_CODE}) at the moment of the verdict. The runner container mints its registration token with this same credential, so it could never have registered. ⛔ Do NOT runner_deny anyone on this run."
+                exit 1 ;;
+              *)
+                # ⚠ UNKNOWN is not innocent and it is not guilty. An unreadable check
+                # cannot clear the credential, so it must not license the accusation —
+                # the same reason runner_probe.py marks the ambiguous case `unknown`
+                # rather than `runner_deny`.
+                echo "failure_reason=INDETERMINATE" >> "$GITHUB_OUTPUT"
+                echo "::error title=Runners never registered and the credential could not be re-checked::Bids were won and the lease was taken, but the verdict-time credential check returned HTTP ${VERDICT_CODE:-no status}. ⛔ That is NOT evidence the provider is at fault — it is the absence of evidence either way. Do NOT runner_deny anyone on this run."
+                exit 1 ;;
+            esac
             echo "failure_reason=RUNNER_NEVER_REGISTERED" >> "$GITHUB_OUTPUT"
             echo "::error title=Leases won, runners never registered::A provider took the lease but the runner never came online. That provider is a candidate for runner_deny — qualify it with 'just-akash runner-probe'."
           elif [ "$SAW_SEQ_CONTENTION" = "1" ]; then
