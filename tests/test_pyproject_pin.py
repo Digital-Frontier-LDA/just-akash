@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -82,11 +83,26 @@ def test_pin_points_to_digital_frontier_lda(pin_line: str) -> None:
         f'akash_lease_core-X.Y.Z-py3-none-any.whl#sha256=<64-hex>"'
     )
     url = match.group("url")
-    assert "Digital-Frontier-LDA/akash-lease-core" in url
-    assert "github.com" in url
-    # No PyPI, no arbitrary artifact stores.
-    assert "pypi.org" not in url
-    assert "gitlab" not in url
+    # ⚠ Compare the HOST, not a substring. `"github.com" in url` is satisfied by
+    # `https://evil.example/?r=github.com` and by `https://github.com.attacker.net/`,
+    # so it asserts something weaker than it appears to (CodeQL: incomplete URL
+    # substring sanitization, alert 34).
+    #
+    # It happens to be UNEXPLOITABLE here, because `_PIN_PATTERN` anchors at `^` and
+    # begins with the literal `https://github\.com/`. That is exactly why it is worth
+    # fixing rather than dismissing: the assertion is correct only because of something
+    # OUTSIDE it. Parameterise that host one day and this line goes on passing while it
+    # stops protecting anything — a guard whose correctness is on loan.
+    host = urlsplit(url).netloc
+    assert host == "github.com", f"pin must be hosted on github.com, got {host!r}: {url!r}"
+    assert url.startswith("https://github.com/Digital-Frontier-LDA/akash-lease-core/"), (
+        f"pin must point at this org's own release path: {url!r}"
+    )
+    # No PyPI, no arbitrary artifact stores — a host check, for the same reason.
+    assert host not in {"pypi.org", "files.pythonhosted.org"}, (
+        f"pin must not be a PyPI URL: {url!r}"
+    )
+    assert "gitlab" not in host, f"pin must not be a GitLab URL: {url!r}"
 
 
 def test_pin_includes_sha256_digest(pin_line: str) -> None:
