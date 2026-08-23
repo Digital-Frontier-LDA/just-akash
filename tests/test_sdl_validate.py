@@ -224,3 +224,79 @@ def test_repo_sdl_passes():
 
     sdl = Path(__file__).resolve().parent.parent / "sdl" / "cpu-backtest-ssh.yaml"
     validate_sdl(sdl.read_text())
+
+
+def test_all_shipped_sdl_files_declare_bid_window():
+    """C5 review item 1 (issue #178): every shipped SDL documents the
+    bounded bid window.
+
+    The Akash SDL spec has no native `bid_timeout` field. The bounded window
+    is enforced client-side by `just-akash deploy --bid-wait` (default 60s)
+    and pinned by `AuctionPolicy.collection_window_seconds` in the shared
+    `akash-lease-core` package. To make the contract visible at the SDL
+    boundary (so a future SDL that drifts to the wrong window is caught at
+    validation rather than at runtime), every shipped SDL carries a
+    `# just-akash:` annotation block that names the window. This test walks
+    every `sdl/*.yaml` and fails if any one is missing the annotation.
+
+    The annotation lives in the header comment block (above `version: "2.0"`),
+    not in a structured SDL field, so this is a text-level check — keep it
+    cheap and grep-friendly.
+    """
+    from pathlib import Path
+
+    sdl_dir = Path(__file__).resolve().parent.parent / "sdl"
+    sdl_files = sorted(p for p in sdl_dir.glob("*.yaml") if p.is_file())
+    assert sdl_files, f"no SDL files found in {sdl_dir}"
+
+    missing: list[str] = []
+    for sdl_path in sdl_files:
+        text = sdl_path.read_text(encoding="utf-8")
+        if "# just-akash:" not in text or "bid-window" not in text:
+            missing.append(sdl_path.name)
+
+    assert not missing, (
+        f"shipped SDLs missing the `# just-akash: bid-window = ...` "
+        f"annotation: {missing}. Add the header comment per C5 review "
+        f"issue #178 (just-akash)."
+    )
+
+
+def test_bid_window_annotation_references_collection_window_contract():
+    """The annotation block cites the live contract, not a stale string.
+
+    Two anchoring facts must be present together so a future edit that
+    drifts the deploy-side window from 60s and forgets the SDL is caught:
+    (a) `--bid-wait` and the default 60s, and (b) the shared core's
+    `AuctionPolicy.collection_window_seconds` reference. Both names appear
+    in the verbatim annotation block added to each SDL header — searching
+    for the SUBSTRINGS catches a deleted token without parsing the YAML.
+    """
+    from pathlib import Path
+
+    sdl_dir = Path(__file__).resolve().parent.parent / "sdl"
+    for sdl_path in sorted(sdl_dir.glob("*.yaml")):
+        text = sdl_path.read_text(encoding="utf-8")
+        assert "# just-akash:" in text, f"{sdl_path.name} missing `# just-akash:` tag"
+        assert "bid-window" in text, f"{sdl_path.name} missing `bid-window` key"
+        assert "--bid-wait" in text, (
+            f"{sdl_path.name} annotation does not cite `--bid-wait`; "
+            f"if the deploy CLI flag renamed, update the annotation in lockstep"
+        )
+        assert "60s" in text, (
+            f"{sdl_path.name} annotation does not cite the 60s default; "
+            f"if the default changed, update the annotation in lockstep"
+        )
+        assert "AuctionPolicy" in text, (
+            f"{sdl_path.name} annotation does not cite the shared "
+            f"AuctionPolicy; if the core renamed, update the annotation"
+        )
+        assert "collection_window_seconds" in text, (
+            f"{sdl_path.name} annotation does not cite "
+            f"`collection_window_seconds`; if the core renamed, update "
+            f"the annotation"
+        )
+        assert "akash-lease-core" in text, (
+            f"{sdl_path.name} annotation does not cite the `akash-lease-core` "
+            f"package; if the pin renamed, update the annotation"
+        )
