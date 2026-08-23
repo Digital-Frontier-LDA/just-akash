@@ -141,7 +141,7 @@ def test_early_publication_sits_right_after_the_dseq_parse():
     """The publication belongs immediately after DSEQ is parsed from the deploy log —
     before the orphan-close branch, before any wait. Anything between parse and
     publication is a leak window."""
-    parse = SRC.find('DSEQ=$(awk')
+    parse = SRC.find("DSEQ=$(awk")
     publish = SRC.find('echo "dseq=$DSEQ" >> "$GITHUB_OUTPUT"')
     assert parse != -1 and publish != -1 and publish > parse, (
         "the early dseq publication does not follow the DSEQ parse"
