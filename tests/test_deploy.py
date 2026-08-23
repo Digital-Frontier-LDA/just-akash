@@ -1,5 +1,6 @@
 """Tests for just_akash.deploy — deployment orchestrator."""
 
+import time
 from unittest.mock import patch
 
 import pytest
@@ -7,6 +8,9 @@ import pytest
 from just_akash.deploy import (
     _classify_bid,
     _fmt_price,
+    _fmt_window_deadline,
+    _fmt_window_progress_bar,
+    _fmt_window_status_line,
     _inject_env_into_sdl,
     _log_bid_table,
     deploy,
@@ -21,6 +25,138 @@ class TestFmtPrice:
     def test_usd(self):
         bid = {"price": {"amount": 5, "denom": "usd"}}
         assert _fmt_price(bid) == "5.0 usd"
+
+
+class TestWindowDeadlineFormat:
+    """C5 review item 3 (issue #178): the bounded bid-collection window
+    must be visible to operators. Silence reads as 'nothing is happening'
+    and has driven past C-tier misclassifications. The deadline formatter
+    is the wall-clock anchor of the new status line — every test pins a
+    concrete shape so a future edit that drifts the format is caught here.
+    """
+
+    def test_zero_epoch_renders_canonical_utc_iso(self):
+        # 1970-01-01T00:00:00Z — proves the formatter pins the format to UTC
+        # explicitly, not the local timezone, so CI logs from different
+        # runners correlate.
+        assert _fmt_window_deadline(0.0) == "1970-01-01T00:00:00Z"
+
+    def test_format_matches_log_helper_for_same_input(self):
+        # The deadline string is what every other log line uses. If the
+        # formatter diverged from _ts(), grep for either would silently miss
+        # the deadline line in CI artifact scraping.
+        from datetime import datetime, timezone
+
+        deadline_epoch = 1_726_444_800.0  # 2024-09-22T00:00:00Z
+        expected = datetime.fromtimestamp(deadline_epoch, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        assert _fmt_window_deadline(deadline_epoch) == expected
+
+    def test_fractional_seconds_are_not_emitted(self):
+        # The format MUST drop sub-second precision. The CLI poll loop
+        # formats every iteration with .now(), and a fractional tail would
+        # break the fixed-width status line layout (C5 review item 3).
+        assert "." not in _fmt_window_deadline(time.time())
+
+
+class TestWindowProgressBar:
+    """The progress bar is informational only; the actual selection
+    deadline lives in `collection_deadline = start_time + bid_wait`. These
+    tests pin the visual shape so a future edit doesn't make the bar
+    invisible to a tail -f operator.
+    """
+
+    def test_zero_filled_is_all_dashes(self):
+        assert _fmt_window_progress_bar(0, 60) == "[--------------------]"
+
+    def test_full_is_all_hashes(self):
+        assert _fmt_window_progress_bar(60, 60) == "[####################]"
+
+    def test_half_is_balanced(self):
+        # 20 chars wide; 30/60 = 0.5 → 10 hashes, 10 dashes.
+        assert _fmt_window_progress_bar(30, 60) == "[##########----------]"
+
+    def test_overflow_is_capped_not_negative_indexed(self):
+        # A clock that drifted past the deadline (rare but possible during
+        # clock-step adjustments) must NOT crash the formatter with a
+        # negative width slice.
+        assert _fmt_window_progress_bar(120, 60) == "[####################]"
+
+    def test_zero_total_does_not_divide_by_zero(self):
+        # A zero or negative bid_wait would be a config error upstream;
+        # the bar formatter must still emit a sane string rather than
+        # raise.
+        assert _fmt_window_progress_bar(30, 0).startswith("[") and _fmt_window_progress_bar(
+            30, 0
+        ).endswith("]")
+
+    def test_bar_is_always_exactly_22_chars(self):
+        # The status line aligns every iteration; a width drift would
+        # produce a jagged tail -f output that operators read as broken.
+        for elapsed in (0, 1, 30, 59, 60, 120):
+            assert len(_fmt_window_progress_bar(elapsed, 60)) == 22
+
+
+class TestWindowStatusLine:
+    """The per-poll status line is what an operator tail -f sees for the
+    full window. Its shape is pinned here so a future edit cannot drift
+    the deadline visibility (C5 review item 3, issue #178).
+    """
+
+    def test_includes_deadline_timestamp(self):
+        line = _fmt_window_status_line(
+            elapsed=10,
+            total=60,
+            deadline_iso="2026-08-23T12:00:00Z",
+            poll_count=3,
+            bid_count=0,
+            bar=_fmt_window_progress_bar(10, 60),
+        )
+        assert "2026-08-23T12:00:00Z" in line
+        assert "deadline=" in line
+
+    def test_includes_progress_bar_and_counter(self):
+        line = _fmt_window_status_line(
+            elapsed=30,
+            total=60,
+            deadline_iso="2026-08-23T12:00:00Z",
+            poll_count=5,
+            bid_count=2,
+            bar=_fmt_window_progress_bar(30, 60),
+        )
+        assert "[##########----------]" in line
+        assert "30/60s" in line
+        assert "( 50%)" in line
+        assert "bids=2" in line
+        assert "poll=#5" in line
+
+    def test_includes_zero_bid_count_when_empty(self):
+        line = _fmt_window_status_line(
+            elapsed=0,
+            total=60,
+            deadline_iso="2026-08-23T12:00:00Z",
+            poll_count=1,
+            bid_count=0,
+            bar=_fmt_window_progress_bar(0, 60),
+        )
+        assert "bids=0" in line
+        assert " 0/60s" in line
+        assert "(  0%)" in line
+
+    def test_zero_total_does_not_divide_by_zero(self):
+        # A zero bid_wait is a config error but the formatter must still
+        # emit something — the polling loop runs through this on every
+        # iteration and a raise here would crash every deploy.
+        line = _fmt_window_status_line(
+            elapsed=5,
+            total=0,
+            deadline_iso="2026-08-23T12:00:00Z",
+            poll_count=2,
+            bid_count=0,
+            bar=_fmt_window_progress_bar(5, 0),
+        )
+        assert "deadline=2026-08-23T12:00:00Z" in line
 
 
 class TestLogBidTable:
