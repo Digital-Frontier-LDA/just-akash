@@ -337,7 +337,13 @@ def render_sdl(
         # A placeholder still forces the container to be SCHEDULED and started, which is
         # the discriminator. It simply fails to register afterwards.
         "TOKEN_ENV": f"{token_kind}={token}" if token else "ACCESS_TOKEN=probe-no-token",
-        "RUNNER_NAME_PREFIX": label,
+        # ⛔ MUST carry the same `just-akash-` prefix the pool emits. This is the
+        # SECOND emitter in this repo, and the probe does NOT de-register what it
+        # registers — so its leftovers are exactly what a backstop exists to reap.
+        # A backstop scoped to `just-akash-` while this emitted a bare label would
+        # reap nothing here and report success: a half-applied rename is worse than
+        # no rename, because it looks like coverage.
+        "RUNNER_NAME_PREFIX": f"just-akash-{label}",
         "LABELS": f"self-hosted,linux,akash,{label}",
     }.items():
         body = body.replace("{{" + key + "}}", val)

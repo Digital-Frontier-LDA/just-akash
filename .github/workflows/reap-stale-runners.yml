@@ -1,0 +1,95 @@
+name: Reap stale org-runner registrations (reusable)
+
+# This repo's runner producers name their registrations `just-akash-*`. This wrapper is
+# where that fact meets the de-registration backstop, so a caller adopts the backstop
+# WITHOUT having to know this repo's naming convention — and cannot get it wrong.
+#
+# ⛔ WHY THIS IS `workflow_call` AND NOT SCHEDULED. A scheduled reaper here would be a
+# backstop that reaps nothing and reports success:
+#
+#   * just-akash HOLDS NO RUNNER PAT, by policy. `.github/scripts/check_repo_invariants.py`
+#     states it directly — "a caller brings its own Akash account and its own runner PAT,
+#     and this repo must never hold either". A cron here would run with an empty secret.
+#   * IT CANNOT KNOW THE ORG. `runner-pool.yml` takes `github-org` as a REQUIRED input with
+#     no default, and `just-akash runner-probe --org` defaults to $GITHUB_ORG. Registrations
+#     land in whichever org the CALLER named. Measured: no in-repo caller of runner-pool.yml
+#     exists, and a code search across both orgs returned only docs, templates, checker code
+#     and tests — never a live call site. There is no org this repo could hard-code that
+#     would be right.
+#
+# So the caller schedules it, because the caller is what owns the org and the PAT. That is
+# the same division `runner-pool.yml` and `runner-teardown.yml` already use.
+#
+# ⛔ NOT A SECOND IMPLEMENTATION. The DELETE lives in df-cicd's reusable workflow, pinned
+# below to an immutable commit. A second de-registration loop here is the drift defect the
+# standard exists to prevent.
+#
+# CALLER CALL SITE — schedule it in the repo that owns the org:
+#
+#   on:
+#     schedule:
+#       - cron: "47 1,7,13,19 * * *"
+#   jobs:
+#     reap:
+#       uses: Digital-Frontier-LDA/just-akash/.github/workflows/reap-stale-runners.yml@<sha>
+#       with:
+#         github-org: my-org
+#         dry-run: false
+#       secrets:
+#         GH_RUNNER_PAT: ${{ secrets.GH_RUNNER_PAT }}
+#
+# ⚠ THE PRE-RENAME BACKLOG IS OUT OF SCOPE, DELIBERATELY. Registrations made before the
+# `akash-` -> `just-akash-` rename will not match this prefix. Scoping to `akash-` instead
+# would delete Blazing-Back's and blazing's runners, which emit that same shared prefix —
+# no repo can safely claim it. Draining the backlog needs a one-off, human-authorised sweep.
+
+on:
+  workflow_call:
+    inputs:
+      github-org:
+        description: 'GitHub org whose stale `just-akash-*` registrations to reap.'
+        required: true
+        type: string
+      dry-run:
+        description: Report only. Defaults TRUE — a destructive default is how sweepers
+          delete before anyone has read their output.
+        required: false
+        default: true
+        type: boolean
+      api-floor:
+        description: >-
+          Stop reaping when remaining core REST quota falls below this. The reaper competes
+          with the runner PROVISIONER for one budget, and a blinded provisioner orphans
+          runners — an unbounded reaper causes the leak it is cleaning up.
+        required: false
+        default: 1500
+        type: number
+    secrets:
+      GH_RUNNER_PAT:
+        description: PAT with org admin:org scope, supplied by the caller.
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  reap-stale-runners:
+    # ⛔ PINNED TO AN IMMUTABLE COMMIT, not a tag or branch. A tag can move, and a
+    # de-registration loop whose behaviour changes without a commit here is not a backstop.
+    # Verified BY CONTENT rather than by a quoted sha — this is the commit that ADDED
+    # reusable-stale-runner-reaper.yml and it is an ancestor of df-cicd main:
+    #   91eb19a913c640cbff6181ded1fb93d849fad4ad
+    #   feat(akash-runner): ship the de-registration backstop the standard already required (#145)
+    uses: Digital-Frontier-LDA/df-cicd/.github/workflows/reusable-stale-runner-reaper.yml@91eb19a913c640cbff6181ded1fb93d849fad4ad
+    with:
+      org: ${{ inputs.github-org }}
+      # ⛔ MUST equal what this repo's SDLs actually emit. runner-pool.yml emits
+      # `just-akash-${RUNNER_LABEL}`; runner_probe.py emits `just-akash-{label}`.
+      # tests/test_runner_name_prefix_invariants.py fails if this and those diverge —
+      # a half-applied rename leaves a reaper scoped to something nobody emits, which
+      # reaps nothing and reports success.
+      name-prefixes: just-akash-
+      dry-run: ${{ inputs.dry-run }}
+      api-floor: ${{ inputs.api-floor }}
+    secrets:
+      runner-pat: ${{ secrets.GH_RUNNER_PAT }}
