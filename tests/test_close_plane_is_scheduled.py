@@ -24,7 +24,6 @@ cost. Minute OFFSET (23, not 0) to avoid stacking API burst with bid-probe's
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import yaml
@@ -117,7 +116,7 @@ def test_scheduled_workflows_do_not_stack_on_the_same_minute():
             doc = yaml.safe_load(f.read_text())
         except Exception:
             continue
-        for s in (_triggers(doc).get("schedule") or []):
+        for s in _triggers(doc).get("schedule") or []:
             cron = str(s.get("cron", ""))
             if cron:
                 entries.append((f.name, cron))
@@ -126,9 +125,9 @@ def test_scheduled_workflows_do_not_stack_on_the_same_minute():
     # separate change; THIS pin guards only what this PR adds — cleanup-stale's
     # minute (23) must be unique — so the pin is exact, not a blanket that would
     # fail today for reasons predating this change.
-    ours = [name for name, cron in entries if "cleanup-stale" in name]
     others = [cron for name, cron in entries if "cleanup-stale" not in name]
-    our_minute = next(c.split()[0] for n in ours for c in [next(c for nn, c in entries if nn == n)])
+    our_cron = next(c for nn, c in entries if "cleanup-stale" in nn)
+    our_minute = our_cron.split()[0]
     colliding = [c for c in others if c.split()[0] == our_minute]
     assert not colliding, (
         f"cleanup-stale's cron minute {our_minute} collides with existing crons "
