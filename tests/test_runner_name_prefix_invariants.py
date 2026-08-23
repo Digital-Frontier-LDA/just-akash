@@ -30,12 +30,25 @@ REAPER = REPO / ".github" / "workflows" / "reap-stale-runners.yml"
 OWNED_PREFIX = "just-akash-"
 
 # Prefixes owned by OTHER repos that register into the same org(s).
-FOREIGN_PREFIXES = ("df-core-", "df-flow-", "df-cicd-", "akash-", "akash-ci-", "akash-integration-")
+FOREIGN_PREFIXES = (
+    "df-core-",
+    "df-flow-",
+    "df-cicd-",
+    "akash-",
+    "akash-ci-",
+    "akash-integration-",
+)
 
 # `RUNNER_NAME_PREFIX=<literal>${VAR}` (SDL) or `"RUNNER_NAME_PREFIX": f"<literal>{var}"` (python).
 EMITTERS = (
-    (Path(".github/workflows/runner-pool.yml"), re.compile(r"RUNNER_NAME_PREFIX=([A-Za-z0-9._-]*)")),
-    (Path("just_akash/runner_probe.py"), re.compile(r'"RUNNER_NAME_PREFIX":\s*f?"([A-Za-z0-9._-]*)')),
+    (
+        Path(".github/workflows/runner-pool.yml"),
+        re.compile(r"RUNNER_NAME_PREFIX=([A-Za-z0-9._-]*)"),
+    ),
+    (
+        Path("just_akash/runner_probe.py"),
+        re.compile(r'"RUNNER_NAME_PREFIX":\s*f?"([A-Za-z0-9._-]*)'),
+    ),
 )
 
 
@@ -67,7 +80,9 @@ def _reaper_job() -> dict:
 def _configured_prefixes() -> list[str]:
     raw = _reaper_job()["with"]["name-prefixes"]
     parts = [p.strip() for p in str(raw).split(",") if p.strip()]
-    assert parts, "name-prefixes is blank — the reusable workflow fails closed on this, but so should we"
+    assert parts, (
+        "name-prefixes is blank — the reusable workflow fails closed on this, but so should we"
+    )
     return parts
 
 
