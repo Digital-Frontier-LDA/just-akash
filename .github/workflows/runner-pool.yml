@@ -356,7 +356,22 @@ jobs:
                 - ACCESS_TOKEN=${GH_RUNNER_PAT}
                 - ORG_NAME=${ORG}
                 - RUNNER_SCOPE=org
-                - RUNNER_NAME_PREFIX=akash-${RUNNER_LABEL}
+                # ⛔ `just-akash-`, NOT the shared `akash-`. This name prefix is the ONLY
+                # thing a de-registration backstop can scope itself by — GitHub cannot
+                # filter runners by label — so a prefix shared with another repo's
+                # producers means either repo's reaper deletes the other's registrations.
+                # Blazing-Back/akash-runner.yml and blazing/akash-runner.yml both emit
+                # `akash-*` today. `just-akash-` matches this repo's own Akash placement
+                # convention (just-akash-runner.*, just-akash-canary.*, just-akash-backtest.*),
+                # so it is adopted, not invented.
+                #
+                # ⚠ SAFE TO RENAME, VERIFIED not assumed: no site selects runners by NAME.
+                # All three selectors key on status + LABEL —
+                #   runner-pool.yml:622      select(.status=="online")  + .labels[].name
+                #   runner-teardown.yml:253  select(.status=="offline") + .labels[].name
+                #   runner_probe.py:571      select(.status=="online")  + .labels[].name
+                # A rename that broke one of those would strand leases silently.
+                - RUNNER_NAME_PREFIX=just-akash-${RUNNER_LABEL}
                 - LABELS=self-hosted,linux,akash,${RUNNER_LABEL}
                 - EPHEMERAL=${EPHEMERAL}
                 - DISABLE_AUTO_UPDATE=true
