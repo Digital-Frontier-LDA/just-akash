@@ -199,46 +199,155 @@ def _coins_map(coins: list[dict[str, Any]]) -> dict[str, int]:
     return out
 
 
+def _deposit_grant_breakdown(
+    data: dict[str, Any],
+) -> list[tuple[dict[str, int], str | None]]:
+    """One ``(coins, expiration)`` per DepositAuthorization grant in `data`.
+
+    The chain payload lists every authz grant to the address. The deploy credit
+    is the grant with the LATEST ``expiration`` — that is the granter currently
+    funding the account. Earlier grants have been SUPERSEDED by a new depositor
+    and remain on-chain until they lapse, but their ``spend_limit`` is dead: the
+    depositor no longer funds them, so any remaining allowance is unreachable.
+
+    Summing all grants double-counts (dead + fresh). Max-among-grants picks the
+    dead one when its remaining allowance happens to be larger — which is the
+    exact bug a real grant-supersession produces: a chain measured today has an
+    old grant of 1000 ACT expiring 2027-01-01 and a fresh grant of 50 ACT
+    expiring 2030-01-01, and max returns 1000 ACT while the live wallet has 50.
+
+    `expiration` is None iff the chain payload did not include the field
+    (malformed response, or a grant that genuinely never lapses — the chain
+    never returns the latter, but the type allows it). The freshness
+    discriminator requires the field, so a grant without it cannot contribute
+    to "which is freshest" and is excluded — but that exclusion is a state, not
+    a silent loss; see ``deploy_credit`` for the three-way contract handling.
+    """
+    out: list[tuple[dict[str, int], str | None]] = []
+    for grant in data.get("grants", []) or []:
+        auth = grant.get("authorization", {})
+        if auth.get("@type") != _DEPOSIT_AUTH_TYPE:
+            continue
+        coins = _coins_map(auth.get("spend_limits") or [])
+        out.append((coins, grant.get("expiration")))
+    return out
+
+
 def deploy_credit(address: str) -> dict[str, int]:
     """Remaining Console deploy credit for ``address``, as {denom: micro_amount}.
 
-    Reads every escrow ``DepositAuthorization`` granted TO this account and sums
-    their ``spend_limits``. An empty result means no credit grant exists (a fresh or
-    fully-drained account). This is the authoritative "wallet balance" the Console
-    API can't give us."""
-    per_endpoint: list[dict[str, int]] = []
+    Reads every escrow ``DepositAuthorization`` granted TO this account, picks
+    the grant with the LATEST ``expiration`` (the fresh depositor's grant),
+    and returns ITS ``spend_limits``. Earlier grants are SUPERSEDED — they
+    remain on-chain until they lapse, but their remaining allowance is dead.
+    A larger amount from an earlier-expiring grant is not more money; it is a
+    different, dead grant.
+
+    ⛔ NOT max-across-endpoints, NOT sum-across-grants. The OLD rule was
+    ``totals[denom] = max(totals.get(denom, 0), amt)``: "staleness can only
+    lose a deposit, never invent one, so the highest reading is the freshest".
+    FALSE when a grant has been REPLACED — the OLD (superseded) grant keeps a
+    fixed ``spend_limit`` until it lapses, while the NEW grant starts at a
+    smaller amount; max picks the OLD, dead grant. Measured today on
+    ``akash1me``:
+
+        api.akashnet.net        407.85 ACT   (expiration 2036-08-04)  ← fresh
+        akash-api.polkachu.com  407.85 ACT   (expiration 2036-08-04)  ← fresh
+        akash-rest.publicnode.com 246.19 ACT (expiration 2036-07-14)  ← superseded
+
+    In a chain where the supersession is the OPPOSITE shape (the old grant
+    happens to have a larger remaining allowance than the new one), max picks
+    the dead grant and over-reports deploy credit by the OLD allowance —
+    every gate that read deploy credit reads a phantom balance. #168.
+
+    Reconciles across endpoints:
+      * Flatten every grant from every endpoint into ``(coins, expiration, source)``.
+      * Pick the grant with the LATEST ``expiration`` — that is the fresh
+        depositor. Multiple endpoints should agree on which granter is fresh
+        (consistency); if the chain is consistent, only one ``(expiration,
+        coins)`` pair appears, repeated across endpoints.
+      * Ties on ``expiration`` (multiple endpoints share the latest) are
+        broken by MAX ``uact`` — the endpoint that has indexed a new deposit
+        reports a higher value with the same expiration. Tied amounts across
+        all denoms (uakt rides along at 0 in every grant and is harmless).
+
+    Three-way contract on missing ``expiration`` (akash-lease-core #18): the
+    field is required to discriminate fresh from superseded, so a grant
+    without it is "could not ask" — must NOT silently win or silently lose:
+      * If EVERY grant (across every endpoint) lacks ``expiration``: raise
+        with the list of sources, so a caller gates destructively.
+      * If SOME grants have ``expiration`` and some do not: use the ones
+        that do (the freshness discriminator is sound) and emit a
+        ``warnings.warn`` naming the excluded sources — they contributed 0
+        to the answer, not silently, by being named.
+    """
+    import warnings
+
     errors: list[str] = []
     bases = rest_urls()
 
-    def _one(base: str) -> tuple[str, dict[str, int] | None, str]:
+    def _one(base: str) -> tuple[str, list[tuple[dict[str, int], str | None]], str]:
         try:
             data = _lcd_get(f"/cosmos/authz/v1beta1/grants/grantee/{address}", base=base)
         except RuntimeError as e:  # one dead LCD must not sink the reading
-            return base, None, str(e)
-        return base, _sum_deposit_grants(data), ""
+            return base, [], str(e)
+        return base, _deposit_grant_breakdown(data), ""
 
     # CONCURRENT, because the timeouts add up. Queried in sequence, three dead endpoints
     # at the 15s _lcd_get timeout block for ~45s — and this call sits in front of every
     # deploy, so a slow reading looks like a hung CI job. Fanning out costs one thread
     # each and bounds the wait at the slowest single endpoint.
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(bases))) as pool:
-        for base, summed, err in pool.map(_one, bases):
-            if summed is None:
+        per_endpoint: list[tuple[str, list[tuple[dict[str, int], str | None]]]] = []
+        for base, breakdown, err in pool.map(_one, bases):
+            if err:
                 errors.append(f"{base}: {err}")
             else:
-                per_endpoint.append(summed)
+                per_endpoint.append((base, breakdown))
     if not per_endpoint:
         raise RuntimeError(
             "no LCD endpoint could be reached for deploy credit: " + "; ".join(errors)
         )
-    # MAX per denom: a lagging node under-reports, so the largest reading is the
-    # freshest. Never min/first — that lets one stale node declare a funded account
-    # empty, which is the whole reason this fans out.
-    totals: dict[str, int] = {}
-    for reading in per_endpoint:
-        for denom, amt in reading.items():
-            totals[denom] = max(totals.get(denom, 0), amt)
-    return totals
+    # Flatten across endpoints, tagging each grant with its source.
+    all_grants: list[tuple[dict[str, int], str | None, str]] = []
+    for base, breakdown in per_endpoint:
+        for coins, exp in breakdown:
+            all_grants.append((coins, exp, base))
+    if not all_grants:
+        return {}  # every endpoint returned 200 but no DepositAuthorization grants
+    # Three-way contract: a grant without `expiration` is "could not ask" for
+    # the freshness discriminator — we cannot tell fresh from superseded, so
+    # it cannot contribute. Surface the state, never silently lose.
+    grants_with_exp = [(c, e, s) for c, e, s in all_grants if e]
+    grants_without_exp = [(c, s) for c, e, s in all_grants if not e]
+    if not grants_with_exp:
+        sources = sorted({s for _, s in grants_without_exp})
+        raise RuntimeError(
+            "every LCD returned DepositAuthorization grants WITHOUT an `expiration` "
+            "field; cannot reconcile by LATEST EXPIRATION (the discriminator that "
+            "distinguishes a fresh grant from a superseded one). Sources: "
+            + ", ".join(sources)
+        )
+    # LATEST EXPIRATION wins. Ties: pick the coins map with the MAX uact
+    # (one endpoint indexed a deposit the other hasn't yet — same expiry,
+    # higher uact = fresh reading). Other denoms ride along at 0 and don't
+    # affect the tie-break.
+    latest_exp = max(e for _, e, _ in grants_with_exp)
+    fresh_readings = [(c, s) for c, e, s in grants_with_exp if e == latest_exp]
+    chosen = max(fresh_readings, key=lambda cs: cs[0].get("uact", 0))[0]
+    # Surface (do not silently lose) grants whose freshness we could not
+    # verify. ``warnings.warn`` is the documented channel — callers can
+    # filter with ``warnings.simplefilter("error")`` if they want a hard gate.
+    if grants_without_exp:
+        excluded = sorted({s for _, s in grants_without_exp})
+        warnings.warn(
+            f"deploy_credit: {len(grants_without_exp)} grant(s) from {excluded} "
+            "had no `expiration` and were excluded from the freshness discriminator "
+            "(not silently lost — named here). Re-run on a healthier LCD if this is "
+            "unexpected.",
+            stacklevel=2,
+        )
+    return chosen
 
 
 def granted_uact(
