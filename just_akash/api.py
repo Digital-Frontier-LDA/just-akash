@@ -1035,6 +1035,14 @@ def _reconcile_lease_row(d: dict[str, Any]) -> dict[str, Any]:
         or lease_state in TERMINAL_DEPLOYMENT_STATES
         or escrow_state in ("closed", "overdrawn")
         or (escrow_uact is not None and escrow_uact <= 0)
+        # Active deployment that no provider ever bid on — the bid window closed
+        # (or expired) without a lease, nothing is running, and the escrow is held
+        # against nothing. Closing it releases the locked deposit back to the
+        # grant (verified on the Console UI). See #123: a deployment with
+        # ``lease_count==0`` and ``lease_state is None`` is by definition orphaned
+        # at the bid window. NOT flagging active-with-leases — that is the load-
+        # bearing negative control, see ``TestReconcileLeaseRow``.
+        or (dep_state == "active" and lease_count == 0)
     )
     return {
         "dseq": dseq,
