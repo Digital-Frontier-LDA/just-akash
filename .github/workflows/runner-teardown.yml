@@ -38,6 +38,24 @@ name: Akash runner teardown
 on:
   workflow_call:
     inputs:
+      just-akash-ref:
+        description: >-
+          REQUIRED, no default. The just-akash revision to close the lease WITH.
+          Pass the same ref you pinned this workflow to.
+
+          NO DEFAULT ON PURPOSE — see runner-pool.yml's input of the same name. It
+          bites harder here: a checkout that yields no `just-akash` binary fails the
+          destroy, and the lease keeps holding escrow against the grant the next run
+          spends from (#184).
+        required: true
+        type: string
+      just-akash-repository:
+        description: >-
+          Repository to take the just-akash CLI from. Defaults to this repo; override
+          it so a fork's callers close leases with the FORK's CLI.
+        required: false
+        default: 'Digital-Frontier-LDA/just-akash'
+        type: string
       dseq:
         description: 'Deployment to close. Empty is a no-op, not an error.'
         required: false
@@ -116,8 +134,8 @@ jobs:
       # the lease keeps holding escrow against the grant the next run spends from.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: ${{ job.workflow_repository || 'Digital-Frontier-LDA/just-akash' }}
-          ref: ${{ job.workflow_sha }}
+          repository: ${{ inputs.just-akash-repository }}
+          ref: ${{ inputs.just-akash-ref }}
           path: .just-akash
           persist-credentials: false
 

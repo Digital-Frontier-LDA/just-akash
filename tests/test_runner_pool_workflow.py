@@ -75,6 +75,25 @@ def test_tag_prefix_is_required_and_has_no_default():
     )
 
 
+def test_the_just_akash_ref_is_required_and_has_no_default():
+    """A default here is the #184 bug written down as configuration.
+
+    The pin cannot be derived — no context exposes a reusable workflow's own revision to
+    itself (`github.workflow_*` names the CALLER's entry workflow; `job.*` carries only
+    check_run_id/container/services/status). So the only honest options are "the caller
+    supplies it" or "it floats". A default makes it float while LOOKING pinned from the
+    caller's side, which is how every runner came to be built from main's tip at
+    deploy-second while callers believed their pin was honoured.
+
+    Same reasoning as tag-prefix above, and the same remedy: force the caller to say it.
+    """
+    assert INPUTS["just-akash-ref"]["required"] is True
+    assert "default" not in INPUTS["just-akash-ref"], (
+        "a default just-akash-ref silently provisions from whatever main is at "
+        "deploy-second — the unpinned window #184 closed"
+    )
+
+
 def test_the_tag_carries_run_identity():
     """Without run_id a sweeper cannot distinguish this run's lease from a sibling's."""
     assert "${TAG_PREFIX}-${RUN_ID}" in PROVISION["run"]
@@ -316,7 +335,7 @@ def test_the_workflow_checks_out_just_akash_not_the_caller():
         with_ = _checkout(steps).get("with", {})
         repo = str(with_.get("repository", ""))
         assert repo, f"{label}: a bare checkout fetches the CALLER's repo, which has no just_akash"
-        assert "job.workflow_repository" in repo or repo.endswith("/just-akash"), (
+        assert "just-akash-repository" in repo or repo.endswith("/just-akash"), (
             f"{label}: repository={repo!r} does not name just-akash"
         )
         assert with_.get("path"), f"{label}: must not overwrite the caller's workspace root"
@@ -325,19 +344,29 @@ def test_the_workflow_checks_out_just_akash_not_the_caller():
 def test_the_cli_source_is_pinned_to_the_ref_the_caller_pinned():
     """Tracking a branch would let the classification tables, the SDL and the
     provider-qualification bar change under a consumer whose pin never moved — which is
-    the entire reason they pinned a ref. `job.workflow_sha` is the commit of this
-    reusable workflow file, so the CLI always matches the workflow.
+    the entire reason they pinned a ref.
 
-    Note the context: `github.*` is always the CALLER's, so `github.workflow_ref` here
-    names their entry workflow, not ours. Only the `job` context refers to the reusable
-    workflow file. An undefined property evaluates to empty rather than erroring, so if
-    GitHub ever withdraws it the checkout degrades to just-akash's default branch —
-    unpinned, but still our source and not the caller's tree.
+    THIS TEST USED TO ASSERT `job.workflow_sha`, AND THAT PINNED THE BUG. That property
+    does not exist — `job` carries only check_run_id/container/services/status — so it
+    evaluated to the empty string and checkout silently took the default branch. The old
+    docstring foresaw the failure ("an undefined property evaluates to empty ... the
+    checkout degrades to just-akash's default branch") but assumed the property existed
+    and might one day be withdrawn. It never existed, so the degraded state was the ONLY
+    state, and this test held it there: green on the broken workflow, red on the fix.
+
+    Assert the PROPERTY the docstring names — the ref is explicitly supplied and does not
+    float — not the MECHANISM that was supposed to deliver it (#184).
     """
     for label, steps in (("pool", STEPS), ("teardown", TD_STEPS)):
         ref = str(_checkout(steps).get("with", {}).get("ref", ""))
-        assert "job.workflow_sha" in ref, (
-            f"{label}: ref={ref!r} — a floating ref breaks the guarantee a pin exists for"
+        assert ref, f"{label}: an empty ref floats to the default branch"
+        assert "inputs.just-akash-ref" in ref, (
+            f"{label}: ref={ref!r} — the pin must come from a required input; a derived "
+            f"or literal ref floats and breaks the guarantee a caller pins for"
+        )
+        assert "job.workflow_sha" not in ref, (
+            f"{label}: `job.workflow_sha` is not a real context property — it resolves to "
+            f"the empty string and the checkout takes the default branch (#184)"
         )
         assert "github.workflow_sha" not in ref, (
             f"{label}: the github context is the CALLER's workflow, not this one"
@@ -578,9 +607,9 @@ MUTATIONS = [
     (
         '"default" not in tag-prefix',
         lambda s: s.replace(
-            "        required: true\n        type: string\n      github-org:",
+            "        required: true\n        type: string\n      just-akash-ref:",
             "        required: true\n        type: string\n"
-            "        default: 'ci-shared'\n      github-org:",
+            "        default: 'ci-shared'\n      just-akash-ref:",
         ),
     ),
     (
@@ -639,7 +668,18 @@ MUTATIONS = [
         "checkout names just-akash",
         lambda s: re.sub(r"\n\s*repository: [^\n]*just-akash[^\n]*", "", s, count=1),
     ),
-    ("cli ref is the pinned one", lambda s: s.replace("job.workflow_sha", "github.ref")),
+    (
+        "cli ref is the pinned one",
+        lambda s: s.replace("${{ inputs.just-akash-ref }}", "${{ github.ref }}"),
+    ),
+    (
+        "just-akash-ref has no default",
+        lambda s: s.replace(
+            "        required: true\n        type: string\n      just-akash-repository:",
+            "        required: true\n        default: 'main'\n"
+            "        type: string\n      just-akash-repository:",
+        ),
+    ),
     (
         "uv runs from our checkout",
         lambda s: s.replace("working-directory: .just-akash", "working-directory: ."),
