@@ -325,8 +325,7 @@ def deploy_credit(address: str) -> dict[str, int]:
         raise RuntimeError(
             "every LCD returned DepositAuthorization grants WITHOUT an `expiration` "
             "field; cannot reconcile by LATEST EXPIRATION (the discriminator that "
-            "distinguishes a fresh grant from a superseded one). Sources: "
-            + ", ".join(sources)
+            "distinguishes a fresh grant from a superseded one). Sources: " + ", ".join(sources)
         )
     # LATEST EXPIRATION wins. Ties: pick the coins map with the MAX uact
     # (one endpoint indexed a deposit the other hasn't yet — same expiry,

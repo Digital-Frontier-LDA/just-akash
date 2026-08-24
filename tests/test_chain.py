@@ -457,6 +457,7 @@ class TestMultiEndpointCreditReconciliation:
         the staleness discriminator — the case where the OLD rule was right,
         and the NEW rule must remain right.
         """
+
         # Endpoint A has indexed a deposit; endpoint B hasn't. Same expiry.
         def fake(path, timeout=15, base=None):
             if base and "laggy" in base:
@@ -553,9 +554,9 @@ class TestMultiEndpointCreditReconciliation:
             f"fresh grant's amount must win (LATEST EXPIRATION); got {result}"
         )
         # The exclusion is a state, not a silent loss — a warning names it.
-        assert any(
-            "had no `expiration`" in str(w.message) for w in caught
-        ), f"expected a warnings.warn naming the excluded source; got {caught}"
+        assert any("had no `expiration`" in str(w.message) for w in caught), (
+            f"expected a warnings.warn naming the excluded source; got {caught}"
+        )
 
     def test_a_dead_endpoint_does_not_sink_the_reading(self):
         def fake(path, timeout=15, base=None):
