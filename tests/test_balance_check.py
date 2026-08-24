@@ -245,16 +245,20 @@ class TestCheckGatesOnFreeNotGrant:
 
 
 class TestIncompleteEscrowTally:
-    """An escrow tally that could not finish must not read as OK.
+    """Incomplete escrow tallies are diagnostic, not gating — under NET semantics.
 
-    `escrow_locked` skips a deployment whose detail will not load and reports how
-    many via `unreadable`, so `locked_uact` is a LOWER bound — which makes `free` an
-    UPPER bound. `balance --check` used to drop that flag on the floor and print
-    OK/exit 0 on credit that may not exist.
+    The OLD test class (`test_unnameable_deployment_yields_UNKNOWN_not_OK` etc.)
+    pinned UNKNOWN + exit 1 on omitted deployments. That made sense under the OLD
+    formula `free = granted - locked`: an incomplete escrow tally made `locked`
+    a LOWER bound, which made `free` an UPPER bound, so reporting OK could send
+    a deployer into a 402.
 
-    That is worse than no alarm. A caller gating on this deploys, takes a 402, and
-    blames the provider — the exact mis-attribution the free-vs-granted distinction
-    was introduced to prevent, one layer up.
+    Under NET semantics (spend_limits IS the deployable credit) `free_usd`
+    does not depend on `locked_uact` at all. The omission is still useful as
+    a data-quality signal — the JSON payload reports
+    `escrow_unreadable_deployments` and `escrow_unnameable_deployments` — but
+    the gate no longer flips OK to UNKNOWN on its account. CodeRabbit on #190
+    flagged this as a follow-on to the #169 fix.
     """
 
     @staticmethod
@@ -273,11 +277,14 @@ class TestIncompleteEscrowTally:
                 main()
         return exc.value.code
 
-    def test_unnameable_deployment_yields_UNKNOWN_not_OK(self, monkeypatch, capsys):
-        """The SAME hole, via the other skip reason. escrow_locked also omits a
-        deployment it cannot NAME (no extractable dseq), and that understates `locked`
-        identically -- so `free` is an upper bound and OK is a lie. Counting only
-        `unreadable` left this open. Raised by CodeRabbit on #141."""
+    def test_unnameable_deployment_is_OK_with_diagnostic(self, monkeypatch, capsys):
+        """#169 follow-on: NET semantics — omission is diagnostic, not gating.
+
+        spend_limits=170 ACT (well above the 50 ACT threshold). One deployment
+        has no extractable dseq (`skipped_no_dseq: 1`). The OLD check would
+        flip status to UNKNOWN and exit 1; the new check stays OK and exits
+        0 because `free_usd` (== spend_limits) is exact.
+        """
         code = self._with_escrow(
             monkeypatch,
             ["just-akash", "balance", "--check", "--min-usd", "50"],
@@ -291,11 +298,42 @@ class TestIncompleteEscrowTally:
             },
         )
         verdict = json.loads(capsys.readouterr().out)
-        assert verdict["status"] == "UNKNOWN", "an unnameable deployment reported as OK"
+        assert verdict["status"] == "OK", (
+            "omission alone is no longer a gate under NET semantics — the OLD "
+            "behaviour (UNKNOWN + exit 1) was correct only when `free = granted "
+            "- locked` made free an upper bound"
+        )
         assert verdict["escrow_unnameable_deployments"] == 1
-        assert code != 0, "exit 0 tells a gating caller it is safe to deploy"
+        # Diagnostic preserved, status preserved — operators see the data quality issue
+        # without paying for it as an alarm.
+        assert verdict["free_usd"] == 170.0
+        assert code == 0
 
-    def test_OK_requires_BOTH_counters_zero(self, monkeypatch, capsys):
+    def test_unreadable_deployment_is_OK_with_diagnostic(self, monkeypatch, capsys):
+        """Same NET-semantics follow-on: an unreadable deployment is diagnostic.
+
+        The OLD test asserted UNKNOWN + exit 1 here. With NET semantics,
+        free_usd = spend_limits = 170 ACT regardless of escrow data quality,
+        so status is OK and exit 0. `escrow_unreadable_deployments` is still
+        emitted for the operator.
+        """
+        code = self._with_escrow(
+            monkeypatch,
+            ["just-akash", "balance", "--check", "--min-usd", "50"],
+            {"uact": 170_000_000},
+            {"locked_uact": 0, "deployments": 1, "unreadable": 1, "by_deployment": []},
+        )
+        verdict = json.loads(capsys.readouterr().out)
+        assert verdict["status"] == "OK"
+        assert verdict["escrow_unreadable_deployments"] == 1
+        assert verdict["free_usd"] == 170.0
+        assert code == 0
+
+    def test_complete_tally_is_plain_OK(self, monkeypatch, capsys):
+        """Sanity: a complete tally at healthy credit reads OK + exit 0.
+
+        Regression pin against the OLD `low wins over omitted` tests below.
+        """
         code = self._with_escrow(
             monkeypatch,
             ["just-akash", "balance", "--check", "--min-usd", "50"],
@@ -312,20 +350,12 @@ class TestIncompleteEscrowTally:
         assert verdict["status"] == "OK"
         assert code == 0
 
-    def test_unreadable_deployment_yields_UNKNOWN_not_OK(self, monkeypatch, capsys):
-        code = self._with_escrow(
-            monkeypatch,
-            ["just-akash", "balance", "--check", "--min-usd", "50"],
-            {"uact": 170_000_000},
-            {"locked_uact": 0, "deployments": 1, "unreadable": 1, "by_deployment": []},
-        )
-        verdict = json.loads(capsys.readouterr().out)
-        assert verdict["status"] == "UNKNOWN", "an incomplete count reported as OK"
-        assert verdict["escrow_unreadable_deployments"] == 1
-        assert code != 0, "exit 0 tells a gating caller it is safe to deploy"
+    def test_low_still_gates_regardless_of_omission(self, monkeypatch, capsys):
+        """LOW wins: a short spend_limits reads LOW even when escrow is also incomplete.
 
-    def test_low_still_wins_over_unknown(self, monkeypatch, capsys):
-        """Definitely short beats maybe short — the caller needs the actionable one."""
+        Under NET semantics the gate is `spend_limits < min_usd`. Omission is
+        irrelevant here — short is short.
+        """
         code = self._with_escrow(
             monkeypatch,
             ["just-akash", "balance", "--check", "--min-usd", "50"],
@@ -335,7 +365,9 @@ class TestIncompleteEscrowTally:
         assert json.loads(capsys.readouterr().out)["status"] == "LOW"
         assert code != 0
 
-    def test_a_complete_tally_is_still_plain_OK(self, monkeypatch, capsys):
+    def test_a_complete_tally_above_threshold_is_OK_with_spend_limits_as_free(
+        self, monkeypatch, capsys
+    ):
         """#169: spend_limits is the remaining credit; locked is display-only.
 
         Setup: spend_limits=170 ACT (NET), 20 ACT locked in escrow. With NET

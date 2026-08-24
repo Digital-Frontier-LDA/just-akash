@@ -1006,29 +1006,24 @@ def main():
                 locked_usd = chain.usd_estimate("uact", locked_uact) or 0.0
                 usd = chain.usd_estimate("uact", free_uact) or 0.0
                 low = usd < args.min_usd
-                # `escrow_locked` skips a deployment whose detail will not load and
-                # reports how many via `unreadable`, so `locked_uact` is a LOWER
-                # bound — which makes `free` an UPPER bound. Ignoring that flag lets
-                # this print "OK" on credit that may not exist, and an alarm that
-                # over-reports is worse than no alarm: the caller deploys, takes a
-                # 402, and blames the provider. UNKNOWN is a third answer, distinct
-                # from both OK and LOW, so a caller can tell "you are short" from
-                # "I could not finish counting".
-                # BOTH skip reasons make the tally incomplete. escrow_locked also skips a
-                # deployment it cannot NAME (no extractable dseq), and that omission has
-                # the identical consequence as an unreadable one: locked is understated,
-                # so free is overstated, so this prints OK on credit that may not exist.
-                # Counting only `unreadable` left the exact hole described two paragraphs
-                # up still open. Raised by CodeRabbit on #141.
+                # ⭐ Fix for #169 follow-on (CodeRabbit on #190): `spend_limits` IS
+                # the deployable credit, so free_usd is no longer an UPPER bound —
+                # escrow incompleteness cannot make free_usd a lie. The OLD code
+                # downgraded OK to UNKNOWN on omission because, under the OLD
+                # `free = granted - locked` formula, an incomplete escrow tally
+                # made `locked` a lower bound and therefore `free` an upper bound.
+                # Under NET semantics that concern is gone: omission is a
+                # data-quality diagnostic, not a gate.
+                #
+                # The diagnostic is still emitted in the payload (`unreadable` +
+                # `unnameable` counters) so an operator can see the tally was
+                # incomplete — but it does NOT change the status, because
+                # `spend_limits` is the same value whether or not we could read
+                # any given deployment's escrow account.
                 unreadable = escrow.get("unreadable", 0)
                 unnameable = escrow.get("skipped_no_dseq", 0)
                 omitted = unreadable + unnameable
-                if low:
-                    status = "LOW"
-                elif omitted:
-                    status = "UNKNOWN"
-                else:
-                    status = "OK"
+                status = "LOW" if low else "OK"
                 if use_json:
                     print(
                         json.dumps(
@@ -1041,8 +1036,8 @@ def main():
                                 "free_usd": usd,
                                 "granted_usd": granted_usd,
                                 "locked_in_escrow_usd": locked_usd,
-                                # >0 means the escrow tally is INCOMPLETE, so
-                                # free_usd is an upper bound, not a measurement.
+                                # Diagnostic only — does NOT affect status under
+                                # NET semantics (spend_limits IS the free credit).
                                 "escrow_unreadable_deployments": unreadable,
                                 # Same meaning, different cause: a deployment with no
                                 # extractable dseq is omitted from the tally too.
@@ -1052,22 +1047,19 @@ def main():
                         )
                     )
                 else:
+                    diag = (
+                        f" ({omitted} escrow detail(s) omitted: "
+                        f"{unreadable} unreadable, {unnameable} unnameable)"
+                        if omitted
+                        else ""
+                    )
                     print(
                         f"CREDIT-CHECK status={status} free_usd={usd:.2f}"
-                        + (
-                            f" (UPPER BOUND: {omitted} deployment(s) omitted — "
-                            f"{unreadable} unreadable, {unnameable} unnameable)"
-                            if omitted
-                            else ""
-                        )
-                        + f" (granted={granted_usd:.2f} locked_in_escrow={locked_usd:.2f}) "
+                        f"{diag} (granted={granted_usd:.2f} "
+                        f"locked_in_escrow={locked_usd:.2f}) "
                         f"min_usd={args.min_usd:.2f} account={address}"
                     )
-                # Non-zero for UNKNOWN as well as LOW. A caller gating on the exit
-                # code is asking "is it safe to deploy?", and "I could not finish
-                # counting" is not a yes. Exiting 0 there is precisely how an
-                # over-reported balance becomes a 402 nobody predicted.
-                sys.exit(1 if (low or omitted) else 0)
+                sys.exit(1 if low else 0)
 
             # Deploy credit is the real "wallet balance": Console holds the funds and
             # grants this account an escrow DepositAuthorization whose spend_limits is
