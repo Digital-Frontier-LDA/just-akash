@@ -7,9 +7,9 @@ akash_canary_reachable{provider="hetzner_hel"} 1
 akash_canary_reachable{provider="onidc"} 1
 # HELP akash_canary_restarts_total Container restarts observed via boot_id change within the SAME lease. Excludes lease replacements.
 # TYPE akash_canary_restarts_total counter
-akash_canary_restarts_total{provider="alphavps"} 6
+akash_canary_restarts_total{provider="alphavps"} 7
 akash_canary_restarts_total{provider="hetzner_hel"} 0
-akash_canary_restarts_total{provider="onidc"} 8
+akash_canary_restarts_total{provider="onidc"} 9
 # HELP akash_canary_lease_replacements_total Times the lease had to be recreated (dseq changed). Says NOTHING about whose fault it was — see akash_canary_lease_closures_total for the cause.
 # TYPE akash_canary_lease_replacements_total counter
 akash_canary_lease_replacements_total{provider="alphavps"} 16
@@ -44,9 +44,9 @@ akash_canary_unreachable_checks_total{provider="hetzner_hel"} 31
 akash_canary_unreachable_checks_total{provider="onidc"} 25
 # HELP akash_canary_checks_total Total collector checks.
 # TYPE akash_canary_checks_total counter
-akash_canary_checks_total{provider="alphavps"} 749
-akash_canary_checks_total{provider="hetzner_hel"} 749
-akash_canary_checks_total{provider="onidc"} 699
+akash_canary_checks_total{provider="alphavps"} 750
+akash_canary_checks_total{provider="hetzner_hel"} 750
+akash_canary_checks_total{provider="onidc"} 700
 # HELP akash_canary_deployed 1 if this provider has a canary deployment with an ingress to scrape at all. 0 means no canary EXISTS -- not that one is broken.
 # TYPE akash_canary_deployed gauge
 akash_canary_deployed{provider="alphavps"} 1
@@ -60,14 +60,14 @@ akash_canary_providers_total 3
 akash_canary_active_deployments 3
 # HELP akash_canary_uptime_seconds Seconds since the canary process started (resets on restart).
 # TYPE akash_canary_uptime_seconds gauge
-akash_canary_uptime_seconds{provider="alphavps"} 17491.999
-akash_canary_uptime_seconds{provider="hetzner_hel"} 703498.261
-akash_canary_uptime_seconds{provider="onidc"} 79056.853
+akash_canary_uptime_seconds{provider="alphavps"} 123.387
+akash_canary_uptime_seconds{provider="hetzner_hel"} 705525.59
+akash_canary_uptime_seconds{provider="onidc"} 834.55
 # HELP akash_canary_egress_ok_total Successful outbound HTTP probes from inside the deployment.
 # TYPE akash_canary_egress_ok_total counter
-akash_canary_egress_ok_total{provider="alphavps"} 93800.0
-akash_canary_egress_ok_total{provider="hetzner_hel"} 94517.0
-akash_canary_egress_ok_total{provider="onidc"} 87816.0
+akash_canary_egress_ok_total{provider="alphavps"} 93808.0
+akash_canary_egress_ok_total{provider="hetzner_hel"} 94653.0
+akash_canary_egress_ok_total{provider="onidc"} 87871.0
 # HELP akash_canary_egress_fail_total FAILED outbound HTTP probes from inside — the workload could not reach out.
 # TYPE akash_canary_egress_fail_total counter
 akash_canary_egress_fail_total{provider="alphavps"} 0.0
@@ -75,9 +75,9 @@ akash_canary_egress_fail_total{provider="hetzner_hel"} 7.0
 akash_canary_egress_fail_total{provider="onidc"} 0.0
 # HELP akash_canary_dns_ok_total Successful DNS resolutions from inside the deployment.
 # TYPE akash_canary_dns_ok_total counter
-akash_canary_dns_ok_total{provider="alphavps"} 93800.0
-akash_canary_dns_ok_total{provider="hetzner_hel"} 94524.0
-akash_canary_dns_ok_total{provider="onidc"} 87816.0
+akash_canary_dns_ok_total{provider="alphavps"} 93808.0
+akash_canary_dns_ok_total{provider="hetzner_hel"} 94660.0
+akash_canary_dns_ok_total{provider="onidc"} 87871.0
 # HELP akash_canary_dns_fail_total FAILED DNS resolutions from inside the deployment.
 # TYPE akash_canary_dns_fail_total counter
 akash_canary_dns_fail_total{provider="alphavps"} 0.0
@@ -85,34 +85,34 @@ akash_canary_dns_fail_total{provider="hetzner_hel"} 0.0
 akash_canary_dns_fail_total{provider="onidc"} 0.0
 # HELP akash_canary_disk_write_seconds fsync latency for a 4KiB write as the workload feels it (-1 = unusable).
 # TYPE akash_canary_disk_write_seconds gauge
-akash_canary_disk_write_seconds{provider="alphavps"} 0.021426
-akash_canary_disk_write_seconds{provider="hetzner_hel"} 0.001114
-akash_canary_disk_write_seconds{provider="onidc"} 0.018158
+akash_canary_disk_write_seconds{provider="alphavps"} 0.001166
+akash_canary_disk_write_seconds{provider="hetzner_hel"} 0.000784
+akash_canary_disk_write_seconds{provider="onidc"} 0.004101
 # HELP akash_canary_sched_jitter_seconds How late the probe tick fired — CPU contention from the customer's side.
 # TYPE akash_canary_sched_jitter_seconds gauge
-akash_canary_sched_jitter_seconds{provider="alphavps"} 0.000156
-akash_canary_sched_jitter_seconds{provider="hetzner_hel"} 9.8e-05
-akash_canary_sched_jitter_seconds{provider="onidc"} 0.000152
+akash_canary_sched_jitter_seconds{provider="alphavps"} 0.000108
+akash_canary_sched_jitter_seconds{provider="hetzner_hel"} 8.4e-05
+akash_canary_sched_jitter_seconds{provider="onidc"} 0.000149
 # HELP akash_canary_scrape_seconds Time to fetch the canary's /metrics over its public ingress.
 # TYPE akash_canary_scrape_seconds gauge
-akash_canary_scrape_seconds{provider="alphavps"} 0.3853
-akash_canary_scrape_seconds{provider="hetzner_hel"} 0.4038
-akash_canary_scrape_seconds{provider="onidc"} 0.3038
+akash_canary_scrape_seconds{provider="alphavps"} 0.3618
+akash_canary_scrape_seconds{provider="hetzner_hel"} 0.3779
+akash_canary_scrape_seconds{provider="onidc"} 0.2611
 # HELP akash_canary_last_collect_timestamp_seconds Unix time of this collection.
 # TYPE akash_canary_last_collect_timestamp_seconds gauge
-akash_canary_last_collect_timestamp_seconds 1787588276
+akash_canary_last_collect_timestamp_seconds 1787590303
 # HELP akash_wallet_free_credit_usd Deploy credit available NOW. This is what gates the next deploy.
 # TYPE akash_wallet_free_credit_usd gauge
-akash_wallet_free_credit_usd{account="akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee"} 2.79
+akash_wallet_free_credit_usd{account="akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee"} 7.62
 # HELP akash_wallet_granted_usd Total Console grant. Nearly constant, and NOT the spendable figure.
 # TYPE akash_wallet_granted_usd gauge
-akash_wallet_granted_usd{account="akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee"} 2.79
+akash_wallet_granted_usd{account="akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee"} 7.62
 # HELP akash_wallet_locked_in_escrow_usd Grant currently held in escrow by live deployments.
 # TYPE akash_wallet_locked_in_escrow_usd gauge
-akash_wallet_locked_in_escrow_usd{account="akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee"} 319.05
+akash_wallet_locked_in_escrow_usd{account="akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee"} 314.05
 # HELP akash_wallet_credit_timestamp_seconds Unix time the credit was READ.
 # TYPE akash_wallet_credit_timestamp_seconds gauge
-akash_wallet_credit_timestamp_seconds 1787588198
+akash_wallet_credit_timestamp_seconds 1787590231
 # HELP akash_canary_orphan_scan_degraded 1 when the fleet could not be fully enumerated, so the orphan count below is a FLOOR and not a measurement. The count is withheld entirely in that case -- a zero from a half-read fleet is a false all-clear.
 # TYPE akash_canary_orphan_scan_degraded gauge
 akash_canary_orphan_scan_degraded 0
