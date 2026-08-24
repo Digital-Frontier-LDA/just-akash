@@ -51,6 +51,27 @@ on:
           deployment.
         required: true
         type: string
+      just-akash-ref:
+        description: >-
+          REQUIRED, no default. The just-akash revision this pool provisions FROM.
+          Pass the same ref you pinned this workflow to
+          (`uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-pool.yml@<ref>`).
+
+          NO DEFAULT ON PURPOSE. A default here means "whatever main happens to be at
+          deploy-second", which is an unpinned supply-chain window that looks pinned
+          from the caller's side: the caller pinned the WORKFLOW, and the binary it
+          provisions would come from somewhere else. The previous code derived this
+          from `job.workflow_sha`, which is not a real context property and resolved
+          to the empty string, so checkout silently took the default branch (#184).
+        required: true
+        type: string
+      just-akash-repository:
+        description: >-
+          Repository to provision the just-akash CLI from. Defaults to this repo;
+          override it so a fork's callers get the FORK's CLI rather than ours.
+        required: false
+        default: 'Digital-Frontier-LDA/just-akash'
+        type: string
       github-org:
         description: 'GitHub org the runners register into.'
         required: true
@@ -243,24 +264,24 @@ jobs:
       # workflow could therefore only ever have worked inside this repo — and nothing
       # here calls it, so that was never exercised.
       #
-      # `job.workflow_sha` / `job.workflow_repository` are the JOB context, not the
-      # github one, and that distinction is the whole fix: the `github` context is
-      # always the CALLER's, so `github.workflow_ref` here names their entry workflow.
-      # The job context is documented as referring to the REUSABLE workflow file for
-      # jobs defined in one, so this resolves to the exact commit of this file — the
-      # revision the caller pinned. Tracking a branch instead would let the
-      # classification tables, the SDL and the provider-qualification bar all change
-      # under a consumer whose pin never moved, which is the whole reason they pinned.
+      # ⛔ THE PIN IS AN INPUT, NOT A DERIVED VALUE, AND IT CANNOT BE DERIVED.
+      # GitHub exposes NO context giving a reusable workflow its own revision:
+      # `github.workflow_ref` / `github.workflow_sha` name the CALLER's entry
+      # workflow, and `job.*` carries only check_run_id/container/services/status.
+      # The previous code used `job.workflow_sha`, which actionlint reports as
+      # "property not defined in object type"; it evaluated to the EMPTY STRING and
+      # checkout therefore took the default branch. Every runner was provisioned from
+      # main's tip at deploy-second while the caller believed their pin was honoured
+      # — an unpinned supply-chain window that reads as pinned (#184, same class as
+      # #182's `github.organization`, and a recurrence of #1128).
       #
-      # It also follows forks: a fork's callers get the fork's CLI, not ours.
-      #
-      # `job.workflow_*` is unavailable on GitHub Enterprise Server, where both resolve
-      # empty. The literal fallback keeps that case on OUR repo's default branch —
-      # unpinned, but still just-akash rather than the caller's tree.
+      # Tracking a branch would let the classification tables, the SDL and the
+      # provider-qualification bar all change under a consumer whose pin never moved,
+      # which is the whole reason they pinned.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: ${{ job.workflow_repository || 'Digital-Frontier-LDA/just-akash' }}
-          ref: ${{ job.workflow_sha }}
+          repository: ${{ inputs.just-akash-repository }}
+          ref: ${{ inputs.just-akash-ref }}
           path: .just-akash
           persist-credentials: false
 
