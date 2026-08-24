@@ -457,7 +457,6 @@ class TestMultiEndpointCreditReconciliation:
         the staleness discriminator — the case where the OLD rule was right,
         and the NEW rule must remain right.
         """
-
         # Endpoint A has indexed a deposit; endpoint B hasn't. Same expiry.
         def fake(path, timeout=15, base=None):
             if base and "laggy" in base:
@@ -495,7 +494,7 @@ class TestMultiEndpointCreditReconciliation:
         }
         with (
             patch.object(chain, "_lcd_get", return_value=payload),
-            pytest.raises(RuntimeError, match="WITHOUT an `expiration`"),
+            pytest.raises(RuntimeError, match="WITHOUT a parseable `expiration`"),
         ):
             chain.deploy_credit("akash1me")
 
@@ -554,9 +553,9 @@ class TestMultiEndpointCreditReconciliation:
             f"fresh grant's amount must win (LATEST EXPIRATION); got {result}"
         )
         # The exclusion is a state, not a silent loss — a warning names it.
-        assert any("had no `expiration`" in str(w.message) for w in caught), (
-            f"expected a warnings.warn naming the excluded source; got {caught}"
-        )
+        assert any(
+            "had no parseable `expiration`" in str(w.message) for w in caught
+        ), f"expected a warnings.warn naming the excluded source; got {caught}"
 
     def test_a_dead_endpoint_does_not_sink_the_reading(self):
         def fake(path, timeout=15, base=None):
@@ -579,6 +578,117 @@ class TestMultiEndpointCreditReconciliation:
     def test_a_genuinely_empty_account_is_still_empty(self):
         with patch.object(chain, "_lcd_get", return_value={"grants": []}):
             assert chain.deploy_credit("akash1me") == {}
+
+    def test_known_positive_same_instant_two_surface_forms(self):
+        """The freshness discriminator MUST compare by parsed datetime, not by RFC3339
+        string. Two endpoints can report the SAME instant in DIFFERENT surface
+        forms — ``"2030-01-01T00:00:00Z"`` vs ``"2030-01-01T00:00:00.000Z"`` vs
+        ``"2030-01-01T00:00:00+00:00"`` are all the same moment.
+
+        A string-based ``max()`` is LEXICOGRAPHIC: ``ord('.') == 46`` and
+        ``ord('Z') == 90``, so ``"...00Z"`` sorts AFTER ``"...00.000Z"`` even
+        though they denote the same instant. The OLD string-max would return
+        the whole-second form as 'later' — wrong if the OTHER endpoint emits
+        fractional seconds on a strictly-newer grant (next test pins that).
+
+        This is the REGRESSION-ONLY control: on a fixture where both endpoints
+        report the SAME instant in two surface forms, BOTH string-max and
+        datetime-max return the same grant. The defect-detecting shape is the
+        NEXT test, where the chronologically-newer grant carries fractional
+        seconds.
+        """
+        ok_base = "https://nofrac.test"
+        frac_base = "https://frac.test"
+
+        def fake(path, timeout=15, base=None):
+            if base == frac_base:
+                # Same instant, written with fractional seconds.
+                return self._payload(50_000_000, "2030-01-01T00:00:00.000Z")
+            return self._payload(50_000_000, "2030-01-01T00:00:00Z")  # whole-second
+
+        with (
+            patch.object(chain, "rest_urls", return_value=[ok_base, frac_base]),
+            patch.object(chain, "_lcd_get", side_effect=fake),
+        ):
+            # Both readings are 50 ACT at the same instant — same answer
+            # regardless of surface form. If this fails, the dispatcher or
+            # the parse broke; the comparator is exercised below.
+            assert chain.deploy_credit("akash1me") == {"uact": 50_000_000}
+
+    def test_known_positive_fractional_seconds_newer_must_win(self):
+        """⭐ LOAD-BEARING DEFECT-DETECTING CONTROL.
+
+        Per CodeRabbit (now confirmed independently): the OLD code did
+        ``latest_exp = max(e for _, e, _ in grants_with_exp)`` on RAW
+        RFC3339 STRINGS. ``ord('Z') == 90`` sorts after ``ord('.') == 46``,
+        so a whole-second ``"2030-01-01T00:00:00Z"`` is treated as LATER
+        than ``"2030-01-01T00:00:00.001Z"`` — even though the fractional
+        form is 1ms NEWER in time. The moment one LCD emits fractional
+        seconds and the other emits a whole-second timestamp on a STRICTLY
+        NEWER grant, the freshness discriminator selects the SUPERSEDED
+        grant. Same defect class as #168, one layer up.
+
+        This control fails on the string-max mutant; see the mutation
+        check section in the PR body.
+        """
+        laggy_base = "https://laggy.test"
+        fresh_base = "https://fresh.test"
+
+        def fake(path, timeout=15, base=None):
+            if base == fresh_base:
+                # Strictly newer — by 1ms — but written with fractional seconds.
+                return self._payload(50_000_000, "2030-01-01T00:00:00.001Z")
+            # Lagging endpoint reports the OLD grant, whole-second form.
+            return self._payload(100_000_000, "2030-01-01T00:00:00Z")
+
+        with (
+            patch.object(chain, "rest_urls", return_value=[laggy_base, fresh_base]),
+            patch.object(chain, "_lcd_get", side_effect=fake),
+        ):
+            # The fresh grant (50 ACT) wins by expiry, even though the OLD
+            # grant (100 ACT) has the lexicographically-LATER string.
+            assert chain.deploy_credit("akash1me") == {"uact": 50_000_000}, (
+                "string-max would have picked the OLD grant (100 ACT) because "
+                "'...00Z' sorts after '...00.001Z' lexicographically. That is "
+                "the string-max defect — exactly what #168 second-take fixes."
+            )
+
+    def test_unparseable_expiration_treated_as_missing(self):
+        """If a grant's `expiration` is non-empty but does not parse as RFC3339
+        (e.g. a Cosmos node returning a malformed or future-encoding string),
+        route it through the same exclusion path as a missing field — with
+        `warnings.warn` naming the source. NOT silently used, NOT silently
+        dropped.
+
+        Distinct from `test_partial_no_exclusion_emits_warning_not_silent_loss`
+        in that the OTHER source returns a valid RFC3339 timestamp; here the
+        malformed one is excluded while the well-formed one wins.
+        """
+        import warnings
+
+        bad_base = "https://malformed.test"
+        ok_base = "https://wellformed.test"
+
+        def fake(path, timeout=15, base=None):
+            if base == bad_base:
+                # Non-RFC3339 string. _parse_expiration returns None.
+                return self._payload(999_000_000, "not-a-timestamp")
+            return self._payload(50_000_000, "2030-01-01T00:00:00Z")
+
+        with (
+            patch.object(chain, "rest_urls", return_value=[ok_base, bad_base]),
+            patch.object(chain, "_lcd_get", side_effect=fake),
+            warnings.catch_warnings(record=True) as caught,
+        ):
+            warnings.simplefilter("always")
+            result = chain.deploy_credit("akash1me")
+        assert result == {"uact": 50_000_000}, (
+            "well-formed grant's amount must win; the malformed one is EXCLUDED, "
+            "not used as a placeholder."
+        )
+        assert any(
+            "malformed.test" in str(w.message) for w in caught
+        ), f"expected the malformed source named in the warning; got {caught}"
 
 
 class TestRestUrls:

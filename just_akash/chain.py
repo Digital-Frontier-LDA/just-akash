@@ -19,6 +19,7 @@ import json
 import os
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from typing import Any
 
 # Companion to the default AKASH_NODE (akash-rpc.publicnode.com): the same provider's
@@ -233,6 +234,46 @@ def _deposit_grant_breakdown(
     return out
 
 
+def _parse_expiration(value: str) -> datetime | None:
+    """Parse a Cosmos RFC3339 ``expiration`` to a tz-aware UTC datetime.
+
+    REQUIRED for the freshness discriminator: the chain returns expiration as a
+    string, and different endpoints emit DIFFERENT SURFACE FORMS of the SAME
+    instant — ``"2030-01-01T00:00:00Z"`` vs ``"2030-01-01T00:00:00.000Z"`` vs
+    ``"2030-01-01T00:00:00+00:00"``. A string-based ``max()`` over these is
+    LEXICOGRAPHIC, not chronological: ``ord('.') == 46`` and ``ord('Z') == 90``,
+    so ``"...00Z"`` sorts AFTER ``"...00.000Z"`` — the whole-second form is
+    treated as LATER than the fractional form, even when the fractional form
+    is 1ms LATER in time. Picking the wrong one is the same defect class as
+    #168, one layer up: max(amount) became max(string), and both lie about
+    freshness.
+
+    Returns ``None`` on any parse failure. ``None`` is the "could not ask"
+    state for this accessor — the caller (deploy_credit) routes it to the
+    three-way contract exclusion list with ``warnings.warn``, never into the
+    freshness discriminator. Returning ``None`` instead of raising here
+    keeps the helper composable and the error message in one place.
+
+    Accepts the surface forms measured in production:
+      * ``2030-01-01T00:00:00Z``                  — whole second, UTC
+      * ``2030-01-01T00:00:00.001Z``              — fractional, UTC
+      * ``2030-01-01T00:00:00.123456Z``           — microseconds, UTC
+      * ``2030-01-01T00:00:00+00:00``             — explicit offset
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    s = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        dt = datetime.fromisoformat(s)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        # A naive datetime has no instant — comparing it against a tz-aware
+        # one in `max()` would raise TypeError. Treat as un-parseable.
+        return None
+    return dt.astimezone(timezone.utc)
+
+
 def deploy_credit(address: str) -> dict[str, int]:
     """Remaining Console deploy credit for ``address``, as {denom: micro_amount}.
 
@@ -260,23 +301,32 @@ def deploy_credit(address: str) -> dict[str, int]:
     the dead grant and over-reports deploy credit by the OLD allowance —
     every gate that read deploy credit reads a phantom balance. #168.
 
+    ⛔ AND the freshness discriminator compares PARSED DATETIMES, not raw
+    RFC3339 strings. ``max("2030-01-01T00:00:00Z", "2030-01-01T00:00:00.001Z")``
+    returns the WHOLE-SECOND form because ``ord('Z') == 90`` > ``ord('.') == 46`` —
+    a lexicographic comparison, not chronological. The moment one endpoint
+    emits fractional seconds and another does not, the string-max selects the
+    SUPERSEDED grant. #168, second take.
+
     Reconciles across endpoints:
       * Flatten every grant from every endpoint into ``(coins, expiration, source)``.
-      * Pick the grant with the LATEST ``expiration`` — that is the fresh
-        depositor. Multiple endpoints should agree on which granter is fresh
-        (consistency); if the chain is consistent, only one ``(expiration,
-        coins)`` pair appears, repeated across endpoints.
-      * Ties on ``expiration`` (multiple endpoints share the latest) are
-        broken by MAX ``uact`` — the endpoint that has indexed a new deposit
-        reports a higher value with the same expiration. Tied amounts across
-        all denoms (uakt rides along at 0 in every grant and is harmless).
+      * Parse each ``expiration`` to a tz-aware datetime via
+        ``_parse_expiration``. Un-parseable or missing expirations route to
+        the three-way contract below.
+      * Pick the grant with the LATEST ``expiration`` (datetime comparison) —
+        the fresh depositor.
+      * Ties on ``expiration`` (same datetime across endpoints) break by MAX
+        ``uact`` — staleness-only, no supersession. Tied amounts across all
+        denoms (uakt rides along at 0 in every grant and is harmless).
 
-    Three-way contract on missing ``expiration`` (akash-lease-core #18): the
-    field is required to discriminate fresh from superseded, so a grant
-    without it is "could not ask" — must NOT silently win or silently lose:
-      * If EVERY grant (across every endpoint) lacks ``expiration``: raise
-        with the list of sources, so a caller gates destructively.
-      * If SOME grants have ``expiration`` and some do not: use the ones
+    Three-way contract on missing or un-parseable ``expiration``
+    (akash-lease-core #18): the field is required to discriminate fresh from
+    superseded, so a grant without it (or with a value that does not parse as
+    RFC3339) is "could not ask" — must NOT silently win or silently lose:
+      * If EVERY grant (across every endpoint) lacks a parseable
+        ``expiration``: raise with the list of sources, so a caller gates
+        destructively.
+      * If SOME have a parseable expiration and some do not: use the ones
         that do (the freshness discriminator is sound) and emit a
         ``warnings.warn`` naming the excluded sources — they contributed 0
         to the answer, not silently, by being named.
@@ -315,22 +365,33 @@ def deploy_credit(address: str) -> dict[str, int]:
             all_grants.append((coins, exp, base))
     if not all_grants:
         return {}  # every endpoint returned 200 but no DepositAuthorization grants
-    # Three-way contract: a grant without `expiration` is "could not ask" for
-    # the freshness discriminator — we cannot tell fresh from superseded, so
-    # it cannot contribute. Surface the state, never silently lose.
-    grants_with_exp = [(c, e, s) for c, e, s in all_grants if e]
-    grants_without_exp = [(c, s) for c, e, s in all_grants if not e]
+    # Three-way contract: a grant whose `expiration` is missing OR does not
+    # parse as RFC3339 is "could not ask" for the freshness discriminator —
+    # we cannot tell fresh from superseded, so it cannot contribute. Surface
+    # the state, never silently lose. The un-parseable grants share the same
+    # warning channel as the missing ones; both are excluded for the SAME
+    # reason (the discriminator cannot use them), and treating them
+    # uniformly is what keeps the three-way contract simple.
+    grants_with_exp: list[tuple[dict[str, int], datetime, str]] = []
+    grants_without_exp: list[tuple[dict[str, int], str]] = []
+    for coins, exp, source in all_grants:
+        parsed = _parse_expiration(exp) if exp else None
+        if parsed is None:
+            grants_without_exp.append((coins, source))
+        else:
+            grants_with_exp.append((coins, parsed, source))
     if not grants_with_exp:
         sources = sorted({s for _, s in grants_without_exp})
         raise RuntimeError(
-            "every LCD returned DepositAuthorization grants WITHOUT an `expiration` "
-            "field; cannot reconcile by LATEST EXPIRATION (the discriminator that "
-            "distinguishes a fresh grant from a superseded one). Sources: " + ", ".join(sources)
+            "every LCD returned DepositAuthorization grants WITHOUT a parseable "
+            "`expiration` field; cannot reconcile by LATEST EXPIRATION (the "
+            "discriminator that distinguishes a fresh grant from a superseded "
+            "one). Sources: " + ", ".join(sources)
         )
-    # LATEST EXPIRATION wins. Ties: pick the coins map with the MAX uact
-    # (one endpoint indexed a deposit the other hasn't yet — same expiry,
-    # higher uact = fresh reading). Other denoms ride along at 0 and don't
-    # affect the tie-break.
+    # LATEST EXPIRATION wins (datetime comparison, NOT string). Ties: pick
+    # the coins map with the MAX uact (one endpoint indexed a deposit the
+    # other hasn't yet — same expiry, higher uact = fresh reading). Other
+    # denoms ride along at 0 and don't affect the tie-break.
     latest_exp = max(e for _, e, _ in grants_with_exp)
     fresh_readings = [(c, s) for c, e, s in grants_with_exp if e == latest_exp]
     chosen = max(fresh_readings, key=lambda cs: cs[0].get("uact", 0))[0]
@@ -341,9 +402,9 @@ def deploy_credit(address: str) -> dict[str, int]:
         excluded = sorted({s for _, s in grants_without_exp})
         warnings.warn(
             f"deploy_credit: {len(grants_without_exp)} grant(s) from {excluded} "
-            "had no `expiration` and were excluded from the freshness discriminator "
-            "(not silently lost — named here). Re-run on a healthier LCD if this is "
-            "unexpected.",
+            "had no parseable `expiration` and were excluded from the freshness "
+            "discriminator (not silently lost — named here). Re-run on a healthier "
+            "LCD if this is unexpected.",
             stacklevel=2,
         )
     return chosen
