@@ -989,41 +989,41 @@ def main():
                             f" account={address}"
                         )
                     sys.exit(1)
-                # Check FREE credit, not the grant. Every active deployment holds a
-                # deposit in escrow against the same grant, so the grant alone reads
-                # "healthy" while Console is already returning 402 (measured: 165 of
-                # 170.62 ACT locked -> a 5 ACT deploy failed). Free is what decides
-                # whether the next deploy succeeds, so that is what the alarm gates on.
+                # Check FREE credit, not the grant. The DepositAuthorization
+                # spend_limit is ALREADY NET of locked escrow (the Cosmos authz
+                # module decrements it as the grantee uses escrow) — so
+                # `granted_uact` from `chain.granted_uact()` IS the free credit,
+                # and subtracting `locked_uact` a second time would double-count.
+                # ⭐ Fix for #169: `free_uact = max(granted_uact - locked_uact, 0)`
+                # was the OLD expression and was wrong. The fix removes the
+                # subtraction. The locked_uact value is still useful as a
+                # display field (`locked_in_escrow_usd`) — it just isn't a
+                # subtrahend of free credit.
                 escrow = escrow_locked(client)
                 locked_uact = escrow["locked_uact"]
-                free_uact = max(granted_uact - locked_uact, 0)
+                free_uact = chain.free_uact(granted_uact)
                 granted_usd = chain.usd_estimate("uact", granted_uact) or 0.0
                 locked_usd = chain.usd_estimate("uact", locked_uact) or 0.0
                 usd = chain.usd_estimate("uact", free_uact) or 0.0
                 low = usd < args.min_usd
-                # `escrow_locked` skips a deployment whose detail will not load and
-                # reports how many via `unreadable`, so `locked_uact` is a LOWER
-                # bound — which makes `free` an UPPER bound. Ignoring that flag lets
-                # this print "OK" on credit that may not exist, and an alarm that
-                # over-reports is worse than no alarm: the caller deploys, takes a
-                # 402, and blames the provider. UNKNOWN is a third answer, distinct
-                # from both OK and LOW, so a caller can tell "you are short" from
-                # "I could not finish counting".
-                # BOTH skip reasons make the tally incomplete. escrow_locked also skips a
-                # deployment it cannot NAME (no extractable dseq), and that omission has
-                # the identical consequence as an unreadable one: locked is understated,
-                # so free is overstated, so this prints OK on credit that may not exist.
-                # Counting only `unreadable` left the exact hole described two paragraphs
-                # up still open. Raised by CodeRabbit on #141.
+                # ⭐ Fix for #169 follow-on (CodeRabbit on #190): `spend_limits` IS
+                # the deployable credit, so free_usd is no longer an UPPER bound —
+                # escrow incompleteness cannot make free_usd a lie. The OLD code
+                # downgraded OK to UNKNOWN on omission because, under the OLD
+                # `free = granted - locked` formula, an incomplete escrow tally
+                # made `locked` a lower bound and therefore `free` an upper bound.
+                # Under NET semantics that concern is gone: omission is a
+                # data-quality diagnostic, not a gate.
+                #
+                # The diagnostic is still emitted in the payload (`unreadable` +
+                # `unnameable` counters) so an operator can see the tally was
+                # incomplete — but it does NOT change the status, because
+                # `spend_limits` is the same value whether or not we could read
+                # any given deployment's escrow account.
                 unreadable = escrow.get("unreadable", 0)
                 unnameable = escrow.get("skipped_no_dseq", 0)
                 omitted = unreadable + unnameable
-                if low:
-                    status = "LOW"
-                elif omitted:
-                    status = "UNKNOWN"
-                else:
-                    status = "OK"
+                status = "LOW" if low else "OK"
                 if use_json:
                     print(
                         json.dumps(
@@ -1036,8 +1036,8 @@ def main():
                                 "free_usd": usd,
                                 "granted_usd": granted_usd,
                                 "locked_in_escrow_usd": locked_usd,
-                                # >0 means the escrow tally is INCOMPLETE, so
-                                # free_usd is an upper bound, not a measurement.
+                                # Diagnostic only — does NOT affect status under
+                                # NET semantics (spend_limits IS the free credit).
                                 "escrow_unreadable_deployments": unreadable,
                                 # Same meaning, different cause: a deployment with no
                                 # extractable dseq is omitted from the tally too.
@@ -1047,22 +1047,19 @@ def main():
                         )
                     )
                 else:
+                    diag = (
+                        f" ({omitted} escrow detail(s) omitted: "
+                        f"{unreadable} unreadable, {unnameable} unnameable)"
+                        if omitted
+                        else ""
+                    )
                     print(
                         f"CREDIT-CHECK status={status} free_usd={usd:.2f}"
-                        + (
-                            f" (UPPER BOUND: {omitted} deployment(s) omitted — "
-                            f"{unreadable} unreadable, {unnameable} unnameable)"
-                            if omitted
-                            else ""
-                        )
-                        + f" (granted={granted_usd:.2f} locked_in_escrow={locked_usd:.2f}) "
+                        f"{diag} (granted={granted_usd:.2f} "
+                        f"locked_in_escrow={locked_usd:.2f}) "
                         f"min_usd={args.min_usd:.2f} account={address}"
                     )
-                # Non-zero for UNKNOWN as well as LOW. A caller gating on the exit
-                # code is asking "is it safe to deploy?", and "I could not finish
-                # counting" is not a yes. Exiting 0 there is precisely how an
-                # over-reported balance becomes a 402 nobody predicted.
-                sys.exit(1 if (low or omitted) else 0)
+                sys.exit(1 if low else 0)
 
             # Deploy credit is the real "wallet balance": Console holds the funds and
             # grants this account an escrow DepositAuthorization whose spend_limits is
@@ -1088,13 +1085,19 @@ def main():
             credit = chain.describe_coins(granted)
             liquid = chain.describe_coins(chain.bank_balances(address))
             grant = chain.credit_grant_detail(address)
-            # The grant is what Console AUTHORIZED; active deployments hold deposits
-            # in escrow against it. free = granted - locked is what actually decides
-            # whether the next deploy succeeds (see escrow_locked's docstring).
+            # `granted_uact` is `spend_limits` from the DepositAuthorization — ALREADY NET
+            # of locked escrow (Cosmos authz decrements it as the grantee uses
+            # escrow; see chain.free_uact's docstring). ⭐ Fix for #169: the OLD
+            # expression `max(granted_uact - locked_uact, 0)` double-subtracts
+            # and reads 0 for a funded wallet when locked > granted. The fix:
+            # `free_uact = granted_uact` (via `chain.free_uact`).
+            # `locked_in_escrow_uact` and `active_deployments` are still emitted
+            # in the payload — they are useful diagnostic fields, just not
+            # subtrahends of free credit.
             locked_info = escrow_locked(client)
             granted_uact = granted.get("uact", 0)
             locked_uact = locked_info["locked_uact"]
-            free_uact = max(granted_uact - locked_uact, 0)
+            free_uact = chain.free_uact(granted_uact)
 
             if use_json:
                 print(

@@ -96,6 +96,109 @@ class TestDeployCredit:
             assert chain.granted_uact("akash1me", quorum=("a", "b", "c"), height=100) == 10
 
 
+class TestFreeUact:
+    """Fix for #169 — `spend_limits` is already NET of locked escrow.
+
+    The OLD expression `max(granted_uact - locked_uact, 0)` double-subtracts and
+    reads 0 for a funded wallet when `locked > granted` (which is routine on
+    real accounts — see issue body, disproof 1).
+
+    Two payload-level observations prove `spend_limits` is the REMAINING
+    allowance, NOT the gross grant:
+
+    1. `locked > granted` is impossible on a gross grant (a deployment's
+       escrow cannot exceed what was ever granted). It is routine here.
+    2. `spend_limits` falls in exact 5 ACT steps as deployments are created
+       (measured: 25.670005 -> 15.670001 = -10.000004 on 2 deposits). A
+       deposit's escrow cost is 5 ACT; only a remaining allowance moves by
+       that exact amount. A gross grant does not move on a deposit.
+
+    The fix is `free_uact = granted_uact` (clamped to 0 defensively) — the
+    helper `chain.free_uact` enforces this at the function boundary so the
+    OLD expression cannot be re-introduced by a well-meaning caller.
+    """
+
+    def test_free_uact_returns_granted_value_directly(self):
+        """#169: spend_limits is already NET — free == granted (clamped to >=0).
+
+        Real Console data: spend_limit=170.62 ACT (170_623_558 uact), 165 ACT
+        locked in escrow. The OLD expression would compute 5.62 ACT
+        (170.62 - 165) — wrong, that is double-subtract.
+
+        The helper returns the spend_limit value as-is. `locked_uact` is NOT
+        a parameter — there is no subtraction to make.
+        """
+        # Realistic payload values from the cli.py comment (170.62 ACT grant,
+        # 165 ACT locked) — exactly the dataset the OLD expression mishandles.
+        granted_uact = 170_623_558  # 170.62 ACT in uact
+        locked_uact = 165_000_000  # 165.00 ACT in uact (passed for parity)
+
+        free = chain.free_uact(granted_uact)
+
+        # The OLD expression `max(170_623_558 - 165_000_000, 0) = 5_623_558`
+        # would FAIL this assertion.
+        assert free == granted_uact, (
+            f"free_uact must equal granted_uact (spend_limits is already NET). "
+            f"Got {free}, expected {granted_uact}. The OLD expression "
+            f"`max({granted_uact} - {locked_uact}, 0) = {granted_uact - locked_uact} "
+            f"double-subtracts and would FAIL here."
+        )
+        assert free == 170_623_558  # NET, not 5_623_558
+        assert free != 5_623_558  # The OLD's wrong answer — explicit guard.
+
+    def test_free_uact_does_not_take_locked_uact_parameter(self):
+        """The helper must take ONLY the spend_limit value.
+
+        If it took `locked_uact` as a parameter, a future caller could be
+        tempted to compute `max(g - l, 0)` — the OLD expression. The signature
+        is the fence: locked_uact is not in scope.
+        """
+        import inspect
+
+        sig = inspect.signature(chain.free_uact)
+        params = list(sig.parameters)
+        assert "locked_uact" not in params, (
+            f"free_uact must not accept locked_uact — spend_limits is already "
+            f"net, and a `locked_uact` parameter would let callers re-introduce "
+            f"the OLD double-subtract. Current params: {params}."
+        )
+        assert params == ["granted_uact_value"], (
+            f"free_uact must take a single parameter. Got {params}."
+        )
+
+    def test_free_uact_clamps_negative_inputs_to_zero(self):
+        """Defensive clamp. A negative `spend_limits` reading (e.g. parse error)
+        must not propagate as a deployable negative credit — `free_uact = 0`.
+        """
+        assert chain.free_uact(-1) == 0
+        assert chain.free_uact(-1_000_000) == 0
+
+    def test_free_uact_with_locked_greater_than_granted_does_not_clamp_to_zero(self):
+        """#169 disproof 1: locked > granted is routine on real accounts.
+
+        If the OLD `max(g - l, 0)` were re-introduced, this exact scenario
+        clamps to 0 — hiding the wrongness. The helper must NOT clamp in this
+        case; the spend_limit value is what it is, even when escrow locked
+        exceeds it (which proves spend_limit is net, not gross).
+        """
+        # From the issue body, disproof 1:
+        #   akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee: granted=90.23 ACT,
+        #   locked=346.43 ACT. locked > granted — impossible on a gross grant.
+        granted_uact = 90_230_000  # 90.23 ACT
+        locked_uact = 346_430_000  # 346.43 ACT
+
+        free = chain.free_uact(granted_uact)
+
+        # Must NOT be `max(90_230_000 - 346_430_000, 0) = 0` (the OLD's clamp).
+        assert free != 0, (
+            f"free_uact must not clamp to 0 when locked ({locked_uact}) > "
+            f"granted ({granted_uact}) — that is the OLD expression's failure "
+            f"mode (#169). spend_limits is NET, so the helper returns the "
+            f"granted value as-is."
+        )
+        assert free == granted_uact
+
+
 class TestCreditGrantDetail:
     def test_returns_granter_and_expiration(self):
         payload = {

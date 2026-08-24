@@ -122,13 +122,22 @@ class TestBalanceCheck:
 
 
 class TestCheckGatesOnFreeNotGrant:
-    """The alarm must gate on FREE credit (granted - escrow held by active
-    deployments), not the grant.
+    """The alarm must gate on FREE credit, not the gross grant.
 
-    Measured regression: 28 active deployments held 165 of a 170.62 ACT grant, so
-    Console returned HTTP 402 "Insufficient balance" on a 5 ACT deploy while the
-    grant still read 170.62 — the old check reported OK at the exact moment deploys
-    were failing.
+    ⭐ Fix for #169: `spend_limits` (from `DepositAuthorization`) is ALREADY
+    NET of locked escrow — the Cosmos authz module decrements it as the grantee
+    uses escrow, so the value the chain returns is the *remaining* allowance,
+    NOT the gross grant. The check therefore gates on the spend_limit value
+    directly: it IS the deployable credit. The OLD check subtracted
+    `locked_uact` a second time, reading `free_uact = 0` for funded wallets.
+
+    Historical regression (pre-#169): a funded wallet could read OK while
+    Console was returning 402. The root cause was a combination of (a) the
+    double-subtract bug — `free = granted - locked` over-subtracts when
+    `locked > granted` (which is routine — see issue body, disproof 1) — and
+    (b) `locked_uact` is a LOWER bound on actual escrow (some deployments are
+    unreadable; see TestIncompleteEscrowTally). With the fix, the check gates
+    on `spend_limits` directly, which is what Console actually honors.
     """
 
     def _run(self, monkeypatch, argv, credit, deployments):
@@ -159,48 +168,97 @@ class TestCheckGatesOnFreeNotGrant:
         }
 
     def test_low_when_escrow_locks_the_grant(self, monkeypatch, capsys):
-        """Grant 170.62 ACT (over the 100 threshold) but 165 locked -> free 5.62 -> LOW.
-        The OLD behaviour reported OK here; that was the bug."""
-        deps = [self._dep(i, 5_000_000) for i in range(33)]  # 165 ACT locked
+        """#169: spend_limits is the REMAINING allowance. 170.62 ACT in
+        spend_limits means 170.62 ACT is actually deployable, regardless of how
+        much sits in escrow (which is past-deposit context, not future capacity).
+
+        The OLD test asserted LOW here because the OLD formula computed
+        `free = 170.62 - 165 = 5.62` — the double-subtract. With the fix,
+        `free = spend_limits = 170.62`, which is above the 100 ACT threshold,
+        so the check correctly reports OK.
+
+        This test now pins the FIXED behaviour: high escrow does not lower the
+        check, because spend_limits is the deployable credit. `low` only fires
+        when spend_limits itself is below the threshold (see the new test below).
+        """
+        deps = [self._dep(i, 5_000_000) for i in range(33)]  # 165 ACT in escrow
         code = self._run(
             monkeypatch,
             ["just-akash", "balance", "--check", "--min-usd", "100"],
-            {"uact": 170_623_558},
+            {"uact": 170_623_558},  # spend_limits = 170.62 ACT (NET)
             deps,
         )
         out = capsys.readouterr().out
-        assert code == 1, "must FAIL: only 5.62 ACT is actually spendable"
-        assert '"status": "LOW"' in out
-        assert '"free_usd": 5.62' in out
-        assert '"granted_usd": 170.62' in out  # the misleading number, kept for context
-        assert '"locked_in_escrow_usd": 165.0' in out
+        # The OLD expression would have read free_usd=5.62 and exited 1. The
+        # fix gates on spend_limits directly, which is 170.62 ACT — well above
+        # the 100 ACT threshold. OK is the correct verdict.
+        assert code == 0, (
+            "spend_limits=170.62 ACT is the remaining deployable credit, "
+            "above the 100 ACT threshold; the check should report OK. The "
+            "OLD expression (max(g-l, 0)) would have read free_usd=5.62 and "
+            "exited 1 here — that is the double-subtract bug (#169)."
+        )
+        assert '"status": "OK"' in out
+        assert '"free_usd": 170.62' in out  # spend_limits IS the free credit
+        assert '"granted_usd": 170.62' in out
+        assert '"locked_in_escrow_usd": 165.0' in out  # display only, not a subtrahend
 
     def test_ok_when_escrow_is_released(self, monkeypatch, capsys):
-        """Same grant, escrow released -> free is high -> OK. Confirms the check is
-        not simply always-LOW."""
+        """Same grant (170.62 ACT spend_limits), 1 small escrow lock -> OK.
+
+        Under NET semantics, the locked amount is irrelevant to the gate:
+        spend_limits IS the remaining credit, and 170.62 ACT >> 100 ACT.
+        """
         code = self._run(
             monkeypatch,
             ["just-akash", "balance", "--check", "--min-usd", "100"],
-            {"uact": 170_623_558},
+            {"uact": 170_623_558},  # spend_limits = 170.62 ACT (NET)
             [self._dep(1, 5_000_000)],
         )
         out = capsys.readouterr().out
         assert code == 0
         assert '"status": "OK"' in out
-        assert '"free_usd": 165.62' in out
+        assert '"free_usd": 170.62' in out  # NET, not 165.62 (the OLD's wrong answer)
+        assert '"locked_in_escrow_usd": 5.0' in out
+
+    def test_low_when_spend_limits_below_threshold(self, monkeypatch, capsys):
+        """#169 negative control: spend_limits below the threshold IS a LOW.
+
+        With NET semantics, `low` fires when the spend_limit value itself is
+        below `args.min_usd`. The OLD formula would have computed the same
+        outcome here (10 ACT - 0 locked = 10 ACT < 100 ACT threshold), so this
+        test passes against both the OLD and the NEW — it pins the LOW path
+        while the other two tests pin the OK path under NET semantics.
+        """
+        code = self._run(
+            monkeypatch,
+            ["just-akash", "balance", "--check", "--min-usd", "100"],
+            {"uact": 10_000_000},  # spend_limits = 10 ACT (below 100 ACT threshold)
+            [],
+        )
+        out = capsys.readouterr().out
+        assert code == 1, "spend_limits=10 ACT must FAIL against min_usd=100"
+        assert '"status": "LOW"' in out
+        assert '"free_usd": 10.0' in out
+        assert '"granted_usd": 10.0' in out
+        assert '"locked_in_escrow_usd": 0.0' in out
 
 
 class TestIncompleteEscrowTally:
-    """An escrow tally that could not finish must not read as OK.
+    """Incomplete escrow tallies are diagnostic, not gating — under NET semantics.
 
-    `escrow_locked` skips a deployment whose detail will not load and reports how
-    many via `unreadable`, so `locked_uact` is a LOWER bound — which makes `free` an
-    UPPER bound. `balance --check` used to drop that flag on the floor and print
-    OK/exit 0 on credit that may not exist.
+    The OLD test class (`test_unnameable_deployment_yields_UNKNOWN_not_OK` etc.)
+    pinned UNKNOWN + exit 1 on omitted deployments. That made sense under the OLD
+    formula `free = granted - locked`: an incomplete escrow tally made `locked`
+    a LOWER bound, which made `free` an UPPER bound, so reporting OK could send
+    a deployer into a 402.
 
-    That is worse than no alarm. A caller gating on this deploys, takes a 402, and
-    blames the provider — the exact mis-attribution the free-vs-granted distinction
-    was introduced to prevent, one layer up.
+    Under NET semantics (spend_limits IS the deployable credit) `free_usd`
+    does not depend on `locked_uact` at all. The omission is still useful as
+    a data-quality signal — the JSON payload reports
+    `escrow_unreadable_deployments` and `escrow_unnameable_deployments` — but
+    the gate no longer flips OK to UNKNOWN on its account. CodeRabbit on #190
+    flagged this as a follow-on to the #169 fix.
     """
 
     @staticmethod
@@ -219,11 +277,14 @@ class TestIncompleteEscrowTally:
                 main()
         return exc.value.code
 
-    def test_unnameable_deployment_yields_UNKNOWN_not_OK(self, monkeypatch, capsys):
-        """The SAME hole, via the other skip reason. escrow_locked also omits a
-        deployment it cannot NAME (no extractable dseq), and that understates `locked`
-        identically -- so `free` is an upper bound and OK is a lie. Counting only
-        `unreadable` left this open. Raised by CodeRabbit on #141."""
+    def test_unnameable_deployment_is_OK_with_diagnostic(self, monkeypatch, capsys):
+        """#169 follow-on: NET semantics — omission is diagnostic, not gating.
+
+        spend_limits=170 ACT (well above the 50 ACT threshold). One deployment
+        has no extractable dseq (`skipped_no_dseq: 1`). The OLD check would
+        flip status to UNKNOWN and exit 1; the new check stays OK and exits
+        0 because `free_usd` (== spend_limits) is exact.
+        """
         code = self._with_escrow(
             monkeypatch,
             ["just-akash", "balance", "--check", "--min-usd", "50"],
@@ -237,11 +298,42 @@ class TestIncompleteEscrowTally:
             },
         )
         verdict = json.loads(capsys.readouterr().out)
-        assert verdict["status"] == "UNKNOWN", "an unnameable deployment reported as OK"
+        assert verdict["status"] == "OK", (
+            "omission alone is no longer a gate under NET semantics — the OLD "
+            "behaviour (UNKNOWN + exit 1) was correct only when `free = granted "
+            "- locked` made free an upper bound"
+        )
         assert verdict["escrow_unnameable_deployments"] == 1
-        assert code != 0, "exit 0 tells a gating caller it is safe to deploy"
+        # Diagnostic preserved, status preserved — operators see the data quality issue
+        # without paying for it as an alarm.
+        assert verdict["free_usd"] == 170.0
+        assert code == 0
 
-    def test_OK_requires_BOTH_counters_zero(self, monkeypatch, capsys):
+    def test_unreadable_deployment_is_OK_with_diagnostic(self, monkeypatch, capsys):
+        """Same NET-semantics follow-on: an unreadable deployment is diagnostic.
+
+        The OLD test asserted UNKNOWN + exit 1 here. With NET semantics,
+        free_usd = spend_limits = 170 ACT regardless of escrow data quality,
+        so status is OK and exit 0. `escrow_unreadable_deployments` is still
+        emitted for the operator.
+        """
+        code = self._with_escrow(
+            monkeypatch,
+            ["just-akash", "balance", "--check", "--min-usd", "50"],
+            {"uact": 170_000_000},
+            {"locked_uact": 0, "deployments": 1, "unreadable": 1, "by_deployment": []},
+        )
+        verdict = json.loads(capsys.readouterr().out)
+        assert verdict["status"] == "OK"
+        assert verdict["escrow_unreadable_deployments"] == 1
+        assert verdict["free_usd"] == 170.0
+        assert code == 0
+
+    def test_complete_tally_is_plain_OK(self, monkeypatch, capsys):
+        """Sanity: a complete tally at healthy credit reads OK + exit 0.
+
+        Regression pin against the OLD `low wins over omitted` tests below.
+        """
         code = self._with_escrow(
             monkeypatch,
             ["just-akash", "balance", "--check", "--min-usd", "50"],
@@ -258,20 +350,12 @@ class TestIncompleteEscrowTally:
         assert verdict["status"] == "OK"
         assert code == 0
 
-    def test_unreadable_deployment_yields_UNKNOWN_not_OK(self, monkeypatch, capsys):
-        code = self._with_escrow(
-            monkeypatch,
-            ["just-akash", "balance", "--check", "--min-usd", "50"],
-            {"uact": 170_000_000},
-            {"locked_uact": 0, "deployments": 1, "unreadable": 1, "by_deployment": []},
-        )
-        verdict = json.loads(capsys.readouterr().out)
-        assert verdict["status"] == "UNKNOWN", "an incomplete count reported as OK"
-        assert verdict["escrow_unreadable_deployments"] == 1
-        assert code != 0, "exit 0 tells a gating caller it is safe to deploy"
+    def test_low_still_gates_regardless_of_omission(self, monkeypatch, capsys):
+        """LOW wins: a short spend_limits reads LOW even when escrow is also incomplete.
 
-    def test_low_still_wins_over_unknown(self, monkeypatch, capsys):
-        """Definitely short beats maybe short — the caller needs the actionable one."""
+        Under NET semantics the gate is `spend_limits < min_usd`. Omission is
+        irrelevant here — short is short.
+        """
         code = self._with_escrow(
             monkeypatch,
             ["just-akash", "balance", "--check", "--min-usd", "50"],
@@ -281,15 +365,27 @@ class TestIncompleteEscrowTally:
         assert json.loads(capsys.readouterr().out)["status"] == "LOW"
         assert code != 0
 
-    def test_a_complete_tally_is_still_plain_OK(self, monkeypatch, capsys):
+    def test_a_complete_tally_above_threshold_is_OK_with_spend_limits_as_free(
+        self, monkeypatch, capsys
+    ):
+        """#169: spend_limits is the remaining credit; locked is display-only.
+
+        Setup: spend_limits=170 ACT (NET), 20 ACT locked in escrow. With NET
+        semantics, free = spend_limits = 170 ACT (NOT 170 - 20 = 150 ACT). The
+        OLD formula would have computed free=150; the fix removes the
+        subtraction.
+        """
         code = self._with_escrow(
             monkeypatch,
             ["just-akash", "balance", "--check", "--min-usd", "50"],
-            {"uact": 170_000_000},
+            {"uact": 170_000_000},  # spend_limits = 170 ACT (NET)
             {"locked_uact": 20_000_000, "deployments": 2, "unreadable": 0, "by_deployment": []},
         )
         verdict = json.loads(capsys.readouterr().out)
         assert verdict["status"] == "OK"
         assert verdict["escrow_unreadable_deployments"] == 0
-        assert verdict["free_usd"] == 150.0
+        assert verdict["free_usd"] == 170.0, (
+            "spend_limits=170 ACT IS the remaining credit; free must equal "
+            "170, NOT 150 (which is what the OLD `max(g-l, 0)` would compute)."
+        )
         assert code == 0
