@@ -115,6 +115,83 @@ class TestReconcileLeaseRow:
         row = api._reconcile_lease_row(_dep("7", funds=(("uakt", "999"), ("uact", "10"))))
         assert row["escrow_remaining_uact"] == 10
 
+    def test_active_zero_leases_is_closeable(self):
+        """⭐ #123 LOAD-BEARING DEFECT-DETECTING CONTROL.
+
+        The defect shape measured in production: a deployment is ``active``
+        (bid window closed / auction finished), ``lease_count == 0`` (no
+        provider ever bid), ``lease_state is None``, ``provider is None``,
+        ``escrow_state == "open"`` and a non-zero ``escrow_remaining_uact``
+        (13.34 ACT in the reported case). Nothing is running — no provider
+        ever took it — yet the OLD ``closeable`` rule returns False because
+        none of the four terminals it recognises apply: deployment_state is
+        not terminal, lease_state is None (not a terminal string), escrow is
+        open, and escrow funds are positive.
+
+        The discriminator is ``lease_count == 0 AND deployment is active``:
+        no lease ever existed, so closing the deployment releases the
+        escrow back to the grant. This control fails under the OLD code
+        (returns False); it MUST pass under the fix.
+
+        Reported by DEVOPS today across AKASH_CONSOLE: 50 active deployments
+        with rent transferred 0.0018 ACT — essentially nothing consumed
+        against 250 ACT locked. Across all accounts: 569.03 ACT locked over
+        116 deployments, ~4.91 ACT each. If a meaningful slice of those 116
+        are active-with-zero-leases, fixing ``closeable`` turns dead escrow
+        into recoverable escrow automatically.
+        """
+        row = api._reconcile_lease_row(
+            _dep(
+                "1234567890",
+                dep_state="active",
+                lease_state=None,  # no lease — bid window closed without a bid
+                provider="akash1prov",  # provider arg is ignored when lease_state is None
+                escrow_state="open",
+                funds=(("uact", "13344539000000"),),  # 13.34 ACT still locked
+            )
+        )
+        assert row["lease_count"] == 0, "the fixture must start with zero leases"
+        assert row["deployment_state"] == "active", "the deployment must still be active"
+        assert row["escrow_remaining_uact"] == 13344539000000, (
+            "the funds must remain visible — escrow is open and untouched"
+        )
+        assert row["closeable"] is True, (
+            "active + lease_count==0 is the closeable shape: nothing is running, "
+            "the escrow is held against nothing, and closing the deployment "
+            "releases the locked deposit back to the grant. That is #123."
+        )
+
+    def test_active_with_lease_stays_not_closeable(self):
+        """⭐ #123 KN — the load-bearing negative control.
+
+        If the fix is implemented as "close anything active" (e.g. a blanket
+        ``dep_state == 'active'`` flag), this control catches the catastrophic
+        version that would close healthy running deployments. The discriminator
+        MUST be active AND zero leases — NOT active alone. Active + at least
+        one lease means a provider is running something, and closing releases
+        a provider's escrow mid-flight, not dead escrow.
+
+        This control fails under a "close all active" blanket (returns True);
+        it MUST pass under the precise "active AND zero leases" discriminator.
+        """
+        row = api._reconcile_lease_row(
+            _dep(
+                "9876543210",
+                dep_state="active",
+                lease_state="active",  # a provider is running on this lease
+                provider="akash1prov",
+                escrow_state="open",
+                funds=(("uact", "5000000"),),
+            )
+        )
+        assert row["lease_count"] == 1
+        assert row["active_lease_count"] == 1
+        assert row["closeable"] is False, (
+            "active + at least one active lease is the NOT-closeable shape: "
+            "a provider is running. Closing here releases a live provider's "
+            "escrow mid-flight, not dead escrow."
+        )
+
 
 class TestLeaseStatus:
     def test_maps_all_deployments_and_passes_active_only_flag(self):
