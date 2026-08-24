@@ -285,6 +285,44 @@ def granted_uact(
     return max(agreeing) if agreeing else None
 
 
+def free_uact(granted_uact_value: int) -> int:
+    """Free deploy credit in uact, derived from the DepositAuthorization spend_limit.
+
+    ⭐ Fix for #169: ``spend_limits`` is ALREADY NET of locked escrow. The Cosmos
+    authz module decrements ``spend_limits`` as the grantee uses escrow, so the
+    value the chain returns is the *remaining* allowance, NOT the gross grant.
+    Subtracting a separately-measured ``locked_uact`` double-subtracts and clamps
+    to 0 — so a 90 ACT account with 346 ACT in escrow reads ``free_uact = 0``,
+    firing the low-credit alarm permanently on a funded wallet.
+
+    The OLD expression ``max(granted_uact - locked_uact, 0)`` is wrong. The
+    correct expression is the spend_limit value itself (clamped to 0 defensively):
+
+    - **Two independent payload-level disproofs (from the issue):**
+      1. ``locked > granted`` is routine on real accounts
+         (e.g. akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee: granted=90.23 ACT,
+         locked=346.43 ACT). A gross grant could not allow more escrow to be
+         locked than was ever granted. ``spend_limits`` must be net.
+      2. ``spend_limits`` falls in exact 5 ACT steps as deployments are created
+         (measured: ``25.670005 -> 15.670001`` = -10.000004 on 2 deposits,
+         ``15.670001 -> 10.662414`` = -5.007587 on 1 deposit). A deposit's
+         escrow cost is 5 ACT; only a *remaining allowance* decreases by that
+         exact amount. A gross grant does not move when a deposit is taken.
+
+    - **Where this is used:** ``cli.py:999`` (deploy-credit-check path) and
+      ``cli.py:1097`` (wallet-balance path). Both sites previously computed
+      ``free_uact = max(granted_uact - locked_uact, 0)`` — the bug. They now
+      call this helper.
+
+    ``locked_in_escrow_uact`` is still useful as a DISPLAY field (how much is
+    parked in escrow right now) — keep emitting it in payloads. It is just
+    not a subtrahend of free credit.
+    """
+    if granted_uact_value < 0:
+        return 0
+    return granted_uact_value
+
+
 def _sum_deposit_grants(data: dict[str, Any]) -> dict[str, int]:
     """Sum uact spend_limits across DepositAuthorization grants in one LCD payload."""
     totals: dict[str, int] = {}
