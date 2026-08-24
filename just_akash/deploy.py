@@ -844,16 +844,44 @@ def deploy(
     last_bid_count = -1
     first_seen_by_provider: dict[str, float] = {}
 
-    def _do_poll() -> None:
-        """Performs one poll, updates `bids`, prints progress + diff log line."""
-        nonlocal poll_count, last_bid_count, bids
+    # ⛔ A status line is written WITHOUT a trailing newline so the next poll can
+    # overwrite it with \r. If anything else writes to stdout in between — a bid
+    # arriving, an API error — its output lands on the SAME line, directly after
+    # the progress text. `_status_open` tracks that state so the writer can close
+    # the line first. Tracking it is not cosmetic: the corrupted line is the one a
+    # reader consults when a poll fails, i.e. exactly when it must be legible.
+    _status_open = False
+
+    def _close_status_line() -> None:
+        """Terminate a pending in-place status line before other stdout output."""
+        nonlocal _status_open
+        if _status_open:
+            print(flush=True)
+            _status_open = False
+
+    def _log_below_status(level: int, msg: str) -> None:
+        """`_log`, but never onto the tail of an unterminated status line."""
+        _close_status_line()
+        _log(level, msg)
+
+    def _do_poll(total: int, window_deadline_iso: str) -> None:
+        """Performs one poll, updates `bids`, prints progress + diff log line.
+
+        ⛔ `total` and `window_deadline_iso` are PARAMETERS, not closure reads. The
+        fallback round polls to `fallback_deadline`, and reading the collection
+        window's `bid_wait` / `deadline_iso` here reported 100% against an ALREADY
+        EXPIRED deadline while polling was still live — a progress bar that says
+        finished while it is not is worse than none, because it is consulted to
+        decide whether to keep waiting.
+        """
+        nonlocal poll_count, last_bid_count, bids, _status_open
         poll_count += 1
         elapsed = int(time.time() - start_time)
-        bar = _fmt_window_progress_bar(elapsed, bid_wait)
+        bar = _fmt_window_progress_bar(elapsed, total)
         status_line = _fmt_window_status_line(
             elapsed=elapsed,
-            total=bid_wait,
-            deadline_iso=deadline_iso,
+            total=total,
+            deadline_iso=window_deadline_iso,
             poll_count=poll_count,
             bid_count=0,  # updated below when known
             bar=bar,
@@ -861,20 +889,21 @@ def deploy(
         try:
             bids = client.get_bids(str(dseq))
         except RuntimeError as e:
-            _log(
+            _log_below_status(
                 logging.WARNING,
                 f"  poll #{poll_count} @ {elapsed}s: API error: {e}",
             )
             print(f"\r{status_line}  api_error=1", end="", flush=True)
+            _status_open = True
             return
 
         current_count = len(bids)
         if current_count != last_bid_count:
             last_bid_count = current_count
             if current_count == 0:
-                _log(logging.DEBUG, f"  poll #{poll_count} @ {elapsed}s: 0 bids")
+                _log_below_status(logging.DEBUG, f"  poll #{poll_count} @ {elapsed}s: 0 bids")
             else:
-                _log(
+                _log_below_status(
                     logging.INFO,
                     f"  poll #{poll_count} @ {elapsed}s: {current_count} bid(s) received",
                 )
@@ -886,33 +915,51 @@ def deploy(
                         first_seen_by_provider.setdefault(p, float(elapsed))
                     s = _bid_state(b)
                     tag = _classify_bid(p, preferred, backup)
-                    _log(
+                    _log_below_status(
                         logging.INFO,
                         f"    bid[{i}] provider={p}  price={_fmt_price(b)}  state={s}  [{tag}]",
                     )
 
         status_line = _fmt_window_status_line(
             elapsed=elapsed,
-            total=bid_wait,
-            deadline_iso=deadline_iso,
+            total=total,
+            deadline_iso=window_deadline_iso,
             poll_count=poll_count,
             bid_count=current_count,
             bar=bar,
         )
         if current_count > 0:
+            # This branch prints WITH a newline, so no status line is left open.
             print(f"\r{status_line}  WAITING_FOR_LATE_BIDDERS_UNTIL_DEADLINE", flush=True)
+            _status_open = False
         else:
             print(f"\r{status_line}  WAITING_FOR_FIRST_BID", end="", flush=True)
+            _status_open = True
 
-    def _poll_until(deadline: float, early_exit=None) -> None:
+    def _poll_until(
+        deadline: float,
+        early_exit=None,
+        *,
+        total: int | None = None,
+        window_deadline_iso: str | None = None,
+    ) -> None:
+        """Poll to `deadline`, reporting progress against THAT window.
+
+        ⚠ `total` / `window_deadline_iso` default to the COLLECTION window so the
+        first call reads unchanged. The fallback round MUST pass its own, or it
+        reports the previous window's numbers.
+        """
         while time.time() < deadline:
-            _do_poll()
+            _do_poll(
+                bid_wait if total is None else total,
+                deadline_iso if window_deadline_iso is None else window_deadline_iso,
+            )
             if early_exit is not None and early_exit(bids):
                 return
             time.sleep(5)
 
     _poll_until(collection_deadline)
-    print()
+    _close_status_line()
 
     def _filter_tier(current: list, tier: str) -> list:
         """Bids of a tier that are still leasable (state filter — issue #14)."""
@@ -960,7 +1007,13 @@ def deploy(
                 for item in current
             )
 
-        _poll_until(fallback_deadline, early_exit=_eligible_open)
+        _poll_until(
+            fallback_deadline,
+            early_exit=_eligible_open,
+            total=bid_wait_retry,
+            window_deadline_iso=_fmt_window_deadline(fallback_deadline),
+        )
+        _close_status_line()
         elapsed_for_decision = min(time.time() - start_time, float(bid_wait_retry))
         selected_bid, auction_result = _select_auction_bid(
             bids,
