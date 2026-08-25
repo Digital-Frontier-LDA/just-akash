@@ -20,7 +20,7 @@ dependencies = [
     # provider-selection decisions have exactly ONE implementation.
     # Pinned to a release wheel (not a branch) so the protocol cannot shift
     # under an installed CLI.
-    "akash-lease-core @ https://github.com/Digital-Frontier-LDA/akash-lease-core/releases/download/v0.7.0/akash_lease_core-0.7.0-py3-none-any.whl#sha256=65318a871ef04b8204f0665617acca05d5c514386dd86615f2a8c1976623cf55",
+    "akash-lease-core @ https://github.com/Digital-Frontier-LDA/akash-lease-core/releases/download/v0.8.0/akash_lease_core-0.8.0-py3-none-any.whl#sha256=391d1e78aec9dab6d76590ae64efc4bdca9af5156940e1ccf09be4255aac6898",
 ]
 
 [project.scripts]

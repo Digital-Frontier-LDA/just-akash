@@ -24,7 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 
 # Format produced by GitHub release downloads, e.g.
-#   akash-lease-core @ https://github.com/.../releases/download/v0.7.0/akash_lease_core-0.7.0-py3-none-any.whl#sha256=65318a87...
+#   akash-lease-core @ https://github.com/.../releases/download/v0.8.0/akash_lease_core-0.8.0-py3-none-any.whl#sha256=65318a87...
 _PIN_PATTERN = re.compile(
     r"""
     ^\s*                      # leading whitespace
