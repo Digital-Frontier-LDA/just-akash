@@ -1,7 +1,7 @@
 {
   "alphavps": {
     "dseq": "1786873428316",
-    "live": false,
+    "live": true,
     "uri": "262usig0tld1b12eju6dmio1o8.ingress.h6i-dedicated.eu-se-1.digitalfrontier.so"
   },
   "hetzner_hel": {
