@@ -26,7 +26,9 @@ whatever a future opener adds. Only two schemes are ever correct for a provider 
 
 from __future__ import annotations
 
+import ipaddress
 import json
+import socket
 import ssl
 import urllib.error
 import urllib.parse
@@ -55,12 +57,57 @@ class UnsafeProviderURL(ValueError):
     """A provider advertised a URL we will not dereference."""
 
 
+def _is_public_host(host: str) -> bool:
+    """Whether ``host`` resolves ONLY to public addresses.
+
+    ⛔ A HOSTNAME IS NOT PROOF OF A PUBLIC ENDPOINT. The scheme allowlist stops
+    `file://`, and stops nothing else: `http://127.0.0.1:9090/status`,
+    `http://169.254.169.254/` (cloud metadata) and `http://10.0.0.5/` all carry a
+    hostname and an allowed scheme. The URL comes from a PROVIDER'S OWN on-chain
+    record, so any bidder can choose it — this is a server-side request forgery with
+    an attacker-controlled target, and the target is inside our CI network.
+
+    ⚠ Resolution happens HERE and the check covers EVERY returned address, because a
+    name can map to several and a permissive check on the first would be bypassed by
+    ordering. This still leaves a DNS-rebinding window between the check and the
+    connect; closing that needs connect-time pinning, which urllib does not expose.
+    Narrowing an attacker from "any address" to "wins a rebind race" is the reduction
+    available at this layer, and saying so is better than implying it is airtight.
+    """
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        try:
+            addr = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False
+        if (
+            addr.is_private
+            or addr.is_loopback
+            or addr.is_link_local
+            or addr.is_reserved
+            or addr.is_multicast
+            or addr.is_unspecified
+        ):
+            return False
+    return True
+
+
 def _require_safe_url(url: str) -> str:
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in _ALLOWED_SCHEMES:
         raise UnsafeProviderURL(f"refusing scheme {parsed.scheme!r} (allowed: {_ALLOWED_SCHEMES})")
     if not parsed.hostname:
         raise UnsafeProviderURL("refusing a URL with no host")
+    if not _is_public_host(parsed.hostname):
+        raise UnsafeProviderURL(
+            f"refusing non-public host {parsed.hostname!r} — a provider-advertised URL "
+            "must not point at loopback, private, link-local or reserved space"
+        )
     return url
 
 

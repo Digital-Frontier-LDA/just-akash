@@ -1115,6 +1115,25 @@ def deploy(
         )
         _close_status_line()
         elapsed_for_decision = min(time.time() - start_time, float(bid_wait_retry))
+        # ⛔ THE FALLBACK WINDOW CAN ADD BIDDERS THE FIRST FETCH NEVER SAW. The snapshot
+        #   above covers only providers present before the first evaluation. If that
+        #   returned COLLECTING, polling ran on and a NEW provider may now be bidding —
+        #   and it would reach the auction with no capacity entry, i.e. unrankable, and
+        #   EMPTIEST would silently ignore precisely the bid it was asked to consider.
+        #   Fetch only the ADDITIONS, so the common case costs nothing.
+        if _selection is PreferredSelection.EMPTIEST and _capacity is not None:
+            late = [
+                pr
+                for pr in {_extract_provider(b) for b in bids if isinstance(b, dict)}
+                if pr and pr not in _capacity
+            ]
+            if late:
+                _capacity.update(capacity_by_provider(late))
+                _log(
+                    logging.INFO,
+                    f"  EMPTIEST: fetched capacity for {len(late)} provider(s) that "
+                    "arrived during the fallback window",
+                )
         selected_bid, auction_result = _select_auction_bid(
             bids,
             preferred=preferred,
@@ -1436,6 +1455,12 @@ def deploy(
         if has_allowlist
         else "first eligible bid after preferred window"
     )
+    # ⚠ THE PHASE IS NOT THE POLICY. `phase_label` names WHEN the decision was taken
+    #   ("cheapest preferred after collection window"); it hard-codes the tie-break as
+    #   cheapest. Under EMPTIEST that sentence is simply false, and the deploy log is
+    #   the only place an operator can see which policy actually ran.
+    if _selection is PreferredSelection.EMPTIEST:
+        selection_label = f"{selection_label} [selection: emptiest]"
     _log(
         logging.INFO,
         f"STEP 5: Selection made via {selection_label}",
