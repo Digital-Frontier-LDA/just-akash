@@ -4,10 +4,10 @@ requires-python = ">=3.10"
 
 [[package]]
 name = "akash-lease-core"
-version = "0.8.0"
-source = { url = "https://github.com/Digital-Frontier-LDA/akash-lease-core/releases/download/v0.8.0/akash_lease_core-0.8.0-py3-none-any.whl" }
+version = "0.9.0"
+source = { url = "https://github.com/Digital-Frontier-LDA/akash-lease-core/releases/download/v0.9.0/akash_lease_core-0.9.0-py3-none-any.whl" }
 wheels = [
-    { url = "https://github.com/Digital-Frontier-LDA/akash-lease-core/releases/download/v0.8.0/akash_lease_core-0.8.0-py3-none-any.whl", hash = "sha256:391d1e78aec9dab6d76590ae64efc4bdca9af5156940e1ccf09be4255aac6898" },
+    { url = "https://github.com/Digital-Frontier-LDA/akash-lease-core/releases/download/v0.9.0/akash_lease_core-0.9.0-py3-none-any.whl", hash = "sha256:e1aea5d9fce79de6f8b897ed39c3c582b241a9bf2e55dc2c1d81485f8ab88fa3" },
 ]
 
 [[package]]
@@ -181,7 +181,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "akash-lease-core", url = "https://github.com/Digital-Frontier-LDA/akash-lease-core/releases/download/v0.8.0/akash_lease_core-0.8.0-py3-none-any.whl" },
+    { name = "akash-lease-core", url = "https://github.com/Digital-Frontier-LDA/akash-lease-core/releases/download/v0.9.0/akash_lease_core-0.9.0-py3-none-any.whl" },
     { name = "pexpect", specifier = ">=4.9.0" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "websockets", specifier = ">=16.0" },

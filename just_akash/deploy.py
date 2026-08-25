@@ -22,8 +22,11 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TypedDict
 
 from akash_lease_core import Auction, AuctionPolicy, AuctionStatus, BidObservation
+from akash_lease_core.auction import PreferredSelection
+from akash_lease_core.capacity import ProviderCapacity
 
 from . import chain
 from ._diagnostics import Code, emit, enabled
@@ -33,6 +36,7 @@ from .api import (
     _extract_provider,
 )
 from .provenance import PLACEMENT_PREFIX, SIBLING_REAPED_PREFIX, run_id_of, stamp_run
+from .provider_capacity import capacity_by_provider
 from .sdl_validate import SDLValidationError, validate_sdl
 
 logger = logging.getLogger("akash.deploy")
@@ -388,6 +392,47 @@ def _classify_bid(provider: str | None, preferred: list[str], backup: list[str])
     return "FOREIGN"
 
 
+class _SelectionKwarg(TypedDict, total=False):
+    """The single optional keyword handed to AuctionPolicy.
+
+    ⛔ A TypedDict, NOT `dict[str, PreferredSelection]`. Pyright reads `**dict[str, V]`
+    as "may supply ANY keyword with a value of type V", so it then reports the value as
+    incompatible with every other field on the policy — measured here against
+    `excluded_providers` and `required_proofs`, both `frozenset[str]`. `total=False`
+    says exactly what is true: this mapping carries `preferred_selection` or nothing.
+    """
+
+    preferred_selection: "PreferredSelection"
+
+
+def _selection_kwarg(selection: "PreferredSelection | None") -> _SelectionKwarg:
+    """`{'preferred_selection': ...}` when asked for, `{}` otherwise.
+
+    Keeping this a separate function is what lets the type narrow: the caller holds an
+    Optional, the policy field does not, and an empty mapping carries no key at all.
+    """
+    if selection is None:
+        return {}
+    return {"preferred_selection": selection}
+
+
+def _resolve_selection(select: str) -> "PreferredSelection":
+    """Map the CLI's `--select` to the auction's mode.
+
+    ⛔ AN UNKNOWN VALUE RAISES. Falling back to cheapest on a typo would be the worst
+    outcome: the operator asked for a different placement policy, got the default, and
+    nothing said so. A typo must be loud.
+    """
+    table = {
+        "cheapest": PreferredSelection.CHEAPEST,
+        "emptiest": PreferredSelection.EMPTIEST,
+    }
+    key = (select or "cheapest").strip().lower()
+    if key not in table:
+        raise ValueError(f"unknown --select {select!r}; expected one of {sorted(table)}")
+    return table[key]
+
+
 def _select_auction_bid(
     bids: list,
     *,
@@ -397,6 +442,8 @@ def _select_auction_bid(
     fallback_window_seconds: float = 0,
     evaluated_at: float | None = None,
     observed_at_by_provider: dict[str, float] | None = None,
+    capacity_by_provider: dict[str, "ProviderCapacity"] | None = None,
+    preferred_selection: "PreferredSelection | None" = None,
 ):
     """Normalize Console bids and delegate the decision to the shared core.
 
@@ -411,6 +458,16 @@ def _select_auction_bid(
             fallback_window_seconds=fallback_window_seconds,
             preferred_providers=frozenset(preferred),
             eligible_providers=eligible,
+            # ⚠ DEFAULT IS UNCHANGED. An absent selection leaves AuctionPolicy on its
+            # OWN default rather than restating it here — passing CHEAPEST explicitly
+            # would pin just-akash to today's library default and silently diverge if
+            # akash-lease-core ever changes it. So the key is omitted, not defaulted.
+            #
+            # ⛔ Built as a narrowed dict rather than `**({...} if x else {})`: inside
+            # the `is not None` branch the value is a PreferredSelection, which is what
+            # the field declares. The inline-conditional form leaves the type as
+            # `PreferredSelection | None` at the call site and Pyright rejects it.
+            **_selection_kwarg(preferred_selection),
         ),
         started_at=0,
     )
@@ -436,6 +493,18 @@ def _select_auction_bid(
                 # has always treated that shape as leasable; normalize the
                 # transport quirk here rather than teaching the core about it.
                 state="open" if _is_open_bid(raw_bid) else _bid_state(raw_bid),
+                # ⛔ THE LINK THAT WAS MISSING. `PreferredSelection.EMPTIEST` has shipped
+                # since v0.8.0 and ranked on a capacity that nothing ever supplied, so it
+                # was selectable and inert — it silently degraded to cheapest and said so
+                # in `selection_reason`.
+                # ⚠ `None` here means UNMEASURED, and the core treats it as unrankable
+                # rather than as full. A provider whose /status could not be read must not
+                # sort last for being unreachable.
+                # ⚠ The FETCH stays with the caller. This adapter translates Console's
+                # response shape and nothing else; putting an HTTP call per bid inside a
+                # bid loop is the hot-path cost that kept the funding primitive off the
+                # deploy path for weeks.
+                capacity=(capacity_by_provider or {}).get(provider),
             )
         except (TypeError, ValueError):
             continue
@@ -703,6 +772,7 @@ def deploy(
     preferred_providers: list[str] | None = None,
     backup_providers: list[str] | None = None,
     deposit: float = 5.0,
+    select: str = "cheapest",
 ) -> dict:
     # deposit is user-controlled (--deposit); reject non-finite/non-positive
     # values before they reach json.dumps (which would emit invalid NaN/Infinity).
@@ -715,6 +785,11 @@ def deploy(
             "or equal to bid_wait"
         )
     fallback_wait = bid_wait_retry - bid_wait
+    # ⛔ VALIDATE BEFORE YOU SPEND. This raises on a bad --select, and it must raise HERE:
+    #   resolving it next to its use (just before the auction) put it AFTER
+    #   create_deployment, so a typo bought a deployment and a deposit before failing.
+    #   Argument validation is free; do it before the first irreversible step.
+    _selection = _resolve_selection(select)
     AuctionPolicy(
         collection_window_seconds=bid_wait,
         fallback_window_seconds=fallback_wait,
@@ -981,6 +1056,29 @@ def deploy(
             )
         return pool
 
+    # ⛔ THE FETCH HAPPENS ONCE, AND ONLY WHEN ASKED. `select` defaults to "cheapest",
+    #   so this block is skipped entirely on the default path — an HTTP round-trip per
+    #   bidder inside a bid loop is the cost that kept the funding primitive off the
+    #   deploy path for weeks. The result is reused for BOTH evaluations below; bidders
+    #   do not change between them, and re-fetching would pay the cost twice to answer
+    #   the same question.
+    _capacity: dict[str, ProviderCapacity] | None = None
+    if _selection is PreferredSelection.EMPTIEST:
+        providers_bidding = [
+            pr for pr in (_extract_provider(b) for b in bids if isinstance(b, dict)) if pr
+        ]
+        _capacity = capacity_by_provider(providers_bidding)
+        _readable = sum(1 for c in _capacity.values() if c.available_fraction() is not None)
+        # ⚠ SAY WHAT WAS MEASURED. If no provider's /status is readable the auction
+        #   silently degrades to cheapest — correct behaviour, but invisible unless the
+        #   coverage is reported. "emptiest requested" and "emptiest applied" are
+        #   different facts.
+        _log(
+            logging.INFO,
+            f"  EMPTIEST: capacity readable for {_readable}/{len(_capacity)} bidding "
+            f"provider(s){' — falling back to cheapest' if not _readable else ''}",
+        )
+
     selected_bid, auction_result = _select_auction_bid(
         bids,
         preferred=preferred,
@@ -989,6 +1087,8 @@ def deploy(
         fallback_window_seconds=fallback_wait,
         evaluated_at=bid_wait,
         observed_at_by_provider=first_seen_by_provider,
+        capacity_by_provider=_capacity,
+        preferred_selection=_selection,
     )
     if auction_result.status is AuctionStatus.COLLECTING:
         fallback_deadline = start_time + bid_wait_retry
@@ -1015,6 +1115,25 @@ def deploy(
         )
         _close_status_line()
         elapsed_for_decision = min(time.time() - start_time, float(bid_wait_retry))
+        # ⛔ THE FALLBACK WINDOW CAN ADD BIDDERS THE FIRST FETCH NEVER SAW. The snapshot
+        #   above covers only providers present before the first evaluation. If that
+        #   returned COLLECTING, polling ran on and a NEW provider may now be bidding —
+        #   and it would reach the auction with no capacity entry, i.e. unrankable, and
+        #   EMPTIEST would silently ignore precisely the bid it was asked to consider.
+        #   Fetch only the ADDITIONS, so the common case costs nothing.
+        if _selection is PreferredSelection.EMPTIEST and _capacity is not None:
+            late = [
+                pr
+                for pr in {_extract_provider(b) for b in bids if isinstance(b, dict)}
+                if pr and pr not in _capacity
+            ]
+            if late:
+                _capacity.update(capacity_by_provider(late))
+                _log(
+                    logging.INFO,
+                    f"  EMPTIEST: fetched capacity for {len(late)} provider(s) that "
+                    "arrived during the fallback window",
+                )
         selected_bid, auction_result = _select_auction_bid(
             bids,
             preferred=preferred,
@@ -1023,6 +1142,8 @@ def deploy(
             fallback_window_seconds=fallback_wait,
             evaluated_at=elapsed_for_decision,
             observed_at_by_provider=first_seen_by_provider,
+            capacity_by_provider=_capacity,
+            preferred_selection=_selection,
         )
     selection_phase = (
         1 if auction_result.selection_reason == "cheapest_preferred" or not has_allowlist else 2
@@ -1334,6 +1455,12 @@ def deploy(
         if has_allowlist
         else "first eligible bid after preferred window"
     )
+    # ⚠ THE PHASE IS NOT THE POLICY. `phase_label` names WHEN the decision was taken
+    #   ("cheapest preferred after collection window"); it hard-codes the tie-break as
+    #   cheapest. Under EMPTIEST that sentence is simply false, and the deploy log is
+    #   the only place an operator can see which policy actually ran.
+    if _selection is PreferredSelection.EMPTIEST:
+        selection_label = f"{selection_label} [selection: emptiest]"
     _log(
         logging.INFO,
         f"STEP 5: Selection made via {selection_label}",

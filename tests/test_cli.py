@@ -309,6 +309,7 @@ class TestCliDeployPassesArgs:
             preferred_providers=None,
             backup_providers=None,
             deposit=5.0,
+            select="cheapest",
         )
 
     @patch("just_akash.deploy.deploy")
