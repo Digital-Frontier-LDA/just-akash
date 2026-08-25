@@ -626,7 +626,7 @@ MUTATIONS = [
     (
         "pool image matches the probe",
         lambda s: s.replace(
-            "github-runner@sha256:030ae11a6b597c5db28b12375461e35f694d74ceb06a1b73c90545b1adef16da",
+            "github-runner@sha256:7509763af8209796f3e7fde5fb536c742075ec1a59ad1b36e3c9c27bc3bafc67",
             "github-runner:latest",
         ),
     ),
