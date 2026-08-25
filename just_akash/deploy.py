@@ -24,6 +24,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from akash_lease_core import Auction, AuctionPolicy, AuctionStatus, BidObservation
+from akash_lease_core.auction import PreferredSelection
+from akash_lease_core.capacity import ProviderCapacity
 
 from . import chain
 from ._diagnostics import Code, emit, enabled
@@ -397,6 +399,8 @@ def _select_auction_bid(
     fallback_window_seconds: float = 0,
     evaluated_at: float | None = None,
     observed_at_by_provider: dict[str, float] | None = None,
+    capacity_by_provider: dict[str, "ProviderCapacity"] | None = None,
+    preferred_selection: "PreferredSelection | None" = None,
 ):
     """Normalize Console bids and delegate the decision to the shared core.
 
@@ -411,6 +415,10 @@ def _select_auction_bid(
             fallback_window_seconds=fallback_window_seconds,
             preferred_providers=frozenset(preferred),
             eligible_providers=eligible,
+            # ⚠ DEFAULT IS UNCHANGED. `None` leaves AuctionPolicy on its own default
+            # (CHEAPEST), so wiring capacity through here changes no placement until a
+            # caller explicitly asks for EMPTIEST.
+            **({"preferred_selection": preferred_selection} if preferred_selection else {}),
         ),
         started_at=0,
     )
@@ -436,6 +444,18 @@ def _select_auction_bid(
                 # has always treated that shape as leasable; normalize the
                 # transport quirk here rather than teaching the core about it.
                 state="open" if _is_open_bid(raw_bid) else _bid_state(raw_bid),
+                # ⛔ THE LINK THAT WAS MISSING. `PreferredSelection.EMPTIEST` has shipped
+                # since v0.8.0 and ranked on a capacity that nothing ever supplied, so it
+                # was selectable and inert — it silently degraded to cheapest and said so
+                # in `selection_reason`.
+                # ⚠ `None` here means UNMEASURED, and the core treats it as unrankable
+                # rather than as full. A provider whose /status could not be read must not
+                # sort last for being unreachable.
+                # ⚠ The FETCH stays with the caller. This adapter translates Console's
+                # response shape and nothing else; putting an HTTP call per bid inside a
+                # bid loop is the hot-path cost that kept the funding primitive off the
+                # deploy path for weeks.
+                capacity=(capacity_by_provider or {}).get(provider),
             )
         except (TypeError, ValueError):
             continue
