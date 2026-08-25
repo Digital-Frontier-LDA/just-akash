@@ -134,6 +134,32 @@ def _lcd_get(
 # polkachu): v1beta3 -> 501, v1beta4 -> 200.
 _DEPLOYMENT_API = "/akash/deployment/v1beta4"
 
+# ⚠ THE MARKET MODULE IS ON A DIFFERENT VERSION FROM DEPLOYMENT, AND THAT IS EASY TO GET
+# BACKWARDS. Deployments answer on v1beta4 (above); market/leases answer on v1beta5 and
+# return 501 on v1beta4. Verified 2026-08-25 against the configured endpoints.
+_MARKET_API = "/akash/market/v1beta5"
+
+
+def active_deployment_count(owner: str, timeout: int = 15) -> int | None:
+    """How many ACTIVE deployments the chain attributes to ``owner``.
+
+    ⛔ Returns ``None`` — never 0 — when the chain cannot be read. This exists to
+    CORROBORATE a Console listing, so collapsing "could not ask" into "zero" would
+    defeat its only purpose: it would confirm an empty listing with an empty answer.
+    """
+    path = (
+        f"{_DEPLOYMENT_API}/deployments/list"
+        f"?filters.owner={owner}&filters.state=active&pagination.limit=1000"
+    )
+    try:
+        data = _lcd_get(path, timeout=timeout)
+    except RuntimeError:
+        return None
+    deployments = data.get("deployments")
+    if not isinstance(deployments, list):
+        return None
+    return len(deployments)
+
 
 def deployment_group_names(owner: str, dseq: str) -> list[str]:
     """``group_spec.name`` for every group of one deployment, read from chain.
