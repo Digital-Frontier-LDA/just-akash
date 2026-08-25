@@ -67,4 +67,35 @@ jobs:
         with:
           age-key: ${{ secrets.SOPS_AGE_KEY }}
       - name: Inventory / cleanup
-        run: uv run python -m just_akash.cleanup_stale ${{ inputs.execute && '--execute' || '' }}
+        # ⛔ `--reap-runners` IS PASSED UNCONDITIONALLY, AND WITHOUT IT THIS WORKFLOW CANNOT
+        # REACH THE POPULATION IT EXISTS FOR. `classify()` returns LEAVE-real-or-unknown for
+        # EVERY `services == ['runner']` deployment when the flag is off (cleanup_stale.py:112),
+        # so the runner leases this repo creates were invisible to it regardless of --execute.
+        # MEASURED on the 12:35Z scheduled run of 2026-08-25: 30 active deployments, 22 of them
+        # `just-akash-runner` leases holding 110 ACT, verdict `stale (closable): 0`. Promoting
+        # that run to --execute would have closed NOTHING. The schedule was never the only
+        # thing missing, and fixing only the schedule would have looked like a fix.
+        #
+        # ⚠ Safe unconditionally because it only OPENS the runner branch, which then proves
+        # ownership itself: group_spec.name must carry PLACEMENT_PREFIX (LEAVE-not-ours
+        # otherwise), an unreadable listing refuses (LEAVE-unverified-runner), and a 6h age
+        # floor applies. Scheduled runs still inherit execute=false, so this changes what the
+        # cron REPORTS, not what it closes. Promotion to --execute stays a human decision and
+        # the 200GiB-volume protocol is unchanged.
+        # ⚠ NO `${{ }}` INTERPOLATION IN THE RUN BODY. The value is a typed boolean and so
+        # cannot carry attacker text, but the pattern is the one that DOES when the input is a
+        # string, and a scanner cannot tell the two apart from the call site. Passing it through
+        # `env:` and branching in shell removes the class rather than arguing about this instance.
+        env:
+          EXECUTE: ${{ inputs.execute }}
+        run: |
+          # ⛔ EQUALITY AGAINST "true", NEVER A PRESENCE TEST. A scheduled run supplies no
+          # inputs, so EXECUTE is empty; a dry-run dispatch sets it to the STRING "false".
+          # `${EXECUTE:+--execute}` or `[ -n "$EXECUTE" ]` would both fire on "false" and turn
+          # every dry run into a live close — the same defect as DRY_RUN=1 parsing as false
+          # (Blazing-Back #1581) with the sign flipped.
+          if [ "$EXECUTE" = "true" ]; then
+            uv run python -m just_akash.cleanup_stale --reap-runners --execute
+          else
+            uv run python -m just_akash.cleanup_stale --reap-runners
+          fi
