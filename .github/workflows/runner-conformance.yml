@@ -16,6 +16,9 @@ permissions:
 jobs:
   pool:
     name: runner-pool
-    uses: Digital-Frontier-LDA/df-cicd/.github/workflows/reusable-akash-runner-conformance.yml@13ba1b441cf9b7a2406d8df813d579729c1f0890 # df-cicd main 2026-08-23
+    uses: Digital-Frontier-LDA/akash-github-runner/.github/workflows/reusable-akash-runner-conformance.yml@3e82b18132c39b80a1afaf3d1e7a65453cf73c7d # df-cicd main 2026-08-23
     with:
       workflow: .github/workflows/runner-pool.yml
+      # REQUIRED, no default: the revision of the CHECKER to run.
+      # Pinned to the SAME sha as the @pin above so checker and contract cannot drift.
+      checker-ref: 3e82b18132c39b80a1afaf3d1e7a65453cf73c7d
