@@ -592,3 +592,39 @@ def describe_coins(coins: dict[str, int]) -> list[dict[str, Any]]:
     ]
     rows.sort(key=lambda r: r["micro"], reverse=True)
     return rows
+
+
+def corroborate_listing(
+    listing_is_empty: bool, chain_active: int | None, address: str = ""
+) -> list[str]:
+    """Why an empty Console listing must not be reported as a clean fleet.
+
+    Returns the degradation reasons; empty list means the result stands on its own.
+
+    ⛔ THE THREE EMPTY CASES ARE NOT ONE CASE. An empty listing can mean the fleet is
+    clean, that the listing is incomplete, or that nobody could check — and all three
+    print `closeable_count: 0`. Only the first is an all-clear.
+
+      listing non-empty            -> []                      (nothing to corroborate)
+      empty + chain says N>0       -> [mismatch]              (the listing is lying)
+      empty + chain says 0         -> []                      (corroborated clean)
+      empty + chain unreadable     -> [unconfirmed]           (an unasked question)
+
+    ⚠ `chain_active == 0` and `chain_active is None` MUST stay distinguishable here.
+    Collapsing "could not ask" into "zero" would confirm an empty listing with an empty
+    answer — which is the exact defect this function exists to prevent (#208).
+    """
+    if not listing_is_empty:
+        return []
+    if chain_active is None:
+        return [
+            "Console listing returned 0 deployments and the chain could not be "
+            "read to corroborate it. UNCONFIRMED, not clean."
+        ]
+    if chain_active > 0:
+        return [
+            f"Console listing returned 0 deployments for {address}, but the chain "
+            f"reports {chain_active} ACTIVE. The listing is incomplete, so "
+            f"'closeable_count: 0' is NOT an all-clear — it is an unasked question."
+        ]
+    return []

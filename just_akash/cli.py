@@ -1296,17 +1296,11 @@ def main():
             # LCD hiccup look like a Console failure.
             degraded_reasons: list[str] = []
             chain_active = chain.active_deployment_count(address)
-            if not all_rows and chain_active:
-                degraded_reasons.append(
-                    f"Console listing returned 0 deployments for {address}, but the chain "
-                    f"reports {chain_active} ACTIVE. The listing is incomplete, so "
-                    f"'closeable_count: 0' is NOT an all-clear — it is an unasked question."
-                )
-            elif not all_rows and chain_active is None:
-                degraded_reasons.append(
-                    "Console listing returned 0 deployments and the chain could not be "
-                    "read to corroborate it. UNCONFIRMED, not clean."
-                )
+            # The decision is a pure function so it can be tested on all four cases;
+            # inline, it was only reachable through a live Console + chain read.
+            degraded_reasons += chain.corroborate_listing(
+                listing_is_empty=not all_rows, chain_active=chain_active, address=address
+            )
             is_degraded = bool(degraded_reasons)
 
             def _esc(r):
