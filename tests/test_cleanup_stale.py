@@ -72,6 +72,39 @@ class TestClassify:
             == "STALE-runner"
         )
 
+    def test_the_CANARY_survives_even_with_the_flag_on_and_our_own_prefix(self):
+        """⛔ THE KNOWN-NEGATIVE THIS SUITE DID NOT HAVE.
+
+        `just-akash-canary` is a long-lived service whose 200 GiB volume was destroyed
+        FOUR times by a widened prefix. Nothing in this file asserted it survives, so the
+        protection was structural-by-accident rather than tested.
+
+        It is safe for a reason worth pinning: the runner branch is entered only on
+        `services == ['runner']`, and the canary's service set is `['canary']`. It is
+        excluded by SERVICE IDENTITY, never by a name filter — so it survives even with
+        `reap_runners=True`, even carrying OUR OWN placement prefix, and even at an age
+        far past every stale floor. A prefix-based guard would not give that.
+        """
+        ancient = _dseq(30 * 86400)
+        ours = ["just-akash-canary"]
+        verdict, _, _ = cs.classify(
+            _detail(["canary"]), ancient, NOW, reap_runners=True, group_names=ours
+        )
+        assert verdict == "LEAVE-real-or-unknown", (
+            "the canary must never be classified stale: flag on, our prefix, 30 days old"
+        )
+
+    def test_a_mixed_service_set_containing_the_runner_is_NOT_reaped(self):
+        """⚠ `services == ['runner']` is an EQUALITY, not a membership test, and that is
+        load-bearing. A deployment that runs a runner ALONGSIDE something else is not a
+        disposable pool, and must not be reaped as one."""
+        old = _dseq(8 * 3600)
+        for mixed in (["canary", "runner"], ["runner", "backtest"], ["runner", "consul"]):
+            verdict, _, _ = cs.classify(
+                _detail(mixed), old, NOW, reap_runners=True, group_names=["just-akash-runner"]
+            )
+            assert verdict == "LEAVE-real-or-unknown", mixed
+
     def test_another_repos_runner_on_the_shared_wallet_is_left_alone(self):
         """The concrete deployment this protects: `dfci-infra-runner`, six of them live
         on our wallet when this was written. Same service set, same age, not ours."""

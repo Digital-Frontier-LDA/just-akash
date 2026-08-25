@@ -133,3 +133,46 @@ def test_scheduled_workflows_do_not_stack_on_the_same_minute():
         f"cleanup-stale's cron minute {our_minute} collides with existing crons "
         f"{colliding} — API burst stacking against the shared 5000/hr budget"
     )
+
+
+# ── #201: A SCHEDULE IS NOT REACH ────────────────────────────────────────────────
+#
+# ⛔ THE MEASURED DEFECT (2026-08-25). The close plane was scheduled and firing — eight
+# consecutive `schedule` runs, all `completed/success`, every 6h since 2026-08-23T18:33Z.
+# It still let `just-akash-runner` leases grow 13 -> 22 (65 -> 110 ACT) because
+# `cleanup-stale.yml` never passed `--reap-runners`, and `classify()` returns
+# LEAVE-real-or-unknown for every `services == ['runner']` deployment when that flag is
+# off. The 12:35Z run of 2026-08-25 saw all 30 active deployments, 22 of them runner
+# leases, and reported `stale (closable): 0`.
+#
+# ⇒ Scheduling it was necessary and not sufficient. Promoting that same run to
+# `--execute` would have closed nothing. This test exists so "it has a cron" can never
+# again be mistaken for "it can reach the population".
+
+
+def _cleanup_stale_run_line() -> str:
+    import pathlib
+
+    text = pathlib.Path(".github/workflows/cleanup-stale.yml").read_text()
+    lines = [ln for ln in text.splitlines() if "just_akash.cleanup_stale" in ln]
+    assert len(lines) == 1, f"expected exactly one cleanup_stale invocation, found {len(lines)}"
+    return lines[0]
+
+
+def test_the_scheduled_reaper_passes_reap_runners() -> None:
+    """Without this flag the workflow cannot classify a runner lease as stale at all."""
+    assert "--reap-runners" in _cleanup_stale_run_line(), (
+        "cleanup-stale.yml must pass --reap-runners. Without it, classify() short-circuits "
+        "every services==['runner'] deployment to LEAVE-real-or-unknown and the cron reports "
+        "'stale (closable): 0' over a population that is growing."
+    )
+
+
+def test_execute_is_still_gated_on_the_input_not_the_schedule() -> None:
+    """⚠ The flag must NOT drag --execute along with it. A scheduled run inherits
+    execute=false; promotion stays a human decision, preserving the 200GiB-volume protocol."""
+    line = _cleanup_stale_run_line()
+    assert "inputs.execute" in line, "--execute must remain conditional on the dispatch input"
+    assert "--execute'" not in line.replace("inputs.execute && '--execute'", ""), (
+        "--execute must not be passed unconditionally"
+    )
