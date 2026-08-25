@@ -628,3 +628,20 @@ def corroborate_listing(
             f"'closeable_count: 0' is NOT an all-clear — it is an unasked question."
         ]
     return []
+
+
+def latest_height(timeout: int = 15) -> int | None:
+    """The chain's current block height, or None when it cannot be read.
+
+    ⛔ None, never 0. Height is the denominator of every age computation here; a 0 would
+    make every deployment look infinitely old, which is the direction that closes live
+    escrow. An unreadable height must make ages UNKNOWN, not ancient.
+    """
+    try:
+        data = _lcd_get("/cosmos/base/tendermint/v1beta1/blocks/latest", timeout=timeout)
+    except RuntimeError:
+        return None
+    try:
+        return int(data["block"]["header"]["height"])
+    except (KeyError, TypeError, ValueError):
+        return None
