@@ -76,12 +76,14 @@ def test_the_default_is_unchanged_and_still_picks_cheapest() -> None:
     """⭐ The control. If this moves, the wiring changed placement for every caller."""
     raw, result = _run()
     assert raw is not None
+    assert result.selected is not None
     assert result.selected.provider == SMALL
 
 
 def test_capacity_alone_changes_nothing_without_the_mode() -> None:
     """Supplying capacity must not silently switch selection."""
     raw, result = _run(capacity_by_provider=CAPACITY)
+    assert result.selected is not None
     assert result.selected.provider == SMALL
 
 
@@ -91,6 +93,7 @@ def test_emptiest_selects_the_roomiest_provider_not_the_cheapest() -> None:
     raw, result = _run(
         capacity_by_provider=CAPACITY, preferred_selection=PreferredSelection.EMPTIEST
     )
+    assert result.selected is not None
     assert result.selected.provider == BIG
     assert "emptiest" in result.selection_reason
 
@@ -99,6 +102,7 @@ def test_emptiest_without_capacity_degrades_to_cheapest_AND_SAYS_SO() -> None:
     """⚠ The pre-wiring behaviour, pinned deliberately. Asking for emptiest with no
     capacity is not an error — but the reason must not claim the mode was honoured."""
     raw, result = _run(preferred_selection=PreferredSelection.EMPTIEST)
+    assert result.selected is not None
     assert result.selected.provider == SMALL
     assert result.selection_reason != "emptiest_preferred"
     assert "emptiest" in result.selection_reason
@@ -114,6 +118,7 @@ def test_an_unreadable_provider_is_unranked_not_ranked_last() -> None:
     )
     # BIG is unrankable, so the roomiest MEASURED provider wins — not BIG, and not
     # "BIG last" either; it is simply out of the ranking.
+    assert result.selected is not None
     assert result.selected.provider == MID
 
 
@@ -123,4 +128,5 @@ def test_a_provider_with_no_capacity_entry_is_treated_as_unmeasured() -> None:
         capacity_by_provider={BIG: CAPACITY[BIG]},
         preferred_selection=PreferredSelection.EMPTIEST,
     )
+    assert result.selected is not None
     assert result.selected.provider == BIG

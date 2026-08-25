@@ -22,6 +22,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TypedDict
 
 from akash_lease_core import Auction, AuctionPolicy, AuctionStatus, BidObservation
 from akash_lease_core.auction import PreferredSelection
@@ -391,6 +392,30 @@ def _classify_bid(provider: str | None, preferred: list[str], backup: list[str])
     return "FOREIGN"
 
 
+class _SelectionKwarg(TypedDict, total=False):
+    """The single optional keyword handed to AuctionPolicy.
+
+    ⛔ A TypedDict, NOT `dict[str, PreferredSelection]`. Pyright reads `**dict[str, V]`
+    as "may supply ANY keyword with a value of type V", so it then reports the value as
+    incompatible with every other field on the policy — measured here against
+    `excluded_providers` and `required_proofs`, both `frozenset[str]`. `total=False`
+    says exactly what is true: this mapping carries `preferred_selection` or nothing.
+    """
+
+    preferred_selection: "PreferredSelection"
+
+
+def _selection_kwarg(selection: "PreferredSelection | None") -> _SelectionKwarg:
+    """`{'preferred_selection': ...}` when asked for, `{}` otherwise.
+
+    Keeping this a separate function is what lets the type narrow: the caller holds an
+    Optional, the policy field does not, and an empty mapping carries no key at all.
+    """
+    if selection is None:
+        return {}
+    return {"preferred_selection": selection}
+
+
 def _resolve_selection(select: str) -> "PreferredSelection":
     """Map the CLI's `--select` to the auction's mode.
 
@@ -433,10 +458,16 @@ def _select_auction_bid(
             fallback_window_seconds=fallback_window_seconds,
             preferred_providers=frozenset(preferred),
             eligible_providers=eligible,
-            # ⚠ DEFAULT IS UNCHANGED. `None` leaves AuctionPolicy on its own default
-            # (CHEAPEST), so wiring capacity through here changes no placement until a
-            # caller explicitly asks for EMPTIEST.
-            **({"preferred_selection": preferred_selection} if preferred_selection else {}),
+            # ⚠ DEFAULT IS UNCHANGED. An absent selection leaves AuctionPolicy on its
+            # OWN default rather than restating it here — passing CHEAPEST explicitly
+            # would pin just-akash to today's library default and silently diverge if
+            # akash-lease-core ever changes it. So the key is omitted, not defaulted.
+            #
+            # ⛔ Built as a narrowed dict rather than `**({...} if x else {})`: inside
+            # the `is not None` branch the value is a PreferredSelection, which is what
+            # the field declares. The inline-conditional form leaves the type as
+            # `PreferredSelection | None` at the call site and Pyright rejects it.
+            **_selection_kwarg(preferred_selection),
         ),
         started_at=0,
     )
