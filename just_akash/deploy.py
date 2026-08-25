@@ -35,6 +35,7 @@ from .api import (
     _extract_provider,
 )
 from .provenance import PLACEMENT_PREFIX, SIBLING_REAPED_PREFIX, run_id_of, stamp_run
+from .provider_capacity import capacity_by_provider
 from .sdl_validate import SDLValidationError, validate_sdl
 
 logger = logging.getLogger("akash.deploy")
@@ -390,6 +391,23 @@ def _classify_bid(provider: str | None, preferred: list[str], backup: list[str])
     return "FOREIGN"
 
 
+def _resolve_selection(select: str) -> "PreferredSelection":
+    """Map the CLI's `--select` to the auction's mode.
+
+    ⛔ AN UNKNOWN VALUE RAISES. Falling back to cheapest on a typo would be the worst
+    outcome: the operator asked for a different placement policy, got the default, and
+    nothing said so. A typo must be loud.
+    """
+    table = {
+        "cheapest": PreferredSelection.CHEAPEST,
+        "emptiest": PreferredSelection.EMPTIEST,
+    }
+    key = (select or "cheapest").strip().lower()
+    if key not in table:
+        raise ValueError(f"unknown --select {select!r}; expected one of {sorted(table)}")
+    return table[key]
+
+
 def _select_auction_bid(
     bids: list,
     *,
@@ -723,6 +741,7 @@ def deploy(
     preferred_providers: list[str] | None = None,
     backup_providers: list[str] | None = None,
     deposit: float = 5.0,
+    select: str = "cheapest",
 ) -> dict:
     # deposit is user-controlled (--deposit); reject non-finite/non-positive
     # values before they reach json.dumps (which would emit invalid NaN/Infinity).
@@ -735,6 +754,11 @@ def deploy(
             "or equal to bid_wait"
         )
     fallback_wait = bid_wait_retry - bid_wait
+    # ⛔ VALIDATE BEFORE YOU SPEND. This raises on a bad --select, and it must raise HERE:
+    #   resolving it next to its use (just before the auction) put it AFTER
+    #   create_deployment, so a typo bought a deployment and a deposit before failing.
+    #   Argument validation is free; do it before the first irreversible step.
+    _selection = _resolve_selection(select)
     AuctionPolicy(
         collection_window_seconds=bid_wait,
         fallback_window_seconds=fallback_wait,
@@ -1001,6 +1025,29 @@ def deploy(
             )
         return pool
 
+    # ⛔ THE FETCH HAPPENS ONCE, AND ONLY WHEN ASKED. `select` defaults to "cheapest",
+    #   so this block is skipped entirely on the default path — an HTTP round-trip per
+    #   bidder inside a bid loop is the cost that kept the funding primitive off the
+    #   deploy path for weeks. The result is reused for BOTH evaluations below; bidders
+    #   do not change between them, and re-fetching would pay the cost twice to answer
+    #   the same question.
+    _capacity: dict[str, ProviderCapacity] | None = None
+    if _selection is PreferredSelection.EMPTIEST:
+        providers_bidding = [
+            pr for pr in (_extract_provider(b) for b in bids if isinstance(b, dict)) if pr
+        ]
+        _capacity = capacity_by_provider(providers_bidding)
+        _readable = sum(1 for c in _capacity.values() if c.available_fraction() is not None)
+        # ⚠ SAY WHAT WAS MEASURED. If no provider's /status is readable the auction
+        #   silently degrades to cheapest — correct behaviour, but invisible unless the
+        #   coverage is reported. "emptiest requested" and "emptiest applied" are
+        #   different facts.
+        _log(
+            logging.INFO,
+            f"  EMPTIEST: capacity readable for {_readable}/{len(_capacity)} bidding "
+            f"provider(s){' — falling back to cheapest' if not _readable else ''}",
+        )
+
     selected_bid, auction_result = _select_auction_bid(
         bids,
         preferred=preferred,
@@ -1009,6 +1056,8 @@ def deploy(
         fallback_window_seconds=fallback_wait,
         evaluated_at=bid_wait,
         observed_at_by_provider=first_seen_by_provider,
+        capacity_by_provider=_capacity,
+        preferred_selection=_selection,
     )
     if auction_result.status is AuctionStatus.COLLECTING:
         fallback_deadline = start_time + bid_wait_retry
@@ -1043,6 +1092,8 @@ def deploy(
             fallback_window_seconds=fallback_wait,
             evaluated_at=elapsed_for_decision,
             observed_at_by_provider=first_seen_by_provider,
+            capacity_by_provider=_capacity,
+            preferred_selection=_selection,
         )
     selection_phase = (
         1 if auction_result.selection_reason == "cheapest_preferred" or not has_allowlist else 2

@@ -262,6 +262,19 @@ def main():
         help="Preferred provider address (repeatable; overrides AKASH_PROVIDERS)",
     )
     deploy_p.add_argument(
+        "--select",
+        dest="select",
+        choices=["cheapest", "emptiest"],
+        default="cheapest",
+        help=(
+            "Bid selection policy among equally-eligible providers. cheapest (default) "
+            "picks the lowest price; emptiest prefers the provider with the most free "
+            "capacity, probing each bidder's /status. emptiest costs one HTTP round-trip "
+            "per bidder and silently degrades to cheapest for any provider whose status "
+            "is unreadable."
+        ),
+    )
+    deploy_p.add_argument(
         "--backup-provider",
         action="append",
         dest="backup_providers",
@@ -697,6 +710,7 @@ def main():
                 # argument unset.
                 backup_providers=[] if args.no_backup_fallback else args.backup_providers,
                 deposit=args.deposit,
+                select=args.select,
             )
             sys.exit(0)
         except RuntimeError as e:
