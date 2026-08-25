@@ -1,34 +1,34 @@
 {
   "alphavps": {
     "boot_id": "5f490281427048e2",
-    "checks_total": 770,
+    "checks_total": 771,
     "closures": {
       "self": 9
     },
     "deployed": 1,
-    "disk_write_seconds": 0.00144,
+    "disk_write_seconds": 0.000974,
     "dns_fail": 0.0,
-    "dns_ok": 95988.0,
+    "dns_ok": 96077.0,
     "dseq": "1786873428316",
     "egress_fail": 0.0,
-    "egress_ok": 95988.0,
-    "last_collect": 1787628559.3407717,
+    "egress_ok": 96077.0,
+    "last_collect": 1787629903.1684618,
     "lease_lifetime_hours": 12.003320662777778,
     "lease_replacements_total": 16,
     "raw_dns_fail": 0.0,
-    "raw_dns_ok": 759.0,
+    "raw_dns_ok": 848.0,
     "raw_egress_fail": 0.0,
-    "raw_egress_ok": 759.0,
+    "raw_egress_ok": 848.0,
     "reachable": 1,
     "restarts_total": 11,
-    "sched_jitter_seconds": 0.000115,
-    "scrape_seconds": 0.3226,
+    "sched_jitter_seconds": 0.000114,
+    "scrape_seconds": 0.396,
     "unreachable_checks_total": 24,
-    "uptime_seconds": 11385.357
+    "uptime_seconds": 12729.243
   },
   "hetzner_hel": {
     "boot_id": "90d7bee356404375",
-    "checks_total": 770,
+    "checks_total": 771,
     "closures": {
       "self": 10
     },
@@ -39,7 +39,7 @@
     "dseq": "1786884699629",
     "egress_fail": 7.0,
     "egress_ok": 95771.0,
-    "last_collect": 1787628559.3407717,
+    "last_collect": 1787629903.1684618,
     "lease_lifetime_hours": 11.87235602138889,
     "lease_replacements_total": 16,
     "raw_dns_fail": 0.0,
@@ -49,13 +49,13 @@
     "reachable": 0,
     "restarts_total": 2,
     "sched_jitter_seconds": 0.00013,
-    "scrape_seconds": 0.4909,
-    "unreachable_checks_total": 40,
+    "scrape_seconds": 0.6369,
+    "unreachable_checks_total": 41,
     "uptime_seconds": 16559.623
   },
   "onidc": {
     "boot_id": "c272fc7091424b7b",
-    "checks_total": 720,
+    "checks_total": 721,
     "closures": {
       "self": 9
     },
@@ -66,7 +66,7 @@
     "dseq": "1786975940216",
     "egress_fail": 0.0,
     "egress_ok": 88979.0,
-    "last_collect": 1787628559.3407717,
+    "last_collect": 1787629903.1684618,
     "lease_lifetime_hours": 11.8907878675,
     "lease_replacements_total": 16,
     "raw_dns_fail": 0.0,
@@ -76,8 +76,8 @@
     "reachable": 0,
     "restarts_total": 11,
     "sched_jitter_seconds": 0.000146,
-    "scrape_seconds": 0.3174,
-    "unreachable_checks_total": 34,
+    "scrape_seconds": 0.5376,
+    "unreachable_checks_total": 35,
     "uptime_seconds": 3277.041
   }
 }
