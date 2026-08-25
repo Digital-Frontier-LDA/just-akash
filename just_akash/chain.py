@@ -134,6 +134,32 @@ def _lcd_get(
 # polkachu): v1beta3 -> 501, v1beta4 -> 200.
 _DEPLOYMENT_API = "/akash/deployment/v1beta4"
 
+# ⚠ THE MARKET MODULE IS ON A DIFFERENT VERSION FROM DEPLOYMENT, AND THAT IS EASY TO GET
+# BACKWARDS. Deployments answer on v1beta4 (above); market/leases answer on v1beta5 and
+# return 501 on v1beta4. Verified 2026-08-25 against the configured endpoints.
+_MARKET_API = "/akash/market/v1beta5"
+
+
+def active_deployment_count(owner: str, timeout: int = 15) -> int | None:
+    """How many ACTIVE deployments the chain attributes to ``owner``.
+
+    ⛔ Returns ``None`` — never 0 — when the chain cannot be read. This exists to
+    CORROBORATE a Console listing, so collapsing "could not ask" into "zero" would
+    defeat its only purpose: it would confirm an empty listing with an empty answer.
+    """
+    path = (
+        f"{_DEPLOYMENT_API}/deployments/list"
+        f"?filters.owner={owner}&filters.state=active&pagination.limit=1000"
+    )
+    try:
+        data = _lcd_get(path, timeout=timeout)
+    except RuntimeError:
+        return None
+    deployments = data.get("deployments")
+    if not isinstance(deployments, list):
+        return None
+    return len(deployments)
+
 
 def deployment_group_names(owner: str, dseq: str) -> list[str]:
     """``group_spec.name`` for every group of one deployment, read from chain.
@@ -566,3 +592,39 @@ def describe_coins(coins: dict[str, int]) -> list[dict[str, Any]]:
     ]
     rows.sort(key=lambda r: r["micro"], reverse=True)
     return rows
+
+
+def corroborate_listing(
+    listing_is_empty: bool, chain_active: int | None, address: str = ""
+) -> list[str]:
+    """Why an empty Console listing must not be reported as a clean fleet.
+
+    Returns the degradation reasons; empty list means the result stands on its own.
+
+    ⛔ THE THREE EMPTY CASES ARE NOT ONE CASE. An empty listing can mean the fleet is
+    clean, that the listing is incomplete, or that nobody could check — and all three
+    print `closeable_count: 0`. Only the first is an all-clear.
+
+      listing non-empty            -> []                      (nothing to corroborate)
+      empty + chain says N>0       -> [mismatch]              (the listing is lying)
+      empty + chain says 0         -> []                      (corroborated clean)
+      empty + chain unreadable     -> [unconfirmed]           (an unasked question)
+
+    ⚠ `chain_active == 0` and `chain_active is None` MUST stay distinguishable here.
+    Collapsing "could not ask" into "zero" would confirm an empty listing with an empty
+    answer — which is the exact defect this function exists to prevent (#208).
+    """
+    if not listing_is_empty:
+        return []
+    if chain_active is None:
+        return [
+            "Console listing returned 0 deployments and the chain could not be "
+            "read to corroborate it. UNCONFIRMED, not clean."
+        ]
+    if chain_active > 0:
+        return [
+            f"Console listing returned 0 deployments for {address}, but the chain "
+            f"reports {chain_active} ACTIVE. The listing is incomplete, so "
+            f"'closeable_count: 0' is NOT an all-clear — it is an unasked question."
+        ]
+    return []

@@ -1264,9 +1264,44 @@ def main():
             use_json = args.json or not sys.stdout.isatty()
             address = client.account_address()
             rows = lease_status(client, active_only=not args.include_closed)
+            # ⚠ Corroborate against the UNFILTERED set. `--closeable-only` legitimately
+            #   empties `rows`, and treating that as a degraded listing would fire on
+            #   every healthy fleet with nothing to close.
+            all_rows = list(rows)
             if args.closeable_only:
                 rows = [r for r in rows if r["closeable"]]
             n_close = sum(1 for r in rows if r["closeable"])
+
+            # ⛔⛔ AN EMPTY CONSOLE LISTING AND A CLEAN FLEET PRINT THE SAME THING.
+            # `lease_status` builds its rows from `client.list_deployments()` — the
+            # Console API. When that returns nothing, `closeable_count: 0` and
+            # `leases: []` are emitted, which is byte-identical to a genuinely idle
+            # account. Measured 2026-08-25: this command reported 0 leases for
+            # akash1n4uut3v… while the chain showed 55 ACTIVE leases and 60 active
+            # deployments for that same owner, in the same minute.
+            #
+            # ⚠ `orphan-scan` already solved this in this repo and states the rule:
+            # "publishing 0 from a degraded scan would be a false all-clear … a green
+            # number standing in for an unasked question". It carries `degraded` /
+            # `degraded_reasons` and refuses to exit 0 on an incomplete scan. This
+            # command carried no such field, so it could answer "nothing to close"
+            # without having seen anything.
+            #
+            # THE CORROBORATION IS CHEAP AND CREDENTIAL-FREE: the chain already knows
+            # how many active deployments an owner holds. A Console listing that is
+            # empty while the chain is not is the degraded signal.
+            #
+            # ⚠ An UNREADABLE chain is NOT degraded. The primary source answered; we
+            # simply could not confirm it. Reporting that as degraded would make every
+            # LCD hiccup look like a Console failure.
+            degraded_reasons: list[str] = []
+            chain_active = chain.active_deployment_count(address)
+            # The decision is a pure function so it can be tested on all four cases;
+            # inline, it was only reachable through a live Console + chain read.
+            degraded_reasons += chain.corroborate_listing(
+                listing_is_empty=not all_rows, chain_active=chain_active, address=address
+            )
+            is_degraded = bool(degraded_reasons)
 
             def _esc(r):
                 micro = r["escrow_remaining_uact"]
@@ -1279,6 +1314,8 @@ def main():
                             "account": address,
                             "scope": "all" if args.include_closed else "active",
                             "closeable_count": n_close,
+                            "degraded": is_degraded,
+                            "degraded_reasons": degraded_reasons,
                             "leases": rows,
                         },
                         indent=2,
@@ -1303,6 +1340,23 @@ def main():
                         f"\n  {n_close} lease(s) closeable (terminal state or drained escrow) — "
                         "`just-akash destroy --dseq <DSEQ>` to stop the escrow bleed."
                     )
+
+            # ⛔ A DEGRADED REPORT MUST NOT EXIT 0. A caller checking only the exit
+            #   status would otherwise read an incomplete listing as a clean fleet —
+            #   the same reasoning `orphan-scan` applies to its own scan, and the same
+            #   reason its metric is ABSENT rather than 0 when degraded.
+            # ⚠ The findings above are still printed: an unconfirmed listing does not
+            #   make the rows it DID return untrue. Degradation dominates the exit
+            #   code because exit 0 asserts "these are all of them".
+            if is_degraded:
+                for reason in degraded_reasons:
+                    print(f"\n⚠ DEGRADED: {reason}", file=sys.stderr)
+                print(
+                    "\n⇒ This is NOT a clean result. Do not treat 'closeable_count: 0' "
+                    "from a degraded listing as 'nothing to close'.",
+                    file=sys.stderr,
+                )
+                return 1
         except RuntimeError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
