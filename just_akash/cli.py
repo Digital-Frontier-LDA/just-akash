@@ -554,6 +554,24 @@ def main():
         help="Block time in seconds (default: 6.0; env AKASH_BLOCK_TIME_S)",
     )
 
+    # ── unleased-orders ────────────────────────────────
+    uo_p = subparsers.add_parser(
+        "unleased-orders",
+        help="Deployments still holding escrow whose order never acquired a lease "
+        "(report-only; verdicts come from akash-lease-core's leaked-order policy)",
+    )
+    uo_p.add_argument("--owner", required=True, help="Akash account address to audit")
+    uo_p.add_argument("--json", action="store_true", help="Output in JSON format")
+    uo_p.add_argument(
+        "--min-age-seconds",
+        type=float,
+        default=None,
+        help="Override the age floor. ⚠ The default (900s) is DERIVED in "
+        "akash-lease-core from the 450s bid window x2 — below it an order may still be "
+        "mid-auction, which is how the previous version of this audit produced five "
+        "false positives. Lower it only with a reason.",
+    )
+
     # ── lease-status ───────────────────────────────────
     ls_p = subparsers.add_parser(
         "lease-status",
@@ -1253,6 +1271,64 @@ def main():
             sys.exit(1)
 
     # ── lease-status ───────────────────────────────────
+    elif args.command == "unleased-orders":
+        import json as _json
+
+        from akash_lease_core.orders import OrderPolicy
+
+        from .unleased_orders import audit_owner, summarise
+
+        policy = (
+            OrderPolicy(min_age_seconds=args.min_age_seconds)
+            if args.min_age_seconds is not None
+            else None
+        )
+        try:
+            decisions = audit_owner(args.owner, policy=policy)
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        counts = summarise(decisions)
+        closeable = [d for d in decisions if d.status.value == "closeable"]
+        if args.json:
+            print(
+                _json.dumps(
+                    {
+                        "owner": args.owner,
+                        "counts": counts,
+                        "closeable": [d.dseq for d in closeable],
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print(f"owner {args.owner}")
+            # ⚠ Print EVERY status, including the zeros. A summary that omits absent
+            #   categories reads as "none of those exist" when it means "not shown".
+            for status in (
+                "closeable",
+                "has_lease",
+                "too_young",
+                "protected",
+                "excluded",
+                "not_active",
+                "not_open_order",
+                "undetermined",
+            ):
+                print(f"  {status:16s} {counts.get(status, 0)}")
+            for d in closeable:
+                print(f"  ⚠ CLOSEABLE dseq={d.dseq}")
+            if not closeable:
+                # ⛔ Say which question was answered. "0 closeable" is only meaningful
+                #   alongside the population it was drawn from.
+                print(
+                    f"\n⇒ no unleased orders over the age floor, across "
+                    f"{sum(counts.values())} active deployment(s)."
+                )
+        # Report-only: a CLOSEABLE verdict is a CANDIDATE, never an authorisation.
+        sys.exit(0)
+
     elif args.command == "lease-status":
         import json
 
