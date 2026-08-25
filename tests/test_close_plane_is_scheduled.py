@@ -150,29 +150,75 @@ def test_scheduled_workflows_do_not_stack_on_the_same_minute():
 # again be mistaken for "it can reach the population".
 
 
-def _cleanup_stale_run_line() -> str:
+def _cleanup_stale_invocations() -> list[str]:
+    """Every line that invokes the cleanup_stale module, from the workflow."""
     import pathlib
 
     text = pathlib.Path(".github/workflows/cleanup-stale.yml").read_text()
     lines = [ln for ln in text.splitlines() if "just_akash.cleanup_stale" in ln]
-    assert len(lines) == 1, f"expected exactly one cleanup_stale invocation, found {len(lines)}"
-    return lines[0]
+    assert lines, "no cleanup_stale invocation found — the workflow moved or was renamed"
+    return lines
 
 
-def test_the_scheduled_reaper_passes_reap_runners() -> None:
-    """Without this flag the workflow cannot classify a runner lease as stale at all."""
-    assert "--reap-runners" in _cleanup_stale_run_line(), (
-        "cleanup-stale.yml must pass --reap-runners. Without it, classify() short-circuits "
-        "every services==['runner'] deployment to LEAVE-real-or-unknown and the cron reports "
-        "'stale (closable): 0' over a population that is growing."
+def _cleanup_stale_run_body() -> str:
+    """The run: body of the step that invokes cleanup_stale, verbatim."""
+    import pathlib
+
+    import yaml
+
+    doc = yaml.safe_load(pathlib.Path(".github/workflows/cleanup-stale.yml").read_text())
+    bodies = [
+        st["run"]
+        for job in doc["jobs"].values()
+        for st in job.get("steps", [])
+        if "run" in st and "cleanup_stale" in st["run"]
+    ]
+    assert len(bodies) == 1, f"expected one cleanup_stale run step, found {len(bodies)}"
+    return bodies[0]
+
+
+def test_EVERY_cleanup_stale_invocation_passes_reap_runners() -> None:
+    """Without this flag the workflow cannot classify a runner lease as stale at all.
+
+    Asserted over EVERY invocation, not one: the step branches on execute, so a flag added
+    to only one arm would leave the other blind — and the blind arm is the scheduled one.
+    """
+    for line in _cleanup_stale_invocations():
+        assert "--reap-runners" in line, (
+            f"invocation without --reap-runners: {line.strip()!r}. classify() short-circuits "
+            "every services==['runner'] deployment to LEAVE-real-or-unknown without it, and the "
+            "cron reports 'stale (closable): 0' over a population that is growing."
+        )
+
+
+def test_execute_is_reached_only_through_an_equality_on_the_string_true() -> None:
+    """⚠ A scheduled run supplies no inputs (EXECUTE empty); a dry-run dispatch sets the
+    STRING "false". A presence test — `[ -n "$EXECUTE" ]` or `${EXECUTE:+--execute}` — fires
+    on "false" and turns every dry run into a live close. Same defect as DRY_RUN=1 parsing
+    as false, sign flipped. The guard must be an equality against "true"."""
+    # ⛔ MATCH CODE, NOT PROSE. The first version of this test scanned the raw file and
+    # failed on its OWN explanatory comment, which names `${EXECUTE:+...}` as the
+    # anti-pattern to avoid. A guard that cannot tell a warning about a defect from the
+    # defect is satisfied by deleting the warning.
+    code = "\n".join(
+        ln for ln in _cleanup_stale_run_body().splitlines() if not ln.lstrip().startswith("#")
     )
+    assert '[ "$EXECUTE" = "true" ]' in code, "execute must be gated on an equality against \"true\""
+    assert "${EXECUTE:+" not in code, "presence expansion fires on the string 'false'"
+    assert '[ -n "$EXECUTE" ]' not in code, "presence test fires on the string 'false'"
+    execs = [ln for ln in _cleanup_stale_invocations() if "--execute" in ln]
+    assert len(execs) == 1, f"exactly one invocation may pass --execute, found {len(execs)}"
 
 
-def test_execute_is_still_gated_on_the_input_not_the_schedule() -> None:
-    """⚠ The flag must NOT drag --execute along with it. A scheduled run inherits
-    execute=false; promotion stays a human decision, preserving the 200GiB-volume protocol."""
-    line = _cleanup_stale_run_line()
-    assert "inputs.execute" in line, "--execute must remain conditional on the dispatch input"
-    assert "--execute'" not in line.replace("inputs.execute && '--execute'", ""), (
-        "--execute must not be passed unconditionally"
-    )
+def test_the_run_body_does_not_interpolate_a_github_expression() -> None:
+    """⚠ The value is a typed boolean and cannot carry attacker text, but `${{ }}` inside a
+    run body is the shape that DOES when the input is a string, and a scanner cannot tell
+    them apart. Keep it in `env:`."""
+    import yaml, pathlib
+
+    doc = yaml.safe_load(pathlib.Path(".github/workflows/cleanup-stale.yml").read_text())
+    for job in doc["jobs"].values():
+        for step in job.get("steps", []):
+            body = step.get("run", "")
+            if "cleanup_stale" in body:
+                assert "${{" not in body, "no GitHub expression interpolation inside the run body"

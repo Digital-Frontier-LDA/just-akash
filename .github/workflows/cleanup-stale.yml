@@ -82,4 +82,20 @@ jobs:
         # floor applies. Scheduled runs still inherit execute=false, so this changes what the
         # cron REPORTS, not what it closes. Promotion to --execute stays a human decision and
         # the 200GiB-volume protocol is unchanged.
-        run: uv run python -m just_akash.cleanup_stale --reap-runners ${{ inputs.execute && '--execute' || '' }}
+        # ⚠ NO `${{ }}` INTERPOLATION IN THE RUN BODY. The value is a typed boolean and so
+        # cannot carry attacker text, but the pattern is the one that DOES when the input is a
+        # string, and a scanner cannot tell the two apart from the call site. Passing it through
+        # `env:` and branching in shell removes the class rather than arguing about this instance.
+        env:
+          EXECUTE: ${{ inputs.execute }}
+        run: |
+          # ⛔ EQUALITY AGAINST "true", NEVER A PRESENCE TEST. A scheduled run supplies no
+          # inputs, so EXECUTE is empty; a dry-run dispatch sets it to the STRING "false".
+          # `${EXECUTE:+--execute}` or `[ -n "$EXECUTE" ]` would both fire on "false" and turn
+          # every dry run into a live close — the same defect as DRY_RUN=1 parsing as false
+          # (Blazing-Back #1581) with the sign flipped.
+          if [ "$EXECUTE" = "true" ]; then
+            uv run python -m just_akash.cleanup_stale --reap-runners --execute
+          else
+            uv run python -m just_akash.cleanup_stale --reap-runners
+          fi
