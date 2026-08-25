@@ -203,7 +203,7 @@ def test_execute_is_reached_only_through_an_equality_on_the_string_true() -> Non
     code = "\n".join(
         ln for ln in _cleanup_stale_run_body().splitlines() if not ln.lstrip().startswith("#")
     )
-    assert '[ "$EXECUTE" = "true" ]' in code, "execute must be gated on an equality against \"true\""
+    assert '[ "$EXECUTE" = "true" ]' in code, 'execute must be gated on an equality against "true"'
     assert "${EXECUTE:+" not in code, "presence expansion fires on the string 'false'"
     assert '[ -n "$EXECUTE" ]' not in code, "presence test fires on the string 'false'"
     execs = [ln for ln in _cleanup_stale_invocations() if "--execute" in ln]
@@ -214,7 +214,9 @@ def test_the_run_body_does_not_interpolate_a_github_expression() -> None:
     """⚠ The value is a typed boolean and cannot carry attacker text, but `${{ }}` inside a
     run body is the shape that DOES when the input is a string, and a scanner cannot tell
     them apart. Keep it in `env:`."""
-    import yaml, pathlib
+    import pathlib
+
+    import yaml
 
     doc = yaml.safe_load(pathlib.Path(".github/workflows/cleanup-stale.yml").read_text())
     for job in doc["jobs"].values():
