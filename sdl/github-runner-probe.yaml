@@ -70,7 +70,11 @@ services:
       # overflowed the org's runner-listing first page once and broke provisioning
       # for every repo, so a qualification run must not contribute to that.
       - EPHEMERAL=true
-      - DISABLE_AUTO_UPDATE=true
+      # ⛔ DELETED, NOT SET TO false. The entrypoint tests PRESENCE, not value, so
+      # `DISABLE_AUTO_UPDATE=false` still applies --disableupdate (measured, Blazing-Back
+      # run 31614227678). A pinned digest freezes the binary; without auto-update it can
+      # never climb past a deprecation — it registers forever and receives no jobs.
+      # The probe qualifies the SAME image the pool runs, so this must stay in step.
       - RUNNER_WORKDIR=/_work
       - RUN_AS_ROOT=true
     expose:

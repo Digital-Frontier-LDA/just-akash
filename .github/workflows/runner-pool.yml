@@ -395,7 +395,27 @@ jobs:
                 - RUNNER_NAME_PREFIX=just-akash-${RUNNER_LABEL}
                 - LABELS=self-hosted,linux,akash,${RUNNER_LABEL}
                 - EPHEMERAL=${EPHEMERAL}
-                - DISABLE_AUTO_UPDATE=true
+                # ⛔ DISABLE_AUTO_UPDATE IS DELETED, NOT SET TO false — THAT IS THE FIX.
+                # GitHub deprecates runner versions on a DATE, not at merge, so a pinned
+                # binary that is current today is deprecated later with NO code change.
+                # Auto-update is the only mechanism that survives that; a static version
+                # floor cannot, because it passes at merge and then rots.
+                #
+                # MEASURED in Blazing-Back 2026-08-12 (run 31610657650):
+                #   Current runner version: '2.334.0'
+                #   Disable auto update option is enabled
+                #   ...: Listening for Jobs
+                #   An error occurred: Runner version v2.334.0 is deprecated and cannot
+                #   receive messages.
+                # The runner REGISTERS fine and is then never sent a job — which is why the
+                # org listing fills with records while nothing ever runs, and why a paid
+                # lease burns for its whole life having executed nothing.
+                #
+                # ⚠ SETTING IT TO `false` DOES NOT WORK. Measured, run 31614227678: with
+                # `DISABLE_AUTO_UPDATE=false` the container still printed "Disable auto
+                # update option is enabled" and stayed on 2.334.0. The entrypoint tests the
+                # variable's PRESENCE, not its value, so any non-empty string — including
+                # "false" — applies --disableupdate. The line must be ABSENT.
                 - RUNNER_WORKDIR=/_work
                 - RUN_AS_ROOT=true
               expose:
