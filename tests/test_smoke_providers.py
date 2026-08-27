@@ -2243,9 +2243,8 @@ class TestAuthFailureIsNotAProviderFault:
         import re
         from pathlib import Path
 
-        src = (Path(__file__).resolve().parents[1] / "just_akash" / "smoke_providers.py").read_text(
-            encoding="utf-8"
-        )
+        mod = Path(__file__).resolve().parents[1] / "just_akash" / "smoke_providers.py"
+        src = mod.read_text(encoding="utf-8")
         assert re.search(r'"no-auth":\s*"NO-AUTH"', src), (
             'no-auth has no entry in the note->outcome map, so .get(note, "FAIL") '
             "scores it as a provider failure — the exact bug this class exists to stop"
