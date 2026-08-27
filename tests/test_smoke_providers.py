@@ -2312,8 +2312,8 @@ class TestBidWaitInvariant:
     never checked against the callee's contract.
     """
 
-    def _built_command(self):
-        captured = {}
+    def _built_command(self) -> str:
+        captured: dict = {}
 
         def fake_run(cmd, **kw):
             captured["cmd"] = cmd
@@ -2323,21 +2323,28 @@ class TestBidWaitInvariant:
             sp._deploy("sdl.yml", "akash1prov", {})
         return captured["cmd"]
 
+    @staticmethod
+    def _flag(cmd: str, flag: str) -> int:
+        m = re.search(rf"{re.escape(flag)} (\d+)", cmd)
+        assert m is not None, f"{flag} missing or reformatted in the built command: {cmd}"
+        return int(m.group(1))
+
     def test_retry_is_at_least_the_wait(self):
         cmd = self._built_command()
-        wait = int(re.search(r"--bid-wait (\d+)", cmd).group(1))
-        retry = int(re.search(r"--bid-wait-retry (\d+)", cmd).group(1))
+        wait = self._flag(cmd, "--bid-wait")
+        retry = self._flag(cmd, "--bid-wait-retry")
         assert retry >= wait, (
             f"--bid-wait-retry {retry} < --bid-wait {wait}: deploy() raises "
             "ValueError('bid_wait_retry is the total auction deadline...') and the "
-            "smoke fails before reaching the network"
+            f"smoke fails before reaching the network. {cmd}"
         )
 
-    def test_the_invariant_still_lives_in_deploy(self):
-        """⛔ A copied contract rots. Pin it against the source it came from, so
-        this file cannot keep asserting a rule the callee has changed."""
-        mod = Path(__file__).resolve().parents[1] / "just_akash" / "deploy.py"
-        assert "if bid_wait_retry < bid_wait:" in mod.read_text(encoding="utf-8"), (
-            "deploy() no longer validates this relationship — re-derive what the "
-            "smoke should pass instead of trusting this test"
-        )
+    def test_deploy_really_rejects_the_inverted_pair(self):
+        """⛔ Pin the contract by CALLING the callee, not by grepping its source.
+
+        The validation runs before any spend or network call, so this is cheap and
+        it cannot drift the way a copied string can.
+        """
+        deploy_mod = pytest.importorskip("just_akash.deploy")
+        with pytest.raises(ValueError, match="total auction deadline"):
+            deploy_mod.deploy(sdl_path="unused.yml", bid_wait=120, bid_wait_retry=60)
