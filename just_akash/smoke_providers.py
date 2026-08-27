@@ -756,6 +756,35 @@ def _bidders_from_output(out: str) -> list[str]:
     return list(seen)
 
 
+_SECRETISH = re.compile(r"[A-Za-z0-9+/=_-]{24,}")
+
+
+def _explain_deploy_failed(provider: str, out: str, rc: int) -> None:
+    """Print WHY a deploy failed. Without this the note is undiagnosable.
+
+    `deploy-failed` is the fallthrough: every classified cause (no-credit,
+    no-auth, no-bid, index-lag) has its own note, so reaching this one means the
+    output matched nothing we know. `_run` captures stdout+stderr and no caller
+    ever printed it, so the only evidence of the actual error was discarded — a
+    red matrix row with no way to tell an expired credential from a broken CLI
+    from a network fault. Measured 2026-08-27: three providers failing in
+    240-749ms, and answering "why" needed a source dive plus a code change,
+    because the run itself said nothing.
+
+    This repo is PUBLIC, so the excerpt is bounded and any long opaque token is
+    redacted before printing. Best-effort, never raises: diagnostics must not
+    become control flow.
+    """
+    try:
+        tail = (out or "").strip()[-400:]
+        tail = _SECRETISH.sub("<redacted>", tail)
+        if not tail:
+            tail = "(the deploy produced no output at all)"
+        print(f"  {YELLOW}deploy-failed evidence{RESET} [{provider} rc={rc}]: {tail}")
+    except Exception:  # noqa: BLE001 — evidence is best-effort
+        pass
+
+
 def _record_no_bid_evidence(provider: str, out: str) -> None:
     """Explain a NO-BID instead of silently recording it.
 
@@ -967,6 +996,7 @@ def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, s
                 # "couldn't test", never a provider verdict.
                 return None, "no-bid-unverified"
         return None, "no-bid"
+    _explain_deploy_failed(provider, out, r.returncode)
     return None, "deploy-failed"
 
 
