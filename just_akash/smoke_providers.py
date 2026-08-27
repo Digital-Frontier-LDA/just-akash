@@ -932,6 +932,16 @@ def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, s
     # balance endpoint, and a 402 probe commits no resources.)
     if re.search(r"\(402\)|PaymentRequired|[Ii]nsufficient balance", out):
         return None, "no-credit"
+    # OUR OWN CREDENTIAL BEING DEAD IS NOT A PROVIDER FAULT. A rejected Console API
+    # key fails the deploy before any order reaches the chain — same shape as the 402
+    # above: account-wide, nothing created, every provider "fails" identically and
+    # instantly. Without this branch it falls through to "deploy-failed", scores FAIL
+    # against all three providers, gates the run, and pages the fleet for a key.
+    # Observed 2026-08-27: the Console key returned HTTP 401 "Invalid API key" and the
+    # daily smoke had been red since 08-22 with deploy FAIL in 260-402ms per provider —
+    # far too fast to be a bid wait, which is the tell.
+    if re.search(r"\(401\)|\(403\)|UnauthorizedError|Invalid API key|[Uu]nauthorized", out):
+        return None, "no-auth"
     # Case-insensitive, and "bids" as well as "bid": deploy's wording differs by path
     # — "NO BID FROM n allowlisted provider(s)" when an allowlisted provider ignored
     # us, but "No bids received within Ns" when nothing bid at all. The old
@@ -1754,6 +1764,9 @@ def smoke_provider(
             results["deploy"] = {
                 "no-bid": "NO-BID",
                 "no-credit": "NO-CREDIT",
+                # A dead/rejected Console API key: account-wide, our side, nothing
+                # testable. A skip, never a provider verdict.
+                "no-auth": "NO-AUTH",
                 # 2026-07-23 audit: Console-index lag / unverifiable absence are
                 # "couldn't test" skips — they never page and never gate.
                 "bid-index-lag": "BID-INDEX-LAG",

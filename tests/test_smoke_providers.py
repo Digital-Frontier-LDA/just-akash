@@ -2186,3 +2186,67 @@ class TestMatrixTimings:
         row = next(ln for ln in lines if ln.startswith("akash1"))
         assert len(header) == len(row.rstrip()) or len(row.rstrip()) <= len(header)
         assert "PASS 354ms" in row and "PASS 30.8s" in row
+
+
+class TestAuthFailureIsNotAProviderFault:
+    """A rejected Console API key must read as "couldn't test", never as FAIL.
+
+    OBSERVED 2026-08-27. The Console key returned HTTP 401 "Invalid API key".
+    Every deploy died before reaching the chain, so all three providers scored
+    deploy FAIL in 260-402ms — far too fast to be a bid wait, which is the tell —
+    the run gated, and the daily smoke had been red since 08-22. Nothing was wrong
+    with any provider: the failure was account-wide and on our side, exactly like
+    the 402/no-credit case the classifier already handled.
+
+    Same principle as the no-bid and no-credit branches: an absence of evidence
+    about a provider is never evidence against it.
+    """
+
+    AUTH_OUTPUTS = [
+        "RuntimeError: API Error (401): Unauthorized",
+        'API Error (401): {"error":"UnauthorizedError","message":"Invalid API key"}',
+        "API Error (403): Forbidden",
+    ]
+
+    def test_auth_failure_classifies_as_no_auth(self):
+        for out in self.AUTH_OUTPUTS:
+            with patch.object(sp, "_run", return_value=_completed(out, returncode=1)):
+                dseq, note = sp._deploy("sdl.yml", "akash1x", {})
+            assert dseq is None
+            assert note == "no-auth", f"scored a dead API key as a provider fault: {out!r}"
+
+    def test_no_auth_is_a_skip_not_a_failing_outcome(self):
+        """NO-AUTH must not sit in _FAILING_OUTCOMES, or it gates the run and
+        pages the fleet for our own credential."""
+        assert "NO-AUTH" not in sp._FAILING_OUTCOMES
+
+    def test_neighbouring_branches_still_classify(self):
+        """The new branch sits between 402 and no-bid; neither may be shadowed."""
+        cases = {
+            "API Error (402): insufficient balance": "no-credit",
+            "Received 6 bid(s) but NONE from our providers.": "no-bid",
+        }
+        for out, want in cases.items():
+            with patch.object(sp, "_run", return_value=_completed(out, returncode=1)):
+                _, note = sp._deploy("sdl.yml", "akash1x", {})
+            assert note == want, f"{out!r} -> {note}, expected {want}"
+
+    def test_a_plain_failure_is_still_deploy_failed(self):
+        """The fallthrough must survive — this branch must not swallow everything."""
+        with patch.object(sp, "_run", return_value=_completed("boom", returncode=1)):
+            _, note = sp._deploy("sdl.yml", "akash1x", {})
+        assert note == "deploy-failed"
+
+    def test_note_maps_to_a_non_failing_outcome(self):
+        """⛔ The note is only half the contract: the note->outcome map decides
+        whether it pages. A note with no entry falls through to "FAIL"."""
+        import re
+        from pathlib import Path
+
+        src = (Path(__file__).resolve().parents[1] / "just_akash" / "smoke_providers.py").read_text(
+            encoding="utf-8"
+        )
+        assert re.search(r'"no-auth":\s*"NO-AUTH"', src), (
+            'no-auth has no entry in the note->outcome map, so .get(note, "FAIL") '
+            "scores it as a provider failure — the exact bug this class exists to stop"
+        )
