@@ -24,10 +24,14 @@ emptiest` is what makes the spread reachable at all.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from akash_lease_core import from_provider_status
 from akash_lease_core.auction import PreferredSelection
 
 from just_akash.deploy import _select_auction_bid
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 LIS, SOF, HEL = "akash1lisbon", "akash1sofia", "akash1helsinki"
 
@@ -137,3 +141,72 @@ def test_a_sole_bidder_is_still_taken_even_when_already_used() -> None:
     )
     assert result.selected is not None, "a sole already-used bidder must still be selectable"
     assert result.selected.provider == LIS
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# `--already-selected` must be REFUSED where it cannot work.
+#
+# ⛔ alc applies the anti-affinity penalty inside `if emptiest and readable:`. Under the
+# default `cheapest` policy the addresses are parsed, threaded through `deploy()`, handed
+# to the auction — and change nothing. A flag that is accepted and silently dropped is
+# worse than one that is rejected: the caller believes the spread was requested.
+# Raised by CodeRabbit on #216.
+class TestAlreadySelectedRequiresEmptiest:
+    def _run(self, argv):
+        import subprocess
+        import sys
+
+        return subprocess.run(
+            [sys.executable, "-m", "just_akash.cli", *argv],
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_ROOT),
+        )
+
+    def test_rejected_under_the_default_policy(self):
+        r = self._run(["deploy", "--sdl", "nope.yaml", "--already-selected", "akash1aaa"])
+        assert r.returncode == 2, f"expected refusal, got {r.returncode}: {r.stderr[:300]}"
+        assert "--already-selected needs --select emptiest" in r.stderr
+
+    def test_rejected_under_an_explicit_cheapest(self):
+        r = self._run(
+            [
+                "deploy",
+                "--sdl",
+                "nope.yaml",
+                "--select",
+                "cheapest",
+                "--already-selected",
+                "akash1aaa",
+            ]
+        )
+        assert r.returncode == 2, r.stderr[:300]
+        assert "silently ignored" in r.stderr
+
+    def test_the_guard_does_not_fire_without_the_flag(self):
+        """BOTH DIRECTIONS. A guard that refuses everything would pass the two tests
+        above while breaking every ordinary deploy — the refusal has to be specific to
+        the combination, not to the command."""
+
+        r = self._run(["deploy", "--sdl", "nope.yaml", "--select", "cheapest"])
+        assert "--already-selected needs" not in r.stderr, (
+            "the guard fired on a command that never passed the flag"
+        )
+
+    def test_accepted_under_emptiest(self):
+        """The combination the flag exists for must survive argument validation."""
+
+        r = self._run(
+            [
+                "deploy",
+                "--sdl",
+                "nope.yaml",
+                "--select",
+                "emptiest",
+                "--already-selected",
+                "akash1aaa",
+            ]
+        )
+        assert "--already-selected needs" not in r.stderr, (
+            "the guard rejected the one policy under which the flag works"
+        )

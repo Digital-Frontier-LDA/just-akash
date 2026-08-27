@@ -95,6 +95,68 @@ def wiring_errors(source: str) -> list[str]:
                     "the PREVIOUS order's group"
                 )
 
+    # --- site 3: the group must travel with the provider on EVERY reselection -----
+    # ⛔ THE LIMB THAT WAS MISSING, and its absence cost a real defect. The first version
+    # checked the initial selection and the re-deploy path and called that complete. It
+    # missed the STALE-BID RETRY, which picks a different bid on the SAME order: it
+    # rebound `provider` from `next_bid` and left the group on the previous bid — the
+    # very defect this file exists to prevent, surviving one path over. CodeRabbit caught
+    # it on review; this rule is why it cannot return.
+    #
+    # ⚠ SCOPED TO THE FUNCTION THAT LEASES. A rule over every `_extract_provider` call in
+    # the module reads providers out of logging helpers and bid-filtering comprehensions
+    # too (`b`, `item`) and would demand a group for bids that never reach a lease — a
+    # false-positive machine, and the pressure to silence it would take the real rule
+    # with it.
+    def _arg(call: ast.Call) -> str | None:
+        return call.args[0].id if call.args and isinstance(call.args[0], ast.Name) else None
+
+    def _calls(node: ast.AST, fn: str) -> set[str]:
+        return {
+            a
+            for c in ast.walk(node)
+            if isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id == fn
+            for a in [_arg(c)]
+            if a is not None
+        }
+
+    holder = None
+    for fn_node in ast.walk(tree):
+        if not isinstance(fn_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        # innermost wins: keep the smallest span that still contains the call
+        if any(c is calls[0] for c in ast.walk(fn_node)) and (
+            holder is None or fn_node.lineno > holder.lineno
+        ):
+            holder = fn_node
+    if holder is None:
+        errors.append("the create_lease call sits in no function (cannot scope limb 3)")
+        return errors
+
+    # A provider BINDING: an assignment to `provider` / `*_provider` whose value reads a
+    # bid. These are the ones the lease consumes, directly or via the re-deploy return.
+    bindings: dict[str, int] = {}
+    for n in ast.walk(holder):
+        if not isinstance(n, ast.Assign):
+            continue
+        names = [t.id for t in n.targets if isinstance(t, ast.Name)]
+        if not any(t == "provider" or t.endswith("_provider") for t in names):
+            continue
+        for bid_var in _calls(n.value, "_extract_provider"):
+            bindings.setdefault(bid_var, n.lineno)
+
+    if not bindings:
+        errors.append(
+            "no provider is bound from a bid in the leasing function (limb 3 is aimed at nothing)"
+        )
+    groups = _calls(holder, "_extract_gseq")
+    for bid_var in sorted(set(bindings) - groups):
+        errors.append(
+            f"line {bindings[bid_var]} binds a provider from {bid_var!r} but never reads "
+            "its group: a reselection that changes the provider without changing the "
+            "group leases the new provider against the old group"
+        )
+
     return errors
 
 
@@ -196,3 +258,24 @@ def test_failing_to_rebind_after_a_redeploy_is_a_red_mutation():
     errors = wiring_errors(mutated)
     assert errors, "leaving the group stale across a re-created order did not fail"
     assert any("re-deploy unpack" in e for e in errors), errors
+
+
+def test_dropping_the_group_from_a_reselection_path_is_a_red_mutation():
+    """Limb 3's own control — the one that was missing when the defect got through.
+
+    Removes the group refresh from a reselection path while LEAVING the provider
+    refresh in place. That is precisely the shape CodeRabbit caught on review: the
+    provider changes, the group does not, and the lease is struck against the group
+    of a bid that no longer applies."""
+
+    source = DEPLOY.read_text()
+    assert not wiring_errors(source), "not green before mutation"
+
+    # Find a bid variable that BOTH extractors read, and blind the group side of it.
+    mutated, n = re.subn(r"\n[ \t]*\w+ = _extract_gseq\(next_bid\)[^\n]*", "", source, count=1)
+    assert n == 1, "the reselection anchor has moved — fix the anchor, not the assertion"
+    assert mutated != source
+
+    errors = wiring_errors(mutated)
+    assert errors, "a provider-without-group reselection did not fail the check"
+    assert any("never reads" in e for e in errors), errors

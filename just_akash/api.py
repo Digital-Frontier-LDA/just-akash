@@ -648,6 +648,11 @@ def _extract_gseq(bid: dict[str, Any]) -> int | None:
     raw = bid_id.get("gseq") if isinstance(bid_id, dict) else None
     if raw is None:
         raw = bid.get("gseq")
+    if raw is None:
+        return None
+    # The TypeError catch stays for the shapes an explicit None check cannot cover — a
+    # dict or list where a scalar was expected. Narrowing None FIRST is what lets a type
+    # checker see that, and an unreadable field must return None, never 1.
     try:
         return int(raw)
     except (TypeError, ValueError):

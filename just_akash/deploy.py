@@ -1814,6 +1814,12 @@ def deploy(
                 next_bid = _next_open_bid(fresh_bids, failed_providers)
                 if next_bid is not None:
                     provider = _extract_provider(next_bid) or ""
+                    # The group travels with the provider on EVERY reselection. This
+                    # retry picks a different bid on the SAME order; the replacement may
+                    # be for a different group, and keeping the previous `lease_gseq`
+                    # would lease the new provider against the old group — the very
+                    # defect this change exists to fix, surviving one path over.
+                    lease_gseq = _extract_gseq(next_bid) or 1
                     price_amount, price_denom = _extract_bid_price(next_bid)
                     _log(
                         logging.INFO,
