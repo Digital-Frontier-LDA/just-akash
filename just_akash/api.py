@@ -627,6 +627,38 @@ def _extract_provider(bid: dict[str, Any]) -> str | None:
     return bid.get("provider")
 
 
+def _extract_gseq(bid: dict[str, Any]) -> int | None:
+    """The GROUP a bid is for, or None when the shape does not say.
+
+    ⛔ WHY THIS MATTERS MORE THAN IT LOOKS. An order split into groups roughly DOUBLES the
+    bid rate — 74.9% of 191 vs 36.6% of 303 measured — because a provider that can satisfy
+    SOME of twelve resources cannot bid at all when they are one indivisible group. But a
+    winning bid on group 3 is worthless if the lease is created against group 1, which is
+    what a hardcoded `gseq=1` does.
+
+    ⚠ Returns None rather than 1 on an unreadable shape. `None` means "the bid did not say",
+    and the caller keeps its own default — guessing 1 here would reintroduce the exact bug
+    at a lower level, where it is harder to see.
+    """
+    if not isinstance(bid, dict):
+        return None
+    nested = bid.get("bid", {})
+    nested_id = nested.get("id", {}) if isinstance(nested, dict) else {}
+    bid_id = bid.get("id", nested_id)
+    raw = bid_id.get("gseq") if isinstance(bid_id, dict) else None
+    if raw is None:
+        raw = bid.get("gseq")
+    if raw is None:
+        return None
+    # The TypeError catch stays for the shapes an explicit None check cannot cover — a
+    # dict or list where a scalar was expected. Narrowing None FIRST is what lets a type
+    # checker see that, and an unreadable field must return None, never 1.
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def _extract_bid_price(bid: dict[str, Any]) -> tuple:
     # Display-only fallback denom for malformed bids that omit `denom`. The
     # real denom comes from the bid response when present. Default to BME-era

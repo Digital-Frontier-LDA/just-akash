@@ -33,6 +33,7 @@ from ._diagnostics import Code, emit, enabled
 from .api import (
     AkashConsoleAPI,
     _extract_bid_price,
+    _extract_gseq,
     _extract_provider,
 )
 from .provenance import PLACEMENT_PREFIX, SIBLING_REAPED_PREFIX, run_id_of, stamp_run
@@ -444,6 +445,7 @@ def _select_auction_bid(
     observed_at_by_provider: dict[str, float] | None = None,
     capacity_by_provider: dict[str, "ProviderCapacity"] | None = None,
     preferred_selection: "PreferredSelection | None" = None,
+    already_selected: frozenset[str] | None = None,
 ):
     """Normalize Console bids and delegate the decision to the shared core.
 
@@ -505,14 +507,37 @@ def _select_auction_bid(
                 # bid loop is the hot-path cost that kept the funding primitive off the
                 # deploy path for weeks.
                 capacity=(capacity_by_provider or {}).get(provider),
+                # The GROUP this bid is for. An order split into groups lets a provider
+                # bid on the subset it can actually host, and the core needs the group to
+                # tell two bids from one provider apart. None = the shape did not say.
+                gseq=_extract_gseq(raw_bid),
             )
         except (TypeError, ValueError):
             continue
         auction.observe(observation)
         raw_by_key[bid_key] = raw_bid
 
+    # ⭐ ANTI-AFFINITY. `already_selected` names the providers this DEPLOYMENT ROUND has
+    # already placed on, so an N-region placement spreads across N distinct providers
+    # instead of stacking on whichever one is cheapest N times over.
+    #
+    # ⛔ IT CHANGES THE ORDER, NEVER THE ELIGIBILITY — akash-lease-core's own words. If an
+    # already-used provider is the ONLY bidder, it is still taken, because "taking it beats
+    # failing to place". That is the correct trade at the measured ~93% provider fullness:
+    # a soft spread wins placements, a hard exclusion loses them.
+    #
+    # ⚠ `None` and `frozenset()` are the same thing to the core (no spread requested), so a
+    # caller that does not track placements is unaffected.
+    #
+    # ⛔⛔ AND IT ONLY ENGAGES UNDER `--select emptiest` WITH READABLE CAPACITY — measured,
+    # against the assumption. The `taken` term lives INSIDE the core's `if emptiest and
+    # readable:` branch; the else-branch is a plain `min(pool, key=price)` with no spread term.
+    # So `already_selected` passed under CHEAPEST is silently INERT. The 2026-08-25 handoff
+    # recorded the opposite ("needs NO capacity data ... the half that works today"); that is
+    # false for v0.9.0. EMPTIEST is a PREREQUISITE for the spread, not a parallel lever.
     result = auction.evaluate(
-        now=collection_window_seconds if evaluated_at is None else evaluated_at
+        now=collection_window_seconds if evaluated_at is None else evaluated_at,
+        already_selected=already_selected,
     )
     if result.status is not AuctionStatus.DECIDED or result.selected is None:
         return None, result
@@ -773,6 +798,7 @@ def deploy(
     backup_providers: list[str] | None = None,
     deposit: float = 5.0,
     select: str = "cheapest",
+    already_selected: list[str] | None = None,
 ) -> dict:
     # deposit is user-controlled (--deposit); reject non-finite/non-positive
     # values before they reach json.dumps (which would emit invalid NaN/Infinity).
@@ -790,6 +816,15 @@ def deploy(
     #   create_deployment, so a typo bought a deployment and a deposit before failing.
     #   Argument validation is free; do it before the first irreversible step.
     _selection = _resolve_selection(select)
+    # ⭐ ANTI-AFFINITY INPUT, normalised beside the selection mode and for the same reason:
+    # validate before the first irreversible step. Empty and None are the same thing to the
+    # core — no spread requested — so a caller that does not track placements is unaffected.
+    #
+    # ⚠ Addresses are NOT validated against the allowlist. A caller naming a provider it
+    # placed on last round is stating a FACT about its own history; rejecting an unknown
+    # address would turn a spread hint into a failure, and the core already treats the set as
+    # ordering-only. Blank entries are dropped so `--already-selected ""` cannot poison it.
+    _already_selected = frozenset(a.strip() for a in (already_selected or []) if a and a.strip())
     AuctionPolicy(
         collection_window_seconds=bid_wait,
         fallback_window_seconds=fallback_wait,
@@ -1089,6 +1124,7 @@ def deploy(
         observed_at_by_provider=first_seen_by_provider,
         capacity_by_provider=_capacity,
         preferred_selection=_selection,
+        already_selected=_already_selected,
     )
     if auction_result.status is AuctionStatus.COLLECTING:
         fallback_deadline = start_time + bid_wait_retry
@@ -1144,6 +1180,7 @@ def deploy(
             observed_at_by_provider=first_seen_by_provider,
             capacity_by_provider=_capacity,
             preferred_selection=_selection,
+            already_selected=_already_selected,
         )
     selection_phase = (
         1 if auction_result.selection_reason == "cheapest_preferred" or not has_allowlist else 2
@@ -1482,6 +1519,14 @@ def deploy(
         )
 
     provider = _extract_provider(selected_bid) or ""
+    # ⛔ LEASE THE GROUP THAT WON, NOT GROUP 1. `create_lease` defaults `gseq=1`, and
+    # every caller took that default — so a winning bid on group 2 created a lease
+    # against group 1, which either fails or leases resources nobody bid on. Harmless
+    # while orders are single-group; silently wrong the moment they are split, which is
+    # the change that roughly DOUBLES the bid rate (74.9% of 191 vs 36.6% of 303).
+    # ⚠ `or 1` is the deliberate floor: an unreadable shape keeps the historical
+    # behaviour rather than crashing the deploy on a field Console may omit.
+    lease_gseq = _extract_gseq(selected_bid) or 1
     price_amount, price_denom = _extract_bid_price(selected_bid)
 
     if not provider:
@@ -1595,7 +1640,7 @@ def deploy(
     def _redeploy_and_reselect(
         reason: str = "all bids stale",
         deprioritize: frozenset[str] = frozenset(),
-    ) -> tuple[str, str, str, float, str]:
+    ) -> tuple[str, str, str, float, str, int]:
         """Close the stale/gone order and create a fresh one (issue #19), then select
         a fresh open bid on it.
 
@@ -1684,7 +1729,19 @@ def deploy(
             f"  Fresh bid selected: provider={fresh_provider}  price={amount} {denom} "
             "— leasing immediately",
         )
-        return str(new_dseq), new_manifest, fresh_provider, amount, denom
+        # ⚠ The fresh bid's GROUP travels with it. A re-created order is a NEW order:
+        # its winning bid may be for a different group than the one that won on the
+        # order this replaced, so carrying the old `lease_gseq` forward would lease the
+        # right provider against the wrong group — the exact defect this change fixes,
+        # reintroduced one path over.
+        return (
+            str(new_dseq),
+            new_manifest,
+            fresh_provider,
+            amount,
+            denom,
+            _extract_gseq(fresh) or 1,
+        )
 
     _log(logging.INFO, "STEP 6: Creating lease...")
     max_lease_attempts = 3
@@ -1709,6 +1766,7 @@ def deploy(
                 dseq=str(dseq),
                 provider=provider,
                 manifest=manifest,
+                gseq=lease_gseq,
             )
             break
         except RuntimeError as e:
@@ -1756,6 +1814,12 @@ def deploy(
                 next_bid = _next_open_bid(fresh_bids, failed_providers)
                 if next_bid is not None:
                     provider = _extract_provider(next_bid) or ""
+                    # The group travels with the provider on EVERY reselection. This
+                    # retry picks a different bid on the SAME order; the replacement may
+                    # be for a different group, and keeping the previous `lease_gseq`
+                    # would lease the new provider against the old group — the very
+                    # defect this change exists to fix, surviving one path over.
+                    lease_gseq = _extract_gseq(next_bid) or 1
                     price_amount, price_denom = _extract_bid_price(next_bid)
                     _log(
                         logging.INFO,
@@ -1786,11 +1850,13 @@ def deploy(
                 )
                 failed_providers.clear()
                 try:
-                    dseq, manifest, provider, price_amount, price_denom = _redeploy_and_reselect(
-                        reason="order un-leaseable (404 'no lease for deployment')"
-                        if no_order
-                        else "all bids stale",
-                        deprioritize=deprioritize,
+                    dseq, manifest, provider, price_amount, price_denom, lease_gseq = (
+                        _redeploy_and_reselect(
+                            reason="order un-leaseable (404 'no lease for deployment')"
+                            if no_order
+                            else "all bids stale",
+                            deprioritize=deprioritize,
+                        )
                     )
                 except RuntimeError as redeploy_err:
                     emit(

@@ -262,6 +262,20 @@ def main():
         help="Preferred provider address (repeatable; overrides AKASH_PROVIDERS)",
     )
     deploy_p.add_argument(
+        "--already-selected",
+        dest="already_selected",
+        action="append",
+        default=[],
+        metavar="ADDR",
+        help=(
+            "Provider this deployment round has ALREADY placed on (repeatable). An "
+            "N-region placement passes the providers chosen so far, so the auction spreads "
+            "across N distinct providers instead of stacking on the cheapest one N times. "
+            "Soft by design: it changes bid ORDER, never eligibility — if an already-used "
+            "provider is the only bidder it is still taken, because placing beats failing."
+        ),
+    )
+    deploy_p.add_argument(
         "--select",
         dest="select",
         choices=["cheapest", "emptiest"],
@@ -695,6 +709,21 @@ def main():
                 file=sys.stderr,
             )
             sys.exit(2)
+        # --already-selected is INERT under `cheapest`. alc applies the anti-affinity
+        # penalty inside `if emptiest and readable:` — under the default policy the
+        # addresses are accepted, carried all the way into the auction, and change
+        # nothing. Accepting a flag that cannot do what its name says is the failure
+        # mode this repo keeps paying for: the caller reads "spread across providers",
+        # gets every group stacked on the cheapest one, and has no signal that the
+        # request was dropped. Refuse loudly instead. Raised by CodeRabbit on #216.
+        if args.already_selected and args.select != "emptiest":
+            print(
+                f"Error: --already-selected needs --select emptiest (got {args.select!r}). "
+                "Anti-affinity is applied only on the emptiest path, so under "
+                f"{args.select!r} these addresses would be accepted and silently ignored.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
         try:
             deploy(
                 sdl_path=args.sdl,
@@ -711,6 +740,7 @@ def main():
                 backup_providers=[] if args.no_backup_fallback else args.backup_providers,
                 deposit=args.deposit,
                 select=args.select,
+                already_selected=args.already_selected,
             )
             sys.exit(0)
         except RuntimeError as e:

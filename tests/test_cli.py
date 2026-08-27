@@ -310,6 +310,11 @@ class TestCliDeployPassesArgs:
             backup_providers=None,
             deposit=5.0,
             select="cheapest",
+            # Anti-affinity: the CLI always forwards the (possibly empty) list of
+            # addresses already won in this run, so the auction can spread a
+            # multi-region deployment across distinct providers instead of stacking
+            # every group on the single cheapest one.
+            already_selected=[],
         )
 
     @patch("just_akash.deploy.deploy")
