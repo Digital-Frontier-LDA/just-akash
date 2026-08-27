@@ -105,3 +105,4 @@
 {"run_id":"33030483510","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-08-27T01:33:44Z","attempt":"1","accrued_at":"2026-08-27T01:37:21Z","published":true}
 {"run_id":"33040559249","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-08-27T04:49:14Z","attempt":"1","accrued_at":"2026-08-27T04:53:01Z","published":true}
 {"run_id":"33057123368","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-08-27T09:07:44Z","attempt":"1","accrued_at":"2026-08-27T09:14:52Z","published":true}
+{"run_id":"33089381431","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-08-27T15:43:34Z","attempt":"1","accrued_at":"2026-08-27T15:48:40Z","published":true}
