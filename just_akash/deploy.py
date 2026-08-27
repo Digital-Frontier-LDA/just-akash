@@ -33,6 +33,7 @@ from ._diagnostics import Code, emit, enabled
 from .api import (
     AkashConsoleAPI,
     _extract_bid_price,
+    _extract_gseq,
     _extract_provider,
 )
 from .provenance import PLACEMENT_PREFIX, SIBLING_REAPED_PREFIX, run_id_of, stamp_run
@@ -506,6 +507,10 @@ def _select_auction_bid(
                 # bid loop is the hot-path cost that kept the funding primitive off the
                 # deploy path for weeks.
                 capacity=(capacity_by_provider or {}).get(provider),
+                # The GROUP this bid is for. An order split into groups lets a provider
+                # bid on the subset it can actually host, and the core needs the group to
+                # tell two bids from one provider apart. None = the shape did not say.
+                gseq=_extract_gseq(raw_bid),
             )
         except (TypeError, ValueError):
             continue
@@ -1514,6 +1519,14 @@ def deploy(
         )
 
     provider = _extract_provider(selected_bid) or ""
+    # ⛔ LEASE THE GROUP THAT WON, NOT GROUP 1. `create_lease` defaults `gseq=1`, and
+    # every caller took that default — so a winning bid on group 2 created a lease
+    # against group 1, which either fails or leases resources nobody bid on. Harmless
+    # while orders are single-group; silently wrong the moment they are split, which is
+    # the change that roughly DOUBLES the bid rate (74.9% of 191 vs 36.6% of 303).
+    # ⚠ `or 1` is the deliberate floor: an unreadable shape keeps the historical
+    # behaviour rather than crashing the deploy on a field Console may omit.
+    lease_gseq = _extract_gseq(selected_bid) or 1
     price_amount, price_denom = _extract_bid_price(selected_bid)
 
     if not provider:
@@ -1627,7 +1640,7 @@ def deploy(
     def _redeploy_and_reselect(
         reason: str = "all bids stale",
         deprioritize: frozenset[str] = frozenset(),
-    ) -> tuple[str, str, str, float, str]:
+    ) -> tuple[str, str, str, float, str, int]:
         """Close the stale/gone order and create a fresh one (issue #19), then select
         a fresh open bid on it.
 
@@ -1716,7 +1729,19 @@ def deploy(
             f"  Fresh bid selected: provider={fresh_provider}  price={amount} {denom} "
             "— leasing immediately",
         )
-        return str(new_dseq), new_manifest, fresh_provider, amount, denom
+        # ⚠ The fresh bid's GROUP travels with it. A re-created order is a NEW order:
+        # its winning bid may be for a different group than the one that won on the
+        # order this replaced, so carrying the old `lease_gseq` forward would lease the
+        # right provider against the wrong group — the exact defect this change fixes,
+        # reintroduced one path over.
+        return (
+            str(new_dseq),
+            new_manifest,
+            fresh_provider,
+            amount,
+            denom,
+            _extract_gseq(fresh) or 1,
+        )
 
     _log(logging.INFO, "STEP 6: Creating lease...")
     max_lease_attempts = 3
@@ -1741,6 +1766,7 @@ def deploy(
                 dseq=str(dseq),
                 provider=provider,
                 manifest=manifest,
+                gseq=lease_gseq,
             )
             break
         except RuntimeError as e:
@@ -1818,11 +1844,13 @@ def deploy(
                 )
                 failed_providers.clear()
                 try:
-                    dseq, manifest, provider, price_amount, price_denom = _redeploy_and_reselect(
-                        reason="order un-leaseable (404 'no lease for deployment')"
-                        if no_order
-                        else "all bids stale",
-                        deprioritize=deprioritize,
+                    dseq, manifest, provider, price_amount, price_denom, lease_gseq = (
+                        _redeploy_and_reselect(
+                            reason="order un-leaseable (404 'no lease for deployment')"
+                            if no_order
+                            else "all bids stale",
+                            deprioritize=deprioritize,
+                        )
                     )
                 except RuntimeError as redeploy_err:
                     emit(
