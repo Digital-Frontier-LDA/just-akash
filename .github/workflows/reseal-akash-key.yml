@@ -73,7 +73,12 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # persist-credentials: false — a job holding a wallet credential should not also
+      # leave GITHUB_TOKEN in .git/config for every later step to reach. Matches
+      # auto-topup-audit.yml, close-orphans.yml, runner-teardown.yml and security.yml.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install age
         run: |
@@ -99,7 +104,7 @@ jobs:
           set -euo pipefail
           set +x
 
-          grep -q "$OPS_PUB" .sops.yaml \
+          grep -qF -- "$OPS_PUB" .sops.yaml \
             || { echo "::error::OPS_PUB is not a recipient in .sops.yaml — ops may have been rotated; refusing to seal"; exit 1; }
 
           [ -n "${AKASH_API_KEY:-}" ] \
@@ -119,7 +124,7 @@ jobs:
           fi
           echo "sealed $(wc -c < sealed.b64) bytes of base64 ciphertext"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: akash-api-key-sealed-for-proxy-akash
           path: sealed.b64
