@@ -8,6 +8,7 @@ classified, and how each feature check reads a subprocess result.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from unittest.mock import MagicMock, patch
 
@@ -2299,3 +2300,50 @@ class TestDeployFailedIsExplained:
         with patch.object(sp, "_run", return_value=_completed("", returncode=127)):
             sp._deploy("sdl.yml", "akash1prov", {})
         assert "no output at all" in capsys.readouterr().out
+
+
+class TestBidWaitInvariant:
+    """deploy() raises ValueError when bid_wait_retry < bid_wait. The smoke built
+    exactly that command, so every deploy died in ~250ms before touching the
+    network and all three providers scored FAIL for five days.
+
+    Nothing caught it: _deploy's own tests mock _run, so the command string was
+    never checked against the callee's contract.
+    """
+
+    def _built_command(self) -> str:
+        captured: dict = {}
+
+        def fake_run(cmd, **kw):
+            captured["cmd"] = cmd
+            return _completed("", returncode=1)
+
+        with patch.object(sp, "_run", side_effect=fake_run):
+            sp._deploy("sdl.yml", "akash1prov", {})
+        return captured["cmd"]
+
+    @staticmethod
+    def _flag(cmd: str, flag: str) -> int:
+        m = re.search(rf"{re.escape(flag)} (\d+)", cmd)
+        assert m is not None, f"{flag} missing or reformatted in the built command: {cmd}"
+        return int(m.group(1))
+
+    def test_retry_is_at_least_the_wait(self):
+        cmd = self._built_command()
+        wait = self._flag(cmd, "--bid-wait")
+        retry = self._flag(cmd, "--bid-wait-retry")
+        assert retry >= wait, (
+            f"--bid-wait-retry {retry} < --bid-wait {wait}: deploy() raises "
+            "ValueError('bid_wait_retry is the total auction deadline...') and the "
+            f"smoke fails before reaching the network. {cmd}"
+        )
+
+    def test_deploy_really_rejects_the_inverted_pair(self):
+        """⛔ Pin the contract by CALLING the callee, not by grepping its source.
+
+        The validation runs before any spend or network call, so this is cheap and
+        it cannot drift the way a copied string can.
+        """
+        deploy_mod = pytest.importorskip("just_akash.deploy")
+        with pytest.raises(ValueError, match="total auction deadline"):
+            deploy_mod.deploy(sdl_path="unused.yml", bid_wait=120, bid_wait_retry=60)
