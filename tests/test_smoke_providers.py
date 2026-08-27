@@ -8,7 +8,9 @@ classified, and how each feature check reads a subprocess result.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -2299,3 +2301,43 @@ class TestDeployFailedIsExplained:
         with patch.object(sp, "_run", return_value=_completed("", returncode=127)):
             sp._deploy("sdl.yml", "akash1prov", {})
         assert "no output at all" in capsys.readouterr().out
+
+
+class TestBidWaitInvariant:
+    """deploy() raises ValueError when bid_wait_retry < bid_wait. The smoke built
+    exactly that command, so every deploy died in ~250ms before touching the
+    network and all three providers scored FAIL for five days.
+
+    Nothing caught it: _deploy's own tests mock _run, so the command string was
+    never checked against the callee's contract.
+    """
+
+    def _built_command(self):
+        captured = {}
+
+        def fake_run(cmd, **kw):
+            captured["cmd"] = cmd
+            return _completed("", returncode=1)
+
+        with patch.object(sp, "_run", side_effect=fake_run):
+            sp._deploy("sdl.yml", "akash1prov", {})
+        return captured["cmd"]
+
+    def test_retry_is_at_least_the_wait(self):
+        cmd = self._built_command()
+        wait = int(re.search(r"--bid-wait (\d+)", cmd).group(1))
+        retry = int(re.search(r"--bid-wait-retry (\d+)", cmd).group(1))
+        assert retry >= wait, (
+            f"--bid-wait-retry {retry} < --bid-wait {wait}: deploy() raises "
+            "ValueError('bid_wait_retry is the total auction deadline...') and the "
+            "smoke fails before reaching the network"
+        )
+
+    def test_the_invariant_still_lives_in_deploy(self):
+        """⛔ A copied contract rots. Pin it against the source it came from, so
+        this file cannot keep asserting a rule the callee has changed."""
+        mod = Path(__file__).resolve().parents[1] / "just_akash" / "deploy.py"
+        assert "if bid_wait_retry < bid_wait:" in mod.read_text(encoding="utf-8"), (
+            "deploy() no longer validates this relationship — re-derive what the "
+            "smoke should pass instead of trusting this test"
+        )
