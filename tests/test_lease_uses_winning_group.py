@@ -69,11 +69,16 @@ def wiring_errors(source: str) -> list[str]:
     # A re-created order is a NEW order. If the helper's result does not refresh the
     # group, the second attempt leases the right provider against the first order's
     # group. Find the unpack by the CALL, never by the variable name.
+    # ⚠ The group node is BOUND before it is narrowed. Writing `kw["gseq"].id` under
+    # `if isinstance(kw.get("gseq"), ast.Name)` narrows a DIFFERENT expression than the
+    # one it then subscripts, so a type checker cannot carry the guarantee across — and
+    # pyright rejected exactly that: `Cannot access attribute "id" for class "expr"`.
     lease_names = {
-        kw["gseq"].id
+        node.id
         for call in calls
         for kw in [{k.arg: k.value for k in call.keywords if k.arg}]
-        if isinstance(kw.get("gseq"), ast.Name)
+        for node in [kw.get("gseq")]
+        if isinstance(node, ast.Name)
     }
     unpacks = [
         n
