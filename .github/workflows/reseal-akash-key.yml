@@ -117,11 +117,24 @@ jobs:
           printf '\n' >> sealed.b64
 
           # Prove the artifact is ciphertext rather than trusting that it is.
-          if grep -qF "$AKASH_API_KEY" sealed.b64; then
-            echo "::error::sealed output contains the plaintext key — refusing to upload"
-            rm -f sealed.b64
-            exit 1
-          fi
+          #
+          # Exit code is read explicitly instead of `if grep ...; then`. Inside an
+          # `if`, `set -e` is suppressed, so grep exit 2 — file unreadable, or any
+          # internal error — would fall to the else branch and upload WITHOUT the
+          # check having run. A guard that passes when it did not actually check is
+          # worse than no guard. 0 = plaintext present, 1 = absent, anything else =
+          # the check itself failed; only 1 may proceed.
+          set +e
+          grep -qF -- "$AKASH_API_KEY" sealed.b64
+          rc=$?
+          set -e
+          case "$rc" in
+            0) echo "::error::sealed output contains the plaintext key — refusing to upload"
+               rm -f sealed.b64; exit 1 ;;
+            1) : ;;
+            *) echo "::error::plaintext check could not run (grep exit $rc) — refusing to upload unverified"
+               rm -f sealed.b64; exit 1 ;;
+          esac
           echo "sealed $(wc -c < sealed.b64) bytes of base64 ciphertext"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
