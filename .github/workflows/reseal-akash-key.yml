@@ -1,0 +1,145 @@
+name: Re-seal AKASH_API_KEY for another DF repo
+
+# WHY THIS EXISTS
+#
+# `proxy-akash` (the Akash GPU Gateway) needs this repo's `AKASH_API_KEY` at
+# runtime: its gateway calls the Console API to create deployments, and Gate C
+# cannot measure `lease_created -> ssh_ready` without one. It cannot simply read
+# `secrets/ci.sops.env`, because SOPS ciphertext is bound to ITS recipients — ops,
+# ci-just-akash and breakglass — and proxy-akash's CI holds only ci-proxy-akash.
+# Re-encrypting for a different repo therefore requires decrypting first, and the
+# only places that can are this repo's CI and a human holding ops or breakglass.
+#
+# Minting a fresh key in the Console UI is the cleaner answer and remains the
+# preferred one. It is currently blocked by a KYC page bug, so this exists as the
+# path that does not need a Console session, a laptop age key, or a human ever
+# seeing the plaintext.
+#
+# WHAT IT EMITS, AND WHY THE ARTIFACT IS SAFE
+#
+# The output is `age -r <ops public key>` then base64 — byte-identical to what
+# `df-cicd/infra/scripts/df-sops-seal.sh` produces, and exactly the shape the
+# `sops-edit` workflow's `sealed:` input expects. Only the ops PRIVATE key opens
+# it, which lives with the ops holder and in df-cicd's `sops-apply` environment.
+# The artifact is therefore ciphertext to everyone who can download it, including
+# whoever dispatches this workflow.
+#
+# Consume it with:
+#   gh workflow run sops-edit.yml --repo Digital-Frontier-LDA/df-cicd \
+#     -f repo=Digital-Frontier-LDA/proxy-akash \
+#     -f file=secrets/app.sops.env \
+#     -f key=AKASH_API_KEY -f verb=add -f apply=true \
+#     -f sealed="$(cat sealed.b64)"
+#
+# ONE-SHOT. Delete this workflow once the key has landed in proxy-akash. A
+# standing job that exports a wallet credential to another repo is a capability
+# nobody should have to remember exists.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: just-akash-reseal-akash-key
+  cancel-in-progress: false
+
+jobs:
+  reseal:
+    name: Re-seal AKASH_API_KEY to the ops recipient
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # TRUSTED REF ONLY, and this runs BEFORE checkout on purpose — the same
+      # guard, for the same reason, as auto-topup-audit.yml (raised by CodeRabbit
+      # on #141). workflow_dispatch lets the operator pick any branch or tag, and
+      # checkout would then execute code from it, including
+      # ./.github/actions/sops-env, with SOPS_AGE_KEY and AKASH_API_KEY in scope.
+      # A pushed branch could rewrite that action to print the key instead of
+      # masking it. Nothing about re-sealing needs a non-default ref.
+      #
+      # github.ref, NOT github.ref_name: branches and tags share ref_name, so a
+      # TAG named `main` would pass a ref_name check and still have wallet
+      # secrets in scope. Comparing the full ref makes refs/tags/main fail.
+      - name: Refuse to run from a non-default ref
+        env:
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [ "$REF" != "refs/heads/${DEFAULT_BRANCH}" ]; then
+            echo "::error::refusing to run from '${REF}'; only refs/heads/${DEFAULT_BRANCH} is trusted"
+            exit 1
+          fi
+
+      # persist-credentials: false — a job holding a wallet credential should not also
+      # leave GITHUB_TOKEN in .git/config for every later step to reach. Matches
+      # auto-topup-audit.yml, close-orphans.yml, runner-teardown.yml and security.yml.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install age
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq age
+          age --version
+
+      - name: Load SOPS secrets
+        uses: ./.github/actions/sops-env
+        with:
+          age-key: ${{ secrets.SOPS_AGE_KEY }}
+
+      # The ops recipient is not hardcoded on trust: it is asserted against this
+      # repo's own .sops.yaml, where ops is already a recipient. If the org ever
+      # rotates ops, this job fails loudly rather than sealing to a key nobody
+      # holds any more — which would produce a blob that looks fine and can never
+      # be opened.
+      - name: Re-seal to the ops recipient
+        env:
+          OPS_PUB: age1dyt7ls7v0y8ytqglfs7uhvn2m6jxg20awc780hslknu3g6aaz32s8pnqr2
+        run: |
+          set -euo pipefail
+          set +x
+
+          grep -qF -- "$OPS_PUB" .sops.yaml \
+            || { echo "::error::OPS_PUB is not a recipient in .sops.yaml — ops may have been rotated; refusing to seal"; exit 1; }
+
+          [ -n "${AKASH_API_KEY:-}" ] \
+            || { echo "::error::AKASH_API_KEY absent after sops-env; nothing to re-seal"; exit 1; }
+
+          # Piped, never written in plaintext and never echoed. The runner also
+          # masks the value: sops-env calls ::add-mask:: on every secret before
+          # exporting it.
+          printf '%s' "$AKASH_API_KEY" | age -r "$OPS_PUB" | base64 -w0 > sealed.b64
+          printf '\n' >> sealed.b64
+
+          # Prove the artifact is ciphertext rather than trusting that it is.
+          #
+          # Exit code is read explicitly instead of `if grep ...; then`. Inside an
+          # `if`, `set -e` is suppressed, so grep exit 2 — file unreadable, or any
+          # internal error — would fall to the else branch and upload WITHOUT the
+          # check having run. A guard that passes when it did not actually check is
+          # worse than no guard. 0 = plaintext present, 1 = absent, anything else =
+          # the check itself failed; only 1 may proceed.
+          set +e
+          grep -qF -- "$AKASH_API_KEY" sealed.b64
+          rc=$?
+          set -e
+          case "$rc" in
+            0) echo "::error::sealed output contains the plaintext key — refusing to upload"
+               rm -f sealed.b64; exit 1 ;;
+            1) : ;;
+            *) echo "::error::plaintext check could not run (grep exit $rc) — refusing to upload unverified"
+               rm -f sealed.b64; exit 1 ;;
+          esac
+          echo "sealed $(wc -c < sealed.b64) bytes of base64 ciphertext"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: akash-api-key-sealed-for-proxy-akash
+          path: sealed.b64
+          retention-days: 1
+          if-no-files-found: error
