@@ -2239,13 +2239,27 @@ class TestAuthFailureIsNotAProviderFault:
 
     def test_note_maps_to_a_non_failing_outcome(self):
         """⛔ The note is only half the contract: the note->outcome map decides
-        whether it pages. A note with no entry falls through to "FAIL"."""
-        import re
-        from pathlib import Path
+        whether it pages. A note with no entry falls through to "FAIL".
 
-        mod = Path(__file__).resolve().parents[1] / "just_akash" / "smoke_providers.py"
-        src = mod.read_text(encoding="utf-8")
-        assert re.search(r'"no-auth":\s*"NO-AUTH"', src), (
+        Asserted through smoke_provider() rather than by scanning the source, so
+        this verifies the mapping the run actually applies — a source regex would
+        also match the string in a comment.
+        """
+        records: list = []
+        with (
+            patch.object(sp, "_deploy", return_value=(None, "no-auth")),
+            patch.object(sp, "install_signal_cleanup"),
+            patch.object(sp, "robust_destroy"),
+        ):
+            res = sp.smoke_provider("prov", "/sdl", "/key", records=records)
+        assert res["deploy"] == "NO-AUTH", (
             'no-auth has no entry in the note->outcome map, so .get(note, "FAIL") '
-            "scores it as a provider failure — the exact bug this class exists to stop"
+            "scores a dead API key as a provider failure — the exact bug this "
+            "class exists to stop"
         )
+        assert res["deploy"] not in sp._FAILING_OUTCOMES, (
+            "NO-AUTH became a gating outcome; it would fail the run and page the "
+            "fleet for our own credential"
+        )
+        by = {r["feature"]: r for r in records}
+        assert by["deploy"]["outcome"] == "NO-AUTH"
