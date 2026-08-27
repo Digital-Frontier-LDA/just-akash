@@ -930,14 +930,17 @@ def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, s
     r = _run(
         f"uv run just-akash deploy --sdl {q(sdl_path)} "
         f"--provider {q(provider)} --backup-provider '' "
-        # bid_wait_retry is the TOTAL auction deadline, not a retry interval, and
-        # deploy() rejects bid_wait_retry < bid_wait. This read "--bid-wait 120
-        # --bid-wait-retry 60" — the old semantics, where 60 was the gap AFTER the
-        # 120s wait — so every deploy died in ~250ms on a ValueError before touching
-        # the network, and the whole fleet scored deploy FAIL from 2026-08-22.
-        # 180 = 120 preferred + 60 fallback, preserving exactly what the old pair meant
-        # (fallback_wait = bid_wait_retry - bid_wait).
-        f"--bid-wait 120 --bid-wait-retry 180",
+        # deploy() maps these onto AuctionPolicy, which bounds BOTH windows:
+        #   collection_window_seconds = bid_wait                 must be 0..60
+        #   fallback_window_seconds   = bid_wait_retry - bid_wait must be 0..120
+        # and deploy() separately requires bid_wait_retry >= bid_wait.
+        #
+        # This read "--bid-wait 120 --bid-wait-retry 60", which broke BOTH rules and
+        # raised before any network call, so every provider scored deploy FAIL in
+        # ~250ms from 2026-08-22. 60/180 is the longest legal auction: a 60s
+        # collection window plus a 120s fallback, both at the maximum, keeping the
+        # 180s total the original pair was reaching for.
+        f"--bid-wait 60 --bid-wait-retry 180",
         timeout=420,
     )
     out = (r.stdout or "") + (r.stderr or "")

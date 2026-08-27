@@ -2338,6 +2338,24 @@ class TestBidWaitInvariant:
             f"smoke fails before reaching the network. {cmd}"
         )
 
+    def test_the_windows_are_within_auction_policy_bounds(self):
+        """⛔ deploy()'s own check (retry >= wait) is NOT the whole contract.
+
+        The values land in AuctionPolicy, which bounds each window separately.
+        --bid-wait 120 satisfied nothing-is-inverted yet still raised, because a
+        collection window may not exceed 60s. Construct the real policy object
+        rather than restating its numbers here, so the bounds cannot drift.
+        """
+        auction = pytest.importorskip("akash_lease_core.auction")
+        cmd = self._built_command()
+        wait = self._flag(cmd, "--bid-wait")
+        retry = self._flag(cmd, "--bid-wait-retry")
+        # Mirrors deploy.py: collection = bid_wait, fallback = bid_wait_retry - bid_wait.
+        auction.AuctionPolicy(
+            collection_window_seconds=wait,
+            fallback_window_seconds=retry - wait,
+        )
+
     def test_deploy_really_rejects_the_inverted_pair(self):
         """⛔ Pin the contract by CALLING the callee, not by grepping its source.
 
