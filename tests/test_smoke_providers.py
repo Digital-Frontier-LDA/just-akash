@@ -2263,3 +2263,39 @@ class TestAuthFailureIsNotAProviderFault:
         )
         by = {r["feature"]: r for r in records}
         assert by["deploy"]["outcome"] == "NO-AUTH"
+
+
+class TestDeployFailedIsExplained:
+    """`deploy-failed` is the fallthrough — reaching it means we classified
+    nothing, so the captured output is the ONLY evidence of why. It used to be
+    discarded, which is what made a fleet-wide red matrix undiagnosable from CI.
+    """
+
+    def test_evidence_is_printed_on_the_fallthrough(self, capsys):
+        boom = _completed("kaboom: totally unknown", returncode=1)
+        with patch.object(sp, "_run", return_value=boom):
+            _, note = sp._deploy("sdl.yml", "akash1prov", {})
+        assert note == "deploy-failed"
+        assert "kaboom: totally unknown" in capsys.readouterr().out
+
+    def test_long_opaque_tokens_are_redacted(self, capsys):
+        """The repo is public; CI logs are public. A captured credential must
+        not be printed verbatim."""
+        leak = "A" * 40
+        with patch.object(sp, "_run", return_value=_completed(f"failed key={leak}", returncode=1)):
+            sp._deploy("sdl.yml", "akash1prov", {})
+        out = capsys.readouterr().out
+        assert leak not in out, "a long opaque token reached a public log verbatim"
+        assert "<redacted>" in out
+
+    def test_classified_paths_print_no_evidence(self, capsys):
+        """Only the fallthrough is unexplained; the others already carry a note."""
+        for text in ("API Error (402): insufficient balance", "API Error (401): Invalid API key"):
+            with patch.object(sp, "_run", return_value=_completed(text, returncode=1)):
+                sp._deploy("sdl.yml", "akash1prov", {})
+            assert "deploy-failed evidence" not in capsys.readouterr().out
+
+    def test_empty_output_still_says_something(self, capsys):
+        with patch.object(sp, "_run", return_value=_completed("", returncode=127)):
+            sp._deploy("sdl.yml", "akash1prov", {})
+        assert "no output at all" in capsys.readouterr().out
