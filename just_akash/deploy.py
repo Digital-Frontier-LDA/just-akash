@@ -444,6 +444,7 @@ def _select_auction_bid(
     observed_at_by_provider: dict[str, float] | None = None,
     capacity_by_provider: dict[str, "ProviderCapacity"] | None = None,
     preferred_selection: "PreferredSelection | None" = None,
+    already_selected: frozenset[str] | None = None,
 ):
     """Normalize Console bids and delegate the decision to the shared core.
 
@@ -511,8 +512,27 @@ def _select_auction_bid(
         auction.observe(observation)
         raw_by_key[bid_key] = raw_bid
 
+    # ⭐ ANTI-AFFINITY. `already_selected` names the providers this DEPLOYMENT ROUND has
+    # already placed on, so an N-region placement spreads across N distinct providers
+    # instead of stacking on whichever one is cheapest N times over.
+    #
+    # ⛔ IT CHANGES THE ORDER, NEVER THE ELIGIBILITY — akash-lease-core's own words. If an
+    # already-used provider is the ONLY bidder, it is still taken, because "taking it beats
+    # failing to place". That is the correct trade at the measured ~93% provider fullness:
+    # a soft spread wins placements, a hard exclusion loses them.
+    #
+    # ⚠ `None` and `frozenset()` are the same thing to the core (no spread requested), so a
+    # caller that does not track placements is unaffected.
+    #
+    # ⛔⛔ AND IT ONLY ENGAGES UNDER `--select emptiest` WITH READABLE CAPACITY — measured,
+    # against the assumption. The `taken` term lives INSIDE the core's `if emptiest and
+    # readable:` branch; the else-branch is a plain `min(pool, key=price)` with no spread term.
+    # So `already_selected` passed under CHEAPEST is silently INERT. The 2026-08-25 handoff
+    # recorded the opposite ("needs NO capacity data ... the half that works today"); that is
+    # false for v0.9.0. EMPTIEST is a PREREQUISITE for the spread, not a parallel lever.
     result = auction.evaluate(
-        now=collection_window_seconds if evaluated_at is None else evaluated_at
+        now=collection_window_seconds if evaluated_at is None else evaluated_at,
+        already_selected=already_selected,
     )
     if result.status is not AuctionStatus.DECIDED or result.selected is None:
         return None, result
@@ -773,6 +793,7 @@ def deploy(
     backup_providers: list[str] | None = None,
     deposit: float = 5.0,
     select: str = "cheapest",
+    already_selected: list[str] | None = None,
 ) -> dict:
     # deposit is user-controlled (--deposit); reject non-finite/non-positive
     # values before they reach json.dumps (which would emit invalid NaN/Infinity).
@@ -790,6 +811,15 @@ def deploy(
     #   create_deployment, so a typo bought a deployment and a deposit before failing.
     #   Argument validation is free; do it before the first irreversible step.
     _selection = _resolve_selection(select)
+    # ⭐ ANTI-AFFINITY INPUT, normalised beside the selection mode and for the same reason:
+    # validate before the first irreversible step. Empty and None are the same thing to the
+    # core — no spread requested — so a caller that does not track placements is unaffected.
+    #
+    # ⚠ Addresses are NOT validated against the allowlist. A caller naming a provider it
+    # placed on last round is stating a FACT about its own history; rejecting an unknown
+    # address would turn a spread hint into a failure, and the core already treats the set as
+    # ordering-only. Blank entries are dropped so `--already-selected ""` cannot poison it.
+    _already_selected = frozenset(a.strip() for a in (already_selected or []) if a and a.strip())
     AuctionPolicy(
         collection_window_seconds=bid_wait,
         fallback_window_seconds=fallback_wait,
@@ -1089,6 +1119,7 @@ def deploy(
         observed_at_by_provider=first_seen_by_provider,
         capacity_by_provider=_capacity,
         preferred_selection=_selection,
+        already_selected=_already_selected,
     )
     if auction_result.status is AuctionStatus.COLLECTING:
         fallback_deadline = start_time + bid_wait_retry
@@ -1144,6 +1175,7 @@ def deploy(
             observed_at_by_provider=first_seen_by_provider,
             capacity_by_provider=_capacity,
             preferred_selection=_selection,
+            already_selected=_already_selected,
         )
     selection_phase = (
         1 if auction_result.selection_reason == "cheapest_preferred" or not has_allowlist else 2

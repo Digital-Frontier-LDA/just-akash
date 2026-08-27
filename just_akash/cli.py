@@ -262,6 +262,20 @@ def main():
         help="Preferred provider address (repeatable; overrides AKASH_PROVIDERS)",
     )
     deploy_p.add_argument(
+        "--already-selected",
+        dest="already_selected",
+        action="append",
+        default=[],
+        metavar="ADDR",
+        help=(
+            "Provider this deployment round has ALREADY placed on (repeatable). An "
+            "N-region placement passes the providers chosen so far, so the auction spreads "
+            "across N distinct providers instead of stacking on the cheapest one N times. "
+            "Soft by design: it changes bid ORDER, never eligibility — if an already-used "
+            "provider is the only bidder it is still taken, because placing beats failing."
+        ),
+    )
+    deploy_p.add_argument(
         "--select",
         dest="select",
         choices=["cheapest", "emptiest"],
@@ -711,6 +725,7 @@ def main():
                 backup_providers=[] if args.no_backup_fallback else args.backup_providers,
                 deposit=args.deposit,
                 select=args.select,
+                already_selected=args.already_selected,
             )
             sys.exit(0)
         except RuntimeError as e:
