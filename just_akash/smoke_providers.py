@@ -780,7 +780,7 @@ def _explain_deploy_failed(provider: str, out: str, rc: int) -> None:
         tail = _SECRETISH.sub("<redacted>", tail)
         if not tail:
             tail = "(the deploy produced no output at all)"
-        print(f"  {YELLOW}deploy-failed evidence{RESET} [{provider[:14]} rc={rc}]: {tail}")
+        print(f"  {YELLOW}deploy-failed evidence{RESET} [{provider} rc={rc}]: {tail}")
     except Exception:  # noqa: BLE001 — evidence is best-effort
         pass
 
