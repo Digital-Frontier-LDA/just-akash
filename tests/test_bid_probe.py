@@ -20,6 +20,7 @@ from just_akash.bid_probe import (
     OUTCOME_ERROR,
     OUTCOME_INDEX_LAG,
     OUTCOME_NO_BID,
+    OUTCOME_NO_BID_UNVERIFIED,
     OUTCOME_NO_CREDIT,
     PROVIDERS,
     SCENARIOS,
@@ -454,3 +455,76 @@ def test_exposition_survives_the_consumer_allowlist_shape():
         if not ln or ln.startswith("#"):
             continue
         assert sample.match(ln), f"line would poison the whole scrape: {ln!r}"
+
+
+class TestUnverifiableCrossCheckIsNotAProviderFault:
+    """`_chain_bids_exist` returns True / False / **None**, and only the first
+    two were ever tested. None means neither the Console index nor the LCDs
+    could answer — an absence of evidence, not evidence of absence.
+
+    It used to fall into the same OUTCOME_NO_BID as a chain-CONFIRMED absence,
+    separated only by a note string that the exported metric — and therefore the
+    critical alert — cannot see. Measured on onidc 2026-08-29: **55 of 55**
+    no-bids in the entire 480-record history carried
+    note="chain cross-check unverifiable" and ZERO were chain-confirmed, so
+    every critical page this rule had ever produced was false.
+
+    Root cause of the unverifiability: the LCD `bids/list?filters.dseq=` query
+    answers a malformed request in 0.2s but times out past 30s on a real dseq,
+    while the cross-check allows 8s — so it can never reach the two agreeing
+    endpoints it needs. That is worth fixing separately; this class only ensures
+    the failure cannot masquerade as a provider verdict.
+    """
+
+    @staticmethod
+    def _target():
+        return ProviderTarget(
+            "hetzner_hel", HETZNER.wallet, frozenset({"cpu"}), HETZNER.attributes
+        )
+
+    def test_unverifiable_is_a_skip(self, monkeypatch):
+        monkeypatch.setattr("just_akash.smoke_providers._chain_bids_exist", lambda dseq: None)
+        client = FakeClient([[], []])
+        recs = run_probe(
+            client,
+            providers=[self._target()],
+            sleep=lambda _s: None,
+            wait_s=0,
+        )
+        assert recs[0].outcome == OUTCOME_NO_BID_UNVERIFIED
+        assert recs[0].skipped is True, (
+            "an unverifiable cross-check reached the alert as a provider "
+            "failure — the exact mistake this module's docstring forbids"
+        )
+
+    def test_chain_confirmed_absence_is_still_a_real_no_bid(self, monkeypatch):
+        """The fix must not silence genuine no-bids: False is still an ANSWER."""
+        monkeypatch.setattr("just_akash.smoke_providers._chain_bids_exist", lambda dseq: False)
+        client = FakeClient([[], []])
+        recs = run_probe(
+            client,
+            providers=[self._target()],
+            sleep=lambda _s: None,
+            wait_s=0,
+        )
+        assert recs[0].outcome == OUTCOME_NO_BID
+        assert recs[0].skipped is False
+
+    def test_unverifiable_still_gets_its_confirming_retry(self, monkeypatch):
+        """Reclassifying must not drop the retry — an unverifiable answer is
+        exactly the case worth asking twice."""
+        monkeypatch.setattr("just_akash.smoke_providers._chain_bids_exist", lambda dseq: None)
+        client = FakeClient([[], []])
+        slept = []
+        recs = run_probe(
+            client,
+            providers=[self._target()],
+            sleep=slept.append,
+            wait_s=0,
+            retry_delay_s=17,
+        )
+        assert recs[0].retried is True
+        # An explicit, non-default value: this proves the sleep is wired to
+        # retry_delay_s rather than coincidentally matching whatever the
+        # default happens to be today.
+        assert slept == [17]

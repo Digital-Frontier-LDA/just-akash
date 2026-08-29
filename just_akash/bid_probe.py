@@ -358,10 +358,22 @@ def inject_placement_attributes(sdl_text: str, attrs: dict[str, str]) -> str:
 OUTCOME_BID = "bid"
 OUTCOME_NO_BID = "no-bid"
 OUTCOME_INDEX_LAG = "bid-index-lag"
+# The chain cross-check could not confirm the absence. NOT the same as
+# "the chain says nobody bid" — see the block where this is returned.
+OUTCOME_NO_BID_UNVERIFIED = "no-bid-unverified"
 OUTCOME_NO_CREDIT = "no-credit"
 OUTCOME_ERROR = "probe-error"
 
-_SKIPPED_OUTCOMES = frozenset({OUTCOME_INDEX_LAG, OUTCOME_NO_CREDIT, OUTCOME_ERROR})
+# "Couldn't test" is not "failed" (rule 2 in this module's docstring). An
+# unverifiable cross-check belongs here for exactly the reason index-lag does:
+# the answer is meaningless, so it must not reach the operator as a provider
+# verdict. Measured on onidc 2026-08-29: 55 of 55 no-bids in the entire
+# 480-record history carried note="chain cross-check unverifiable" and ZERO
+# were chain-confirmed — i.e. every critical page this rule has ever produced
+# was false.
+_SKIPPED_OUTCOMES = frozenset(
+    {OUTCOME_INDEX_LAG, OUTCOME_NO_BID_UNVERIFIED, OUTCOME_NO_CREDIT, OUTCOME_ERROR}
+)
 
 
 @dataclass
@@ -495,11 +507,19 @@ def probe_pair(
             note="chain reports bids the Console index did not return",
             ts=ts,
         )
+    # on_chain is False -> the chain positively confirms nobody bid. That is a
+    # real NO-BID and must page.
+    # on_chain is None  -> neither the Console index nor the LCDs could answer.
+    #                      That is an absence of evidence, not evidence of
+    #                      absence, and scoring it as a provider failure is the
+    #                      exact mistake this module's docstring forbids. It was
+    #                      previously separated only by a note string, which the
+    #                      exported metric and therefore the alert cannot see.
     return ProbeRecord(
         cluster=target.cluster,
         provider=target.wallet,
         scenario=scenario.name,
-        outcome=OUTCOME_NO_BID,
+        outcome=OUTCOME_NO_BID if on_chain is False else OUTCOME_NO_BID_UNVERIFIED,
         dseq=res.get("dseq"),
         waited_s=int(res.get("waited_s") or 0),
         note="" if on_chain is False else "chain cross-check unverifiable",
@@ -571,7 +591,7 @@ def run_probe(
             )
             continue
 
-        if rec.outcome == OUTCOME_NO_BID and retry_delay_s > 0:
+        if rec.outcome in (OUTCOME_NO_BID, OUTCOME_NO_BID_UNVERIFIED) and retry_delay_s > 0:
             print(
                 f"  {target.cluster}/{scenario.name}: no bid — confirming in {retry_delay_s}s",
                 file=sys.stderr,
