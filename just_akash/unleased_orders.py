@@ -32,6 +32,7 @@ from akash_lease_core.orders import (
     OrderDecision,
     OrderObservation,
     OrderPolicy,
+    OrderStatus,
     evaluate_order,
 )
 
@@ -154,8 +155,32 @@ def audit_owner(
 
 
 def summarise(decisions: Iterable[OrderDecision]) -> dict[str, int]:
-    """Counts by status — every status present, so a zero is visible as a zero."""
-    counts: dict[str, int] = {}
+    """Counts by status, SEEDED FROM THE ENUM so a zero is reported as a zero.
+
+    ⛔ THIS DOCSTRING USED TO BE FALSE. It promised "every status present, so a zero is
+    visible as a zero" over a plain Counter, which only ever contains the statuses that
+    OCCURRED. A status with no members was ABSENT from the JSON, not zero.
+
+    MEASURED 2026-08-29, unleased-order-audit run 33239504420 — three owners, and the
+    shape of each answer differs for reasons a reader cannot see:
+
+        akash1cklqag…  {"has_lease": 6, "excluded": 14}
+        akash1n4uut3…  {"excluded": 36}          <- has_lease is 0, so the key vanished
+        akash14n4rkm…  {}                        <- no decisions at all, or no read at all
+
+    The second is indistinguishable from "this owner has no leases tracked" and the third
+    from a failed enumeration, while the run reported "0 unreadable".
+
+    ⚠ AND THE TEXT PATH WAS ALREADY RIGHT, which is what makes this a drift rather than an
+    oversight. `cli.py` prints a hardcoded list of all eight statuses under the comment
+    "Print EVERY status, including the zeros." So the human-readable output carried the
+    invariant and the machine-readable output — the one the workflow consumes with --json —
+    did not. Two spellings of one promise, and the automation got the lossy one.
+
+    Seeding from `OrderStatus` means the enum is the single authority. A new status appears
+    in every consumer for free; none of them can silently omit one.
+    """
+    counts: dict[str, int] = {s.value: 0 for s in OrderStatus}
     for d in decisions:
         counts[d.status.value] = counts.get(d.status.value, 0) + 1
     return counts

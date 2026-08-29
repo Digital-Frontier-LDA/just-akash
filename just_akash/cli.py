@@ -1320,6 +1320,8 @@ def main():
 
         from akash_lease_core.orders import OrderPolicy
 
+        from akash_lease_core.orders import OrderStatus
+
         from .unleased_orders import audit_owner, summarise
 
         policy = (
@@ -1350,16 +1352,12 @@ def main():
             print(f"owner {args.owner}")
             # ⚠ Print EVERY status, including the zeros. A summary that omits absent
             #   categories reads as "none of those exist" when it means "not shown".
-            for status in (
-                "closeable",
-                "has_lease",
-                "too_young",
-                "protected",
-                "excluded",
-                "not_active",
-                "not_open_order",
-                "undetermined",
-            ):
+            # ⛔ ITERATE THE ENUM, NOT A LIST RETYPED HERE. This block used to hardcode
+            #   the eight status names — a second spelling of `OrderStatus` that nothing
+            #   kept in step. `summarise()` now seeds from the same enum, so the text and
+            #   --json outputs cannot disagree about which statuses exist, and a new
+            #   status reaches both without touching either.
+            for status in (s.value for s in OrderStatus):
                 print(f"  {status:16s} {counts.get(status, 0)}")
             for d in closeable:
                 print(f"  ⚠ CLOSEABLE dseq={d.dseq}")
