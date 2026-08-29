@@ -841,6 +841,36 @@ class TestReconciliationDisagreementVisibility:
             )
         assert value == 116_327_730
 
+    def test_even_quorum_split_fails_safe_and_names_both_sides(self):
+        """CodeRabbit on #222: a four-member quorum can split 2-2. Both values
+        then satisfy `count >= 2`, and the OLD code (a) picked the LARGER via
+        max() — the optimistic direction this module exists to prevent — and
+        (b) filtered dissent with `v not in agreeing`, which stayed SILENT
+        about the losing pair. Fail safe: return the LOWER reading and name
+        every endpoint that differs from the canonical value."""
+
+        def fake(path, timeout=15, base=None, height=None):
+            if path.endswith("blocks/latest"):
+                return {"block": {"header": {"height": "28383596"}}}
+            if base and ("publicnode" in base or "akashnet" in base):
+                return self._vintage(uact=116_327_730, expiration="2036-08-24T22:00:00Z")
+            return self._vintage(uact=170_623_558, expiration="2036-07-08T11:54:24Z")
+
+        with (
+            patch.object(chain, "_lcd_get", side_effect=fake),
+            pytest.warns(UserWarning, match=r"TIED.*170623558"),
+        ):
+            value = chain.granted_uact(
+                "akash1me",
+                quorum=(
+                    "https://akash-rest.publicnode.com",
+                    "https://api.akashnet.net",
+                    "https://akash-api.polkachu.com",
+                    "https://console.example",
+                ),
+            )
+        assert value == 116_327_730, "an even split must return the LOWER reading (fail-safe)"
+
 
 class TestRestUrls:
     def test_default_fans_out_beyond_the_single_public_node(self, monkeypatch):

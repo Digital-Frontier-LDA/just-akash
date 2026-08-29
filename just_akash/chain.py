@@ -528,7 +528,11 @@ def granted_uact(
     agreeing = [value for value, count in counts.items() if count >= 2]
     if not agreeing:
         return None
-    result = max(agreeing)
+    # FAIL-SAFE on an even split (CodeRabbit, #222): with a four-member quorum
+    # reading 2-2, BOTH values satisfy `count >= 2` and max() would return the
+    # LARGER — the optimistic direction this module exists to prevent. min()
+    # under-reports; the TIED warning below tells the operator why.
+    result = min(agreeing)
     # VISIBILITY, same contract as deploy_credit: a correct-but-silent quorum
     # hides the split. Name every member that was excluded (could not serve
     # the pinned height — the measured case is the DEFAULT LCD, which ignores
@@ -538,15 +542,19 @@ def granted_uact(
     import warnings
 
     excluded = [(b, r) for b, v, r in outcomes if v is None]
-    dissent = [(b, v) for b, v, r in outcomes if v is not None and v not in agreeing]
+    # Classify against `result`, NOT membership in `agreeing`: on an even
+    # split both values qualify and the losing pair would be labelled
+    # "agreeing" while differing from the canonical answer (CodeRabbit, #222).
+    dissent = [(b, v) for b, v, r in outcomes if v is not None and v != result]
     if excluded or dissent:
         parts: list[str] = []
         if excluded:
             listed = ", ".join(f"{b} ({r[:80]})" for b, r in excluded)
             parts.append(f"quorum excluded {len(excluded)} endpoint(s): {listed}")
         if dissent:
+            tied = any(counts[v] == counts[result] for _, v in dissent)
             listed = ", ".join(f"{b}={v}uact" for b, v in dissent)
-            parts.append(f"dissent: {listed}")
+            parts.append(f"{'TIED equal-majority split; ' if tied else ''}dissent: {listed}")
         n_agree = counts[result]
         warnings.warn(
             f"granted_uact: {'; '.join(parts)} — canonical {result} uact from "
