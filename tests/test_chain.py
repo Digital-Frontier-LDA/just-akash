@@ -1,5 +1,6 @@
 """Unit tests for just_akash.chain — the read-only LCD queries behind `balance`."""
 
+import warnings
 from unittest.mock import patch
 
 import pytest
@@ -690,6 +691,155 @@ class TestMultiEndpointCreditReconciliation:
         assert any("malformed.test" in str(w.message) for w in caught), (
             f"expected the malformed source named in the warning; got {caught}"
         )
+
+
+class TestReconciliationDisagreementVisibility:
+    """A reconciliation that is CORRECT but SILENT still hides the outage.
+
+    Measured 2026-08-29 on akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee:
+    akash-rest.publicnode.com served a SUPERSEDED grant (170.62 ACT,
+    expiration 2036-07-08) all day while api.akashnet.net and
+    akash-api.polkachu.com agreed on the fresh vintage (116.33 ACT,
+    expiration 2036-08-24). The latest-expiration rule picks the right VALUE
+    either way — and said NOTHING while one default-list LCD disagreed with
+    the other two by 54 ACT. That silence is how a phantom balance lived in
+    the fleet's key ranking: the requirement is that the DISAGREEMENT itself
+    reaches the operator (`balance` stderr / fleet logs / preflight output).
+    """
+
+    @staticmethod
+    def _vintage(uact, expiration):
+        """One endpoint's view: a single DepositAuthorization grant."""
+        return {
+            "grants": [
+                {
+                    "granter": "akash1granter",
+                    "grantee": "akash1me",
+                    "expiration": expiration,
+                    "authorization": {
+                        "@type": _DEPOSIT,
+                        "spend_limits": [
+                            {"denom": "uakt", "amount": "0"},
+                            {"denom": "uact", "amount": str(uact)},
+                        ],
+                    },
+                }
+            ]
+        }
+
+    STALE = dict(uact=170_623_558, expiration="2036-07-08T11:54:24Z")
+    FRESH = dict(uact=116_327_730, expiration="2036-08-24T22:00:00Z")
+
+    def test_endpoints_disagreeing_on_vintage_emit_a_warning(self):
+        """The 2026-08-29 shape verbatim: the stale node is the one that also
+        reports the LARGER amount. Right value AND a warning naming the
+        dissenting endpoint with its phantom figure."""
+
+        def fake(path, timeout=15, base=None, height=None):
+            if base and "publicnode" in base:
+                return self._vintage(**self.STALE)
+            return self._vintage(**self.FRESH)
+
+        with (
+            patch.object(
+                chain,
+                "rest_urls",
+                return_value=[
+                    "https://akash-rest.publicnode.com",
+                    "https://api.akashnet.net",
+                    "https://akash-api.polkachu.com",
+                ],
+            ),
+            patch.object(chain, "_lcd_get", side_effect=fake),
+            pytest.warns(UserWarning, match=r"DISAGREE.*publicnode.*170623558"),
+        ):
+            result = chain.deploy_credit("akash1me")
+        assert result == {"uakt": 0, "uact": 116_327_730}, (
+            "visibility must not change the answer — the fresh vintage still wins."
+        )
+
+    def test_endpoints_agreeing_emit_no_disagreement_warning(self):
+        """The guard against noise: when every reachable endpoint's chosen
+        vintage agrees, no warning. A warning on every healthy call is how
+        operators learn to ignore warnings."""
+
+        def fake(path, timeout=15, base=None, height=None):
+            return self._vintage(**self.FRESH)
+
+        with (
+            patch.object(
+                chain,
+                "rest_urls",
+                return_value=[
+                    "https://akash-rest.publicnode.com",
+                    "https://api.akashnet.net",
+                ],
+            ),
+            patch.object(chain, "_lcd_get", side_effect=fake),
+            warnings.catch_warnings(record=True) as caught,
+        ):
+            warnings.simplefilter("always")
+            result = chain.deploy_credit("akash1me")
+        assert result == {"uakt": 0, "uact": 116_327_730}
+        assert not caught, (
+            f"unanimous endpoints must not warn; got {[str(w.message) for w in caught]}"
+        )
+
+    def test_quorum_names_the_endpoint_that_cannot_pin_height(self):
+        """granted_uact skips a node that cannot serve the pinned height —
+        today SILENTLY. The skip must be named: 'the default LCD cannot
+        participate in canonical reads' is a standing fact an operator sees
+        per-run, not a secret the quorum keeps."""
+
+        def fake(path, timeout=15, base=None, height=None):
+            if path.endswith("blocks/latest"):
+                return {"block": {"header": {"height": "28383596"}}}
+            if base and "publicnode" in base:
+                raise RuntimeError(
+                    "chain query did not echo pinned height "
+                    "(https://akash-rest.publicnode.com/...)"
+                )
+            assert height == 28_383_593, "tip-3 pin must be sent to every quorum member"
+            return self._vintage(**self.FRESH)
+
+        with (
+            patch.object(chain, "_lcd_get", side_effect=fake),
+            pytest.warns(UserWarning, match=r"quorum excluded.*publicnode"),
+        ):
+            value = chain.granted_uact(
+                "akash1me",
+                quorum=(
+                    "https://akash-rest.publicnode.com",
+                    "https://api.akashnet.net",
+                    "https://akash-api.polkachu.com",
+                ),
+            )
+        assert value == 116_327_730
+
+    def test_quorum_names_the_dissenting_reading(self):
+        """A node that answers at the pinned height but disagrees with the
+        majority is a live dissent — name it with its reading."""
+
+        def fake(path, timeout=15, base=None, height=None):
+            if path.endswith("blocks/latest"):
+                return {"block": {"header": {"height": "28383596"}}}
+            if base and "polkachu" in base:
+                return self._vintage(**self.STALE)
+            return self._vintage(**self.FRESH)
+
+        with (
+            patch.object(chain, "_lcd_get", side_effect=fake),
+            pytest.warns(UserWarning, match=r"dissent.*polkachu.*170623558"),
+        ):
+            value = chain.granted_uact(
+                "akash1me",
+                quorum=(
+                    "https://akash-rest.publicnode.com",
+                    "https://api.akashnet.net",
+                    "https://akash-api.polkachu.com",
+                ),
+            )
+        assert value == 116_327_730
 
 
 class TestRestUrls:

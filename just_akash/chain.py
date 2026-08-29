@@ -40,8 +40,13 @@ DEFAULT_REST_URL = "https://akash-rest.publicnode.com"
 # a CI preflight — would report a funded account as short and take the failure path.
 # In CI that means falling back to paid runners while the wallet is fine.
 #
-# Reconciled by MAX (see `deploy_credit`): staleness can only lose a deposit, never
-# invent one, so the highest reading is the freshest.
+# Reconciled by LATEST EXPIRATION (see `deploy_credit`). The OLD rule — MAX across
+# endpoints, justified as "staleness can only lose a deposit, never invent one" — is
+# FALSE: a lagging node can serve a SUPERSEDED grant whose remaining allowance is
+# LARGER than the replacement's. Measured 2026-08-29 on akash1n4uut3…: publicnode
+# served 170.62 ACT (expiration 2036-07-08) while akashnet + polkachu agreed on the
+# fresh 116.33 ACT vintage (2036-08-24). MAX picked the dead grant, and every
+# deposit sized between the two was refused with 402 for 13 days.
 DEFAULT_REST_FALLBACKS = (
     "https://api.akashnet.net",
     "https://akash-api.polkachu.com",
@@ -421,6 +426,41 @@ def deploy_credit(address: str) -> dict[str, int]:
     latest_exp = max(e for _, e, _ in grants_with_exp)
     fresh_readings = [(c, s) for c, e, s in grants_with_exp if e == latest_exp]
     chosen = max(fresh_readings, key=lambda cs: cs[0].get("uact", 0))[0]
+    # VISIBILITY: the reconciliation above is correct whether the endpoints
+    # agree or not — and that is the trap. Measured 2026-08-29 on
+    # akash1n4uut3…: publicnode served a superseded 170.62-ACT grant
+    # (expiration 2036-07-08) all day while akashnet + polkachu agreed on the
+    # fresh 116.33-ACT vintage (2036-08-24). The rule silently picked the
+    # right value, a 54-ACT phantom sat in the fleet's key ranking, and
+    # nothing anywhere said "these LCDs disagree". So when the endpoints'
+    # CHOSEN vintages differ — or a fan-out member was unreachable — SAY SO.
+    # Per-endpoint choice = that endpoint's latest-expiration grant; in the
+    # common case every endpoint reports BOTH grants and chooses identically,
+    # so unanimous chains stay silent (see the no-noise test).
+    per_endpoint_choice: list[tuple[str, int, datetime]] = []
+    for base, breakdown in per_endpoint:
+        endpoint_grants = [(c, _parse_expiration(e)) for c, e in breakdown if _parse_expiration(e)]
+        if endpoint_grants:
+            coins, exp = max(endpoint_grants, key=lambda ce: ce[1])
+            per_endpoint_choice.append((base, coins.get("uact", 0), exp))
+    if len({u for _, u, _ in per_endpoint_choice}) > 1:
+        detail = "; ".join(
+            f"{base}={uact}uact@{exp:%Y-%m-%d}" for base, uact, exp in per_endpoint_choice
+        )
+        warnings.warn(
+            f"deploy_credit: LCDs DISAGREE on the deploy grant — {detail}. "
+            f"Kept the latest-expiration vintage ({latest_exp:%Y-%m-%d}); an endpoint "
+            "holding the LARGER figure on an OLDER expiration is serving a "
+            "superseded grant, not more money.",
+            stacklevel=2,
+        )
+    if errors:
+        warnings.warn(
+            f"deploy_credit: {len(errors)} endpoint(s) unreachable during the grant "
+            f"read: {'; '.join(errors)}. Answer rests on the "
+            f"{len(per_endpoint)} endpoint(s) that answered.",
+            stacklevel=2,
+        )
     # Surface (do not silently lose) grants whose freshness we could not
     # verify. ``warnings.warn`` is the documented channel — callers can
     # filter with ``warnings.simplefilter("error")`` if they want a hard gate.
@@ -462,6 +502,7 @@ def granted_uact(
     if height <= 0:
         return None
     readings: list[int] = []
+    outcomes: list[tuple[str, int | None, str]] = []  # (base, uact | None, skip reason)
     for base in bases:
         try:
             value = _sum_deposit_grants(
@@ -469,15 +510,46 @@ def granted_uact(
                     f"/cosmos/authz/v1beta1/grants/grantee/{address}", base=base, height=height
                 )
             ).get("uact")
-        except RuntimeError:
+        except RuntimeError as e:
+            outcomes.append((base, None, str(e)))
             continue
         if value is not None:
             readings.append(value)
+            outcomes.append((base, value, ""))
+        else:
+            outcomes.append((base, None, "no parseable uact grant"))
     if not readings:
         return None
     counts = {value: readings.count(value) for value in set(readings)}
     agreeing = [value for value, count in counts.items() if count >= 2]
-    return max(agreeing) if agreeing else None
+    if not agreeing:
+        return None
+    result = max(agreeing)
+    # VISIBILITY, same contract as deploy_credit: a correct-but-silent quorum
+    # hides the split. Name every member that was excluded (could not serve
+    # the pinned height — the measured case is the DEFAULT LCD, which ignores
+    # the x-cosmos-block-height pin and must be skipped every single call)
+    # and every reading that dissented from the majority. The operator sees
+    # WHO was not counted; the value still comes from the agreeing pair.
+    import warnings
+
+    excluded = [(b, r) for b, v, r in outcomes if v is None]
+    dissent = [(b, v) for b, v, r in outcomes if v is not None and v not in agreeing]
+    if excluded or dissent:
+        parts: list[str] = []
+        if excluded:
+            listed = ", ".join(f"{b} ({r[:80]})" for b, r in excluded)
+            parts.append(f"quorum excluded {len(excluded)} endpoint(s): {listed}")
+        if dissent:
+            listed = ", ".join(f"{b}={v}uact" for b, v in dissent)
+            parts.append(f"dissent: {listed}")
+        n_agree = counts[result]
+        warnings.warn(
+            f"granted_uact: {'; '.join(parts)} — canonical {result} uact from "
+            f"{n_agree}/{len(bases)} agreeing endpoint(s) at height {height}.",
+            stacklevel=2,
+        )
+    return result
 
 
 def free_uact(granted_uact_value: int) -> int:
