@@ -600,6 +600,54 @@ def test_permissions_are_read_only():
 
 
 # --------------------------------------------------------------------------
+# provider-select — #211 armed `--select emptiest` in the CLI; nothing could reach it
+# --------------------------------------------------------------------------
+
+
+def test_provider_select_input_exists_optional_and_empty_by_default():
+    """⛔ THE GAP THIS CLOSES, measured 2026-08-29: `just-akash deploy --select
+    {cheapest,emptiest}` shipped in #211 and the pool workflow exposed NO input for it —
+    zero call sites pass the flag, so every consumer got `cheapest` regardless. A
+    capability no caller can reach is the merged-not-invoked defect one level down.
+
+    The default is EMPTY on purpose: the CLI owns the real default, and an empty value
+    must contribute NO flag — `--select ""` is an argparse exit 2, and the deploy call's
+    deliberate `|| true` (auction rounds retry) would swallow it silently."""
+    spec = INPUTS.get("provider-select")
+    assert spec is not None, (
+        "no provider-select input — the CLI's --select is unreachable from any consumer"
+    )
+    assert spec.get("required") is False
+    assert spec.get("default") == ""
+
+
+def test_provider_select_is_validated_before_the_first_attempt():
+    """The deploy invocation ends in `|| true` because auction rounds legitimately fail
+    and retry. That tolerance would also swallow argparse's exit 2 on a misspelled
+    --select value — every attempt would burn a bid window reporting nothing. So the
+    workflow rejects an unknown value ITSELF, before the first attempt."""
+    code = _code(PROVISION["run"])
+    assert "cheapest|emptiest" in code, (
+        "no case guard constrains provider-select — a typo is retried as an auction failure"
+    )
+
+
+def test_provider_select_env_is_wired_from_the_input():
+    env = PROVISION.get("env") or {}
+    assert env.get("PROVIDER_SELECT") == "${{ inputs.provider-select }}"
+
+
+def test_provider_select_reaches_the_deploy_invocation():
+    """The point of the input: the consumer's choice must arrive at `deploy`. An input
+    that validates but is never passed is decorative."""
+    code = _code(PROVISION["run"])
+    line = next((ln for ln in code.splitlines() if '"${PROV_ARGS[@]}"' in ln), "")
+    assert '"${SELECT_ARGS[@]}"' in line, (
+        "the deploy invocation takes --provider args but no --select"
+    )
+
+
+# --------------------------------------------------------------------------
 # Anti-vacuity — prove the guards above can actually fail
 # --------------------------------------------------------------------------
 
@@ -663,6 +711,17 @@ MUTATIONS = [
     ),
     ("contention backoff is jittered", lambda s: s.replace("(RANDOM % 20) + 10", "15")),
     ("unclassified failures print evidence", lambda s: s.replace("tail -40 /tmp/ja.log", "true")),
+    # provider-select: an input that validates but never reaches deploy is the
+    # merged-not-invoked defect one level down; and the guard exists because the
+    # deploy's deliberate `|| true` would swallow argparse's exit 2 on a bad value.
+    (
+        "select reaches the deploy call",
+        lambda s: s.replace('"${SELECT_ARGS[@]}" "${PROV_ARGS[@]}"', '"${PROV_ARGS[@]}"'),
+    ),
+    (
+        "select is validated before deploy",
+        lambda s: s.replace("cheapest|emptiest)", "cheapest) # unguarded:"),
+    ),
     # The consumer-facing trio: fetch OUR source, at the ref they pinned, and run there.
     (
         "checkout names just-akash",
