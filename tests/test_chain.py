@@ -793,6 +793,7 @@ class TestReconciliationDisagreementVisibility:
     def _two_vintages(first, second):
         """One endpoint serving TWO grants, in the order given. Payload order is
         the variable under test — it must not decide anything."""
+
         def one(uact, expiration):
             return {
                 "granter": "akash1granter",
@@ -806,6 +807,7 @@ class TestReconciliationDisagreementVisibility:
                     ],
                 },
             }
+
         return {"grants": [one(**first), one(**second)]}
 
     def test_payload_ORDER_does_not_manufacture_a_disagreement(self):
@@ -881,8 +883,7 @@ class TestReconciliationDisagreementVisibility:
         ):
             result = chain.deploy_credit("akash1me")
         assert result == {"uakt": 0, "uact": SAME_UACT}, (
-            "the amounts agree, so the answer is unchanged — only the SILENCE was "
-            "the defect"
+            "the amounts agree, so the answer is unchanged — only the SILENCE was the defect"
         )
 
     # ─── CodeRabbit's second round on #222. Both are about the MESSAGE rather than the
@@ -953,10 +954,8 @@ class TestReconciliationDisagreementVisibility:
         assert caught, "endpoints differing by hours on the same day must still warn"
         msg = str(caught[0].message)
         assert "02:00" in msg and "22:00" in msg, (
-            "the message must show the TIME that made these two readings differ; "
-            f"got: {msg}"
+            f"the message must show the TIME that made these two readings differ; got: {msg}"
         )
-
 
     def test_quorum_names_the_endpoint_that_cannot_pin_height(self):
         """granted_uact skips a node that cannot serve the pinned height —
