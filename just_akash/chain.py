@@ -438,12 +438,21 @@ def deploy_credit(address: str) -> dict[str, int]:
     # common case every endpoint reports BOTH grants and chooses identically,
     # so unanimous chains stay silent (see the no-noise test).
     per_endpoint_choice: list[tuple[str, int, datetime]] = []
+    # ⛔ AN ENDPOINT WITH NO SELECTABLE GRANT IS A DISAGREEMENT, NOT AN ABSENCE.
+    # These used to be dropped by the `if endpoint_grants:` below and never reached the
+    # message, so an LCD that answered and reported NO usable deploy grant — while its
+    # peers reported one — was silently missing from a warning whose whole job is to
+    # name who disagrees. "This endpoint does not see the grant at all" is the strongest
+    # disagreement there is, and it was the one form that could not be printed.
+    barren: list[str] = []
     for base, breakdown in per_endpoint:
         endpoint_grants: list[tuple[dict[str, int], datetime]] = []
         for coins, exp in breakdown:
             parsed = _parse_expiration(exp) if exp else None
             if parsed is not None:
                 endpoint_grants.append((coins, parsed))
+        if not endpoint_grants:
+            barren.append(base)
         if endpoint_grants:
             # ⛔ TIE-BREAK ON uact, EXACTLY AS THE GLOBAL RECONCILIATION ABOVE DOES.
             # Keying on expiration alone made `max` return the FIRST maximal element,
@@ -459,10 +468,21 @@ def deploy_credit(address: str) -> dict[str, int]:
     # grants of EQUAL amount but DIFFERENT expiration are disagreeing about which
     # vintage is current — the precise condition this warning was added for — and
     # the amount-only set collapsed them to one element and stayed silent.
-    if len({(u, e) for _, u, e in per_endpoint_choice}) > 1:
+    # A barren endpoint only means something ALONGSIDE one that did select a grant;
+    # if nothing anywhere has a grant there is no disagreement to report, just no data.
+    if len({(u, e) for _, u, e in per_endpoint_choice}) > 1 or (barren and per_endpoint_choice):
+        # ⛔ PRINT THE WHOLE INSTANT, NOT THE DATE. The comparison above is over the full
+        # datetime, so two endpoints can differ by HOURS and be a genuine disagreement —
+        # and `%Y-%m-%d` rendered them as the SAME STRING. That is a warning that fires
+        # correctly and then shows the reader two identical values as its evidence,
+        # which reads as a bug in the warning rather than a fault in the fleet.
+        # The comparison and the message must have the same resolution.
         detail = "; ".join(
-            f"{base}={uact}uact@{exp:%Y-%m-%d}" for base, uact, exp in per_endpoint_choice
+            f"{base}={uact}uact@{exp:%Y-%m-%dT%H:%M:%S%z}"
+            for base, uact, exp in per_endpoint_choice
         )
+        if barren:
+            detail += "; " + "; ".join(f"{base}=NO SELECTABLE GRANT" for base in barren)
         warnings.warn(
             f"deploy_credit: LCDs DISAGREE on the deploy grant — {detail}. "
             f"Kept the latest-expiration vintage ({latest_exp:%Y-%m-%d}); an endpoint "

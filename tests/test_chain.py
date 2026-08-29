@@ -885,6 +885,79 @@ class TestReconciliationDisagreementVisibility:
             "the defect"
         )
 
+    # ─── CodeRabbit's second round on #222. Both are about the MESSAGE rather than the
+    # ─── detection: the comparison was already right and could not show its work.
+
+    def test_an_endpoint_with_NO_selectable_grant_is_named(self):
+        """⛔ THE STRONGEST DISAGREEMENT WAS THE ONE THAT COULD NOT BE PRINTED.
+
+        An endpoint that answers and reports no usable deploy grant, while its peers
+        report one, does not merely differ about the amount — it does not see the grant
+        at all. Those endpoints were dropped before the message was built, so the
+        warning whose entire job is to name who disagrees stayed silent about them.
+        """
+
+        def fake(path, timeout=15, base=None, height=None):
+            if base and "publicnode" in base:
+                return {"grants": []}
+            return self._vintage(**self.FRESH)
+
+        with (
+            patch.object(
+                chain,
+                "rest_urls",
+                return_value=[
+                    "https://akash-rest.publicnode.com",
+                    "https://api.akashnet.net",
+                ],
+            ),
+            patch.object(chain, "_lcd_get", side_effect=fake),
+            pytest.warns(UserWarning, match=r"publicnode.*NO SELECTABLE GRANT"),
+        ):
+            result = chain.deploy_credit("akash1me")
+        assert result == {"uakt": 0, "uact": 116_327_730}, (
+            "naming the barren endpoint must not change the answer the others agree on"
+        )
+
+    def test_the_message_resolution_matches_the_COMPARISON_resolution(self):
+        """⛔ A WARNING THAT FIRES CORRECTLY AND PRINTS TWO IDENTICAL VALUES.
+
+        The disagreement test compares full datetimes, so two endpoints differing by
+        HOURS are a real disagreement. The message rendered `%Y-%m-%d`, so its evidence
+        was the SAME STRING twice — which reads as a bug in the warning rather than a
+        fault in the fleet. Comparison and message must have one resolution.
+        """
+        same_day_early = dict(uact=116_327_730, expiration="2036-08-24T02:00:00Z")
+        same_day_late = dict(uact=116_327_730, expiration="2036-08-24T22:00:00Z")
+
+        def fake(path, timeout=15, base=None, height=None):
+            if base and "publicnode" in base:
+                return self._vintage(**same_day_early)
+            return self._vintage(**same_day_late)
+
+        with (
+            patch.object(
+                chain,
+                "rest_urls",
+                return_value=[
+                    "https://akash-rest.publicnode.com",
+                    "https://api.akashnet.net",
+                ],
+            ),
+            patch.object(chain, "_lcd_get", side_effect=fake),
+            warnings.catch_warnings(record=True) as caught,
+        ):
+            warnings.simplefilter("always")
+            chain.deploy_credit("akash1me")
+
+        assert caught, "endpoints differing by hours on the same day must still warn"
+        msg = str(caught[0].message)
+        assert "02:00" in msg and "22:00" in msg, (
+            "the message must show the TIME that made these two readings differ; "
+            f"got: {msg}"
+        )
+
+
     def test_quorum_names_the_endpoint_that_cannot_pin_height(self):
         """granted_uact skips a node that cannot serve the pinned height —
         today SILENTLY. The skip must be named: 'the default LCD cannot
