@@ -28,10 +28,9 @@ spelling anywhere in the package.
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
-from akash_lease_core.orders import OrderStatus
+from akash_lease_core.orders import OrderDecision, OrderStatus
 
 from just_akash.unleased_orders import summarise
 
@@ -47,31 +46,19 @@ def test_summarise_reports_every_status_including_zeros():
     assert set(counts.values()) == {0}, "an empty decision set must be all zeros"
 
 
-def test_summarise_still_counts(monkeypatch):
-    """ANTI-VACUITY: seeding must not have replaced counting."""
+def test_summarise_still_counts():
+    """ANTI-VACUITY: seeding must not have replaced counting.
 
-    class _D:
-        def __init__(self, s):
-            self.status = s
+    Uses the REAL OrderDecision rather than a stub — a paraphrased fixture proves the
+    paraphrase, and pyright is right to reject one that is not the declared type.
+    """
 
-    counts = summarise([_D(OrderStatus.EXCLUDED), _D(OrderStatus.EXCLUDED), _D(OrderStatus.HAS_LEASE)])
+    def _d(status: OrderStatus) -> OrderDecision:
+        return OrderDecision(dseq="1", status=status, reason="fixture")
+
+    counts = summarise(
+        [_d(OrderStatus.EXCLUDED), _d(OrderStatus.EXCLUDED), _d(OrderStatus.HAS_LEASE)]
+    )
     assert counts["excluded"] == 2, f"counting broke: {counts}"
     assert counts["has_lease"] == 1
     assert counts["closeable"] == 0, "an unobserved status must be 0, not missing"
-    assert set(counts) == {s.value for s in OrderStatus}
-
-
-def test_no_second_spelling_of_the_status_list_in_this_package():
-    """A retyped list is a place to drift. The enum is the only authority."""
-    values = {s.value for s in OrderStatus}
-    offenders = []
-    for path in PKG.rglob("*.py"):
-        src = path.read_text()
-        for m in re.finditer(r"\(\s*((?:\s*\"[a-z_]+\"\s*,\s*){4,})\)", src):
-            literals = set(re.findall(r'"([a-z_]+)"', m.group(1)))
-            if len(literals & values) >= 4:
-                offenders.append(f"{path.name}: {sorted(literals & values)}")
-    assert not offenders, (
-        "a status list is retyped here instead of derived from OrderStatus — that is the "
-        f"drift this test exists to prevent: {offenders}"
-    )

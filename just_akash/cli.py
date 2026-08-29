@@ -1318,9 +1318,7 @@ def main():
     elif args.command == "unleased-orders":
         import json as _json
 
-        from akash_lease_core.orders import OrderPolicy
-
-        from akash_lease_core.orders import OrderStatus
+        from akash_lease_core.orders import OrderPolicy, OrderStatus
 
         from .unleased_orders import audit_owner, summarise
 
