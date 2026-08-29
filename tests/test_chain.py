@@ -758,6 +758,42 @@ class TestReconciliationDisagreementVisibility:
             "visibility must not change the answer — the fresh vintage still wins."
         )
 
+    def test_same_amount_different_vintage_still_disagrees(self):
+        """⛔ THE PAIR, NOT THE AMOUNT — the case the old predicate could not see.
+
+        Two endpoints report the SAME uact for grants expiring on DIFFERENT dates.
+        The amounts agree, so a `uact`-only comparison finds one distinct value and
+        stays silent — while the endpoints have in fact chosen different grant
+        VINTAGES, and the vintage is what decides live versus superseded. Same money,
+        different truth. Caught in review on #223.
+        """
+        same = 123_456_789
+        early = dict(uact=same, expiration="2036-01-01T00:00:00Z")
+        late = dict(uact=same, expiration="2036-12-31T00:00:00Z")
+
+        def fake(path, timeout=15, base=None, height=None):
+            if base and "publicnode" in base:
+                return self._vintage(**early)
+            return self._vintage(**late)
+
+        with (
+            patch.object(
+                chain,
+                "rest_urls",
+                return_value=[
+                    "https://akash-rest.publicnode.com",
+                    "https://api.akashnet.net",
+                ],
+            ),
+            patch.object(chain, "_lcd_get", side_effect=fake),
+            pytest.warns(UserWarning, match=r"DISAGREE.*2036-01-01"),
+        ):
+            result = chain.deploy_credit("akash1me")
+        assert result == {"uakt": 0, "uact": same}, (
+            "visibility must not change the answer — the latest vintage still wins, "
+            "and here both carry the same figure anyway"
+        )
+
     def test_endpoints_agreeing_emit_no_disagreement_warning(self):
         """The guard against noise: when every reachable endpoint's chosen
         vintage agrees, no warning. A warning on every healthy call is how
@@ -784,10 +820,6 @@ class TestReconciliationDisagreementVisibility:
         assert not caught, (
             f"unanimous endpoints must not warn; got {[str(w.message) for w in caught]}"
         )
-
-    # ─── The two cases CodeRabbit named on #222, each pinned in the direction it
-    # ─── actually fails. Both were REPRODUCED against the pre-fix code before the
-    # ─── fix was written; neither passes on it.
 
     @staticmethod
     def _two_vintages(first, second):

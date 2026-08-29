@@ -438,12 +438,11 @@ def deploy_credit(address: str) -> dict[str, int]:
     # common case every endpoint reports BOTH grants and chooses identically,
     # so unanimous chains stay silent (see the no-noise test).
     per_endpoint_choice: list[tuple[str, int, datetime]] = []
-    # ⛔ AN ENDPOINT WITH NO SELECTABLE GRANT IS A DISAGREEMENT, NOT AN ABSENCE.
-    # These used to be dropped by the `if endpoint_grants:` below and never reached the
-    # message, so an LCD that answered and reported NO usable deploy grant — while its
-    # peers reported one — was silently missing from a warning whose whole job is to
-    # name who disagrees. "This endpoint does not see the grant at all" is the strongest
-    # disagreement there is, and it was the one form that could not be printed.
+    # ⛔ AN ENDPOINT WITH NO SELECTABLE GRANT IS A DISAGREEMENT, NOT AN ABSENCE. These
+    # were dropped by `if endpoint_grants:` before the message was built, so an LCD that
+    # ANSWERED and reported no usable deploy grant — while its peers reported one — was
+    # silently missing from a warning whose whole job is to name who disagrees. That is
+    # the strongest disagreement available and it was the one form it could not print.
     barren: list[str] = []
     for base, breakdown in per_endpoint:
         endpoint_grants: list[tuple[dict[str, int], datetime]] = []
@@ -455,28 +454,26 @@ def deploy_credit(address: str) -> dict[str, int]:
             barren.append(base)
         if endpoint_grants:
             # ⛔ TIE-BREAK ON uact, EXACTLY AS THE GLOBAL RECONCILIATION ABOVE DOES.
-            # Keying on expiration alone made `max` return the FIRST maximal element,
-            # so when an endpoint served two grants with the SAME expiration the
-            # PAYLOAD ORDER picked the winner. Two endpoints serving identical grants
-            # in different order then "chose" different uact and this function
-            # reported a DISAGREE that did not exist. The two selections have to use
-            # one rule or the comparison between them is meaningless.
+            # Keying on expiration alone made `max` return the FIRST maximal element, so
+            # when an endpoint served two grants with the SAME expiration the PAYLOAD
+            # ORDER picked the winner. Two endpoints holding the identical pair,
+            # serialised in opposite order, then "chose" different uact and this reported
+            # a DISAGREE about data that was byte-equal as a set. Two selections compared
+            # against each other have to use one rule.
             coins, exp = max(endpoint_grants, key=lambda ce: (ce[1], ce[0].get("uact", 0)))
             per_endpoint_choice.append((base, coins.get("uact", 0), exp))
-    # ⛔ COMPARE THE WHOLE VINTAGE, NOT JUST THE AMOUNT. Comparing `uact` alone made
-    # the check blind in the direction it exists to watch: two endpoints choosing
-    # grants of EQUAL amount but DIFFERENT expiration are disagreeing about which
-    # vintage is current — the precise condition this warning was added for — and
-    # the amount-only set collapsed them to one element and stayed silent.
-    # A barren endpoint only means something ALONGSIDE one that did select a grant;
-    # if nothing anywhere has a grant there is no disagreement to report, just no data.
+    # ⛔ THE PAIR, NOT THE AMOUNT. Comparing only `uact` misses endpoints that agree on
+    # the figure while having chosen DIFFERENT grant vintages — same money, different
+    # expiration, and the vintage is what decides whether the grant is live or superseded.
+    # A silent reconciliation of exactly that kind hid a 54-ACT phantom. Caught on #223.
+    # A barren endpoint only means something ALONGSIDE one that did select a grant; if
+    # nothing anywhere has a grant there is no disagreement, just no data.
     if len({(u, e) for _, u, e in per_endpoint_choice}) > 1 or (barren and per_endpoint_choice):
-        # ⛔ PRINT THE WHOLE INSTANT, NOT THE DATE. The comparison above is over the full
-        # datetime, so two endpoints can differ by HOURS and be a genuine disagreement —
-        # and `%Y-%m-%d` rendered them as the SAME STRING. That is a warning that fires
-        # correctly and then shows the reader two identical values as its evidence,
-        # which reads as a bug in the warning rather than a fault in the fleet.
-        # The comparison and the message must have the same resolution.
+        # ⛔ PRINT THE WHOLE INSTANT, NOT THE DATE. The comparison above is over full
+        # datetimes, so two endpoints can differ by HOURS and be a genuine disagreement —
+        # and `%Y-%m-%d` rendered them as the SAME STRING. A warning that fires correctly
+        # and then offers two identical values as its evidence reads as a bug in the
+        # warning. The comparison and the message need one resolution.
         detail = "; ".join(
             f"{base}={uact}uact@{exp:%Y-%m-%dT%H:%M:%S%z}"
             for base, uact, exp in per_endpoint_choice

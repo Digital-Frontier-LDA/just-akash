@@ -62,6 +62,14 @@ class Code:
     BIDS_FOREIGN_ONLY = "BIDS_FOREIGN_ONLY"  # only non-allowed providers bid
     BIDS_STALE = "BIDS_STALE"  # bids aged out of 'open'
     BIDS_MALFORMED = "BIDS_MALFORMED"  # all bid entries failed schema
+
+    # ── selection policy ────────────────────────────────────────────────────
+    # ⚠ EMPTIEST DEGRADES SILENTLY BY DESIGN, and that is the problem this code
+    #   reports. When no bidder's /status is readable the auction falls back to
+    #   cheapest — correct behaviour, but indistinguishable in a machine-readable
+    #   record from emptiest having been APPLIED. "requested" and "applied" are
+    #   different facts and only the human log line separated them.
+    SELECTION_EMPTIEST_DEGRADED = "SELECTION_EMPTIEST_DEGRADED"
     DEPLOY_CREATE_FAILED = "DEPLOY_CREATE_FAILED"
     # A create that RAISED may still have created the deployment: the POST writes
     # on-chain state, so a gateway 500 or timeout can land after the transaction

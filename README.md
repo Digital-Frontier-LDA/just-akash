@@ -63,7 +63,9 @@ it, and for those 5 days `balance` reported a superseded grant as live credit.
 The check nobody knew to make — installed rev vs `main`:
 
 ```bash
-grep -o 'rev=[a-f0-9]*' ~/.local/share/uv/tools/just-akash/uv-receipt.toml
+# `uv tool dir` resolves UV_TOOL_DIR and the platform default; the hard-coded
+# ~/.local/share path is wrong on any machine that sets either.
+grep -o 'rev=[a-f0-9]*' "$(uv tool dir)/just-akash/uv-receipt.toml"
 git ls-remote https://github.com/Digital-Frontier-LDA/just-akash main
 ```
 
