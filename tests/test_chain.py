@@ -785,6 +785,106 @@ class TestReconciliationDisagreementVisibility:
             f"unanimous endpoints must not warn; got {[str(w.message) for w in caught]}"
         )
 
+    # ─── The two cases CodeRabbit named on #222, each pinned in the direction it
+    # ─── actually fails. Both were REPRODUCED against the pre-fix code before the
+    # ─── fix was written; neither passes on it.
+
+    @staticmethod
+    def _two_vintages(first, second):
+        """One endpoint serving TWO grants, in the order given. Payload order is
+        the variable under test — it must not decide anything."""
+        def one(uact, expiration):
+            return {
+                "granter": "akash1granter",
+                "grantee": "akash1me",
+                "expiration": expiration,
+                "authorization": {
+                    "@type": _DEPOSIT,
+                    "spend_limits": [
+                        {"denom": "uakt", "amount": "0"},
+                        {"denom": "uact", "amount": str(uact)},
+                    ],
+                },
+            }
+        return {"grants": [one(**first), one(**second)]}
+
+    def test_payload_ORDER_does_not_manufacture_a_disagreement(self):
+        """⛔ FALSE POSITIVE. Two endpoints holding the IDENTICAL pair of grants —
+        same two amounts, same single expiration — serialised in opposite order.
+
+        Per-endpoint selection keyed on expiration alone, so `max` returned the
+        FIRST maximal element and payload order chose the winner: one endpoint
+        "chose" 170623558, the other 116327730, and this function reported LCDs
+        DISAGREE about data that was byte-equal as a set. The global
+        reconciliation had always broken the same tie by `uact`; the two
+        selections simply did not use one rule.
+        """
+        SAME_EXP = "2036-08-24T22:00:00Z"
+        low = dict(uact=116_327_730, expiration=SAME_EXP)
+        high = dict(uact=170_623_558, expiration=SAME_EXP)
+
+        def fake(path, timeout=15, base=None, height=None):
+            if base and "publicnode" in base:
+                return self._two_vintages(low, high)
+            return self._two_vintages(high, low)
+
+        with (
+            patch.object(
+                chain,
+                "rest_urls",
+                return_value=[
+                    "https://akash-rest.publicnode.com",
+                    "https://api.akashnet.net",
+                ],
+            ),
+            patch.object(chain, "_lcd_get", side_effect=fake),
+            warnings.catch_warnings(record=True) as caught,
+        ):
+            warnings.simplefilter("always")
+            result = chain.deploy_credit("akash1me")
+        assert result == {"uakt": 0, "uact": 170_623_558}, (
+            "on an expiration tie the larger grant is the answer, as the global "
+            "reconciliation has always held"
+        )
+        assert not caught, (
+            "endpoints serving the SAME grants in a different order do not "
+            f"disagree; got {[str(w.message) for w in caught]}"
+        )
+
+    def test_equal_amounts_on_DIFFERENT_expirations_still_warn(self):
+        """⛔ FALSE NEGATIVE, and blind in the exact direction this warning exists
+        to watch. Two endpoints agree on the AMOUNT and disagree on WHICH VINTAGE
+        is current. Comparing `uact` alone collapsed them to a one-element set and
+        said nothing — a superseded grant passing silently because its figure
+        happened to match, which is the #222 incident with one coincidence added.
+        """
+        SAME_UACT = 116_327_730
+        fresh = dict(uact=SAME_UACT, expiration="2036-08-24T22:00:00Z")
+        stale = dict(uact=SAME_UACT, expiration="2036-07-08T11:54:24Z")
+
+        def fake(path, timeout=15, base=None, height=None):
+            if base and "publicnode" in base:
+                return self._vintage(**stale)
+            return self._vintage(**fresh)
+
+        with (
+            patch.object(
+                chain,
+                "rest_urls",
+                return_value=[
+                    "https://akash-rest.publicnode.com",
+                    "https://api.akashnet.net",
+                ],
+            ),
+            patch.object(chain, "_lcd_get", side_effect=fake),
+            pytest.warns(UserWarning, match=r"DISAGREE.*publicnode"),
+        ):
+            result = chain.deploy_credit("akash1me")
+        assert result == {"uakt": 0, "uact": SAME_UACT}, (
+            "the amounts agree, so the answer is unchanged — only the SILENCE was "
+            "the defect"
+        )
+
     def test_quorum_names_the_endpoint_that_cannot_pin_height(self):
         """granted_uact skips a node that cannot serve the pinned height —
         today SILENTLY. The skip must be named: 'the default LCD cannot

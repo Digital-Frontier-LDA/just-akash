@@ -445,9 +445,21 @@ def deploy_credit(address: str) -> dict[str, int]:
             if parsed is not None:
                 endpoint_grants.append((coins, parsed))
         if endpoint_grants:
-            coins, exp = max(endpoint_grants, key=lambda ce: ce[1])
+            # ⛔ TIE-BREAK ON uact, EXACTLY AS THE GLOBAL RECONCILIATION ABOVE DOES.
+            # Keying on expiration alone made `max` return the FIRST maximal element,
+            # so when an endpoint served two grants with the SAME expiration the
+            # PAYLOAD ORDER picked the winner. Two endpoints serving identical grants
+            # in different order then "chose" different uact and this function
+            # reported a DISAGREE that did not exist. The two selections have to use
+            # one rule or the comparison between them is meaningless.
+            coins, exp = max(endpoint_grants, key=lambda ce: (ce[1], ce[0].get("uact", 0)))
             per_endpoint_choice.append((base, coins.get("uact", 0), exp))
-    if len({u for _, u, _ in per_endpoint_choice}) > 1:
+    # ⛔ COMPARE THE WHOLE VINTAGE, NOT JUST THE AMOUNT. Comparing `uact` alone made
+    # the check blind in the direction it exists to watch: two endpoints choosing
+    # grants of EQUAL amount but DIFFERENT expiration are disagreeing about which
+    # vintage is current — the precise condition this warning was added for — and
+    # the amount-only set collapsed them to one element and stayed silent.
+    if len({(u, e) for _, u, e in per_endpoint_choice}) > 1:
         detail = "; ".join(
             f"{base}={uact}uact@{exp:%Y-%m-%d}" for base, uact, exp in per_endpoint_choice
         )
