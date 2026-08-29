@@ -76,11 +76,24 @@ jobs:
   reap-stale-runners:
     # ⛔ PINNED TO AN IMMUTABLE COMMIT, not a tag or branch. A tag can move, and a
     # de-registration loop whose behaviour changes without a commit here is not a backstop.
-    # Verified BY CONTENT rather than by a quoted sha — this is the commit that ADDED
-    # reusable-stale-runner-reaper.yml and it is an ancestor of df-cicd main:
-    #   91eb19a913c640cbff6181ded1fb93d849fad4ad
-    #   feat(akash-runner): ship the de-registration backstop the standard already required (#145)
-    uses: Digital-Frontier-LDA/df-cicd/.github/workflows/reusable-stale-runner-reaper.yml@91eb19a913c640cbff6181ded1fb93d849fad4ad
+    #
+    # ⛔ MOVED FROM df-cicd TO akash-github-runner. df-cicd is `visibility=internal`, so a
+    # cross-org `uses:` to it resolves to NOTHING from Borduas-Holdings — where the runners
+    # that actually need reaping live. GitHub reports that as "workflow was not found",
+    # never "forbidden", so the previous pin was correct-looking and unreachable. agr is
+    # `public`; Blazing-Back already consumes agr's conformance reusable cross-org today.
+    #
+    # Verified BY CONTENT rather than by a quoted sha, and the old justification did NOT
+    # transfer — it named the commit that ADDED the file to df-cicd, which says nothing
+    # about agr. Re-derived: this is the first sha at which agr's own reaper is the
+    # CANONICAL one the conformance rule accepts.
+    #   5d82c5973e01b0067e61e7b65ab97579aed5ffd9
+    #   fix(conformance): the canonical reaper moved and this rule still pointed at df-cicd
+    # ⚠ #34 declared agr canonical in the header; `check_dereg_backstop.py` still hard-coded
+    # CANONICAL_REAPER to df-cicd until #37. So a pin to agr EARLIER than this sha would
+    # have made this repo read as having NO BACKSTOP AT ALL — the rule checks adoption
+    # before the local-reaper gate, and an adopting job has no `run:` text to fall back on.
+    uses: Digital-Frontier-LDA/akash-github-runner/.github/workflows/reusable-stale-runner-reaper.yml@5d82c5973e01b0067e61e7b65ab97579aed5ffd9
     with:
       org: ${{ inputs.github-org }}
       # ⛔ MUST equal what this repo's SDLs actually emit. runner-pool.yml emits
