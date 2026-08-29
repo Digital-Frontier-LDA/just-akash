@@ -438,23 +438,55 @@ def deploy_credit(address: str) -> dict[str, int]:
     # common case every endpoint reports BOTH grants and chooses identically,
     # so unanimous chains stay silent (see the no-noise test).
     per_endpoint_choice: list[tuple[str, int, datetime]] = []
+    # ⛔ AN ENDPOINT WITH NO SELECTABLE GRANT IS A DISAGREEMENT, NOT AN ABSENCE. These
+    # were dropped by `if endpoint_grants:` before the message was built, so an LCD that
+    # ANSWERED and reported no usable deploy grant — while its peers reported one — was
+    # silently missing from a warning whose whole job is to name who disagrees. That is
+    # the strongest disagreement available and it was the one form it could not print.
+    barren: list[str] = []
     for base, breakdown in per_endpoint:
         endpoint_grants: list[tuple[dict[str, int], datetime]] = []
         for coins, exp in breakdown:
             parsed = _parse_expiration(exp) if exp else None
             if parsed is not None:
                 endpoint_grants.append((coins, parsed))
+        if not endpoint_grants:
+            barren.append(base)
         if endpoint_grants:
-            coins, exp = max(endpoint_grants, key=lambda ce: ce[1])
+            # ⛔ TIE-BREAK ON uact, EXACTLY AS THE GLOBAL RECONCILIATION ABOVE DOES.
+            # Keying on expiration alone made `max` return the FIRST maximal element, so
+            # when an endpoint served two grants with the SAME expiration the PAYLOAD
+            # ORDER picked the winner. Two endpoints holding the identical pair,
+            # serialised in opposite order, then "chose" different uact and this reported
+            # a DISAGREE about data that was byte-equal as a set. Two selections compared
+            # against each other have to use one rule.
+            coins, exp = max(endpoint_grants, key=lambda ce: (ce[1], ce[0].get("uact", 0)))
             per_endpoint_choice.append((base, coins.get("uact", 0), exp))
     # ⛔ THE PAIR, NOT THE AMOUNT. Comparing only `uact` misses endpoints that agree on
     # the figure while having chosen DIFFERENT grant vintages — same money, different
     # expiration, and the vintage is what decides whether the grant is live or superseded.
     # A silent reconciliation of exactly that kind hid a 54-ACT phantom. Caught on #223.
-    if len({(u, e) for _, u, e in per_endpoint_choice}) > 1:
+    # A barren endpoint only means something ALONGSIDE one that did select a grant; if
+    # nothing anywhere has a grant there is no disagreement, just no data.
+    if len({(u, e) for _, u, e in per_endpoint_choice}) > 1 or (barren and per_endpoint_choice):
+        # ⛔ PRINT THE WHOLE INSTANT, AT THE COMPARISON'S OWN RESOLUTION. `%Y-%m-%d`
+        # rendered endpoints differing by HOURS as the SAME STRING. Fixing that with
+        # `%Y-%m-%dT%H:%M:%S%z` moved the defect rather than removing it: `_parse_expiration`
+        # preserves MICROSECONDS and the comparison is over full datetimes, so
+        # `…00.000Z` and `…00.001Z` still rendered identically —
+        #     2036-08-24T22:00:00+0000  |  2036-08-24T22:00:00+0000
+        # measured. `isoformat()` is the only rendering that cannot fall behind the
+        # comparison, because it carries whatever precision the datetime holds:
+        #     2036-08-24T22:00:00+00:00 | 2036-08-24T22:00:00.001000+00:00
+        # A warning that fires correctly and offers two identical values as its evidence
+        # reads as a bug in the warning. Any FIXED format string re-opens this the moment
+        # the parser gains precision; the message must follow the comparison, not a
+        # snapshot of it.
         detail = "; ".join(
-            f"{base}={uact}uact@{exp:%Y-%m-%d}" for base, uact, exp in per_endpoint_choice
+            f"{base}={uact}uact@{exp.isoformat()}" for base, uact, exp in per_endpoint_choice
         )
+        if barren:
+            detail += "; " + "; ".join(f"{base}=NO SELECTABLE GRANT" for base in barren)
         warnings.warn(
             f"deploy_credit: LCDs DISAGREE on the deploy grant — {detail}. "
             f"Kept the latest-expiration vintage ({latest_exp:%Y-%m-%d}); an endpoint "

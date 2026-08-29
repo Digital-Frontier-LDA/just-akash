@@ -821,6 +821,219 @@ class TestReconciliationDisagreementVisibility:
             f"unanimous endpoints must not warn; got {[str(w.message) for w in caught]}"
         )
 
+    @staticmethod
+    def _two_vintages(first, second):
+        """One endpoint serving TWO grants, in the order given. Payload order is
+        the variable under test — it must not decide anything."""
+
+        def one(uact, expiration):
+            return {
+                "granter": "akash1granter",
+                "grantee": "akash1me",
+                "expiration": expiration,
+                "authorization": {
+                    "@type": _DEPOSIT,
+                    "spend_limits": [
+                        {"denom": "uakt", "amount": "0"},
+                        {"denom": "uact", "amount": str(uact)},
+                    ],
+                },
+            }
+
+        return {"grants": [one(**first), one(**second)]}
+
+    def test_payload_ORDER_does_not_manufacture_a_disagreement(self):
+        """⛔ FALSE POSITIVE. Two endpoints holding the IDENTICAL pair of grants —
+        same two amounts, same single expiration — serialised in opposite order.
+
+        Per-endpoint selection keyed on expiration alone, so `max` returned the
+        FIRST maximal element and payload order chose the winner: one endpoint
+        "chose" 170623558, the other 116327730, and this function reported LCDs
+        DISAGREE about data that was byte-equal as a set. The global
+        reconciliation had always broken the same tie by `uact`; the two
+        selections simply did not use one rule.
+        """
+        SAME_EXP = "2036-08-24T22:00:00Z"
+        low = dict(uact=116_327_730, expiration=SAME_EXP)
+        high = dict(uact=170_623_558, expiration=SAME_EXP)
+
+        def fake(path, timeout=15, base=None, height=None):
+            if base and "publicnode" in base:
+                return self._two_vintages(low, high)
+            return self._two_vintages(high, low)
+
+        with (
+            patch.object(
+                chain,
+                "rest_urls",
+                return_value=[
+                    "https://akash-rest.publicnode.com",
+                    "https://api.akashnet.net",
+                ],
+            ),
+            patch.object(chain, "_lcd_get", side_effect=fake),
+            warnings.catch_warnings(record=True) as caught,
+        ):
+            warnings.simplefilter("always")
+            result = chain.deploy_credit("akash1me")
+        assert result == {"uakt": 0, "uact": 170_623_558}, (
+            "on an expiration tie the larger grant is the answer, as the global "
+            "reconciliation has always held"
+        )
+        assert not caught, (
+            "endpoints serving the SAME grants in a different order do not "
+            f"disagree; got {[str(w.message) for w in caught]}"
+        )
+
+    def test_equal_amounts_on_DIFFERENT_expirations_still_warn(self):
+        """⛔ FALSE NEGATIVE, and blind in the exact direction this warning exists
+        to watch. Two endpoints agree on the AMOUNT and disagree on WHICH VINTAGE
+        is current. Comparing `uact` alone collapsed them to a one-element set and
+        said nothing — a superseded grant passing silently because its figure
+        happened to match, which is the #222 incident with one coincidence added.
+        """
+        SAME_UACT = 116_327_730
+        fresh = dict(uact=SAME_UACT, expiration="2036-08-24T22:00:00Z")
+        stale = dict(uact=SAME_UACT, expiration="2036-07-08T11:54:24Z")
+
+        def fake(path, timeout=15, base=None, height=None):
+            if base and "publicnode" in base:
+                return self._vintage(**stale)
+            return self._vintage(**fresh)
+
+        with (
+            patch.object(
+                chain,
+                "rest_urls",
+                return_value=[
+                    "https://akash-rest.publicnode.com",
+                    "https://api.akashnet.net",
+                ],
+            ),
+            patch.object(chain, "_lcd_get", side_effect=fake),
+            pytest.warns(UserWarning, match=r"DISAGREE.*publicnode"),
+        ):
+            result = chain.deploy_credit("akash1me")
+        assert result == {"uakt": 0, "uact": SAME_UACT}, (
+            "the amounts agree, so the answer is unchanged — only the SILENCE was the defect"
+        )
+
+    # ─── CodeRabbit's second round on #222. Both are about the MESSAGE rather than the
+    # ─── detection: the comparison was already right and could not show its work.
+
+    def test_an_endpoint_with_NO_selectable_grant_is_named(self):
+        """⛔ THE STRONGEST DISAGREEMENT WAS THE ONE THAT COULD NOT BE PRINTED.
+
+        An endpoint that answers and reports no usable deploy grant, while its peers
+        report one, does not merely differ about the amount — it does not see the grant
+        at all. Those endpoints were dropped before the message was built, so the
+        warning whose entire job is to name who disagrees stayed silent about them.
+        """
+
+        def fake(path, timeout=15, base=None, height=None):
+            if base and "publicnode" in base:
+                return {"grants": []}
+            return self._vintage(**self.FRESH)
+
+        with (
+            patch.object(
+                chain,
+                "rest_urls",
+                return_value=[
+                    "https://akash-rest.publicnode.com",
+                    "https://api.akashnet.net",
+                ],
+            ),
+            patch.object(chain, "_lcd_get", side_effect=fake),
+            pytest.warns(UserWarning, match=r"publicnode.*NO SELECTABLE GRANT"),
+        ):
+            result = chain.deploy_credit("akash1me")
+        assert result == {"uakt": 0, "uact": 116_327_730}, (
+            "naming the barren endpoint must not change the answer the others agree on"
+        )
+
+    def test_the_message_resolution_matches_the_COMPARISON_resolution(self):
+        """⛔ A WARNING THAT FIRES CORRECTLY AND PRINTS TWO IDENTICAL VALUES.
+
+        The disagreement test compares full datetimes, so two endpoints differing by
+        HOURS are a real disagreement. The message rendered `%Y-%m-%d`, so its evidence
+        was the SAME STRING twice — which reads as a bug in the warning rather than a
+        fault in the fleet. Comparison and message must have one resolution.
+        """
+        same_day_early = dict(uact=116_327_730, expiration="2036-08-24T02:00:00Z")
+        same_day_late = dict(uact=116_327_730, expiration="2036-08-24T22:00:00Z")
+
+        def fake(path, timeout=15, base=None, height=None):
+            if base and "publicnode" in base:
+                return self._vintage(**same_day_early)
+            return self._vintage(**same_day_late)
+
+        with (
+            patch.object(
+                chain,
+                "rest_urls",
+                return_value=[
+                    "https://akash-rest.publicnode.com",
+                    "https://api.akashnet.net",
+                ],
+            ),
+            patch.object(chain, "_lcd_get", side_effect=fake),
+            warnings.catch_warnings(record=True) as caught,
+        ):
+            warnings.simplefilter("always")
+            chain.deploy_credit("akash1me")
+
+        assert caught, "endpoints differing by hours on the same day must still warn"
+        msg = str(caught[0].message)
+        assert "02:00" in msg and "22:00" in msg, (
+            f"the message must show the TIME that made these two readings differ; got: {msg}"
+        )
+
+    def test_the_message_keeps_MICROSECOND_precision(self):
+        """⛔ THE SAME DEFECT ONE DECIMAL PLACE DOWN, AND MY OWN FIX CREATED IT.
+
+        `%Y-%m-%d` was replaced with `%Y-%m-%dT%H:%M:%S%z`, which fixed endpoints
+        differing by hours and left microseconds truncated — while `_parse_expiration`
+        preserves them and the comparison is over full datetimes. So `…00.000Z` and
+        `…00.001Z` DISAGREE and printed identically. Measured:
+
+            %Y-%m-%dT%H:%M:%S%z -> 2036-08-24T22:00:00+0000  (both)
+            isoformat()         -> …22:00:00+00:00 | …22:00:00.001000+00:00
+
+        Any FIXED format string re-opens this the moment the parser gains precision.
+        `isoformat()` carries whatever the datetime holds, so the message cannot fall
+        behind the comparison again.
+        """
+        early = dict(uact=116_327_730, expiration="2036-08-24T22:00:00.000Z")
+        late = dict(uact=116_327_730, expiration="2036-08-24T22:00:00.001Z")
+
+        def fake(path, timeout=15, base=None, height=None):
+            if base and "publicnode" in base:
+                return self._vintage(**early)
+            return self._vintage(**late)
+
+        with (
+            patch.object(
+                chain,
+                "rest_urls",
+                return_value=[
+                    "https://akash-rest.publicnode.com",
+                    "https://api.akashnet.net",
+                ],
+            ),
+            patch.object(chain, "_lcd_get", side_effect=fake),
+            warnings.catch_warnings(record=True) as caught,
+        ):
+            warnings.simplefilter("always")
+            chain.deploy_credit("akash1me")
+
+        assert caught, "grants differing by microseconds are a disagreement and must warn"
+        msg = str(caught[0].message)
+        assert "22:00:00.001" in msg, (
+            "the message must carry the fractional second that made these two readings "
+            f"differ; got: {msg}"
+        )
+
     def test_quorum_names_the_endpoint_that_cannot_pin_height(self):
         """granted_uact skips a node that cannot serve the pinned height —
         today SILENTLY. The skip must be named: 'the default LCD cannot
