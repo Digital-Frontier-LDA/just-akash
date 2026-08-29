@@ -149,6 +149,18 @@ on:
         required: false
         type: string
         default: '5'
+      provider-select:
+        description: >-
+          OPTIONAL. Bid selection policy among equally-eligible providers, passed to
+          `just-akash deploy --select`. EMPTY (the default) means the CLI's default,
+          `cheapest`. `emptiest` prefers the bidder with the most free capacity (one
+          /status probe per bidder; a bidder whose status is unreadable degrades to
+          cheapest). Measured 2026-08-27: both readable vetted providers sit ~93% full,
+          so on a contended market `emptiest` raises the per-attempt bid rate. Shipped
+          in the CLI by #211; unreachable from any consumer until this input.
+        required: false
+        type: string
+        default: ''
       runner-wait-tries:
         description: >-
           How many 5-second polls to wait for the pool to come online. 90 (7.5 min) is
@@ -469,6 +481,7 @@ jobs:
           MAX_ATTEMPTS: '3'
           RUNNER_WAIT_TRIES: ${{ inputs.runner-wait-tries }}
           REQUIRED_DEPOSIT_USD: ${{ inputs.required-deposit-usd }}
+          PROVIDER_SELECT: ${{ inputs.provider-select }}
         run: |
           set -uo pipefail
 
@@ -525,9 +538,21 @@ jobs:
               echo "::endgroup::"; exit 1
             fi
 
+            # --select reaches the CLI ONLY when the consumer chose a policy: an empty
+            # value contributes NO flag (`--select ""` is an argparse exit 2, and this
+            # call's deliberate `|| true` would swallow it into silent retry rounds).
+            # An unknown value is rejected HERE so a typo fails fast under its own name
+            # instead of burning three bid windows as an apparent market failure.
+            SELECT_ARGS=()
+            case "${PROVIDER_SELECT:-}" in
+              "") ;;
+              cheapest|emptiest) SELECT_ARGS=(--select "$PROVIDER_SELECT") ;;
+              *) echo "::error title=provider-select::must be 'cheapest' or 'emptiest', got '${PROVIDER_SELECT}'"; exit 1 ;;
+            esac
+
             rm -f /tmp/ja.log
             "${JA[@]}" deploy --sdl /tmp/runner-sdl.yaml --deposit "$REQUIRED_DEPOSIT_USD" --bid-wait 60 \
-              --bid-wait-retry 120 "${PROV_ARGS[@]}" 2>&1 | tee /tmp/ja.log || true
+              --bid-wait-retry 120 "${SELECT_ARGS[@]}" "${PROV_ARGS[@]}" 2>&1 | tee /tmp/ja.log || true
             DSEQ=$(awk -F': +' '/^[[:space:]]*DSEQ:/{print $2; exit}' /tmp/ja.log || true)
             # ⭐ PUBLISH THE DSEQ THE MOMENT IT EXISTS — before tagging, before the
             # registration wait, before anything can fail or be cancelled. The
