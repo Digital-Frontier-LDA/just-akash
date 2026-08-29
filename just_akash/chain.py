@@ -439,7 +439,11 @@ def deploy_credit(address: str) -> dict[str, int]:
     # so unanimous chains stay silent (see the no-noise test).
     per_endpoint_choice: list[tuple[str, int, datetime]] = []
     for base, breakdown in per_endpoint:
-        endpoint_grants = [(c, _parse_expiration(e)) for c, e in breakdown if _parse_expiration(e)]
+        endpoint_grants: list[tuple[dict[str, int], datetime]] = []
+        for coins, exp in breakdown:
+            parsed = _parse_expiration(exp) if exp else None
+            if parsed is not None:
+                endpoint_grants.append((coins, parsed))
         if endpoint_grants:
             coins, exp = max(endpoint_grants, key=lambda ce: ce[1])
             per_endpoint_choice.append((base, coins.get("uact", 0), exp))
