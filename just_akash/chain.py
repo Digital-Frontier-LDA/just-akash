@@ -447,7 +447,11 @@ def deploy_credit(address: str) -> dict[str, int]:
         if endpoint_grants:
             coins, exp = max(endpoint_grants, key=lambda ce: ce[1])
             per_endpoint_choice.append((base, coins.get("uact", 0), exp))
-    if len({u for _, u, _ in per_endpoint_choice}) > 1:
+    # ⛔ THE PAIR, NOT THE AMOUNT. Comparing only `uact` misses endpoints that agree on
+    # the figure while having chosen DIFFERENT grant vintages — same money, different
+    # expiration, and the vintage is what decides whether the grant is live or superseded.
+    # A silent reconciliation of exactly that kind hid a 54-ACT phantom. Caught on #223.
+    if len({(u, e) for _, u, e in per_endpoint_choice}) > 1:
         detail = "; ".join(
             f"{base}={uact}uact@{exp:%Y-%m-%d}" for base, uact, exp in per_endpoint_choice
         )

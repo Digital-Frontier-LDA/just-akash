@@ -86,3 +86,40 @@ def test_deploy_emits_it_on_incomplete_coverage_not_only_on_zero():
     assert "fully_degraded=not _readable" in src, (
         "the event must distinguish partial coverage from a full fallback to cheapest"
     )
+
+
+def test_coverage_is_recomputed_after_late_bidders_join():
+    """⛔ ORDERING, NOT PRESENCE — the gap CodeRabbit found on #223.
+
+    The first coverage emission is computed from the FIRST bid snapshot. When the
+    auction returns COLLECTING, the fallback window admits late bidders and
+    `_capacity.update(...)` grows the population. If `_readable` is not recomputed
+    after that, a late bidder with unreadable capacity degrades the selection with
+    NO `SELECTION_EMPTIEST_DEGRADED` record anywhere — both halves proven and the
+    value never travels.
+
+    Asserting only that a recompute EXISTS would pass against the broken version,
+    because one already existed before the fallback block. This pins the ORDER.
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "just_akash" / "deploy.py").read_text()
+
+    update = src.index("_capacity.update(capacity_by_provider(late))")
+    # the auction call that CONSUMES the grown capacity
+    consume = src.index("_select_auction_bid", update)
+    window = src[update:consume]
+
+    assert "_readable = sum(" in window, (
+        "capacity grew during the fallback window and `_readable` was never recomputed "
+        "before the auction consumed it — the degraded record describes a population "
+        "that no longer exists"
+    )
+    assert "SELECTION_EMPTIEST_DEGRADED" in window, (
+        "the recomputed coverage must be EMITTED in the fallback path, not merely "
+        "calculated; a number nothing reports is not an observation"
+    )
+    assert "after_fallback=True" in window, (
+        "the second emission must be distinguishable from the first, or a reader "
+        "cannot tell which population a degraded record describes"
+    )

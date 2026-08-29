@@ -1194,6 +1194,36 @@ def deploy(
                     f"  EMPTIEST: fetched capacity for {len(late)} provider(s) that "
                     "arrived during the fallback window",
                 )
+                # ⛔ RE-EMIT, OR THE DEGRADED RECORD DESCRIBES A POPULATION THAT NO LONGER
+                # EXISTS. The coverage event above was computed from the FIRST snapshot. A
+                # late bidder whose capacity is unreadable degrades the selection AFTER that
+                # event was emitted (or not emitted at all, if the first snapshot was fully
+                # readable) — so the run could rank on partial capacity with no
+                # SELECTION_EMPTIEST_DEGRADED record anywhere. Both halves were proven and
+                # the value never travelled. Caught in review on #223.
+                _readable = sum(
+                    1 for c in _capacity.values() if c.available_fraction() is not None
+                )
+                if _readable < len(_capacity):
+                    emit(
+                        Code.SELECTION_EMPTIEST_DEGRADED,
+                        "warning",
+                        (
+                            "emptiest requested; capacity unreadable for "
+                            f"{len(_capacity) - _readable}/{len(_capacity)} bidding "
+                            "provider(s) AFTER the fallback window admitted "
+                            f"{len(late)} late bidder(s)"
+                            + (" — auction fell back to cheapest" if not _readable else "")
+                        ),
+                        readable=_readable,
+                        bidding=len(_capacity),
+                        fully_degraded=not _readable,
+                        after_fallback=True,
+                        late_providers=sorted(late),
+                        unreadable_providers=sorted(
+                            p for p, c in _capacity.items() if c.available_fraction() is None
+                        ),
+                    )
         selected_bid, auction_result = _select_auction_bid(
             bids,
             preferred=preferred,
