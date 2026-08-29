@@ -469,14 +469,21 @@ def deploy_credit(address: str) -> dict[str, int]:
     # A barren endpoint only means something ALONGSIDE one that did select a grant; if
     # nothing anywhere has a grant there is no disagreement, just no data.
     if len({(u, e) for _, u, e in per_endpoint_choice}) > 1 or (barren and per_endpoint_choice):
-        # ⛔ PRINT THE WHOLE INSTANT, NOT THE DATE. The comparison above is over full
-        # datetimes, so two endpoints can differ by HOURS and be a genuine disagreement —
-        # and `%Y-%m-%d` rendered them as the SAME STRING. A warning that fires correctly
-        # and then offers two identical values as its evidence reads as a bug in the
-        # warning. The comparison and the message need one resolution.
+        # ⛔ PRINT THE WHOLE INSTANT, AT THE COMPARISON'S OWN RESOLUTION. `%Y-%m-%d`
+        # rendered endpoints differing by HOURS as the SAME STRING. Fixing that with
+        # `%Y-%m-%dT%H:%M:%S%z` moved the defect rather than removing it: `_parse_expiration`
+        # preserves MICROSECONDS and the comparison is over full datetimes, so
+        # `…00.000Z` and `…00.001Z` still rendered identically —
+        #     2036-08-24T22:00:00+0000  |  2036-08-24T22:00:00+0000
+        # measured. `isoformat()` is the only rendering that cannot fall behind the
+        # comparison, because it carries whatever precision the datetime holds:
+        #     2036-08-24T22:00:00+00:00 | 2036-08-24T22:00:00.001000+00:00
+        # A warning that fires correctly and offers two identical values as its evidence
+        # reads as a bug in the warning. Any FIXED format string re-opens this the moment
+        # the parser gains precision; the message must follow the comparison, not a
+        # snapshot of it.
         detail = "; ".join(
-            f"{base}={uact}uact@{exp:%Y-%m-%dT%H:%M:%S%z}"
-            for base, uact, exp in per_endpoint_choice
+            f"{base}={uact}uact@{exp.isoformat()}" for base, uact, exp in per_endpoint_choice
         )
         if barren:
             detail += "; " + "; ".join(f"{base}=NO SELECTABLE GRANT" for base in barren)

@@ -989,6 +989,51 @@ class TestReconciliationDisagreementVisibility:
             f"the message must show the TIME that made these two readings differ; got: {msg}"
         )
 
+    def test_the_message_keeps_MICROSECOND_precision(self):
+        """⛔ THE SAME DEFECT ONE DECIMAL PLACE DOWN, AND MY OWN FIX CREATED IT.
+
+        `%Y-%m-%d` was replaced with `%Y-%m-%dT%H:%M:%S%z`, which fixed endpoints
+        differing by hours and left microseconds truncated — while `_parse_expiration`
+        preserves them and the comparison is over full datetimes. So `…00.000Z` and
+        `…00.001Z` DISAGREE and printed identically. Measured:
+
+            %Y-%m-%dT%H:%M:%S%z -> 2036-08-24T22:00:00+0000  (both)
+            isoformat()         -> …22:00:00+00:00 | …22:00:00.001000+00:00
+
+        Any FIXED format string re-opens this the moment the parser gains precision.
+        `isoformat()` carries whatever the datetime holds, so the message cannot fall
+        behind the comparison again.
+        """
+        early = dict(uact=116_327_730, expiration="2036-08-24T22:00:00.000Z")
+        late = dict(uact=116_327_730, expiration="2036-08-24T22:00:00.001Z")
+
+        def fake(path, timeout=15, base=None, height=None):
+            if base and "publicnode" in base:
+                return self._vintage(**early)
+            return self._vintage(**late)
+
+        with (
+            patch.object(
+                chain,
+                "rest_urls",
+                return_value=[
+                    "https://akash-rest.publicnode.com",
+                    "https://api.akashnet.net",
+                ],
+            ),
+            patch.object(chain, "_lcd_get", side_effect=fake),
+            warnings.catch_warnings(record=True) as caught,
+        ):
+            warnings.simplefilter("always")
+            chain.deploy_credit("akash1me")
+
+        assert caught, "grants differing by microseconds are a disagreement and must warn"
+        msg = str(caught[0].message)
+        assert "22:00:00.001" in msg, (
+            "the message must carry the fractional second that made these two readings "
+            f"differ; got: {msg}"
+        )
+
     def test_quorum_names_the_endpoint_that_cannot_pin_height(self):
         """granted_uact skips a node that cannot serve the pinned height —
         today SILENTLY. The skip must be named: 'the default LCD cannot
