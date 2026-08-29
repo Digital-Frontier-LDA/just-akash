@@ -521,6 +521,10 @@ class TestUnverifiableCrossCheckIsNotAProviderFault:
             providers=[self._target()],
             sleep=slept.append,
             wait_s=0,
+            retry_delay_s=17,
         )
         assert recs[0].retried is True
-        assert slept == [60]
+        # An explicit, non-default value: this proves the sleep is wired to
+        # retry_delay_s rather than coincidentally matching whatever the
+        # default happens to be today.
+        assert slept == [17]
