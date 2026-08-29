@@ -1113,6 +1113,30 @@ def deploy(
             f"  EMPTIEST: capacity readable for {_readable}/{len(_capacity)} bidding "
             f"provider(s){' — falling back to cheapest' if not _readable else ''}",
         )
+        # ⛔ THE LOG LINE ABOVE DOES NOT SURVIVE. The consuming workflow truncates
+        #   deploy.log PER ROUND and accumulates only `akash-diag` lines into diag.jsonl
+        #   (akash-runner.yml, "Accumulate just-akash's structured diagnostics across ALL
+        #   rounds"). So coverage was discarded for every round but the last — on the one
+        #   fact that says whether emptiest was APPLIED or merely REQUESTED.
+        # ⚠ Emitted whenever coverage is INCOMPLETE, not only when it is zero. Partial
+        #   coverage still ranks a subset while reading as "emptiest applied", and the
+        #   caller cannot tell 3-of-3 from 1-of-3 without the numbers.
+        if _readable < len(_capacity):
+            emit(
+                Code.SELECTION_EMPTIEST_DEGRADED,
+                "warning",
+                (
+                    "emptiest requested; capacity unreadable for "
+                    f"{len(_capacity) - _readable}/{len(_capacity)} bidding provider(s)"
+                    + (" — auction fell back to cheapest" if not _readable else "")
+                ),
+                readable=_readable,
+                bidding=len(_capacity),
+                fully_degraded=not _readable,
+                unreadable_providers=sorted(
+                    p for p, c in _capacity.items() if c.available_fraction() is None
+                ),
+            )
 
     selected_bid, auction_result = _select_auction_bid(
         bids,
