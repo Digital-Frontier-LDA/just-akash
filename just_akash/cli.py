@@ -63,6 +63,41 @@ def _require_api_key():
     return api_key
 
 
+def _warn_if_listing_degraded(client, listings):
+    """Emit the same ⚠ DEGRADED warning that `lease-status` already carries.
+
+    ⛔ An empty Console listing is NOT an all-clear. Issue #208: the Console API does
+    not see deployments that were created via direct chain tx; a clean `[]` from
+    `client.list_deployments()` reads as a healthy fleet, but the chain may report 21
+    ACTIVE. The fix `lease-status` already wires (see corroborate_listing below) is to
+    cross-check against `chain.active_deployment_count(address)` and surface the gap.
+
+    This helper is the shared primitive for the four CLI sites at lines 71, 100, 1006,
+    1729 that previously printed `[]` / `No deployments to …` without corroborating.
+    The shape of the check is identical to the one already proven in lease-status; we
+    factor it so a future command doesn't re-implement it wrong.
+
+    Non-fatal: prints to stderr and returns. The caller still gets its empty listing
+    to render, but the operator sees the warning before they make a destructive call.
+    """
+    if listings:
+        return
+    try:
+        address = client.account_address()
+    except Exception:
+        # If we can't even get the address, we can't corroborate. Don't pretend the
+        # empty listing is clean — but don't claim it's degraded either; an unreadable
+        # primary source is its own class (chain.corroborate_listing handles it).
+        address = ""
+    from . import chain as _chain
+
+    chain_active = _chain.active_deployment_count(address) if address else None
+    for reason in _chain.corroborate_listing(
+        listing_is_empty=True, chain_active=chain_active, address=address
+    ):
+        print(f"⚠ DEGRADED: {reason}", file=sys.stderr)
+
+
 def _resolve_deployment(client, dseq_arg):
     from .api import _extract_dseq, _interactive_pick, _resolve_dseq
 
@@ -70,6 +105,7 @@ def _resolve_deployment(client, dseq_arg):
     if not dseq:
         deployments = client.list_deployments()
         if not deployments:
+            _warn_if_listing_degraded(client, deployments)
             print("No active deployments.")
             sys.exit(1)
         dseq = (
@@ -100,6 +136,13 @@ def _resolve_deployment_client(dseq_arg):
             rows = client.list_deployments()
         except RuntimeError:
             continue
+        # Cross-check this wallet's listing against the chain — see _warn_if_listing_degraded.
+        # If `rows` is empty, the chain might still report active deployments that this
+        # Console key is the only way to enumerate. The single-wallet list path above
+        # emits the warning once per key; here we surface it before printing the pool-wide
+        # "No active deployments" line.
+        if not rows:
+            _warn_if_listing_degraded(client, rows)
         for row in rows or []:
             found = _extract_dseq(row) if isinstance(row, dict) else None
             if found and found not in owner_by_dseq:
@@ -1004,6 +1047,11 @@ def main():
             client = AkashConsoleAPI(_require_api_key())
             use_json = args.json or not sys.stdout.isatty()
             deployments = client.list_deployments()
+            # `list` is the canonical inventory command. An empty result here is the
+            # exact shape #208 reports: clean stdout, no degraded flag. Surface the
+            # ⚠ DEGRADED warning to stderr BEFORE printing the (empty) JSON / table
+            # so the operator sees it without scrolling.
+            _warn_if_listing_degraded(client, deployments)
             if use_json:
                 print(format_deployments_json(deployments))
             else:
@@ -1724,6 +1772,11 @@ def main():
             client = AkashConsoleAPI(_require_api_key())
             deployments = client.list_deployments()
             if not deployments:
+                # `destroy-all` is destructive-by-default. An empty Console listing here
+                # is the exact wedge #208 names: "no deployments to destroy" is silent
+                # authorization to skip — but the chain may hold 21 ACTIVE that this
+                # Console key cannot see. Warn before printing the all-clear.
+                _warn_if_listing_degraded(client, deployments)
                 print("No deployments to destroy.")
             else:
                 print(format_deployments_table(deployments))
