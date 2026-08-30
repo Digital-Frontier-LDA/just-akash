@@ -580,7 +580,13 @@ def _gpu_target():
     return ProviderTarget("onidc", ONIDC.wallet, frozenset({"gpu"}), ONIDC.attributes)
 
 
-def _stats(available, total=14):
+def _stats(available: int, total: int = 14) -> dict[str, Any]:
+    """A Console provider record carrying only the GPU aggregate.
+
+    Typed dict[str, Any] because callers add a `gpuModels` LIST alongside the
+    `stats` DICT; a narrower inferred value type makes that assignment a type
+    error under pyright.
+    """
     return {
         "stats": {"gpu": {"active": total - available, "available": available, "total": total}}
     }
@@ -603,7 +609,7 @@ def test_zero_free_gpu_is_a_skip_not_a_no_bid():
 def test_owning_none_of_the_probed_models_is_a_skip():
     """Removes the manual-sync footgun above GPU_PROBE_MODELS: if the list and
     the provider's real inventory disjoin, every probe is unfillable."""
-    info = dict(_stats(available=4))
+    info: dict[str, Any] = dict(_stats(available=4))
     info["gpuModels"] = [
         {"vendor": "nvidia", "model": "h100"},
         {"vendor": "nvidia", "model": "a100"},
@@ -642,7 +648,7 @@ def test_free_gpu_of_a_probed_model_still_probes(monkeypatch):
     still reach the provider, or the probe silently stops testing anything."""
     calls: list[Any] = []
     _stub_submit(monkeypatch, calls)
-    info = dict(_stats(available=2))
+    info: dict[str, Any] = dict(_stats(available=2))
     info["gpuModels"] = [{"vendor": "nvidia", "model": GPU_PROBE_MODELS[0]}]
     recs = _run_gpu(_CapClient([], info))
     assert recs[0].outcome == OUTCOME_BID

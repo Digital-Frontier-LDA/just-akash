@@ -497,6 +497,16 @@ def _gpu_probe_is_answerable(client: Any, target: ProviderTarget) -> tuple[bool,
             return False, f"provider advertises 0 free GPU (total {total})"
 
     models = info.get("gpuModels")
+    # An EMPTY gpuModels is deliberately NOT decisive, though it looks like it
+    # should be ("every pinned model is absent"). Measured against the live
+    # Console 2026-08-30: a genuinely GPU-less provider reports BOTH
+    # `stats.gpu.available: 0` AND `gpuModels: []` (alphavps and hetzner_hel
+    # both), so the aggregate check above already catches that case decisively.
+    # The only situation where empty-is-decisive would change the outcome is the
+    # INCONSISTENT one -- available > 0 while the catalogue is empty, i.e. a
+    # stale or partially-populated Console record -- and there it would suppress
+    # a probe of a provider that does have free GPUs. That trades a false page
+    # for a false silence, which is the worse failure. Fail open.
     if isinstance(models, list) and models:
         owned = {
             str(m.get("model", "")).strip().lower()
