@@ -244,7 +244,26 @@ auto-topup dseq="" toggle="":
 
 # ── Testing ──────────────────────────────────────────
 
-# Full lifecycle test: up → verify provider → SSH → down → cleanup
+# ⛔ `uv run`, NEVER a bare `python3 -m pytest`. `akash-lease-core` is a PEP 508 direct
+# reference to a release wheel URL (pyproject.toml), so it lands in the uv environment and
+# NOWHERE ELSE. Outside it the suite reports ~145 failures — 98 ModuleNotFoundError and 37
+# AttributeError — which reads as "this repo is broken" and is one absent dependency.
+# Measured 2026-08-30, same tree, same minute: bare python3 -> 145 failed + 27 collection
+# errors; `uv run` -> 0 failed. (Failure counts only — a passing total drifts with every
+# test added and would be stale within a week.)
+#
+# ⚠ THE LINE BELOW IS THE `just --list` DESCRIPTION, and it must stay last: just takes the
+# LAST comment before a recipe. The first version of this block put the prose after the
+# summary, and `just --list` advertised `unit` as "test added and would be stale within a
+# week.)" — caught by running it rather than assuming.
+# Unit + integration suite — no deployment, no spend, ~65s
+unit:
+    uv run pytest tests/ -q
+
+# ⚠ THIS DEPLOYS REAL INFRASTRUCTURE AND SPENDS ESCROW. It is not the unit suite — for that
+# use `just unit`. The name is kept for compatibility; the warning exists because someone
+# looking for "how do I run the tests" finds this recipe first.
+# ⚠ SPENDS ESCROW — full lifecycle E2E, not the unit suite (see `just unit`)
 test:
     #!/bin/bash
     set -euo pipefail
