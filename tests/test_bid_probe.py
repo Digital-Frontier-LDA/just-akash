@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from just_akash.bid_probe import (
+    GPU_PROBE_MODELS,
     M_PAIR_TS,
     M_RESULT,
     M_SKIPPED,
@@ -22,6 +23,7 @@ from just_akash.bid_probe import (
     OUTCOME_NO_BID,
     OUTCOME_NO_BID_UNVERIFIED,
     OUTCOME_NO_CREDIT,
+    OUTCOME_NO_GPU_CAPACITY,
     PROVIDERS,
     SCENARIOS,
     ProbeRecord,
@@ -539,3 +541,162 @@ class TestUnverifiableCrossCheckIsNotAProviderFault:
         # retry_delay_s rather than coincidentally matching whatever the
         # default happens to be today.
         assert slept == [17]
+
+
+# --------------------------------------------------------------------------
+# GPU answerability — never ask a question the provider cannot answer
+# --------------------------------------------------------------------------
+#
+# A GPU probe that lands when the provider cannot serve it earns a CORRECT
+# `insufficient capacity` decline, which this module then scored as a provider
+# failure and paged on. Measured on onidc 2026-08-30: m4000 1/1 leased and p4
+# 2/2 leased, the provider logging `insufficient capacity for reservation` for
+# every pinned order while the probe recorded no-bid.
+#
+# Only two conditions are decidable from outside the cluster: zero free GPUs of
+# ANY model, and "the provider owns none of the models we pin". The Console
+# publishes an AGGREGATE free count plus a model catalogue, never free-by-model,
+# so "has free GPUs but not of the pinned model" stays unanswerable and MUST NOT
+# be faked from the aggregate.
+
+
+class _CapClient(FakeClient):
+    """FakeClient plus a Console provider record, and a call counter."""
+
+    def __init__(self, bidders_per_call, provider_info, raises=False):
+        super().__init__(bidders_per_call)
+        self._info = provider_info
+        self._raises = raises
+        self.provider_lookups = 0
+
+    def get_provider(self, owner):
+        self.provider_lookups += 1
+        if self._raises:
+            raise RuntimeError("console unreachable")
+        return self._info
+
+
+def _gpu_target():
+    return ProviderTarget("onidc", ONIDC.wallet, frozenset({"gpu"}), ONIDC.attributes)
+
+
+def _stats(available: int, total: int = 14) -> dict[str, Any]:
+    """A Console provider record carrying only the GPU aggregate.
+
+    Typed dict[str, Any] because callers add a `gpuModels` LIST alongside the
+    `stats` DICT; a narrower inferred value type makes that assignment a type
+    error under pyright.
+    """
+    return {
+        "stats": {"gpu": {"active": total - available, "available": available, "total": total}}
+    }
+
+
+def _run_gpu(client):
+    return run_probe(client, providers=[_gpu_target()], sleep=lambda _s: None, wait_s=0)
+
+
+def test_zero_free_gpu_is_a_skip_not_a_no_bid():
+    """The exact 2026-08-30 shape: nothing free, so the decline is correct."""
+    client = _CapClient([[]], _stats(available=0))
+    recs = _run_gpu(client)
+    assert [r.outcome for r in recs] == [OUTCOME_NO_GPU_CAPACITY]
+    assert recs[0].skipped is True, "a skip that does not set skipped still pages"
+    assert client.created == 0, "submitted an order that could not possibly be served"
+    assert client.closed == [], "nothing was created, so nothing should be closed"
+
+
+def test_owning_none_of_the_probed_models_is_a_skip():
+    """Removes the manual-sync footgun above GPU_PROBE_MODELS: if the list and
+    the provider's real inventory disjoin, every probe is unfillable."""
+    info: dict[str, Any] = dict(_stats(available=4))
+    info["gpuModels"] = [
+        {"vendor": "nvidia", "model": "h100"},
+        {"vendor": "nvidia", "model": "a100"},
+    ]
+    client = _CapClient([[]], info)
+    recs = _run_gpu(client)
+    assert recs[0].outcome == OUTCOME_NO_GPU_CAPACITY
+    assert client.created == 0
+
+
+def _stub_submit(monkeypatch, calls):
+    """Replace the real order submission so the GATE can be tested hermetically.
+
+    These tests are about whether probe_pair SUBMITS, not about what submitting
+    does. Stubbing also drops the akash_lease_core dependency that
+    capacity.probe_order_sdl pulls in, so the gate is verifiable anywhere.
+    """
+
+    def _fake(client, sdl, *, wait_s=45, poll_s=5, provider=None, deposit=0.5):
+        calls.append(provider)
+        # bidders are BID DICTS, not addresses — probe_pair reads .get on each.
+        # Reuses _bid_from so the fake matches the shape production parses.
+        return {
+            "placeable": True,
+            "bidders": _bid_from(provider),
+            "dseq": "1234",
+            "owner": "akash1me",
+            "waited_s": 1,
+        }
+
+    monkeypatch.setattr("just_akash.capacity.probe_order_sdl", _fake)
+
+
+def test_free_gpu_of_a_probed_model_still_probes(monkeypatch):
+    """The gate must not swallow the real question — this is the case that MUST
+    still reach the provider, or the probe silently stops testing anything."""
+    calls: list[Any] = []
+    _stub_submit(monkeypatch, calls)
+    info: dict[str, Any] = dict(_stats(available=2))
+    info["gpuModels"] = [{"vendor": "nvidia", "model": GPU_PROBE_MODELS[0]}]
+    recs = _run_gpu(_CapClient([], info))
+    assert recs[0].outcome == OUTCOME_BID
+    assert calls == [ONIDC.wallet], "the gate blocked a probe it should have allowed"
+
+
+def test_capacity_lookup_failure_fails_open(monkeypatch):
+    """An unreadable stat must never suppress a real probe: absence of evidence
+    is not evidence of capacity."""
+    calls: list[Any] = []
+    _stub_submit(monkeypatch, calls)
+    recs = _run_gpu(_CapClient([], None, raises=True))
+    assert recs[0].outcome != OUTCOME_NO_GPU_CAPACITY
+    assert calls, "a Console hiccup silently stopped probing"
+
+
+def test_client_without_get_provider_fails_open(monkeypatch):
+    """Older/partial clients lack the method entirely — still must probe."""
+    calls: list[Any] = []
+    _stub_submit(monkeypatch, calls)
+    recs = run_probe(FakeClient([]), providers=[_gpu_target()], sleep=lambda _s: None, wait_s=0)
+    assert recs[0].outcome != OUTCOME_NO_GPU_CAPACITY
+    assert calls, "a client without get_provider silently stopped probing"
+
+
+def test_non_gpu_scenarios_never_consult_capacity(monkeypatch):
+    """A cpu probe must not pay a Console round-trip, nor be gated by GPU stats."""
+    calls: list[Any] = []
+    _stub_submit(monkeypatch, calls)
+    client = _CapClient([], _stats(available=0))
+    run_probe(
+        client,
+        providers=[
+            ProviderTarget("hetzner_hel", HETZNER.wallet, frozenset({"cpu"}), HETZNER.attributes)
+        ],
+        sleep=lambda _s: None,
+        wait_s=0,
+    )
+    assert client.provider_lookups == 0
+    assert calls == [HETZNER.wallet], "the cpu probe was wrongly gated by a GPU stat"
+
+
+def test_skip_reaches_the_metric_contract():
+    """The per-cluster alert multiplies by `skipped == bool 0`. If this outcome
+    did not render skipped=1 the alert would still page on it."""
+    client = _CapClient([[]], _stats(available=0))
+    recs = _run_gpu(client)
+    text = render_prom(recs)
+    assert f"{M_SKIPPED}{{" in text
+    line = [ln for ln in text.splitlines() if ln.startswith(M_SKIPPED + "{")][0]
+    assert line.rstrip().endswith(" 1"), f"skipped must be 1 for a skip, got: {line}"
