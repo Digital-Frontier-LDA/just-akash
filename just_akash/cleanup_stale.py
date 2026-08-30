@@ -273,9 +273,7 @@ def run(
         names: list[str] | None = None
         if reap_runners and _deployment_service_names(detail) == {RUNNER_SERVICE}:
             names = chain.deployment_group_names(address, dseq)
-        verdict, services, age = classify(
-            detail, dseq, now, reap_runners, names, placement_prefix
-        )
+        verdict, services, age = classify(detail, dseq, now, reap_runners, names, placement_prefix)
         age_str = f"{age / 86400:5.1f}d" if age is not None else "   ?  "
         filtered = only_service is not None and set(services or []) != {only_service}
         suffix = f" (skipped: not services=={{{only_service}}})" if filtered else ""
