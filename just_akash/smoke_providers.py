@@ -786,7 +786,7 @@ def _explain_deploy_failed(provider: str, out: str, rc: int) -> None:
         pass
 
 
-def _record_no_bid_evidence(provider: str, out: str) -> None:
+def _record_no_bid_evidence(provider: str, out: str, dseq: str = "") -> None:
     """Explain a NO-BID instead of silently recording it.
 
     A bare "NO-BID" cannot distinguish "the provider declined" from "we never got a
@@ -795,6 +795,18 @@ def _record_no_bid_evidence(provider: str, out: str) -> None:
     screen but thrown away: WHO did bid on the same order, and the target's on-chain
     status. Emits a structured PROVIDER_NO_BID / PROVIDER_OFFLINE / ... diagnostic
     (docs/diagnostics.md) so CI/Sentry can act on it, plus a human line.
+
+    `dseq` NAMES THE ORDER, and without it a NO-BID is not diagnosable from this
+    side at all. This harness runs OUTSIDE the cluster and cannot read provider
+    logs, so the only way to learn why a provider declined is to go to its logs
+    and find the order — which needs the dseq. Chasing one NO-BID on 2026-08-30
+    took five passes and two wrong diagnoses purely because the verdict never
+    said which order it was about; the operator had to guess from timestamps,
+    and the fleet runs a bid-probe from the SAME wallet whose orders interleave
+    with the smoke's. With the dseq, `{instance="akash-provider"} |= "<dseq>"`
+    in Loki answers it in one query. The real reasons found that way were
+    `unable to fulfill: incompatible attributes` and `insufficient capacity` —
+    both of which the provider logs plainly and neither of which is a fault.
 
     Best-effort and never raises: this is diagnostics, not control flow.
     """
@@ -839,20 +851,29 @@ def _record_no_bid_evidence(provider: str, out: str) -> None:
             mem_available=mem.get("available"),
             other_bidders=len(others),
             market_had_bids=bool(bidders),
+            dseq=dseq or None,
         )
-        # Human line: the market context is the part that makes a NO-BID readable.
+        # Human line: the market context is the part that makes a NO-BID readable,
+        # and the dseq is what makes it INVESTIGABLE — it is the join key into the
+        # provider's own logs, which are the only place the decline reason exists.
+        where = f" dseq={dseq}" if dseq else " dseq=unknown"
         if others:
             print(
-                f"  {YELLOW}NO-BID evidence{RESET}: {len(others)} other provider(s) bid "
+                f"  {YELLOW}NO-BID evidence{RESET}:{where} — {len(others)} other provider(s) bid "
                 f"on this order — {msg} (isOnline={online} isValidVersion={valid})"
             )
         else:
             print(
-                f"  {YELLOW}NO-BID evidence{RESET}: NOBODY bid on this order "
+                f"  {YELLOW}NO-BID evidence{RESET}:{where} — NOBODY bid on this order "
                 f"(market-wide, not {provider[:14]}…-specific)"
             )
     except Exception as e:  # noqa: BLE001 — diagnostics must never break the run
-        print(f"  {YELLOW}NO-BID evidence unavailable{RESET}: {type(e).__name__}: {e}")
+        # Still name the order: the dseq is the one thing worth having even when
+        # every enrichment lookup failed.
+        print(
+            f"  {YELLOW}NO-BID evidence unavailable{RESET} (dseq={dseq or 'unknown'}): "
+            f"{type(e).__name__}: {e}"
+        )
 
 
 def _chain_bids_exist(dseq: str, owner: str | None = None) -> bool | None:
@@ -1008,7 +1029,7 @@ def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, s
     # "Cleaning up deployment N (no bids)" log line — i.e. the verdict hung on
     # incidental log wording. Matching the real message removes that dependency.
     if re.search(r"no bids?\b|none from our providers|foreign bids", out, re.IGNORECASE):
-        _record_no_bid_evidence(provider, out)
+        _record_no_bid_evidence(provider, out, dseq=dseqs[-1] if dseqs else "")
         # 2026-07-23 audit: "no bids AT ALL" is an absence claim from the single
         # Console bid index — cross-check the chain's own LCD before letting it
         # page as NO-BID. (The "foreign bids / none from ours / NO BID FROM n
