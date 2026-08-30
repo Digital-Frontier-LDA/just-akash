@@ -189,7 +189,10 @@ class TestNoBidNamesTheOrder:
         """The dseq is the one field worth keeping when every lookup blew up —
         it is what lets an operator go read the provider's logs anyway."""
         monkeypatch.setenv("AKASH_DIAGNOSTICS", "json")
-        with patch("just_akash.smoke_providers._bidders_from_output", side_effect=RuntimeError("boom")):
+        with patch(
+            "just_akash.smoke_providers._bidders_from_output",
+            side_effect=RuntimeError("boom"),
+        ):
             _record_no_bid_evidence(TARGET, DEPLOY_OUT_OTHERS_BID, dseq="99887766")
         out = capsys.readouterr().out
         assert "99887766" in out and "unavailable" in out
@@ -202,7 +205,6 @@ class TestNoBidNamesTheOrder:
             mock_api.return_value.get_provider.return_value = {"isOnline": True}
             _record_no_bid_evidence(TARGET, DEPLOY_OUT_OTHERS_BID)
         assert "dseq=unknown" in capsys.readouterr().out
-        assert self._emit_events(capsys) == [] or True  # emit already drained above
 
     def test_deploy_wires_the_real_dseq_through(self, monkeypatch, capsys):
         """The WIRING, not just the function: _deploy must hand its own dseq to
@@ -218,8 +220,10 @@ class TestNoBidNamesTheOrder:
         def _spy(provider, output, dseq=""):
             seen["dseq"] = dseq
 
-        with patch.object(sp, "_run", return_value=completed), \
-             patch.object(sp, "_record_no_bid_evidence", side_effect=_spy):
+        with (
+            patch.object(sp, "_run", return_value=completed),
+            patch.object(sp, "_record_no_bid_evidence", side_effect=_spy),
+        ):
             _dseq, note = sp._deploy("sdl", TARGET, {"dseq": None})
 
         assert note == "no-bid"
