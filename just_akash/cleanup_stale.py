@@ -175,8 +175,34 @@ def run(
     print(f"account: {address}")
     print(f"credit BEFORE: {_credit_line(client, address)}")
 
-    deployments = client.list_deployments()
-    print(f"active deployments: {len(deployments)}\n")
+    # ⛔ ENUMERATE FROM THE CHAIN, NOT FROM THE CONSOLE LISTING. `client.list_deployments()`
+    # sends `GET /v1/deployments` and relies on the API key to scope the response
+    # server-side. IT DOES NOT. Measured 2026-08-30, three DISTINCT keys for three DISTINCT
+    # accounts in the same minute: byte-identical bodies (sha256[:10]=56432a8d66, n=2)
+    # against a chain showing 23 / 33 / 0 active. Minutes later all three returned HTTP 403.
+    # The same endpoint is separately non-deterministic over time — 44 / 27 / 0 for ONE key
+    # minutes apart, every time HTTP 200.
+    #
+    # ⛔ WHY THAT IS FATAL *HERE* SPECIFICALLY. This function's next act is to CLOSE things.
+    # An enumeration that can return another account's page means closing another account's
+    # deployments; one that can return a short page means a wallet is skipped with no error
+    # for an unknown number of cycles. `filters.owner` on the chain is keyless, per-owner and
+    # authoritative, and `_extract_dseq` already accepts the chain's nested record shape.
+    #
+    # Per-DSEQ Console reads below are unaffected — it is the LISTING that cannot scope.
+    deployments = chain.list_active_deployments(address)
+    if deployments is None:
+        # ⛔ None IS NOT []. "Could not ask the chain" must never be swept as "holds nothing":
+        # that collapse is exactly how a broken enumeration reads as a clean account.
+        print(
+            "::error::chain enumeration FAILED for "
+            f"{address} — refusing to sweep. This is NOT an empty account; nothing was "
+            "closed and nothing was ruled out. Retry, or set AKASH_REST_URL to a healthy "
+            "endpoint.",
+            file=sys.stderr,
+        )
+        return 2
+    print(f"active deployments: {len(deployments)} (source: chain, owner-scoped)\n")
 
     stale: list[str] = []
     for d in deployments:

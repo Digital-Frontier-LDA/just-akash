@@ -166,19 +166,32 @@ class TestClassify:
         assert verdict == "LEAVE-unclassifiable"
 
 
+def _chain_records(deployments) -> list[dict]:
+    """The CHAIN's record shape — `{"deployment": {"id": {...}}}`, which is what
+    `chain.list_active_deployments` returns and what the sweep now enumerates from.
+
+    ⚠ These used to be stubbed onto `client.list_deployments`. That call was removed
+    because Console's `GET /v1/deployments` does not scope to the API key: three distinct
+    keys for three distinct accounts returned byte-identical bodies in the same minute,
+    against a chain showing 23 / 33 / 0 active. A test that still stubbed the Console
+    listing would be pinning an enumeration the sweep no longer performs — green, and
+    describing nothing.
+    """
+    return [{"deployment": {"state": "active", "id": {"owner": "akash1me", "dseq": d}}} for d in deployments]
+
+
 def _mock_client(deployments: dict[str, dict]):
     client = MagicMock()
     client.account_address.return_value = "akash1me"
-    client.list_deployments.return_value = [
-        {"deployment": {"state": "active", "id": {"dseq": d}}} for d in deployments
-    ]
     client.get_deployment.side_effect = lambda d: deployments[str(d)]
+    client._records = _chain_records(deployments)
     return client
 
 
 def _run(client, execute: bool) -> int:
     with (
         patch.object(cs, "AkashConsoleAPI", return_value=client),
+        patch.object(cs.chain, "list_active_deployments", return_value=client._records),
         patch.object(cs.chain, "deploy_credit", return_value={"uact": 100_000_000}),
         patch.object(
             cs,
@@ -236,3 +249,73 @@ class TestRun:
         assert _run(client, execute=True) == 0
         closed = {c.args[0] for c in client.close_deployment.call_args_list}
         assert closed == {good}
+
+
+class TestChainEnumerationIsAuthoritative:
+    """The sweep enumerates from the chain, and an unreadable chain is NOT an empty account.
+
+    ⛔ The property these pin is the reason the enumeration moved. Console's listing could
+    return another account's page, a short page, or a 403 — all indistinguishable from
+    "this wallet is clean" to a caller whose next act is to CLOSE things.
+    """
+
+    def _run_with_chain(self, chain_result, execute=False):
+        client = MagicMock()
+        client.account_address.return_value = "akash1me"
+        client.get_deployment.side_effect = lambda d: _detail(["probe"])
+        with (
+            patch.object(cs, "AkashConsoleAPI", return_value=client),
+            patch.object(cs.chain, "list_active_deployments", return_value=chain_result),
+            patch.object(cs.chain, "deploy_credit", return_value={"uact": 100_000_000}),
+            patch.object(
+                cs,
+                "escrow_locked",
+                return_value={"locked_uact": 0, "deployments": 0, "by_deployment": {}},
+            ),
+            patch.dict("os.environ", {"AKASH_API_KEY": "k"}),
+            patch.object(cs.time, "sleep", lambda s: None),
+        ):
+            return cs.run(execute=execute, now=NOW), client
+
+    def test_an_unreadable_chain_refuses_to_sweep(self, capsys):
+        """⛔ THE LOAD-BEARING ONE. None must exit non-zero and close NOTHING — never be
+        swept as an empty account."""
+        rc, client = self._run_with_chain(None, execute=True)
+        assert rc == 2, f"an unreadable chain returned {rc}, so a failed enumeration reads as success"
+        client.close_deployment.assert_not_called()
+        assert "refusing to sweep" in capsys.readouterr().err
+
+    def test_a_genuinely_empty_account_succeeds(self, capsys):
+        """Anti-vacuity partner: if [] also refused, the test above would pass while the
+        sweep could never report a clean account at all."""
+        rc, client = self._run_with_chain([], execute=True)
+        assert rc == 0, "a readable, empty account must succeed"
+        client.close_deployment.assert_not_called()
+        assert "active deployments: 0" in capsys.readouterr().out
+
+    def test_the_console_listing_is_never_called(self):
+        """The whole point of the change. If this call came back, the sweep would silently
+        depend on an enumeration that cannot scope to the account again."""
+        _, client = self._run_with_chain(_chain_records(["1787822013544"]))
+        client.list_deployments.assert_not_called()
+
+    def test_enumeration_is_scoped_to_the_account_address(self):
+        """The chain is asked about THIS key's owner, not some other address."""
+        client = MagicMock()
+        client.account_address.return_value = "akash1me"
+        client.get_deployment.side_effect = lambda d: _detail(["probe"])
+        seen = []
+        with (
+            patch.object(cs, "AkashConsoleAPI", return_value=client),
+            patch.object(cs.chain, "list_active_deployments", side_effect=lambda o: seen.append(o) or []),
+            patch.object(cs.chain, "deploy_credit", return_value={"uact": 100_000_000}),
+            patch.object(
+                cs,
+                "escrow_locked",
+                return_value={"locked_uact": 0, "deployments": 0, "by_deployment": {}},
+            ),
+            patch.dict("os.environ", {"AKASH_API_KEY": "k"}),
+            patch.object(cs.time, "sleep", lambda s: None),
+        ):
+            cs.run(now=NOW)
+        assert seen == ["akash1me"], f"chain was asked about {seen!r}, not the key's own owner"

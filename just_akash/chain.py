@@ -166,6 +166,70 @@ def active_deployment_count(owner: str, timeout: int = 15) -> int | None:
     return len(deployments)
 
 
+def list_active_deployments(owner: str, timeout: int = 15) -> list[dict[str, Any]] | None:
+    """Every ACTIVE deployment record the chain attributes to ``owner``, or None if unknown.
+
+    ⛔ WHY THIS EXISTS: THE CONSOLE LISTING CANNOT SCOPE TO AN ACCOUNT. `list_deployments`
+    sends `GET /v1/deployments` and relies on the API key to scope the response server-side.
+    It does not. MEASURED 2026-08-30 from one host, three DISTINCT keys for three DISTINCT
+    accounts, same minute:
+
+        AKASH_CONSOLE    -> n=2  sha256(body)[:10] = 56432a8d66
+        AKASH_CONSOLE_2  -> n=2  sha256(body)[:10] = 56432a8d66
+        AKASH_CONSOLE_3  -> n=2  sha256(body)[:10] = 56432a8d66
+
+    Byte-identical bodies for three different accounts, against a chain showing 23 / 42 / 0
+    active. The same endpoint is separately NON-DETERMINISTIC over time — 44 / 27 / 0 for one
+    key minutes apart, every time HTTP 200 — which is what `verify_not_silently_empty` was
+    written to catch downstream. Both faults have the same fix: ask the chain, which is
+    keyless, per-owner and authoritative.
+
+    ⛔ None IS NOT []. `[]` means "asked, and this owner genuinely holds nothing"; ``None``
+    means "could not ask". Collapsing them is how a sweeper skips a wallet with no error for
+    an unknown number of cycles, and a caller that DESTROYS things must branch on the
+    difference. Every failure path below returns None — never a partial page.
+
+    ⚠ PAGINATED, unlike :func:`active_deployment_count`, which asks for `limit=1000` once and
+    would silently truncate a larger account. Truncation here is not a smaller report, it is
+    a set of deployments that are invisible to the sweep.
+    """
+    if not owner:
+        return None
+    base_path = (
+        f"{_DEPLOYMENT_API}/deployments/list"
+        f"?filters.owner={urllib.parse.quote(owner)}&filters.state=active&pagination.limit=200"
+    )
+    # One endpoint answers for the whole listing. Paging ACROSS endpoints could interleave
+    # two nodes at different heights and produce a set that never existed at any height.
+    for base in rest_urls():
+        out: list[dict[str, Any]] = []
+        next_key: str | None = None
+        ok = True
+        for _ in range(50):  # hard page cap — a runaway cursor must not loop forever
+            path = base_path
+            if next_key:
+                path += f"&pagination.key={urllib.parse.quote(next_key)}"
+            try:
+                data = _lcd_get(path, timeout=timeout, base=base)
+            except RuntimeError:
+                ok = False
+                break  # try the next endpoint; one lagging node must not answer for the chain
+            deployments = data.get("deployments")
+            if not isinstance(deployments, list):
+                ok = False
+                break
+            out.extend(d for d in deployments if isinstance(d, dict))
+            pagination = data.get("pagination")
+            next_key = (pagination.get("next_key") if isinstance(pagination, dict) else None) or None
+            if not next_key:
+                return out
+        else:
+            ok = False  # exhausted the page cap without terminating — refuse the partial
+        if ok:
+            return out
+    return None
+
+
 def deployment_group_names(owner: str, dseq: str) -> list[str]:
     """``group_spec.name`` for every group of one deployment, read from chain.
 
