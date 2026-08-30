@@ -177,7 +177,10 @@ def _chain_records(deployments) -> list[dict]:
     listing would be pinning an enumeration the sweep no longer performs — green, and
     describing nothing.
     """
-    return [{"deployment": {"state": "active", "id": {"owner": "akash1me", "dseq": d}}} for d in deployments]
+    return [
+        {"deployment": {"state": "active", "id": {"owner": "akash1me", "dseq": d}}}
+        for d in deployments
+    ]
 
 
 def _mock_client(deployments: dict[str, dict]):
@@ -281,7 +284,9 @@ class TestChainEnumerationIsAuthoritative:
         """⛔ THE LOAD-BEARING ONE. None must exit non-zero and close NOTHING — never be
         swept as an empty account."""
         rc, client = self._run_with_chain(None, execute=True)
-        assert rc == 2, f"an unreadable chain returned {rc}, so a failed enumeration reads as success"
+        assert rc == 2, (
+            f"an unreadable chain returned {rc}, so a failed enumeration reads as success"
+        )
         client.close_deployment.assert_not_called()
         assert "refusing to sweep" in capsys.readouterr().err
 
@@ -307,7 +312,9 @@ class TestChainEnumerationIsAuthoritative:
         seen = []
         with (
             patch.object(cs, "AkashConsoleAPI", return_value=client),
-            patch.object(cs.chain, "list_active_deployments", side_effect=lambda o: seen.append(o) or []),
+            patch.object(
+                cs.chain, "list_active_deployments", side_effect=lambda o: seen.append(o) or []
+            ),
             patch.object(cs.chain, "deploy_credit", return_value={"uact": 100_000_000}),
             patch.object(
                 cs,
@@ -407,7 +414,7 @@ class TestProtectedDseqs:
 
         reloaded = importlib.reload(cs)
         try:
-            assert reloaded.PROTECTED_DSEQS == frozenset({"111", "222", "333"})
+            assert frozenset({"111", "222", "333"}) == reloaded.PROTECTED_DSEQS
         finally:
             monkeypatch.delenv("PROTECTED_DSEQS", raising=False)
             importlib.reload(cs)

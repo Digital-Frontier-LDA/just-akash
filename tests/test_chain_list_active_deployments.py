@@ -17,8 +17,6 @@ DESTROY:
 
 from __future__ import annotations
 
-import json
-
 import pytest
 
 from just_akash import chain
@@ -28,7 +26,9 @@ OWNER = "akash1testowner000000000000000000000000000"
 
 def _page(n, next_key=None, start=0):
     return {
-        "deployments": [{"deployment": {"id": {"owner": OWNER, "dseq": str(start + i)}}} for i in range(n)],
+        "deployments": [
+            {"deployment": {"id": {"owner": OWNER, "dseq": str(start + i)}}} for i in range(n)
+        ],
         "pagination": {"next_key": next_key},
     }
 
@@ -101,7 +101,9 @@ def test_a_runaway_cursor_refuses_the_partial(lcd):
 
 
 def test_one_dead_endpoint_does_not_answer_for_the_chain(lcd, monkeypatch):
-    monkeypatch.setattr(chain, "rest_urls", lambda: ["https://dead.example", "https://live.example"])
+    monkeypatch.setattr(
+        chain, "rest_urls", lambda: ["https://dead.example", "https://live.example"]
+    )
     calls = lcd(lambda base, path: RuntimeError("dead") if "dead" in base else _page(5))
     got = chain.list_active_deployments(OWNER)
     assert got is not None and len(got) == 5
@@ -129,3 +131,45 @@ def test_a_blank_owner_is_refused(lcd):
     caller whose next action is to close them."""
     lcd(lambda base, path: _page(999))
     assert chain.list_active_deployments("") is None
+
+
+@pytest.mark.parametrize(
+    "pagination",
+    [
+        "not-an-object",
+        123,
+        {"next_key": 42},
+        {"next_key": ["a"]},
+        {"next_key": {"k": "v"}},
+    ],
+    ids=["str", "int", "int-key", "list-key", "dict-key"],
+)
+def test_a_malformed_cursor_is_unknown_not_done(lcd, pagination):
+    """⛔ A cursor it cannot read must NOT read as end-of-list.
+
+    Treating it as "done" returns a PARTIAL set that looks complete, and the caller's next
+    act is to close what it did not see — the same empty-vs-failed collapse this module
+    refuses one level up. A non-string key would additionally raise TypeError inside
+    `urllib.parse.quote`, which is a crash rather than a verdict.
+    """
+    lcd(
+        lambda base, path: {
+            "deployments": [{"deployment": {"id": {"dseq": "1"}}}],
+            "pagination": pagination,
+        }
+    )
+    assert chain.list_active_deployments(OWNER) is None
+
+
+@pytest.mark.parametrize("pagination", [None, {}, {"next_key": None}, {"next_key": ""}])
+def test_a_legitimately_absent_cursor_ends_the_listing(lcd, pagination):
+    """Anti-vacuity partner. If every cursor shape returned None, the test above would pass
+    while the function could never complete a listing at all."""
+    lcd(
+        lambda base, path: {
+            "deployments": [{"deployment": {"id": {"dseq": "1"}}}],
+            "pagination": pagination,
+        }
+    )
+    got = chain.list_active_deployments(OWNER)
+    assert got is not None and len(got) == 1, f"a normal end-of-list was rejected: {got!r}"

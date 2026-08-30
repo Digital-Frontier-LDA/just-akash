@@ -101,9 +101,7 @@ STALE_VERDICTS = ("STALE-probe", "STALE-e2e", "STALE-runner")
 # from one that was not there, which is how an over-broad allowlist would hide a real leak
 # forever.
 PROTECTED_DSEQS = frozenset(
-    d.strip()
-    for d in os.environ.get("PROTECTED_DSEQS", "1784532174413").split(",")
-    if d.strip()
+    d.strip() for d in os.environ.get("PROTECTED_DSEQS", "1784532174413").split(",") if d.strip()
 )
 
 

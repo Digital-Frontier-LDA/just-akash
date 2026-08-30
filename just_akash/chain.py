@@ -219,10 +219,23 @@ def list_active_deployments(owner: str, timeout: int = 15) -> list[dict[str, Any
                 ok = False
                 break
             out.extend(d for d in deployments if isinstance(d, dict))
+            # ⛔ A MALFORMED CURSOR IS "UNKNOWN", NOT "DONE". Treating an unreadable
+            # `pagination` as end-of-list returns a PARTIAL set that looks complete — the
+            # same empty-vs-failed collapse this function refuses one level up, and the
+            # caller's next act is to close what it did not see. A non-string `next_key`
+            # would additionally raise TypeError inside `quote`, which is a crash rather
+            # than a verdict.
             pagination = data.get("pagination")
-            next_key = (pagination.get("next_key") if isinstance(pagination, dict) else None) or None
-            if not next_key:
+            if pagination is not None and not isinstance(pagination, dict):
+                ok = False
+                break
+            raw = pagination.get("next_key") if isinstance(pagination, dict) else None
+            if raw is None or raw == "":
                 return out
+            if not isinstance(raw, str):
+                ok = False
+                break
+            next_key = raw
         else:
             ok = False  # exhausted the page cap without terminating — refuse the partial
         if ok:
