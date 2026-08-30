@@ -363,6 +363,10 @@ OUTCOME_INDEX_LAG = "bid-index-lag"
 OUTCOME_NO_BID_UNVERIFIED = "no-bid-unverified"
 OUTCOME_NO_CREDIT = "no-credit"
 OUTCOME_ERROR = "probe-error"
+# The GPU question could not be ASKED of this provider: it advertises no free
+# GPU at all, or owns none of the models we pin. Submitting anyway earns a
+# correct "insufficient capacity" decline that scores as a provider failure.
+OUTCOME_NO_GPU_CAPACITY = "no-gpu-capacity"
 
 # "Couldn't test" is not "failed" (rule 2 in this module's docstring). An
 # unverifiable cross-check belongs here for exactly the reason index-lag does:
@@ -372,7 +376,13 @@ OUTCOME_ERROR = "probe-error"
 # were chain-confirmed — i.e. every critical page this rule has ever produced
 # was false.
 _SKIPPED_OUTCOMES = frozenset(
-    {OUTCOME_INDEX_LAG, OUTCOME_NO_BID_UNVERIFIED, OUTCOME_NO_CREDIT, OUTCOME_ERROR}
+    {
+        OUTCOME_INDEX_LAG,
+        OUTCOME_NO_BID_UNVERIFIED,
+        OUTCOME_NO_CREDIT,
+        OUTCOME_ERROR,
+        OUTCOME_NO_GPU_CAPACITY,
+    }
 )
 
 
@@ -435,6 +445,72 @@ def _is_credit_error(exc: BaseException) -> bool:
     return any(m in msg for m in _CREDIT_MARKERS)
 
 
+def _gpu_probe_is_answerable(client: Any, target: ProviderTarget) -> tuple[bool, str]:
+    """(can_ask, reason) — may a GPU-pinned probe be submitted to this provider?
+
+    A GPU probe that lands when the provider cannot possibly serve it earns a
+    CORRECT `insufficient capacity` decline, which this module then scores as a
+    provider failure and pages on. That is the same "couldn't test is not
+    failed" rule the chain cross-check already enforces (rule 2 in the module
+    docstring); it just was never applied to capacity. The in-cluster probe got
+    this in its PR #74 and self-skips when the fleet is fully leased — this one
+    never did, so the comment above GPU_PROBE_MODELS carries the burden as a
+    hand-maintained list instead.
+
+    Measured on onidc 2026-08-30: m4000 1/1 leased and p4 2/2 leased, the
+    provider logging `insufficient capacity for reservation` for every pinned
+    order, while the probe recorded them as no-bid.
+
+    TWO conditions are decidable from outside the cluster, and only two:
+
+      * `stats.gpu.available <= 0` — no free GPU of ANY model, so nothing we
+        could pin is servable.
+      * the provider owns NONE of GPU_PROBE_MODELS — every model we pin is
+        absent from its `gpuModels`, so the order is unfillable by definition.
+        This also removes the manual-sync footgun: the list above must track
+        each cluster's real inventory, and nothing enforced that.
+
+    What is NOT decidable: "the provider has free GPUs, but none of the pinned
+    MODEL". The Console publishes only an AGGREGATE free count
+    (`stats.gpu: {active, available, total}`) plus the model catalogue — never
+    free-by-model. So a probe pinning a sold-out model while a different model
+    sits free still reads as no-bid, and closing that needs an API that can
+    answer it. Do not fake it by inferring from the aggregate.
+
+    FAIL-OPEN, like _provider_room in the smoke: an unreadable stat must never
+    suppress a real probe. Absence of evidence is not evidence of capacity.
+    """
+    try:
+        info = client.get_provider(target.wallet) or {}
+    except Exception as e:  # noqa: BLE001 — capacity is advisory, never fatal
+        return True, f"capacity unknown ({type(e).__name__}); probing anyway"
+    if not isinstance(info, dict) or not info:
+        return True, "provider not in registry; probing anyway"
+
+    stats = info.get("stats")
+    gpu = stats.get("gpu") if isinstance(stats, dict) else None
+    if isinstance(gpu, dict):
+        avail = gpu.get("available")
+        # `is not None` and not a truthiness test: 0 is the whole point here.
+        if isinstance(avail, (int, float)) and avail <= 0:
+            total = gpu.get("total")
+            return False, f"provider advertises 0 free GPU (total {total})"
+
+    models = info.get("gpuModels")
+    if isinstance(models, list) and models:
+        owned = {
+            str(m.get("model", "")).strip().lower()
+            for m in models
+            if isinstance(m, dict) and m.get("model")
+        }
+        if owned and not (owned & {m.lower() for m in GPU_PROBE_MODELS}):
+            return False, (
+                "provider owns none of the probed models "
+                f"(has {sorted(owned)}, probes {sorted(GPU_PROBE_MODELS)})"
+            )
+    return True, "ok"
+
+
 def probe_pair(
     client: Any,
     target: ProviderTarget,
@@ -453,6 +529,21 @@ def probe_pair(
     from .capacity import probe_order_sdl
 
     ts = now if now is not None else time.time()
+    # Ask only questions this provider can answer. See _gpu_probe_is_answerable:
+    # an unservable GPU probe earns a correct decline that would page as a fault.
+    if scenario.name == "gpu":
+        answerable, why = _gpu_probe_is_answerable(client, target)
+        if not answerable:
+            return ProbeRecord(
+                cluster=target.cluster,
+                provider=target.wallet,
+                scenario=scenario.name,
+                outcome=OUTCOME_NO_GPU_CAPACITY,
+                dseq=None,
+                waited_s=0,
+                note=why,
+                ts=ts,
+            )
     sdl = inject_placement_attributes(scenario.sdl, target.attributes)
     try:
         res = probe_order_sdl(
