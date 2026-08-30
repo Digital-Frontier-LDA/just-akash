@@ -134,3 +134,99 @@ class TestRecordNoBidEvidence:
             _record_no_bid_evidence(TARGET, DEPLOY_OUT_OTHERS_BID)
         out = capsys.readouterr().out
         assert "2 other provider(s) bid" in out
+
+
+class TestNoBidNamesTheOrder:
+    """A NO-BID must say WHICH ORDER it is about.
+
+    This harness runs outside the cluster and cannot read provider logs, so the
+    decline reason only exists there — and finding the order needs its dseq.
+    Chasing one NO-BID on 2026-08-30 took five passes and two wrong diagnoses
+    purely because the verdict never named the order: the fleet runs a bid-probe
+    from the SAME wallet, so its orders interleave with the smoke's and timestamps
+    alone cannot tell them apart. The reasons found once the right orders were
+    identified (`unable to fulfill: incompatible attributes`, `insufficient
+    capacity`) were both plainly logged provider-side, and neither is a fault.
+    """
+
+    def _emit_events(self, capsys):
+        err = capsys.readouterr().err
+        return [
+            json.loads(line)
+            for line in err.splitlines()
+            if line.strip().startswith("{") and "akash-diag" in line
+        ]
+
+    def test_dseq_reaches_the_structured_diagnostic(self, monkeypatch, capsys):
+        monkeypatch.setenv("AKASH_DIAGNOSTICS", "json")
+        with patch("just_akash.smoke_providers._api") as mock_api:
+            mock_api.return_value.get_provider.return_value = {
+                "isOnline": True,
+                "isValidVersion": True,
+            }
+            _record_no_bid_evidence(TARGET, DEPLOY_OUT_OTHERS_BID, dseq="1788112687264")
+        # TOP LEVEL, not context: emit() already reserved a first-class `dseq`
+        # field in the diagnostics schema (docs/diagnostics.md) — the no-bid path
+        # simply never populated it, which is the whole defect.
+        assert self._emit_events(capsys)[0]["dseq"] == "1788112687264"
+
+    def test_dseq_is_printed_for_a_human(self, monkeypatch, capsys):
+        monkeypatch.setenv("AKASH_DIAGNOSTICS", "json")
+        with patch("just_akash.smoke_providers._api") as mock_api:
+            mock_api.return_value.get_provider.return_value = {"isOnline": True}
+            _record_no_bid_evidence(TARGET, DEPLOY_OUT_OTHERS_BID, dseq="1788112687264")
+        assert "1788112687264" in capsys.readouterr().out
+
+    def test_dseq_printed_when_nobody_bid_either(self, monkeypatch, capsys):
+        """The market-wide branch needs the order named just as much."""
+        monkeypatch.setenv("AKASH_DIAGNOSTICS", "json")
+        with patch("just_akash.smoke_providers._api") as mock_api:
+            mock_api.return_value.get_provider.return_value = {"isOnline": True}
+            _record_no_bid_evidence(TARGET, DEPLOY_OUT_NOBODY_BID, dseq="42424242")
+        assert "42424242" in capsys.readouterr().out
+
+    def test_dseq_survives_a_failed_enrichment(self, monkeypatch, capsys):
+        """The dseq is the one field worth keeping when every lookup blew up —
+        it is what lets an operator go read the provider's logs anyway."""
+        monkeypatch.setenv("AKASH_DIAGNOSTICS", "json")
+        with patch(
+            "just_akash.smoke_providers._bidders_from_output",
+            side_effect=RuntimeError("boom"),
+        ):
+            _record_no_bid_evidence(TARGET, DEPLOY_OUT_OTHERS_BID, dseq="99887766")
+        out = capsys.readouterr().out
+        assert "99887766" in out and "unavailable" in out
+
+    def test_missing_dseq_is_explicit_not_silent(self, monkeypatch, capsys):
+        """Absent dseq must read as 'unknown', never as a blank that looks fine.
+        Also keeps the two-arg call signature working for existing callers."""
+        monkeypatch.setenv("AKASH_DIAGNOSTICS", "json")
+        with patch("just_akash.smoke_providers._api") as mock_api:
+            mock_api.return_value.get_provider.return_value = {"isOnline": True}
+            _record_no_bid_evidence(TARGET, DEPLOY_OUT_OTHERS_BID)
+        assert "dseq=unknown" in capsys.readouterr().out
+
+    def test_deploy_wires_the_real_dseq_through(self, monkeypatch, capsys):
+        """The WIRING, not just the function: _deploy must hand its own dseq to
+        the evidence recorder. A correct recorder called with nothing is exactly
+        the bug this fixes, and only an end-to-end assertion catches that."""
+        import just_akash.smoke_providers as sp
+
+        monkeypatch.setenv("AKASH_DIAGNOSTICS", "json")
+        out = f"DSEQ: 1788112866249\n{DEPLOY_OUT_OTHERS_BID}"
+        completed = type("R", (), {"stdout": out, "stderr": "", "returncode": 1})()
+        seen: dict = {}
+
+        def _spy(provider, output, dseq=""):
+            seen["dseq"] = dseq
+
+        with (
+            patch.object(sp, "_run", return_value=completed),
+            patch.object(sp, "_record_no_bid_evidence", side_effect=_spy),
+        ):
+            _dseq, note = sp._deploy("sdl", TARGET, {"dseq": None})
+
+        assert note == "no-bid"
+        assert seen.get("dseq") == "1788112866249", (
+            "the evidence recorder was called without the dseq _deploy already had"
+        )
