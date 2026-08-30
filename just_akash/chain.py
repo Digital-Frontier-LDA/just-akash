@@ -40,8 +40,13 @@ DEFAULT_REST_URL = "https://akash-rest.publicnode.com"
 # a CI preflight — would report a funded account as short and take the failure path.
 # In CI that means falling back to paid runners while the wallet is fine.
 #
-# Reconciled by MAX (see `deploy_credit`): staleness can only lose a deposit, never
-# invent one, so the highest reading is the freshest.
+# Reconciled by LATEST EXPIRATION (see `deploy_credit`). The OLD rule — MAX across
+# endpoints, justified as "staleness can only lose a deposit, never invent one" — is
+# FALSE: a lagging node can serve a SUPERSEDED grant whose remaining allowance is
+# LARGER than the replacement's. Measured 2026-08-29 on akash1n4uut3…: publicnode
+# served 170.62 ACT (expiration 2036-07-08) while akashnet + polkachu agreed on the
+# fresh 116.33 ACT vintage (2036-08-24). MAX picked the dead grant, and every
+# deposit sized between the two was refused with 402 for 13 days.
 DEFAULT_REST_FALLBACKS = (
     "https://api.akashnet.net",
     "https://akash-api.polkachu.com",
@@ -159,6 +164,83 @@ def active_deployment_count(owner: str, timeout: int = 15) -> int | None:
     if not isinstance(deployments, list):
         return None
     return len(deployments)
+
+
+def list_active_deployments(owner: str, timeout: int = 15) -> list[dict[str, Any]] | None:
+    """Every ACTIVE deployment record the chain attributes to ``owner``, or None if unknown.
+
+    ⛔ WHY THIS EXISTS: THE CONSOLE LISTING CANNOT SCOPE TO AN ACCOUNT. `list_deployments`
+    sends `GET /v1/deployments` and relies on the API key to scope the response server-side.
+    It does not. MEASURED 2026-08-30 from one host, three DISTINCT keys for three DISTINCT
+    accounts, same minute:
+
+        AKASH_CONSOLE    -> n=2  sha256(body)[:10] = 56432a8d66
+        AKASH_CONSOLE_2  -> n=2  sha256(body)[:10] = 56432a8d66
+        AKASH_CONSOLE_3  -> n=2  sha256(body)[:10] = 56432a8d66
+
+    Byte-identical bodies for three different accounts, against a chain showing 23 / 42 / 0
+    active. The same endpoint is separately NON-DETERMINISTIC over time — 44 / 27 / 0 for one
+    key minutes apart, every time HTTP 200 — which is what `verify_not_silently_empty` was
+    written to catch downstream. Both faults have the same fix: ask the chain, which is
+    keyless, per-owner and authoritative.
+
+    ⛔ None IS NOT []. `[]` means "asked, and this owner genuinely holds nothing"; ``None``
+    means "could not ask". Collapsing them is how a sweeper skips a wallet with no error for
+    an unknown number of cycles, and a caller that DESTROYS things must branch on the
+    difference. Every failure path below returns None — never a partial page.
+
+    ⚠ PAGINATED, unlike :func:`active_deployment_count`, which asks for `limit=1000` once and
+    would silently truncate a larger account. Truncation here is not a smaller report, it is
+    a set of deployments that are invisible to the sweep.
+    """
+    if not owner:
+        return None
+    base_path = (
+        f"{_DEPLOYMENT_API}/deployments/list"
+        f"?filters.owner={urllib.parse.quote(owner)}&filters.state=active&pagination.limit=200"
+    )
+    # One endpoint answers for the whole listing. Paging ACROSS endpoints could interleave
+    # two nodes at different heights and produce a set that never existed at any height.
+    for base in rest_urls():
+        out: list[dict[str, Any]] = []
+        next_key: str | None = None
+        ok = True
+        for _ in range(50):  # hard page cap — a runaway cursor must not loop forever
+            path = base_path
+            if next_key:
+                path += f"&pagination.key={urllib.parse.quote(next_key)}"
+            try:
+                data = _lcd_get(path, timeout=timeout, base=base)
+            except RuntimeError:
+                ok = False
+                break  # try the next endpoint; one lagging node must not answer for the chain
+            deployments = data.get("deployments")
+            if not isinstance(deployments, list):
+                ok = False
+                break
+            out.extend(d for d in deployments if isinstance(d, dict))
+            # ⛔ A MALFORMED CURSOR IS "UNKNOWN", NOT "DONE". Treating an unreadable
+            # `pagination` as end-of-list returns a PARTIAL set that looks complete — the
+            # same empty-vs-failed collapse this function refuses one level up, and the
+            # caller's next act is to close what it did not see. A non-string `next_key`
+            # would additionally raise TypeError inside `quote`, which is a crash rather
+            # than a verdict.
+            pagination = data.get("pagination")
+            if pagination is not None and not isinstance(pagination, dict):
+                ok = False
+                break
+            raw = pagination.get("next_key") if isinstance(pagination, dict) else None
+            if raw is None or raw == "":
+                return out
+            if not isinstance(raw, str):
+                ok = False
+                break
+            next_key = raw
+        else:
+            ok = False  # exhausted the page cap without terminating — refuse the partial
+        if ok:
+            return out
+    return None
 
 
 def deployment_group_names(owner: str, dseq: str) -> list[str]:
@@ -421,6 +503,81 @@ def deploy_credit(address: str) -> dict[str, int]:
     latest_exp = max(e for _, e, _ in grants_with_exp)
     fresh_readings = [(c, s) for c, e, s in grants_with_exp if e == latest_exp]
     chosen = max(fresh_readings, key=lambda cs: cs[0].get("uact", 0))[0]
+    # VISIBILITY: the reconciliation above is correct whether the endpoints
+    # agree or not — and that is the trap. Measured 2026-08-29 on
+    # akash1n4uut3…: publicnode served a superseded 170.62-ACT grant
+    # (expiration 2036-07-08) all day while akashnet + polkachu agreed on the
+    # fresh 116.33-ACT vintage (2036-08-24). The rule silently picked the
+    # right value, a 54-ACT phantom sat in the fleet's key ranking, and
+    # nothing anywhere said "these LCDs disagree". So when the endpoints'
+    # CHOSEN vintages differ — or a fan-out member was unreachable — SAY SO.
+    # Per-endpoint choice = that endpoint's latest-expiration grant; in the
+    # common case every endpoint reports BOTH grants and chooses identically,
+    # so unanimous chains stay silent (see the no-noise test).
+    per_endpoint_choice: list[tuple[str, int, datetime]] = []
+    # ⛔ AN ENDPOINT WITH NO SELECTABLE GRANT IS A DISAGREEMENT, NOT AN ABSENCE. These
+    # were dropped by `if endpoint_grants:` before the message was built, so an LCD that
+    # ANSWERED and reported no usable deploy grant — while its peers reported one — was
+    # silently missing from a warning whose whole job is to name who disagrees. That is
+    # the strongest disagreement available and it was the one form it could not print.
+    barren: list[str] = []
+    for base, breakdown in per_endpoint:
+        endpoint_grants: list[tuple[dict[str, int], datetime]] = []
+        for coins, exp in breakdown:
+            parsed = _parse_expiration(exp) if exp else None
+            if parsed is not None:
+                endpoint_grants.append((coins, parsed))
+        if not endpoint_grants:
+            barren.append(base)
+        if endpoint_grants:
+            # ⛔ TIE-BREAK ON uact, EXACTLY AS THE GLOBAL RECONCILIATION ABOVE DOES.
+            # Keying on expiration alone made `max` return the FIRST maximal element, so
+            # when an endpoint served two grants with the SAME expiration the PAYLOAD
+            # ORDER picked the winner. Two endpoints holding the identical pair,
+            # serialised in opposite order, then "chose" different uact and this reported
+            # a DISAGREE about data that was byte-equal as a set. Two selections compared
+            # against each other have to use one rule.
+            coins, exp = max(endpoint_grants, key=lambda ce: (ce[1], ce[0].get("uact", 0)))
+            per_endpoint_choice.append((base, coins.get("uact", 0), exp))
+    # ⛔ THE PAIR, NOT THE AMOUNT. Comparing only `uact` misses endpoints that agree on
+    # the figure while having chosen DIFFERENT grant vintages — same money, different
+    # expiration, and the vintage is what decides whether the grant is live or superseded.
+    # A silent reconciliation of exactly that kind hid a 54-ACT phantom. Caught on #223.
+    # A barren endpoint only means something ALONGSIDE one that did select a grant; if
+    # nothing anywhere has a grant there is no disagreement, just no data.
+    if len({(u, e) for _, u, e in per_endpoint_choice}) > 1 or (barren and per_endpoint_choice):
+        # ⛔ PRINT THE WHOLE INSTANT, AT THE COMPARISON'S OWN RESOLUTION. `%Y-%m-%d`
+        # rendered endpoints differing by HOURS as the SAME STRING. Fixing that with
+        # `%Y-%m-%dT%H:%M:%S%z` moved the defect rather than removing it: `_parse_expiration`
+        # preserves MICROSECONDS and the comparison is over full datetimes, so
+        # `…00.000Z` and `…00.001Z` still rendered identically —
+        #     2036-08-24T22:00:00+0000  |  2036-08-24T22:00:00+0000
+        # measured. `isoformat()` is the only rendering that cannot fall behind the
+        # comparison, because it carries whatever precision the datetime holds:
+        #     2036-08-24T22:00:00+00:00 | 2036-08-24T22:00:00.001000+00:00
+        # A warning that fires correctly and offers two identical values as its evidence
+        # reads as a bug in the warning. Any FIXED format string re-opens this the moment
+        # the parser gains precision; the message must follow the comparison, not a
+        # snapshot of it.
+        detail = "; ".join(
+            f"{base}={uact}uact@{exp.isoformat()}" for base, uact, exp in per_endpoint_choice
+        )
+        if barren:
+            detail += "; " + "; ".join(f"{base}=NO SELECTABLE GRANT" for base in barren)
+        warnings.warn(
+            f"deploy_credit: LCDs DISAGREE on the deploy grant — {detail}. "
+            f"Kept the latest-expiration vintage ({latest_exp:%Y-%m-%d}); an endpoint "
+            "holding the LARGER figure on an OLDER expiration is serving a "
+            "superseded grant, not more money.",
+            stacklevel=2,
+        )
+    if errors:
+        warnings.warn(
+            f"deploy_credit: {len(errors)} endpoint(s) unreachable during the grant "
+            f"read: {'; '.join(errors)}. Answer rests on the "
+            f"{len(per_endpoint)} endpoint(s) that answered.",
+            stacklevel=2,
+        )
     # Surface (do not silently lose) grants whose freshness we could not
     # verify. ``warnings.warn`` is the documented channel — callers can
     # filter with ``warnings.simplefilter("error")`` if they want a hard gate.
@@ -462,6 +619,7 @@ def granted_uact(
     if height <= 0:
         return None
     readings: list[int] = []
+    outcomes: list[tuple[str, int | None, str]] = []  # (base, uact | None, skip reason)
     for base in bases:
         try:
             value = _sum_deposit_grants(
@@ -469,15 +627,54 @@ def granted_uact(
                     f"/cosmos/authz/v1beta1/grants/grantee/{address}", base=base, height=height
                 )
             ).get("uact")
-        except RuntimeError:
+        except RuntimeError as e:
+            outcomes.append((base, None, str(e)))
             continue
         if value is not None:
             readings.append(value)
+            outcomes.append((base, value, ""))
+        else:
+            outcomes.append((base, None, "no parseable uact grant"))
     if not readings:
         return None
     counts = {value: readings.count(value) for value in set(readings)}
     agreeing = [value for value, count in counts.items() if count >= 2]
-    return max(agreeing) if agreeing else None
+    if not agreeing:
+        return None
+    # FAIL-SAFE on an even split (CodeRabbit, #222): with a four-member quorum
+    # reading 2-2, BOTH values satisfy `count >= 2` and max() would return the
+    # LARGER — the optimistic direction this module exists to prevent. min()
+    # under-reports; the TIED warning below tells the operator why.
+    result = min(agreeing)
+    # VISIBILITY, same contract as deploy_credit: a correct-but-silent quorum
+    # hides the split. Name every member that was excluded (could not serve
+    # the pinned height — the measured case is the DEFAULT LCD, which ignores
+    # the x-cosmos-block-height pin and must be skipped every single call)
+    # and every reading that dissented from the majority. The operator sees
+    # WHO was not counted; the value still comes from the agreeing pair.
+    import warnings
+
+    excluded = [(b, r) for b, v, r in outcomes if v is None]
+    # Classify against `result`, NOT membership in `agreeing`: on an even
+    # split both values qualify and the losing pair would be labelled
+    # "agreeing" while differing from the canonical answer (CodeRabbit, #222).
+    dissent = [(b, v) for b, v, r in outcomes if v is not None and v != result]
+    if excluded or dissent:
+        parts: list[str] = []
+        if excluded:
+            listed = ", ".join(f"{b} ({r[:80]})" for b, r in excluded)
+            parts.append(f"quorum excluded {len(excluded)} endpoint(s): {listed}")
+        if dissent:
+            tied = any(counts[v] == counts[result] for _, v in dissent)
+            listed = ", ".join(f"{b}={v}uact" for b, v in dissent)
+            parts.append(f"{'TIED equal-majority split; ' if tied else ''}dissent: {listed}")
+        n_agree = counts[result]
+        warnings.warn(
+            f"granted_uact: {'; '.join(parts)} — canonical {result} uact from "
+            f"{n_agree}/{len(bases)} agreeing endpoint(s) at height {height}.",
+            stacklevel=2,
+        )
+    return result
 
 
 def free_uact(granted_uact_value: int) -> int:

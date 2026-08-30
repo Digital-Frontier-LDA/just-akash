@@ -166,19 +166,35 @@ class TestClassify:
         assert verdict == "LEAVE-unclassifiable"
 
 
+def _chain_records(deployments) -> list[dict]:
+    """The CHAIN's record shape — `{"deployment": {"id": {...}}}`, which is what
+    `chain.list_active_deployments` returns and what the sweep now enumerates from.
+
+    ⚠ These used to be stubbed onto `client.list_deployments`. That call was removed
+    because Console's `GET /v1/deployments` does not scope to the API key: three distinct
+    keys for three distinct accounts returned byte-identical bodies in the same minute,
+    against a chain showing 23 / 33 / 0 active. A test that still stubbed the Console
+    listing would be pinning an enumeration the sweep no longer performs — green, and
+    describing nothing.
+    """
+    return [
+        {"deployment": {"state": "active", "id": {"owner": "akash1me", "dseq": d}}}
+        for d in deployments
+    ]
+
+
 def _mock_client(deployments: dict[str, dict]):
     client = MagicMock()
     client.account_address.return_value = "akash1me"
-    client.list_deployments.return_value = [
-        {"deployment": {"state": "active", "id": {"dseq": d}}} for d in deployments
-    ]
     client.get_deployment.side_effect = lambda d: deployments[str(d)]
+    client._records = _chain_records(deployments)
     return client
 
 
 def _run(client, execute: bool) -> int:
     with (
         patch.object(cs, "AkashConsoleAPI", return_value=client),
+        patch.object(cs.chain, "list_active_deployments", return_value=client._records),
         patch.object(cs.chain, "deploy_credit", return_value={"uact": 100_000_000}),
         patch.object(
             cs,
@@ -236,3 +252,169 @@ class TestRun:
         assert _run(client, execute=True) == 0
         closed = {c.args[0] for c in client.close_deployment.call_args_list}
         assert closed == {good}
+
+
+class TestChainEnumerationIsAuthoritative:
+    """The sweep enumerates from the chain, and an unreadable chain is NOT an empty account.
+
+    ⛔ The property these pin is the reason the enumeration moved. Console's listing could
+    return another account's page, a short page, or a 403 — all indistinguishable from
+    "this wallet is clean" to a caller whose next act is to CLOSE things.
+    """
+
+    def _run_with_chain(self, chain_result, execute=False):
+        client = MagicMock()
+        client.account_address.return_value = "akash1me"
+        client.get_deployment.side_effect = lambda d: _detail(["probe"])
+        with (
+            patch.object(cs, "AkashConsoleAPI", return_value=client),
+            patch.object(cs.chain, "list_active_deployments", return_value=chain_result),
+            patch.object(cs.chain, "deploy_credit", return_value={"uact": 100_000_000}),
+            patch.object(
+                cs,
+                "escrow_locked",
+                return_value={"locked_uact": 0, "deployments": 0, "by_deployment": {}},
+            ),
+            patch.dict("os.environ", {"AKASH_API_KEY": "k"}),
+            patch.object(cs.time, "sleep", lambda s: None),
+        ):
+            return cs.run(execute=execute, now=NOW), client
+
+    def test_an_unreadable_chain_refuses_to_sweep(self, capsys):
+        """⛔ THE LOAD-BEARING ONE. None must exit non-zero and close NOTHING — never be
+        swept as an empty account."""
+        rc, client = self._run_with_chain(None, execute=True)
+        assert rc == 2, (
+            f"an unreadable chain returned {rc}, so a failed enumeration reads as success"
+        )
+        client.close_deployment.assert_not_called()
+        assert "refusing to sweep" in capsys.readouterr().err
+
+    def test_a_genuinely_empty_account_succeeds(self, capsys):
+        """Anti-vacuity partner: if [] also refused, the test above would pass while the
+        sweep could never report a clean account at all."""
+        rc, client = self._run_with_chain([], execute=True)
+        assert rc == 0, "a readable, empty account must succeed"
+        client.close_deployment.assert_not_called()
+        assert "active deployments: 0" in capsys.readouterr().out
+
+    def test_the_console_listing_is_never_called(self):
+        """The whole point of the change. If this call came back, the sweep would silently
+        depend on an enumeration that cannot scope to the account again."""
+        _, client = self._run_with_chain(_chain_records(["1787822013544"]))
+        client.list_deployments.assert_not_called()
+
+    def test_enumeration_is_scoped_to_the_account_address(self):
+        """The chain is asked about THIS key's owner, not some other address."""
+        client = MagicMock()
+        client.account_address.return_value = "akash1me"
+        client.get_deployment.side_effect = lambda d: _detail(["probe"])
+        seen = []
+        with (
+            patch.object(cs, "AkashConsoleAPI", return_value=client),
+            patch.object(
+                cs.chain, "list_active_deployments", side_effect=lambda o: seen.append(o) or []
+            ),
+            patch.object(cs.chain, "deploy_credit", return_value={"uact": 100_000_000}),
+            patch.object(
+                cs,
+                "escrow_locked",
+                return_value={"locked_uact": 0, "deployments": 0, "by_deployment": {}},
+            ),
+            patch.dict("os.environ", {"AKASH_API_KEY": "k"}),
+            patch.object(cs.time, "sleep", lambda s: None),
+        ):
+            cs.run(now=NOW)
+        assert seen == ["akash1me"], f"chain was asked about {seen!r}, not the key's own owner"
+
+
+class TestProtectedDseqs:
+    """The never-close list holds when the classifier is wrong.
+
+    ⛔ WHY IT IS NEEDED HERE AND NOT ONLY IN THE SIBLING SWEEPER. Two of the three closable
+    classes are well-defended — a runner needs on-chain provenance, an unrecognised service
+    set is LEAVE-real-or-unknown — but STALE-e2e closes on SERVICE NAME AND AGE ALONE.
+    Measured against the shipped classifier: services=["backtest"] at 30 days -> STALE-e2e.
+    A long-running research workload sharing a wallet with CI is indistinguishable from an
+    interrupted e2e run, and the sibling sweeper destroyed a 200 GiB persistent volume four
+    times learning that.
+    """
+
+    def _run(self, dseq, services, execute=True, env=None):
+        client = MagicMock()
+        client.account_address.return_value = "akash1me"
+        client.get_deployment.side_effect = lambda d: _detail(services)
+        environ = {"AKASH_API_KEY": "k"}
+        environ.update(env or {})
+        with (
+            patch.object(cs, "AkashConsoleAPI", return_value=client),
+            patch.object(cs.chain, "list_active_deployments", return_value=_chain_records([dseq])),
+            patch.object(cs.chain, "deploy_credit", return_value={"uact": 100_000_000}),
+            patch.object(
+                cs,
+                "escrow_locked",
+                return_value={"locked_uact": 0, "deployments": 0, "by_deployment": {}},
+            ),
+            patch.dict("os.environ", environ),
+            patch.object(cs.time, "sleep", lambda s: None),
+        ):
+            rc = cs.run(execute=execute, now=NOW)
+        return rc, client
+
+    def test_a_protected_dseq_is_not_closed_even_when_stale(self, capsys):
+        stale = _dseq(30 * 86400)
+        with patch.object(cs, "PROTECTED_DSEQS", frozenset({stale})):
+            _, client = self._run(stale, ["backtest"])
+        client.close_deployment.assert_not_called()
+
+    def test_the_same_deployment_UNPROTECTED_is_closed(self):
+        """⛔ THE ANTI-VACUITY PARTNER, AND THE ONE THAT MATTERS. Without it, a sweep that
+        closed nothing at all would satisfy the test above — and "protects everything" is a
+        failure mode indistinguishable from "protects the right thing" until a real leak sits
+        there forever."""
+        stale = _dseq(30 * 86400)
+        with patch.object(cs, "PROTECTED_DSEQS", frozenset()):
+            _, client = self._run(stale, ["backtest"])
+        client.close_deployment.assert_called_once_with(stale)
+
+    def test_the_protection_is_printed_never_silent(self, capsys):
+        """A deployment skipped without a word is indistinguishable from one that was not
+        there, which is how an over-broad allowlist hides a real leak forever."""
+        stale = _dseq(30 * 86400)
+        with patch.object(cs, "PROTECTED_DSEQS", frozenset({stale})):
+            self._run(stale, ["backtest"])
+        out = capsys.readouterr().out
+        assert "PROTECTED-DSEQ" in out
+        assert stale in out
+        assert "PROTECTED (never-close list): 1" in out
+
+    def test_protection_does_not_swallow_the_verdict(self, capsys):
+        """The real classification must still be reported. Replacing STALE-e2e with silence
+        would make the sweep unable to show that a leak-shaped thing was found and spared."""
+        stale = _dseq(30 * 86400)
+        with patch.object(cs, "PROTECTED_DSEQS", frozenset({stale})):
+            self._run(stale, ["backtest"])
+        assert "STALE-e2e" in capsys.readouterr().out
+
+    def test_a_protected_dseq_that_is_NOT_stale_changes_nothing(self):
+        """Protection is a veto on closing, not a reclassification."""
+        fresh = _dseq(60)
+        with patch.object(cs, "PROTECTED_DSEQS", frozenset({fresh})):
+            _, client = self._run(fresh, ["app"])
+        client.close_deployment.assert_not_called()
+
+    def test_the_default_list_carries_the_research_deployment(self):
+        """The default is not empty. An allowlist nobody populated protects nothing, and this
+        one encodes an incident that already happened four times."""
+        assert "1784532174413" in cs.PROTECTED_DSEQS
+
+    def test_the_list_is_env_overridable(self, monkeypatch):
+        monkeypatch.setenv("PROTECTED_DSEQS", "111, 222 ,333")
+        import importlib
+
+        reloaded = importlib.reload(cs)
+        try:
+            assert frozenset({"111", "222", "333"}) == reloaded.PROTECTED_DSEQS
+        finally:
+            monkeypatch.delenv("PROTECTED_DSEQS", raising=False)
+            importlib.reload(cs)

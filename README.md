@@ -51,6 +51,30 @@ uv sync --dev           # install package + dev tools (ruff)
 uv run pre-commit install   # install gitleaks + ruff hooks
 ```
 
+## Verifying what is installed (uv-tool installs do not self-update)
+
+A `uv tool install --from "git+…@<rev>"` pins that rev in
+`~/.local/share/uv/tools/just-akash/uv-receipt.toml`, and `uv tool upgrade`
+**honors the pin: it exits 0 while delivering nothing**. A merged fix can sit
+on `main` for days while every upgrade looks successful — the #168
+grant-reconciliation fix was merged 5 days before the machine running it got
+it, and for those 5 days `balance` reported a superseded grant as live credit.
+
+The check nobody knew to make — installed rev vs `main`:
+
+```bash
+# `uv tool dir` resolves UV_TOOL_DIR and the platform default; the hard-coded
+# ~/.local/share path is wrong on any machine that sets either.
+grep -o 'rev=[a-f0-9]*' "$(uv tool dir)/just-akash/uv-receipt.toml"
+git ls-remote https://github.com/Digital-Frontier-LDA/just-akash main
+```
+
+The command that always delivers is an explicit reinstall at the rev you want:
+
+```bash
+uv tool install --force --from "git+https://github.com/Digital-Frontier-LDA/just-akash@<main-sha>" just-akash
+```
+
 ## Usage
 
 ### With `just` (recommended)
