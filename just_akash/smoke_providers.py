@@ -854,7 +854,7 @@ def _record_no_bid_evidence(provider: str, out: str) -> None:
         print(f"  {YELLOW}NO-BID evidence unavailable{RESET}: {type(e).__name__}: {e}")
 
 
-def _chain_bids_exist(dseq: str) -> bool | None:
+def _chain_bids_exist(dseq: str, owner: str | None = None) -> bool | None:
     """Do any bids exist ON-CHAIN for this dseq? (2026-07-23 audit.)
 
     The smoke's NO-BID verdict — and the critical page behind it — used to rest
@@ -889,7 +889,20 @@ def _chain_bids_exist(dseq: str) -> bool | None:
         bases = _parse_bases(default_bases)
     empty_confirmations = 0
     for base in bases:
-        url = f"{base}/akash/market/v1beta5/bids/list?filters.dseq={dseq}&pagination.limit=5"
+        # filters.owner is not cosmetic — it is the difference between a
+        # selective lookup and a full scan. Measured 2026-08-30 against both
+        # default LCDs: dseq alone TIMED OUT past 30s (the cross-check allows
+        # 8s, so it could never succeed and every verdict came back None);
+        # owner+dseq answered in ~0.2s. Semantics are unchanged: no state
+        # filter, so bids in ANY state still count — which matters because the
+        # probe closes its deployment before cross-checking, leaving the bid in
+        # `closed`, and filtering by state to gain speed would return zero bids
+        # and manufacture a CONFIRMED false no-bid.
+        owner_filter = f"filters.owner={owner}&" if owner else ""
+        url = (
+            f"{base}/akash/market/v1beta5/bids/list?"
+            f"{owner_filter}filters.dseq={dseq}&pagination.limit=5"
+        )
         try:
             with urllib.request.urlopen(url, timeout=8) as resp:  # noqa: S310 — scheme-validated above
                 payload = json.load(resp)

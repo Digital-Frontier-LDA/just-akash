@@ -616,6 +616,29 @@ def _extract_dseq(deployment: dict[str, Any]) -> str | None:
     return None
 
 
+def _extract_owner(deployment: dict[str, Any]) -> str | None:
+    """Owner account of a created deployment. Mirrors _extract_dseq's shapes.
+
+    Needed by the chain cross-check: an LCD `bids/list` filtered by dseq ALONE
+    scans, and both public endpoints time out past 30s on it. Adding
+    filters.owner makes the same query a selective lookup — measured 2026-08-30
+    at ~0.2s against >30s — with identical semantics (any bid, any state).
+    """
+    if not isinstance(deployment, dict):
+        return None
+    if "owner" in deployment:
+        val = deployment["owner"]
+        return str(val) if val is not None else None
+    dep = deployment.get("deployment", {})
+    if not isinstance(dep, dict):
+        return None
+    dep_id = dep.get("id", {})
+    if not isinstance(dep_id, dict):
+        return None
+    val = dep_id.get("owner")
+    return str(val) if val is not None else None
+
+
 def _extract_provider(bid: dict[str, Any]) -> str | None:
     if not isinstance(bid, dict):
         return None

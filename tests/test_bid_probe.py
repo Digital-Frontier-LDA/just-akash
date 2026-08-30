@@ -99,6 +99,17 @@ def test_injection_refuses_an_unexpected_sdl_shape():
 # --------------------------------------------------------------------------
 
 
+def _chain_verdict(value):
+    """monkeypatch stand-in for _chain_bids_exist(dseq, owner=None) -> value.
+
+    A factory rather than an inline lambda at each call site: the signature
+    gained an `owner` argument (the LCD owner filter), and eight inline lambdas
+    would each have to be updated — and each was already at the line-length
+    limit.
+    """
+    return lambda dseq, owner=None: value
+
+
 class FakeClient:
     """Minimal Console API stand-in. Records every close so leaks are visible.
 
@@ -150,7 +161,7 @@ def test_our_bid_is_recorded_and_the_order_is_always_closed(monkeypatch):
 
 
 def test_no_bid_is_confirmed_by_a_retry_before_being_believed(monkeypatch):
-    monkeypatch.setattr("just_akash.smoke_providers._chain_bids_exist", lambda dseq: False)
+    monkeypatch.setattr("just_akash.smoke_providers._chain_bids_exist", _chain_verdict(False))
     # First poll empty, retry finds our bid -> a flake must not page.
     client = FakeClient([[], _bid_from(HETZNER.wallet)])
     slept = []
@@ -169,7 +180,7 @@ def test_no_bid_is_confirmed_by_a_retry_before_being_believed(monkeypatch):
 
 
 def test_sustained_no_bid_survives_the_retry(monkeypatch):
-    monkeypatch.setattr("just_akash.smoke_providers._chain_bids_exist", lambda dseq: False)
+    monkeypatch.setattr("just_akash.smoke_providers._chain_bids_exist", _chain_verdict(False))
     client = FakeClient([[], []])
     recs = run_probe(
         client,
@@ -185,7 +196,7 @@ def test_sustained_no_bid_survives_the_retry(monkeypatch):
 
 def test_index_lag_is_a_skip_not_a_provider_fault(monkeypatch):
     # Console returned no bids but the chain says bids exist: our index lied.
-    monkeypatch.setattr("just_akash.smoke_providers._chain_bids_exist", lambda dseq: True)
+    monkeypatch.setattr("just_akash.smoke_providers._chain_bids_exist", _chain_verdict(True))
     client = FakeClient([[], []])
     recs = run_probe(
         client,
@@ -217,7 +228,7 @@ def test_probe_error_is_a_skip_and_does_not_abort_the_run(monkeypatch):
     # The second pair reaches the no-bid path, which cross-checks the chain.
     # Without this stub the test would make live calls to the public LCD
     # endpoints — slow, flaky, and dependent on someone else's uptime.
-    monkeypatch.setattr("just_akash.smoke_providers._chain_bids_exist", lambda dseq: False)
+    monkeypatch.setattr("just_akash.smoke_providers._chain_bids_exist", _chain_verdict(False))
 
     class FlakyClient(FakeClient):
         def create_deployment(self, sdl, deposit=0.5):
@@ -337,7 +348,7 @@ def test_carriage_returns_cannot_split_a_sample_line():
 def test_retry_delay_zero_disables_the_retry_entirely(monkeypatch):
     # The CLI documents 0 as "disables the retry", so it must not merely make
     # the confirming re-probe instant — that doubles the orders on every no-bid.
-    monkeypatch.setattr("just_akash.smoke_providers._chain_bids_exist", lambda dseq: False)
+    monkeypatch.setattr("just_akash.smoke_providers._chain_bids_exist", _chain_verdict(False))
     client = FakeClient([[], []])
     recs = run_probe(
         client,
@@ -483,7 +494,7 @@ class TestUnverifiableCrossCheckIsNotAProviderFault:
         )
 
     def test_unverifiable_is_a_skip(self, monkeypatch):
-        monkeypatch.setattr("just_akash.smoke_providers._chain_bids_exist", lambda dseq: None)
+        monkeypatch.setattr("just_akash.smoke_providers._chain_bids_exist", _chain_verdict(None))
         client = FakeClient([[], []])
         recs = run_probe(
             client,
@@ -499,7 +510,7 @@ class TestUnverifiableCrossCheckIsNotAProviderFault:
 
     def test_chain_confirmed_absence_is_still_a_real_no_bid(self, monkeypatch):
         """The fix must not silence genuine no-bids: False is still an ANSWER."""
-        monkeypatch.setattr("just_akash.smoke_providers._chain_bids_exist", lambda dseq: False)
+        monkeypatch.setattr("just_akash.smoke_providers._chain_bids_exist", _chain_verdict(False))
         client = FakeClient([[], []])
         recs = run_probe(
             client,
@@ -513,7 +524,7 @@ class TestUnverifiableCrossCheckIsNotAProviderFault:
     def test_unverifiable_still_gets_its_confirming_retry(self, monkeypatch):
         """Reclassifying must not drop the retry — an unverifiable answer is
         exactly the case worth asking twice."""
-        monkeypatch.setattr("just_akash.smoke_providers._chain_bids_exist", lambda dseq: None)
+        monkeypatch.setattr("just_akash.smoke_providers._chain_bids_exist", _chain_verdict(None))
         client = FakeClient([[], []])
         slept = []
         recs = run_probe(

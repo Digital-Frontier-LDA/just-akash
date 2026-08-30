@@ -1198,7 +1198,7 @@ class TestOrphanProbeSweep:
     def _fake_api(self, deployments, details):
         api = MagicMock()
         api.list_deployments.return_value = deployments
-        api.get_deployment.side_effect = lambda dseq: details[dseq]
+        api.get_deployment.side_effect = lambda dseq, owner=None: details[dseq]
         return api
 
     def test_sweep_reaps_only_the_old_probe(self):
@@ -2365,3 +2365,65 @@ class TestBidWaitInvariant:
         deploy_mod = pytest.importorskip("just_akash.deploy")
         with pytest.raises(ValueError, match="total auction deadline"):
             deploy_mod.deploy(sdl_path="unused.yml", bid_wait=120, bid_wait_retry=60)
+
+
+class TestChainCrossCheckUsesTheOwnerFilter:
+    """The owner filter is the difference between a lookup and a full scan.
+
+    Measured 2026-08-30 against both default LCDs: `bids/list` filtered by dseq
+    ALONE timed out past 30s, while the cross-check allows 8s — so it could
+    never return a verdict and every no-bid came back "unverifiable". Adding
+    filters.owner answered the same question in ~0.2s.
+
+    Semantics must NOT change: no state filter. The probe closes its deployment
+    before cross-checking, so a matching bid sits in `closed`; filtering by
+    state to gain speed returns zero bids and manufactures a CONFIRMED false
+    no-bid, which pages. (Verified: state=open/active answer fast but return 0
+    for a dseq that demonstrably had a bid; state=closed/lost time out.)
+    """
+
+    def _capture(self, monkeypatch, owner):
+        seen = []
+
+        class _Resp:
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *a):
+                return False
+
+            def read(self_inner):
+                return b'{"bids": []}'
+
+        def fake_urlopen(url, timeout=0):
+            seen.append(url)
+            return _Resp()
+
+        monkeypatch.setattr(sp.urllib.request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(sp.json, "load", lambda fh: {"bids": []})
+        sp._chain_bids_exist("12345", owner)
+        return seen
+
+    def test_owner_is_sent_when_known(self, monkeypatch):
+        urls = self._capture(monkeypatch, "akash1owner")
+        assert urls, "no LCD request was made"
+        assert all("filters.owner=akash1owner" in u for u in urls), (
+            "the owner filter is missing — the query degrades to a full scan "
+            f"and will time out: {urls[0]}"
+        )
+        assert all("filters.dseq=12345" in u for u in urls)
+
+    def test_no_state_filter_is_ever_added(self, monkeypatch):
+        """A state filter would be fast and WRONG — see the class docstring."""
+        urls = self._capture(monkeypatch, "akash1owner")
+        assert all("filters.state" not in u for u in urls), (
+            "a state filter would miss bids on the closed deployment the probe "
+            "has already torn down, producing a confirmed false no-bid"
+        )
+
+    def test_absent_owner_still_queries(self, monkeypatch):
+        """Callers that cannot supply an owner (the smoke parses dseq from CLI
+        output) must keep working, just without the fast path."""
+        urls = self._capture(monkeypatch, None)
+        assert urls and all("filters.owner" not in u for u in urls)
+        assert all("filters.dseq=12345" in u for u in urls)

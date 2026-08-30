@@ -495,7 +495,7 @@ def probe_pair(
     # "nobody bid" (2026-07-23 audit). An index lag is NOT a provider fault.
     from .smoke_providers import _chain_bids_exist
 
-    on_chain = _chain_bids_exist(str(res.get("dseq") or ""))
+    on_chain = _chain_bids_exist(str(res.get("dseq") or ""), res.get("owner"))
     if on_chain is True:
         return ProbeRecord(
             cluster=target.cluster,
