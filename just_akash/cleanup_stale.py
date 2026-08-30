@@ -78,6 +78,35 @@ STALE_RUNNER_AGE_SECONDS = 6 * 3600
 STALE_VERDICTS = ("STALE-probe", "STALE-e2e", "STALE-runner")
 
 
+# ⛔ DEPLOYMENTS THAT MUST NEVER BE CLOSED, WHATEVER THE CLASSIFIER SAYS.
+#
+# This is not defensive padding. The classifier below is strong on two of its three closable
+# classes — a runner needs on-chain provenance, and anything with an unrecognised service set
+# is LEAVE-real-or-unknown — but STALE-e2e closes on SERVICE NAME AND AGE ALONE. Measured
+# against the shipped classifier: services=["backtest"] at 30 days -> STALE-e2e -> CLOSES.
+#
+# A long-running research or backtest workload sharing a Console wallet with CI is therefore
+# INDISTINGUISHABLE from an interrupted e2e run. The sibling sweeper in Blazing-Back learned
+# this the expensive way: the df-sci-runtime deployment (64 vCPU / 64 GiB / 200 GiB
+# persistent) was destroyed FOUR times — dseqs 1784375167504, 1784396842984, 1784470750834,
+# and the current incarnation — each close taking the persistent volume with it.
+#
+# ⚠ THE DURABLE FIX IS A NARROWER PREDICATE, NOT A LONGER LIST, and this does not pretend
+# otherwise. An allowlist protects the instances someone remembered to add; it cannot protect
+# the next research deployment nobody told it about. It is kept because it is cheap, exact,
+# and orthogonal to every heuristic above it — the one protection that holds when the
+# classifier is wrong.
+#
+# ⚠ AND IT IS PRINTED, NEVER SILENT. A deployment skipped without a word is indistinguishable
+# from one that was not there, which is how an over-broad allowlist would hide a real leak
+# forever.
+PROTECTED_DSEQS = frozenset(
+    d.strip()
+    for d in os.environ.get("PROTECTED_DSEQS", "1784532174413").split(",")
+    if d.strip()
+)
+
+
 def classify(
     detail: dict,
     dseq: str,
@@ -205,6 +234,7 @@ def run(
     print(f"active deployments: {len(deployments)} (source: chain, owner-scoped)\n")
 
     stale: list[str] = []
+    protected: list[str] = []
     for d in deployments:
         dseq = _extract_dseq(d)
         if not dseq:
@@ -224,9 +254,15 @@ def run(
         filtered = only_service is not None and set(services or []) != {only_service}
         suffix = f" (skipped: not services=={{{only_service}}})" if filtered else ""
         print(f"  {dseq}  age={age_str}  services={services or '-'}  -> {verdict}{suffix}")
+        if verdict in STALE_VERDICTS and dseq in PROTECTED_DSEQS:
+            print(f"    ^ PROTECTED-DSEQ: on the never-close list, {verdict} overridden")
+            protected.append(dseq)
+            continue
         if verdict in STALE_VERDICTS and not filtered:
             stale.append(dseq)
 
+    if protected:
+        print(f"\nPROTECTED (never-close list): {len(protected)} -> {', '.join(protected)}")
     print(f"\nstale (closable): {len(stale)}")
     if not execute:
         print("DRY RUN — nothing closed. Re-run with --execute to close the stale set.")

@@ -319,3 +319,95 @@ class TestChainEnumerationIsAuthoritative:
         ):
             cs.run(now=NOW)
         assert seen == ["akash1me"], f"chain was asked about {seen!r}, not the key's own owner"
+
+
+class TestProtectedDseqs:
+    """The never-close list holds when the classifier is wrong.
+
+    ⛔ WHY IT IS NEEDED HERE AND NOT ONLY IN THE SIBLING SWEEPER. Two of the three closable
+    classes are well-defended — a runner needs on-chain provenance, an unrecognised service
+    set is LEAVE-real-or-unknown — but STALE-e2e closes on SERVICE NAME AND AGE ALONE.
+    Measured against the shipped classifier: services=["backtest"] at 30 days -> STALE-e2e.
+    A long-running research workload sharing a wallet with CI is indistinguishable from an
+    interrupted e2e run, and the sibling sweeper destroyed a 200 GiB persistent volume four
+    times learning that.
+    """
+
+    def _run(self, dseq, services, execute=True, env=None):
+        client = MagicMock()
+        client.account_address.return_value = "akash1me"
+        client.get_deployment.side_effect = lambda d: _detail(services)
+        environ = {"AKASH_API_KEY": "k"}
+        environ.update(env or {})
+        with (
+            patch.object(cs, "AkashConsoleAPI", return_value=client),
+            patch.object(cs.chain, "list_active_deployments", return_value=_chain_records([dseq])),
+            patch.object(cs.chain, "deploy_credit", return_value={"uact": 100_000_000}),
+            patch.object(
+                cs,
+                "escrow_locked",
+                return_value={"locked_uact": 0, "deployments": 0, "by_deployment": {}},
+            ),
+            patch.dict("os.environ", environ),
+            patch.object(cs.time, "sleep", lambda s: None),
+        ):
+            rc = cs.run(execute=execute, now=NOW)
+        return rc, client
+
+    def test_a_protected_dseq_is_not_closed_even_when_stale(self, capsys):
+        stale = _dseq(30 * 86400)
+        with patch.object(cs, "PROTECTED_DSEQS", frozenset({stale})):
+            _, client = self._run(stale, ["backtest"])
+        client.close_deployment.assert_not_called()
+
+    def test_the_same_deployment_UNPROTECTED_is_closed(self):
+        """⛔ THE ANTI-VACUITY PARTNER, AND THE ONE THAT MATTERS. Without it, a sweep that
+        closed nothing at all would satisfy the test above — and "protects everything" is a
+        failure mode indistinguishable from "protects the right thing" until a real leak sits
+        there forever."""
+        stale = _dseq(30 * 86400)
+        with patch.object(cs, "PROTECTED_DSEQS", frozenset()):
+            _, client = self._run(stale, ["backtest"])
+        client.close_deployment.assert_called_once_with(stale)
+
+    def test_the_protection_is_printed_never_silent(self, capsys):
+        """A deployment skipped without a word is indistinguishable from one that was not
+        there, which is how an over-broad allowlist hides a real leak forever."""
+        stale = _dseq(30 * 86400)
+        with patch.object(cs, "PROTECTED_DSEQS", frozenset({stale})):
+            self._run(stale, ["backtest"])
+        out = capsys.readouterr().out
+        assert "PROTECTED-DSEQ" in out
+        assert stale in out
+        assert "PROTECTED (never-close list): 1" in out
+
+    def test_protection_does_not_swallow_the_verdict(self, capsys):
+        """The real classification must still be reported. Replacing STALE-e2e with silence
+        would make the sweep unable to show that a leak-shaped thing was found and spared."""
+        stale = _dseq(30 * 86400)
+        with patch.object(cs, "PROTECTED_DSEQS", frozenset({stale})):
+            self._run(stale, ["backtest"])
+        assert "STALE-e2e" in capsys.readouterr().out
+
+    def test_a_protected_dseq_that_is_NOT_stale_changes_nothing(self):
+        """Protection is a veto on closing, not a reclassification."""
+        fresh = _dseq(60)
+        with patch.object(cs, "PROTECTED_DSEQS", frozenset({fresh})):
+            _, client = self._run(fresh, ["app"])
+        client.close_deployment.assert_not_called()
+
+    def test_the_default_list_carries_the_research_deployment(self):
+        """The default is not empty. An allowlist nobody populated protects nothing, and this
+        one encodes an incident that already happened four times."""
+        assert "1784532174413" in cs.PROTECTED_DSEQS
+
+    def test_the_list_is_env_overridable(self, monkeypatch):
+        monkeypatch.setenv("PROTECTED_DSEQS", "111, 222 ,333")
+        import importlib
+
+        reloaded = importlib.reload(cs)
+        try:
+            assert reloaded.PROTECTED_DSEQS == frozenset({"111", "222", "333"})
+        finally:
+            monkeypatch.delenv("PROTECTED_DSEQS", raising=False)
+            importlib.reload(cs)
