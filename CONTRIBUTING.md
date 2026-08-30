@@ -51,6 +51,21 @@ uv run python -c "import akash_lease_core, sys; print('OK', sys.executable)"
 python3      -c "import akash_lease_core, sys; print('OK', sys.executable)"
 ```
 
+⛔ **`ruff check` and `ruff format --check` are TWO SEPARATE GATES.** CI runs both
+(`ci.yml:35` and `:38`) and a tree can pass one while failing the other. `just lint` runs
+both; reading "All checks passed!" from `ruff check` alone and concluding the tree is clean is
+how a CI round gets spent learning it is not — measured twice in one session on this repo.
+
+```bash
+uv run ruff check .          # gate 1
+uv run ruff format --check . # gate 2 — DIFFERENT gate, different answer
+uv run ruff format .         # apply
+```
+
+⚠ And `ruff format` **rewraps lines**, so a patch anchored on a line it reformatted will
+silently match nothing. If you are scripting an edit, assert the anchor was found rather than
+trusting a `str.replace` that returns the string unchanged when it fails.
+
 ⚠ **`just test` is not this.** It runs the full lifecycle E2E — it deploys real
 infrastructure and spends escrow. `just unit` is the one you want.
 
