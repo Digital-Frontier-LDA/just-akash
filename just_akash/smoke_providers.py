@@ -56,6 +56,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from shlex import quote as q
@@ -898,11 +899,15 @@ def _chain_bids_exist(dseq: str, owner: str | None = None) -> bool | None:
         # probe closes its deployment before cross-checking, leaving the bid in
         # `closed`, and filtering by state to gain speed would return zero bids
         # and manufacture a CONFIRMED false no-bid.
-        owner_filter = f"filters.owner={owner}&" if owner else ""
-        url = (
-            f"{base}/akash/market/v1beta5/bids/list?"
-            f"{owner_filter}filters.dseq={dseq}&pagination.limit=5"
-        )
+        params = {"filters.dseq": dseq, "pagination.limit": "5"}
+        if owner:
+            params["filters.owner"] = owner
+        # urlencode, not concatenation: an owner or dseq carrying a reserved
+        # character (&, ?, #) would otherwise change the query's meaning — at
+        # best dropping the owner filter and silently restoring the timeout
+        # this function exists to avoid, at worst returning another account's
+        # bids as evidence about ours.
+        url = f"{base}/akash/market/v1beta5/bids/list?{urllib.parse.urlencode(params)}"
         try:
             with urllib.request.urlopen(url, timeout=8) as resp:  # noqa: S310 — scheme-validated above
                 payload = json.load(resp)

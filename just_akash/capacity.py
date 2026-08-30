@@ -114,7 +114,8 @@ def probe_order_sdl(
     scripts it replaced leaked escrow every time they raised mid-probe — so
     there must be exactly one implementation of it.
 
-    Returns ``{placeable, bidders, dseq, waited_s}``. Never creates a lease.
+    Returns ``{placeable, bidders, dseq, owner, waited_s}``. Never creates a
+    lease. ``owner`` is carried so the chain cross-check can filter by it.
     """
     from .api import _extract_bid_price, _extract_dseq, _extract_owner, _extract_provider
     from .deploy import _is_open_bid
