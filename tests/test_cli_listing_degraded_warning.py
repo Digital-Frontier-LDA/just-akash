@@ -27,10 +27,12 @@ class _FakeClient:
     to the unconfirmed path (None chain count)."""
 
     def __init__(self, address: str = "akash1test", raise_addr: bool = False):
+        """Hold the address to return (or raise the address call on demand)."""
         self._address = address
         self._raise = raise_addr
 
     def account_address(self) -> str:
+        """Return the fake address, or simulate a primary-source failure."""
         if self._raise:
             raise RuntimeError("primary source unreadable")
         return self._address
@@ -42,6 +44,7 @@ def test_non_empty_listing_emits_no_warning(monkeypatch, capsys):
     called = {"chain": 0}
 
     def _count(_addr):
+        """Stub chain counter; record the call to assert no round-trip happens."""
         called["chain"] += 1
         return 7
 
@@ -103,6 +106,7 @@ def test_decision_is_a_pure_function_of_three_args(monkeypatch, capsys):
     seen = {}
 
     def _fake_corroborate(listing_is_empty, chain_active, address=""):
+        """Stub corroboration; record all 3 args to assert pure delegation."""
         seen["listing_is_empty"] = listing_is_empty
         seen["chain_active"] = chain_active
         seen["address"] = address
