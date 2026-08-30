@@ -10,6 +10,8 @@ from __future__ import annotations
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from just_akash import cleanup_stale as cs
 
 NOW = time.time()
@@ -418,3 +420,114 @@ class TestProtectedDseqs:
         finally:
             monkeypatch.delenv("PROTECTED_DSEQS", raising=False)
             importlib.reload(cs)
+
+
+class TestPlacementPrefixIsAReapParameter:
+    """The ownership prefix is a parameter of the REAP, never of the STAMP.
+
+    ⛔ WHY IT EXISTS. The sibling repo stamps `dfci-infra-` and this one stamps
+    `just-akash-`; the prefix IS the ownership boundary, which is what makes each sweep safe.
+    With it hardcoded, a sibling adopting this implementation would get a reaper that matches
+    NONE of its own deployments — reporting 0 forever while looking adopted. That is worse
+    than no adoption, because it satisfies an adoption audit while reaping nothing.
+
+    ⚠ And the stamp must NOT move with it: `deploy.py` writes `provenance.PLACEMENT_PREFIX`
+    unconditionally, so nothing already on chain is orphaned.
+    """
+
+    def test_a_sibling_prefix_reaps_a_sibling_runner(self):
+        v, _, _ = cs.classify(
+            _detail(["runner"]),
+            _dseq(86400),
+            NOW,
+            True,
+            ["dfci-infra-runner-run-123-end"],
+            "dfci-infra-",
+        )
+        assert v == "STALE-runner"
+
+    def test_the_same_deployment_under_the_DEFAULT_prefix_is_not_ours(self):
+        """Anti-vacuity partner: without it, a parameter that was ignored entirely would
+        satisfy the test above."""
+        v, _, _ = cs.classify(
+            _detail(["runner"]),
+            _dseq(86400),
+            NOW,
+            True,
+            ["dfci-infra-runner-run-123-end"],
+        )
+        assert v == "LEAVE-not-ours"
+
+    def test_the_default_prefix_still_reaps_our_own(self):
+        v, _, _ = cs.classify(
+            _detail(["runner"]),
+            _dseq(86400),
+            NOW,
+            True,
+            ["just-akash-runner.abc"],
+        )
+        assert v == "STALE-runner"
+
+    def test_a_foreign_prefix_is_still_refused_under_a_custom_prefix(self):
+        """Parameterising must not weaken the predicate — only re-aim it."""
+        v, _, _ = cs.classify(
+            _detail(["runner"]),
+            _dseq(86400),
+            NOW,
+            True,
+            ["someone-else-runner.abc"],
+            "dfci-infra-",
+        )
+        assert v == "LEAVE-not-ours"
+
+    @pytest.mark.parametrize("blank", ["", "   ", None])
+    def test_a_blank_prefix_is_REFUSED_not_permissive(self, blank, capsys):
+        """⛔ THE CATASTROPHIC CASE. `"".startswith(x)` is True for every string, so an empty
+        prefix turns the ownership conjunct into a tautology and the sweep would claim every
+        deployment on the account — including other repos'. A sweep on shape alone once
+        destroyed 14 third-party deployments."""
+        client = MagicMock()
+        client.account_address.return_value = "akash1me"
+        with (
+            patch.object(cs, "AkashConsoleAPI", return_value=client),
+            patch.object(cs.chain, "list_active_deployments", return_value=[]),
+            patch.dict("os.environ", {"AKASH_API_KEY": "k"}),
+        ):
+            rc = cs.run(execute=True, now=NOW, placement_prefix=blank)
+        assert rc == 2, f"a blank prefix returned {rc} instead of refusing"
+        client.close_deployment.assert_not_called()
+        assert "Refusing to run" in capsys.readouterr().err
+
+    def test_the_prefix_in_force_is_PRINTED(self, capsys):
+        """'0 closable' and 'looking for the wrong prefix' are otherwise the same output,
+        and the second reads as a clean account forever."""
+        client = MagicMock()
+        client.account_address.return_value = "akash1me"
+        with (
+            patch.object(cs, "AkashConsoleAPI", return_value=client),
+            patch.object(cs.chain, "list_active_deployments", return_value=[]),
+            patch.object(cs.chain, "deploy_credit", return_value={"uact": 1}),
+            patch.object(
+                cs,
+                "escrow_locked",
+                return_value={"locked_uact": 0, "deployments": 0, "by_deployment": {}},
+            ),
+            patch.dict("os.environ", {"AKASH_API_KEY": "k"}),
+            patch.object(cs.time, "sleep", lambda s: None),
+        ):
+            cs.run(now=NOW, placement_prefix="dfci-infra-")
+        assert "ownership prefix: 'dfci-infra-'" in capsys.readouterr().out
+
+    def test_the_STAMP_is_not_parameterised(self):
+        """⚠ deploy.py must keep writing the module constant. Making the stamp configurable
+        would orphan every deployment already carrying the old value — they stop matching,
+        and under a positive-allowlist sweeper that means PROTECTED and alarmed, but it also
+        means nothing reaps them."""
+        import inspect
+
+        from just_akash import deploy
+
+        src = inspect.getsource(deploy)
+        assert "placement_prefix" not in src, (
+            "deploy.py gained a configurable prefix — the stamp must stay the module constant"
+        )

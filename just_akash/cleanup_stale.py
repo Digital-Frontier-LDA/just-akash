@@ -111,8 +111,16 @@ def classify(
     now: float | None = None,
     reap_runners: bool = False,
     group_names: list[str] | None = None,
+    placement_prefix: str = PLACEMENT_PREFIX,
 ) -> tuple[str, list[str], float | None]:
-    """(verdict, services, age_seconds) for one deployment detail."""
+    """(verdict, services, age_seconds) for one deployment detail.
+
+    ``placement_prefix`` is the on-chain provenance marker a runner must carry to be
+    considered OURS. It is a parameter of the REAP, never of the STAMP: `deploy.py` still
+    writes `provenance.PLACEMENT_PREFIX` unconditionally, so nothing already deployed is
+    orphaned. What this makes possible is a sibling repo sweeping ITS OWN prefix with this
+    implementation instead of a second one.
+    """
     services = sorted(_deployment_service_names(detail))
     age = _probe_age_seconds(dseq, now)
     if services == [PROBE_SERVICE]:
@@ -143,7 +151,7 @@ def classify(
             # deployment may have closed under us. Destroying on a failed read is the
             # same class of error as destroying on a guess.
             return "LEAVE-unverified-runner", services, age
-        if not any(n.startswith(PLACEMENT_PREFIX) for n in group_names):
+        if not any(n.startswith(placement_prefix) for n in group_names):
             return "LEAVE-not-ours", services, age
         if age is not None and age >= STALE_RUNNER_AGE_SECONDS:
             return "STALE-runner", services, age
@@ -173,6 +181,7 @@ def run(
     now: float | None = None,
     reap_runners: bool = False,
     only_service: str | None = None,
+    placement_prefix: str = PLACEMENT_PREFIX,
 ) -> int:
     """Audit (and optionally close) stale test deployments.
 
@@ -191,6 +200,20 @@ def run(
     moot for that run, which is the point — the bid-probe's own sweep has no
     business deciding anything about a runner pool.
     """
+    # ⛔ A BLANK PREFIX MATCHES EVERY DEPLOYMENT ON THE ACCOUNT. `"".startswith` is True for
+    # any string, so an empty prefix turns the ownership conjunct — the ONLY thing standing
+    # between this reaper and a third party's workload — into a tautology. That is how a
+    # sweep once destroyed 14 third-party deployments. An absent value is a configuration
+    # error, never a permissive default.
+    placement_prefix = (placement_prefix or "").strip()
+    if not placement_prefix:
+        print(
+            "Error: placement prefix is empty. It is the ownership predicate; blank matches "
+            "EVERY deployment on the account, including other repos'. Refusing to run.",
+            file=sys.stderr,
+        )
+        return 2
+
     api_key = os.environ.get("AKASH_API_KEY")
     if not api_key:
         print("Error: AKASH_API_KEY not set.", file=sys.stderr)
@@ -229,7 +252,10 @@ def run(
             file=sys.stderr,
         )
         return 2
-    print(f"active deployments: {len(deployments)} (source: chain, owner-scoped)\n")
+    print(f"active deployments: {len(deployments)} (source: chain, owner-scoped)")
+    # ⚠ PRINTED, because "0 closable" and "looking for the wrong prefix" are the same
+    # output otherwise — and the second reads as a clean account forever.
+    print(f"ownership prefix: {placement_prefix!r}\n")
 
     stale: list[str] = []
     protected: list[str] = []
@@ -247,7 +273,7 @@ def run(
         names: list[str] | None = None
         if reap_runners and _deployment_service_names(detail) == {RUNNER_SERVICE}:
             names = chain.deployment_group_names(address, dseq)
-        verdict, services, age = classify(detail, dseq, now, reap_runners, names)
+        verdict, services, age = classify(detail, dseq, now, reap_runners, names, placement_prefix)
         age_str = f"{age / 86400:5.1f}d" if age is not None else "   ?  "
         filtered = only_service is not None and set(services or []) != {only_service}
         suffix = f" (skipped: not services=={{{only_service}}})" if filtered else ""
@@ -311,10 +337,22 @@ def main(argv: list[str] | None = None) -> int:
             "close a long-lived class it does not understand."
         ),
     )
+    ap.add_argument(
+        "--placement-prefix",
+        default=os.environ.get("AKASH_PLACEMENT_PREFIX", PLACEMENT_PREFIX),
+        metavar="PREFIX",
+        help=(
+            "The on-chain provenance marker a runner must carry to count as ours "
+            f"(default: {PLACEMENT_PREFIX!r}). Set this ONLY to sweep a sibling repo's own "
+            "prefix with this implementation; it changes what is REAPED, never what is "
+            "STAMPED. A blank value is refused — it would match everything."
+        ),
+    )
     args = ap.parse_args(argv)
     return run(
         execute=args.execute,
         reap_runners=args.reap_runners,
+        placement_prefix=args.placement_prefix,
         only_service=args.only_service,
     )
 
