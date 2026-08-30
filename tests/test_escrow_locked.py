@@ -26,7 +26,7 @@ def _deployment(dseq, escrow_uact=None, denom="uact"):
 def _client(deployments):
     c = MagicMock()
     c.list_deployments.return_value = deployments
-    c.get_deployment.side_effect = lambda dseq: next(
+    c.get_deployment.side_effect = lambda dseq, owner=None: next(
         (d for d in deployments if d["dseq"] == str(dseq)), {}
     )
     return c

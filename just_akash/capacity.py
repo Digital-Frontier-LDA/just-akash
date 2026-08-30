@@ -114,9 +114,10 @@ def probe_order_sdl(
     scripts it replaced leaked escrow every time they raised mid-probe — so
     there must be exactly one implementation of it.
 
-    Returns ``{placeable, bidders, dseq, waited_s}``. Never creates a lease.
+    Returns ``{placeable, bidders, dseq, owner, waited_s}``. Never creates a
+    lease. ``owner`` is carried so the chain cross-check can filter by it.
     """
-    from .api import _extract_bid_price, _extract_dseq, _extract_provider
+    from .api import _extract_bid_price, _extract_dseq, _extract_owner, _extract_provider
     from .deploy import _is_open_bid
 
     # poll_s must advance the clock. At 0 the loop sleeps for nothing, `waited`
@@ -127,6 +128,9 @@ def probe_order_sdl(
 
     dep = client.create_deployment(sdl, deposit=deposit)
     dseq = _extract_dseq(dep)
+    # Carried so the chain cross-check can filter by owner; without it the LCD
+    # query scans and times out. See _extract_owner.
+    owner = _extract_owner(dep)
     bidders: list[dict[str, Any]] = []
     waited = 0
     try:
@@ -158,5 +162,6 @@ def probe_order_sdl(
         "placeable": bool(bidders),
         "bidders": bidders,
         "dseq": dseq,
+        "owner": owner,
         "waited_s": waited,
     }

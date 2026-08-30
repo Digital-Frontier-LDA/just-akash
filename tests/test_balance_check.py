@@ -150,7 +150,7 @@ class TestCheckGatesOnFreeNotGrant:
             client = MockAPI.return_value
             client.account_address.return_value = "akash1me"
             client.list_deployments.return_value = deployments
-            client.get_deployment.side_effect = lambda dseq: next(
+            client.get_deployment.side_effect = lambda dseq, owner=None: next(
                 (d for d in deployments if d["dseq"] == str(dseq)), {}
             )
             from just_akash.cli import main
