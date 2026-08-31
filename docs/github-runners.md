@@ -22,12 +22,15 @@ numbers exist **only in df-wiki**. A contributor who hits `§1` in CI output and
 repo finds nothing — which was the state of this repo until #238: two of the canonical
 reusables consumed, and **zero** references to either standard.
 
-Consumed here, both pinned to `akash-github-runner@5d82c597`:
+Consumed here — both pinned to `Digital-Frontier-LDA/akash-github-runner@5d82c597`:
 
-```
-.github/workflows/reusable-akash-runner-conformance.yml
-.github/workflows/reusable-stale-runner-reaper.yml
-```
+| local caller (this repo) | upstream reusable it calls |
+|---|---|
+| `.github/workflows/runner-conformance.yml` | `Digital-Frontier-LDA/akash-github-runner` → `reusable-akash-runner-conformance.yml` |
+| `.github/workflows/reap-stale-runners.yml` | `Digital-Frontier-LDA/akash-github-runner` → `reusable-stale-runner-reaper.yml` |
+
+⚠ The `reusable-*.yml` files are **not in this repo** — they live upstream. Only the callers
+in the left column exist here.
 
 
 > [!note]
