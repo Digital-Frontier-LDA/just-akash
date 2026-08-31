@@ -6,6 +6,19 @@ Contributions are welcome — bug reports, fixes, and well-scoped features.
 
 For anything beyond a small bug fix, open an issue first to discuss the change. This avoids wasted effort if the direction doesn't fit the project.
 
+## If you are touching the GitHub runners
+
+The runner workflows here implement a standard defined in **other repos**, and the CI rules
+that enforce it cite **section numbers** that exist in only one of them:
+
+- **§-numbered mandates §1–§11** → df-wiki `content/platform/akash-github-runners.md`
+- **CI contract and workflow template** → df-cicd `standards/AKASH-RUNNER-CI.md`
+- **the rules that enforce both** → akash-github-runner `akash_runner/check_*.py`, consumed
+  here via the canonical reusable
+
+⚠ A conformance finding citing `§N` cannot be resolved from this repo alone — the numbers are
+not defined here. See `docs/github-runners.md` for the full pointer.
+
 ## Setup
 
 ```bash

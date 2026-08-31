@@ -3,6 +3,33 @@
 Two reusable workflows that run your CI on Akash instead of GitHub-hosted runners, and —
 more importantly — **tell you why** when they can't.
 
+## The standard this implements
+
+This repo **implements** the Akash runner standard; it does not define it. Two documents do,
+and they are normative for different things — reading the wrong one is how a §-numbered
+finding becomes unanswerable:
+
+| document | normative for |
+|---|---|
+| **df-wiki** `content/platform/akash-github-runners.md` | the numbered **mandates** §1–§11 — the only doc with `## N` sections |
+| **df-cicd** `standards/AKASH-RUNNER-CI.md` | the **CI contract** and the workflow template |
+| **akash-github-runner** `akash_runner/check_*.py` | the **rules that enforce** both |
+
+⇒ For a §-numbered mandate, read **df-wiki**. For the CI contract, read **df-cicd**.
+
+⚠ This matters because the enforcing rules cite section numbers in their findings, and those
+numbers exist **only in df-wiki**. A contributor who hits `§1` in CI output and searches this
+repo finds nothing — which was the state of this repo until #238: two of the canonical
+reusables consumed, and **zero** references to either standard.
+
+Consumed here, both pinned to `akash-github-runner@5d82c597`:
+
+```
+.github/workflows/reusable-akash-runner-conformance.yml
+.github/workflows/reusable-stale-runner-reaper.yml
+```
+
+
 > [!note]
 > **`runner-v1` is tagged** (2026-08-07). The gate: **three providers, each passing three
 > CONSECUTIVE full-bar attempts** — 9 of 9 overall, and 3/3 per provider, which is the
