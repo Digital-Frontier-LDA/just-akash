@@ -94,3 +94,69 @@ def test_the_existing_service_verdicts_are_unchanged() -> None:
     verdicts — this change adds a fallback, it does not re-route them."""
     assert _classify("runner", OLD, [f"{PLACEMENT_PREFIX}runner"]) != "STALE-owned"
     assert classify(_detail("backtest"), _dseq_aged(OLD), reap_owned=True)[0] == "STALE-e2e"
+
+
+# ── the wiring, not just the rule ─────────────────────────────────────────────────────
+#
+# ⛔ THE RULE ABOVE WAS CORRECT AND UNREACHABLE. As first written, `run()` had no
+# `reap_owned` parameter, `classify` was called POSITIONALLY (so the flag could never
+# arrive), and provenance was read only for `services == {runner}` — so even a wired flag
+# would have seen `group_names=None` and returned LEAVE-unverified-owned for everything.
+#
+# ⚠ Three independent breaks, each of which alone makes the feature inert, and NONE of
+# which a test of `classify` can see. A rule nobody can invoke is the failure this estate
+# keeps finding; these tests exist so it cannot recur silently here.
+
+def test_run_accepts_the_flag() -> None:
+    """`run()` must take `reap_owned` — without it the CLI has nothing to pass."""
+    import inspect
+
+    from just_akash.cleanup_stale import run
+
+    assert "reap_owned" in inspect.signature(run).parameters, (
+        "run() has no reap_owned parameter — the rule in classify() is unreachable"
+    )
+
+
+def test_classify_receives_the_flag_by_keyword() -> None:
+    """⛔ POSITIONAL CALLS SILENTLY DROP A TRAILING PARAMETER.
+
+    `classify(detail, dseq, now, reap_runners, names, prefix)` passes six positionals; the
+    seventh keeps its default however the caller was invoked. Pinned as a keyword so adding
+    a parameter cannot quietly disable this one.
+    """
+    import inspect
+
+    from just_akash import cleanup_stale
+
+    src = inspect.getsource(cleanup_stale.run)
+    assert "reap_owned=reap_owned" in src, (
+        "run() does not pass reap_owned to classify() by keyword — the flag is inert"
+    )
+
+
+def test_provenance_is_read_when_the_flag_is_on() -> None:
+    """The verdict rests on `group_spec.name`, so the sweep must fetch it for ANY service.
+
+    Reading it only for `runner` leaves every other service at group_names=None, which
+    returns LEAVE-unverified-owned — a sweep that reports a clean account it never judged.
+    """
+    import inspect
+
+    from just_akash import cleanup_stale
+
+    src = inspect.getsource(cleanup_stale.run)
+    assert "elif reap_owned:" in src and src.count("deployment_group_names") >= 2, (
+        "provenance is fetched only for runners — reap_owned would always be unverified"
+    )
+
+
+def test_the_cli_exposes_the_flag() -> None:
+    """An operator has to be able to turn it on, or the scheduled sweep never will."""
+    import inspect
+
+    from just_akash import cleanup_stale
+
+    src = inspect.getsource(cleanup_stale)
+    assert '"--reap-owned"' in src, "no --reap-owned CLI flag"
+    assert "reap_owned=args.reap_owned" in src, "the CLI flag is parsed but never passed to run()"

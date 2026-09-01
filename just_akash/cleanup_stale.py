@@ -215,6 +215,7 @@ def run(
     reap_runners: bool = False,
     only_service: str | None = None,
     placement_prefix: str = PLACEMENT_PREFIX,
+    reap_owned: bool = False,
 ) -> int:
     """Audit (and optionally close) stale test deployments.
 
@@ -306,7 +307,20 @@ def run(
         names: list[str] | None = None
         if reap_runners and _deployment_service_names(detail) == {RUNNER_SERVICE}:
             names = chain.deployment_group_names(address, dseq)
-        verdict, services, age = classify(detail, dseq, now, reap_runners, names, placement_prefix)
+        elif reap_owned:
+            # ⛔ reap_owned DECIDES ON PROVENANCE, so it must READ provenance — for every
+            # service, not just `runner`. Without this the flag is inert in the worst way:
+            # `classify` returns LEAVE-unverified-owned for everything and the sweep reports
+            # a clean account it never actually judged.
+            #
+            # ⚠ This is the round-trip-per-deployment the comment above avoids, and it is
+            # the price of the flag. It is paid ONLY when the operator opts in, and the
+            # alternative is what shipped: 28.28 ACT held for six days while the sweep
+            # printed `stale (closable): 0`.
+            names = chain.deployment_group_names(address, dseq)
+        verdict, services, age = classify(
+            detail, dseq, now, reap_runners, names, placement_prefix, reap_owned=reap_owned
+        )
         age_str = f"{age / 86400:5.1f}d" if age is not None else "   ?  "
         filtered = only_service is not None and set(services or []) != {only_service}
         suffix = f" (skipped: not services=={{{only_service}}})" if filtered else ""
@@ -360,6 +374,17 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     ap.add_argument(
+        "--reap-owned",
+        action="store_true",
+        help=(
+            "Also close deployments of ANY service whose on-chain group name carries our "
+            "placement prefix and which are older than STALE_OWNED_AGE_SECONDS. Ownership is "
+            "PROVEN from group_spec.name, never assumed from the service name — a service-name "
+            "allowlist is a convention between repos, and it silently stopped covering when a "
+            "second repo began deploying. Costs one chain read per deployment."
+        ),
+    )
+    ap.add_argument(
         "--only-service",
         default=None,
         metavar="NAME",
@@ -385,6 +410,7 @@ def main(argv: list[str] | None = None) -> int:
     return run(
         execute=args.execute,
         reap_runners=args.reap_runners,
+        reap_owned=args.reap_owned,
         placement_prefix=args.placement_prefix,
         only_service=args.only_service,
     )
