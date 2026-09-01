@@ -403,7 +403,9 @@ def main(argv: list[str] | None = None) -> int:
             "placement prefix and which are older than STALE_OWNED_AGE_SECONDS. Ownership is "
             "PROVEN from group_spec.name, never assumed from the service name — a service-name "
             "allowlist is a convention between repos, and it silently stopped covering when a "
-            "second repo began deploying. Costs one chain read per deployment."
+            "second repo began deploying. Costs one chain read per CANDIDATE — deployments "
+            "whose service set classify decides without provenance ({probe}, {backtest}, "
+            "{runner}, none) and those younger than the age floor are skipped."
         ),
     )
     ap.add_argument(
