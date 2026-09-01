@@ -24,7 +24,10 @@ disposable test residue; when in doubt, leave it and say so:
     (``ephemeral: false`` outlives one job, a slow matrix runs for hours),
     while the e2e's 48h would let one cancelled run starve every other pool
     spending from the same grant
-  * services == {}           -> LEAVE (provider reported nothing: cannot classify)
+  * services == {}           -> LEAVE-unclassifiable (provider reported nothing) — UNLESS
+    --reap-owned proves OURS on chain, then STALE-provider-closed at the 1h probe floor
+    (#1763: provider-stopped, escrow recoverable only by close; unowned/unreadable/young
+    stay LEAVE — the safe default is not widened, it is preceded by a proof)
   * anything else (node, runner, train, ...) -> LEAVE (real or unknown workload)
   * unknown age -> LEAVE (never mis-age and reap wrongly)
 
@@ -93,7 +96,13 @@ STALE_OWNED_AGE_SECONDS = 48 * 3600
 RUNNER_SERVICE = "runner"
 STALE_RUNNER_AGE_SECONDS = 6 * 3600
 
-STALE_VERDICTS = ("STALE-probe", "STALE-e2e", "STALE-runner", "STALE-owned")
+STALE_VERDICTS = (
+    "STALE-probe",
+    "STALE-e2e",
+    "STALE-runner",
+    "STALE-owned",
+    "STALE-provider-closed",
+)
 
 
 # ⛔ DEPLOYMENTS THAT MUST NEVER BE CLOSED, WHATEVER THE CLASSIFIER SAYS.
@@ -126,23 +135,27 @@ PROTECTED_DSEQS = frozenset(
 def _wants_owned_provenance(detail: dict, dseq: str, now: float | None = None) -> bool:
     """True when `classify`'s reap_owned branch would actually consult ``group_names``.
 
-    ⛔ MIRRORS classify's EARLY RETURNS and must be kept in step with them. Every service set
-    that returns before the reap_owned branch — {probe}, {backtest}, {runner}, and the empty
-    set — needs no provenance, so reading it spends a chain round-trip on a value nothing
-    looks at. `test_provenance_is_skipped_where_classify_ignores_it` pins the pairing.
+    ⛔ MIRRORS classify's EARLY RETURNS and must be kept in step with them. {probe},
+    {backtest} and {runner} return before the reap_owned branch, so reading their
+    provenance spends a chain round-trip on a value nothing looks at.
+    `test_provenance_is_skipped_where_classify_ignores_it` pins the pairing.
+
+    The EMPTY set is judged by the reap_owned branch too (provider-closed), but at the
+    PROBE floor rather than the owned floor — see classify for why the two floors differ.
 
     ⚠ The age test lives here too: a deployment younger than the floor returns
-    LEAVE-recent-owned regardless of ownership, so its provenance is equally unread. On a busy
+    LEAVE-recent-* regardless of ownership, so its provenance is equally unread. On a busy
     account that is the majority case and where most of the saving is.
     """
     services = _deployment_service_names(detail)
-    if not services or services in ({PROBE_SERVICE}, {E2E_SERVICE}, {RUNNER_SERVICE}):
+    if services in ({PROBE_SERVICE}, {E2E_SERVICE}, {RUNNER_SERVICE}):
         return False
     age = _probe_age_seconds(dseq, now)
     # An UNAGED deployment (undecodable dseq) still needs the read: classify cannot rule on
-    # age, and skipping it would silently downgrade the verdict to LEAVE-unverified-owned —
+    # age, and skipping it would silently downgrade the verdict to LEAVE-unverified-* —
     # unreadable dressed as unowned, which is the confusion this module exists to refuse.
-    return age is None or age >= STALE_OWNED_AGE_SECONDS
+    floor = STALE_OWNED_AGE_SECONDS if services else MIN_ORPHAN_AGE_SECONDS
+    return age is None or age >= floor
 
 
 def classify(
@@ -198,6 +211,34 @@ def classify(
             return "STALE-runner", services, age
         return "LEAVE-recent-runner", services, age
     if not services:
+        # PROVIDER-CLOSED (#1763, Blazing-Back): open on chain, the provider stopped it,
+        # no live service manifest, escrow still held — and with auto top-up on, a
+        # RECURRING charge into something running nothing. Console's own text: "close it
+        # to recover any unused funds"; nothing else recovers them. This used to exit
+        # here as LEAVE-unclassifiable BEFORE the ownership-proven path below could run,
+        # so the one class that most needs closing was unreachable by the one proof that
+        # would license it — the scheduled sweep reported `stale (closable): 0` while
+        # exactly this shape sat holding escrow (dseq 1788245492506, group
+        # dfci-infra-app, observed 2026-09-01).
+        #
+        # The guards are the owned branch's, in the same order, at the PROBE floor. The
+        # floor is NOT a workload lifetime — a provider-closed deployment cannot become
+        # live again, only a NEW deployment can replace it — it guards the READ RACE: a
+        # healthy deployment minutes old may show no services yet (age=0.0d, services=-
+        # was observed in run 33431994913), and 1h is this module's smallest existing
+        # margin over every deploy→lease→manifest window in this fleet's pipelines.
+        if reap_owned:
+            if not group_names:
+                # UNREADABLE is not UNOWNED, and here it is not CLASSIFIABLE either: a
+                # failed chain read leaves this exactly where the safe default found it.
+                return "LEAVE-unverified-provider-closed", services, age
+            if not any(n.startswith(placement_prefix) for n in group_names):
+                # Another project's naming scheme, or a bare unattributable group
+                # (dcloud / akash1...): not ours to close, however stranded it looks.
+                return "LEAVE-not-ours-provider-closed", services, age
+            if age is not None and age >= MIN_ORPHAN_AGE_SECONDS:
+                return "STALE-provider-closed", services, age
+            return "LEAVE-young-or-unaged-provider-closed", services, age
         return "LEAVE-unclassifiable", services, age
     # ── ANY service, when ownership is PROVEN on chain and the thing is old ────────────
     # Opt-in (`reap_owned`), so no existing caller changes behaviour by upgrading. The
@@ -346,7 +387,11 @@ def run(
         age_str = f"{age / 86400:5.1f}d" if age is not None else "   ?  "
         filtered = only_service is not None and set(services or []) != {only_service}
         suffix = f" (skipped: not services=={{{only_service}}})" if filtered else ""
-        print(f"  {dseq}  age={age_str}  services={services or '-'}  -> {verdict}{suffix}")
+        # When a verdict rests on provenance, the line SHOWS the name it rested on. A
+        # table that asserts ownership without printing it makes every STALE-*-owned row
+        # an uncheckable claim (#1763 wants per-deployment proof in the report itself).
+        prov = f"  group={','.join(names) or '?'}" if names is not None else ""
+        print(f"  {dseq}  age={age_str}  services={services or '-'}{prov}  -> {verdict}{suffix}")
         if verdict in STALE_VERDICTS and dseq in PROTECTED_DSEQS:
             print(f"    ^ PROTECTED-DSEQ: on the never-close list, {verdict} overridden")
             protected.append(dseq)
