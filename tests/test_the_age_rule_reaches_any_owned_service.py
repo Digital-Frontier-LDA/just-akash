@@ -153,7 +153,11 @@ def test_provenance_is_read_when_the_flag_is_on() -> None:
     from just_akash import cleanup_stale
 
     src = inspect.getsource(cleanup_stale.run)
-    assert "elif reap_owned:" in src and src.count("deployment_group_names") >= 2, (
+    # ⚠ Matched on the GATE, not the whole line. The first version pinned the literal
+    # `elif reap_owned:` and went red when the branch gained a narrowing predicate — a test
+    # failing on a refactor that preserved its subject. It must still catch REMOVAL, which
+    # the group_names count does.
+    assert "elif reap_owned" in src and src.count("deployment_group_names") >= 2, (
         "provenance is fetched only for runners — reap_owned would always be unverified"
     )
 
@@ -167,3 +171,63 @@ def test_the_cli_exposes_the_flag() -> None:
     src = inspect.getsource(cleanup_stale)
     assert '"--reap-owned"' in src, "no --reap-owned CLI flag"
     assert "reap_owned=args.reap_owned" in src, "the CLI flag is parsed but never passed to run()"
+
+
+# ── the provenance read is narrowed to what classify actually consults ────────────────
+
+
+def test_provenance_is_skipped_where_classify_ignores_it() -> None:
+    """⛔ THE PREDICATE MUST MIRROR classify's EARLY RETURNS.
+
+    `{probe}`, `{backtest}`, `{runner}` and the empty set all return BEFORE the reap_owned
+    branch, so `group_names` is never consulted for them. The first version read provenance
+    for every deployment regardless — a chain round-trip each, on an account of hundreds,
+    for a value nothing looks at.
+
+    ⚠ This pins the PAIRING, not the saving. If a future edit gives one of those service
+    sets a reap_owned path, this test goes red and the predicate must be updated with it —
+    which is the point: a skipped read that classify later needs returns
+    LEAVE-unverified-owned, i.e. unreadable dressed as unowned.
+    """
+    from just_akash.cleanup_stale import (
+        E2E_SERVICE,
+        PROBE_SERVICE,
+        RUNNER_SERVICE,
+        _wants_owned_provenance,
+    )
+
+    for svc in (PROBE_SERVICE, E2E_SERVICE, RUNNER_SERVICE):
+        assert not _wants_owned_provenance(_detail(svc), _dseq_aged(OLD)), (
+            f"provenance read for services=={{{svc}}}, whose classify branch returns before "
+            "group_names is consulted — a wasted chain round-trip"
+        )
+    assert not _wants_owned_provenance({"leases": []}, _dseq_aged(OLD)), (
+        "provenance read for a deployment with no services (LEAVE-unclassifiable)"
+    )
+
+
+def test_provenance_is_read_for_the_case_that_leaked() -> None:
+    """Anti-vacuity for the test above: if it never returned True, the flag would be inert
+    again and every assertion there would pass while nothing was ever judged."""
+    from just_akash.cleanup_stale import _wants_owned_provenance
+
+    assert _wants_owned_provenance(_detail("app"), _dseq_aged(OLD)), (
+        "service `app` older than the floor is exactly the leaked class — it MUST be read"
+    )
+
+
+def test_a_young_deployment_needs_no_provenance() -> None:
+    """Younger than the floor returns LEAVE-recent-owned whatever the ownership, so the read
+    is unread. On a busy account this is the majority case and most of the saving."""
+    from just_akash.cleanup_stale import _wants_owned_provenance
+
+    assert not _wants_owned_provenance(_detail("app"), _dseq_aged(YOUNG))
+
+
+def test_an_unaged_deployment_is_still_read() -> None:
+    """⛔ UNREADABLE IS NOT UNOWNED, HERE TOO. An undecodable dseq means classify cannot rule
+    on age; skipping the read would silently produce LEAVE-unverified-owned rather than a
+    verdict about ownership."""
+    from just_akash.cleanup_stale import _wants_owned_provenance
+
+    assert _wants_owned_provenance(_detail("app"), "not-a-dseq")

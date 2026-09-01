@@ -123,6 +123,28 @@ PROTECTED_DSEQS = frozenset(
 )
 
 
+def _wants_owned_provenance(detail: dict, dseq: str, now: float | None = None) -> bool:
+    """True when `classify`'s reap_owned branch would actually consult ``group_names``.
+
+    ⛔ MIRRORS classify's EARLY RETURNS and must be kept in step with them. Every service set
+    that returns before the reap_owned branch — {probe}, {backtest}, {runner}, and the empty
+    set — needs no provenance, so reading it spends a chain round-trip on a value nothing
+    looks at. `test_provenance_is_skipped_where_classify_ignores_it` pins the pairing.
+
+    ⚠ The age test lives here too: a deployment younger than the floor returns
+    LEAVE-recent-owned regardless of ownership, so its provenance is equally unread. On a busy
+    account that is the majority case and where most of the saving is.
+    """
+    services = _deployment_service_names(detail)
+    if not services or services in ({PROBE_SERVICE}, {E2E_SERVICE}, {RUNNER_SERVICE}):
+        return False
+    age = _probe_age_seconds(dseq, now)
+    # An UNAGED deployment (undecodable dseq) still needs the read: classify cannot rule on
+    # age, and skipping it would silently downgrade the verdict to LEAVE-unverified-owned —
+    # unreadable dressed as unowned, which is the confusion this module exists to refuse.
+    return age is None or age >= STALE_OWNED_AGE_SECONDS
+
+
 def classify(
     detail: dict,
     dseq: str,
@@ -307,16 +329,16 @@ def run(
         names: list[str] | None = None
         if reap_runners and _deployment_service_names(detail) == {RUNNER_SERVICE}:
             names = chain.deployment_group_names(address, dseq)
-        elif reap_owned:
-            # ⛔ reap_owned DECIDES ON PROVENANCE, so it must READ provenance — for every
-            # service, not just `runner`. Without this the flag is inert in the worst way:
-            # `classify` returns LEAVE-unverified-owned for everything and the sweep reports
-            # a clean account it never actually judged.
+        elif reap_owned and _wants_owned_provenance(detail, dseq, now):
+            # ⛔ reap_owned DECIDES ON PROVENANCE, so it must READ provenance — for the
+            # services `classify` will actually consult it for. Without the read the flag is
+            # inert in the worst way: `classify` returns LEAVE-unverified-owned for everything
+            # and the sweep reports a clean account it never judged.
             #
-            # ⚠ This is the round-trip-per-deployment the comment above avoids, and it is
-            # the price of the flag. It is paid ONLY when the operator opts in, and the
-            # alternative is what shipped: 28.28 ACT held for six days while the sweep
-            # printed `stale (closable): 0`.
+            # ⚠ NARROWED, because the naive form paid a chain round-trip for EVERY deployment
+            # — including {probe}, {backtest} and {runner}, whose branches return before
+            # `group_names` is ever read. On an account of hundreds that is hundreds of wasted
+            # reads for a value nothing consults.
             names = chain.deployment_group_names(address, dseq)
         verdict, services, age = classify(
             detail, dseq, now, reap_runners, names, placement_prefix, reap_owned=reap_owned
