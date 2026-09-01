@@ -201,8 +201,13 @@ def test_provenance_is_skipped_where_classify_ignores_it() -> None:
             f"provenance read for services=={{{svc}}}, whose classify branch returns before "
             "group_names is consulted — a wasted chain round-trip"
         )
-    assert not _wants_owned_provenance({"leases": []}, _dseq_aged(OLD)), (
-        "provenance read for a deployment with no services (LEAVE-unclassifiable)"
+    # ⚠ THE TRIPWIRE FIRED, AS DESIGNED (2026-09-01, Blazing-Back #1763): the empty set
+    # gained a reap_owned path (provider-closed), so it is no longer skipped when old or
+    # unaged — only when young, where the read-race floor makes the read unread. The
+    # young case is pinned in test_a_provider_closed_deployment_is_closable_when_owned.py.
+    assert _wants_owned_provenance({"leases": []}, _dseq_aged(OLD)), (
+        "the empty set has an owned path now — an old provider-closed deployment that "
+        "skips the provenance read silently downgrades to LEAVE-unverified-provider-closed"
     )
 
 
