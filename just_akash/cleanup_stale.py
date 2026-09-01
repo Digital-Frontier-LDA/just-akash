@@ -72,10 +72,28 @@ STALE_E2E_AGE_SECONDS = 48 * 3600
 # run for hours, so an hour would reap live CI. It is not the e2e's 48h either, because at
 # spike every leaked lease holds escrow against the same grant every other pool spends
 # from — two days of that is what turns one cancelled run into a fleet-wide 402.
+# ⛔ THE AGE RULE WAS UNREACHABLE FOR ANYTHING NOT ON THE SERVICE ALLOWLIST.
+# `stamp_run`'s docstring promises that an UNSTAMPED deployment "falls back to the age
+# rule". It could not: `classify` only reaches an age test after matching one of three
+# EXACT service names — `probe`, `backtest`, `runner`. Anything else lands in
+# LEAVE-real-or-unknown, where no age can ever be consulted.
+#
+# MEASURED 2026-09-01: six Blazing-Back E2E deployments (service `app`, images
+# postgres:16-alpine and uzyexe/tetris) sat 62-139h holding 28.28 ACT. The scheduled
+# reaper reported `stale (closable): 0` on every run. `E2E_SERVICE = "backtest"` is
+# just-akash's own vocabulary; the sibling repo sharing this sweeper names its service
+# `app`, and a service-name allowlist is a CONVENTION, not a fact about ownership.
+#
+# ⭐ Ownership is already provable without it. `group_spec.name` is author-controlled,
+# written atomically inside MsgCreateDeployment and immutable after — the runner branch
+# below already rests on exactly that. This threshold lets the same proof gate the age
+# rule for ANY service, so the promise in stamp_run's docstring becomes true.
+STALE_OWNED_AGE_SECONDS = 48 * 3600
+
 RUNNER_SERVICE = "runner"
 STALE_RUNNER_AGE_SECONDS = 6 * 3600
 
-STALE_VERDICTS = ("STALE-probe", "STALE-e2e", "STALE-runner")
+STALE_VERDICTS = ("STALE-probe", "STALE-e2e", "STALE-runner", "STALE-owned")
 
 
 # ⛔ DEPLOYMENTS THAT MUST NEVER BE CLOSED, WHATEVER THE CLASSIFIER SAYS.
@@ -105,6 +123,28 @@ PROTECTED_DSEQS = frozenset(
 )
 
 
+def _wants_owned_provenance(detail: dict, dseq: str, now: float | None = None) -> bool:
+    """True when `classify`'s reap_owned branch would actually consult ``group_names``.
+
+    ⛔ MIRRORS classify's EARLY RETURNS and must be kept in step with them. Every service set
+    that returns before the reap_owned branch — {probe}, {backtest}, {runner}, and the empty
+    set — needs no provenance, so reading it spends a chain round-trip on a value nothing
+    looks at. `test_provenance_is_skipped_where_classify_ignores_it` pins the pairing.
+
+    ⚠ The age test lives here too: a deployment younger than the floor returns
+    LEAVE-recent-owned regardless of ownership, so its provenance is equally unread. On a busy
+    account that is the majority case and where most of the saving is.
+    """
+    services = _deployment_service_names(detail)
+    if not services or services in ({PROBE_SERVICE}, {E2E_SERVICE}, {RUNNER_SERVICE}):
+        return False
+    age = _probe_age_seconds(dseq, now)
+    # An UNAGED deployment (undecodable dseq) still needs the read: classify cannot rule on
+    # age, and skipping it would silently downgrade the verdict to LEAVE-unverified-owned —
+    # unreadable dressed as unowned, which is the confusion this module exists to refuse.
+    return age is None or age >= STALE_OWNED_AGE_SECONDS
+
+
 def classify(
     detail: dict,
     dseq: str,
@@ -112,6 +152,7 @@ def classify(
     reap_runners: bool = False,
     group_names: list[str] | None = None,
     placement_prefix: str = PLACEMENT_PREFIX,
+    reap_owned: bool = False,
 ) -> tuple[str, list[str], float | None]:
     """(verdict, services, age_seconds) for one deployment detail.
 
@@ -158,6 +199,20 @@ def classify(
         return "LEAVE-recent-runner", services, age
     if not services:
         return "LEAVE-unclassifiable", services, age
+    # ── ANY service, when ownership is PROVEN on chain and the thing is old ────────────
+    # Opt-in (`reap_owned`), so no existing caller changes behaviour by upgrading. The
+    # guards are the runner branch's, in the same order and for the same reasons:
+    #   no group_names      -> UNREADABLE is not UNOWNED; a failed read must not destroy
+    #   prefix does not match -> not ours; a shared wallet carries other repos' work
+    #   young               -> leave; the age floor is the whole safety margin
+    if reap_owned:
+        if not group_names:
+            return "LEAVE-unverified-owned", services, age
+        if not any(n.startswith(placement_prefix) for n in group_names):
+            return "LEAVE-not-ours", services, age
+        if age is not None and age >= STALE_OWNED_AGE_SECONDS:
+            return "STALE-owned", services, age
+        return "LEAVE-recent-owned", services, age
     return "LEAVE-real-or-unknown", services, age
 
 
@@ -182,6 +237,7 @@ def run(
     reap_runners: bool = False,
     only_service: str | None = None,
     placement_prefix: str = PLACEMENT_PREFIX,
+    reap_owned: bool = False,
 ) -> int:
     """Audit (and optionally close) stale test deployments.
 
@@ -273,7 +329,20 @@ def run(
         names: list[str] | None = None
         if reap_runners and _deployment_service_names(detail) == {RUNNER_SERVICE}:
             names = chain.deployment_group_names(address, dseq)
-        verdict, services, age = classify(detail, dseq, now, reap_runners, names, placement_prefix)
+        elif reap_owned and _wants_owned_provenance(detail, dseq, now):
+            # ⛔ reap_owned DECIDES ON PROVENANCE, so it must READ provenance — for the
+            # services `classify` will actually consult it for. Without the read the flag is
+            # inert in the worst way: `classify` returns LEAVE-unverified-owned for everything
+            # and the sweep reports a clean account it never judged.
+            #
+            # ⚠ NARROWED, because the naive form paid a chain round-trip for EVERY deployment
+            # — including {probe}, {backtest} and {runner}, whose branches return before
+            # `group_names` is ever read. On an account of hundreds that is hundreds of wasted
+            # reads for a value nothing consults.
+            names = chain.deployment_group_names(address, dseq)
+        verdict, services, age = classify(
+            detail, dseq, now, reap_runners, names, placement_prefix, reap_owned=reap_owned
+        )
         age_str = f"{age / 86400:5.1f}d" if age is not None else "   ?  "
         filtered = only_service is not None and set(services or []) != {only_service}
         suffix = f" (skipped: not services=={{{only_service}}})" if filtered else ""
@@ -327,6 +396,19 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     ap.add_argument(
+        "--reap-owned",
+        action="store_true",
+        help=(
+            "Also close deployments of ANY service whose on-chain group name carries our "
+            "placement prefix and which are older than STALE_OWNED_AGE_SECONDS. Ownership is "
+            "PROVEN from group_spec.name, never assumed from the service name — a service-name "
+            "allowlist is a convention between repos, and it silently stopped covering when a "
+            "second repo began deploying. Costs one chain read per CANDIDATE — deployments "
+            "whose service set classify decides without provenance ({probe}, {backtest}, "
+            "{runner}, none) and those younger than the age floor are skipped."
+        ),
+    )
+    ap.add_argument(
         "--only-service",
         default=None,
         metavar="NAME",
@@ -352,6 +434,7 @@ def main(argv: list[str] | None = None) -> int:
     return run(
         execute=args.execute,
         reap_runners=args.reap_runners,
+        reap_owned=args.reap_owned,
         placement_prefix=args.placement_prefix,
         only_service=args.only_service,
     )
