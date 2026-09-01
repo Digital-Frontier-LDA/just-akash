@@ -42,8 +42,7 @@ def _detail(service: str = "app") -> dict:
     fixture that puts services anywhere else classifies as LEAVE-unclassifiable and every
     assertion below would pass for the wrong reason.
     """
-    return {"leases": [{"id": {"provider": "akash1prov"},
-                        "status": {"services": {service: {}}}}]}
+    return {"leases": [{"id": {"provider": "akash1prov"}, "status": {"services": {service: {}}}}]}
 
 
 def _dseq_aged(seconds: float) -> str:
@@ -52,8 +51,9 @@ def _dseq_aged(seconds: float) -> str:
 
 
 def _classify(service, age_s, group_names, reap_owned=True):
-    return classify(_detail(service), _dseq_aged(age_s),
-                    group_names=group_names, reap_owned=reap_owned)[0]
+    return classify(
+        _detail(service), _dseq_aged(age_s), group_names=group_names, reap_owned=reap_owned
+    )[0]
 
 
 def test_an_owned_aged_app_deployment_is_stale() -> None:
@@ -66,7 +66,10 @@ def test_an_owned_aged_app_deployment_is_stale() -> None:
 def test_the_same_deployment_is_left_alone_before_the_opt_in() -> None:
     """⛔ NO CALLER CHANGES BEHAVIOUR BY UPGRADING. Without `reap_owned` the verdict is
     exactly what it was, so this cannot surprise an existing scheduled sweep."""
-    assert _classify("app", OLD, [f"{PLACEMENT_PREFIX}app"], reap_owned=False) == "LEAVE-real-or-unknown"
+    assert (
+        _classify("app", OLD, [f"{PLACEMENT_PREFIX}app"], reap_owned=False)
+        == "LEAVE-real-or-unknown"
+    )
 
 
 def test_a_foreign_prefix_is_refused_however_old() -> None:
@@ -74,7 +77,10 @@ def test_a_foreign_prefix_is_refused_however_old() -> None:
     and NOT ours must still be refused — otherwise this change destroys a sibling repo's
     work, which is the failure the runner branch was written to prevent."""
     assert _classify("app", OLD, ["someone-else-app"]) == "LEAVE-not-ours"
-    assert _classify("app", OLD, ["dfci-infra-lookalike".replace("dfci", "notdfci")]) == "LEAVE-not-ours"
+    assert (
+        _classify("app", OLD, ["dfci-infra-lookalike".replace("dfci", "notdfci")])
+        == "LEAVE-not-ours"
+    )
 
 
 def test_unreadable_ownership_is_not_unowned() -> None:
@@ -106,6 +112,7 @@ def test_the_existing_service_verdicts_are_unchanged() -> None:
 # ⚠ Three independent breaks, each of which alone makes the feature inert, and NONE of
 # which a test of `classify` can see. A rule nobody can invoke is the failure this estate
 # keeps finding; these tests exist so it cannot recur silently here.
+
 
 def test_run_accepts_the_flag() -> None:
     """`run()` must take `reap_owned` — without it the CLI has nothing to pass."""
