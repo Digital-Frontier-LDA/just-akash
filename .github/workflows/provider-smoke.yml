@@ -10,11 +10,19 @@ name: Provider smoke test
 
 on:
   schedule:
+    # NOT on the hour: GitHub preferentially drops schedules at :00 under load.
+    # 2026-09-02 the 07:00 slot never produced a run at all, which froze
+    # just_akash_smoke_latest_outcome_info on the prior day's result and paged
+    # alphavps NO-BID (critical) every ~65min for 10h against 26h-old data.
+    # Minute 17 is free: 23 is cleanup-stale's (pinned by
+    # test_scheduled_workflows_do_not_stack_on_the_same_minute), 5/35 are the
+    # canary's, 0 is the pile-up this line moved off. Keep it off :00.
+    #
     # Normal cadence. The 2026-07-14..17 every-3h accumulation burst is DONE: it
     # accrued ~1243 telemetry rows (from ~600), enough for percentile/SLO thresholds,
     # so we're back to daily to limit Actions minutes and cost. To re-run a burst,
     # swap the two lines below (and revert once the dataset is big enough).
-    - cron: "0 7 * * *" # 07:00 UTC daily (normal cadence)
+    - cron: "17 7 * * *" # 07:17 UTC daily (normal cadence)
     # - cron: "0 */3 * * *" # every 3 hours (accumulation burst — temporary only)
   workflow_dispatch:
     inputs:
