@@ -949,7 +949,32 @@ jobs:
     name: Close lease and de-register runners (the pool owns this)
     needs: [pool]
     if: always()
-    uses: ./.github/workflows/runner-teardown.yml
+    # ⛔ FULL PATH AT A PINNED SHA, NEVER `./`. A reusable workflow's job runs in the
+    # CALLER's context, so a bare `./` resolves inside the CALLER's tree — where this
+    # file does not exist. The job then cannot be created, the graph cannot be built,
+    # and the consumer's run dies with `jobs=0`: a startup_failure rendered as a
+    # generic "workflow file issue" against THEIR workflow, for a defect in ours.
+    #
+    # ⚠ IT WORKS PERFECTLY HERE, WHICH IS WHY IT SHIPPED. In this repo's own CI the
+    # caller IS just-akash, so `./` resolves. A reusable workflow cannot test its own
+    # cross-repo callability from inside its own repo. Measured 2026-09-03:
+    # Borduas-Holdings/blazing bumped past #243 and both of its Akash workflows
+    # returned startup_failure with zero jobs (just-akash#247).
+    #
+    # ⚠ AND IT IS A RECURRENCE. akash-github-runner#149 was the same bug one repo over,
+    # with the same `jobs=0` signature; its test now records the rule verbatim:
+    # "a bare `./` resolves inside the CALLER's tree […] every consumer run died with
+    # jobs=0" (test_reusable_conformance_workflow.py:88).
+    #
+    # ⇒ The pin is not trusted, it is CHECKED:
+    # test_the_nested_teardown_pin_matches_the_file_it_calls asserts the teardown at this
+    # SHA is byte-identical to the working copy, so editing the teardown forces the bump
+    # in the SAME change and the two cannot drift.
+    # ⚠ NOT "lags by exactly one commit" — this comment said that, and the guard does not
+    # check it. Commit DISTANCE is not enforceable here: a multi-commit PR or a squash
+    # merge breaks it while the pin stays correct. IDENTITY is the property that matters,
+    # and it is the one asserted. The test docstring records the same correction.
+    uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@c2cad20a3aae242781518538c8ea637dbbb81ae2
     with:
       dseq: ${{ needs.pool.outputs.dseq }}
       tag-prefix: ${{ inputs.tag-prefix }}

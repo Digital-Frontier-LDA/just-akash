@@ -13,6 +13,7 @@ reports safety it never checked.
 from __future__ import annotations
 
 import os
+import pathlib
 import re
 import subprocess
 import sys
@@ -35,6 +36,16 @@ CALL = (DOC.get("on") or DOC.get(True))["workflow_call"]
 INPUTS = CALL["inputs"]
 OUTPUTS = CALL["outputs"]
 STEPS = DOC["jobs"]["pool"]["steps"]
+
+
+# A cross-repo-callable reusable reference: owner and repo, then the workflow path, then
+# a pinned SHA. Each component is anchored to `[A-Za-z0-9]` because GitHub owner and repo
+# names must begin with one — without that anchor a lone `.` or `..` matches the class and
+# `././…` and `../../…` sail through, which is exactly the hole this guard exists to close.
+REUSABLE_WORKFLOW_REF = (
+    r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*"
+    r"/\.github/workflows/[A-Za-z0-9._-]+\.ya?ml@[0-9a-f]{40}"
+)
 
 
 def _step(fragment: str) -> dict:
@@ -1175,3 +1186,140 @@ def test_a_missing_pat_is_distinct_from_an_invalid_one():
 def test_the_pat_failure_reason_reaches_the_caller():
     assert "steps.pat.outputs.failure_reason" in DOC["jobs"]["pool"]["outputs"]["failure_reason"]
     assert "RUNNER_PAT_INVALID" in OUTPUTS["failure_reason"]["description"]
+
+
+# ── cross-repo callability ───────────────────────────────────────────────────
+
+
+def test_no_job_in_this_reusable_uses_a_bare_local_path():
+    """⛔ `./` IN A REUSABLE RESOLVES IN THE CALLER'S TREE, NOT OURS.
+
+    A reusable workflow's job runs in the caller's context, so `uses: ./…` is looked up
+    in the CONSUMER's repository — where the file does not exist. The job cannot be
+    created, the graph cannot be built, and the consumer's run dies with `jobs=0`: a
+    startup_failure rendered as a generic "workflow file issue" against THEIR workflow.
+
+    ⚠ IT PASSES IN THIS REPO'S OWN CI EITHER WAY, which is why it shipped — here the
+    caller IS just-akash. A reusable workflow cannot test its own cross-repo callability
+    from inside its own repo, so this static check is the only thing that can.
+
+    Measured 2026-09-03 (just-akash#247): Borduas-Holdings/blazing bumped past #243 and
+    both of its Akash workflows returned startup_failure with zero jobs. And it is a
+    recurrence — akash-github-runner#149 was the same bug with the same signature, one
+    repo over.
+    """
+    for job_name, job in DOC["jobs"].items():
+        uses = str(job.get("uses") or "")
+        if not uses:
+            continue
+        assert re.fullmatch(REUSABLE_WORKFLOW_REF, uses), (
+            f"job {job_name!r} calls {uses!r}. From a consumer, anything but the full "
+            "owner/repo path resolves in THEIR tree. Use "
+            "<owner>/<repo>/.github/workflows/<file>.yml@<40-hex sha>."
+        )
+
+
+LOCAL_FORMS_THAT_MUST_BE_REJECTED = [
+    "./.github/workflows/runner-teardown.yml@" + "a" * 40,
+    "././.github/workflows/runner-teardown.yml@" + "a" * 40,
+    "../.github/workflows/runner-teardown.yml@" + "a" * 40,
+    "../../.github/workflows/runner-teardown.yml@" + "a" * 40,
+    ".github/workflows/runner-teardown.yml@" + "a" * 40,
+    "runner-teardown.yml@" + "a" * 40,
+    "Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@main",
+]
+
+
+@pytest.mark.parametrize("uses", LOCAL_FORMS_THAT_MUST_BE_REJECTED)
+def test_every_caller_relative_or_unpinned_form_is_rejected(uses):
+    """`not uses.startswith("./")` was the whole guard, and it let five of these through.
+
+    Reported by Copilot review on just-akash#248. `.github/workflows/…`, `../…` and a
+    bare filename all resolve in the CONSUMER's tree exactly as `./` does — the guard
+    would have gone green on a recurrence of just-akash#247. The last case is unpinned:
+    a moving ref lets the close logic change under a consumer that changed nothing.
+    """
+    assert not re.fullmatch(REUSABLE_WORKFLOW_REF, uses)
+
+
+def test_the_real_reference_is_accepted():
+    """Known-negative: the reference runner-pool.yml actually carries must still pass.
+
+    Read from the workflow rather than written out here. A literal 40-hex SHA in a test
+    is flagged by detect-secrets as a high-entropy string (it was, on this PR), and a
+    pasted pin also goes stale the moment the real one is bumped.
+    """
+    assert re.fullmatch(REUSABLE_WORKFLOW_REF, str(DOC["jobs"]["teardown"]["uses"]))
+
+
+def test_the_nested_teardown_pin_matches_the_file_it_calls():
+    """The pinned teardown must be byte-identical to the working copy.
+
+    Referencing by pin means the pool calls the teardown as it was at that SHA. Harmless
+    while they agree, and silent drift the moment they do not — which is the failure a pin
+    is supposed to prevent. Asserting identity forces the bump into the SAME change that
+    edits the teardown.
+
+    ⚠ NOT "lags by exactly one commit" — an earlier version of this docstring claimed that
+    and the repo cannot guarantee it: multi-commit PRs and squash merges both break the
+    distance. What is enforced is IDENTITY, which is the property that matters; commit
+    distance is not.
+
+    ⛔ AND THIS GUARD MUST NOT SKIP IN CI. `actions/checkout` fetches shallow, so the
+    pinned commit is usually absent and `git show` fails — turning the whole check into a
+    silent skip on the one surface it exists to protect. That is the "a check that cannot
+    fail" class this repo keeps finding. So: fetch the object on demand, and if it still
+    cannot be read, FAIL under CI and skip only on a developer machine.
+    """
+    import os
+    import subprocess
+
+    uses = str(DOC["jobs"]["teardown"]["uses"])
+    pin = uses.rsplit("@", 1)[-1]
+    assert re.fullmatch(r"[0-9a-f]{40}", pin), f"teardown pinned to {pin!r}, not a 40-hex SHA"
+
+    # ⚠ From __file__, never from WF_PATH: the mutation harness overrides RUNNER_POOL_WF to
+    # a temp copy, and deriving the repo root from it would point git at /tmp.
+    root = pathlib.Path(__file__).resolve().parents[1]
+
+    def _show() -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "show",
+                f"{pin}:.github/workflows/runner-teardown.yml",
+            ],
+            capture_output=True,
+            timeout=60,
+        )  # ⚠ no text=True: decoding hides a CRLF/LF difference, and this asserts BYTES
+
+    shown = _show()
+    if shown.returncode != 0:
+        # Shallow clone: ask for just this object, then retry once.
+        subprocess.run(
+            ["git", "-C", str(root), "fetch", "--depth=1", "origin", pin],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        shown = _show()
+
+    if shown.returncode != 0:
+        detail = shown.stderr.decode("utf-8", "replace").strip()[:120]
+        assert not os.environ.get("CI"), (
+            f"cannot read runner-teardown.yml at the pinned {pin[:8]} even after fetching "
+            f"({detail}). Under CI this is a FAILURE, not a skip: a drift guard that skips "
+            "on the surface it protects is a check that cannot fail."
+        )
+        pytest.skip(f"pinned commit {pin[:8]} unavailable locally: {detail}")
+
+    # ⚠ read_bytes, not read_text. The docstring claims byte-identity; comparing decoded
+    # text would make a line-ending difference invisible and the claim false — an overclaim
+    # of the same kind this file already corrected once.
+    current = (root / ".github/workflows/runner-teardown.yml").read_bytes()
+    assert shown.stdout == current, (
+        f"runner-teardown.yml has changed since the pinned {pin[:8]}, so the pool calls a "
+        "STALE copy of its own teardown. Bump the pin in this change."
+    )
