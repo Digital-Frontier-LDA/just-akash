@@ -18,6 +18,7 @@ from just_akash.provenance import (
     SIBLING_REAPED_PREFIX,
     _heredocs,
     inline_sdls,
+    is_templated,
     placement_keys,
     run_id_of,
     run_scoped,
@@ -69,7 +70,11 @@ def test_the_inline_workflow_sdls_are_actually_found():
 # A placement key rendered from a caller input rather than written literally. The pool's
 # key became `${PLACEMENT_KEY}` so a consumer adopting the canonical escrow reaper can
 # namespace its own deployments; see runner-pool.yml's `placement-key` input.
-_TEMPLATED_KEY = re.compile(r"^\$\{[A-Z_]+\}$")
+#
+# ⛔ ASKED OF THE MODULE, NOT RE-TYPED HERE. This was a private `^\$\{[A-Z_]+\}$`, stricter
+# than what `_KEY_RE` accepts — so `${PLACEMENT_KEY2}` would have been SCANNED as a
+# template and then JUDGED as a literal, failing for not starting with the repo prefix.
+# A guard that disagrees with the scanner it guards is worse than no guard.
 
 
 def _pool_input_default(name: str) -> str:
@@ -110,7 +115,7 @@ def test_every_inline_sdl_stamps_the_repo_prefix():
         keys = placement_keys(text)
         assert keys, f"{label}: no placement key found in the rendered SDL"
         for key in keys:
-            if _TEMPLATED_KEY.match(key):
+            if is_templated(key):
                 default = _pool_input_default("placement-key")
                 assert default.startswith(PLACEMENT_PREFIX), (
                     f"{label}: placement key {key!r} is rendered from an input whose "
@@ -523,3 +528,17 @@ def test_the_key_is_not_rewritten_inside_a_comment_or_block_scalar():
     out, _ = stamp_run(sdl, RUN)
     assert "        just-akash-a:" in out, "block scalar content was rewritten"
     assert "# see just-akash-a: for the placement" in out, "a comment was rewritten"
+
+
+def test_the_template_predicate_agrees_with_the_scanner():
+    """⛔ ONE DEFINITION, ASSERTED. A caller asking "is this a template?" must get the same
+    answer the scanner gave when it ACCEPTED the key. A stricter private copy — this test
+    once carried `^\\$\\{[A-Z_]+\\}$` — scans `${PLACEMENT_KEY2}` as a template and then
+    judges it as a literal, failing it for not starting with the repo prefix. The two must
+    not be able to disagree."""
+    for key in ("${PLACEMENT_KEY}", "${PLACEMENT_KEY2}", "${x}", "${_k9}"):
+        sdl = f"profiles:\n  placement:\n    {key}:\n"
+        assert placement_keys(sdl) == [key], f"scanner missed {key}"
+        assert is_templated(key), f"predicate disagrees with the scanner on {key}"
+    for key in ("just-akash-runner", "borduas", "dcloud"):
+        assert not is_templated(key), f"{key} is a literal, not a template"
