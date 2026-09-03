@@ -81,7 +81,14 @@ _PLACEMENT_RE = re.compile(r"^(?P<ind>\s{2})placement:\s*$")
 # what to do with it (test_provenance checks the input's default instead), which is the
 # same principle as the block-scalar handling below: a guard that silently skips what it
 # cannot read is not a guard.
-_KEY_RE = re.compile(r"^(?P<ind>\s*)(?P<key>\$\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z0-9._-]+):\s*$")
+_KEY_RE = re.compile(
+    r"^(?P<ind>\s*)"
+    r"(?P<key>"
+    r"\$\{[A-Za-z_][A-Za-z0-9_]*\}"  # a shell template: ${PLACEMENT_KEY}
+    r"|[A-Za-z0-9._-]+"  # or a literal key
+    r")"
+    r":\s*$"
+)
 # A block scalar opener: `key: |`, `- >-`, `args: |2` etc. Everything indented under one is
 # STRING CONTENT, not YAML structure.
 _BLOCK_OPEN_RE = re.compile(r":\s*[|>][0-9+-]*\s*$|^\s*-\s*[|>][0-9+-]*\s*$")
