@@ -1246,9 +1246,8 @@ def test_the_nested_teardown_pin_matches_the_file_it_calls():
                 f"{pin}:.github/workflows/runner-teardown.yml",
             ],
             capture_output=True,
-            text=True,
             timeout=60,
-        )
+        )  # ⚠ no text=True: decoding hides a CRLF/LF difference, and this asserts BYTES
 
     shown = _show()
     if shown.returncode != 0:
@@ -1262,7 +1261,7 @@ def test_the_nested_teardown_pin_matches_the_file_it_calls():
         shown = _show()
 
     if shown.returncode != 0:
-        detail = shown.stderr.strip()[:120]
+        detail = shown.stderr.decode("utf-8", "replace").strip()[:120]
         assert not os.environ.get("CI"), (
             f"cannot read runner-teardown.yml at the pinned {pin[:8]} even after fetching "
             f"({detail}). Under CI this is a FAILURE, not a skip: a drift guard that skips "
@@ -1270,7 +1269,10 @@ def test_the_nested_teardown_pin_matches_the_file_it_calls():
         )
         pytest.skip(f"pinned commit {pin[:8]} unavailable locally: {detail}")
 
-    current = (root / ".github/workflows/runner-teardown.yml").read_text()
+    # ⚠ read_bytes, not read_text. The docstring claims byte-identity; comparing decoded
+    # text would make a line-ending difference invisible and the claim false — an overclaim
+    # of the same kind this file already corrected once.
+    current = (root / ".github/workflows/runner-teardown.yml").read_bytes()
     assert shown.stdout == current, (
         f"runner-teardown.yml has changed since the pinned {pin[:8]}, so the pool calls a "
         "STALE copy of its own teardown. Bump the pin in this change."

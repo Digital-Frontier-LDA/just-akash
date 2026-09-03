@@ -99,10 +99,16 @@ def test_teardown_calls_the_existing_reusable_teardown():
     td = JOBS.get("teardown", {})
     uses = str(td.get("uses", ""))
     path, _, ref = uses.partition("@")
-    assert path.endswith("runner-teardown.yml"), f"teardown does not reuse the workflow: {uses!r}"
-    assert not uses.startswith("./"), (
-        "teardown calls the reusable by a bare `./`, which resolves in the CONSUMER's tree "
-        "and makes this workflow uncallable from any other repo (just-akash#247)."
+    # ⚠ THE FULLY-QUALIFIED PATH, NOT A SUFFIX. `endswith(...)` plus "not `./`" still
+    # accepts `runner-teardown.yml@<sha>` and `../runner-teardown.yml@<sha>`, neither of
+    # which resolves from a consumer — so the guard would pass on values that reproduce
+    # the very bug it exists to stop.
+    assert re.fullmatch(
+        r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/\.github/workflows/runner-teardown\.yml", path
+    ), (
+        f"teardown must call <owner>/<repo>/.github/workflows/runner-teardown.yml, got "
+        f"{uses!r}. A bare `./` or a relative path resolves in the CONSUMER's tree and "
+        "makes this workflow uncallable from any other repo (just-akash#247)."
     )
     assert re.fullmatch(r"[0-9a-f]{40}", ref), (
         f"teardown must pin the reusable to a 40-hex SHA, got {ref!r} — an unpinned ref "
