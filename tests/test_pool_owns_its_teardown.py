@@ -38,6 +38,7 @@ import os
 import re
 from pathlib import Path
 
+import pytest
 import yaml
 
 WF_PATH = Path(
@@ -52,6 +53,14 @@ JOBS = DOC["jobs"]
 
 
 # ── Part A: the internalized teardown job ──────────────────────────────────────
+
+
+# GitHub owner and repo names must START with an alphanumeric, which is what keeps a
+# lone `.` or `..` component out. Without that anchor `././…` and `../../…` match.
+TEARDOWN_MUST_MATCH = (
+    r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*"
+    r"/\.github/workflows/runner-teardown\.yml"
+)
 
 
 def test_the_pool_workflow_declares_a_teardown_job():
@@ -103,9 +112,12 @@ def test_teardown_calls_the_existing_reusable_teardown():
     # accepts `runner-teardown.yml@<sha>` and `../runner-teardown.yml@<sha>`, neither of
     # which resolves from a consumer — so the guard would pass on values that reproduce
     # the very bug it exists to stop.
-    assert re.fullmatch(
-        r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/\.github/workflows/runner-teardown\.yml", path
-    ), (
+    # ⚠ AND THE COMPONENTS MUST BE REAL OWNER/REPO NAMES. A character class of
+    # `[A-Za-z0-9._-]+` matches a lone `.` or `..`, so `././…` and `../../…` both
+    # satisfied a "fully qualified" regex while still being caller-relative — the
+    # guard would have gone green on the exact defect again. GitHub owner and repo
+    # names must begin with an alphanumeric, so requiring that closes it.
+    assert re.fullmatch(TEARDOWN_MUST_MATCH, path), (
         f"teardown must call <owner>/<repo>/.github/workflows/runner-teardown.yml, got "
         f"{uses!r}. A bare `./` or a relative path resolves in the CONSUMER's tree and "
         "makes this workflow uncallable from any other repo (just-akash#247)."
@@ -113,6 +125,34 @@ def test_teardown_calls_the_existing_reusable_teardown():
     assert re.fullmatch(r"[0-9a-f]{40}", ref), (
         f"teardown must pin the reusable to a 40-hex SHA, got {ref!r} — an unpinned ref "
         "lets the close logic change under a consumer that changed nothing."
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "./.github/workflows/runner-teardown.yml",
+        "././.github/workflows/runner-teardown.yml",
+        "../.github/workflows/runner-teardown.yml",
+        "../../.github/workflows/runner-teardown.yml",
+        ".github/workflows/runner-teardown.yml",
+        "runner-teardown.yml",
+    ],
+)
+def test_caller_relative_forms_are_rejected(path):
+    """Every one of these resolves in the CONSUMER's tree, which is just-akash#247.
+
+    `././…` and `../../…` are the ones that matter: they passed the first version of
+    this guard, because `[A-Za-z0-9._-]+` happily matches a lone `.` or `..`.
+    """
+    assert not re.fullmatch(TEARDOWN_MUST_MATCH, path)
+
+
+def test_the_real_reference_is_accepted():
+    """Known-negative: the guard must not reject the form the fix actually uses."""
+    assert re.fullmatch(
+        TEARDOWN_MUST_MATCH,
+        "Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml",
     )
 
 
