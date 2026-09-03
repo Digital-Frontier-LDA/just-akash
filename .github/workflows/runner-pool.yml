@@ -51,6 +51,28 @@ on:
           deployment.
         required: true
         type: string
+      placement-key:
+        description: >-
+          The on-chain `group_spec.name` this pool's deployments carry — the provenance
+          marker a reaper matches on. Defaults to `just-akash-runner`, so a caller that
+          does not set it is byte-identical to before.
+
+          ⛔ SET THIS IF YOU ADOPT `reusable-akash-escrow-reaper.yml`. That workflow
+          requires a `placement-prefix` with no default, deliberately, because a prefix
+          matching nothing gives an INERT reaper — one that reports 0 forever over an
+          unswept account. The default below is shared by every consumer of this
+          workflow on a shared Console wallet, so a consumer adopting the reaper with
+          `placement-prefix: just-akash-` would claim EVERY other consumer's pools and
+          this repo's own provider canary. Namespace it to your repo instead.
+
+          ⚠ THE DEFAULT IS ALSO WHAT PROTECTS AN UNCHANGED CALLER. `just-akash-runner`
+          is what the sibling repo's sweeper spares; see just_akash/provenance.py, which
+          records why the placement KEY carries this and not an attribute. A caller that
+          changes it and does not adopt a reaper aimed at the new value has unstamped its
+          pools relative to every existing filter — change it and adopt in one change.
+        required: false
+        default: just-akash-runner
+        type: string
       just-akash-ref:
         description: >-
           REQUIRED, no default. The just-akash revision this pool provisions FROM.
@@ -369,8 +391,32 @@ jobs:
           MEMORY: ${{ inputs.memory }}
           STORAGE: ${{ inputs.storage }}
           EPHEMERAL: ${{ inputs.ephemeral }}
+          PLACEMENT_KEY: ${{ inputs.placement-key }}
         run: |
           set -euo pipefail
+          # ⛔ FAIL CLOSED ON THE ONE INPUT WHOSE FAILURE MODE IS SILENT. An empty or
+          # foreign placement key does not break the deploy — it produces a lease nobody
+          # can claim, or one a sibling's sweeper will close mid-CI, and both look like a
+          # provider fault from here. The three refusals below are the three ways it has
+          # actually gone wrong on this wallet:
+          #   * blank            — `group_spec.name` must be non-empty on chain, and a
+          #                        caller passing "" would fail at MsgCreateDeployment
+          #                        with a message about the SDL, not about this input.
+          #   * dcloud           — the network-wide DEFAULT placement name, used by most
+          #                        SDLs on Akash and owned by nobody. Measured in
+          #                        Borduas-Holdings/blazing 2026-09-02: its killcron probe
+          #                        stamped `dcloud`, so no prefix could claim it without
+          #                        also claiming strangers' deployments.
+          #   * dfci-infra-*     — the SIBLING's prefix, which its sweeper REAPS on a
+          #                        schedule. just_akash/provenance.py:66 keeps this value
+          #                        as SIBLING_REAPED_PREFIX and a test pins the two equal,
+          #                        so this literal cannot drift from the module's.
+          case "${PLACEMENT_KEY}" in
+            "")          echo "::error title=runner-pool::placement-key is empty. The on-chain group_spec.name is the only ownership marker that survives a job boundary; an unstamped pool cannot be reclaimed by any reaper." >&2; exit 2 ;;
+            dcloud|dcloud-*) echo "::error title=runner-pool::placement-key '${PLACEMENT_KEY}' is the Akash-wide default placement name, owned by nobody. A reaper aimed at it would match strangers' deployments. Namespace it to your repo." >&2; exit 2 ;;
+            dfci-infra-*)    echo "::error title=runner-pool::placement-key '${PLACEMENT_KEY}' is the SIBLING repo's prefix, which its sweeper reaps on a schedule. Stamping it would have that sweeper close this pool mid-CI." >&2; exit 2 ;;
+          esac
+          echo "placement key (on-chain group_spec.name): ${PLACEMENT_KEY}"
           # All N replicas share ONE label carrying run identity; the runner image
           # randomises each replica's NAME from the prefix, so the wait loop counts
           # DISTINCT online runners by label rather than by name.
@@ -451,12 +497,12 @@ jobs:
             # back as RUNNER_NEVER_REGISTERED against a provider that did nothing wrong.
             # See just_akash/provenance.py for why the key, and not an attribute.
             placement:
-              just-akash-runner:
+              ${PLACEMENT_KEY}:
                 pricing:
                   runner: { denom: uact, amount: 100000 }
           deployment:
             runner:
-              just-akash-runner:
+              ${PLACEMENT_KEY}:
                 profile: runner
                 count: ${POOL_SIZE}
           SDL

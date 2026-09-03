@@ -11,6 +11,7 @@ gets deleted every ~12 hours and a metric that lies about whose fault it was.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from just_akash.provenance import (
     PLACEMENT_PREFIX,
@@ -65,16 +66,58 @@ def test_the_inline_workflow_sdls_are_actually_found():
     assert any("runner-pool" in label for label, _ in found), [lbl for lbl, _ in found]
 
 
+# A placement key rendered from a caller input rather than written literally. The pool's
+# key became `${PLACEMENT_KEY}` so a consumer adopting the canonical escrow reaper can
+# namespace its own deployments; see runner-pool.yml's `placement-key` input.
+_TEMPLATED_KEY = re.compile(r"^\$\{[A-Z_]+\}$")
+
+
+def _pool_input_default(name: str) -> str:
+    """The default of one `runner-pool.yml` workflow_call input.
+
+    Read from the workflow rather than passed in, so this guard and the pool's own tests
+    cannot disagree about what a caller who sets nothing actually deploys.
+    """
+    import yaml
+
+    wf = Path(__file__).resolve().parents[1] / ".github/workflows/runner-pool.yml"
+    doc = yaml.safe_load(wf.read_text())
+    call = (doc.get("on") or doc.get(True))["workflow_call"]
+    return str(call["inputs"][name]["default"])
+
+
 def test_every_inline_sdl_stamps_the_repo_prefix():
     """An unstamped runner pool is precisely what the sibling sweeper closes: non-GPU,
     and with `ephemeral: false` legitimately older than 12h. The symptom is runners
     vanishing mid-job, read back as RUNNER_NEVER_REGISTERED against a provider that did
     nothing wrong — a fabricated provider fault, which is the failure this whole runner
-    stack exists to stop manufacturing."""
+    stack exists to stop manufacturing.
+
+    ⛔ ONE KEY IS NOW RENDERED FROM AN INPUT, AND THIS IS NOT A WEAKENING. The claim is
+    unchanged — every deployment this repo creates carries an OWNED marker — but for the
+    pool the value moved out of the SDL text, so asserting the text would assert the
+    wrong object. A templated key is accepted only against the two halves that now carry
+    the property, each with its own test in test_runner_pool_workflow.py:
+
+        the DEFAULT is stamped   test_the_placement_key_is_optional_and_defaults_...
+        foreign values REFUSED   test_the_guard_actually_runs_and_decides (executed)
+
+    A literal key still has to be stamped here, so this cannot be sidestepped by writing
+    one — and a template that is not backed by both halves is a hole, which is why the
+    default is re-checked below rather than taken on trust.
+    """
     for label, text in inline_sdls():
         keys = placement_keys(text)
         assert keys, f"{label}: no placement key found in the rendered SDL"
         for key in keys:
+            if _TEMPLATED_KEY.match(key):
+                default = _pool_input_default("placement-key")
+                assert default.startswith(PLACEMENT_PREFIX), (
+                    f"{label}: placement key {key!r} is rendered from an input whose "
+                    f"default is {default!r}, which does not start with {PLACEMENT_PREFIX!r}. "
+                    f"A caller that sets nothing would deploy unstamped."
+                )
+                continue
             assert key.startswith(PLACEMENT_PREFIX), (
                 f"{label}: placement key {key!r} does not start with {PLACEMENT_PREFIX!r}. "
                 f"Unstamped deployments are indistinguishable from a CI leak on the "
@@ -83,6 +126,11 @@ def test_every_inline_sdl_stamps_the_repo_prefix():
 
 
 def test_no_inline_sdl_wears_the_siblings_reaped_prefix():
+    """⚠ A TEMPLATED KEY PASSES THIS TRIVIALLY — `${PLACEMENT_KEY}` never starts with
+    `dfci-infra-` — so for the templated case the real claim is that the workflow REFUSES
+    the sibling's prefix at run time. That is asserted where it can be executed:
+    test_the_guard_refuses_the_sibling_prefix_the_module_names, and behaviourally in
+    test_the_guard_actually_runs_and_decides. This function keeps the literal case."""
     for label, text in inline_sdls():
         for key in placement_keys(text):
             assert not key.startswith(SIBLING_REAPED_PREFIX), (
