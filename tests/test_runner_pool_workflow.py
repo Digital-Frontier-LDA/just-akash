@@ -13,6 +13,7 @@ reports safety it never checked.
 from __future__ import annotations
 
 import os
+import pathlib
 import re
 import subprocess
 import sys
@@ -1179,8 +1180,6 @@ def test_the_pat_failure_reason_reaches_the_caller():
 
 # ── cross-repo callability ───────────────────────────────────────────────────
 
-_LOCAL_USES = re.compile(r"^\s*uses:\s*\./", re.M)
-
 
 def test_no_job_in_this_reusable_uses_a_bare_local_path():
     """⛔ `./` IN A REUSABLE RESOLVES IN THE CALLER'S TREE, NOT OURS.
@@ -1208,29 +1207,69 @@ def test_no_job_in_this_reusable_uses_a_bare_local_path():
 
 
 def test_the_nested_teardown_pin_matches_the_file_it_calls():
-    """The pin lags this file by one commit; that is checked, not trusted.
+    """The pinned teardown must be byte-identical to the working copy.
 
-    Referencing the teardown by full path means the pool at commit N calls the teardown
-    as it was at commit N-1. Harmless while they agree — and silent drift the moment they
-    do not, which is the failure mode a pin is supposed to prevent. Asserting the pinned
-    copy is byte-identical to the working copy forces the bump into the SAME change that
+    Referencing by pin means the pool calls the teardown as it was at that SHA. Harmless
+    while they agree, and silent drift the moment they do not — which is the failure a pin
+    is supposed to prevent. Asserting identity forces the bump into the SAME change that
     edits the teardown.
+
+    ⚠ NOT "lags by exactly one commit" — an earlier version of this docstring claimed that
+    and the repo cannot guarantee it: multi-commit PRs and squash merges both break the
+    distance. What is enforced is IDENTITY, which is the property that matters; commit
+    distance is not.
+
+    ⛔ AND THIS GUARD MUST NOT SKIP IN CI. `actions/checkout` fetches shallow, so the
+    pinned commit is usually absent and `git show` fails — turning the whole check into a
+    silent skip on the one surface it exists to protect. That is the "a check that cannot
+    fail" class this repo keeps finding. So: fetch the object on demand, and if it still
+    cannot be read, FAIL under CI and skip only on a developer machine.
     """
+    import os
     import subprocess
 
     uses = str(DOC["jobs"]["teardown"]["uses"])
     pin = uses.rsplit("@", 1)[-1]
     assert re.fullmatch(r"[0-9a-f]{40}", pin), f"teardown pinned to {pin!r}, not a 40-hex SHA"
 
-    root = WF_PATH.resolve().parents[2]
-    shown = subprocess.run(
-        ["git", "-C", str(root), "show", f"{pin}:.github/workflows/runner-teardown.yml"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+    # ⚠ From __file__, never from WF_PATH: the mutation harness overrides RUNNER_POOL_WF to
+    # a temp copy, and deriving the repo root from it would point git at /tmp.
+    root = pathlib.Path(__file__).resolve().parents[1]
+
+    def _show() -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "show",
+                f"{pin}:.github/workflows/runner-teardown.yml",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+    shown = _show()
     if shown.returncode != 0:
-        pytest.skip(f"pinned commit {pin[:8]} not present locally: {shown.stderr.strip()[:80]}")
+        # Shallow clone: ask for just this object, then retry once.
+        subprocess.run(
+            ["git", "-C", str(root), "fetch", "--depth=1", "origin", pin],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        shown = _show()
+
+    if shown.returncode != 0:
+        detail = shown.stderr.strip()[:120]
+        assert not os.environ.get("CI"), (
+            f"cannot read runner-teardown.yml at the pinned {pin[:8]} even after fetching "
+            f"({detail}). Under CI this is a FAILURE, not a skip: a drift guard that skips "
+            "on the surface it protects is a check that cannot fail."
+        )
+        pytest.skip(f"pinned commit {pin[:8]} unavailable locally: {detail}")
+
     current = (root / ".github/workflows/runner-teardown.yml").read_text()
     assert shown.stdout == current, (
         f"runner-teardown.yml has changed since the pinned {pin[:8]}, so the pool calls a "
