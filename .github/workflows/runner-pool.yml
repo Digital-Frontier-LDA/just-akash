@@ -987,6 +987,17 @@ jobs:
       # so the teardown MUST name the same org the registration used — guaranteed
       # consistent by reading the SAME input, not by reconstructing it from context.
       github-org: ${{ inputs.github-org }}
+      # ⛔ REQUIRED BY THE CALLEE, WITH NO DEFAULT — and omitting it did not fail HERE.
+      # runner-teardown.yml declares `just-akash-ref` required. A reusable call that
+      # omits a required input cannot be turned into a job, so GitHub abandons the whole
+      # graph: the CONSUMER's run returns startup_failure with ZERO jobs, no logs and no
+      # annotation. Measured 2026-09-03 from Borduas-Holdings/blazing#798 — both of its
+      # workflows that call this one died that way, while the same branch with the
+      # previous pin (017b9e0b, which had no nested teardown at all) built 14 jobs.
+      # ⚠ THIS REPO'S OWN CI CANNOT SEE IT. Nothing here calls runner-pool.yml as a
+      # reusable, so the broken graph is only ever built in a consumer. Same blind spot
+      # as the `./` defect in #248, one input along.
+      just-akash-ref: ${{ inputs.just-akash-ref }}
     secrets:
       AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
       AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}
