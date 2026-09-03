@@ -725,10 +725,24 @@ def test_the_guard_refuses_the_sibling_prefix_the_module_names():
     "key,accepted",
     [
         ("just-akash-runner", True),
+        ("just-akash-runner.", True),  # the register's own form, with the dot
         ("ci-blazing-pool", True),
         ("", False),
+        ("   ", False),
         ("dcloud", False),
+        # ⛔ WHITESPACE IS NOT COSMETIC HERE. `dcloud ` does not match the `dcloud` pattern,
+        # so an unnormalised value walks past the reserved-key check and is then written
+        # into the SDL, where YAML swallows the space and the deployment is stamped
+        # `dcloud` after all. Raised by CodeRabbit on the PR that added this input.
+        ("dcloud ", False),
+        (" dcloud ", False),
         ("dfci-infra-runner", False),
+        # ⛔ THE KEY IS INTERPOLATED INTO A YAML HEREDOC, so a value carrying `:` or a
+        # newline does not make a bad key — it makes a DIFFERENT DOCUMENT.
+        ("a: b", False),
+        ("x\ny", False),
+        ("-leading-dash", False),
+        (".leading-dot", False),
     ],
 )
 def test_the_guard_actually_runs_and_decides(key, accepted, tmp_path):

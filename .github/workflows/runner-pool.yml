@@ -411,8 +411,31 @@ jobs:
           #                        schedule. just_akash/provenance.py:66 keeps this value
           #                        as SIBLING_REAPED_PREFIX and a test pins the two equal,
           #                        so this literal cannot drift from the module's.
+          # ⛔ NORMALISE BEFORE JUDGING, OR THE JUDGEMENT IS BYPASSABLE. `dcloud ` with a
+          # trailing space does not match the `dcloud` pattern below, so an unnormalised
+          # value walks straight past the reserved-key checks and is then written into the
+          # SDL — where the whitespace is silently swallowed by the YAML parser and the
+          # deployment is stamped `dcloud` after all. Raised by CodeRabbit on the PR that
+          # added this input.
+          #
+          # ⚠ TRIM THE ENDS, DO NOT DELETE ALL WHITESPACE. Deleting it everywhere turns an
+          # embedded newline into a silent JOIN — `x\ny` became the perfectly valid key
+          # `xy` and was accepted, which is the caller getting a different marker than it
+          # asked for. Trimming leaves an interior character to fail the shape check below,
+          # so a surprising value is REFUSED rather than quietly repaired.
+          PLACEMENT_KEY="${PLACEMENT_KEY#"${PLACEMENT_KEY%%[![:space:]]*}"}"
+          PLACEMENT_KEY="${PLACEMENT_KEY%"${PLACEMENT_KEY##*[![:space:]]}"}"
+          # ⛔ AND THE KEY IS INTERPOLATED INTO A YAML HEREDOC, so its SHAPE is not
+          # cosmetic: a value containing `:` or a newline does not produce a bad key, it
+          # produces a DIFFERENT DOCUMENT. Restricting to what a placement key can
+          # actually be closes that as well as the whitespace case — one rule instead of a
+          # list of forbidden characters nobody will keep current.
           case "${PLACEMENT_KEY}" in
-            "")          echo "::error title=runner-pool::placement-key is empty. The on-chain group_spec.name is the only ownership marker that survives a job boundary; an unstamped pool cannot be reclaimed by any reaper." >&2; exit 2 ;;
+            *[!A-Za-z0-9._-]*|-*|.*|"")
+              echo "::error title=runner-pool::placement-key '${PLACEMENT_KEY}' is not a plain placement key. It is interpolated into the SDL, so it must match [A-Za-z0-9][A-Za-z0-9._-]* — anything else can restructure the document rather than name a key." >&2
+              exit 2 ;;
+          esac
+          case "${PLACEMENT_KEY}" in
             dcloud|dcloud-*) echo "::error title=runner-pool::placement-key '${PLACEMENT_KEY}' is the Akash-wide default placement name, owned by nobody. A reaper aimed at it would match strangers' deployments. Namespace it to your repo." >&2; exit 2 ;;
             dfci-infra-*)    echo "::error title=runner-pool::placement-key '${PLACEMENT_KEY}' is the SIBLING repo's prefix, which its sweeper reaps on a schedule. Stamping it would have that sweeper close this pool mid-CI." >&2; exit 2 ;;
           esac
