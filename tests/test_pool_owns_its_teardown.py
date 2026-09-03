@@ -57,6 +57,10 @@ JOBS = DOC["jobs"]
 
 # GitHub owner and repo names must START with an alphanumeric, which is what keeps a
 # lone `.` or `..` component out. Without that anchor `././…` and `../../…` match.
+OUR_TEARDOWN = "Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml"
+
+# The shape check is kept as well: it is what the parametrised rejection cases below
+# exercise, and it states WHY an arbitrary path is wrong, not merely that it differs.
 TEARDOWN_MUST_MATCH = (
     r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*"
     r"/\.github/workflows/runner-teardown\.yml"
@@ -117,6 +121,16 @@ def test_teardown_calls_the_existing_reusable_teardown():
     # satisfied a "fully qualified" regex while still being caller-relative — the
     # guard would have gone green on the exact defect again. GitHub owner and repo
     # names must begin with an alphanumeric, so requiring that closes it.
+    # ⚠ WELL-FORMED IS NOT THE SAME AS OURS. The pattern below proves only the SHAPE of
+    # a cross-repo reference; a typo'd owner, or another repository entirely, satisfies it
+    # just as well. And the SHA check that follows is a LOCAL `git show`, which succeeds
+    # on any commit we happen to have — it does not verify the path. So assert the
+    # identity first, then the shape, then the pin.
+    # (Reported by CodeRabbit on just-akash#248.)
+    assert path == OUR_TEARDOWN, (
+        f"teardown must call {OUR_TEARDOWN}, got {uses!r}. Another owner/repo is a "
+        "perfectly well-formed reference to a workflow this repo does not control."
+    )
     assert re.fullmatch(TEARDOWN_MUST_MATCH, path), (
         f"teardown must call <owner>/<repo>/.github/workflows/runner-teardown.yml, got "
         f"{uses!r}. A bare `./` or a relative path resolves in the CONSUMER's tree and "
@@ -148,11 +162,24 @@ def test_caller_relative_forms_are_rejected(path):
     assert not re.fullmatch(TEARDOWN_MUST_MATCH, path)
 
 
+def test_a_well_formed_reference_to_someone_elses_repo_is_not_enough():
+    """Shape is not identity — the gap CodeRabbit found on just-akash#248.
+
+    `Someone-Else/their-fork/.github/workflows/runner-teardown.yml` is a perfectly
+    well-formed cross-repo reference. It passes the shape pattern, and the SHA check
+    that follows is a LOCAL `git show` that never looks at the path, so a typo'd owner
+    could satisfy both while GitHub loads a workflow this repo does not control.
+    """
+    foreign = "Someone-Else/their-fork/.github/workflows/runner-teardown.yml"
+    assert re.fullmatch(TEARDOWN_MUST_MATCH, foreign), "shape check should accept it"
+    assert foreign != OUR_TEARDOWN, "identity check must reject it"
+
+
 def test_the_real_reference_is_accepted():
     """Known-negative: the guard must not reject the form the fix actually uses."""
     assert re.fullmatch(
         TEARDOWN_MUST_MATCH,
-        "Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml",
+        OUR_TEARDOWN,
     )
 
 

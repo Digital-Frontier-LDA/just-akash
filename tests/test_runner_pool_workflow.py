@@ -1243,12 +1243,13 @@ def test_every_caller_relative_or_unpinned_form_is_rejected(uses):
 
 
 def test_the_real_reference_is_accepted():
-    """Known-negative: the form runner-pool.yml actually uses must still pass."""
-    assert re.fullmatch(
-        REUSABLE_WORKFLOW_REF,
-        "Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@"
-        + "c2cad20a3aae242781518538c8ea637dbbb81ae2",
-    )
+    """Known-negative: the reference runner-pool.yml actually carries must still pass.
+
+    Read from the workflow rather than written out here. A literal 40-hex SHA in a test
+    is flagged by detect-secrets as a high-entropy string (it was, on this PR), and a
+    pasted pin also goes stale the moment the real one is bumped.
+    """
+    assert re.fullmatch(REUSABLE_WORKFLOW_REF, str(DOC["jobs"]["teardown"]["uses"]))
 
 
 def test_the_nested_teardown_pin_matches_the_file_it_calls():
