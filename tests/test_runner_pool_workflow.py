@@ -651,13 +651,157 @@ def test_provider_select_reaches_the_deploy_invocation():
 # Anti-vacuity — prove the guards above can actually fail
 # --------------------------------------------------------------------------
 
+# ─── placement key: the on-chain ownership marker ────────────────────────────
+#
+# ⛔ WHY THIS IS AN INPUT AT ALL. The key was a literal, and the comment beside it said
+# what it is for: it becomes `group_spec.name` on chain and is what stops a sibling
+# repo's sweeper closing this pool mid-CI. But every consumer of this workflow shares one
+# Console wallet, so a literal means every consumer's pools carry the SAME marker — and
+# `reusable-akash-escrow-reaper.yml` requires a `placement-prefix` with no default
+# precisely so a consumer cannot claim what is not its own. With one shared value, the
+# only prefix matching a consumer's pools also matches everyone else's, including this
+# repo's provider canary. Measured 2026-09-03 in Borduas-Holdings/blazing: three
+# different placement keys across four producers, and the pools — the biggest spender —
+# were the ones no prefix could safely claim.
+
+
+def test_the_placement_key_is_optional_and_defaults_to_the_module_s_marker():
+    """A caller that does not set it must be byte-identical to before the input existed.
+
+    The default is asserted against `provenance.PLACEMENT_PREFIX` rather than typed here,
+    so changing the module's marker cannot silently leave this workflow stamping the old
+    one — the drift shape this repo fixes by importing constants instead of copying them.
+    """
+    from just_akash.provenance import PLACEMENT_PREFIX
+
+    spec = INPUTS["placement-key"]
+    assert spec.get("required") is False, (
+        "placement-key must be optional, or every existing caller breaks"
+    )
+    assert spec["default"] == f"{PLACEMENT_PREFIX}runner", (
+        f"the default is {spec['default']!r} but the module stamps {PLACEMENT_PREFIX!r} — "
+        "a caller that sets nothing would get a marker no sweeper in this repo matches"
+    )
+
+
+def test_both_sdl_sites_take_the_key_from_the_input():
+    """`placement.<KEY>` and `deployment.<svc>.<KEY>` must be the SAME key.
+
+    Substituting one and leaving the other a literal renders an SDL whose deployment
+    references a placement that does not exist — rejected at MsgCreateDeployment, with a
+    message about the SDL rather than about this input.
+    """
+    render = _step("Render runner SDL")["run"]
+    assert render.count("${PLACEMENT_KEY}:") == 2, (
+        "expected the key under both `placement:` and `deployment.runner:`; found "
+        f"{render.count('${PLACEMENT_KEY}:')}"
+    )
+    assert "just-akash-runner:" not in render, (
+        "the SDL still hardcodes a placement key. The default belongs on the INPUT, where "
+        "a caller can override it; hardcoded, every consumer shares one marker again."
+    )
+    assert "PLACEMENT_KEY: ${{ inputs.placement-key }}" in SRC, (
+        "the render step does not receive the input"
+    )
+
+
+def test_the_guard_refuses_the_sibling_prefix_the_module_names():
+    """The literal in the guard must be the module's, not a second copy of it.
+
+    `provenance.SIBLING_REAPED_PREFIX` exists so this repo can assert it never collides
+    with the sibling. A hand-typed copy in the workflow drifts from it silently, and the
+    failure is a pool the sibling's scheduled sweeper closes mid-CI.
+    """
+    from just_akash.provenance import SIBLING_REAPED_PREFIX
+
+    guard = _code(_step("Render runner SDL")["run"])
+    assert f"{SIBLING_REAPED_PREFIX}*)" in guard, (
+        f"the guard does not refuse {SIBLING_REAPED_PREFIX!r} — stamping the sibling's "
+        "prefix hands our pool to their reaper"
+    )
+
+
+@pytest.mark.parametrize(
+    "key,accepted",
+    [
+        ("just-akash-runner", True),
+        ("just-akash-runner.", True),  # the register's own form, with the dot
+        ("ci-blazing-pool", True),
+        ("", False),
+        ("   ", False),
+        ("dcloud", False),
+        # ⛔ WHITESPACE IS NOT COSMETIC HERE. `dcloud ` does not match the `dcloud` pattern,
+        # so an unnormalised value walks past the reserved-key check and is then written
+        # into the SDL, where YAML swallows the space and the deployment is stamped
+        # `dcloud` after all. Raised by CodeRabbit on the PR that added this input.
+        ("dcloud ", False),
+        (" dcloud ", False),
+        ("dfci-infra-runner", False),
+        # ⛔ THE KEY IS INTERPOLATED INTO A YAML HEREDOC, so a value carrying `:` or a
+        # newline does not make a bad key — it makes a DIFFERENT DOCUMENT.
+        ("a: b", False),
+        ("x\ny", False),
+        ("-leading-dash", False),
+        (".leading-dot", False),
+    ],
+)
+def test_the_guard_actually_runs_and_decides(key, accepted, tmp_path):
+    """Executed, not read. A `case` that never matches looks identical to one that does.
+
+    `dcloud` is the Akash-wide DEFAULT placement name, used by most SDLs on the network
+    and owned by nobody, so a reaper aimed at it matches strangers' deployments; the empty
+    key cannot be written to chain at all; the sibling's prefix is actively reaped.
+    """
+    render = _step("Render runner SDL")["run"]
+    script = tmp_path / "render.sh"
+    script.write_text(render)
+    env = {
+        **os.environ,
+        "GH_RUNNER_PAT": "x",
+        "ORG": "o",
+        "RUNNER_LABEL": "l",
+        "POOL_SIZE": "1",
+        "CPU": "1",
+        "MEMORY": "1Gi",
+        "STORAGE": "1Gi",
+        "EPHEMERAL": "true",
+        "PLACEMENT_KEY": key,
+    }
+    proc = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True)
+    if accepted:
+        assert proc.returncode == 0, f"{key!r} was refused: {proc.stdout} {proc.stderr}"
+    else:
+        assert proc.returncode == 2, f"{key!r} was ACCEPTED (rc={proc.returncode})"
+        assert "::error" in (proc.stdout + proc.stderr), "refused without saying why"
+
+
 MUTATIONS = [
     (
-        '"default" not in tag-prefix',
+        "placement-key keeps its default",
         lambda s: s.replace(
-            "        required: true\n        type: string\n      just-akash-ref:",
+            "        required: false\n        default: just-akash-runner",
+            "        required: true",
+        ),
+    ),
+    (
+        "SDL takes the key from the input",
+        lambda s: s.replace("${PLACEMENT_KEY}:", "just-akash-runner:"),
+    ),
+    (
+        "the guard still refuses the network default",
+        lambda s: s.replace("            dcloud|dcloud-*)", "            never-matches-me)"),
+    ),
+    (
+        '"default" not in tag-prefix',
+        # ⚠ ANCHORED ON WHAT FOLLOWS tag-prefix, WHICH MOVED. This mutation used to end
+        # at `just-akash-ref:`; adding `placement-key:` between the two silently stopped
+        # it matching, and the harness caught that by refusing a mutation that no longer
+        # changes the text. Re-anchor rather than loosen: a mutation that matches the
+        # wrong block tests the wrong guard.
+        lambda s: s.replace(
+            "        required: true\n        type: string\n      placement-key:",
             "        required: true\n        type: string\n"
-            "        default: 'ci-shared'\n      just-akash-ref:",
+            "        default: 'ci-shared'\n      placement-key:",
         ),
     ),
     (

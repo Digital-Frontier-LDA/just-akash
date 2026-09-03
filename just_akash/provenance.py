@@ -72,10 +72,44 @@ _SDL_DIR = Path(__file__).resolve().parent.parent / "sdl"
 # a guard that silently skips the files it cannot read is not a guard.
 _PROFILES_RE = re.compile(r"^profiles:\s*$")
 _PLACEMENT_RE = re.compile(r"^(?P<ind>\s{2})placement:\s*$")
-_KEY_RE = re.compile(r"^(?P<ind>\s*)(?P<key>[A-Za-z0-9._-]+):\s*$")
+# ⛔ THE KEY MAY BE A SHELL TEMPLATE, AND AN UNREADABLE KEY MUST NOT READ AS NO KEY.
+# `runner-pool.yml` renders its SDL from a heredoc and takes the placement key from its
+# `placement-key` input, so the text carries `${PLACEMENT_KEY}:`. The original character
+# class had no `$`/`{`/`}`, so the scanner returned an EMPTY list for that document —
+# and empty is the one answer a caller cannot act on safely: "every key starts with our
+# prefix" is vacuously TRUE of no keys. Reporting the template lets the caller decide
+# what to do with it (test_provenance checks the input's default instead), which is the
+# same principle as the block-scalar handling below: a guard that silently skips what it
+# cannot read is not a guard.
+# The shell-template shape, named once. `_KEY_RE` matches it as one alternative and
+# `is_templated` asks about it directly; two spellings of the same idea is how a caller
+# comes to disagree with the scanner about what it just accepted.
+_TEMPLATE = r"\$\{[A-Za-z_][A-Za-z0-9_]*\}"
+_TEMPLATE_RE = re.compile(_TEMPLATE)
+_KEY_RE = re.compile(
+    r"^(?P<ind>\s*)"
+    r"(?P<key>"
+    + _TEMPLATE  # a shell template: ${PLACEMENT_KEY}
+    + r"|[A-Za-z0-9._-]+"  # or a literal key
+    r")"
+    r":\s*$"
+)
 # A block scalar opener: `key: |`, `- >-`, `args: |2` etc. Everything indented under one is
 # STRING CONTENT, not YAML structure.
 _BLOCK_OPEN_RE = re.compile(r":\s*[|>][0-9+-]*\s*$|^\s*-\s*[|>][0-9+-]*\s*$")
+
+
+def is_templated(key: str) -> bool:
+    """True if `key` is a shell template rather than a literal placement key.
+
+    ⛔ EXPORTED SO THERE IS ONE DEFINITION. A caller deciding "is this a template?" needs
+    the same answer `_KEY_RE` gave when it accepted the key; a second regex written beside
+    it drifts, and the drift is silent — a template the caller does not recognise falls
+    through to the literal branch and gets judged as an unstamped key. Raised on the PR
+    that introduced the template form, where a test's private copy accepted only
+    `[A-Z_]+` and would have misjudged `${PLACEMENT_KEY2}`.
+    """
+    return bool(_TEMPLATE_RE.fullmatch(key))
 
 
 def placement_keys(text: str) -> list[str]:
