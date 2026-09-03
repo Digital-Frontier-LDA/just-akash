@@ -1175,3 +1175,62 @@ def test_a_missing_pat_is_distinct_from_an_invalid_one():
 def test_the_pat_failure_reason_reaches_the_caller():
     assert "steps.pat.outputs.failure_reason" in DOC["jobs"]["pool"]["outputs"]["failure_reason"]
     assert "RUNNER_PAT_INVALID" in OUTPUTS["failure_reason"]["description"]
+
+
+# ── cross-repo callability ───────────────────────────────────────────────────
+
+_LOCAL_USES = re.compile(r"^\s*uses:\s*\./", re.M)
+
+
+def test_no_job_in_this_reusable_uses_a_bare_local_path():
+    """⛔ `./` IN A REUSABLE RESOLVES IN THE CALLER'S TREE, NOT OURS.
+
+    A reusable workflow's job runs in the caller's context, so `uses: ./…` is looked up
+    in the CONSUMER's repository — where the file does not exist. The job cannot be
+    created, the graph cannot be built, and the consumer's run dies with `jobs=0`: a
+    startup_failure rendered as a generic "workflow file issue" against THEIR workflow.
+
+    ⚠ IT PASSES IN THIS REPO'S OWN CI EITHER WAY, which is why it shipped — here the
+    caller IS just-akash. A reusable workflow cannot test its own cross-repo callability
+    from inside its own repo, so this static check is the only thing that can.
+
+    Measured 2026-09-03 (just-akash#247): Borduas-Holdings/blazing bumped past #243 and
+    both of its Akash workflows returned startup_failure with zero jobs. And it is a
+    recurrence — akash-github-runner#149 was the same bug with the same signature, one
+    repo over.
+    """
+    for job_name, job in DOC["jobs"].items():
+        uses = str(job.get("uses") or "")
+        assert not uses.startswith("./"), (
+            f"job {job_name!r} calls {uses!r}. From a consumer that path resolves in "
+            "THEIR tree. Use the full owner/repo path at a pinned SHA."
+        )
+
+
+def test_the_nested_teardown_pin_matches_the_file_it_calls():
+    """The pin lags this file by one commit; that is checked, not trusted.
+
+    Referencing the teardown by full path means the pool at commit N calls the teardown
+    as it was at commit N-1. Harmless while they agree — and silent drift the moment they
+    do not, which is the failure mode a pin is supposed to prevent. Asserting the pinned
+    copy is byte-identical to the working copy forces the bump into the SAME change that
+    edits the teardown.
+    """
+    import subprocess
+
+    uses = str(DOC["jobs"]["teardown"]["uses"])
+    pin = uses.rsplit("@", 1)[-1]
+    assert re.fullmatch(r"[0-9a-f]{40}", pin), f"teardown pinned to {pin!r}, not a 40-hex SHA"
+
+    root = WF_PATH.resolve().parents[2]
+    shown = subprocess.run(
+        ["git", "-C", str(root), "show", f"{pin}:.github/workflows/runner-teardown.yml"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if shown.returncode != 0:
+        pytest.skip(f"pinned commit {pin[:8]} not present locally: {shown.stderr.strip()[:80]}")
+    current = (root / ".github/workflows/runner-teardown.yml").read_text()
+    assert shown.stdout == current, (
+        f"runner-teardown.yml has changed since the pinned {pin[:8]}, so the pool calls a "
+        "STALE copy of its own teardown. Bump the pin in this change."
+    )
