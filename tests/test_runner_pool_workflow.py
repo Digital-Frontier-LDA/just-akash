@@ -1225,7 +1225,9 @@ def test_the_nested_teardown_pin_matches_the_file_it_calls():
     root = WF_PATH.resolve().parents[2]
     shown = subprocess.run(
         ["git", "-C", str(root), "show", f"{pin}:.github/workflows/runner-teardown.yml"],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
     if shown.returncode != 0:
         pytest.skip(f"pinned commit {pin[:8]} not present locally: {shown.stderr.strip()[:80]}")
