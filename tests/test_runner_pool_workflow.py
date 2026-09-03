@@ -38,6 +38,16 @@ OUTPUTS = CALL["outputs"]
 STEPS = DOC["jobs"]["pool"]["steps"]
 
 
+# A cross-repo-callable reusable reference: owner and repo, then the workflow path, then
+# a pinned SHA. Each component is anchored to `[A-Za-z0-9]` because GitHub owner and repo
+# names must begin with one — without that anchor a lone `.` or `..` matches the class and
+# `././…` and `../../…` sail through, which is exactly the hole this guard exists to close.
+REUSABLE_WORKFLOW_REF = (
+    r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*"
+    r"/\.github/workflows/[A-Za-z0-9._-]+\.ya?ml@[0-9a-f]{40}"
+)
+
+
 def _step(fragment: str) -> dict:
     for s in STEPS:
         hay = (s.get("name", "") + s.get("id", "") + s.get("uses", "")).lower()
@@ -1200,10 +1210,45 @@ def test_no_job_in_this_reusable_uses_a_bare_local_path():
     """
     for job_name, job in DOC["jobs"].items():
         uses = str(job.get("uses") or "")
-        assert not uses.startswith("./"), (
-            f"job {job_name!r} calls {uses!r}. From a consumer that path resolves in "
-            "THEIR tree. Use the full owner/repo path at a pinned SHA."
+        if not uses:
+            continue
+        assert re.fullmatch(REUSABLE_WORKFLOW_REF, uses), (
+            f"job {job_name!r} calls {uses!r}. From a consumer, anything but the full "
+            "owner/repo path resolves in THEIR tree. Use "
+            "<owner>/<repo>/.github/workflows/<file>.yml@<40-hex sha>."
         )
+
+
+LOCAL_FORMS_THAT_MUST_BE_REJECTED = [
+    "./.github/workflows/runner-teardown.yml@" + "a" * 40,
+    "././.github/workflows/runner-teardown.yml@" + "a" * 40,
+    "../.github/workflows/runner-teardown.yml@" + "a" * 40,
+    "../../.github/workflows/runner-teardown.yml@" + "a" * 40,
+    ".github/workflows/runner-teardown.yml@" + "a" * 40,
+    "runner-teardown.yml@" + "a" * 40,
+    "Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@main",
+]
+
+
+@pytest.mark.parametrize("uses", LOCAL_FORMS_THAT_MUST_BE_REJECTED)
+def test_every_caller_relative_or_unpinned_form_is_rejected(uses):
+    """`not uses.startswith("./")` was the whole guard, and it let five of these through.
+
+    Reported by Copilot review on just-akash#248. `.github/workflows/…`, `../…` and a
+    bare filename all resolve in the CONSUMER's tree exactly as `./` does — the guard
+    would have gone green on a recurrence of just-akash#247. The last case is unpinned:
+    a moving ref lets the close logic change under a consumer that changed nothing.
+    """
+    assert not re.fullmatch(REUSABLE_WORKFLOW_REF, uses)
+
+
+def test_the_real_reference_is_accepted():
+    """Known-negative: the form runner-pool.yml actually uses must still pass."""
+    assert re.fullmatch(
+        REUSABLE_WORKFLOW_REF,
+        "Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@"
+        + "c2cad20a3aae242781518538c8ea637dbbb81ae2",
+    )
 
 
 def test_the_nested_teardown_pin_matches_the_file_it_calls():
