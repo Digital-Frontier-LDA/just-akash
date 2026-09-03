@@ -84,10 +84,30 @@ def test_teardown_needs_the_pool_and_runs_always():
 def test_teardown_calls_the_existing_reusable_teardown():
     """It CALLS runner-teardown.yml rather than duplicating its shell — the close
     logic (ownership-by-provenance, verify-don't-trust, per-label de-registration)
-    is already correct and guarded; a copy would fork it."""
+    is already correct and guarded; a copy would fork it.
+
+    ⚠ THE PROPERTY, NOT THE LITERAL — and this test previously asserted the literal.
+    `uses.endswith("runner-teardown.yml")` was true only of the `./` form, so it went RED
+    on the fix for just-akash#247 and stayed GREEN on the defect: a reusable's `./`
+    resolves in the CALLER's tree, so every consumer's run died with `jobs=0`. That is
+    exactly the trap akash-github-runner#149 records — "asserting the caller-relative
+    literal made the broken form mandatory: green on the defect, red on the fix" — and
+    this file walked into it one repo over.
+
+    So: it must name runner-teardown.yml, by full path, at a pinned SHA.
+    """
     td = JOBS.get("teardown", {})
     uses = str(td.get("uses", ""))
-    assert uses.endswith("runner-teardown.yml"), f"teardown does not reuse the workflow: {uses!r}"
+    path, _, ref = uses.partition("@")
+    assert path.endswith("runner-teardown.yml"), f"teardown does not reuse the workflow: {uses!r}"
+    assert not uses.startswith("./"), (
+        "teardown calls the reusable by a bare `./`, which resolves in the CONSUMER's tree "
+        "and makes this workflow uncallable from any other repo (just-akash#247)."
+    )
+    assert re.fullmatch(r"[0-9a-f]{40}", ref), (
+        f"teardown must pin the reusable to a 40-hex SHA, got {ref!r} — an unpinned ref "
+        "lets the close logic change under a consumer that changed nothing."
+    )
 
 
 def test_teardown_passes_the_pools_own_dseq():
