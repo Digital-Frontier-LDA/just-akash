@@ -532,6 +532,26 @@ jobs:
           echo "--- rendered SDL (token redacted) ---"
           grep -vE 'ACCESS_TOKEN' /tmp/runner-sdl.yaml
 
+      # ── Why the runner listing is read in three steps, not one ────────────────
+      # `gh api --paginate` emits one JSON document per page. A throttled or transient
+      # failure mid-pagination is an error object — {"message":"API rate limit
+      # exceeded",...} — with no `.runners` key. `.runners[]` on it raises "Cannot
+      # iterate over null" and jq exits 5, and because this step runs under GitHub's
+      # default `bash -e {0}`, a failing command substitution aborts AT THE ASSIGNMENT:
+      # `GH_RC=$?` and the whole GITHUB_API_UNAVAILABLE branch never execute. The
+      # handling was written correctly and was simply unreachable.
+      #
+      # MEASURED, Borduas-Holdings/blazing run 33796902050: the lease was created and
+      # tagged, the wait loop printed `0/4 online` three times, then
+      # `jq: error (at <stdin>:5): Cannot iterate over null (null)` and
+      # `Process completed with exit code 5` — jq's runtime-error code surfacing as the
+      # step's. No diagnosis, and the lease outlived the run: that DSEQ (1788463980879)
+      # appears in this repo's own cleanup-stale verdict table at 0.7d as
+      # `-> STALE-runner`. See issue #250 for why nothing then closed it.
+      #
+      # ⚠ This prose lives OUT here on purpose. Comments inside a `run:` scalar count
+      # toward the job's size, and an oversized job makes GitHub build zero jobs with no
+      # log — Borduas-Holdings/blazing#664. Out here the parser drops them.
       - name: Provision (retry down candidates, tag before waiting)
         id: provision
         env:
@@ -778,10 +798,40 @@ jobs:
               # `--paginate` without `--jq` emits one JSON object per page, and jq reads
               # that concatenated stream natively — so the per-page filtering that makes
               # a line-per-match correct across pages is unchanged.
-              RUNNER_IDS=$(gh api --paginate "orgs/${ORG}/actions/runners?per_page=100" 2>/tmp/gh-runners.err \
-                | jq -r --arg L "$RUNNER_LABEL" \
-                  '.runners[] | select(.status=="online") | select(any(.labels[].name; .==$L)) | .id')
-              GH_RC=$?
+              # An error page has no `.runners`, and `.runners[]` on it exits jq 5 —
+              # which under `bash -e {0}` aborts at the ASSIGNMENT, so `GH_RC=$?` and the
+              # unreadable-listing branch below never run. Null-safety alone would be
+              # worse (a throttled page would silently undercount and a healthy pool would
+              # be discarded), so an error page is detected and routed to that branch.
+              # Full incident: see the comment above this step.
+              GH_RC=0
+              RUNNER_PAGES=$(gh api --paginate "orgs/${ORG}/actions/runners?per_page=100" 2>/tmp/gh-runners.err) || GH_RC=$?
+              if [ "$GH_RC" -eq 0 ]; then
+                # `has("runners")` distinguishes a listing from an error object. An empty
+                # org returns {"total_count":0,"runners":[]} — has the key, counts as 0.
+                # COUNT LINES, NEVER `| length` — the same rule the online count follows
+                # below, and for the same reason: an aggregating filter is per-document.
+                # One line per bad page, `grep -c .` collapses it to one integer.
+                BAD_PAGES=$(printf '%s' "$RUNNER_PAGES" | jq -r 'select(has("runners") | not) | 1' 2>/dev/null | grep -c . || true)
+                if [ "${BAD_PAGES:-0}" -ne 0 ]; then
+                  # ⚠ GUARDED ASSIGNMENT, because `| head -1` can SIGPIPE jq. With
+                  # `pipefail` on and enough documents, head closes the pipe early and
+                  # jq dies 141 — a non-zero substitution, which under `bash -e` aborts
+                  # AT THE ASSIGNMENT and reintroduces the exact defect this block fixes,
+                  # inside the handler for it. Reproduced: 3 docs -> rc=0, 20,000 docs ->
+                  # rc=141. ⛔ AND `pipefail` IS ON HERE — this step opens with
+                  # `set -uo pipefail`, so the risk is live, not theoretical. (I first
+                  # wrote that it was off; the awk I checked with had silently failed.
+                  # Measuring the parsed step said otherwise.) `|| _why=""` makes any
+                  # exit code survivable. (Reported by Copilot on PR #251.)
+                  _why=$(printf '%s' "$RUNNER_PAGES" | jq -r 'select(has("runners") | not) | .message // "no message field"' 2>/dev/null | head -1) || _why=""
+                  echo "  runner listing unreadable (${BAD_PAGES} error page(s)): ${_why:-unparseable}"
+                  sleep 15
+                  continue
+                fi
+              fi
+              RUNNER_IDS=$(printf '%s' "$RUNNER_PAGES" | jq -r --arg L "$RUNNER_LABEL" \
+                  '(.runners // [])[] | select(.status=="online") | select(any(.labels[].name; .==$L)) | .id') || GH_RC=$?
               if [ "$GH_RC" -ne 0 ]; then
                 # Deliberately NOT the 5s cadence: if this is the secondary limit (a
                 # per-MINUTE budget) then retrying at 5s spends the recovery window.
