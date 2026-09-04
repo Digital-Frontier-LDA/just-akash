@@ -24,6 +24,15 @@ from unittest.mock import MagicMock, patch
 from just_akash import cleanup_stale as cs
 
 NOW = time.time()
+
+# Dummy Console credentials. `configured_api_keys()` only splits on [,;\n],
+# strips and de-duplicates, so the VALUES are arbitrary — these are named to say
+# so at a glance, in the test and in any secrets baseline that records them.
+# The two separators are covered deliberately: both are in the split regex.
+FAKE_KEY = "not-a-real-console-key"
+FAKE_KEYS_COMMA = "not-a-real-key-1,not-a-real-key-2,not-a-real-key-3"
+FAKE_KEYS_SEMICOLON = "not-a-real-key-1;not-a-real-key-2"
+
 SRC = Path(__file__).resolve().parents[1] / "just_akash" / "cleanup_stale.py"
 
 
@@ -60,7 +69,7 @@ def _run(client, *, execute: bool, env: dict | None = None, **kw) -> int:
             "escrow_locked",
             return_value={"locked_uact": 50_000_000, "deployments": 2, "by_deployment": {}},
         ),
-        patch.dict("os.environ", env or {"AKASH_API_KEY": "k"}, clear=True),
+        patch.dict("os.environ", env or {"AKASH_API_KEY": FAKE_KEY}, clear=True),
         patch.object(cs.time, "sleep", lambda s: None),
     ):
         return cs.run(execute=execute, now=NOW, **kw)
@@ -243,7 +252,7 @@ class TestWalletPoolScope:
                 "escrow_locked",
                 return_value={"locked_uact": 5, "deployments": 1, "by_deployment": {}},
             ),
-            patch.dict("os.environ", {"AKASH_API_KEY": "k"}, clear=True),
+            patch.dict("os.environ", {"AKASH_API_KEY": FAKE_KEY}, clear=True),
             patch.object(cs.time, "sleep", lambda s: None),
         ):
             rc = cs.run_all_wallets(execute=False, now=NOW)
@@ -264,7 +273,7 @@ class TestWalletPoolScope:
                 "escrow_locked",
                 return_value={"locked_uact": 5, "deployments": 1, "by_deployment": {}},
             ),
-            patch.dict("os.environ", {"AKASH_API_KEYS": "a,b,c"}, clear=True),
+            patch.dict("os.environ", {"AKASH_API_KEYS": FAKE_KEYS_COMMA}, clear=True),
             patch.object(cs.time, "sleep", lambda s: None),
         ):
             rc = cs.run_all_wallets(execute=False, now=NOW)
@@ -288,7 +297,7 @@ class TestWalletPoolScope:
                 "escrow_locked",
                 return_value={"locked_uact": 5, "deployments": 1, "by_deployment": {}},
             ),
-            patch.dict("os.environ", {"AKASH_API_KEYS": "a;b"}, clear=True),
+            patch.dict("os.environ", {"AKASH_API_KEYS": FAKE_KEYS_SEMICOLON}, clear=True),
             patch.object(cs.time, "sleep", lambda s: None),
         ):
             cs.run_all_wallets(execute=False, now=NOW)
@@ -307,6 +316,6 @@ class TestWalletPoolScope:
         calls = iter([0, 2, 0])
         with (
             patch.object(cs, "run", side_effect=lambda **kw: next(calls)),
-            patch.dict("os.environ", {"AKASH_API_KEYS": "a,b,c"}, clear=True),
+            patch.dict("os.environ", {"AKASH_API_KEYS": FAKE_KEYS_COMMA}, clear=True),
         ):
             assert cs.run_all_wallets(execute=False, now=NOW) == 2
