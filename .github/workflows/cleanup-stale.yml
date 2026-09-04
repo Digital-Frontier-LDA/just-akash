@@ -32,6 +32,30 @@ on:
 permissions:
   contents: read
 
+env:
+  # ⛔ OFF. THE ONE-LINE PROMOTION (#250).
+  #
+  # "false" keeps scheduled runs reporting only, exactly as today. "true"
+  # promotes them to close, with the rails in cleanup_stale.py binding: a cap
+  # per wallet per run (oldest first), a refusal on any verdict the reaper does
+  # not recognise, and a refusal if an implausible share of the account looks
+  # closable. Every rail exits non-zero and says why.
+  #
+  # WHAT TO CHECK BEFORE FLIPPING IT, so this is a decision and not a shrug:
+  #   1. A dispatch with execute=true has been run recently and its verdict
+  #      table reviewed. The protocol is proven — 2026-08-30 closed 20, failed
+  #      0 — so this is confirming it still holds, not discovering it.
+  #   2. `stale (closable)` is in its normal range. The observed band across 56
+  #      scheduled runs is 0-55; a number far outside it wants explaining
+  #      before it is acted on automatically.
+  #   3. If AKASH_API_KEYS is set, the report names every wallet it audited.
+  #      "Console wallets configured: N" is printed before any of them.
+  #
+  # Deliberately a workflow-level constant rather than an input: an input can be
+  # set per-dispatch by anyone with Actions access, and the point of the gate is
+  # that promoting the SCHEDULE is a durable, reviewable change to a file.
+  CLEANUP_AUTO_EXECUTE: "false"
+
 # Never overlap with a live smoke run: the smoke holds young probes that the
 # age floors already spare, but serializing removes even the theoretical race.
 #
@@ -47,7 +71,19 @@ concurrency:
 
 jobs:
   cleanup:
-    name: ${{ inputs.execute && 'Close stale deployments' || 'Dry-run stale report' }}
+    # ⛔ MODE-NEUTRAL ON PURPOSE. This used to read
+    #   ${{ inputs.execute && 'Close stale deployments' || 'Dry-run stale report' }}
+    # which was correct for dispatches and WRONG for a promoted schedule: a
+    # scheduled run supplies no inputs, so `inputs.execute` is empty and the job
+    # would be labelled "Dry-run stale report" while CLEANUP_AUTO_EXECUTE had it
+    # closing deployments. A run that closed 55 leases under a label saying it
+    # closed nothing is the exact defect #250 is about, reproduced in the audit
+    # trail of the fix for it.
+    #
+    # The `env` context is not available in a job name, so the honest option is
+    # a label that CANNOT misdescribe the run. The effective mode is written to
+    # the step summary below, where both variables are readable.
+    name: Stale deployment sweep
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -88,14 +124,35 @@ jobs:
         # `env:` and branching in shell removes the class rather than arguing about this instance.
         env:
           EXECUTE: ${{ inputs.execute }}
+          AUTO_EXECUTE: ${{ env.CLEANUP_AUTO_EXECUTE }}
         run: |
           # ⛔ EQUALITY AGAINST "true", NEVER A PRESENCE TEST. A scheduled run supplies no
           # inputs, so EXECUTE is empty; a dry-run dispatch sets it to the STRING "false".
           # `${EXECUTE:+--execute}` or `[ -n "$EXECUTE" ]` would both fire on "false" and turn
           # every dry run into a live close — the same defect as DRY_RUN=1 parsing as false
           # (Blazing-Back #1581) with the sign flipped.
-          if [ "$EXECUTE" = "true" ]; then
+          # AUTO_EXECUTE gets the SAME equality-against-"true" treatment, and for
+          # the same reason: it is a workflow-level string, so a presence test
+          # would fire on the literal "false" and silently promote every
+          # scheduled run to a live close. One careful comparison here is worth
+          # more than any amount of care elsewhere in this file.
+          if [ "$EXECUTE" = "true" ] || [ "$AUTO_EXECUTE" = "true" ]; then
+            # Record the mode where it cannot be inferred wrongly later. The job
+            # label is deliberately neutral, so this is the audit trail's answer
+            # to "did this run close anything, and why was it allowed to?".
+            {
+              echo "### Stale sweep: **CLOSING** (live)"
+              echo ""
+              echo "- \`execute\` input: \`${EXECUTE:-<unset>}\`"
+              echo "- \`CLEANUP_AUTO_EXECUTE\`: \`${AUTO_EXECUTE:-<unset>}\`"
+            } >> "$GITHUB_STEP_SUMMARY"
             uv run python -m just_akash.cleanup_stale --reap-runners --execute
           else
+            {
+              echo "### Stale sweep: dry run (reported only, closed nothing)"
+              echo ""
+              echo "- \`execute\` input: \`${EXECUTE:-<unset>}\`"
+              echo "- \`CLEANUP_AUTO_EXECUTE\`: \`${AUTO_EXECUTE:-<unset>}\`"
+            } >> "$GITHUB_STEP_SUMMARY"
             uv run python -m just_akash.cleanup_stale --reap-runners
           fi
