@@ -34,9 +34,7 @@ LEASE_STATUS_WITH_IP = {
     "services": {"probe": {"name": "probe", "available": 1, "total": 1, "uris": []}},
     "forwarded_ports": {},
     "ips": {
-        "probe": [
-            {"IP": "213.58.173.241", "ExternalPort": 80, "Port": 80, "Protocol": "TCP"}
-        ]
+        "probe": [{"IP": "213.58.173.241", "ExternalPort": 80, "Port": 80, "Protocol": "TCP"}]
     },
 }
 
@@ -177,9 +175,7 @@ class TestClassify:
         """dseq 1788531162 went active->closed within hours on the day #244 was
         written. Reporting that as FAIL would make a healthy provider look
         broken every time a lease turns over."""
-        outcome, reason = classify(
-            ips=[], reachable=None, in_pool=None, lease_state="closed"
-        )
+        outcome, reason = classify(ips=[], reachable=None, in_pool=None, lease_state="closed")
         assert outcome == OUTCOME_CHURNED
         assert "closed" in reason
 
@@ -195,9 +191,7 @@ class TestClassify:
         assert outcome == OUTCOME_CHURNED
 
     def test_no_ip_assigned_is_the_wedged_operator_shape(self):
-        outcome, reason = classify(
-            ips=[], reachable=None, in_pool=None, lease_state="active"
-        )
+        outcome, reason = classify(ips=[], reachable=None, in_pool=None, lease_state="active")
         assert outcome == OUTCOME_FAIL
         assert "no IP assigned" in reason
 
@@ -342,7 +336,9 @@ class TestParsingEdges:
 
         parsed = datetime.fromisoformat(ts)
         assert parsed.tzinfo is not None
-        assert parsed.utcoffset().total_seconds() == 0
+        offset = parsed.utcoffset()
+        assert offset is not None
+        assert offset.total_seconds() == 0
 
 
 # ── the stage: orchestration + the no-leak guarantee ─────────────────────
@@ -422,8 +418,8 @@ class TestStageFailureModes:
         r = d.run()
         assert r.outcome == OUTCOME_FAIL
         assert "no IP assigned" in r.reason
-        assert d.curled == []          # nothing to reach; reachability not faked
-        assert r.reachable is None     # not measured, not "failed"
+        assert d.curled == []  # nothing to reach; reachability not faked
+        assert r.reachable is None  # not measured, not "failed"
         assert d.destroyed == ["1788000000001"]
 
     def test_assigned_but_unroutable(self):

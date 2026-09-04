@@ -145,9 +145,7 @@ class LeasedIP:
         return f"http://{self.ip}:{self.external_port}"
 
 
-def extract_leased_ips(
-    lease_status: Any, service: str = IP_SERVICE_NAME
-) -> list[LeasedIP]:
+def extract_leased_ips(lease_status: Any, service: str = IP_SERVICE_NAME) -> list[LeasedIP]:
     """Pull assigned addresses out of a lease-status payload.
 
     Tolerant by design: this parses a provider's response, and a provider that
@@ -190,17 +188,22 @@ def extract_leased_ips(
         raw_port = e.get("ExternalPort")
         if raw_port is None:
             raw_port = e.get("external_port")
-        if not isinstance(raw_ip, str) or not raw_ip:
+        if not isinstance(raw_ip, str) or not raw_ip or raw_port is None:
             continue
+        # Narrowed explicitly rather than leaning on the `except TypeError`
+        # below: the runtime guard alone leaves the None case invisible to the
+        # type checker, and a reader cannot see which absences are handled.
         try:
             ext = int(raw_port)
         except (TypeError, ValueError):
             continue
         inner = e.get("Port", e.get("port"))
-        try:
-            inner_port = int(inner) if inner is not None else None
-        except (TypeError, ValueError):
-            inner_port = None
+        inner_port: int | None = None
+        if inner is not None:
+            try:
+                inner_port = int(inner)
+            except (TypeError, ValueError):
+                inner_port = None
         proto = e.get("Protocol", e.get("protocol"))
         out.append(
             LeasedIP(
