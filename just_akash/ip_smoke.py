@@ -126,6 +126,35 @@ def ip_in_pool(ip: str, cidr: str | None) -> bool | None:
         return None
 
 
+def is_curlable(ip: str) -> bool:
+    """May we send a request to this address?
+
+    The address comes from a PROVIDER-CONTROLLED payload (`lease-status`), and
+    this probe runs on a CI runner that can reach our own infrastructure. So a
+    provider returning `127.0.0.1` or `10.0.0.5` would have the runner make a
+    request into its own network on the provider's say-so. Mirrors the same
+    predicate `provider_capacity._is_public_host` applies to provider-advertised
+    URLs — the trust boundary is identical and there should not be two answers
+    to the same question.
+
+    Note the direction of the failure: refusing to curl leaves `reachable` as
+    None, which classify() reports as "reachability was never established", i.e.
+    a FAIL. Being unable to safely test is never a pass.
+    """
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return not (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_reserved
+        or addr.is_multicast
+        or addr.is_unspecified
+    )
+
+
 # ── reading the assigned address off the lease ───────────────────────────
 
 
@@ -281,7 +310,17 @@ def classify(
     if reachable is None:
         return OUTCOME_FAIL, "reachability was never established"
     # in_pool None (no declared pool) is not a pass-blocker: we cannot check
-    # what we have not declared, and the reachability assertion still held.
+    # what we have not declared, and the reachability assertion still held. But
+    # the reason string must SAY which checks ran — claiming "in declared pool"
+    # when no pool was checked is the same not-measured-vs-measured-true
+    # conflation this module exists to prevent, and it would mislead exactly the
+    # ledger consumers that read these strings.
+    if in_pool is None:
+        return (
+            OUTCOME_PASS,
+            "IP assigned and reachable from outside; pool conformance NOT "
+            "checked (no declared pool for this cluster)",
+        )
     return OUTCOME_PASS, "IP assigned, in declared pool, reachable from outside"
 
 
@@ -419,9 +458,21 @@ def run_ip_stage(
             result.assigned_ip = first.ip
             result.external_port = first.external_port
             result.in_pool = ip_in_pool(first.ip, cidr)
-            # Only curl an address we actually got. Reachability stays None
-            # when there was nothing to reach — "not measured", not "failed".
-            result.reachable, result.http_status = curl(first.url)
+            # Only curl an address we actually got, and only one it is safe and
+            # meaningful to curl. Reachability stays None otherwise — "not
+            # measured", never "failed" and never "fine".
+            if result.in_pool is False:
+                # Already a FAIL on pool conformance; curling it would add SSRF
+                # exposure without changing the verdict.
+                result.diagnostics["curl_skipped"] = "address outside declared pool"
+            elif not is_curlable(first.ip):
+                result.diagnostics["curl_skipped"] = (
+                    "address is not public (loopback/private/link-local/"
+                    "reserved) — refusing to send a request into our own network "
+                    "on a provider's say-so"
+                )
+            else:
+                result.reachable, result.http_status = curl(first.url)
 
         # Read on-chain state ONLY when something looks wrong. A lease that
         # churned mid-probe explains the anomaly; asking on the happy path

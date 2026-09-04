@@ -491,3 +491,102 @@ class TestStageLedger:
         blocker.write_text("x")
         r = _Deps().run(ledger_path=str(blocker / "sub" / "l.jsonl"))
         assert r.diagnostics.get("ledger_write_failed") is True
+
+
+# ── SSRF guard + honest PASS reasons (PR #254 review) ────────────────────
+
+from just_akash.ip_smoke import is_curlable  # noqa: E402
+
+
+class TestCurlSafety:
+    """The address is provider-controlled and the runner can reach our own
+    infrastructure, so this is a trust boundary, not hygiene."""
+
+    def test_public_addresses_are_curlable(self):
+        assert is_curlable("213.58.173.241") is True
+        assert is_curlable("8.8.8.8") is True
+
+    def test_refuses_non_public_space(self):
+        for ip in [
+            "127.0.0.1",
+            "10.0.0.5",
+            "192.168.1.1",
+            "172.16.0.1",
+            "169.254.169.254",
+            "0.0.0.0",
+            "224.0.0.1",
+            "::1",
+        ]:
+            assert is_curlable(ip) is False, f"{ip} must not be curled"
+
+    def test_refuses_garbage(self):
+        assert is_curlable("not-an-ip") is False
+        assert is_curlable("") is False
+
+    def test_matches_provider_capacity_predicate(self):
+        """Same trust boundary as provider-advertised URLs; two answers to one
+        question is how a guard gets bypassed."""
+        from just_akash.provider_capacity import _is_public_host
+
+        for ip in ["8.8.8.8", "127.0.0.1", "10.0.0.5", "169.254.169.254"]:
+            assert is_curlable(ip) == _is_public_host(ip)
+
+
+class TestStageCurlSkipping:
+    def test_does_not_curl_a_private_address(self):
+        """Isolates the non-public branch by declaring a pool that CONTAINS the
+        private address — otherwise the out-of-pool check fires first and this
+        would pass for the wrong reason, proving nothing about the SSRF guard."""
+        d = _Deps(status={"ips": {"probe": [{"IP": "127.0.0.1", "ExternalPort": 80}]}})
+        r = d.run(pool_overrides={"onidc": "127.0.0.0/8"})
+        assert d.curled == [], "sent a request into our own network on a provider's say-so"
+        assert r.in_pool is True, "fixture must put the address IN pool to isolate the guard"
+        assert r.reachable is None
+        assert r.outcome == OUTCOME_FAIL
+        assert "not public" in r.diagnostics.get("curl_skipped", "")
+
+    def test_out_of_pool_check_precedes_the_public_check(self):
+        """Both reasons can apply at once; conformance is reported first because
+        it is the more specific finding."""
+        d = _Deps(status={"ips": {"probe": [{"IP": "127.0.0.1", "ExternalPort": 80}]}})
+        r = d.run()
+        assert d.curled == []
+        assert "outside declared pool" in r.diagnostics.get("curl_skipped", "")
+
+    def test_does_not_curl_an_out_of_pool_address(self):
+        """Already a FAIL on conformance — curling adds exposure without
+        changing the verdict."""
+        d = _Deps(status={"ips": {"probe": [{"IP": "8.8.8.8", "ExternalPort": 80}]}})
+        r = d.run()
+        assert d.curled == []
+        assert r.outcome == OUTCOME_FAIL
+        assert r.in_pool is False
+        assert "outside declared pool" in r.diagnostics.get("curl_skipped", "")
+
+    def test_refusing_to_curl_is_never_a_pass(self):
+        d = _Deps(status={"ips": {"probe": [{"IP": "127.0.0.1", "ExternalPort": 80}]}})
+        assert d.run().outcome != OUTCOME_PASS
+
+
+class TestPassReasonHonesty:
+    def test_pass_reason_does_not_claim_an_unchecked_pool(self):
+        """Claiming 'in declared pool' when no pool was checked is the exact
+        not-measured-vs-measured-true conflation this module exists to prevent."""
+        outcome, reason = classify(
+            ips=[LeasedIP("8.8.8.8", 80)],
+            reachable=True,
+            in_pool=None,
+            lease_state="active",
+        )
+        assert outcome == OUTCOME_PASS
+        assert "NOT checked" in reason
+        assert "in declared pool" not in reason
+
+    def test_pass_reason_states_the_pool_check_when_it_ran(self):
+        _, reason = classify(
+            ips=[LeasedIP("213.58.173.241", 80)],
+            reachable=True,
+            in_pool=True,
+            lease_state="active",
+        )
+        assert "in declared pool" in reason
