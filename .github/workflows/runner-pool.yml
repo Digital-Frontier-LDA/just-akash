@@ -814,7 +814,17 @@ jobs:
                 # One line per bad page, `grep -c .` collapses it to one integer.
                 BAD_PAGES=$(printf '%s' "$RUNNER_PAGES" | jq -r 'select(has("runners") | not) | 1' 2>/dev/null | grep -c . || true)
                 if [ "${BAD_PAGES:-0}" -ne 0 ]; then
-                  _why=$(printf '%s' "$RUNNER_PAGES" | jq -r 'select(has("runners") | not) | .message // "no message field"' 2>/dev/null | head -1)
+                  # ⚠ GUARDED ASSIGNMENT, because `| head -1` can SIGPIPE jq. With
+                  # `pipefail` on and enough documents, head closes the pipe early and
+                  # jq dies 141 — a non-zero substitution, which under `bash -e` aborts
+                  # AT THE ASSIGNMENT and reintroduces the exact defect this block fixes,
+                  # inside the handler for it. Reproduced: 3 docs -> rc=0, 20,000 docs ->
+                  # rc=141. ⛔ AND `pipefail` IS ON HERE — this step opens with
+                  # `set -uo pipefail`, so the risk is live, not theoretical. (I first
+                  # wrote that it was off; the awk I checked with had silently failed.
+                  # Measuring the parsed step said otherwise.) `|| _why=""` makes any
+                  # exit code survivable. (Reported by Copilot on PR #251.)
+                  _why=$(printf '%s' "$RUNNER_PAGES" | jq -r 'select(has("runners") | not) | .message // "no message field"' 2>/dev/null | head -1) || _why=""
                   echo "  runner listing unreadable (${BAD_PAGES} error page(s)): ${_why:-unparseable}"
                   sleep 15
                   continue
