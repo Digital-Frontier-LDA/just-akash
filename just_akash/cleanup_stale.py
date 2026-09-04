@@ -429,6 +429,12 @@ def run(
     # shows what the execute path WOULD have refused on.
     seen_verdicts: set[str] = set()
     stale_ages: dict[str, float] = {}
+    # Counted, not inferred from len(deployments): rows with no dseq, or whose
+    # detail read failed, are `continue`d before classify() ever sees them. Using
+    # the enumerated count as the tripwire denominator understates the stale
+    # FRACTION, so a provider having a bad day would silently loosen the safety
+    # margin — read failures making a rail LESS likely to fire is backwards.
+    classified = 0
     for d in deployments:
         dseq = _extract_dseq(d)
         if not dseq:
@@ -465,6 +471,7 @@ def run(
         # an uncheckable claim (#1763 wants per-deployment proof in the report itself).
         prov = f"  group={','.join(names) or '?'}" if names is not None else ""
         print(f"  {dseq}  age={age_str}  services={services or '-'}{prov}  -> {verdict}{suffix}")
+        classified += 1
         seen_verdicts.add(verdict)
         if verdict in STALE_VERDICTS and dseq in PROTECTED_DSEQS:
             print(f"    ^ PROTECTED-DSEQ: on the never-close list, {verdict} overridden")
@@ -513,14 +520,15 @@ def run(
     # RAIL 2 — shape tripwire. Not about any single row: if suddenly almost
     # everything looks closable, the likeliest cause is a classification fault,
     # and the right response to that is to stop and be looked at.
-    audited = len(deployments)
-    if audited >= MIN_AUDITED_FOR_FRACTION_RAIL:
-        fraction = len(stale) / audited
+    if classified >= MIN_AUDITED_FOR_FRACTION_RAIL:
+        fraction = len(stale) / classified
         if fraction > MAX_STALE_FRACTION:
             print(
-                f"\nREFUSING TO EXECUTE: {len(stale)}/{audited} = {fraction:.0%} of audited "
-                f"deployments classified closable, above the {MAX_STALE_FRACTION:.0%} "
-                "tripwire.\n"
+                f"\nREFUSING TO EXECUTE: {len(stale)}/{classified} = {fraction:.0%} of "
+                f"CLASSIFIED deployments closable, above the {MAX_STALE_FRACTION:.0%} "
+                f"tripwire. ({len(deployments)} enumerated, "
+                f"{len(deployments) - classified} unreadable and excluded from the "
+                "denominator.)\n"
                 "  A share this high is more likely a classification fault than a real "
                 "backlog. Investigate the verdict table above before closing anything.",
                 file=sys.stderr,
@@ -531,6 +539,22 @@ def run(
     # locked longest, and say plainly that it stopped short. Progress that
     # announces its own incompleteness beats either refusing entirely (the
     # backlog never drains) or closing everything (unbounded blast radius).
+    #
+    # ⛔ A NON-POSITIVE CAP INVERTS THIS RAIL. `stale[:-1]` closes all but one:
+    # 54 of 55 measured. A bound on blast radius that EXPANDS it given a bad
+    # value is worse than no bound at all, because its presence is what makes
+    # an operator believe the run is capped. Rejected at parse time too (see
+    # _positive_cap); this is the second lock, so neither a CLI typo nor a
+    # future in-process caller can invert it.
+    if max_close < 1:
+        print(
+            f"\nREFUSING TO EXECUTE: --max-close must be >= 1, got {max_close}.\n"
+            "  A non-positive cap does not narrow this run, it inverts the rail: a "
+            "negative value slices from the END and would close nearly everything.",
+            file=sys.stderr,
+        )
+        return 2
+
     stale = sorted(stale, key=lambda d: stale_ages.get(d, -1.0), reverse=True)
     capped = False
     if len(stale) > max_close:
@@ -601,6 +625,29 @@ def run_all_wallets(**kwargs) -> int:
     return worst
 
 
+def _positive_cap(value: str) -> int:
+    """argparse type for --max-close: a cap must be at least 1.
+
+    Rejected HERE as well as on the execute path because the two failures are
+    different. This one turns `--max-close -1` into a usage error the operator
+    sees immediately; the execute-path check catches an in-process caller that
+    never goes through argparse. A rail that bounds blast radius must not be
+    invertible from either direction — `stale[:-1]` closes all but one.
+    """
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--max-close must be an integer, got {value!r}"
+        ) from None
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(
+            f"--max-close must be >= 1, got {parsed}. A non-positive cap does not narrow "
+            "the run — a negative value slices from the end and would close nearly everything."
+        )
+    return parsed
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Close stale test deployments to free escrow.")
     ap.add_argument(
@@ -610,7 +657,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument(
         "--max-close",
-        type=int,
+        type=_positive_cap,
         default=MAX_CLOSE_PER_RUN,
         metavar="N",
         help=(

@@ -319,3 +319,82 @@ class TestWalletPoolScope:
             patch.dict("os.environ", {"AKASH_API_KEYS": FAKE_KEYS_COMMA}, clear=True),
         ):
             assert cs.run_all_wallets(execute=False, now=NOW) == 2
+
+
+# ── the two defects two reviewers found independently (PR #256) ──────────
+
+
+class TestCapCannotInvert:
+    """A bound on blast radius that EXPANDS it given a bad value is worse than
+    no bound: its presence is what makes an operator believe the run is capped.
+    `stale[:-1]` closes all but one — measured at 54 of 55."""
+
+    def test_negative_cap_refuses_instead_of_closing_almost_everything(self, capsys):
+        deployments = {_dseq(3 * 86400 + i): _detail(["backtest"]) for i in range(6)}
+        deployments.update({_dseq(60 + i): _detail(["node"]) for i in range(6)})
+        client = _mock_client(deployments)
+        rc = _run(client, execute=True, max_close=-1)
+        assert rc == 2, "a negative cap must refuse, not slice from the end"
+        client.close_deployment.assert_not_called()
+        assert "must be >= 1" in capsys.readouterr().err
+
+    def test_zero_cap_refuses_rather_than_silently_closing_nothing(self, capsys):
+        """`stale[:0]` is empty — safe by accident, but it reports a CAP while
+        doing nothing, which is the silent-no-op shape this issue is about."""
+        deployments = {_dseq(3 * 86400 + i): _detail(["backtest"]) for i in range(3)}
+        deployments.update({_dseq(60 + i): _detail(["node"]) for i in range(3)})
+        rc = _run(_mock_client(deployments), execute=True, max_close=0)
+        assert rc == 2
+        assert "must be >= 1" in capsys.readouterr().err
+
+    def test_rejected_at_parse_time_too(self):
+        """Two locks, because they catch different failures: this one turns a
+        CLI typo into an immediate usage error; the execute-path check catches
+        an in-process caller that never goes through argparse."""
+        import pytest
+
+        for bad in ["-1", "0"]:
+            with pytest.raises(SystemExit):
+                cs.main(["--max-close", bad])
+
+    def test_a_valid_cap_still_parses(self):
+        assert cs._positive_cap("7") == 7
+
+
+class TestTripwireDenominator:
+    """Read failures must not loosen a safety rail. Rows skipped before
+    classify() were counted in the denominator, understating the stale fraction
+    and making the tripwire LESS likely to fire exactly when the API is flaky."""
+
+    def test_unreadable_rows_are_excluded_from_the_denominator(self, capsys):
+        n = cs.MIN_AUDITED_FOR_FRACTION_RAIL + 2
+        stale = {_dseq(3 * 86400 + i): _detail(["backtest"]) for i in range(n)}
+        # Enough unreadable rows that counting them would drag the fraction
+        # under the tripwire and let a fully-stale account through.
+        unreadable = {_dseq(500 + i): None for i in range(n * 2)}
+        deployments = {**stale, **unreadable}
+
+        client = MagicMock()
+        client.account_address.return_value = "akash1me"
+
+        def _get(d):
+            detail = deployments[str(d)]
+            if detail is None:
+                raise RuntimeError("detail read failed")
+            return detail
+
+        client.get_deployment.side_effect = _get
+        client._records = [
+            {"deployment": {"state": "active", "id": {"owner": "akash1me", "dseq": d}}}
+            for d in deployments
+        ]
+
+        rc = _run(client, execute=True)
+        assert rc == 2, (
+            "unreadable rows padded the denominator and let a fully-stale "
+            "account past the tripwire"
+        )
+        client.close_deployment.assert_not_called()
+        err = capsys.readouterr().err
+        assert "CLASSIFIED" in err, "the refusal must say which denominator it used"
+        assert "unreadable and excluded" in err
