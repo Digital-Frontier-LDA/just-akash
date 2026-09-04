@@ -129,3 +129,54 @@ def test_owner_lookup_failure_names_attempt_count_without_exposing_keys(monkeypa
         select_client_for_dseq("123", client_factory=lambda key: clients[key])
     assert "secret-a" not in str(exc.value)
     assert "secret-b" not in str(exc.value)
+
+
+def test_unmeasurable_wallets_report_why_each_one_failed(monkeypatch):
+    """ "could not measure any of 3" named the symptom and hid every cause.
+
+    MEASURED in Borduas-Holdings/blazing job 101096063489: that line appeared six
+    times and the run then classified itself PROVIDER_CAPACITY — "a market/capacity
+    condition, not a code failure" — a verdict about the market reached without
+    reading a single wallet. Auth failure, network failure, rate limit and a typo'd
+    key all rendered identically, so no occurrence could be told from any other.
+    """
+    monkeypatch.setenv("AKASH_API_KEYS", "pool-a\npool-b")
+    monkeypatch.delenv("AKASH_API_KEY", raising=False)
+
+    def factory(key):
+        client = MagicMock()
+        client.account_address.side_effect = RuntimeError(f"401 Unauthorized ({key})")
+        return client
+
+    with pytest.raises(RuntimeError) as exc:
+        select_client_for_create(5_000_000, client_factory=factory, credit_reader=MagicMock())
+
+    message = str(exc.value)
+    assert "could not measure any of 2 configured Console wallets" in message
+    assert "wallet-0" in message and "wallet-1" in message
+    assert message.count("401 Unauthorized") == 2, "each wallet's own reason must survive"
+
+
+def test_a_failure_reason_never_carries_a_key_into_the_log(monkeypatch):
+    """⛔ Reporting the cause must not cost the secret.
+
+    The reasons come from a third-party HTTP client. A client that puts the request
+    URL or an auth header into its exception message would carry a Console key
+    straight into the run log, which is world-readable on a public Actions run. This
+    module's contract is that key values are never logged (`configured_api_keys`).
+    """
+    monkeypatch.setenv("AKASH_API_KEYS", "sk-SECRET-AAA\nsk-SECRET-BBB")
+    monkeypatch.delenv("AKASH_API_KEY", raising=False)
+
+    def factory(key):
+        client = MagicMock()
+        client.account_address.side_effect = RuntimeError(f"401 for https://api/x?token={key}")
+        return client
+
+    with pytest.raises(RuntimeError) as exc:
+        select_client_for_create(5_000_000, client_factory=factory, credit_reader=MagicMock())
+
+    message = str(exc.value)
+    assert "sk-SECRET-AAA" not in message and "sk-SECRET-BBB" not in message
+    assert message.count("***") == 2, "each echoed key must be redacted, not dropped silently"
+    assert "401 for https://api/x?token=" in message, "the cause must still be readable"

@@ -45,6 +45,22 @@ def configured_api_keys() -> list[str]:
     return result
 
 
+def _redact_keys(message: str, keys: list[str]) -> str:
+    """Strip any configured key that a third-party exception may have echoed back.
+
+    ⛔ THIS MODULE'S CONTRACT IS THAT KEY VALUES ARE NEVER LOGGED — see
+    `configured_api_keys`, "de-duplicated without ever logging their values". The
+    failure reasons added alongside this function come from exceptions raised by an
+    HTTP client, and a client that puts the request URL or an auth header into its
+    message would carry a key straight into the run log, which is world-readable on
+    a public Actions run. Reporting the cause must not cost the secret.
+    """
+    for key in keys:
+        if key:
+            message = message.replace(key, "***")
+    return message
+
+
 def _candidate_id(index: int) -> str:
     """Opaque in-process identity; never derive an identifier from a credential."""
 
@@ -139,6 +155,7 @@ def select_client_for_create(
 
     clients: dict[str, AkashConsoleAPI] = {}
     candidates: list[WalletCandidate] = []
+    failures: list[str] = []
     errors = 0
     for index, key in enumerate(keys):
         candidate_id = _candidate_id(index)
@@ -155,8 +172,18 @@ def select_client_for_create(
                     denom="uact",
                 )
             )
-        except Exception:  # noqa: BLE001 — one broken wallet must not hide healthy siblings
+        except Exception as exc:  # noqa: BLE001 — one broken wallet must not hide healthy siblings
             errors += 1
+            # ⛔ KEEP THE REASON. Counting the failure and discarding what it was
+            # leaves the caller with "could not measure any of 3", which names the
+            # symptom and hides every cause — auth, network, rate limit and a typo'd
+            # key all render identically. MEASURED in Borduas-Holdings/blazing job
+            # 101096063489: that line appeared six times and the run then classified
+            # itself PROVIDER_CAPACITY, "a market/capacity condition, not a code
+            # failure" — a verdict about the market reached without reading a wallet.
+            failures.append(
+                f"{candidate_id}: {_redact_keys(f'{type(exc).__name__}: {exc}', keys)}"
+            )
 
     result = rank_wallets(
         candidates,
@@ -164,7 +191,10 @@ def select_client_for_create(
     )
     if result.selected is None:
         if not candidates and errors:
-            raise RuntimeError(f"could not measure any of {len(keys)} configured Console wallets")
+            raise RuntimeError(
+                f"could not measure any of {len(keys)} configured Console wallets: "
+                + "; ".join(failures)
+            )
         richest = max((int(item.available_credit) for item in candidates), default=0)
         raise RuntimeError(
             "no Console wallet can fund this deployment: "
