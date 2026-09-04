@@ -344,8 +344,27 @@ jobs:
           # spend, and lets the two disagree: the status line could come from a call
           # that succeeded while the branch is taken on a call that failed, reporting a
           # code that never belonged to the failure.
-          RESP=$(gh api "orgs/${ORG}/actions/runners?per_page=1" -i 2>&1)
-          RC=$?
+          # ⛔ `RC=$?` ON THE NEXT LINE NEVER RAN. This step's shell is `bash -e {0}`
+          #    (the Actions default), and `set -uo pipefail` above does NOT clear `-e`.
+          #    A bare `VAR=$(cmd)` whose command fails is itself a failing command, so
+          #    `-e` killed the shell AT the assignment -- before `RC` was read, before
+          #    `CODE` was parsed, and before any of the diagnostic below could print.
+          #
+          # ⇒ The step exited 1 with NO annotation and NO summary. Every word of the
+          #   "CI is not broken, Akash is fine, and no provider is at fault" message --
+          #   written precisely so a credential failure would not be misread as a
+          #   provider outage -- was unreachable exactly when it was needed.
+          #
+          #   Measured on blazing: `Provision Fast-Tests pool` failed 23 consecutive
+          #   times on main, and its check annotation was the bare string
+          #   "Process completed with exit code 1". Nobody could tell whether the PAT
+          #   had expired, the org listing was rate-limited, or a provider was down --
+          #   which is the exact confusion `failure_reason` exists to prevent.
+          #
+          # ⚠ `|| RC=$?` keeps the assignment inside a list, which `-e` does not act on.
+          #   Do not "simplify" this back to a bare assignment.
+          RC=0
+          RESP=$(gh api "orgs/${ORG}/actions/runners?per_page=1" -i 2>&1) || RC=$?
           CODE=$(printf '%s' "$RESP" | awk 'NR==1{print $2}')
           if [ "$RC" -ne 0 ]; then
             echo "failure_reason=RUNNER_PAT_INVALID" >> "$GITHUB_OUTPUT"
