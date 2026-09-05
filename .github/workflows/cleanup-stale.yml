@@ -125,6 +125,29 @@ jobs:
         env:
           EXECUTE: ${{ inputs.execute }}
           AUTO_EXECUTE: ${{ env.CLEANUP_AUTO_EXECUTE }}
+          # ⛔ THE REAPER IS POOL-CAPABLE AND HAS NEVER BEEN POOL-SCOPED (#259).
+          #
+          # `run_all_wallets()` has iterated `configured_api_keys()` since #256,
+          # but `secrets/ci.sops.env` defines only the SINGULAR AKASH_API_KEY —
+          # so it has always resolved to one account and audited one of three
+          # Console wallets while reporting green about the others. Measured
+          # 2026-09-05: AKASH_CONSOLE holds 15 active deployments that nothing
+          # in this repo has ever looked at.
+          #
+          # ⚠️ NOTHING IS WIRED HERE ON PURPOSE. This repo's invariant is that
+          # secrets live in secrets/ci.sops.env and reach jobs through
+          # ./.github/actions/sops-env, never as a direct workflow-level
+          # secrets reference (enforced by tests/test_repo_invariants.py, which
+          # scans this file's text — hence the wording). That action
+          # exports EVERY variable in the file into $GITHUB_ENV, so the moment
+          # AKASH_API_KEYS is added to ci.sops.env it arrives here — and in
+          # every other job that loads SOPS — with no change to this file.
+          #
+          # Adding it needs the real key material and the age key, which is a
+          # human action and deliberately not attempted here. The same route
+          # carries AKASH_WALLETS_EXPECTED, which turns a pool that silently
+          # failed to arrive into a hard error (see run_all_wallets, and
+          # just-akash#167).
         run: |
           # ⛔ EQUALITY AGAINST "true", NEVER A PRESENCE TEST. A scheduled run supplies no
           # inputs, so EXECUTE is empty; a dry-run dispatch sets it to the STRING "false".

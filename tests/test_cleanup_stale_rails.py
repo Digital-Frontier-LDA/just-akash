@@ -398,3 +398,64 @@ class TestTripwireDenominator:
         err = capsys.readouterr().err
         assert "CLASSIFIED" in err, "the refusal must say which denominator it used"
         assert "unreadable and excluded" in err
+
+
+# ── the pool-arrival guard (#259, landmine from just-akash#167) ──────────
+
+
+class TestWalletsExpectedGuard:
+    """A plural that silently degrades to a singular is the green-because-it-
+    never-ran defect wearing a different hat: the job audits one wallet and
+    reports clean about the others, indistinguishable from a healthy
+    single-wallet run. The receiver cannot infer intent from an empty variable,
+    so intent is declared and a mismatch is fatal."""
+
+    def _run_pool(self, env: dict) -> int:
+        d = {_dseq(3 * 86400): _detail(["backtest"])}
+        client = _mock_client(d)
+        with (
+            patch.object(cs, "AkashConsoleAPI", return_value=client),
+            patch.object(cs.chain, "list_active_deployments", return_value=client._records),
+            patch.object(cs.chain, "deploy_credit", return_value={"uact": 100_000_000}),
+            patch.object(
+                cs,
+                "escrow_locked",
+                return_value={"locked_uact": 5, "deployments": 1, "by_deployment": {}},
+            ),
+            patch.dict("os.environ", env, clear=True),
+            patch.object(cs.time, "sleep", lambda s: None),
+        ):
+            return cs.run_all_wallets(execute=False, now=NOW)
+
+    def test_silent_downgrade_to_one_wallet_is_fatal(self, capsys):
+        """The #167 shape: a caller pinned to a ref predating the pool has
+        AKASH_API_KEYS read as empty. Without this guard the run audits the
+        single fallback key and reports success."""
+        rc = self._run_pool(
+            {"AKASH_API_KEY": FAKE_KEY, "AKASH_API_KEYS": "", "AKASH_WALLETS_EXPECTED": "3"}
+        )
+        assert rc == 2, "a pool that did not arrive must fail, not quietly audit one wallet"
+        err = capsys.readouterr().err
+        assert "AKASH_WALLETS_EXPECTED=3" in err and "1 Console wallet" in err
+
+    def test_matching_count_proceeds(self, capsys):
+        rc = self._run_pool({"AKASH_API_KEYS": FAKE_KEYS_COMMA, "AKASH_WALLETS_EXPECTED": "3"})
+        assert rc == 0
+        assert "Console wallets configured: 3" in capsys.readouterr().out
+
+    def test_unset_asserts_nothing(self, capsys):
+        """Today's config has no pool secret. The guard must not turn that into
+        a failure — it is opt-in, declared by whoever provisions the pool."""
+        assert self._run_pool({"AKASH_API_KEY": FAKE_KEY}) == 0
+
+    def test_non_integer_expectation_is_rejected(self, capsys):
+        rc = self._run_pool({"AKASH_API_KEY": FAKE_KEY, "AKASH_WALLETS_EXPECTED": "three"})
+        assert rc == 2
+        assert "must be an integer" in capsys.readouterr().err
+
+    def test_more_wallets_than_expected_also_fails(self, capsys):
+        """Symmetric on purpose: resolving MORE than declared means the pool is
+        not what the operator thinks it is, and a reaper closing deployments
+        should not act on a wallet set nobody declared."""
+        rc = self._run_pool({"AKASH_API_KEYS": FAKE_KEYS_COMMA, "AKASH_WALLETS_EXPECTED": "2"})
+        assert rc == 2

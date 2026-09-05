@@ -607,6 +607,42 @@ def run_all_wallets(**kwargs) -> int:
     or failing to close, must not be masked by another's success.
     """
     keys = configured_api_keys()
+
+    # ⛔ FAIL LOUD WHEN A POOL WAS INTENDED AND DID NOT ARRIVE.
+    #
+    # just-akash#167: a caller pinning a tag that predates the pool feature has
+    # `AKASH_API_KEYS` read as NOTHING, silently — the job then audits one
+    # wallet and reports green about the others, which is indistinguishable
+    # from a healthy single-wallet run. That is the same green-because-it-never-
+    # ran defect this repo keeps finding, and a plural that quietly degrades to
+    # a singular is exactly its shape.
+    #
+    # The receiver cannot infer intent from an empty variable, so intent is
+    # declared: set AKASH_WALLETS_EXPECTED=N alongside the keys and a mismatch
+    # is a hard error instead of a quiet downgrade. Unset means no assertion —
+    # today's single-wallet config stays valid without ceremony.
+    expected_raw = os.environ.get("AKASH_WALLETS_EXPECTED", "").strip()
+    if expected_raw:
+        try:
+            expected = int(expected_raw)
+        except ValueError:
+            print(
+                f"Error: AKASH_WALLETS_EXPECTED must be an integer, got {expected_raw!r}.",
+                file=sys.stderr,
+            )
+            return 2
+        if len(keys) != expected:
+            print(
+                f"Error: AKASH_WALLETS_EXPECTED={expected} but "
+                f"{len(keys)} Console wallet(s) resolved.\n"
+                "  A pool was intended and did not arrive. The usual cause is a "
+                "caller pinned to a ref that predates the pool, where "
+                "AKASH_API_KEYS reads as empty and this would otherwise audit "
+                "one wallet and report green about the rest (just-akash#167).",
+                file=sys.stderr,
+            )
+            return 2
+
     if not keys:
         print("Error: neither AKASH_API_KEY nor AKASH_API_KEYS is set.", file=sys.stderr)
         return 2
