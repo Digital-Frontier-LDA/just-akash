@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -73,6 +74,42 @@ def _run(client, *, execute: bool, env: dict | None = None, **kw) -> int:
         patch.object(cs.time, "sleep", lambda s: None),
     ):
         return cs.run(execute=execute, now=NOW, **kw)
+
+
+def _mock_pool(key_to_address: dict[str, str], deployments: dict | None = None):
+    """One client per KEY, each answering with its OWN account address.
+
+    ⛔ The previous harness returned a single client for every key, so three
+    keys resolved to one account while the suite asserted "3 wallets audited".
+    It modelled one wallet three times and called it a pool — which is why the
+    suite could not have caught the keys-are-not-wallets defect it was written
+    to cover. A fixture that cannot express the bug cannot exclude it.
+    """
+
+    return {
+        key: _mock_client(dict(deployments or {}), address=address)
+        for key, address in key_to_address.items()
+    }
+
+
+@contextmanager
+def _pool(clients: dict, env: dict):
+    records = {c.account_address.return_value: c._records for c in clients.values()}
+    with (
+        patch.object(cs, "AkashConsoleAPI", side_effect=lambda key: clients[key]),
+        patch.object(
+            cs.chain, "list_active_deployments", side_effect=lambda a: records.get(a, [])
+        ),
+        patch.object(cs.chain, "deploy_credit", return_value={"uact": 100_000_000}),
+        patch.object(
+            cs,
+            "escrow_locked",
+            return_value={"locked_uact": 5, "deployments": 1, "by_deployment": {}},
+        ),
+        patch.dict("os.environ", env, clear=True),
+        patch.object(cs.time, "sleep", lambda s: None),
+    ):
+        yield
 
 
 # ── the verdict set is pinned to the source, not hand-maintained ─────────
@@ -262,20 +299,11 @@ class TestWalletPoolScope:
     def test_audits_every_configured_wallet(self, capsys):
         """The #250 defect: reading the singular key audits one of three and
         reports green about the other two — never having looked."""
-        d = {_dseq(3 * 86400): _detail(["backtest"])}
-        client = _mock_client(d)
-        with (
-            patch.object(cs, "AkashConsoleAPI", return_value=client),
-            patch.object(cs.chain, "list_active_deployments", return_value=client._records),
-            patch.object(cs.chain, "deploy_credit", return_value={"uact": 100_000_000}),
-            patch.object(
-                cs,
-                "escrow_locked",
-                return_value={"locked_uact": 5, "deployments": 1, "by_deployment": {}},
-            ),
-            patch.dict("os.environ", {"AKASH_API_KEYS": FAKE_KEYS_COMMA}, clear=True),
-            patch.object(cs.time, "sleep", lambda s: None),
-        ):
+        clients = _mock_pool(
+            dict(zip(FAKE_KEYS_COMMA.split(","), ("akash1a", "akash1b", "akash1c"), strict=True)),
+            {_dseq(3 * 86400): _detail(["backtest"])},
+        )
+        with _pool(clients, {"AKASH_API_KEYS": FAKE_KEYS_COMMA}):
             rc = cs.run_all_wallets(execute=False, now=NOW)
         assert rc == 0
         out = capsys.readouterr().out
@@ -286,20 +314,11 @@ class TestWalletPoolScope:
     def test_says_how_many_wallets_before_auditing_any(self, capsys):
         """'1 wallet, clean' and '3 wallets, only 1 audited' must never render
         the same way — that is the whole defect, restated."""
-        d = {_dseq(3 * 86400): _detail(["backtest"])}
-        client = _mock_client(d)
-        with (
-            patch.object(cs, "AkashConsoleAPI", return_value=client),
-            patch.object(cs.chain, "list_active_deployments", return_value=client._records),
-            patch.object(cs.chain, "deploy_credit", return_value={"uact": 100_000_000}),
-            patch.object(
-                cs,
-                "escrow_locked",
-                return_value={"locked_uact": 5, "deployments": 1, "by_deployment": {}},
-            ),
-            patch.dict("os.environ", {"AKASH_API_KEYS": FAKE_KEYS_SEMICOLON}, clear=True),
-            patch.object(cs.time, "sleep", lambda s: None),
-        ):
+        clients = _mock_pool(
+            dict(zip(FAKE_KEYS_SEMICOLON.split(";"), ("akash1a", "akash1b"), strict=True)),
+            {_dseq(3 * 86400): _detail(["backtest"])},
+        )
+        with _pool(clients, {"AKASH_API_KEYS": FAKE_KEYS_SEMICOLON}):
             cs.run_all_wallets(execute=False, now=NOW)
         out = capsys.readouterr().out
         assert out.index("Console wallets configured: 2") < out.index("wallet 1/2")
@@ -314,9 +333,12 @@ class TestWalletPoolScope:
         success — an aggregate that reports the best outcome is how a partial
         failure disappears."""
         calls = iter([0, 2, 0])
+        clients = _mock_pool(
+            dict(zip(FAKE_KEYS_COMMA.split(","), ("akash1a", "akash1b", "akash1c"), strict=True))
+        )
         with (
+            _pool(clients, {"AKASH_API_KEYS": FAKE_KEYS_COMMA}),
             patch.object(cs, "run", side_effect=lambda **kw: next(calls)),
-            patch.dict("os.environ", {"AKASH_API_KEYS": FAKE_KEYS_COMMA}, clear=True),
         ):
             assert cs.run_all_wallets(execute=False, now=NOW) == 2
 
@@ -410,21 +432,14 @@ class TestWalletsExpectedGuard:
     single-wallet run. The receiver cannot infer intent from an empty variable,
     so intent is declared and a mismatch is fatal."""
 
-    def _run_pool(self, env: dict) -> int:
-        d = {_dseq(3 * 86400): _detail(["backtest"])}
-        client = _mock_client(d)
-        with (
-            patch.object(cs, "AkashConsoleAPI", return_value=client),
-            patch.object(cs.chain, "list_active_deployments", return_value=client._records),
-            patch.object(cs.chain, "deploy_credit", return_value={"uact": 100_000_000}),
-            patch.object(
-                cs,
-                "escrow_locked",
-                return_value={"locked_uact": 5, "deployments": 1, "by_deployment": {}},
-            ),
-            patch.dict("os.environ", env, clear=True),
-            patch.object(cs.time, "sleep", lambda s: None),
-        ):
+    def _run_pool(self, env: dict, addresses: tuple[str, ...] | None = None) -> int:
+        raw = env.get("AKASH_API_KEYS", "").strip() or env.get("AKASH_API_KEY", "")
+        keys = [k for k in (p.strip() for p in re.split(r"[,;]", raw)) if k]
+        addrs = addresses or tuple(f"akash1w{i}" for i in range(len(keys)))
+        clients = _mock_pool(
+            dict(zip(keys, addrs, strict=True)), {_dseq(3 * 86400): _detail(["backtest"])}
+        )
+        with _pool(clients, env):
             return cs.run_all_wallets(execute=False, now=NOW)
 
     def test_silent_downgrade_to_one_wallet_is_fatal(self, capsys):
@@ -459,3 +474,95 @@ class TestWalletsExpectedGuard:
         should not act on a wallet set nobody declared."""
         rc = self._run_pool({"AKASH_API_KEYS": FAKE_KEYS_COMMA, "AKASH_WALLETS_EXPECTED": "2"})
         assert rc == 2
+
+
+# ── a key is not a wallet (#261 review) ─────────────────────────────────
+
+
+class TestKeysAreNotWallets:
+    """The guard was named WALLETS_EXPECTED and counted KEYS.
+
+    The repo supports several keys resolving to one account, so two aliases
+    satisfied AKASH_WALLETS_EXPECTED=2 while the pool was one wallet — the
+    silent shortfall the guard exists to catch, reproduced inside the guard.
+
+    The count is the smaller half. `run()` enumerates from the CHAIN by
+    address, so duplicate keys walk the IDENTICAL deployment set once per key
+    with `max_close` applied per call: a cap of 25 closes 50. That is the #256
+    blast-radius rail inverting again by another route, and it is why these
+    tests assert on close calls and not only on printed counts.
+    """
+
+    ALIASES = "alias-a,alias-b"
+
+    def test_two_keys_for_one_account_count_as_one_wallet(self, capsys):
+        clients = _mock_pool(
+            {"alias-a": "akash1same", "alias-b": "akash1same"},
+            {_dseq(3 * 86400): _detail(["backtest"])},
+        )
+        with _pool(clients, {"AKASH_API_KEYS": self.ALIASES}):
+            rc = cs.run_all_wallets(execute=False, now=NOW)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Console wallets configured: 1" in out
+        assert "2 keys, 1 alias(es) of an account already in scope" in out
+        assert "wallet 2/" not in out, "one account must be audited once, not once per key"
+
+    def test_expected_two_is_not_satisfied_by_two_aliases_of_one_wallet(self, capsys):
+        """The reviewer's exact case: the guard must not accept a key count."""
+        clients = _mock_pool(
+            {"alias-a": "akash1same", "alias-b": "akash1same"},
+            {_dseq(3 * 86400): _detail(["backtest"])},
+        )
+        with _pool(clients, {"AKASH_API_KEYS": self.ALIASES, "AKASH_WALLETS_EXPECTED": "2"}):
+            rc = cs.run_all_wallets(execute=False, now=NOW)
+        assert rc == 2, "two aliases for one account is one wallet, not two"
+        err = capsys.readouterr().err
+        assert "1 Console wallet(s) resolved from 2 key(s)" in err
+
+    def test_duplicate_keys_do_not_double_the_close_cap(self):
+        """The rail, not the label. Both keys reach one account holding more
+        stale deployments than the cap; auditing per key would close 2x."""
+        stale = {
+            _dseq(3 * 86400 + i): _detail(["backtest"]) for i in range(cs.MAX_CLOSE_PER_RUN + 5)
+        }
+        keep = {_dseq(60 + i): _detail(["node"]) for i in range(cs.MAX_CLOSE_PER_RUN + 5)}
+        clients = _mock_pool({"alias-a": "akash1same", "alias-b": "akash1same"}, {**stale, **keep})
+        with _pool(clients, {"AKASH_API_KEYS": self.ALIASES}):
+            cs.run_all_wallets(execute=True, now=NOW)
+
+        closed = sum(c.close_deployment.call_count for c in clients.values())
+        assert closed == cs.MAX_CLOSE_PER_RUN, (
+            f"cap is {cs.MAX_CLOSE_PER_RUN} per run; auditing one account once "
+            f"per alias closed {closed}"
+        )
+
+    def test_an_unidentifiable_key_refuses_rather_than_guessing(self, capsys):
+        """We cannot tell three wallets from one wallet three times without
+        resolving every key, and one of those closes 3x the cap."""
+        clients = _mock_pool(
+            {"alias-a": "akash1a", "alias-b": "akash1b"},
+            {_dseq(3 * 86400): _detail(["backtest"])},
+        )
+        clients["alias-b"].account_address.side_effect = RuntimeError("403")
+        with _pool(clients, {"AKASH_API_KEYS": self.ALIASES}):
+            rc = cs.run_all_wallets(execute=False, now=NOW)
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "position(s) 2 of 2" in err
+        assert "alias-b" not in err, "a refusal must never echo the credential"
+        clients["alias-a"].close_deployment.assert_not_called()
+
+    def test_resolution_happens_before_any_wallet_is_audited(self):
+        """Eager by design: this function has no selection step to assert
+        after — it iterates every wallet and closes as it goes, so a guard
+        that fires afterwards is a post-mortem."""
+        clients = _mock_pool(
+            {"alias-a": "akash1a", "alias-b": "akash1b"},
+            {_dseq(3 * 86400): _detail(["backtest"])},
+        )
+        clients["alias-b"].account_address.side_effect = RuntimeError("403")
+        with _pool(clients, {"AKASH_API_KEYS": self.ALIASES}):
+            assert cs.run_all_wallets(execute=True, now=NOW) == 2
+        for client in clients.values():
+            client.close_deployment.assert_not_called()
