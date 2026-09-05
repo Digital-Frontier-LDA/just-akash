@@ -31,6 +31,7 @@ from akash_lease_core.capacity import ProviderCapacity
 from . import chain
 from ._diagnostics import Code, emit, enabled
 from .api import (
+    AkashAPIError,
     AkashConsoleAPI,
     _extract_bid_price,
     _extract_dseq,
@@ -1034,8 +1035,49 @@ def deploy(
                     f"Failed to create deployment after retry: {retry_err}"
                 ) from retry_err
         else:
-            _log(logging.ERROR, f"Create deployment FAILED: {e}")
-            emit(Code.DEPLOY_CREATE_FAILED, "error", f"create deployment failed: {e}")
+            # ⛔ NAME AN UPSTREAM TIMEOUT AS UPSTREAM. A Cloudflare 524 is the proxy
+            # giving up on Akash's origin; it says nothing about the change under
+            # test. Reported as a plain create failure it reads as "this PR broke
+            # the E2E", the leg gets called flaky, and it is re-run by hand at real
+            # Akash cost per round (#266).
+            if isinstance(e, AkashAPIError) and e.is_upstream_timeout():
+                _log(
+                    logging.ERROR,
+                    f"Create deployment FAILED — UPSTREAM TIMEOUT, not this change: {e}",
+                )
+                emit(
+                    Code.DEPLOY_CREATE_FAILED,
+                    "error",
+                    f"create deployment failed UPSTREAM (HTTP {e.status}"
+                    f"{', ' + e.error_name if e.error_name else ''}): the Console API's "
+                    f"proxy gave up on its origin. This is NOT evidence about the code "
+                    f"under test.",
+                )
+                # ⛔ AND WE DO NOT RE-POST IT, THOUGH THE BODY SAYS retryable:true.
+                # That flag is Cloudflare describing its own proxy semantics — it
+                # cannot describe whether the origin committed, because Cloudflare
+                # does not know. This file's own _report_suspected_orphans records
+                # the measured counter-case: a PROXY TIMEOUT can land after the
+                # transaction committed (HTTP 500 at 103s). A blind retry on a
+                # non-idempotent create double-spends escrow on exactly the failure
+                # that is hardest to see. The orphan report below is the read-back
+                # that would have to come first.
+                # ⛔ `is not None`, NOT TRUTHINESS. `retry_after: 0` is a legitimate
+                # value meaning "retry immediately", and truthiness makes it
+                # indistinguishable from the upstream having said nothing at all —
+                # the exact absent-vs-present collapse this change deliberately
+                # avoids for `retryable`. Same distinction, and I applied it to one
+                # field and not the other in the same commit.
+                if e.retry_after is not None:
+                    _log(
+                        logging.ERROR,
+                        f"  upstream advertised retry_after={e.retry_after}s — NOT acted on "
+                        "automatically; a create is not idempotent and may already have "
+                        "landed. See the orphan report below before re-running.",
+                    )
+            else:
+                _log(logging.ERROR, f"Create deployment FAILED: {e}")
+                emit(Code.DEPLOY_CREATE_FAILED, "error", f"create deployment failed: {e}")
             _report_suspected_orphans(client, _create_started, _RUN_ID)
             raise RuntimeError(f"Failed to create deployment: {e}") from e
 
