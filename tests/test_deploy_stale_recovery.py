@@ -33,6 +33,34 @@ NOW = time.time()
 OLD = dp.STALE_RETRY_MIN_AGE_SECONDS + 3600
 OURS = "just-akash-runner-abc123"
 
+_MINIMAL_SDL = """\
+version: "2.0"
+services:
+  web:
+    image: nginx
+    expose:
+      - port: 80
+        as: 80
+        to:
+          - global: true
+profiles:
+  compute:
+    web:
+      resources:
+        cpu: {units: 0.1}
+        memory: {size: 128Mi}
+        storage: {size: 128Mi}
+  placement:
+    akash:
+      pricing:
+        web: {denom: uakt, amount: 1000}
+deployment:
+  web:
+    akash:
+      profile: web
+      count: 1
+"""
+
 
 def _dseq(age_s: float) -> str:
     return str(int((NOW - age_s) * 1000))
@@ -176,3 +204,54 @@ def test_the_recovery_never_raises_into_the_callers_error_path():
     client = _client()
     client.account_address.side_effect = RuntimeError("console down")
     assert dp._close_stale_for_retry(client, now=NOW) == []
+
+
+class TestTheRecoveryNeverEscapesIntoTheCallersError:
+    """⛔ TWO FAILURE MODES, ONE COVERED. Guard 1 handled the enumeration
+    RETURNING None — "could not ask the chain is not an empty account" — and
+    left the case where it RAISES bare. `list_active_deployments` calls
+    `rest_urls()` outside any try, and `rest_url()` raises RuntimeError on a bad
+    AKASH_REST_URL, so the docstring's "never raises" was untrue for the one
+    external call of five that was not wrapped.
+
+    Distinguishing None from [] and forgetting the third state is the same shape
+    as an assertion that cannot tell "not yet" from "never".
+
+    ⚠ Severity is diagnostic, not destructive: a raise closes NOTHING, so the
+    safety property held. What broke is that the exception replaces the caller's
+    real failure — which is why the second test here asserts the caller's error
+    SURVIVES, not merely that this function returned [].
+    """
+
+    def test_an_enumeration_that_raises_closes_nothing_and_returns_empty(self):
+        client = _client()
+        with patch.object(
+            dp.chain, "list_active_deployments", side_effect=RuntimeError("bad AKASH_REST_URL")
+        ):
+            assert dp._close_stale_for_retry(client, now=NOW) == []
+        client.close_deployment.assert_not_called()
+
+    def test_the_contract_holds_WITHOUT_the_callers_wrapper(self):
+        """⛔ THE HONEST VERSION OF THIS TEST.
+
+        My first attempt asserted that `deploy()` still surfaces the create's
+        error when the enumeration raises — and it PASSED with the bug present,
+        because the call site wraps `_close_stale_for_retry` in
+        `except Exception` and logs "Stale deployment cleanup failed". So the
+        caller's error was never actually replaced, and a test asserting it
+        could not fail. I had claimed a severity the code did not support.
+
+        What was really wrong is narrower and more interesting: this function
+        was safe only because something DOWNSTREAM covered it, while its own
+        docstring promised the guarantee. So the assertion that means something
+        is made HERE, against the function alone, with no caller in the picture —
+        a contract that holds by luck is one refactor from not holding.
+        """
+
+        client = _client()
+        for boom in (RuntimeError("bad AKASH_REST_URL"), ValueError("x"), OSError("y")):
+            with patch.object(dp.chain, "list_active_deployments", side_effect=boom):
+                assert dp._close_stale_for_retry(client, now=NOW) == [], (
+                    f"{type(boom).__name__} escaped a function documented as never raising"
+                )
+        client.close_deployment.assert_not_called()

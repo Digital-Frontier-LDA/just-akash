@@ -207,7 +207,25 @@ def _close_stale_for_retry(client, *, now: float | None = None) -> list[str]:
     # GUARD 1 — enumerate from the CHAIN, owner-scoped and authoritative.
     # ⛔ None IS NOT []. "Could not ask the chain" must never be swept as "holds
     # nothing": that collapse is how a broken enumeration reads as a clean account.
-    active = chain.list_active_deployments(owner)
+    # ⛔ TWO FAILURE MODES, NOT ONE. An earlier cut handled only the one that
+    # RETURNS — `None`, "could not ask the chain" — and left the one that RAISES
+    # bare. `list_active_deployments` calls `rest_urls()` outside any try, and
+    # `rest_url()` raises RuntimeError on a bad or empty AKASH_REST_URL. It was
+    # the ONLY unwrapped external call of five, in a function whose docstring
+    # promises it never raises.
+    #
+    # ⚠ SEVERITY, STATED ACCURATELY. The single current caller ALSO wraps this
+    # function in `except Exception`, so a raise did NOT reach the operator in
+    # place of the create failure — it was logged as "Stale deployment cleanup
+    # failed" and the retry proceeded. The defect was that this function was safe
+    # only because something downstream covered it, while its own docstring
+    # claimed the guarantee. A contract that holds by luck is one refactor from
+    # not holding, and the next caller inherits a promise that was never true.
+    try:
+        active = chain.list_active_deployments(owner)
+    except Exception as exc:  # noqa: BLE001 — never mask the caller's error
+        _log(logging.WARNING, f"Stale recovery: chain enumeration raised ({exc}) — skipped")
+        return []
     if active is None:
         _log(logging.WARNING, "Stale recovery: chain enumeration failed — closing nothing")
         return []
