@@ -54,11 +54,25 @@ def _redact_keys(message: str, keys: list[str]) -> str:
     HTTP client, and a client that puts the request URL or an auth header into its
     message would carry a key straight into the run log, which is world-readable on
     a public Actions run. Reporting the cause must not cost the secret.
+
+    ⛔ ONE PASS, LONGEST KEY FIRST — the ordering IS the security property.
+    A `str.replace` per key in configuration order leaks (CWE-532): with keys
+    `abc` and `abcdef`, the shorter runs first, rewrites an echoed `abcdef` to
+    `***def`, and the longer key's suffix survives in a world-readable log
+    while the redaction reports itself done. It needs only one configured key
+    to be a prefix of another, and nothing prevents that.
+
+    Fixed by construction rather than by reordering the loop. A single regex
+    pass tries alternatives longest-first at each position and resumes AFTER
+    the match, so no substitution can create or destroy another one — which a
+    sequential loop cannot promise however it is ordered. Sorting on
+    (-len, value) additionally makes the output independent of the order the
+    keys were configured in, so the guarantee does not rest on caller habit.
     """
-    for key in keys:
-        if key:
-            message = message.replace(key, "***")
-    return message
+    ordered = sorted({k for k in keys if k}, key=lambda k: (-len(k), k))
+    if not ordered:
+        return message
+    return re.sub("|".join(re.escape(k) for k in ordered), "***", message)
 
 
 def _candidate_id(index: int) -> str:
@@ -191,9 +205,12 @@ def select_client_for_create(
     )
     if result.selected is None:
         if not candidates and errors:
+            # One per line, as the PR describes. A single "; "-joined line put
+            # every wallet's reason in one wall of text exactly when there are
+            # most of them to read.
             raise RuntimeError(
-                f"could not measure any of {len(keys)} configured Console wallets: "
-                + "; ".join(failures)
+                f"could not measure any of {len(keys)} configured Console wallets:\n  "
+                + ";\n  ".join(failures)
             )
         richest = max((int(item.available_credit) for item in candidates), default=0)
         raise RuntimeError(
