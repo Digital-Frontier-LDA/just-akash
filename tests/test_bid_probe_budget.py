@@ -23,21 +23,49 @@ from pathlib import Path
 
 import pytest
 
-from just_akash.bid_probe import PROVIDERS, SCENARIOS, eligible_pairs
+from just_akash.bid_probe import PROVIDERS, SCENARIOS, _build_parser, eligible_pairs
 
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "bid-probe.yml"
 
-# Mirrors the CLI defaults the workflow passes: --wait 45, --retry-delay 60,
-# and the confirming re-probe waits a second full --wait.
-WAIT_S = 45
-CONFIRM_DELAY_S = 60
-RETRY_WAIT_S = 45
-WORST_CASE_PER_PAIR_S = WAIT_S + CONFIRM_DELAY_S + RETRY_WAIT_S
+# ⛔ DERIVED, NEVER RE-DECLARED. An earlier cut of this file hard-coded 45/60/45
+# and asserted in a comment that the workflow "passes --wait 45". It does not:
+# the workflow passes ONLY --retry-delay (plus the out-paths), so `--wait` comes
+# from the argparse default and IS the operative value on every scheduled run.
+# Re-declaring the numbers here would have been the same hand-copied-constant
+# defect this file exists to catch, one layer up. So each is read from the place
+# that actually decides it.
+_CLI_DEFAULTS = {a.dest: a.default for a in _build_parser()._actions}
+
+
+def _workflow_text() -> str:
+    # encoding pinned: this workflow carries non-ASCII (⛔) and the platform
+    # default would raise UnicodeDecodeError under a non-UTF-8 locale.
+    return WORKFLOW.read_text(encoding="utf-8")
+
+
+def _confirm_delay_s(text: str) -> int:
+    """The retry delay a SCHEDULED run actually uses.
+
+    Not the argparse default: a cron run supplies no inputs, so the workflow's
+    own shell fallback `RETRY="${RETRY_DELAY_INPUT:-60}"` is what reaches the
+    CLI. test_the_two_retry_defaults_agree pins them together so a divergence
+    is a failure rather than a silent change of meaning.
+    """
+    m = re.search(r'RETRY="\$\{RETRY_DELAY_INPUT:-(\d+)\}"', text)
+    assert m, "could not find the workflow's retry-delay fallback"
+    return int(m.group(1))
+
+
+def _worst_case_per_pair_s(text: str) -> int:
+    # run_probe re-probes a NO-BID with wait_s=wait_s (verified in source), so a
+    # retried pair costs a full wait, the confirm delay, then another full wait.
+    wait = int(_CLI_DEFAULTS["wait"])
+    return wait + _confirm_delay_s(text) + wait
 
 
 @pytest.fixture(scope="module")
 def workflow_text() -> str:
-    return WORKFLOW.read_text()
+    return _workflow_text()
 
 
 def test_documented_pair_count_matches_reality(workflow_text: str):
@@ -58,7 +86,7 @@ def test_step_timeout_covers_the_worst_case(workflow_text: str):
     m = re.search(r"- name: Run bid probe\n\s+timeout-minutes: (\d+)", workflow_text)
     assert m, "could not find the bid-probe step timeout"
     step_minutes = int(m.group(1))
-    worst_case_minutes = len(eligible_pairs()) * WORST_CASE_PER_PAIR_S / 60
+    worst_case_minutes = len(eligible_pairs()) * _worst_case_per_pair_s(workflow_text) / 60
     assert step_minutes >= worst_case_minutes, (
         f"step timeout {step_minutes}m is under the {worst_case_minutes:.1f}m "
         "worst case; a kill mid-run leaks every open order"
@@ -109,4 +137,35 @@ def test_nodeport_is_probed_on_every_provider():
     assert asked == {p.cluster for p in PROVIDERS}, (
         "nodeport must be probed on every provider — narrowing it to the "
         "clusters known to serve it reproduces the #257 blind spot"
+    )
+
+
+def test_the_workflow_does_not_pass_wait(workflow_text: str):
+    """The budget's `--wait` term comes from the argparse default because the
+    workflow never overrides it. If that ever changes, the model must read the
+    passed value instead — and this assertion is how anyone finds out."""
+    invocation = workflow_text[workflow_text.index("python -m just_akash.bid_probe") :][:400]
+    assert "--wait" not in invocation, (
+        "the workflow now passes --wait, so the argparse default is no longer "
+        "the operative value — derive the budget from the passed value"
+    )
+
+
+def test_the_two_retry_defaults_agree(workflow_text: str):
+    """The workflow's shell fallback and the CLI default are separate values
+    that happen to match. A divergence would make the model quietly wrong for
+    whichever caller it did not describe, so pin them together."""
+    assert _confirm_delay_s(workflow_text) == int(_CLI_DEFAULTS["retry_delay"]), (
+        "the workflow's RETRY_DELAY_INPUT fallback and --retry-delay's argparse "
+        "default have diverged; the budget arithmetic describes only one of them"
+    )
+
+
+def test_workflow_is_readable_under_a_non_utf8_locale():
+    """The workflow carries non-ASCII; an unencoded read_text() would raise
+    UnicodeDecodeError wherever the platform default is not UTF-8."""
+    raw = WORKFLOW.read_bytes()
+    assert not raw.decode("utf-8").isascii(), "guard is vacuous if the file is pure ASCII"
+    assert 'encoding="utf-8"' in Path(__file__).read_text(encoding="utf-8"), (
+        "this suite must pin the encoding when reading the workflow"
     )

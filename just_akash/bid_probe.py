@@ -896,7 +896,17 @@ def render_prom(records: list[ProbeRecord], *, run_ts: float | None = None) -> s
 # ---------------------------------------------------------------------------
 
 
-def main(argv: list[str] | None = None) -> int:
+def _build_parser() -> argparse.ArgumentParser:
+    """The CLI surface, as a value rather than a side effect of ``main``.
+
+    Extracted so the DEFAULTS are importable. The bid-probe workflow's step
+    timeout is arithmetic over `--wait` and `--retry-delay`, and it does not
+    pass `--wait` at all — so that default IS the operative value on every
+    scheduled run, and a change to it silently invalidates the budget. A test
+    that re-declared the numbers instead of reading them would be the same
+    hand-copied-constant defect it exists to catch (see
+    tests/test_bid_probe_budget.py).
+    """
     ap = argparse.ArgumentParser(description="Probe whether our providers still bid.")
     ap.add_argument(
         "--cluster",
@@ -919,7 +929,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="print the eligible pairs and exit without spending anything",
     )
-    args = ap.parse_args(argv)
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
 
     targets = [p for p in PROVIDERS if not args.cluster or p.cluster in args.cluster]
     if not targets:
