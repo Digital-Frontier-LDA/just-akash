@@ -39,8 +39,11 @@ _FILTERED_LISTING = re.compile(r"actions/runners\?[^\"'\s]*\bname=")
 
 def _uncommented(text: str) -> list[str]:
     """A commented-out example is not a query. Same convention as the conformance rules."""
-    return [ln for ln in text.splitlines() if not ln.strip().lstrip("#").strip().startswith("#")
-            and not ln.strip().startswith("#")]
+    return [
+        ln
+        for ln in text.splitlines()
+        if not ln.strip().lstrip("#").strip().startswith("#") and not ln.strip().startswith("#")
+    ]
 
 
 def test_no_workflow_filters_the_runner_listing_by_name():
@@ -53,7 +56,9 @@ def test_no_workflow_filters_the_runner_listing_by_name():
                 offenders.append(f"{wf.name}:{i}: {line.strip()[:110]}")
     # Non-vacuity: if the workflows directory moves, this must fail rather than pass
     # over an empty scan — a locator that finds nothing proves nothing.
-    assert scanned, f"no workflows found under {WORKFLOWS} — the locator is stale, not the repo clean"
+    assert scanned, (
+        f"no workflows found under {WORKFLOWS} — the locator is stale, not the repo clean"
+    )
     assert not offenders, (
         "a runner listing is filtered by `name=`, which is EXACT-match and returns 0 for "
         "any prefix. The landing gate would then see an empty projection and discard every "
@@ -71,7 +76,10 @@ def test_the_matcher_fires_on_the_shape_it_guards():
 def test_the_matcher_does_not_fire_on_legitimate_client_side_matching():
     """The false-positive side. `.labels[].name` is how this repo matches correctly."""
     for benign in (
-        """RUNNER_IDS=$(printf '%s' "$RUNNER_PAGES" | jq -r --arg L "$RUNNER_LABEL" '.runners[] | select(any(.labels[].name; .==$L)) | .id')""",
+        (
+            """RUNNER_IDS=$(printf '%s' "$RUNNER_PAGES" | jq -r --arg L "$RUNNER_LABEL" """
+            """'.runners[] | select(any(.labels[].name; .==$L)) | .id')"""
+        ),
         'gh api --paginate "orgs/${ORG}/actions/runners?per_page=100"',
         'RESP=$(gh api "orgs/${ORG}/actions/runners?per_page=1" -i 2>&1)',
     ):
