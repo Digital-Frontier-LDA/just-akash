@@ -33,12 +33,14 @@ from ._diagnostics import Code, emit, enabled
 from .api import (
     AkashConsoleAPI,
     _extract_bid_price,
+    _extract_dseq,
     _extract_gseq,
     _extract_provider,
 )
 from .provenance import PLACEMENT_PREFIX, SIBLING_REAPED_PREFIX, run_id_of, stamp_run
 from .provider_capacity import capacity_by_provider
 from .sdl_validate import SDLValidationError, validate_sdl
+from .smoke_providers import _probe_age_seconds
 
 logger = logging.getLogger("akash.deploy")
 
@@ -152,6 +154,116 @@ def _close_proven_orphan(client, dseq: str, key: str) -> bool:
         closed=True,
     )
     return True
+
+
+# ── stale-deployment recovery: guards, each covering what the others cannot ──
+#
+# ⛔ THE RECOVERY CLOSED ON ONE SIGNAL, FROM A LISTING THAT CANNOT SCOPE.
+# It called `client.list_deployments(active_only=True)` and closed EVERY
+# lease-less row. Three things were wrong at once, and this file already
+# documents every one of them for a NEIGHBOURING function:
+#
+#   * `list_deployments` does not scope by API key. cleanup_stale.py:391 records
+#     the measurement — three DISTINCT keys for three DISTINCT accounts returned
+#     byte-identical bodies, and the same key returned 44/27/0 minutes apart.
+#     `_report_suspected_orphans` tolerates that because it only NAMES; a path
+#     that CLOSES cannot.
+#   * No provenance. The shared wallet hosts other repos — a live read found six
+#     `dfci-infra-runner` among eleven active.
+#   * No age floor. `_report_suspected_orphans` says it outright: a concurrent
+#     run of THIS repo "is also leaseless mid-create, and lands in the same
+#     window". That is the collision ci.yml:150-155 attributes to this very
+#     function, and ci.yml's per-ref concurrency key does not prevent it across
+#     two PRs.
+#
+# The path that merely NAMES strangers was guarded with three signals; the path
+# that DESTROYS them had one. These guards are deliberately independent, so the
+# recovery is safe on its own merits rather than because a mutex happens to hold
+# (just-akash#267): a wider mutex would serialise the fleet's CI and still leave
+# a cross-ACCOUNT close reachable.
+STALE_RETRY_MIN_AGE_SECONDS = 15 * 60
+STALE_RETRY_MAX_CLOSE = 5
+
+
+def _close_stale_for_retry(client, *, now: float | None = None) -> list[str]:
+    """Close OUR OWN abandoned, lease-less deployments so a create can retry.
+
+    Returns the dseqs closed. Never raises: this runs on an error path and must
+    not replace the caller's real failure with its own.
+
+    ⚠ IT FAILS TOWARDS NOT CLOSING. A leftover younger than the age floor is
+    left alone and the retry may fail — a recoverable outcome. Destroying a
+    concurrent run's in-flight deployment is not recoverable, and that is the
+    one this function used to produce.
+    """
+
+    now = time.time() if now is None else now
+    try:
+        owner = client.account_address()
+    except Exception as exc:  # noqa: BLE001 — never mask the caller's error
+        _log(logging.WARNING, f"Stale recovery: could not resolve the account ({exc}) — skipped")
+        return []
+
+    # GUARD 1 — enumerate from the CHAIN, owner-scoped and authoritative.
+    # ⛔ None IS NOT []. "Could not ask the chain" must never be swept as "holds
+    # nothing": that collapse is how a broken enumeration reads as a clean account.
+    active = chain.list_active_deployments(owner)
+    if active is None:
+        _log(logging.WARNING, "Stale recovery: chain enumeration failed — closing nothing")
+        return []
+
+    candidates: list[tuple[float, str]] = []
+    for dep in active:
+        dseq = _extract_dseq(dep)
+        if not dseq:
+            continue
+        age = _probe_age_seconds(dseq, now)
+        # GUARD 2 — age floor. An unreadable age is NOT old enough: unknown must
+        # never be read as safe to destroy.
+        if age is None or age < STALE_RETRY_MIN_AGE_SECONDS:
+            continue
+        # GUARD 3 — no lease. A deployment holding a lease is somebody's live
+        # workload. Per-DSEQ Console reads are unaffected by the listing defect.
+        try:
+            detail = client.get_deployment(str(dseq))
+        except Exception as exc:  # noqa: BLE001 — unreadable is not closable
+            # DEBUG, matching _report_suspected_orphans: a skipped dseq must not
+            # appear in human-facing output, but a silent skip is untraceable.
+            _log(logging.DEBUG, f"  stale recovery: {dseq} unreadable ({exc}) — left alone")
+            continue
+        if (detail or {}).get("leases") or (detail or {}).get("lease"):
+            continue
+        # GUARD 4 — provenance, read from chain. Repo-level is enough HERE only
+        # because the age floor has already excluded our own concurrent runs;
+        # on its own it is not, and _report_suspected_orphans says so.
+        try:
+            names = chain.deployment_group_names(owner, str(dseq))
+        except Exception as exc:  # noqa: BLE001 — unreadable provenance is unproven
+            _log(logging.DEBUG, f"  stale recovery: {dseq} provenance unreadable ({exc})")
+            continue
+        if not any(n.startswith(PLACEMENT_PREFIX) for n in names):
+            continue
+        candidates.append((age, str(dseq)))
+
+    # GUARD 5 — cap, oldest first. Needing to close more than a handful to
+    # unblock ONE create means something else is wrong and wants looking at,
+    # not bulldozing.
+    candidates.sort(reverse=True)
+    closed: list[str] = []
+    for _age, dseq in candidates[:STALE_RETRY_MAX_CLOSE]:
+        try:
+            client.close_deployment(dseq)
+            closed.append(dseq)
+            _log(logging.INFO, f"Closed stale deployment {dseq}")
+        except Exception as exc:  # noqa: BLE001 — keep going; report at the end
+            _log(logging.WARNING, f"Could not close stale deployment {dseq}: {exc}")
+    if len(candidates) > STALE_RETRY_MAX_CLOSE:
+        _log(
+            logging.WARNING,
+            f"Stale recovery: {len(candidates)} eligible, closed the "
+            f"{len(closed)} oldest (cap {STALE_RETRY_MAX_CLOSE}).",
+        )
+    return closed
 
 
 def _report_suspected_orphans(client, since_epoch_s: float, run_id: str = "") -> list[str]:
@@ -882,17 +994,12 @@ def deploy(
                 "Deployment already exists — closing stale deployments and retrying...",
             )
             try:
-                active = client.list_deployments(active_only=True)
-                for dep in active:
-                    # Only close deployments without a lease (stale from failed runs)
-                    leases = dep.get("leases") or dep.get("lease", [])
-                    if leases:
-                        continue
-                    stale_dseq = dep.get("dseq") or dep.get("deployment", {}).get("dseq")
-                    if stale_dseq:
-                        client.close_deployment(str(stale_dseq))
-                        _log(logging.INFO, f"Closed stale deployment {stale_dseq}")
-            except Exception as cleanup_err:
+                # Aged against the moment the create was ATTEMPTED, not a fresh
+                # clock read. If the recovery runs long after, deployments then
+                # compare as YOUNGER and fewer qualify — the conservative
+                # direction for a function whose next act is to close things.
+                _close_stale_for_retry(client, now=_create_started)
+            except Exception as cleanup_err:  # noqa: BLE001 — documented as never raising
                 _log(logging.ERROR, f"Stale deployment cleanup failed: {cleanup_err}")
             # Retry once after cleanup
             try:
