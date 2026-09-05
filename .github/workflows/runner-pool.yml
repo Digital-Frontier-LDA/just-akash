@@ -486,6 +486,19 @@ jobs:
               echo
               echo "**Fix:** ${FIX}"
             } >> "$GITHUB_STEP_SUMMARY"
+            # ⛔ FLATTEN BEFORE EMITTING A WORKFLOW COMMAND. `${ORG}` is a
+            # caller-supplied `workflow_call` input and flows into TITLE; an embedded
+            # CR/LF would END the `::error ...::` line and let the remainder start a
+            # NEW workflow command. Third entry point for this same class today: an
+            # exception message (#252), an HTTP response body (this PR's fallback
+            # arm), and now a workflow input.
+            #
+            # Normalised HERE, at the point of emission, rather than at ORG — any
+            # future value interpolated into this line is covered too, which
+            # sanitising one input would not do.
+            TITLE=$(printf '%s' "$TITLE" | tr -d '\r\n')
+            CLASS=$(printf '%s' "$CLASS" | tr -d '\r\n')
+            CODE_TEXT=$(printf '%s' "$CODE_TEXT" | tr -d '\r\n')
             echo "::error title=${TITLE} (HTTP status: ${CODE_TEXT})::This is ${CLASS}. Untreated it surfaces 15 minutes later as 'runner did not come online'."
             exit 1
           fi
