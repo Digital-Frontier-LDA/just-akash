@@ -244,7 +244,19 @@ class AkashConsoleAPI:
                 raw_retryable = error_json.get("retryable")
                 retryable = raw_retryable if isinstance(raw_retryable, bool) else None
                 raw_after = error_json.get("retry_after")
-                retry_after = raw_after if isinstance(raw_after, int) else None
+                # ⛔ `bool` IS a subclass of `int`, so `isinstance(True, int)` is True
+                # and `"retry_after": true` would be stored as True — logged as
+                # "retry_after=Trues". Note the mirror: `retryable` above uses
+                # isinstance(..., bool), which correctly rejects an int. Same two
+                # fields, opposite type confusion, and this is the THIRD asymmetry
+                # between them in this PR (absent-vs-False, truthiness-vs-0, now
+                # bool-vs-int). A pair of adjacent fields with different rules is
+                # where a rule applied once stops being applied twice.
+                retry_after = (
+                    raw_after
+                    if isinstance(raw_after, int) and not isinstance(raw_after, bool)
+                    else None
+                )
                 raw_name = error_json.get("error_name")
                 error_name = raw_name if isinstance(raw_name, str) else ""
             raise AkashAPIError(

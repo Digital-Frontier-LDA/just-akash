@@ -119,6 +119,27 @@ class TestZeroIsAValueNotAnAbsence:
         assert isinstance(err, AkashAPIError)
         assert err.retry_after == 0, "0 must survive parsing, not become None"
 
+    def test_a_boolean_retry_after_is_rejected(self, monkeypatch, client):
+        """⛔ `bool` subclasses `int`, so `isinstance(True, int)` is True and
+        `"retry_after": true` would be stored as True — surfacing as
+        "retry_after=Trues" in the operator's log.
+
+        Note the mirror: `retryable` is guarded with isinstance(..., bool), which
+        correctly rejects an int. The same two fields, opposite type confusion.
+        """
+        body = json.dumps({"message": "x", "retry_after": True})
+        err = _raise_http(monkeypatch, client, 524, body)
+        assert isinstance(err, AkashAPIError)
+        assert err.retry_after is None, "a bool is not a duration"
+
+    def test_a_non_bool_retryable_is_rejected(self, monkeypatch, client):
+        """The complement, so the pair is guarded symmetrically: an int is not a
+        boolean claim, and must not become one."""
+        body = json.dumps({"message": "x", "retryable": 1})
+        err = _raise_http(monkeypatch, client, 524, body)
+        assert isinstance(err, AkashAPIError)
+        assert err.retryable is None
+
     def test_absent_stays_absent(self, monkeypatch, client):
         err = _raise_http(monkeypatch, client, 524, json.dumps({"message": "x"}))
         assert isinstance(err, AkashAPIError)
