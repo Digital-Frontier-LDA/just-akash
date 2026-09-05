@@ -905,6 +905,48 @@ MUTATIONS = [
 ]
 
 
+# pytest's own exit codes. Only 0 and 1 mean "the suite RAN and produced a verdict":
+#   0 all passed   1 tests failed   2 interrupted
+#   3 internal error   4 USAGE ERROR   5 no tests collected
+# 2-5 all exit non-zero while proving nothing about any guard.
+_INNER_RAN = frozenset({0, 1})
+
+
+def _classify_inner_run(returncode: int, out: str) -> tuple[str, str]:
+    """RAN, or UNREADABLE with the reason. Never a verdict about the guard.
+
+    ⛔ THE DISTINCTION THIS FUNCTION EXISTS FOR. "The mutation survived" and "the
+    instrument did not run" are different findings, and only the first says anything
+    about the guard under test. Collapsing them is how this harness told a maintainer
+    that 27 WORKING guards were "decorative" — measured 2026-09-05: the inner run
+    inherited `addopts = --cov=just_akash` from pyproject, the interpreter had no
+    `pytest_cov`, and pytest exited 4 with `unrecognized arguments`. No "N failed"
+    appeared, so every mutation read as survived.
+
+    ⚠ THAT IS WORSE THAN FAILING OPEN. A gate that fails open loses a check. A harness
+    that fails into a FALSE ACCUSATION invites someone to delete 27 real controls
+    because it told them they were decorative.
+
+    The old code guarded exactly one of the modes its own comment names -- "a collection
+    error, an import failure or a crash all exit non-zero while proving nothing" -- and
+    a usage error is the sibling it names in principle and misses in code. So this
+    requires POSITIVE evidence of execution rather than the absence of one known
+    failure: a zero proves neither that the suite ran nor that the guard held.
+    """
+    if "error during collection" in out or "errors during collection" in out:
+        return "UNREADABLE", "the inner run failed to COLLECT, so no guard was evaluated"
+    if returncode not in _INNER_RAN:
+        return "UNREADABLE", (
+            f"pytest exited {returncode} (not 0/1), which means it did not run the suite "
+            f"— usage error, internal error, interruption, or nothing collected"
+        )
+    if not re.search(r"\d+ (?:passed|failed|skipped|xfailed)", out):
+        return "UNREADABLE", (
+            "the inner run reported no test outcomes at all, so nothing was evaluated"
+        )
+    return "RAN", ""
+
+
 @pytest.mark.skipif(
     os.environ.get("RUNNER_POOL_WF") is not None,
     reason="inner mutation run — must not recurse",
@@ -933,6 +975,14 @@ def test_the_guards_are_not_vacuous(label, mutate, tmp_path):
             "--no-header",
             "-p",
             "no:cacheprovider",
+            # ⚠ THE PROXIMATE CAUSE, and it must be explicit. Without this the inner run
+            # inherits `addopts = --cov=just_akash --cov-report=term-missing` from
+            # pyproject.toml, so on any interpreter without `pytest_cov` it dies with a
+            # usage error before running a single test. The harness then has no outcomes
+            # to read and — before the classification below — called that a surviving
+            # mutation. This makes the inner run independent of the outer environment.
+            "-o",
+            "addopts=",
         ],
         env={**os.environ, "RUNNER_POOL_WF": str(broken)},
         capture_output=True,
@@ -940,12 +990,13 @@ def test_the_guards_are_not_vacuous(label, mutate, tmp_path):
     )
     out = proc.stdout + proc.stderr
 
-    # A non-zero exit is NOT enough. A collection error, an import failure or a crash all
-    # exit non-zero while proving nothing about the guard — that is precisely how this
-    # harness sat green while checking nothing. Require an actual test FAILURE.
-    assert "error during collection" not in out and "errors during collection" not in out, (
-        f"mutation {label!r}: the inner run failed to COLLECT, so no guard was "
-        f"evaluated.\n{out[-1500:]}"
+    # A non-zero exit is NOT enough, and neither is the absence of one known failure
+    # mode. Establish that the instrument RAN before reading anything as a verdict
+    # about the guard — see `_classify_inner_run`.
+    verdict, why = _classify_inner_run(proc.returncode, out)
+    assert verdict == "RAN", (
+        f"mutation {label!r}: UNREADABLE — {why}. This says NOTHING about the guard; "
+        f"do not read it as 'the guard is decorative'.\n{out[-1500:]}"
     )
     assert re.search(r"\d+ failed", out), (
         f"mutation {label!r} left the suite GREEN — the guard for it is decorative.\n{out[-1500:]}"
@@ -1322,4 +1373,99 @@ def test_the_nested_teardown_pin_matches_the_file_it_calls():
     assert shown.stdout == current, (
         f"runner-teardown.yml has changed since the pinned {pin[:8]}, so the pool calls a "
         "STALE copy of its own teardown. Bump the pin in this change."
+    )
+
+
+# ==========================================================================
+# The harness's own harness.
+#
+# `test_the_guards_are_not_vacuous` renders a verdict about 27 real guards. On
+# 2026-09-05 it rendered the WRONG one: the inner run inherited
+# `addopts = --cov=just_akash` from pyproject, the interpreter had no
+# `pytest_cov`, pytest exited 4 with `unrecognized arguments`, no "N failed"
+# appeared, and every mutation was reported as "the guard for it is decorative".
+#
+# ⛔ THAT IS WORSE THAN FAILING OPEN, which is why these tests exist. A gate that
+# fails open loses a check. A harness that fails into a FALSE ACCUSATION invites
+# a maintainer to DELETE 27 working controls because it told them to.
+#
+# Both error rates are pinned below. A classifier that returns UNREADABLE for
+# everything would satisfy the first half and destroy the harness — it is the
+# same defect wearing the safe colour.
+# ==========================================================================
+
+
+@pytest.mark.parametrize(
+    "returncode,out,reason_fragment",
+    [
+        (4, "ERROR: usage: pytest [options]\nunrecognized arguments: --cov=just_akash\n", "exited 4"),
+        (5, "no tests ran in 0.01s\n", "exited 5"),
+        (3, "INTERNALERROR> Traceback\n", "exited 3"),
+        (2, "!!! KeyboardInterrupt !!!\n", "exited 2"),
+        (1, "ERROR tests/x.py\n1 errors during collection\n", "COLLECT"),
+        (0, "", "no test outcomes"),
+    ],
+    ids=["usage-error", "nothing-collected", "internal-error", "interrupted",
+         "collection-error", "silent-success"],
+)
+def test_an_inner_run_that_did_not_execute_is_UNREADABLE_not_a_verdict(returncode, out, reason_fragment):
+    """★ THE FALSE-ACCUSATION SIDE.
+
+    None of these say anything about a guard. Reporting any of them as "the guard
+    is decorative" is an accusation the evidence cannot support — and the usage-error
+    row is the one that actually fired.
+    """
+    verdict, why = _classify_inner_run(returncode, out)
+    assert verdict == "UNREADABLE", f"rc={returncode} was read as a verdict about the guard"
+    assert reason_fragment in why, f"the reason must name what happened, got: {why!r}"
+
+
+@pytest.mark.parametrize(
+    "returncode,out",
+    [
+        (1, "F....\n1 failed, 4 passed in 0.30s\n"),
+        (0, ".....\n5 passed in 0.20s\n"),
+        (1, "5 failed, 92 passed in 5.91s\n"),
+        (0, "3 passed, 1 skipped in 0.10s\n"),
+    ],
+    ids=["one-failure", "all-passed", "many-failures", "passed-with-skips"],
+)
+def test_a_run_that_really_executed_is_RAN(returncode, out):
+    """★ THE ANTI-VACUITY SIDE, and it is the half that keeps the harness alive.
+
+    A classifier returning UNREADABLE for everything would pass every test above
+    and silently disable all 27 guard checks — the same defect in the safe colour.
+    These are the shapes that MUST still reach a verdict.
+    """
+    verdict, why = _classify_inner_run(returncode, out)
+    assert verdict == "RAN", f"a real run (rc={returncode}) was suppressed as UNREADABLE: {why}"
+
+
+def test_the_surviving_mutation_verdict_still_reaches_its_conclusion():
+    """A genuinely-surviving mutation must still be reported as decorative.
+
+    The point of the UNREADABLE state is to remove FALSE accusations, not to remove
+    the harness's ability to accuse at all. An inner run that executed and reported
+    zero failures is exactly the case the harness exists to catch.
+    """
+    out = ".....\n5 passed in 0.20s\n"
+    verdict, _ = _classify_inner_run(0, out)
+    assert verdict == "RAN", "an executed run must be judgeable"
+    assert not re.search(r"\d+ failed", out), "and this one legitimately shows no failures"
+
+
+def test_the_inner_run_does_not_inherit_addopts():
+    """The proximate cause, pinned at the call site.
+
+    Without an explicit `-o addopts=` the inner pytest picks up
+    `--cov=just_akash --cov-report=term-missing` from pyproject.toml and dies with a
+    usage error on any interpreter lacking `pytest_cov`. The UNREADABLE verdict now
+    stops that from becoming an accusation; this stops it from happening at all.
+    """
+    src = pathlib.Path(__file__).read_text()
+    call = src[src.index("def test_the_guards_are_not_vacuous") :]
+    call = call[: call.index("out = proc.stdout")]
+    assert '"-o",' in call and '"addopts=",' in call, (
+        "the inner pytest invocation must pass `-o addopts=` so it does not depend on "
+        "the outer environment having every plugin pyproject's addopts names"
     )
