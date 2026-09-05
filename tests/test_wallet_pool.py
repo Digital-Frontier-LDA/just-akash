@@ -4,6 +4,7 @@ import pytest
 
 from just_akash.wallet_pool import (
     _http_endpoint,
+    _one_line,
     _quorum_uact,
     _redact_keys,
     configured_api_keys,
@@ -232,3 +233,59 @@ def test_a_key_containing_regex_metacharacters_is_matched_literally():
     redacted = _redact_keys("auth failed for a.c+d", ["a.c+d"])
     assert redacted == "auth failed for ***"
     assert _redact_keys("auth failed for abcXd", ["a.c+d"]) == "auth failed for abcXd"
+
+
+def test_a_failure_reason_cannot_forge_a_workflow_command(monkeypatch):
+    """⛔ CWE-117. In GitHub Actions a line beginning `::error::` is a WORKFLOW
+    COMMAND, not output. Exception text comes from an HTTP client and can carry
+    server-controlled bytes, so an embedded newline would let a remote endpoint
+    forge annotations, `::add-mask::` text, or `::stop-commands::` its way out
+    of command processing entirely.
+
+    The property asserted is the one that matters: no LINE of the message may
+    begin with `::`. Asserting merely that "::" is absent would be wrong — it
+    is legitimate mid-string (IPv6 literals, C++ scope, timestamps).
+    """
+    monkeypatch.setenv("AKASH_API_KEYS", "pool-a\npool-b")
+    monkeypatch.delenv("AKASH_API_KEY", raising=False)
+    payloads = {
+        "pool-a": "500\n::error title=forged::a provider is down",
+        "pool-b": "503\r\n::stop-commands::deadbeef",
+    }
+
+    def factory(key):
+        client = MagicMock()
+        client.account_address.side_effect = RuntimeError(payloads[key])
+        return client
+
+    with pytest.raises(RuntimeError) as exc:
+        select_client_for_create(5_000_000, client_factory=factory, credit_reader=MagicMock())
+
+    for line in str(exc.value).splitlines():
+        assert not line.lstrip().startswith("::"), f"forged workflow command: {line!r}"
+    assert "::error title=forged::" in str(exc.value), (
+        "the text must still be REPORTED — neutralising it by deleting the "
+        "operator's evidence would trade one blind spot for another"
+    )
+
+
+def test_an_ansi_escape_cannot_rewrite_what_the_reader_sees():
+    """A control sequence in a failure reason can repaint or erase the lines
+    around it, so a redacted log still misleads the person reading it."""
+    assert _one_line("\x1b[31mred\x1b[0m text") == "red text"
+    assert _one_line("a\x1b[2Kb") == "ab"
+
+
+def test_a_failure_reason_is_bounded():
+    """An unbounded third-party string can bury every other wallet's reason
+    under one wall of text — the same 'reported but unreadable' failure."""
+    bounded = _one_line("x" * 5000)
+    assert len(bounded) == 300
+    assert bounded.endswith("…"), "truncation must be visible, not silent"
+
+
+def test_sanitising_preserves_an_ordinary_message_unchanged():
+    """The guard must not cost legibility in the 99% case, and `::` stays
+    intact mid-string where it is legitimate."""
+    assert _one_line("RuntimeError: 401 Unauthorized") == "RuntimeError: 401 Unauthorized"
+    assert _one_line("connect to [fe80::1]:443 failed") == "connect to [fe80::1]:443 failed"

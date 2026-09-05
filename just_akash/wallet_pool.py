@@ -45,6 +45,40 @@ def configured_api_keys() -> list[str]:
     return result
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\\\)")
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def _one_line(text: str, limit: int = 300) -> str:
+    """Bound a third-party exception to ONE printable line before it is logged.
+
+    ⛔ CWE-117. These strings come from an HTTP client and can carry
+    server-controlled bytes. In GitHub Actions a line beginning `::error::` (or
+    `::add-mask::`, `::stop-commands::`) is a WORKFLOW COMMAND, not output — so
+    an embedded newline lets a remote endpoint forge annotations, mask text, or
+    switch command processing off entirely. ANSI escapes can additionally
+    rewrite what a reader sees in the terminal.
+
+    ⚠ FLATTENING IS THE FIX, not cosmetics. A workflow command is only honoured
+    at the START of a line, so removing newlines removes the only way injected
+    content can reach that position — and this became load-bearing when the
+    failures started being joined one-per-line. `::` is left intact MID-string
+    on purpose: rewriting it would corrupt legitimate text (IPv6 literals, C++
+    scope, timestamps) while adding nothing once no newline can precede it. A
+    leading `::` is still displaced, so the helper is safe for callers that do
+    not prefix each entry the way this module does.
+    """
+
+    flattened = _ANSI_RE.sub("", text)
+    flattened = _CONTROL_RE.sub("", flattened.replace("\r\n", " ").replace("\n", " "))
+    flattened = flattened.replace("\r", " ").replace("\t", " ").strip()
+    if flattened.startswith("::"):
+        flattened = " " + flattened
+    if len(flattened) > limit:
+        flattened = flattened[: limit - 1] + "…"
+    return flattened
+
+
 def _redact_keys(message: str, keys: list[str]) -> str:
     """Strip any configured key that a third-party exception may have echoed back.
 
@@ -196,7 +230,7 @@ def select_client_for_create(
             # itself PROVIDER_CAPACITY, "a market/capacity condition, not a code
             # failure" — a verdict about the market reached without reading a wallet.
             failures.append(
-                f"{candidate_id}: {_redact_keys(f'{type(exc).__name__}: {exc}', keys)}"
+                f"{candidate_id}: {_one_line(_redact_keys(f'{type(exc).__name__}: {exc}', keys))}"
             )
 
     result = rank_wallets(
