@@ -30,7 +30,7 @@ WF_PATH = Path(
         Path(__file__).resolve().parents[1] / ".github/workflows/runner-pool.yml",
     )
 )
-SRC = WF_PATH.read_text()
+SRC = WF_PATH.read_text(encoding="utf-8")
 DOC = yaml.safe_load(SRC)
 CALL = (DOC.get("on") or DOC.get(True))["workflow_call"]
 INPUTS = CALL["inputs"]
@@ -405,7 +405,9 @@ def test_the_pool_runs_the_image_providers_were_qualified_against():
 
     The probe SDL already explains why it pins a digest; this asserts the pool did not
     quietly opt out of that reasoning."""
-    probe_sdl = (Path(__file__).resolve().parents[1] / "sdl/github-runner-probe.yaml").read_text()
+    probe_sdl = (Path(__file__).resolve().parents[1] / "sdl/github-runner-probe.yaml").read_text(
+        encoding="utf-8"
+    )
 
     def _image(text: str, what: str) -> str:
         m = re.search(r"image:\s*(\S+)", text)
@@ -940,11 +942,64 @@ def _classify_inner_run(returncode: int, out: str) -> tuple[str, str]:
             f"pytest exited {returncode} (not 0/1), which means it did not run the suite "
             f"— usage error, internal error, interruption, or nothing collected"
         )
-    if not re.search(r"\d+ (?:passed|failed|skipped|xfailed)", out):
+    # ⚠ `errors?` BELONGS HERE. A test that ERRORS (a fixture raising, say) is a test
+    # that was collected and attempted — the suite demonstrably ran. Measured 2026-09-05:
+    # a fixture raising RuntimeError gives exit 1 and a summary of "1 warning, 1 error in
+    # 0.21s" with no passed/failed/skipped/xfailed anywhere, so the old regex called a
+    # genuine run UNREADABLE. That direction is safe here (the caller asserts RAN, so it
+    # fails loudly rather than silently) but it is still a false alarm on a real result.
+    #
+    # This does NOT re-admit collection errors: those are caught above by name and again
+    # by exit code 2, which is not in _INNER_RAN. Both guards still stand in front.
+    if not re.search(r"\d+ (?:passed|failed|skipped|xfailed|errors?)", out):
         return "UNREADABLE", (
             "the inner run reported no test outcomes at all, so nothing was evaluated"
         )
     return "RAN", ""
+
+
+# ⛔ REAL pytest summary lines, captured 2026-09-05 by actually running each shape rather
+# than by writing down what pytest is believed to print. The fixture-error row is the one
+# the classifier used to get wrong: exit 1, a genuine run, and not one of
+# passed/failed/skipped/xfailed anywhere in the summary.
+_CLASSIFY_CASES = [
+    (
+        "fixture error is a RUN",
+        1,
+        "ERROR test_x.py::test_a - RuntimeError: boom\n"
+        "========== 1 warning, 1 error in 0.21s ==========",
+        "RAN",
+    ),
+    (
+        "collection error is not",
+        2,
+        "ERROR test_x.py\n"
+        "!!!!! Interrupted: 1 error during collection !!!!!\n"
+        "========== 1 error in 0.09s ==========",
+        "UNREADABLE",
+    ),
+    ("ordinary failure", 1, "========== 1 failed, 2 passed in 0.30s ==========", "RAN"),
+    ("all green", 0, "========== 27 passed in 1.10s ==========", "RAN"),
+    (
+        "usage error — the original incident",
+        4,
+        "ERROR: unrecognized arguments: --cov=just_akash",
+        "UNREADABLE",
+    ),
+    ("no outcomes at all", 1, "some stray output with no summary line", "UNREADABLE"),
+]
+
+
+@pytest.mark.parametrize("label,rc,out,want", _CLASSIFY_CASES, ids=[c[0] for c in _CLASSIFY_CASES])
+def test_classify_inner_run_separates_a_run_from_an_instrument_failure(label, rc, out, want):
+    """★ Pinned in BOTH directions: what must read as RAN, and what must not.
+
+    A classifier tested only on the failures it was written for will happily
+    misread a success — which is how a fixture error, exit 1 and unmistakably a
+    real run, came back as "the instrument did not run".
+    """
+    verdict, _why = _classify_inner_run(rc, out)
+    assert verdict == want, f"{label}: expected {want}, got {verdict}"
 
 
 @pytest.mark.skipif(
@@ -1014,7 +1069,7 @@ def test_the_guards_are_not_vacuous(label, mutate, tmp_path):
 # `assert proc.returncode != 0` was satisfied by the import error for every mutation,
 # including ones whose guard checks nothing. The anti-vacuity harness was itself vacuous.
 TD_PATH = Path(__file__).resolve().parents[1] / ".github/workflows/runner-teardown.yml"
-TD_SRC = TD_PATH.read_text()
+TD_SRC = TD_PATH.read_text(encoding="utf-8")
 TD = yaml.safe_load(TD_SRC)
 TD_STEPS = TD["jobs"]["teardown"]["steps"]
 TD_CLOSE = next(s for s in TD_STEPS if s.get("id") == "close")
@@ -1474,7 +1529,7 @@ def test_the_inner_run_does_not_inherit_addopts():
     usage error on any interpreter lacking `pytest_cov`. The UNREADABLE verdict now
     stops that from becoming an accusation; this stops it from happening at all.
     """
-    src = pathlib.Path(__file__).read_text()
+    src = pathlib.Path(__file__).read_text(encoding="utf-8")
     call = src[src.index("def test_the_guards_are_not_vacuous") :]
     call = call[: call.index("out = proc.stdout")]
     assert '"-o",' in call and '"addopts=",' in call, (
