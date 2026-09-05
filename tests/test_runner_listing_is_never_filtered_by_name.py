@@ -28,6 +28,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github" / "workflows"
 
@@ -37,13 +39,33 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 _FILTERED_LISTING = re.compile(r"actions/runners\?[^\"'\s]*\bname=")
 
 
+# Every `grep ...` up to the next pipe or command separator. Matching the SEGMENT
+# rather than the first flag token is deliberate — see the three ways the token form
+# was wrong in `test_version_comparisons_use_fixed_string_matching`.
+_GREP_SEGMENT = re.compile(r"grep\b([^|;]*)")
+_SHORT_FLAGS = re.compile(r"(?<!\S)-([a-zA-Z]+)")
+
+
+def _greps_without_fixed_strings(line: str) -> list[str]:
+    """Segments of `line` whose grep does NOT ask for literal matching.
+
+    ⚠ FAILS CLOSED. A grep with no flag token at all is an offender, not a pass:
+    `all([])` is True, and that vacuity let `grep "$EXPECTED"` — the plainest regex
+    comparison there is — through the previous version of this check silently.
+    """
+    bad = []
+    for seg in _GREP_SEGMENT.findall(line):
+        if re.search(r"(?<!\S)--fixed-strings\b", seg):
+            continue
+        if any("F" in tok for tok in _SHORT_FLAGS.findall(seg)):
+            continue
+        bad.append(seg.strip())
+    return bad
+
+
 def _uncommented(text: str) -> list[str]:
     """A commented-out example is not a query. Same convention as the conformance rules."""
-    return [
-        ln
-        for ln in text.splitlines()
-        if not ln.strip().lstrip("#").strip().startswith("#") and not ln.strip().startswith("#")
-    ]
+    return [ln for ln in text.splitlines() if not ln.strip().startswith("#")]
 
 
 def test_no_workflow_filters_the_runner_listing_by_name():
@@ -51,7 +73,7 @@ def test_no_workflow_filters_the_runner_listing_by_name():
     scanned = 0
     for wf in sorted(WORKFLOWS.glob("*.yml")):
         scanned += 1
-        for i, line in enumerate(_uncommented(wf.read_text()), 1):
+        for i, line in enumerate(_uncommented(wf.read_text(encoding="utf-8")), 1):
             if _FILTERED_LISTING.search(line):
                 offenders.append(f"{wf.name}:{i}: {line.strip()[:110]}")
     # Non-vacuity: if the workflows directory moves, this must fail rather than pass
@@ -103,13 +125,13 @@ def test_version_comparisons_use_fixed_string_matching():
     rather than on today's four call sites, so a fifth comparison added later is held
     to the same rule.
     """
-    wf = (WORKFLOWS / "runner-pool.yml").read_text()
+    wf = (WORKFLOWS / "runner-pool.yml").read_text(encoding="utf-8")
     offenders = [
         ln.strip()
         for ln in _uncommented(wf)
         if ("RUNNER_VERSIONS" in ln or "EXPECTED_RUNNER_VERSION" in ln)
         and "grep" in ln
-        and not all("F" in flag for flag in re.findall(r"grep\s+(-[a-zA-Z]+)", ln))
+        and _greps_without_fixed_strings(ln)
     ]
     assert not offenders, (
         "a version comparison greps without -F, so `.` matches any character and wrong "
@@ -117,11 +139,44 @@ def test_version_comparisons_use_fixed_string_matching():
     )
 
 
-def test_that_matcher_would_catch_a_regex_comparison():
-    """★ The control's own control: without this, a broken matcher reads as clean."""
-    line = (
-        """GATE_WRONG=$(printf '%s\\n' "$RUNNER_VERSIONS" """
-        """| grep -cvx "${EXPECTED_RUNNER_VERSION}")"""
-    )
-    flags = re.findall(r"grep\s+(-[a-zA-Z]+)", line)
-    assert flags and not all("F" in f for f in flags), "the matcher must reject a regex comparison"
+# ⛔ BOTH DIRECTIONS, because the first version of this matcher was wrong in THREE ways
+# and its control caught none of them — the control only asserted that one wrong form was
+# rejected, so nothing tested what it did to correct forms or to the empty case.
+#
+# The old predicate was `all("F" in f for f in re.findall(r"grep\s+(-[a-zA-Z]+)", ln))`,
+# which reads only the FIRST flag token after each `grep`. Measured:
+#
+#   grep -c -x -F "$E"          correct  -> FLAGGED    (false alarm; a guard that cries
+#                                                       wolf is a guard that gets deleted)
+#   grep -c --fixed-strings     correct  -> FLAGGED    (same, long form)
+#   grep "$E"                   WRONG    -> passed     (⚠ all([]) is True — FAILS OPEN)
+#
+# The third is the one that matters: a fail-open inside the check whose whole purpose is
+# to catch a fail-open.
+_FIXED_STRING_CASES = [
+    # (label, line, is_offender)
+    ("combined flags", 'X=$(printf "%s" "$V" | grep -cvxF "${EXP}")', False),
+    ("separated flags", 'X=$(printf "%s" "$V" | grep -c -x -F "${EXP}")', False),
+    ("long option", 'X=$(printf "%s" "$V" | grep -c --fixed-strings "${EXP}")', False),
+    ("two greps, both fixed", 'printf "%s" "$V" | grep -vxF "n" | grep -cvxF "${EXP}"', False),
+    ("regex comparison", 'X=$(printf "%s" "$V" | grep -cvx "${EXP}")', True),
+    ("no flags at all", 'X=$(printf "%s" "$V" | grep "${EXP}")', True),
+    ("second grep unfixed", 'printf "%s" "$V" | grep -vxF "n" | grep -cvx "${EXP}"', True),
+]
+
+
+@pytest.mark.parametrize(
+    "label,line,is_offender", _FIXED_STRING_CASES, ids=[c[0] for c in _FIXED_STRING_CASES]
+)
+def test_that_matcher_would_catch_a_regex_comparison(label, line, is_offender):
+    """★ The control's own control, in BOTH directions.
+
+    A matcher is only trustworthy if it is pinned on what it must ACCEPT as well as
+    what it must reject. Testing rejection alone is how a matcher that flagged correct
+    code and passed `grep "$E"` read as working.
+    """
+    offenders = _greps_without_fixed_strings(line)
+    if is_offender:
+        assert offenders, f"{label}: must be rejected — this grep matches a version as a REGEX"
+    else:
+        assert not offenders, f"{label}: must be accepted — this grep already matches literally"
