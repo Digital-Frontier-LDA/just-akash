@@ -3,6 +3,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from just_akash.wallet_pool import (
+    _ANSI_RE,
+    _CONTROL_RE,
     _http_endpoint,
     _one_line,
     _quorum_uact,
@@ -289,3 +291,51 @@ def test_sanitising_preserves_an_ordinary_message_unchanged():
     intact mid-string where it is legitimate."""
     assert _one_line("RuntimeError: 401 Unauthorized") == "RuntimeError: 401 Unauthorized"
     assert _one_line("connect to [fe80::1]:443 failed") == "connect to [fe80::1]:443 failed"
+
+
+# ── the ANSI pattern is asserted ALONE, on purpose ──────────────────────
+#
+# ⛔ `_one_line` runs `_ANSI_RE` then `_CONTROL_RE`, and the second covers ESC
+# (0x1b). So a test that only calls `_one_line` CANNOT distinguish "the ANSI
+# pattern matched the sequence" from "the control-character sweep removed the
+# ESC afterwards". That is not hypothetical: the OSC String-Terminator branch
+# was dead for its whole life — the raw string `\\\\` demanded ESC + TWO
+# backslashes where ST is ESC + ONE — and every `_one_line` test still passed,
+# including the mutation checks, because `_CONTROL_RE` cleaned up behind it.
+#
+# The cost of that masking is real: reorder those two passes, or narrow
+# `_CONTROL_RE` to spare a C1 range, and escape injection reopens with the suite
+# green. These tests pin each pass to its own job so the guarantee cannot move
+# silently to the other one.
+
+_OSC_ST = "A\x1b]0;PWNED\x1b\\B"
+_OSC_BEL = "A\x1b]0;PWNED\x07B"
+_CSI = "A\x1b[31mB"
+
+
+@pytest.mark.parametrize(
+    ("label", "payload"),
+    [("CSI colour", _CSI), ("OSC + BEL", _OSC_BEL), ("OSC + ST", _OSC_ST)],
+)
+def test_the_ansi_pattern_strips_each_sequence_by_itself(label, payload):
+    assert _ANSI_RE.sub("", payload) == "AB", (
+        f"{label} survived _ANSI_RE. If _one_line still looks clean, the "
+        "control-character sweep is masking this — the guarantee has moved to a "
+        "pass that was never meant to provide it."
+    )
+
+
+def test_the_control_sweep_alone_does_not_remove_an_osc_payload():
+    """The complement, so the division of labour is pinned from both sides:
+    stripping ESC is NOT the same as removing the sequence. `_CONTROL_RE` alone
+    leaves the attacker's payload behind as visible text."""
+    swept = _CONTROL_RE.sub("", _OSC_ST.replace("\x1b", "\x1b"))
+    assert "PWNED" in swept, "if this ever passes, the two passes have merged"
+
+
+def test_no_escape_byte_survives_the_full_pipeline():
+    """The impact bound, asserted rather than argued: whatever the pattern does
+    or does not match, no ESC reaches the log — so a residue is a hygiene defect,
+    never terminal control."""
+    for payload in (_CSI, _OSC_BEL, _OSC_ST):
+        assert "\x1b" not in _one_line(payload)

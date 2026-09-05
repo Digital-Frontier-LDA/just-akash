@@ -45,7 +45,17 @@ def configured_api_keys() -> list[str]:
     return result
 
 
-_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\\\)")
+# ⛔ THE ST BRANCH WAS DEAD, AND `_CONTROL_RE` HID IT. In a raw string `\\\\` is
+# two source backslashes, so the regex demanded ESC + TWO literal backslashes;
+# the OSC String Terminator is ESC + ONE. That alternative therefore never
+# matched anything. It looked like it was providing the guarantee while
+# `_CONTROL_RE` — which runs second and covers ESC — quietly did the work, so
+# every test passed. Reorder those two lines, or narrow `_CONTROL_RE` to spare a
+# C1 range, and the hole opens with the suite still green. Hence the tests that
+# exercise this pattern ALONE: a test that only calls `_one_line` cannot tell
+# "the ANSI pattern matched" from "the control-character sweep cleaned up after
+# it", which is exactly how this survived a mutation check.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 
