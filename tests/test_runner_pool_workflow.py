@@ -12,6 +12,7 @@ reports safety it never checked.
 
 from __future__ import annotations
 
+import ast
 import os
 import pathlib
 import re
@@ -767,7 +768,7 @@ def test_the_guard_actually_runs_and_decides(key, accepted, tmp_path):
     """
     render = _step("Render runner SDL")["run"]
     script = tmp_path / "render.sh"
-    script.write_text(render)
+    script.write_text(render, encoding="utf-8")
     env = {
         **os.environ,
         "GH_RUNNER_PAT": "x",
@@ -1019,7 +1020,7 @@ def test_the_guards_are_not_vacuous(label, mutate, tmp_path):
     assert mutated != SRC, f"mutation {label!r} no longer matches the workflow text"
 
     broken = tmp_path / "runner-pool.yml"
-    broken.write_text(mutated)
+    broken.write_text(mutated, encoding="utf-8")
     proc = subprocess.run(
         [
             sys.executable,
@@ -1521,6 +1522,70 @@ def test_the_surviving_mutation_verdict_still_reaches_its_conclusion():
     assert not re.search(r"\d+ failed", out), "and this one legitimately shows no failures"
 
 
+# ⛔ BOTH DIRECTIONS, including the case the substring form got wrong. The old check
+# would have PASSED "separated" below — `-o` present, `addopts=` present, but the inner
+# run still inheriting addopts because they were never a pair.
+_ADDOPTS_CASES = [
+    ("adjacent", ["-m", "pytest", "-o", "addopts=", "-q"], True),
+    ("adjacent at end", ["-m", "pytest", "-o", "addopts="], True),
+    ("separated", ["-o", "cov=x", "-q", "addopts=", "-p"], False),
+    ("reversed", ["addopts=", "-o"], False),
+    ("-o with another value", ["-o", "cache_dir=/tmp", "-q"], False),
+    ("absent entirely", ["-m", "pytest", "-q"], False),
+    ("non-literal in the slot", ["-o", None, "addopts="], False),
+]
+
+
+@pytest.mark.parametrize("label,argv,want", _ADDOPTS_CASES, ids=[c[0] for c in _ADDOPTS_CASES])
+def test_the_addopts_matcher_requires_adjacency(label, argv, want):
+    """★ The pin's own control. A matcher tested only on the passing case cannot see
+    the arrangement that satisfies it while the behaviour is absent."""
+    assert _passes_o_addopts(argv) is want, f"{label}: expected {want}"
+
+
+def _inner_pytest_argv(source: str) -> list[str | None]:
+    """The literal argv list handed to `subprocess.run` inside the mutation harness.
+
+    ⚠ PARSED, NOT GREPPED. The previous version substring-matched `\'"-o",\'` and
+    `\'"addopts=",\'` in the source text, which was wrong in two directions:
+
+      * it hard-coded DOUBLE quotes, so a formatter flipping quote style would fail a
+        test whose behaviour had not changed (cries wolf), and
+      * it never checked ADJACENCY, so `"-o", "something-else"` plus the string
+        `"addopts="` anywhere else in the window — a comment, another argument — would
+        satisfy it while the inner run still inherited addopts (fails OPEN).
+
+    Non-literal elements come back as None so they cannot accidentally satisfy a pair.
+    """
+    tree = ast.parse(source)
+    fn = next(
+        (
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "test_the_guards_are_not_vacuous"
+        ),
+        None,
+    )
+    assert fn is not None, "the mutation harness function was renamed — this pin is stale"
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        target = node.func
+        name = target.attr if isinstance(target, ast.Attribute) else getattr(target, "id", "")
+        if name != "run" or not node.args or not isinstance(node.args[0], ast.List):
+            continue
+        return [
+            e.value if isinstance(e, ast.Constant) and isinstance(e.value, str) else None
+            for e in node.args[0].elts
+        ]
+    raise AssertionError("no subprocess.run([...]) call found in the mutation harness")
+
+
+def _passes_o_addopts(argv: list) -> bool:
+    """`-o` immediately followed by `addopts=` — adjacency is the whole point."""
+    return any(a == "-o" and b == "addopts=" for a, b in zip(argv, argv[1:]))
+
+
 def test_the_inner_run_does_not_inherit_addopts():
     """The proximate cause, pinned at the call site.
 
@@ -1529,10 +1594,8 @@ def test_the_inner_run_does_not_inherit_addopts():
     usage error on any interpreter lacking `pytest_cov`. The UNREADABLE verdict now
     stops that from becoming an accusation; this stops it from happening at all.
     """
-    src = pathlib.Path(__file__).read_text(encoding="utf-8")
-    call = src[src.index("def test_the_guards_are_not_vacuous") :]
-    call = call[: call.index("out = proc.stdout")]
-    assert '"-o",' in call and '"addopts=",' in call, (
-        "the inner pytest invocation must pass `-o addopts=` so it does not depend on "
-        "the outer environment having every plugin pyproject's addopts names"
+    argv = _inner_pytest_argv(pathlib.Path(__file__).read_text(encoding="utf-8"))
+    assert _passes_o_addopts(argv), (
+        "the inner pytest invocation must pass `-o addopts=` as ADJACENT arguments so it "
+        f"does not inherit pyproject's addopts. Parsed argv: {argv}"
     )
