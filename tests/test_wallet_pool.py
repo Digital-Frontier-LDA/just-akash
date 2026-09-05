@@ -3,8 +3,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from just_akash.wallet_pool import (
+    _ANSI_RE,
+    _CONTROL_RE,
     _http_endpoint,
+    _one_line,
     _quorum_uact,
+    _redact_keys,
     configured_api_keys,
     select_client_for_create,
     select_client_for_dseq,
@@ -129,3 +133,209 @@ def test_owner_lookup_failure_names_attempt_count_without_exposing_keys(monkeypa
         select_client_for_dseq("123", client_factory=lambda key: clients[key])
     assert "secret-a" not in str(exc.value)
     assert "secret-b" not in str(exc.value)
+
+
+def test_unmeasurable_wallets_report_why_each_one_failed(monkeypatch):
+    """ "could not measure any of 3" named the symptom and hid every cause.
+
+    MEASURED in Borduas-Holdings/blazing job 101096063489: that line appeared six
+    times and the run then classified itself PROVIDER_CAPACITY — "a market/capacity
+    condition, not a code failure" — a verdict about the market reached without
+    reading a single wallet. Auth failure, network failure, rate limit and a typo'd
+    key all rendered identically, so no occurrence could be told from any other.
+    """
+    monkeypatch.setenv("AKASH_API_KEYS", "pool-a\npool-b")
+    monkeypatch.delenv("AKASH_API_KEY", raising=False)
+
+    # ⛔ THE REASONS MUST DIFFER, AND MUST NOT BE THE KEY.
+    # An earlier cut raised f"401 Unauthorized ({key})" for BOTH wallets. Both
+    # redact to the identical "401 Unauthorized (***)", so counting occurrences
+    # could not distinguish "each wallet kept its own reason" from "one wallet's
+    # reason was emitted twice" — the exact claim the assertion makes. A test
+    # whose fixture collapses the dimension it asserts on cannot fail correctly.
+    reasons = {"pool-a": "401 Unauthorized", "pool-b": "503 Service Unavailable"}
+
+    def factory(key):
+        client = MagicMock()
+        client.account_address.side_effect = RuntimeError(reasons[key])
+        return client
+
+    with pytest.raises(RuntimeError) as exc:
+        select_client_for_create(5_000_000, client_factory=factory, credit_reader=MagicMock())
+
+    message = str(exc.value)
+    assert "could not measure any of 2 configured Console wallets" in message
+    # Each candidate is asserted WITH its own reason, so a duplicated or
+    # dropped entry fails rather than counting to the right total by accident.
+    assert "wallet-0: RuntimeError: 401 Unauthorized" in message
+    assert "wallet-1: RuntimeError: 503 Service Unavailable" in message
+
+
+def test_a_failure_reason_never_carries_a_key_into_the_log(monkeypatch):
+    """⛔ Reporting the cause must not cost the secret.
+
+    The reasons come from a third-party HTTP client. A client that puts the request
+    URL or an auth header into its exception message would carry a Console key
+    straight into the run log, which is world-readable on a public Actions run. This
+    module's contract is that key values are never logged (`configured_api_keys`).
+    """
+    monkeypatch.setenv("AKASH_API_KEYS", "sk-SECRET-AAA\nsk-SECRET-BBB")
+    monkeypatch.delenv("AKASH_API_KEY", raising=False)
+
+    def factory(key):
+        client = MagicMock()
+        client.account_address.side_effect = RuntimeError(f"401 for https://api/x?token={key}")
+        return client
+
+    with pytest.raises(RuntimeError) as exc:
+        select_client_for_create(5_000_000, client_factory=factory, credit_reader=MagicMock())
+
+    message = str(exc.value)
+    assert "sk-SECRET-AAA" not in message and "sk-SECRET-BBB" not in message
+    assert message.count("***") == 2, "each echoed key must be redacted, not dropped silently"
+    assert "401 for https://api/x?token=" in message, "the cause must still be readable"
+
+
+def test_a_key_that_is_a_prefix_of_another_does_not_leak_the_longer_one():
+    """⛔ CWE-532. Sequential per-key `str.replace` in configuration order
+    rewrites an echoed `abcdef` to `***def` once `abc` runs first — the longer
+    key's suffix survives in a world-readable log while redaction reports done.
+
+    Needs only one configured key to be a prefix of another, and nothing
+    prevents that: `configured_api_keys` de-duplicates exact matches, not
+    prefixes.
+    """
+    keys = ["abc", "abcdef"]
+    redacted = _redact_keys("auth failed for abcdef", keys)
+
+    assert "abcdef" not in redacted
+    assert "def" not in redacted, "the longer key's suffix survived redaction"
+    assert redacted == "auth failed for ***"
+
+
+def test_redaction_does_not_depend_on_configuration_order():
+    """The guarantee must not rest on the caller happening to list keys in a
+    helpful order — same inputs, same output, whichever way round they arrive."""
+    message = "auth failed for abcdef and abc"
+    assert _redact_keys(message, ["abc", "abcdef"]) == _redact_keys(message, ["abcdef", "abc"])
+    assert _redact_keys(message, ["abc", "abcdef"]) == "auth failed for *** and ***"
+
+
+def test_redaction_survives_an_empty_or_all_blank_key_list():
+    """`configured_api_keys` filters blanks, but this function is also called
+    with whatever a caller has; an empty alternation would match everywhere."""
+    assert _redact_keys("nothing secret here", []) == "nothing secret here"
+    assert _redact_keys("nothing secret here", ["", ""]) == "nothing secret here"
+
+
+def test_a_key_containing_regex_metacharacters_is_matched_literally():
+    """The single-pass fix builds a pattern from the keys, so a key carrying
+    `.` or `+` must be escaped — and must not become a wildcard that redacts
+    unrelated text or, worse, fails to redact itself."""
+    redacted = _redact_keys("auth failed for a.c+d", ["a.c+d"])
+    assert redacted == "auth failed for ***"
+    assert _redact_keys("auth failed for abcXd", ["a.c+d"]) == "auth failed for abcXd"
+
+
+def test_a_failure_reason_cannot_forge_a_workflow_command(monkeypatch):
+    """⛔ CWE-117. In GitHub Actions a line beginning `::error::` is a WORKFLOW
+    COMMAND, not output. Exception text comes from an HTTP client and can carry
+    server-controlled bytes, so an embedded newline would let a remote endpoint
+    forge annotations, `::add-mask::` text, or `::stop-commands::` its way out
+    of command processing entirely.
+
+    The property asserted is the one that matters: no LINE of the message may
+    begin with `::`. Asserting merely that "::" is absent would be wrong — it
+    is legitimate mid-string (IPv6 literals, C++ scope, timestamps).
+    """
+    monkeypatch.setenv("AKASH_API_KEYS", "pool-a\npool-b")
+    monkeypatch.delenv("AKASH_API_KEY", raising=False)
+    payloads = {
+        "pool-a": "500\n::error title=forged::a provider is down",
+        "pool-b": "503\r\n::stop-commands::deadbeef",
+    }
+
+    def factory(key):
+        client = MagicMock()
+        client.account_address.side_effect = RuntimeError(payloads[key])
+        return client
+
+    with pytest.raises(RuntimeError) as exc:
+        select_client_for_create(5_000_000, client_factory=factory, credit_reader=MagicMock())
+
+    for line in str(exc.value).splitlines():
+        assert not line.lstrip().startswith("::"), f"forged workflow command: {line!r}"
+    assert "::error title=forged::" in str(exc.value), (
+        "the text must still be REPORTED — neutralising it by deleting the "
+        "operator's evidence would trade one blind spot for another"
+    )
+
+
+def test_an_ansi_escape_cannot_rewrite_what_the_reader_sees():
+    """A control sequence in a failure reason can repaint or erase the lines
+    around it, so a redacted log still misleads the person reading it."""
+    assert _one_line("\x1b[31mred\x1b[0m text") == "red text"
+    assert _one_line("a\x1b[2Kb") == "ab"
+
+
+def test_a_failure_reason_is_bounded():
+    """An unbounded third-party string can bury every other wallet's reason
+    under one wall of text — the same 'reported but unreadable' failure."""
+    bounded = _one_line("x" * 5000)
+    assert len(bounded) == 300
+    assert bounded.endswith("…"), "truncation must be visible, not silent"
+
+
+def test_sanitising_preserves_an_ordinary_message_unchanged():
+    """The guard must not cost legibility in the 99% case, and `::` stays
+    intact mid-string where it is legitimate."""
+    assert _one_line("RuntimeError: 401 Unauthorized") == "RuntimeError: 401 Unauthorized"
+    assert _one_line("connect to [fe80::1]:443 failed") == "connect to [fe80::1]:443 failed"
+
+
+# ── the ANSI pattern is asserted ALONE, on purpose ──────────────────────
+#
+# ⛔ `_one_line` runs `_ANSI_RE` then `_CONTROL_RE`, and the second covers ESC
+# (0x1b). So a test that only calls `_one_line` CANNOT distinguish "the ANSI
+# pattern matched the sequence" from "the control-character sweep removed the
+# ESC afterwards". That is not hypothetical: the OSC String-Terminator branch
+# was dead for its whole life — the raw string `\\\\` demanded ESC + TWO
+# backslashes where ST is ESC + ONE — and every `_one_line` test still passed,
+# including the mutation checks, because `_CONTROL_RE` cleaned up behind it.
+#
+# The cost of that masking is real: reorder those two passes, or narrow
+# `_CONTROL_RE` to spare a C1 range, and escape injection reopens with the suite
+# green. These tests pin each pass to its own job so the guarantee cannot move
+# silently to the other one.
+
+_OSC_ST = "A\x1b]0;PWNED\x1b\\B"
+_OSC_BEL = "A\x1b]0;PWNED\x07B"
+_CSI = "A\x1b[31mB"
+
+
+@pytest.mark.parametrize(
+    ("label", "payload"),
+    [("CSI colour", _CSI), ("OSC + BEL", _OSC_BEL), ("OSC + ST", _OSC_ST)],
+)
+def test_the_ansi_pattern_strips_each_sequence_by_itself(label, payload):
+    assert _ANSI_RE.sub("", payload) == "AB", (
+        f"{label} survived _ANSI_RE. If _one_line still looks clean, the "
+        "control-character sweep is masking this — the guarantee has moved to a "
+        "pass that was never meant to provide it."
+    )
+
+
+def test_the_control_sweep_alone_does_not_remove_an_osc_payload():
+    """The complement, so the division of labour is pinned from both sides:
+    stripping ESC is NOT the same as removing the sequence. `_CONTROL_RE` alone
+    leaves the attacker's payload behind as visible text."""
+    swept = _CONTROL_RE.sub("", _OSC_ST.replace("\x1b", "\x1b"))
+    assert "PWNED" in swept, "if this ever passes, the two passes have merged"
+
+
+def test_no_escape_byte_survives_the_full_pipeline():
+    """The impact bound, asserted rather than argued: whatever the pattern does
+    or does not match, no ESC reaches the log — so a residue is a hygiene defect,
+    never terminal control."""
+    for payload in (_CSI, _OSC_BEL, _OSC_ST):
+        assert "\x1b" not in _one_line(payload)

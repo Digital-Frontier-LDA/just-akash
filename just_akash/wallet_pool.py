@@ -45,6 +45,80 @@ def configured_api_keys() -> list[str]:
     return result
 
 
+# ⛔ THE ST BRANCH WAS DEAD, AND `_CONTROL_RE` HID IT. In a raw string `\\\\` is
+# two source backslashes, so the regex demanded ESC + TWO literal backslashes;
+# the OSC String Terminator is ESC + ONE. That alternative therefore never
+# matched anything. It looked like it was providing the guarantee while
+# `_CONTROL_RE` — which runs second and covers ESC — quietly did the work, so
+# every test passed. Reorder those two lines, or narrow `_CONTROL_RE` to spare a
+# C1 range, and the hole opens with the suite still green. Hence the tests that
+# exercise this pattern ALONE: a test that only calls `_one_line` cannot tell
+# "the ANSI pattern matched" from "the control-character sweep cleaned up after
+# it", which is exactly how this survived a mutation check.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def _one_line(text: str, limit: int = 300) -> str:
+    """Bound a third-party exception to ONE printable line before it is logged.
+
+    ⛔ CWE-117. These strings come from an HTTP client and can carry
+    server-controlled bytes. In GitHub Actions a line beginning `::error::` (or
+    `::add-mask::`, `::stop-commands::`) is a WORKFLOW COMMAND, not output — so
+    an embedded newline lets a remote endpoint forge annotations, mask text, or
+    switch command processing off entirely. ANSI escapes can additionally
+    rewrite what a reader sees in the terminal.
+
+    ⚠ FLATTENING IS THE FIX, not cosmetics. A workflow command is only honoured
+    at the START of a line, so removing newlines removes the only way injected
+    content can reach that position — and this became load-bearing when the
+    failures started being joined one-per-line. `::` is left intact MID-string
+    on purpose: rewriting it would corrupt legitimate text (IPv6 literals, C++
+    scope, timestamps) while adding nothing once no newline can precede it. A
+    leading `::` is still displaced, so the helper is safe for callers that do
+    not prefix each entry the way this module does.
+    """
+
+    flattened = _ANSI_RE.sub("", text)
+    flattened = _CONTROL_RE.sub("", flattened.replace("\r\n", " ").replace("\n", " "))
+    flattened = flattened.replace("\r", " ").replace("\t", " ").strip()
+    if flattened.startswith("::"):
+        flattened = " " + flattened
+    if len(flattened) > limit:
+        flattened = flattened[: limit - 1] + "…"
+    return flattened
+
+
+def _redact_keys(message: str, keys: list[str]) -> str:
+    """Strip any configured key that a third-party exception may have echoed back.
+
+    ⛔ THIS MODULE'S CONTRACT IS THAT KEY VALUES ARE NEVER LOGGED — see
+    `configured_api_keys`, "de-duplicated without ever logging their values". The
+    failure reasons added alongside this function come from exceptions raised by an
+    HTTP client, and a client that puts the request URL or an auth header into its
+    message would carry a key straight into the run log, which is world-readable on
+    a public Actions run. Reporting the cause must not cost the secret.
+
+    ⛔ ONE PASS, LONGEST KEY FIRST — the ordering IS the security property.
+    A `str.replace` per key in configuration order leaks (CWE-532): with keys
+    `abc` and `abcdef`, the shorter runs first, rewrites an echoed `abcdef` to
+    `***def`, and the longer key's suffix survives in a world-readable log
+    while the redaction reports itself done. It needs only one configured key
+    to be a prefix of another, and nothing prevents that.
+
+    Fixed by construction rather than by reordering the loop. A single regex
+    pass tries alternatives longest-first at each position and resumes AFTER
+    the match, so no substitution can create or destroy another one — which a
+    sequential loop cannot promise however it is ordered. Sorting on
+    (-len, value) additionally makes the output independent of the order the
+    keys were configured in, so the guarantee does not rest on caller habit.
+    """
+    ordered = sorted({k for k in keys if k}, key=lambda k: (-len(k), k))
+    if not ordered:
+        return message
+    return re.sub("|".join(re.escape(k) for k in ordered), "***", message)
+
+
 def _candidate_id(index: int) -> str:
     """Opaque in-process identity; never derive an identifier from a credential."""
 
@@ -139,6 +213,7 @@ def select_client_for_create(
 
     clients: dict[str, AkashConsoleAPI] = {}
     candidates: list[WalletCandidate] = []
+    failures: list[str] = []
     errors = 0
     for index, key in enumerate(keys):
         candidate_id = _candidate_id(index)
@@ -155,8 +230,18 @@ def select_client_for_create(
                     denom="uact",
                 )
             )
-        except Exception:  # noqa: BLE001 — one broken wallet must not hide healthy siblings
+        except Exception as exc:  # noqa: BLE001 — one broken wallet must not hide healthy siblings
             errors += 1
+            # ⛔ KEEP THE REASON. Counting the failure and discarding what it was
+            # leaves the caller with "could not measure any of 3", which names the
+            # symptom and hides every cause — auth, network, rate limit and a typo'd
+            # key all render identically. MEASURED in Borduas-Holdings/blazing job
+            # 101096063489: that line appeared six times and the run then classified
+            # itself PROVIDER_CAPACITY, "a market/capacity condition, not a code
+            # failure" — a verdict about the market reached without reading a wallet.
+            failures.append(
+                f"{candidate_id}: {_one_line(_redact_keys(f'{type(exc).__name__}: {exc}', keys))}"
+            )
 
     result = rank_wallets(
         candidates,
@@ -164,7 +249,13 @@ def select_client_for_create(
     )
     if result.selected is None:
         if not candidates and errors:
-            raise RuntimeError(f"could not measure any of {len(keys)} configured Console wallets")
+            # One per line, as the PR describes. A single "; "-joined line put
+            # every wallet's reason in one wall of text exactly when there are
+            # most of them to read.
+            raise RuntimeError(
+                f"could not measure any of {len(keys)} configured Console wallets:\n  "
+                + ";\n  ".join(failures)
+            )
         richest = max((int(item.available_credit) for item in candidates), default=0)
         raise RuntimeError(
             "no Console wallet can fund this deployment: "
