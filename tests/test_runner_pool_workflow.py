@@ -20,6 +20,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -1811,3 +1812,173 @@ class TestTheAnnotationCannotBeSplitByCallerInput:
         assert len(annotations) == 1, (
             f"one failure must produce ONE annotation, got {len(annotations)}"
         )
+
+
+# ── #260: the probes must exercise the verb the containers use ──────────
+
+
+def _verdict_script(tmp_path, response: str) -> tuple[str, str]:
+    """Run the verdict step's credential re-check with `gh` stubbed.
+
+    Extracted rather than run whole: the block lives inside a 501-line `run:`
+    scalar. The slice is delimited by the VERDICT_RESP capture and the
+    RUNNER_NEVER_REGISTERED line that follows the case, so a restructure that
+    moves either one fails here rather than silently testing nothing.
+    """
+
+    body = _step("Provision")["run"]
+    start = body.index("VERDICT_RESP=")
+    # Cut at the LINE boundary, not the substring: ending mid-`echo "..."` leaves
+    # an unterminated quote and bash dies at EOF with an empty output file — which
+    # a test asserting "X not in out" would read as PASSING. An extractor that
+    # produces a broken script fails the wrong way round.
+    end = body.rindex("\n", 0, body.index("failure_reason=RUNNER_NEVER_REGISTERED")) + 1
+    block = textwrap.dedent(body[start:end])
+    tail = 'echo "failure_reason=RUNNER_NEVER_REGISTERED" >> "$GITHUB_OUTPUT"\n'
+
+    out = tmp_path / "out.txt"
+    script = tmp_path / "verdict.sh"
+    script.write_text(
+        f'set -uo pipefail\nORG=testorg\nGITHUB_OUTPUT="{out}"\n: > "{out}"\n' + block + tail,
+        encoding="utf-8",
+    )
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "gh").write_text(
+        '#!/usr/bin/env bash\nprintf "%s\\n" "$FAKE_RESP"\nexit "$FAKE_RC"\n', encoding="utf-8"
+    )
+    (fake / "gh").chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{fake}{os.pathsep}{os.environ['PATH']}",
+        "FAKE_RESP": response,
+        "FAKE_RC": "0" if response.split()[1:2] in (["200"], ["201"]) else "1",
+    }
+    proc = subprocess.run(["bash", str(script)], env=env, capture_output=True, check=False)
+    combined = (proc.stdout + proc.stderr).decode()
+    # ⛔ VACUITY GUARD. Every test here asserts a reason is ABSENT, and absence is
+    # what a broken extractor produces: a slice ending mid-`echo "..."` leaves an
+    # unterminated quote, bash dies at EOF, and the output file is empty — so
+    # `"RUNNER_NEVER_REGISTERED" not in out` passes while proving nothing. Measured:
+    # that is exactly what happened on the first cut of this harness.
+    assert "unexpected EOF" not in combined, f"the extracted block is not valid bash:\n{combined}"
+    assert combined.strip() or out.exists(), "the verdict block produced no output at all"
+    return (out.read_text(encoding="utf-8") if out.exists() else "", combined)
+
+
+class TestBothProbesUseTheWriteVerb:
+    """⛔ THE PREFLIGHT TESTED A READ; EVERY CONTAINER DOES A WRITE.
+
+    `gh api orgs/{org}/actions/runners` is a GET — it proves the PAT can LIST
+    runners. Each container gets `ACCESS_TOKEN=${GH_RUNNER_PAT}` and the image
+    exchanges it via POST .../actions/runners/registration-token, once per
+    replica because of `count: ${POOL_SIZE}`. So a PAT with read but not write
+    passed the gate and 403'd in all N replicas — the exact failure the gate
+    exists to prevent (#260).
+    """
+
+    def test_both_sites_post_a_registration_token(self):
+        preflight = _step("PAT must still be valid")["run"]
+        provision = _step("Provision")["run"]
+        for label, body in (("preflight", preflight), ("verdict", provision)):
+            assert "actions/runners/registration-token" in body, f"{label} still reads"
+            assert "--method POST" in body, f"{label} is not using the write verb"
+
+    def test_the_preflight_no_longer_probes_with_a_bare_list_read(self):
+        body = _step("PAT must still be valid")["run"]
+        assert "actions/runners?per_page=1" not in body, (
+            "a GET proves only that the PAT can LIST runners; the workload mints"
+        )
+
+
+class TestTheVerdictDoesNotBlameAProviderForOurCredential:
+    """⛔ THE MORE SERIOUS SITE. This step decides whether to accuse a PROVIDER.
+
+    Its own 401 text already said the container "mints its registration token
+    with this same credential" — it NAMED the write path while testing a read.
+    So a PAT that could list but not mint returned 200 here, the check fell
+    through, and the run blamed a host that did nothing wrong.
+
+    A preflight failing a run is recoverable and self-evident. A fabricated
+    provider fault is somebody else's reputation, decided by a check that was
+    asking the wrong question.
+    """
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_a_write_403_does_NOT_produce_a_provider_verdict(self, tmp_path):
+        out, log = _verdict_script(tmp_path, "HTTP/2.0 403 Forbidden")
+        assert "failure_reason=RUNNER_NEVER_REGISTERED" not in out, (
+            "the credential was the fault and the run accused a provider"
+        )
+        assert "runner_deny" in log.lower()
+        assert "do not runner_deny" in log.lower(), (
+            "the operator must be told explicitly not to act on this"
+        )
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_a_write_401_does_NOT_produce_a_provider_verdict(self, tmp_path):
+        out, _log = _verdict_script(tmp_path, "HTTP/2.0 401 Unauthorized")
+        assert "failure_reason=RUNNER_PAT_INVALID" in out
+        assert "failure_reason=RUNNER_NEVER_REGISTERED" not in out
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_201_is_success_so_a_healthy_credential_is_not_INDETERMINATE(self, tmp_path):
+        """⛔ 201, NOT 200. A successful mint is `201 Created`. Leaving the case
+        arm at 200 would send every HEALTHY credential to the `*)` arm and
+        report INDETERMINATE — 'the credential could not be re-checked' — on a
+        run where it was re-checked and was fine. That is not a safe default:
+        it converts a real provider fault into 'no evidence either way' and the
+        provider is never qualified."""
+
+        out, _log = _verdict_script(tmp_path, "HTTP/2.0 201 Created")
+        assert "failure_reason=INDETERMINATE" not in out
+        assert "failure_reason=RUNNER_NEVER_REGISTERED" in out, (
+            "with the credential proven healthy, the provider verdict must stand"
+        )
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_an_unreadable_check_still_refuses_to_accuse(self, tmp_path):
+        out, _log = _verdict_script(tmp_path, "dial tcp: i/o timeout")
+        assert "failure_reason=INDETERMINATE" in out
+        assert "failure_reason=RUNNER_NEVER_REGISTERED" not in out
+
+
+class TestTheVerdictCannotFabricateAStatus:
+    """⛔ A NON-HTTP FIRST LINE MUST NOT BECOME A STATUS CODE.
+
+    `awk 'NR==1{print $2}'` takes the second WORD of whatever the first line is.
+    A transport failure emits a plain error string, so `dial tcp: lookup ...
+    i/o timeout` yields `tcp:` — and that word then SELECTS A CASE ARM in the
+    step that decides whether to accuse a provider.
+
+    ⚠ It matters more here than at the preflight, which captures `|| RC=$?` and
+    branches on it. This capture ends `|| true`, so the status line is the ONLY
+    evidence — an unguarded parse is the whole input, not one input of two.
+    """
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    @pytest.mark.parametrize(
+        "junk",
+        [
+            "dial tcp: lookup api.github.com: i/o timeout",
+            "error: 403 something",
+            "gh: command failed",
+        ],
+    )
+    def test_a_non_http_first_line_reaches_no_accusatory_arm(self, tmp_path, junk):
+        out, log = _verdict_script(tmp_path, junk)
+        assert "failure_reason=INDETERMINATE" in out, (
+            f"{junk!r} was parsed into a status instead of being rejected"
+        )
+        assert "failure_reason=RUNNER_NEVER_REGISTERED" not in out
+        assert "do not runner_deny" in log.lower()
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_the_word_that_would_have_been_taken_is_not_reported_as_a_status(self, tmp_path):
+        """`error: 403 something` has `403` as its second word. Unguarded, that
+        selects the rate-limit arm and reports a status the server never sent —
+        a fabricated fact presented as a measurement."""
+
+        _out, log = _verdict_script(tmp_path, "error: 403 something")
+        assert "HTTP 403" not in log, "a status was invented from an error string"
+        assert "no status" in log.lower()
