@@ -84,3 +84,44 @@ def test_the_matcher_does_not_fire_on_legitimate_client_side_matching():
         'RESP=$(gh api "orgs/${ORG}/actions/runners?per_page=1" -i 2>&1)',
     ):
         assert not _FILTERED_LISTING.search(benign), f"false positive on: {benign[:70]}"
+
+
+def test_version_comparisons_use_fixed_string_matching():
+    """A version is full of `.`, and `grep` reads its pattern as a REGEX.
+
+    ⛔ THE MISCOUNT FAILS OPEN, which is why this is pinned rather than left to review.
+    Measured against versions [2.337.0, 2X337X0, 2.336.0] with EXPECTED=2.337.0:
+
+        grep -cvx   -> 1 wrong     <- treats 2X337X0 as CORRECT
+        grep -cvxF  -> 2 wrong
+
+    So the regex form UNDER-counts wrong versions and a bad pool passes the landing
+    gate. `-x` alone does not save it: whole-line matching still lets `.` match any
+    character within the line.
+
+    Pinned on the SHAPE — every grep in the gate's version comparison must carry -F —
+    rather than on today's four call sites, so a fifth comparison added later is held
+    to the same rule.
+    """
+    wf = (WORKFLOWS / "runner-pool.yml").read_text()
+    offenders = [
+        ln.strip()
+        for ln in _uncommented(wf)
+        if ("RUNNER_VERSIONS" in ln or "EXPECTED_RUNNER_VERSION" in ln)
+        and "grep" in ln
+        and not all("F" in flag for flag in re.findall(r"grep\s+(-[a-zA-Z]+)", ln))
+    ]
+    assert not offenders, (
+        "a version comparison greps without -F, so `.` matches any character and wrong "
+        "versions are under-counted — the gate would fail OPEN:\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_that_matcher_would_catch_a_regex_comparison():
+    """★ The control's own control: without this, a broken matcher reads as clean."""
+    line = (
+        """GATE_WRONG=$(printf '%s\\n' "$RUNNER_VERSIONS" """
+        """| grep -cvx "${EXPECTED_RUNNER_VERSION}")"""
+    )
+    flags = re.findall(r"grep\s+(-[a-zA-Z]+)", line)
+    assert flags and not all("F" in f for f in flags), "the matcher must reject a regex comparison"
