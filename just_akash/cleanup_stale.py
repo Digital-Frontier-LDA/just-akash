@@ -354,6 +354,7 @@ class ExecutionPlan:
     to_close: list[str]
     closable: int
     capped: bool
+    cap: int
 
     @property
     def would_close(self) -> int:
@@ -397,6 +398,7 @@ def _execution_plan(
             to_close=[],
             closable=len(stale),
             capped=False,
+            cap=max_close,
         )
 
     # RAIL 2 — shape tripwire.
@@ -416,6 +418,7 @@ def _execution_plan(
                 to_close=[],
                 closable=len(stale),
                 capped=False,
+                cap=max_close,
             )
 
     # RAIL 3 — cap.
@@ -429,6 +432,7 @@ def _execution_plan(
             to_close=[],
             closable=len(stale),
             capped=False,
+            cap=max_close,
         )
 
     oldest_first = sorted(stale, key=lambda d: stale_ages.get(d, -1.0), reverse=True)
@@ -438,6 +442,7 @@ def _execution_plan(
         to_close=oldest_first[:max_close] if capped else oldest_first,
         closable=len(oldest_first),
         capped=capped,
+        cap=max_close,
     )
 
 
@@ -463,8 +468,12 @@ def _report_plan(plan: ExecutionPlan, *, execute: bool) -> None:
         headline = f"would REFUSE to execute — {plan.refusal.splitlines()[0]}"
     elif plan.capped:
         headline = (
+            # ⛔ plan.cap, NOT the module constant. The plan is computed with the
+            # CALLER's max_close, so reading MAX_CLOSE_PER_RUN here made
+            # `--max-close 5` report "cap 25" while closing 5 — this PR's own
+            # defect, reproduced inside the report it exists to make accurate.
             f"{plan.closable} closable; --execute would close "
-            f"{plan.would_close} (cap {MAX_CLOSE_PER_RUN}), "
+            f"{plan.would_close} (cap {plan.cap}), "
             f"{plan.closable - plan.would_close} would remain"
         )
     elif plan.closable:

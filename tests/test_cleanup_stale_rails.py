@@ -731,3 +731,38 @@ class TestDryRunPredictsExecute:
         deployments.update({_dseq(60 + i): _detail(["node"]) for i in range(5)})
         _, _, client = self._dry(deployments, capsys)
         client.close_deployment.assert_not_called()
+
+
+class TestTheReportUsesTheCapTheRunWillUse:
+    """⛔ THE REPORT MISREPORTED THE THING THIS PR EXISTS TO REPORT ACCURATELY.
+
+    `_report_plan` read the module constant `MAX_CLOSE_PER_RUN` while the plan
+    was computed with the CALLER's `max_close`, so `--max-close 5` announced
+    "cap 25" and closed 5. An operator reviewing that preview would authorise a
+    run on a number no part of the system was using.
+
+    Every existing test missed it because the harness defaults `max_close` to
+    the constant — the two values were equal in every case exercised, so the
+    bug was invisible to a suite that never varied them. Hence the explicit
+    non-default here: the cap and the constant must be able to DISAGREE for the
+    assertion to mean anything.
+    """
+
+    def test_a_custom_cap_is_reported_not_the_module_default(self, capsys):
+        custom = 5
+        assert custom != cs.MAX_CLOSE_PER_RUN, "the test is vacuous if these agree"
+        plan = _plan([f"d{i}" for i in range(30)], max_close=custom)
+        cs._report_plan(plan, execute=False)
+        out = capsys.readouterr().out
+        assert f"cap {custom}" in out
+        assert f"cap {cs.MAX_CLOSE_PER_RUN}" not in out, (
+            "the preview announced a cap the run will not use"
+        )
+        assert plan.would_close == custom
+
+    def test_the_plan_carries_the_cap_it_was_built_with(self):
+        """Carried ON the plan rather than re-read at the report, so the two
+        cannot diverge again — the same structural move as computing the rails
+        once for both paths."""
+        for cap in (1, 7, cs.MAX_CLOSE_PER_RUN, 100):
+            assert _plan([f"d{i}" for i in range(30)], max_close=cap).cap == cap
