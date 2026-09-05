@@ -12,6 +12,7 @@ reports safety it never checked.
 
 from __future__ import annotations
 
+import ast
 import os
 import pathlib
 import re
@@ -30,7 +31,7 @@ WF_PATH = Path(
         Path(__file__).resolve().parents[1] / ".github/workflows/runner-pool.yml",
     )
 )
-SRC = WF_PATH.read_text()
+SRC = WF_PATH.read_text(encoding="utf-8")
 DOC = yaml.safe_load(SRC)
 CALL = (DOC.get("on") or DOC.get(True))["workflow_call"]
 INPUTS = CALL["inputs"]
@@ -405,7 +406,9 @@ def test_the_pool_runs_the_image_providers_were_qualified_against():
 
     The probe SDL already explains why it pins a digest; this asserts the pool did not
     quietly opt out of that reasoning."""
-    probe_sdl = (Path(__file__).resolve().parents[1] / "sdl/github-runner-probe.yaml").read_text()
+    probe_sdl = (Path(__file__).resolve().parents[1] / "sdl/github-runner-probe.yaml").read_text(
+        encoding="utf-8"
+    )
 
     def _image(text: str, what: str) -> str:
         m = re.search(r"image:\s*(\S+)", text)
@@ -765,7 +768,7 @@ def test_the_guard_actually_runs_and_decides(key, accepted, tmp_path):
     """
     render = _step("Render runner SDL")["run"]
     script = tmp_path / "render.sh"
-    script.write_text(render)
+    script.write_text(render, encoding="utf-8")
     env = {
         **os.environ,
         "GH_RUNNER_PAT": "x",
@@ -905,6 +908,101 @@ MUTATIONS = [
 ]
 
 
+# pytest's own exit codes. Only 0 and 1 mean "the suite RAN and produced a verdict":
+#   0 all passed   1 tests failed   2 interrupted
+#   3 internal error   4 USAGE ERROR   5 no tests collected
+# 2-5 all exit non-zero while proving nothing about any guard.
+_INNER_RAN = frozenset({0, 1})
+
+
+def _classify_inner_run(returncode: int, out: str) -> tuple[str, str]:
+    """RAN, or UNREADABLE with the reason. Never a verdict about the guard.
+
+    ⛔ THE DISTINCTION THIS FUNCTION EXISTS FOR. "The mutation survived" and "the
+    instrument did not run" are different findings, and only the first says anything
+    about the guard under test. Collapsing them is how this harness told a maintainer
+    that 27 WORKING guards were "decorative" — measured 2026-09-05: the inner run
+    inherited `addopts = --cov=just_akash` from pyproject, the interpreter had no
+    `pytest_cov`, and pytest exited 4 with `unrecognized arguments`. No "N failed"
+    appeared, so every mutation read as survived.
+
+    ⚠ THAT IS WORSE THAN FAILING OPEN. A gate that fails open loses a check. A harness
+    that fails into a FALSE ACCUSATION invites someone to delete 27 real controls
+    because it told them they were decorative.
+
+    The old code guarded exactly one of the modes its own comment names -- "a collection
+    error, an import failure or a crash all exit non-zero while proving nothing" -- and
+    a usage error is the sibling it names in principle and misses in code. So this
+    requires POSITIVE evidence of execution rather than the absence of one known
+    failure: a zero proves neither that the suite ran nor that the guard held.
+    """
+    if "error during collection" in out or "errors during collection" in out:
+        return "UNREADABLE", "the inner run failed to COLLECT, so no guard was evaluated"
+    if returncode not in _INNER_RAN:
+        return "UNREADABLE", (
+            f"pytest exited {returncode} (not 0/1), which means it did not run the suite "
+            f"— usage error, internal error, interruption, or nothing collected"
+        )
+    # ⚠ `errors?` BELONGS HERE. A test that ERRORS (a fixture raising, say) is a test
+    # that was collected and attempted — the suite demonstrably ran. Measured 2026-09-05:
+    # a fixture raising RuntimeError gives exit 1 and a summary of "1 warning, 1 error in
+    # 0.21s" with no passed/failed/skipped/xfailed anywhere, so the old regex called a
+    # genuine run UNREADABLE. That direction is safe here (the caller asserts RAN, so it
+    # fails loudly rather than silently) but it is still a false alarm on a real result.
+    #
+    # This does NOT re-admit collection errors: those are caught above by name and again
+    # by exit code 2, which is not in _INNER_RAN. Both guards still stand in front.
+    if not re.search(r"\d+ (?:passed|failed|skipped|xfailed|errors?)", out):
+        return "UNREADABLE", (
+            "the inner run reported no test outcomes at all, so nothing was evaluated"
+        )
+    return "RAN", ""
+
+
+# ⛔ REAL pytest summary lines, captured 2026-09-05 by actually running each shape rather
+# than by writing down what pytest is believed to print. The fixture-error row is the one
+# the classifier used to get wrong: exit 1, a genuine run, and not one of
+# passed/failed/skipped/xfailed anywhere in the summary.
+_CLASSIFY_CASES = [
+    (
+        "fixture error is a RUN",
+        1,
+        "ERROR test_x.py::test_a - RuntimeError: boom\n"
+        "========== 1 warning, 1 error in 0.21s ==========",
+        "RAN",
+    ),
+    (
+        "collection error is not",
+        2,
+        "ERROR test_x.py\n"
+        "!!!!! Interrupted: 1 error during collection !!!!!\n"
+        "========== 1 error in 0.09s ==========",
+        "UNREADABLE",
+    ),
+    ("ordinary failure", 1, "========== 1 failed, 2 passed in 0.30s ==========", "RAN"),
+    ("all green", 0, "========== 27 passed in 1.10s ==========", "RAN"),
+    (
+        "usage error — the original incident",
+        4,
+        "ERROR: unrecognized arguments: --cov=just_akash",
+        "UNREADABLE",
+    ),
+    ("no outcomes at all", 1, "some stray output with no summary line", "UNREADABLE"),
+]
+
+
+@pytest.mark.parametrize("label,rc,out,want", _CLASSIFY_CASES, ids=[c[0] for c in _CLASSIFY_CASES])
+def test_classify_inner_run_separates_a_run_from_an_instrument_failure(label, rc, out, want):
+    """★ Pinned in BOTH directions: what must read as RAN, and what must not.
+
+    A classifier tested only on the failures it was written for will happily
+    misread a success — which is how a fixture error, exit 1 and unmistakably a
+    real run, came back as "the instrument did not run".
+    """
+    verdict, _why = _classify_inner_run(rc, out)
+    assert verdict == want, f"{label}: expected {want}, got {verdict}"
+
+
 @pytest.mark.skipif(
     os.environ.get("RUNNER_POOL_WF") is not None,
     reason="inner mutation run — must not recurse",
@@ -922,7 +1020,7 @@ def test_the_guards_are_not_vacuous(label, mutate, tmp_path):
     assert mutated != SRC, f"mutation {label!r} no longer matches the workflow text"
 
     broken = tmp_path / "runner-pool.yml"
-    broken.write_text(mutated)
+    broken.write_text(mutated, encoding="utf-8")
     proc = subprocess.run(
         [
             sys.executable,
@@ -933,6 +1031,14 @@ def test_the_guards_are_not_vacuous(label, mutate, tmp_path):
             "--no-header",
             "-p",
             "no:cacheprovider",
+            # ⚠ THE PROXIMATE CAUSE, and it must be explicit. Without this the inner run
+            # inherits `addopts = --cov=just_akash --cov-report=term-missing` from
+            # pyproject.toml, so on any interpreter without `pytest_cov` it dies with a
+            # usage error before running a single test. The harness then has no outcomes
+            # to read and — before the classification below — called that a surviving
+            # mutation. This makes the inner run independent of the outer environment.
+            "-o",
+            "addopts=",
         ],
         env={**os.environ, "RUNNER_POOL_WF": str(broken)},
         capture_output=True,
@@ -940,12 +1046,13 @@ def test_the_guards_are_not_vacuous(label, mutate, tmp_path):
     )
     out = proc.stdout + proc.stderr
 
-    # A non-zero exit is NOT enough. A collection error, an import failure or a crash all
-    # exit non-zero while proving nothing about the guard — that is precisely how this
-    # harness sat green while checking nothing. Require an actual test FAILURE.
-    assert "error during collection" not in out and "errors during collection" not in out, (
-        f"mutation {label!r}: the inner run failed to COLLECT, so no guard was "
-        f"evaluated.\n{out[-1500:]}"
+    # A non-zero exit is NOT enough, and neither is the absence of one known failure
+    # mode. Establish that the instrument RAN before reading anything as a verdict
+    # about the guard — see `_classify_inner_run`.
+    verdict, why = _classify_inner_run(proc.returncode, out)
+    assert verdict == "RAN", (
+        f"mutation {label!r}: UNREADABLE — {why}. This says NOTHING about the guard; "
+        f"do not read it as 'the guard is decorative'.\n{out[-1500:]}"
     )
     assert re.search(r"\d+ failed", out), (
         f"mutation {label!r} left the suite GREEN — the guard for it is decorative.\n{out[-1500:]}"
@@ -963,7 +1070,7 @@ def test_the_guards_are_not_vacuous(label, mutate, tmp_path):
 # `assert proc.returncode != 0` was satisfied by the import error for every mutation,
 # including ones whose guard checks nothing. The anti-vacuity harness was itself vacuous.
 TD_PATH = Path(__file__).resolve().parents[1] / ".github/workflows/runner-teardown.yml"
-TD_SRC = TD_PATH.read_text()
+TD_SRC = TD_PATH.read_text(encoding="utf-8")
 TD = yaml.safe_load(TD_SRC)
 TD_STEPS = TD["jobs"]["teardown"]["steps"]
 TD_CLOSE = next(s for s in TD_STEPS if s.get("id") == "close")
@@ -1322,4 +1429,175 @@ def test_the_nested_teardown_pin_matches_the_file_it_calls():
     assert shown.stdout == current, (
         f"runner-teardown.yml has changed since the pinned {pin[:8]}, so the pool calls a "
         "STALE copy of its own teardown. Bump the pin in this change."
+    )
+
+
+# ==========================================================================
+# The harness's own harness.
+#
+# `test_the_guards_are_not_vacuous` renders a verdict about 27 real guards. On
+# 2026-09-05 it rendered the WRONG one: the inner run inherited
+# `addopts = --cov=just_akash` from pyproject, the interpreter had no
+# `pytest_cov`, pytest exited 4 with `unrecognized arguments`, no "N failed"
+# appeared, and every mutation was reported as "the guard for it is decorative".
+#
+# ⛔ THAT IS WORSE THAN FAILING OPEN, which is why these tests exist. A gate that
+# fails open loses a check. A harness that fails into a FALSE ACCUSATION invites
+# a maintainer to DELETE 27 working controls because it told them to.
+#
+# Both error rates are pinned below. A classifier that returns UNREADABLE for
+# everything would satisfy the first half and destroy the harness — it is the
+# same defect wearing the safe colour.
+# ==========================================================================
+
+
+@pytest.mark.parametrize(
+    "returncode,out,reason_fragment",
+    [
+        (
+            4,
+            "ERROR: usage: pytest [options]\nunrecognized arguments: --cov=just_akash\n",
+            "exited 4",
+        ),
+        (5, "no tests ran in 0.01s\n", "exited 5"),
+        (3, "INTERNALERROR> Traceback\n", "exited 3"),
+        (2, "!!! KeyboardInterrupt !!!\n", "exited 2"),
+        (1, "ERROR tests/x.py\n1 errors during collection\n", "COLLECT"),
+        (0, "", "no test outcomes"),
+    ],
+    ids=[
+        "usage-error",
+        "nothing-collected",
+        "internal-error",
+        "interrupted",
+        "collection-error",
+        "silent-success",
+    ],
+)
+def test_an_inner_run_that_did_not_execute_is_UNREADABLE_not_a_verdict(
+    returncode, out, reason_fragment
+):
+    """★ THE FALSE-ACCUSATION SIDE.
+
+    None of these say anything about a guard. Reporting any of them as "the guard
+    is decorative" is an accusation the evidence cannot support — and the usage-error
+    row is the one that actually fired.
+    """
+    verdict, why = _classify_inner_run(returncode, out)
+    assert verdict == "UNREADABLE", f"rc={returncode} was read as a verdict about the guard"
+    assert reason_fragment in why, f"the reason must name what happened, got: {why!r}"
+
+
+@pytest.mark.parametrize(
+    "returncode,out",
+    [
+        (1, "F....\n1 failed, 4 passed in 0.30s\n"),
+        (0, ".....\n5 passed in 0.20s\n"),
+        (1, "5 failed, 92 passed in 5.91s\n"),
+        (0, "3 passed, 1 skipped in 0.10s\n"),
+    ],
+    ids=["one-failure", "all-passed", "many-failures", "passed-with-skips"],
+)
+def test_a_run_that_really_executed_is_RAN(returncode, out):
+    """★ THE ANTI-VACUITY SIDE, and it is the half that keeps the harness alive.
+
+    A classifier returning UNREADABLE for everything would pass every test above
+    and silently disable all 27 guard checks — the same defect in the safe colour.
+    These are the shapes that MUST still reach a verdict.
+    """
+    verdict, why = _classify_inner_run(returncode, out)
+    assert verdict == "RAN", f"a real run (rc={returncode}) was suppressed as UNREADABLE: {why}"
+
+
+def test_the_surviving_mutation_verdict_still_reaches_its_conclusion():
+    """A genuinely-surviving mutation must still be reported as decorative.
+
+    The point of the UNREADABLE state is to remove FALSE accusations, not to remove
+    the harness's ability to accuse at all. An inner run that executed and reported
+    zero failures is exactly the case the harness exists to catch.
+    """
+    out = ".....\n5 passed in 0.20s\n"
+    verdict, _ = _classify_inner_run(0, out)
+    assert verdict == "RAN", "an executed run must be judgeable"
+    assert not re.search(r"\d+ failed", out), "and this one legitimately shows no failures"
+
+
+# ⛔ BOTH DIRECTIONS, including the case the substring form got wrong. The old check
+# would have PASSED "separated" below — `-o` present, `addopts=` present, but the inner
+# run still inheriting addopts because they were never a pair.
+_ADDOPTS_CASES = [
+    ("adjacent", ["-m", "pytest", "-o", "addopts=", "-q"], True),
+    ("adjacent at end", ["-m", "pytest", "-o", "addopts="], True),
+    ("separated", ["-o", "cov=x", "-q", "addopts=", "-p"], False),
+    ("reversed", ["addopts=", "-o"], False),
+    ("-o with another value", ["-o", "cache_dir=/tmp", "-q"], False),
+    ("absent entirely", ["-m", "pytest", "-q"], False),
+    ("non-literal in the slot", ["-o", None, "addopts="], False),
+]
+
+
+@pytest.mark.parametrize("label,argv,want", _ADDOPTS_CASES, ids=[c[0] for c in _ADDOPTS_CASES])
+def test_the_addopts_matcher_requires_adjacency(label, argv, want):
+    """★ The pin's own control. A matcher tested only on the passing case cannot see
+    the arrangement that satisfies it while the behaviour is absent."""
+    assert _passes_o_addopts(argv) is want, f"{label}: expected {want}"
+
+
+def _inner_pytest_argv(source: str) -> list[str | None]:
+    """The literal argv list handed to `subprocess.run` inside the mutation harness.
+
+    ⚠ PARSED, NOT GREPPED. The previous version substring-matched `\'"-o",\'` and
+    `\'"addopts=",\'` in the source text, which was wrong in two directions:
+
+      * it hard-coded DOUBLE quotes, so a formatter flipping quote style would fail a
+        test whose behaviour had not changed (cries wolf), and
+      * it never checked ADJACENCY, so `"-o", "something-else"` plus the string
+        `"addopts="` anywhere else in the window — a comment, another argument — would
+        satisfy it while the inner run still inherited addopts (fails OPEN).
+
+    Non-literal elements come back as None so they cannot accidentally satisfy a pair.
+    """
+    tree = ast.parse(source)
+    fn = next(
+        (
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "test_the_guards_are_not_vacuous"
+        ),
+        None,
+    )
+    assert fn is not None, "the mutation harness function was renamed — this pin is stale"
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        target = node.func
+        name = target.attr if isinstance(target, ast.Attribute) else getattr(target, "id", "")
+        if name != "run" or not node.args or not isinstance(node.args[0], ast.List):
+            continue
+        return [
+            e.value if isinstance(e, ast.Constant) and isinstance(e.value, str) else None
+            for e in node.args[0].elts
+        ]
+    raise AssertionError("no subprocess.run([...]) call found in the mutation harness")
+
+
+def _passes_o_addopts(argv: list) -> bool:
+    """`-o` immediately followed by `addopts=` — adjacency is the whole point."""
+    # strict=False is correct and deliberate: the two sequences differ in length by
+    # construction (pairwise over a single list), so strict=True would always raise.
+    return any(a == "-o" and b == "addopts=" for a, b in zip(argv, argv[1:], strict=False))
+
+
+def test_the_inner_run_does_not_inherit_addopts():
+    """The proximate cause, pinned at the call site.
+
+    Without an explicit `-o addopts=` the inner pytest picks up
+    `--cov=just_akash --cov-report=term-missing` from pyproject.toml and dies with a
+    usage error on any interpreter lacking `pytest_cov`. The UNREADABLE verdict now
+    stops that from becoming an accusation; this stops it from happening at all.
+    """
+    argv = _inner_pytest_argv(pathlib.Path(__file__).read_text(encoding="utf-8"))
+    assert _passes_o_addopts(argv), (
+        "the inner pytest invocation must pass `-o addopts=` as ADJACENT arguments so it "
+        f"does not inherit pyproject's addopts. Parsed argv: {argv}"
     )
