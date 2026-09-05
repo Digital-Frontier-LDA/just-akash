@@ -16,6 +16,7 @@ import ast
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1310,14 +1311,14 @@ _CASES = [
 ]
 
 
-def _run_preflight(tmp_path, response: str, rc: int) -> tuple[str, str]:
+def _run_preflight(tmp_path, response: str, rc: int, org: str = "testorg") -> tuple[str, str]:
     """Execute the preflight's classification half with `gh` stubbed out."""
 
     body = _step("PAT must still be valid")["run"]
     script = tmp_path / "preflight.sh"
     out, summary = tmp_path / "out.txt", tmp_path / "sum.txt"
     script.write_text(
-        "set -uo pipefail\nORG=testorg\n"
+        f"set -uo pipefail\nORG={shlex.quote(org)}\n"
         f'GITHUB_OUTPUT="{out}"\nGITHUB_STEP_SUMMARY="{summary}"\n' + body[body.index("RC=0") :],
         encoding="utf-8",
     )
@@ -1774,3 +1775,39 @@ class TestTheFallbackArmPrintsWhatItPromises:
         _run_preflight(tmp_path, "HTTP/2.0 401 Unauthorized\nx-trace: nope", rc=1)
         log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
         assert "::group::Unexpected preflight response" not in log
+
+
+class TestTheAnnotationCannotBeSplitByCallerInput:
+    """⛔ `${ORG}` IS A CALLER-SUPPLIED `workflow_call` INPUT.
+
+    It flows into TITLE, which is interpolated into `::error title=...::`. A CR
+    or LF in it ends that line, and whatever follows starts a NEW workflow
+    command — forging annotations, or `::stop-commands::` to switch command
+    processing off entirely.
+
+    Third entry point for this class in one day: an exception message
+    (just-akash#252), an HTTP response body (this PR's fallback arm), and now a
+    workflow input. Same defect, three doors.
+    """
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_a_newline_in_the_org_cannot_start_a_second_command(self, tmp_path):
+        _run_preflight(
+            tmp_path,
+            # ⛔ 404, NOT 401. Only the 404 arm interpolates ${ORG} into TITLE
+            # ("org ${ORG} is not visible..."); 401's TITLE is a fixed string. With
+            # 401 this test passed with the flattening REMOVED — the fixture could
+            # not carry the tainted value into the sink, so it proved nothing.
+            "HTTP/2.0 404 Not Found",
+            rc=1,
+            org="evil\n::error title=forged::a provider is down",
+        )
+        log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
+        annotations = [ln for ln in log.splitlines() if ln.startswith("::error")]
+        assert annotations, "the step emitted no annotation at all"
+        assert not any("forged" in ln.split("::")[1] for ln in annotations if "::" in ln), (
+            "caller input started its own workflow command"
+        )
+        assert len(annotations) == 1, (
+            f"one failure must produce ONE annotation, got {len(annotations)}"
+        )
