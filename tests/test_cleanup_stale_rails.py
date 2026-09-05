@@ -22,6 +22,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from just_akash import cleanup_stale as cs
 
 NOW = time.time()
@@ -593,3 +595,139 @@ class TestDeclaredPoolWithNoCredential:
         err = capsys.readouterr().err
         assert "neither AKASH_API_KEY nor AKASH_API_KEYS is set" in err
         assert "AKASH_WALLETS_EXPECTED" not in err
+
+
+# ── the dry run must predict the execute run (#250) ─────────────────────
+
+
+def _plan(
+    stale, *, classified=100, max_close=cs.MAX_CLOSE_PER_RUN, verdicts=None, enumerated=None
+):
+    return cs._execution_plan(
+        stale=list(stale),
+        stale_ages={d: float(i) for i, d in enumerate(stale)},
+        seen_verdicts=verdicts if verdicts is not None else {"STALE-e2e"},
+        classified=classified,
+        enumerated=enumerated if enumerated is not None else classified,
+        max_close=max_close,
+    )
+
+
+class TestCapConstrainsAtTheBoundary:
+    """⛔ This file has already produced TWO rail inversions — `--max-close -1`
+    EXPANDED the cap via `stale[:-1]`, and the key/address collapse DOUBLED it
+    by auditing one account once per alias. So the cap is asserted AT the
+    boundary and ONE PAST IT in both directions, not merely 'somewhere in the
+    middle', which is where both inversions hid.
+    """
+
+    def test_exactly_at_the_cap_is_not_capped(self):
+        plan = _plan([f"d{i}" for i in range(25)], max_close=25)
+        assert plan.capped is False
+        assert plan.would_close == 25, "N == cap must close all N, not N-1"
+
+    def test_one_past_the_cap_closes_exactly_the_cap(self):
+        plan = _plan([f"d{i}" for i in range(26)], max_close=25)
+        assert plan.capped is True
+        assert plan.would_close == 25
+        assert plan.closable == 26, "the pre-cap total must survive for the report"
+
+    def test_one_under_the_cap_closes_everything(self):
+        plan = _plan([f"d{i}" for i in range(24)], max_close=25)
+        assert plan.capped is False
+        assert plan.would_close == 24
+
+    def test_a_cap_of_one_closes_one(self):
+        plan = _plan([f"d{i}" for i in range(9)], max_close=1)
+        assert plan.would_close == 1, "the smallest legal cap must still constrain"
+
+    @pytest.mark.parametrize("bad", [0, -1, -25])
+    def test_a_non_positive_cap_closes_NOTHING_rather_than_inverting(self, bad):
+        """The measured inversion: `stale[:-1]` closed 54 of 55. A bound that
+        EXPANDS blast radius given a bad value is worse than no bound, because
+        its presence is what makes an operator believe the run is capped."""
+        plan = _plan([f"d{i}" for i in range(9)], max_close=bad)
+        assert plan.refusal is not None
+        assert plan.would_close == 0
+        assert plan.to_close == []
+
+    def test_the_cap_takes_the_OLDEST(self):
+        """A partial pass must free the escrow locked longest, or the backlog
+        drains newest-first and the oldest lease never leaves."""
+        stale = [f"d{i}" for i in range(30)]
+        plan = cs._execution_plan(
+            stale=stale,
+            stale_ages={d: float(i) for i, d in enumerate(stale)},
+            seen_verdicts={"STALE-e2e"},
+            classified=100,
+            enumerated=100,
+            max_close=3,
+        )
+        assert plan.to_close == ["d29", "d28", "d27"]
+
+
+class TestTripwireBoundary:
+    def test_exactly_at_the_tripwire_does_not_refuse(self):
+        """`>` not `>=`: at exactly the threshold the run proceeds. Asserted so
+        a later `>=` 'tidy-up' is a test failure rather than a silent change to
+        when this reaper refuses."""
+        n = 100
+        stale = [f"d{i}" for i in range(int(n * cs.MAX_STALE_FRACTION))]
+        plan = _plan(stale, classified=n)
+        assert plan.refusal is None
+
+    def test_one_past_the_tripwire_refuses(self):
+        n = 100
+        stale = [f"d{i}" for i in range(int(n * cs.MAX_STALE_FRACTION) + 1)]
+        plan = _plan(stale, classified=n)
+        assert plan.refusal is not None and "tripwire" in plan.refusal
+
+    def test_below_the_minimum_audited_the_fraction_rail_is_not_applied(self):
+        """A small account is legitimately 100% stale; an ungated fraction rail
+        deadlocks it permanently."""
+        n = cs.MIN_AUDITED_FOR_FRACTION_RAIL - 1
+        plan = _plan([f"d{i}" for i in range(n)], classified=n)
+        assert plan.refusal is None
+
+
+class TestDryRunPredictsExecute:
+    """⛔ THE DRY RUN RETURNED BEFORE EVERY RAIL. It printed the CLASSIFICATION
+    count and stopped, so `stale (closable): 55` did not mean 55 would close —
+    with the cap it meant 25, and above the tripwire it meant zero and a
+    refusal. The documented protocol is "dispatch dry-run, review the verdict
+    table, then dispatch execute=true": the review step was reading a figure
+    that does not predict the step it authorises."""
+
+    def _dry(self, deployments, capsys, **kw):
+        client = _mock_client(deployments)
+        rc = _run(client, execute=False, **kw)
+        return rc, capsys.readouterr().out, client
+
+    def test_the_dry_run_states_what_execute_would_close(self, capsys):
+        deployments = {_dseq(3 * 86400 + i): _detail(["backtest"]) for i in range(30)}
+        deployments.update({_dseq(60 + i): _detail(["node"]) for i in range(30)})
+        rc, out, client = self._dry(deployments, capsys)
+        assert rc == 0
+        assert "WOULD EXECUTE:" in out
+        assert f"would close {cs.MAX_CLOSE_PER_RUN}" in out, (
+            "a dry run reporting only the closable count does not predict the "
+            "capped outcome it is authorising"
+        )
+        client.close_deployment.assert_not_called()
+
+    def test_the_dry_run_warns_that_execute_would_refuse(self, capsys):
+        """The costliest surprise: review 'N closable', dispatch execute, and
+        get a refusal instead — with the backlog untouched and the operator
+        believing they have acted."""
+        n = cs.MIN_AUDITED_FOR_FRACTION_RAIL + 10
+        deployments = {_dseq(3 * 86400 + i): _detail(["backtest"]) for i in range(n)}
+        rc, out, client = self._dry(deployments, capsys)
+        assert rc == 0, "reporting a would-refuse is not itself a failure"
+        assert "would REFUSE" in out and "tripwire" in out
+        client.close_deployment.assert_not_called()
+
+    def test_a_dry_run_still_closes_nothing_whatever_the_plan_says(self, capsys):
+        deployments = {_dseq(3 * 86400 + i): _detail(["backtest"]) for i in range(5)}
+        deployments.update({_dseq(60 + i): _detail(["node"]) for i in range(5)})
+        _, _, client = self._dry(deployments, capsys)
+        client.close_deployment.assert_not_called()

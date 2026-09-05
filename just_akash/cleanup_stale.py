@@ -46,6 +46,7 @@ import argparse
 import os
 import sys
 import time
+from dataclasses import dataclass
 
 from . import chain
 from .api import AkashConsoleAPI, _extract_dseq, escrow_locked
@@ -333,6 +334,164 @@ def _credit_line(client: AkashConsoleAPI, address: str) -> str:
     )
 
 
+@dataclass(frozen=True)
+class ExecutionPlan:
+    """What ``--execute`` WOULD do, decided without doing any of it.
+
+    ⛔ THE DRY RUN WAS NOT A PREVIEW OF THE EXECUTE RUN. It printed
+    ``stale (closable): N`` and returned BEFORE every rail — so the number an
+    operator reviewed was the CLASSIFICATION, never the outcome. With the cap,
+    "55 closable" means 25 will close; above the fraction tripwire it means
+    ZERO and a refusal. The documented protocol is "dispatch dry-run, review the
+    verdict table, then dispatch execute=true", and the review step was reading
+    a figure that does not predict the step it authorises (#250).
+
+    Both paths now decide here, so the preview and the act cannot disagree:
+    a dry run reports this, an execute performs it.
+    """
+
+    refusal: str | None
+    to_close: list[str]
+    closable: int
+    capped: bool
+
+    @property
+    def would_close(self) -> int:
+        return 0 if self.refusal else len(self.to_close)
+
+
+def _execution_plan(
+    *,
+    stale: list[str],
+    stale_ages: dict[str, float],
+    seen_verdicts: set[str],
+    classified: int,
+    enumerated: int,
+    max_close: int,
+) -> ExecutionPlan:
+    """Evaluate every execute-path rail WITHOUT acting on any of them.
+
+    Rail order is preserved exactly: unknown verdict, then shape tripwire, then
+    the cap. Order is load-bearing — an unknown verdict means the classifier
+    grew a category, which makes the fraction itself untrustworthy, so it must
+    refuse first.
+    """
+
+    # RAIL 1 — unrecognised verdict.
+    unknown = sorted(seen_verdicts - KNOWN_VERDICTS)
+    if unknown:
+        return ExecutionPlan(
+            refusal=(
+                f"classify() returned {len(unknown)} verdict(s) this reaper does not "
+                f"know: {', '.join(unknown)}.\n"
+                # Worded to avoid ruff S608, and NOT suppressed with a noqa. The
+                # trigger is "Update ... set" parsing as `UPDATE ... SET` — measured;
+                # the previous noqa here blamed the word "EXECUTE", which does NOT
+                # fire it, so anyone rewording around that would have been baffled.
+                # A suppression would also blind this string to a real finding later.
+                "  The classifier has a category the close path was never taught to "
+                "reason about. Extend KNOWN_VERDICTS deliberately after deciding "
+                "whether each new verdict is closable — never widen it just to make "
+                "this pass."
+            ),
+            to_close=[],
+            closable=len(stale),
+            capped=False,
+        )
+
+    # RAIL 2 — shape tripwire.
+    if classified >= MIN_AUDITED_FOR_FRACTION_RAIL:
+        fraction = len(stale) / classified
+        if fraction > MAX_STALE_FRACTION:
+            return ExecutionPlan(
+                refusal=(
+                    f"{len(stale)}/{classified} = {fraction:.0%} of CLASSIFIED "
+                    f"deployments closable, above the {MAX_STALE_FRACTION:.0%} "
+                    f"tripwire. ({enumerated} enumerated, {enumerated - classified} "
+                    "unreadable and excluded from the denominator.)\n"
+                    "  A share this high is more likely a classification fault than a "
+                    "real backlog. Investigate the verdict table above before closing "
+                    "anything."
+                ),
+                to_close=[],
+                closable=len(stale),
+                capped=False,
+            )
+
+    # RAIL 3 — cap.
+    if max_close < 1:
+        return ExecutionPlan(
+            refusal=(
+                f"--max-close must be >= 1, got {max_close}.\n"
+                "  A non-positive cap does not narrow this run, it inverts the rail: a "
+                "negative value slices from the END and would close nearly everything."
+            ),
+            to_close=[],
+            closable=len(stale),
+            capped=False,
+        )
+
+    oldest_first = sorted(stale, key=lambda d: stale_ages.get(d, -1.0), reverse=True)
+    capped = len(oldest_first) > max_close
+    return ExecutionPlan(
+        refusal=None,
+        to_close=oldest_first[:max_close] if capped else oldest_first,
+        closable=len(oldest_first),
+        capped=capped,
+    )
+
+
+def _report_plan(plan: ExecutionPlan, *, execute: bool) -> None:
+    """Say what execute WOULD do, on stdout and in the job summary.
+
+    ⛔ "NOTHING CLOSED" READ THE SAME AT 0 CLOSABLE AND AT 55. The scheduled
+    job is report-only BY DESIGN (CLEANUP_AUTO_EXECUTE=false, and a cron
+    supplies no inputs), which is a defensible choice for something that spends
+    escrow on a shared wallet. But its job summary named only the MODE, so four
+    green runs a day carried no information and a growing backlog looked
+    exactly like an empty one (#250).
+
+    ⚠ THIS DOES NOT FAIL THE RUN, DELIBERATELY. #250 proposes failing the cron
+    above a threshold. A scheduled job that goes red for a condition only a
+    human can clear, and that stays true until they do, is permanently red —
+    which trains people to ignore red exactly as green-by-default trained them
+    to ignore green. Same defect, colour inverted. A warning annotation is
+    visible in the run list without spending that signal.
+    """
+
+    if plan.refusal:
+        headline = f"would REFUSE to execute — {plan.refusal.splitlines()[0]}"
+    elif plan.capped:
+        headline = (
+            f"{plan.closable} closable; --execute would close "
+            f"{plan.would_close} (cap {MAX_CLOSE_PER_RUN}), "
+            f"{plan.closable - plan.would_close} would remain"
+        )
+    elif plan.closable:
+        headline = f"{plan.closable} closable; --execute would close all {plan.would_close}"
+    else:
+        headline = "0 closable — nothing to do"
+
+    if not execute:
+        print(f"WOULD EXECUTE: {headline}")
+
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "").strip()
+    if summary_path:
+        try:
+            with open(summary_path, "a", encoding="utf-8") as fh:
+                fh.write(f"- {'closing' if execute else 'dry run'}: {headline}\n")
+        except OSError as exc:  # noqa: BLE001 — a summary failure must not stop the sweep
+            print(f"(could not write job summary: {exc})", file=sys.stderr)
+
+    # A backlog is worth an annotation, not a red run. Only on the reporting
+    # path: during an execute the closing output is itself the signal.
+    if not execute and plan.closable and not plan.refusal:
+        print(
+            f"::warning title=Stale deployments awaiting the human execute step::"
+            f"{headline}. Dispatch cleanup-stale with execute=true to drain."
+        )
+
+
 def run(
     *,
     execute: bool = False,
@@ -486,84 +645,37 @@ def run(
     if protected:
         print(f"\nPROTECTED (never-close list): {len(protected)} -> {', '.join(protected)}")
     print(f"\nstale (closable): {len(stale)}")
+
+    # ⛔ DECIDE ONCE, FOR BOTH PATHS. The dry run used to return here, before
+    # every rail — so the figure an operator reviewed was the CLASSIFICATION,
+    # not the outcome, and the promotion protocol ("review the table, then
+    # dispatch execute=true") authorised a step the review could not predict.
+    plan = _execution_plan(
+        stale=stale,
+        stale_ages=stale_ages,
+        seen_verdicts=seen_verdicts,
+        classified=classified,
+        enumerated=len(deployments),
+        max_close=max_close,
+    )
+    _report_plan(plan, execute=execute)
+
     if not execute:
         print("DRY RUN — nothing closed. Re-run with --execute to close the stale set.")
         return 0
 
-    # ── EXECUTE-PATH RAILS (#250) ────────────────────────────────────────
-    # Past this point the run destroys things. Each rail refuses LOUDLY and
-    # returns non-zero; none of them may decline quietly, because a silent
-    # decline is indistinguishable from a clean run and that is the defect
-    # this whole issue is about.
-
-    # RAIL 1 — unrecognised verdict. classify() returning a label this reaper
-    # has never been taught means the classifier grew a category and nobody
-    # told the thing that acts on it. Closing on a label you cannot reason
-    # about is how a reaper starts closing the wrong deployments. Refuse the
-    # WHOLE run, not just the unknown rows: the unknown one may be evidence
-    # that the known ones are also being judged by changed rules.
-    unknown = sorted(seen_verdicts - KNOWN_VERDICTS)
-    if unknown:
-        print(
-            # noqa: S608 — the bandit heuristic fires on "EXECUTE" in an f-string and
-            # reads this operator message as SQL. There is no database here; the only
-            # thing this function talks to is the Console API and the chain.
-            f"\nREFUSING TO EXECUTE: classify() returned {len(unknown)} verdict(s) this "  # noqa: S608
-            f"reaper does not know: {', '.join(unknown)}.\n"
-            "  The classifier has a category the close path was never taught to reason "
-            "about. Update KNOWN_VERDICTS deliberately after deciding whether each new "
-            "verdict is closable — do not widen the set to make this pass.",
-            file=sys.stderr,
-        )
+    if plan.refusal:
+        print(f"\nREFUSING TO EXECUTE: {plan.refusal}", file=sys.stderr)
         return 2
 
-    # RAIL 2 — shape tripwire. Not about any single row: if suddenly almost
-    # everything looks closable, the likeliest cause is a classification fault,
-    # and the right response to that is to stop and be looked at.
-    if classified >= MIN_AUDITED_FOR_FRACTION_RAIL:
-        fraction = len(stale) / classified
-        if fraction > MAX_STALE_FRACTION:
-            print(
-                f"\nREFUSING TO EXECUTE: {len(stale)}/{classified} = {fraction:.0%} of "
-                f"CLASSIFIED deployments closable, above the {MAX_STALE_FRACTION:.0%} "
-                f"tripwire. ({len(deployments)} enumerated, "
-                f"{len(deployments) - classified} unreadable and excluded from the "
-                "denominator.)\n"
-                "  A share this high is more likely a classification fault than a real "
-                "backlog. Investigate the verdict table above before closing anything.",
-                file=sys.stderr,
-            )
-            return 2
-
-    # RAIL 3 — cap. Close the OLDEST first so a partial pass frees the escrow
-    # locked longest, and say plainly that it stopped short. Progress that
-    # announces its own incompleteness beats either refusing entirely (the
-    # backlog never drains) or closing everything (unbounded blast radius).
-    #
-    # ⛔ A NON-POSITIVE CAP INVERTS THIS RAIL. `stale[:-1]` closes all but one:
-    # 54 of 55 measured. A bound on blast radius that EXPANDS it given a bad
-    # value is worse than no bound at all, because its presence is what makes
-    # an operator believe the run is capped. Rejected at parse time too (see
-    # _positive_cap); this is the second lock, so neither a CLI typo nor a
-    # future in-process caller can invert it.
-    if max_close < 1:
+    if plan.capped:
         print(
-            f"\nREFUSING TO EXECUTE: --max-close must be >= 1, got {max_close}.\n"
-            "  A non-positive cap does not narrow this run, it inverts the rail: a "
-            "negative value slices from the END and would close nearly everything.",
-            file=sys.stderr,
+            f"\nCAP: {plan.closable} closable, closing the {len(plan.to_close)} oldest "
+            f"this run. {plan.closable - len(plan.to_close)} will remain — re-run to "
+            "continue draining."
         )
-        return 2
-
-    stale = sorted(stale, key=lambda d: stale_ages.get(d, -1.0), reverse=True)
-    capped = False
-    if len(stale) > max_close:
-        capped = True
-        print(
-            f"\nCAP: {len(stale)} closable, closing the {max_close} oldest this run. "
-            f"{len(stale) - max_close} will remain — re-run to continue draining."
-        )
-        stale = stale[:max_close]
+    stale = plan.to_close
+    capped = plan.capped
 
     closed, failed = 0, 0
     for dseq in stale:
