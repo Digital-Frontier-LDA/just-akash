@@ -9,8 +9,11 @@ re-run by hand at real Akash cost per round.
 ⚠️ AND THE OBVIOUS FIX IS THE DANGEROUS ONE. The issue proposes retrying on 524
 because the body says `retryable: true`. That flag is Cloudflare describing its
 OWN proxy semantics; it cannot describe whether Akash's origin committed the
-transaction, because Cloudflare does not know. `deploy.py:290` records the
-measured counter-case in this repo's own words: "a gateway 500, a PROXY TIMEOUT
+transaction, because Cloudflare does not know. `_report_suspected_orphans` in
+deploy.py records the measured counter-case in this repo's own words (referenced
+by SYMBOL, not line: a line number is a hand-computed constant derived from the
+file's current shape, and the claim anchored here is too load-bearing to rot when
+something above it is edited): "a gateway 500, a PROXY TIMEOUT
 or a dropped connection can land AFTER the transaction committed — measured
 shape: HTTP 500 returned 103 SECONDS into the request." The #266 timeout arrived
 at 125s.
@@ -94,6 +97,55 @@ class TestTheErrorCarriesEnoughToApportionBlame:
         assert isinstance(no_flag, AkashAPIError)
         assert no_flag.retryable is None, "absent must stay absent, not become False"
         assert no_flag.is_upstream_timeout(), "classification must not depend on the flag"
+
+
+class TestZeroIsAValueNotAnAbsence:
+    """⛔ THE SAME DISTINCTION, THE OTHER FIELD. `retryable` was deliberately kept
+    as None-when-unstated, and mutation-checked. Then the create path tested
+    `retry_after` with TRUTHINESS in the same commit — and `retry_after: 0` is a
+    legitimate value meaning "retry immediately", indistinguishable under
+    truthiness from the upstream having said nothing.
+
+    A rule applied to one field and not its neighbour is how the collapse gets
+    back in, and this is the quieter direction: `retryable` collapsing is loud
+    (a wrong claim), `retry_after` collapsing is silent (a missing log line).
+    """
+
+    def test_zero_is_carried_through_as_a_value(self, monkeypatch, client):
+        body = json.dumps(
+            {"message": "x", "retry_after": 0, "error_name": "origin_response_timeout"}
+        )
+        err = _raise_http(monkeypatch, client, 524, body)
+        assert isinstance(err, AkashAPIError)
+        assert err.retry_after == 0, "0 must survive parsing, not become None"
+
+    def test_absent_stays_absent(self, monkeypatch, client):
+        err = _raise_http(monkeypatch, client, 524, json.dumps({"message": "x"}))
+        assert isinstance(err, AkashAPIError)
+        assert err.retry_after is None
+
+    def test_the_create_path_guards_with_is_not_none(self):
+        """The behaviour, not just the field. An upstream saying "retry now"
+        (`retry_after: 0`) must still be REPORTED — the operator's decision
+        depends on knowing the upstream spoke at all, and truthiness would
+        silently drop exactly that case.
+
+        Asserted against the source because the log line has no return value to
+        observe; a `dp is not None` style assertion would pass forever and prove
+        nothing.
+        """
+
+        import inspect
+
+        from just_akash import deploy
+
+        src = inspect.getsource(deploy)
+        hot = src[src.index("STEP 2: Creating deployment") :]
+        hot = hot[: hot.index("STEP 3")] if "STEP 3" in hot else hot
+        assert "e.retry_after is not None" in hot, (
+            "the create path must distinguish retry_after=0 from absent"
+        )
+        assert "if e.retry_after:" not in hot, "truthiness drops a legitimate 0"
 
 
 class TestBackwardCompatibility:

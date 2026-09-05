@@ -1062,7 +1062,13 @@ def deploy(
                 # non-idempotent create double-spends escrow on exactly the failure
                 # that is hardest to see. The orphan report below is the read-back
                 # that would have to come first.
-                if e.retry_after:
+                # ⛔ `is not None`, NOT TRUTHINESS. `retry_after: 0` is a legitimate
+                # value meaning "retry immediately", and truthiness makes it
+                # indistinguishable from the upstream having said nothing at all —
+                # the exact absent-vs-present collapse this change deliberately
+                # avoids for `retryable`. Same distinction, and I applied it to one
+                # field and not the other in the same commit.
+                if e.retry_after is not None:
                     _log(
                         logging.ERROR,
                         f"  upstream advertised retry_after={e.retry_after}s — NOT acted on "
