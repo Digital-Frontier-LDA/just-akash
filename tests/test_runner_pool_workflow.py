@@ -1583,7 +1583,9 @@ def _inner_pytest_argv(source: str) -> list[str | None]:
 
 def _passes_o_addopts(argv: list) -> bool:
     """`-o` immediately followed by `addopts=` — adjacency is the whole point."""
-    return any(a == "-o" and b == "addopts=" for a, b in zip(argv, argv[1:]))
+    # strict=False is correct and deliberate: the two sequences differ in length by
+    # construction (pairwise over a single list), so strict=True would always raise.
+    return any(a == "-o" and b == "addopts=" for a, b in zip(argv, argv[1:], strict=False))
 
 
 def test_the_inner_run_does_not_inherit_addopts():
