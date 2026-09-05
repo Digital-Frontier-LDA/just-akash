@@ -342,6 +342,34 @@ jobs:
       # "switch back to hosted runners", which is the bill this workflow exists to remove.
       #
       # One API call turns 15 silent minutes into an immediate, named failure.
+      # ⛔ `RC=$?` ON A LINE OF ITS OWN NEVER RAN. This step's shell is `bash -e {0}`
+      # (the Actions default), and `set -uo pipefail` does NOT clear `-e`. A bare
+      # `VAR=$(cmd)` whose command fails is itself a failing command, so `-e` killed
+      # the shell AT the assignment — before `RC` was read, before `CODE` was parsed,
+      # and before any diagnostic could print.
+      #
+      # ⇒ The step exited 1 with NO annotation and NO summary. Every word of the
+      #   "CI is not broken, Akash is fine, and no provider is at fault" message —
+      #   written precisely so a credential failure would not be misread as a provider
+      #   outage — was unreachable exactly when it was needed.
+      #
+      #   Measured on blazing: `Provision Fast-Tests pool` failed 23 consecutive times
+      #   on main, and its check annotation was the bare string "Process completed with
+      #   exit code 1". Nobody could tell whether the PAT had expired, the org listing
+      #   was rate-limited, or a provider was down — which is the exact confusion
+      #   `failure_reason` exists to prevent.
+      #
+      # ⛔ AND A NONZERO EXIT IS NOT A VERDICT. Mapping every failure to
+      #   RUNNER_PAT_INVALID re-created that same defect one level up: 401, 403, 404,
+      #   429, 5xx and a transport failure with no HTTP response at all all reported
+      #   "your PAT is invalid", and `${CODE:-401}` ASSERTED a 401 that had never been
+      #   received. A preflight whose stated purpose is saying WHY it failed must not
+      #   collapse five causes into one. Classify, then conclude — and when there is no
+      #   status, say so rather than inventing the worst one.
+      #
+      # ⚠ This prose lives OUT here on purpose. Comments inside a `run:` scalar count
+      # toward the job's size, and an oversized job makes GitHub build zero jobs with no
+      # log — Borduas-Holdings/blazing#664, just-akash#247. Out here the parser drops them.
       - name: Preflight — the runner PAT must still be valid
         id: pat
         env:
@@ -354,28 +382,106 @@ jobs:
             echo "::error title=GH_RUNNER_PAT is not set::The pool cannot register runners without it. NOT a provider fault and NOT an Akash outage."
             exit 1
           fi
-          # ONE request, not two. Calling it twice doubles the latency and the API
-          # spend, and lets the two disagree: the status line could come from a call
-          # that succeeded while the branch is taken on a call that failed, reporting a
-          # code that never belonged to the failure.
-          RESP=$(gh api "orgs/${ORG}/actions/runners?per_page=1" -i 2>&1)
-          RC=$?
-          CODE=$(printf '%s' "$RESP" | awk 'NR==1{print $2}')
+          # ONE request, not two. Two calls double latency and API spend and can
+          # disagree: the status line could come from a call that succeeded while
+          # the branch is taken on one that failed.
+          # ⚠ `|| RC=$?` keeps the assignment inside a list, which `-e` does not act
+          #   on. Do NOT simplify to a bare `RESP=$(...)`; see the note above.
+          RC=0
+          RESP=$(gh api "orgs/${ORG}/actions/runners?per_page=1" -i 2>&1) || RC=$?
+          # $1 ~ /^HTTP/ guards the no-response case: without it, awk prints the
+          # second WORD of an arbitrary error string as though it were a status.
+          CODE=$(printf '%s' "$RESP" | awk 'NR==1 && $1 ~ /^HTTP/ {print $2}')
           if [ "$RC" -ne 0 ]; then
-            echo "failure_reason=RUNNER_PAT_INVALID" >> "$GITHUB_OUTPUT"
+            # Classify before concluding. Rationale in the comment above this step.
+            REASON=GITHUB_API_UNAVAILABLE
+            case "$CODE" in
+              401)
+                REASON=RUNNER_PAT_INVALID
+                TITLE="GH_RUNNER_PAT is expired or revoked"
+                FIX="Rotate the PAT. It needs org runner-registration rights." ;;
+              403)
+                if printf '%s' "$RESP" | grep -qiE '^x-ratelimit-remaining: *0|rate limit|abuse detection'; then
+                  TITLE="GitHub API rate limit reached"
+                  FIX="Wait for the limit to reset and re-run. The PAT is not implicated."
+                else
+                  REASON=RUNNER_PAT_INVALID
+                  TITLE="GH_RUNNER_PAT lacks org runner access"
+                  FIX="Grant the PAT org runner-registration rights, or rotate it."
+                fi ;;
+              404)
+                REASON=RUNNER_PAT_INVALID
+                TITLE="org ${ORG} is not visible to GH_RUNNER_PAT"
+                FIX="Check the org name, then the PAT's org access. GitHub returns 404 rather than 403 for resources a token may not see." ;;
+              429)
+                TITLE="GitHub API rate limit reached"
+                FIX="Wait for the limit to reset and re-run. The PAT is not implicated." ;;
+              5??)
+                TITLE="GitHub API returned HTTP ${CODE}"
+                FIX="A GitHub-side failure. Re-run; if it persists check githubstatus.com." ;;
+              "")
+                TITLE="no HTTP response from the GitHub API"
+                FIX="A transport failure (DNS, TLS, timeout, proxy). Re-run. NOTHING here indicts the PAT." ;;
+              *)
+                TITLE="unexpected HTTP ${CODE} from the GitHub API"
+                FIX="The full API response is in this step's log, under 'Unexpected preflight response'."
+                # ⛔ PRINT IT, DO NOT PROMISE IT. The fix text said "read the response
+                # below" and RESP was captured, parsed twice, and never emitted — so the
+                # ONE arm that fires when the status is unrecognised, i.e. when the
+                # operator has least to go on, sent them to output that does not exist.
+                # This is the branch least likely to have been exercised, which is
+                # exactly why the fix's own defect hid in it.
+                #
+                # ⛔ AND IT IS UNTRUSTED OUTPUT. A response body echoed raw into an
+                # Actions log can forge workflow commands — a line beginning `::error::`
+                # or `::stop-commands::` is a COMMAND, not text (same CWE-117 shape as
+                # just-akash#252). `::stop-commands::` with a random token neutralises the
+                # whole block, and MUST be resumed before ::endgroup:: or that is disabled
+                # too. Bounded, because an HTML error page should not bury the summary.
+                RESP_TOKEN=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d " \n")
+                echo "::group::Unexpected preflight response (HTTP ${CODE:-none received})"
+                echo "::stop-commands::${RESP_TOKEN}"
+                printf '%s\n' "$RESP" | head -c 4000
+                if [ "$(printf '%s' "$RESP" | wc -c)" -gt 4000 ]; then
+                  printf '\n[truncated at 4000 bytes]\n'
+                fi
+                echo "::${RESP_TOKEN}::"
+                echo "::endgroup::" ;;
+            esac
+            CODE_TEXT="${CODE:-none received}"
+            echo "failure_reason=${REASON}" >> "$GITHUB_OUTPUT"
+            if [ "$REASON" = "RUNNER_PAT_INVALID" ]; then
+              CLASS="a CREDENTIAL failure, not a provider or Akash failure"
+            else
+              CLASS="a GITHUB API failure — the runner listing was never readable, so the PAT is UNPROVEN, not disproven"
+            fi
             {
-              echo "## The runner PAT is expired or lacks org access"
+              echo "## ${TITLE}"
               echo
               echo "**CI is not broken, Akash is fine, and no provider is at fault.**"
-              echo "\`GH_RUNNER_PAT\` cannot read \`orgs/${ORG}/actions/runners\` (HTTP ${CODE:-401})."
+              echo "\`GH_RUNNER_PAT\` could not read \`orgs/${ORG}/actions/runners\`."
+              echo "HTTP status: ${CODE_TEXT}. Classified: \`${REASON}\`."
               echo
               echo "Without this check the runner would simply never register, the pool would"
               echo "time out after ~15 minutes, and the run would report"
               echo "\`RUNNER_NEVER_REGISTERED\` — which reads exactly like a broken provider."
               echo
-              echo "**Fix:** rotate the PAT. It needs org runner-registration rights."
+              echo "**Fix:** ${FIX}"
             } >> "$GITHUB_STEP_SUMMARY"
-            echo "::error title=GH_RUNNER_PAT expired or lacks org access (HTTP ${CODE:-401})::This is a CREDENTIAL failure, not a provider or Akash failure. Untreated it surfaces 15 minutes later as 'runner did not come online'. Rotate the PAT."
+            # ⛔ FLATTEN BEFORE EMITTING A WORKFLOW COMMAND. `${ORG}` is a
+            # caller-supplied `workflow_call` input and flows into TITLE; an embedded
+            # CR/LF would END the `::error ...::` line and let the remainder start a
+            # NEW workflow command. Third entry point for this same class today: an
+            # exception message (#252), an HTTP response body (this PR's fallback
+            # arm), and now a workflow input.
+            #
+            # Normalised HERE, at the point of emission, rather than at ORG — any
+            # future value interpolated into this line is covered too, which
+            # sanitising one input would not do.
+            TITLE=$(printf '%s' "$TITLE" | tr -d '\r\n')
+            CLASS=$(printf '%s' "$CLASS" | tr -d '\r\n')
+            CODE_TEXT=$(printf '%s' "$CODE_TEXT" | tr -d '\r\n')
+            echo "::error title=${TITLE} (HTTP status: ${CODE_TEXT})::This is ${CLASS}. Untreated it surfaces 15 minutes later as 'runner did not come online'."
             exit 1
           fi
           echo "runner PAT valid for ${ORG}"

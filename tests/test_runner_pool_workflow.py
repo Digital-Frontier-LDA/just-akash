@@ -16,6 +16,8 @@ import ast
 import os
 import pathlib
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -1275,12 +1277,124 @@ def test_the_pat_is_validated_before_provisioning():
 
 def test_an_expired_pat_is_not_reported_as_a_provider_failure():
     body = _step("PAT must still be valid")["run"]
-    assert "failure_reason=RUNNER_PAT_INVALID" in body
+    assert "REASON=RUNNER_PAT_INVALID" in body
     assert "RUNNER_NEVER_REGISTERED" in body, (
         "the message must name the symptom it prevents, or the next reader will not "
         "connect a 15-minute timeout to a credential"
     )
     assert "not a provider" in body.lower() and "rotate" in body.lower()
+
+
+# ⛔ TEXT ASSERTIONS COULD NOT SEE THE DEFECT ABOVE.
+# The original test asserted that the string "failure_reason=RUNNER_PAT_INVALID"
+# appeared in the step. It does — and it appeared for 401, 403, 404, 429, 5xx AND a
+# transport failure with no HTTP response at all, because every nonzero exit took the
+# same branch. "A 401 maps to PAT_INVALID" and "EVERYTHING maps to PAT_INVALID" are
+# indistinguishable to a substring check, so the collapse the preflight exists to
+# prevent shipped inside the preflight, past a green test.
+#
+# These run the actual shell against a stubbed `gh`, because the only assertion that
+# can tell those two apart is one that varies the input.
+
+_CASES = [
+    ("HTTP/2.0 401 Unauthorized", "RUNNER_PAT_INVALID", "an expired or revoked PAT"),
+    ("HTTP/2.0 403 Forbidden", "RUNNER_PAT_INVALID", "403 without rate-limit evidence"),
+    (
+        "HTTP/2.0 403 Forbidden\nx-ratelimit-remaining: 0",
+        "GITHUB_API_UNAVAILABLE",
+        "403 that IS a rate limit",
+    ),
+    ("HTTP/2.0 404 Not Found", "RUNNER_PAT_INVALID", "an org the token cannot see"),
+    ("HTTP/2.0 429 Too Many Requests", "GITHUB_API_UNAVAILABLE", "rate limiting"),
+    ("HTTP/2.0 503 Service Unavailable", "GITHUB_API_UNAVAILABLE", "a GitHub outage"),
+    ("dial tcp: lookup api.github.com: i/o timeout", "GITHUB_API_UNAVAILABLE", "no response"),
+]
+
+
+def _run_preflight(tmp_path, response: str, rc: int, org: str = "testorg") -> tuple[str, str]:
+    """Execute the preflight's classification half with `gh` stubbed out."""
+
+    body = _step("PAT must still be valid")["run"]
+    script = tmp_path / "preflight.sh"
+    out, summary = tmp_path / "out.txt", tmp_path / "sum.txt"
+    script.write_text(
+        f"set -uo pipefail\nORG={shlex.quote(org)}\n"
+        f'GITHUB_OUTPUT="{out}"\nGITHUB_STEP_SUMMARY="{summary}"\n' + body[body.index("RC=0") :],
+        encoding="utf-8",
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text(
+        '#!/usr/bin/env bash\nprintf "%s\\n" "$FAKE_RESP"\nexit "$FAKE_RC"\n',
+        encoding="utf-8",
+    )
+    (fake_bin / "gh").chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        "FAKE_RESP": response,
+        "FAKE_RC": str(rc),
+    }
+    # ⛔ `-e` IS THE POINT, NOT A DETAIL. Actions runs this step as `bash -e {0}`,
+    # and the regression being guarded — a bare `RESP=$(gh ...)` followed by
+    # `RC=$?` — only misbehaves under `-e`, where the failing assignment kills the
+    # shell before RC is ever read. A harness without `-e` cannot reproduce it, so
+    # it would pass forever INCLUDING on the exact regression it exists to stop.
+    proc = subprocess.run(["bash", "-e", str(script)], env=env, capture_output=True, check=False)
+    # Captured so the fallback arm's emitted response can be asserted; without it
+    # a test can only check that the guidance MENTIONS output, never that it exists.
+    (tmp_path / "stdout.txt").write_bytes(proc.stdout + proc.stderr)
+    # ⛔ A block that is not valid bash produces NO output — which every
+    # absence-assertion in this file is trivially satisfied by. Fail here instead.
+    assert b"unexpected EOF" not in proc.stderr, (
+        f"the extracted preflight is not valid bash:\n{proc.stderr.decode()}"
+    )
+    return (
+        out.read_text(encoding="utf-8") if out.exists() else "",
+        summary.read_text(encoding="utf-8") if summary.exists() else "",
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize(("response", "expected", "label"), _CASES)
+def test_each_failure_cause_is_classified_not_collapsed(tmp_path, response, expected, label):
+    out, _ = _run_preflight(tmp_path, response, rc=1)
+    assert f"failure_reason={expected}" in out, (
+        f"{label} must classify as {expected}; a preflight whose purpose is saying "
+        "WHY it failed cannot report five causes as one"
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_a_transport_failure_does_not_invent_an_http_status(tmp_path):
+    """⛔ `${CODE:-401}` ASSERTED a 401 that was never received. Reporting a status
+    the server never sent is worse than reporting none: it is a fabricated fact that
+    sends the reader to rotate a credential which may be perfectly valid."""
+
+    out, summary = _run_preflight(tmp_path, "dial tcp: i/o timeout", rc=1)
+    assert "401" not in summary, "a status was invented for a response that never arrived"
+    assert "none received" in summary
+    assert "failure_reason=GITHUB_API_UNAVAILABLE" in out
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_a_valid_pat_emits_no_failure_reason(tmp_path):
+    """The success path must stay silent — a reason emitted on success would make
+    every run look like a fallback.
+
+    ⛔ AN ABSENCE ASSERTION NEEDS A VALIDITY PRECONDITION. "no failure_reason" is
+    also what an EMPTY output file says, so this passed if the step exited before
+    reaching the success path at all — a moved slice anchor, or the missing-PAT
+    branch firing. An absence is evidence only once the code that would produce a
+    presence is shown to have run.
+    """
+
+    out, _ = _run_preflight(tmp_path, "HTTP/2.0 200 OK", rc=0)
+    log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
+    assert "runner PAT valid for" in log, (
+        "the success path never ran, so 'no failure_reason' proves nothing"
+    )
+    assert "failure_reason=" not in out
 
 
 def test_a_missing_pat_is_distinct_from_an_invalid_one():
@@ -1601,3 +1715,99 @@ def test_the_inner_run_does_not_inherit_addopts():
         "the inner pytest invocation must pass `-o addopts=` as ADJACENT arguments so it "
         f"does not inherit pyproject's addopts. Parsed argv: {argv}"
     )
+
+
+class TestTheFallbackArmPrintsWhatItPromises:
+    """⛔ THE DEFAULT ARM IS WHERE A FIX'S OWN DEFECT HIDES.
+
+    The `*)` branch fires when the status is UNRECOGNISED — precisely when the
+    operator has least to go on. Its fix text said "read the response below",
+    and `RESP` was captured, parsed twice, and never emitted. So the one arm
+    that exists for the unexplained case sent the reader to output that did not
+    exist, in a PR whose entire subject is a preflight that could not report why
+    it failed.
+
+    It is the branch least likely to have been exercised, which is exactly why
+    it was the one still broken. Check the default arm first, not last.
+    """
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_an_unexpected_status_emits_the_response(self, tmp_path):
+        out, summary = _run_preflight(tmp_path, "HTTP/2.0 418 I'm a teapot\nx-trace: abc123", rc=1)
+        log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
+        assert "::group::Unexpected preflight response" in log
+        assert "x-trace: abc123" in log, "the guidance names a response that must be printed"
+        assert "log" in summary, "the summary must say WHERE the response is"
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_the_echoed_response_cannot_forge_a_workflow_command(self, tmp_path):
+        """⛔ CWE-117 again. A response body echoed raw into an Actions log can
+        forge commands — `::error::` at line start is a COMMAND, not text. Same
+        shape as just-akash#252, reached by a different route: there the payload
+        arrived in an exception message, here in an HTTP body.
+
+        Asserted as the property that matters — the payload IS printed (the
+        operator needs it) but is wrapped in `::stop-commands::`, which is
+        GitHub's documented neutraliser. Deleting the payload would trade one
+        blind spot for another.
+        """
+        forged = "HTTP/2.0 418 Teapot\n::error title=forged::a provider is down"
+        _out, _summary = _run_preflight(tmp_path, forged, rc=1)
+        log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
+
+        assert "::error title=forged::" in log, "the evidence must still reach the operator"
+        stop = re.search(r"::stop-commands::([0-9a-f]{32})", log)
+        assert stop, "untrusted output was echoed without ::stop-commands::"
+        token = stop.group(1)
+        body_start = log.index(f"::stop-commands::{token}")
+        body_end = log.index(f"::{token}::")
+        assert body_start < log.index("::error title=forged::") < body_end, (
+            "the forged command fell outside the neutralised block"
+        )
+        assert log.index(f"::{token}::") < log.index("::endgroup::"), (
+            "commands must be resumed BEFORE ::endgroup::, or the group never closes"
+        )
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_a_recognised_status_does_not_dump_the_response(self, tmp_path):
+        """401 has specific guidance and does not promise the raw body — dumping
+        it for every failure would bury the named diagnosis this PR added."""
+        _run_preflight(tmp_path, "HTTP/2.0 401 Unauthorized\nx-trace: nope", rc=1)
+        log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
+        assert "::group::Unexpected preflight response" not in log
+
+
+class TestTheAnnotationCannotBeSplitByCallerInput:
+    """⛔ `${ORG}` IS A CALLER-SUPPLIED `workflow_call` INPUT.
+
+    It flows into TITLE, which is interpolated into `::error title=...::`. A CR
+    or LF in it ends that line, and whatever follows starts a NEW workflow
+    command — forging annotations, or `::stop-commands::` to switch command
+    processing off entirely.
+
+    Third entry point for this class in one day: an exception message
+    (just-akash#252), an HTTP response body (this PR's fallback arm), and now a
+    workflow input. Same defect, three doors.
+    """
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_a_newline_in_the_org_cannot_start_a_second_command(self, tmp_path):
+        _run_preflight(
+            tmp_path,
+            # ⛔ 404, NOT 401. Only the 404 arm interpolates ${ORG} into TITLE
+            # ("org ${ORG} is not visible..."); 401's TITLE is a fixed string. With
+            # 401 this test passed with the flattening REMOVED — the fixture could
+            # not carry the tainted value into the sink, so it proved nothing.
+            "HTTP/2.0 404 Not Found",
+            rc=1,
+            org="evil\n::error title=forged::a provider is down",
+        )
+        log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
+        annotations = [ln for ln in log.splitlines() if ln.startswith("::error")]
+        assert annotations, "the step emitted no annotation at all"
+        assert not any("forged" in ln.split("::")[1] for ln in annotations if "::" in ln), (
+            "caller input started its own workflow command"
+        )
+        assert len(annotations) == 1, (
+            f"one failure must produce ONE annotation, got {len(annotations)}"
+        )
