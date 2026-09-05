@@ -421,7 +421,13 @@ class TestTripwireDenominator:
         client.close_deployment.assert_not_called()
         err = capsys.readouterr().err
         assert "CLASSIFIED" in err, "the refusal must say which denominator it used"
-        assert "unreadable and excluded" in err
+        # ⛔ THE COUNTS ARE NAMED SEPARATELY. The message used to call the whole
+        # shortfall "unreadable", but `classified` is skipped by TWO paths — no
+        # dseq, and a failed detail read — so the subtraction spanned both while
+        # the word named one. A label that asserts a cause it did not measure
+        # misleads at the exact moment an operator is debugging a refusal.
+        assert f"{n * 2} unreadable" in err, "the unreadable count must be measured, not implied"
+        assert "0 without a dseq" in err, "the other skip path must be reported, not folded in"
 
 
 # ── the pool-arrival guard (#259, landmine from just-akash#167) ──────────
@@ -603,9 +609,16 @@ class TestDeclaredPoolWithNoCredential:
 def _plan(
     stale, *, classified=100, max_close=cs.MAX_CLOSE_PER_RUN, verdicts=None, enumerated=None
 ):
+    # ⛔ MATERIALISE ONCE. This consumed `stale` twice — `list(stale)` then
+    # `enumerate(stale)` — so a generator would give the second pass NOTHING:
+    # empty stale_ages, every age defaulting to -1.0, and the oldest-first
+    # ordering silently INVERTING. The cap would then drain the newest end of
+    # the backlog and every assertion about counts would still pass. A fixture
+    # that returns a confident wrong answer is worse than one that raises.
+    items = list(stale)
     return cs._execution_plan(
-        stale=list(stale),
-        stale_ages={d: float(i) for i, d in enumerate(stale)},
+        stale=items,
+        stale_ages={d: float(i) for i, d in enumerate(items)},
         seen_verdicts=verdicts if verdicts is not None else {"STALE-e2e"},
         classified=classified,
         enumerated=enumerated if enumerated is not None else classified,
@@ -766,3 +779,70 @@ class TestTheReportUsesTheCapTheRunWillUse:
         once for both paths."""
         for cap in (1, 7, cs.MAX_CLOSE_PER_RUN, 100):
             assert _plan([f"d{i}" for i in range(30)], max_close=cap).cap == cap
+
+
+def test_the_plan_helper_survives_a_single_pass_iterable():
+    """⛔ The helper consumed `stale` twice, so a generator emptied the second
+    pass: no stale_ages, every age -1.0, and oldest-first silently inverted —
+    the cap draining the NEWEST end while every count assertion still passed.
+
+    Asserted against a generator specifically, because a list cannot express
+    the bug: the defect only appears for a single-pass iterable.
+    """
+
+    dseqs = [f"d{i}" for i in range(cs.MAX_CLOSE_PER_RUN + 3)]
+    from_list = _plan(dseqs, max_close=3)
+    from_gen = _plan((d for d in dseqs), max_close=3)
+
+    assert from_gen.to_close == from_list.to_close, (
+        "a generator produced a different plan than the identical list"
+    )
+    # OLDEST first: `_plan` assigns age = index, so the LAST three dseqs are the
+    # oldest and must come back in descending-age order. Written reversed on
+    # purpose — `dseqs[-3:]` is the same SET in the wrong ORDER, and asserting
+    # the set would pass on exactly the inversion this test exists to catch.
+    assert from_gen.to_close == list(reversed(dseqs[-3:])), "oldest-first ordering was lost"
+
+
+class TestTheClosingLineAgreesWithThePlan:
+    """⛔ TWO CONSECUTIVE LINES OF THE SAME OUTPUT CONTRADICTED EACH OTHER.
+
+    `_report_plan` printed "would REFUSE to execute — ..." and the very next
+    line printed "Re-run with --execute to close the stale set" unconditionally.
+    This PR exists BECAUSE the dry run did not predict the execute run; routing
+    both paths through `_execution_plan()` and then leaving the closing
+    instruction unconditional reproduced the defect inside its own fix.
+
+    The refusal case is the RARE arm — the one nobody exercises — which is why
+    it survived. Check the default arm first.
+    """
+
+    def _dry(self, deployments, capsys):
+        rc = _run(_mock_client(deployments), execute=False)
+        return rc, capsys.readouterr().out
+
+    def test_a_would_refuse_plan_does_not_tell_the_operator_to_re_run(self, capsys):
+        n = cs.MIN_AUDITED_FOR_FRACTION_RAIL + 10
+        _rc, out = self._dry(
+            {_dseq(3 * 86400 + i): _detail(["backtest"]) for i in range(n)}, capsys
+        )
+        assert "would REFUSE" in out, "the plan must still say execute would refuse"
+        assert "Re-run with --execute to close" not in out, (
+            "the closing line told the operator to do the thing the line above "
+            "just said would be refused"
+        )
+        assert "will not close anything" in out
+
+    def test_a_closable_plan_still_names_the_next_step_and_the_count(self, capsys):
+        deployments = {_dseq(3 * 86400 + i): _detail(["backtest"]) for i in range(30)}
+        deployments.update({_dseq(60 + i): _detail(["node"]) for i in range(30)})
+        _rc, out = self._dry(deployments, capsys)
+        assert "Re-run with --execute to close" in out
+        assert f"close {cs.MAX_CLOSE_PER_RUN} of them" in out, (
+            "the instruction must carry the capped number, not the closable total"
+        )
+
+    def test_an_empty_account_does_not_invite_an_execute_run(self, capsys):
+        _rc, out = self._dry({_dseq(60 + i): _detail(["node"]) for i in range(3)}, capsys)
+        assert "nothing is closable" in out
+        assert "Re-run with --execute" not in out

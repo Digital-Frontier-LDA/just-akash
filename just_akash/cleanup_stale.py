@@ -369,6 +369,8 @@ def _execution_plan(
     classified: int,
     enumerated: int,
     max_close: int,
+    no_dseq: int = 0,
+    unreadable: int = 0,
 ) -> ExecutionPlan:
     """Evaluate every execute-path rail WITHOUT acting on any of them.
 
@@ -409,8 +411,9 @@ def _execution_plan(
                 refusal=(
                     f"{len(stale)}/{classified} = {fraction:.0%} of CLASSIFIED "
                     f"deployments closable, above the {MAX_STALE_FRACTION:.0%} "
-                    f"tripwire. ({enumerated} enumerated, {enumerated - classified} "
-                    "unreadable and excluded from the denominator.)\n"
+                    f"tripwire. ({enumerated} enumerated; {unreadable} unreadable, "
+                    f"{no_dseq} without a dseq, both excluded from the "
+                    "denominator.)\n"
                     "  A share this high is more likely a classification fault than a "
                     "real backlog. Investigate the verdict table above before closing "
                     "anything."
@@ -603,14 +606,24 @@ def run(
     # FRACTION, so a provider having a bad day would silently loosen the safety
     # margin — read failures making a rail LESS likely to fire is backwards.
     classified = 0
+    no_dseq = 0
+    unreadable = 0
     for d in deployments:
         dseq = _extract_dseq(d)
         if not dseq:
+            # ⛔ COUNTED SEPARATELY, because the refusal message used to call the
+            # whole shortfall "unreadable". That word names a CAUSE; the
+            # subtraction only measured "did not reach classified", which spans
+            # this skip too. Two counters cost nothing; a guessed proportion
+            # costs the operator's trust at the exact moment they are debugging
+            # a refusal.
+            no_dseq += 1
             continue
         try:
             detail = client.get_deployment(dseq)
         except Exception as exc:  # noqa: BLE001 — one unreadable deployment must not stop the audit
             print(f"  {dseq}  ERROR reading detail: {exc} -> LEAVE")
+            unreadable += 1
             continue
         # Read provenance ONLY for the candidates it can decide, so a sweep does not
         # spend a chain round-trip per deployment on an account of hundreds.
@@ -666,11 +679,37 @@ def run(
         classified=classified,
         enumerated=len(deployments),
         max_close=max_close,
+        no_dseq=no_dseq,
+        unreadable=unreadable,
     )
     _report_plan(plan, execute=execute)
 
     if not execute:
-        print("DRY RUN — nothing closed. Re-run with --execute to close the stale set.")
+        # ⛔ THIS LINE CONTRADICTED THE ONE ABOVE IT. `_report_plan` prints
+        # "would REFUSE to execute — ..." and then this printed "Re-run with
+        # --execute to close the stale set" unconditionally — two consecutive
+        # lines of the same output disagreeing about whether execute is even
+        # available. This PR exists BECAUSE the dry run did not predict the
+        # execute run; routing both paths through _execution_plan() and then
+        # leaving the closing instruction unconditional reproduced the defect
+        # inside its own fix.
+        #
+        # ⚠ The refusal case is the RARE arm, which is why it survived review
+        # here and in two sibling PRs today. Read it from the plan like
+        # everything else: one decision, every consumer reads it.
+        if plan.refusal:
+            print(
+                "DRY RUN — nothing closed, and --execute would REFUSE for the reason "
+                "above. Fix that first; re-running with --execute will not close "
+                "anything."
+            )
+        elif plan.closable:
+            print(
+                f"DRY RUN — nothing closed. Re-run with --execute to close "
+                f"{plan.would_close} of them."
+            )
+        else:
+            print("DRY RUN — nothing closed, and nothing is closable.")
         return 0
 
     if plan.refusal:
