@@ -228,6 +228,63 @@ deployment:
 """
 
 
+# ⛔ THE ONLY THING THAT DIFFERS FROM _SDL_CPU IS THE PORT.
+#
+# Resources, image, command, count and price are byte-identical on purpose, so
+# that `cpu` bids while `nodeport` declines is unambiguous: it cannot be
+# capacity, price, or image pull. The port is the independent variable and the
+# comparison is the measurement.
+#
+# WHY A NON-80 PORT IS ITS OWN ORDER SHAPE. `global: true` on 80/443 is served
+# by the provider's HTTP ingress; any other port is served by allocating from
+# the NodePort range instead. Those are different code paths in the provider,
+# and a provider can serve one while refusing the other.
+#
+# WHY THIS EXISTS (just-akash#257). Every routine signal we own — /status, all
+# four existing bid-probe scenarios, provider-canary, github-runner-probe —
+# exposes `as: 80`, so ALL of them ride the ingress path. The single NodePort
+# exercise in the fleet was the E2E secrets job, which is not a required check,
+# runs only on push, and picks its provider BY PRICE. On 2026-09-04 m3a declined
+# the NodePort-requiring E2E order while bidding normally on this probe's port-80
+# cpu scenario hours later; the E2E simply moved to alphavps and went green. A
+# price-selected test cannot detect one provider losing a capability, because
+# losing it just makes that provider stop winning.
+_SDL_NODEPORT = """\
+---
+version: "2.0"
+services:
+  probe:
+    image: alpine:3.19
+    command: ["sh", "-c", "sleep 60"]
+    expose:
+      - port: 8080
+        as: 8080
+        to:
+          - global: true
+profiles:
+  compute:
+    probe:
+      resources:
+        cpu:
+          units: 1
+        memory:
+          size: 512Mi
+        storage:
+          size: 128Mi
+  placement:
+    akash:
+      pricing:
+        probe:
+          denom: uact
+          amount: 1000000
+deployment:
+  probe:
+    akash:
+      profile: probe
+      count: 1
+"""
+
+
 @dataclass(frozen=True)
 class Scenario:
     name: str
@@ -241,6 +298,7 @@ SCENARIOS: dict[str, Scenario] = {
         Scenario("gpu", _SDL_GPU),
         Scenario("persistent-beta3", _SDL_PERSISTENT_BETA3),
         Scenario("ip-lease", _SDL_IP_LEASE),
+        Scenario("nodeport", _SDL_NODEPORT),
     )
 }
 
@@ -257,6 +315,19 @@ class ProviderTarget:
     cluster missing from that map made its in-cluster probe die silently for 18
     days (hetzner_hel, 2026-06/07), so here an unknown cluster is a hard error
     rather than an empty scenario list.
+
+    ⚠️ THIS LIST SAYS WHAT THE CLUSTER IS EXPECTED TO SERVE, NOT WHAT WE HAVE
+    CONFIRMED IT SERVES. The distinction decides who gets a new capability, and
+    getting it backwards is self-defeating: listing a scenario only where we
+    already believe it works means the probe can never detect a provider LOSING
+    that capability, which is the entire question it is asked to answer. A
+    provider that declines emits PROVIDER_NO_BID — that is the finding, not a
+    misconfiguration to be tuned away by removing the capability.
+
+    ``nodeport`` is therefore on all three (#257). Directly evidenced for
+    alphavps, which served the two-NodePort E2E workload on 2026-09-04. For
+    onidc and hetzner_hel it is INFERENCE from their running the same provider
+    stack — and that unverified inference is precisely what needs measuring.
     """
 
     cluster: str
@@ -269,13 +340,13 @@ PROVIDERS: tuple[ProviderTarget, ...] = (
     ProviderTarget(
         cluster="alphavps",
         wallet="akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z",  # pragma: allowlist secret
-        capabilities=frozenset({"cpu", "persistent-beta3", "ip-lease"}),
+        capabilities=frozenset({"cpu", "persistent-beta3", "ip-lease", "nodeport"}),
         attributes={"region": "eu-east", "organization": "digital frontier"},
     ),
     ProviderTarget(
         cluster="onidc",
         wallet="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",  # pragma: allowlist secret
-        capabilities=frozenset({"cpu", "gpu", "persistent-beta3", "ip-lease"}),
+        capabilities=frozenset({"cpu", "gpu", "persistent-beta3", "ip-lease", "nodeport"}),
         attributes={
             "region": "eu-west",
             "organization": "digital frontier",
@@ -285,7 +356,7 @@ PROVIDERS: tuple[ProviderTarget, ...] = (
     ProviderTarget(
         cluster="hetzner_hel",
         wallet="akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x",  # pragma: allowlist secret
-        capabilities=frozenset({"cpu", "persistent-beta3"}),
+        capabilities=frozenset({"cpu", "persistent-beta3", "nodeport"}),
         attributes={"region": "eu-north", "organization": "digital frontier"},
     ),
 )
