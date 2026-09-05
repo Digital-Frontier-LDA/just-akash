@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
+from just_akash import deploy as dp_mod
 from just_akash.deploy import (
     _classify_bid,
     _fmt_price,
@@ -984,41 +985,83 @@ class TestDeployEnvVarsLogged:
 class TestStaleDeploymentRecovery:
     @patch("just_akash.deploy.time")
     @patch("just_akash.deploy.AkashConsoleAPI")
-    def test_already_exists_closes_stale_and_retries(
+    def test_already_exists_closes_only_what_it_can_prove(
         self, MockAPI, mock_time, tmp_path, monkeypatch
     ):
+        """⛔ REWRITTEN — the previous version pinned the DEFECT as the contract.
+
+        It asserted the recovery closes every lease-less row returned by
+        `client.list_deployments()`. That listing does not scope by API key
+        (cleanup_stale.py:391 — three distinct keys for three distinct accounts,
+        byte-identical bodies), the rows carried no provenance, and there was no
+        age floor — so a green test described a path that could close another
+        ACCOUNT's deployment, another REPO's, or a concurrent run of our own
+        mid-create. See #267.
+
+        The recovery now enumerates owner-scoped from the CHAIN and closes only
+        what carries this repo's provenance, holds no lease, and is past the age
+        floor. Per-guard coverage lives in test_deploy_stale_recovery.py; this
+        test pins the integration — that `deploy()` still recovers and retries.
+        """
         monkeypatch.setenv("AKASH_API_KEY", "test-key")
         monkeypatch.delenv("AKASH_PROVIDERS", raising=False)
         sdl_file = tmp_path / "sdl.yaml"
         sdl_file.write_text(SDL_YAML)
 
         client = MockAPI.return_value
-        # First call raises "already exists"; retry succeeds.
         client.create_deployment.side_effect = [
             RuntimeError("Deployment already exists"),
             {"dseq": "999", "manifest": "abc"},
         ]
-        # Two stale deployments: one without lease (close it), one with lease (skip).
-        client.list_deployments.return_value = [
-            {"dseq": "111", "leases": []},  # closed
-            {"dseq": "222", "leases": [{"id": "x"}]},  # skipped (has lease)
-            {"deployment": {"dseq": "333"}},  # nested dseq, no leases → closed
-        ]
+        client.account_address.return_value = "akash1me"
+
+        now = time.time()
+        old = str(int((now - dp_mod.STALE_RETRY_MIN_AGE_SECONDS - 3600) * 1000))
+        leased = str(int((now - dp_mod.STALE_RETRY_MIN_AGE_SECONDS - 3600) * 1000) + 1)
+        fresh = str(int((now - 30) * 1000))
+
+        client.get_deployment.side_effect = lambda d: (
+            {"leases": [{"id": "x"}]} if str(d) == leased else {"leases": []}
+        )
         client.close_deployment.return_value = {}
         client.get_bids.return_value = [_make_bid("akash1prov", 50)]
         client.create_lease.return_value = {"data": {"lease": "created"}}
 
-        t = _time_mock()
-        mock_time.time.side_effect = t
+        # A REALISTIC clock. The shared `_time_mock` counts 1.0, 2.0, 3.0..., so
+        # a dseq built from a real epoch ages as hugely negative and every row is
+        # filtered before any guard under test is reached — the test would pass
+        # or fail for a reason unrelated to what it asserts.
+        counter = [0.0]
+
+        def _advance():
+            counter[0] += 1
+            return now + counter[0]
+
+        mock_time.time.side_effect = _advance
         mock_time.sleep.return_value = None
 
-        result = deploy(sdl_path=str(sdl_file), bid_wait=10, bid_wait_retry=10)
+        rows = [
+            {"deployment": {"id": {"owner": "akash1me", "dseq": d}}} for d in (old, leased, fresh)
+        ]
+        with (
+            patch.object(dp_mod.chain, "list_active_deployments", return_value=rows),
+            patch.object(
+                dp_mod.chain,
+                "deployment_group_names",
+                return_value=[f"{dp_mod.PLACEMENT_PREFIX}-run"],
+            ),
+        ):
+            result = deploy(sdl_path=str(sdl_file), bid_wait=10, bid_wait_retry=10)
+
         assert result["dseq"] == "999"
-        # Closed only the lease-less stale ones (111 and 333), skipped 222.
         closed_args = [c.args[0] for c in client.close_deployment.call_args_list]
-        assert "111" in closed_args
-        assert "333" in closed_args
-        assert "222" not in closed_args
+        assert old in closed_args, "an aged, unleased, provenanced leftover must be cleared"
+        assert leased not in closed_args, "a leased deployment is somebody's live workload"
+        assert fresh not in closed_args, (
+            "a fresh deployment may be a concurrent run's, leaseless mid-create — "
+            "the exact collision ci.yml:150-155 attributes to this function"
+        )
+        client.list_deployments.assert_not_called()
 
     @patch("just_akash.deploy.time")
     @patch("just_akash.deploy.AkashConsoleAPI")
