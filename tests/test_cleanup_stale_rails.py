@@ -566,3 +566,30 @@ class TestKeysAreNotWallets:
             assert cs.run_all_wallets(execute=True, now=NOW) == 2
         for client in clients.values():
             client.close_deployment.assert_not_called()
+
+
+class TestDeclaredPoolWithNoCredential:
+    """`AKASH_WALLETS_EXPECTED=N` with NO keys is the #167 scenario itself, not
+    an ordinary unconfigured run. Reporting only "neither var is set" would drop
+    the fact that a pool was declared — the single most diagnostic thing known
+    about the failure — so the guard keeps precedence and names both facts."""
+
+    def test_names_the_declared_pool_and_the_missing_credential(self, capsys):
+        clients = _mock_pool({}, {})
+        with _pool(clients, {"AKASH_WALLETS_EXPECTED": "3"}):
+            rc = cs.run_all_wallets(execute=False, now=NOW)
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "AKASH_WALLETS_EXPECTED=3" in err, "the declared intent must survive"
+        assert "0 Console wallet(s) resolved from 0 key(s)" in err
+        assert "Neither AKASH_API_KEY nor AKASH_API_KEYS is set" in err, (
+            "the operator must still learn no credential arrived"
+        )
+
+    def test_no_keys_and_no_expectation_still_says_only_that(self, capsys):
+        """Unset asserts nothing, so this stays the plain message."""
+        with patch.dict("os.environ", {}, clear=True):
+            assert cs.run_all_wallets(execute=False, now=NOW) == 2
+        err = capsys.readouterr().err
+        assert "neither AKASH_API_KEY nor AKASH_API_KEYS is set" in err
+        assert "AKASH_WALLETS_EXPECTED" not in err

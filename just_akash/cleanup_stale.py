@@ -703,9 +703,19 @@ def run_all_wallets(**kwargs) -> int:
         return 2
 
     if expected is not None and len(wallets) != expected:
+        # Deliberately BEFORE the not-keys check below. Reordering would report
+        # a declared pool that did not arrive as an ordinary unconfigured run,
+        # dropping the fact that N wallets were expected — which IS the #167
+        # scenario. So the zero-key case names both facts here instead.
+        no_credential = (
+            "  Neither AKASH_API_KEY nor AKASH_API_KEYS is set, so no credential arrived at all.\n"
+            if not keys
+            else ""
+        )
         print(
             f"Error: AKASH_WALLETS_EXPECTED={expected} but "
             f"{len(wallets)} Console wallet(s) resolved from {len(keys)} key(s).\n"
+            f"{no_credential}"
             "  A pool was intended and did not arrive. The usual cause is a "
             "caller pinned to a ref that predates the pool, where "
             "AKASH_API_KEYS reads as empty and this would otherwise audit "
