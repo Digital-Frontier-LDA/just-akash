@@ -183,6 +183,20 @@ on:
         required: false
         type: string
         default: ''
+      expected-runner-version:
+        description: >-
+          OPTIONAL. When set, the landing gate also discards a lease whose online runners
+          report a version other than this one.
+
+          ⚠ EMPTY BY DEFAULT, AND THAT IS THE POINT. The gate's standing behaviour is to
+          reject a runner reporting NO version — one that registered, took the mandated
+          auto-update, and died. Pinning a version number here turns this into a static
+          floor that passes today and rots at the next release, which is the exact defect
+          the auto-update mandate exists to avoid. Set it only for a deliberate,
+          time-boxed pin, and remove it again.
+        required: false
+        type: string
+        default: ''
       runner-wait-tries:
         description: >-
           How many 5-second polls to wait for the pool to come online. 90 (7.5 min) is
@@ -569,6 +583,7 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           MAX_ATTEMPTS: '3'
           RUNNER_WAIT_TRIES: ${{ inputs.runner-wait-tries }}
+          EXPECTED_RUNNER_VERSION: ${{ inputs.expected-runner-version }}
           REQUIRED_DEPOSIT_USD: ${{ inputs.required-deposit-usd }}
           PROVIDER_SELECT: ${{ inputs.provider-select }}
         run: |
@@ -832,6 +847,26 @@ jobs:
               fi
               RUNNER_IDS=$(printf '%s' "$RUNNER_PAGES" | jq -r --arg L "$RUNNER_LABEL" \
                   '(.runners // [])[] | select(.status=="online") | select(any(.labels[].name; .==$L)) | .id') || GH_RC=$?
+              # ---- LANDING GATE, part 1 of 2: project the VERSION out of the SAME read ----
+              # akash-github-runner#69. Auto-update is MANDATED here (DISABLE_AUTO_UPDATE must
+              # be absent) because a static version floor rots at the next deprecation. True,
+              # and it weighs only one pump. The other is auto-update ITSELF: measured on
+              # borduas-pool dseq 1788575148893 (2026-09-05), a HEALTHY 2.336.0 runner already
+              # "Listening for Jobs", with NO deprecation message anywhere in its log, took the
+              # mandated 2.337.0 update, exited, FAILED to deregister, and died on
+              # `Could not load file or assembly 'System.Linq.Parallel'`.
+              # Register -> die -> restart -> re-register, unbounded.
+              #
+              # ★ `null` IS THE CASE THAT MATTERS. A runner that registered and then died
+              # reports NO version while still listing as `online`, so the count above cannot
+              # tell it from a working one. That corpse is what this projects.
+              #
+              # Deliberately reuses $RUNNER_PAGES rather than issuing a second listing read:
+              # this poll already pages the WHOLE org listing every 5s, and the comment above
+              # explains why that budget is the binding constraint here. A second read would
+              # spend quota to learn something the first read already contains.
+              RUNNER_VERSIONS=$(printf '%s' "$RUNNER_PAGES" | jq -r --arg L "$RUNNER_LABEL" \
+                '(.runners // [])[] | select(.status=="online") | select(any(.labels[].name; .==$L)) | (.version // "null")') || GH_RC=$?
               if [ "$GH_RC" -ne 0 ]; then
                 # Deliberately NOT the 5s cadence: if this is the secondary limit (a
                 # per-MINUTE budget) then retrying at 5s spends the recovery window.
@@ -892,6 +927,61 @@ jobs:
               done
               EXCLUDED="$EXCLUDED $PROVIDER"
               echo "::endgroup::"; continue
+            fi
+
+            # ---- LANDING GATE, part 2 of 2: a corpse that registered still counts as online ----
+            # The count above cannot tell a working runner from one that registered, took the
+            # mandated update, and died -- both list as `online`. Part 1 projected the version
+            # out of that same read; this refuses the lease when it is missing.
+            #
+            # ⚠ THE COST IS NOT LOCAL TO THIS POOL, which is why the lease is closed rather than
+            # merely warned about. Every restart adds an org runner registration, and the org
+            # listing's PAGE COUNT sets the pre-strike CI quota floor for every repo on the
+            # shared PAT. Measured 2026-09-05: 1,732 registrations org-wide; a 300-runner sample
+            # was 300/300 offline, 0 busy, version: null. A repo can be refused CI by a pump it
+            # does not run and cannot see.
+            #
+            # ⚠ NO VERSION LITERAL LIVES HERE. `expected-runner-version` is optional and empty by
+            # default, so the gate's standing behaviour is to reject only a MISSING version -- the
+            # corpse. Pinning a number here would be a static floor, the exact defect the
+            # auto-update mandate exists to avoid, reintroduced by its own guard.
+            # ⚠ AN EMPTY PROJECTION HERE IS A CONTRADICTION, NOT A CLEAN POOL. This point is
+            # only reached once ONLINE >= MIN_POOL, so the same read that produced N ids must
+            # produce N versions. Zero means the projection failed while the count succeeded,
+            # and accepting that would let an unreadable verdict pass as a healthy one -- the
+            # failure this gate exists to stop, arriving through the gate itself.
+            #
+            # Found by testing the decision against synthetic inputs. The conformance rule
+            # passes on the PROJECTION alone, so it cannot see whether the decision is sound;
+            # a gate that satisfies its own rule and accepts everything is the shape this
+            # whole standard exists to refuse.
+            if [ -z "${RUNNER_VERSIONS:-}" ]; then
+              echo "::warning title=Landing gate: version projection empty for a pool reporting ${ONLINE} online::attempt $attempt: the runner listing yielded ${ONLINE} online id(s) and 0 versions on $PROVIDER — the read disagrees with itself, so this lease is discarded rather than trusted."
+              for _try in 1 2 3; do
+                "${JA[@]}" destroy --dseq "$DSEQ" -y 2>&1 | tee /tmp/ja-destroy.log && break
+                grep -qi "Deployment closed" /tmp/ja-destroy.log && break
+                sleep 5
+              done
+              EXCLUDED="$EXCLUDED $PROVIDER"
+              echo "::endgroup::"; continue
+            fi
+            if [ -n "${RUNNER_VERSIONS:-}" ]; then
+              GATE_DEAD=$(printf '%s\n' "$RUNNER_VERSIONS" | grep -cx "null" || true)
+              GATE_WRONG=0
+              if [ -n "${EXPECTED_RUNNER_VERSION:-}" ]; then
+                GATE_WRONG=$(printf '%s\n' "$RUNNER_VERSIONS" | grep -vx "null" | grep -cvx "${EXPECTED_RUNNER_VERSION}" || true)
+              fi
+              if [ "${GATE_DEAD:-0}" -gt 0 ] || [ "${GATE_WRONG:-0}" -gt 0 ]; then
+                echo "::warning title=Landing gate: registered runners are not running::attempt $attempt: ${GATE_DEAD} online runner(s) report NO version and ${GATE_WRONG} report an unexpected one on $PROVIDER — discarding this lease rather than handing the caller a pool of corpses."
+                printf '%s\n' "$RUNNER_VERSIONS" | sort | uniq -c | sed 's/^/    version /'
+                for _try in 1 2 3; do
+                  "${JA[@]}" destroy --dseq "$DSEQ" -y 2>&1 | tee /tmp/ja-destroy.log && break
+                  grep -qi "Deployment closed" /tmp/ja-destroy.log && break
+                  sleep 5
+                done
+                EXCLUDED="$EXCLUDED $PROVIDER"
+                echo "::endgroup::"; continue
+              fi
             fi
 
             {
