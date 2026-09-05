@@ -584,6 +584,45 @@ def run(
     return 0 if failed == 0 else 1
 
 
+def _resolve_distinct_accounts(
+    keys: list[str],
+) -> tuple[list[tuple[str, str]], list[int]]:
+    """Collapse configured keys onto the DISTINCT accounts they actually reach.
+
+    ⛔ A KEY IS NOT A WALLET. This repo supports several keys resolving to one
+    account (`test_duplicate_keys_for_one_account_are_one_wallet`), and the
+    deploy path already models the difference — `WalletClientSelection` carries
+    `configured_keys` AND `distinct_accounts` as separate fields. Counting keys
+    here would reproduce the exact silent shortfall this guard exists to catch:
+    two aliases for one wallet satisfy AKASH_WALLETS_EXPECTED=2 while the pool
+    is one wallet.
+
+    ⛔ AND IT IS NOT ONLY THE COUNT. `run()` enumerates from the chain by
+    `address`, so two keys for one account walk the IDENTICAL deployment set
+    twice — with `max_close` applied per call. A cap of 25 becomes 50. That is
+    the blast-radius rail inverting again, by a different route than #256.
+
+    Returns ``(wallets, unresolved)`` — ``wallets`` is ``(account, key)`` in
+    first-seen order, one entry per account; ``unresolved`` is the 1-based
+    POSITIONS of keys whose account could not be read (never the keys).
+    """
+
+    wallets: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    unresolved: list[int] = []
+    for position, key in enumerate(keys, start=1):
+        try:
+            account = AkashConsoleAPI(key).account_address()
+        except Exception:  # noqa: BLE001 — an unidentifiable key is reported, never guessed
+            unresolved.append(position)
+            continue
+        if account in seen:
+            continue
+        seen.add(account)
+        wallets.append((account, key))
+    return wallets, unresolved
+
+
 def run_all_wallets(**kwargs) -> int:
     """Audit (and optionally close) across EVERY configured Console wallet.
 
@@ -607,21 +646,108 @@ def run_all_wallets(**kwargs) -> int:
     or failing to close, must not be masked by another's success.
     """
     keys = configured_api_keys()
+
+    # ⛔ FAIL LOUD WHEN A POOL WAS INTENDED AND DID NOT ARRIVE.
+    #
+    # just-akash#167: a caller pinning a tag that predates the pool feature has
+    # `AKASH_API_KEYS` read as NOTHING, silently — the job then audits one
+    # wallet and reports green about the others, which is indistinguishable
+    # from a healthy single-wallet run. That is the same green-because-it-never-
+    # ran defect this repo keeps finding, and a plural that quietly degrades to
+    # a singular is exactly its shape.
+    #
+    # The receiver cannot infer intent from an empty variable, so intent is
+    # declared: set AKASH_WALLETS_EXPECTED=N alongside the keys and a mismatch
+    # is a hard error instead of a quiet downgrade. Unset means no assertion —
+    # today's single-wallet config stays valid without ceremony.
+    #
+    # N counts WALLETS, so it is compared against resolved accounts, not keys.
+    expected: int | None = None
+    expected_raw = os.environ.get("AKASH_WALLETS_EXPECTED", "").strip()
+    if expected_raw:
+        try:
+            expected = int(expected_raw)
+        except ValueError:
+            print(
+                f"Error: AKASH_WALLETS_EXPECTED must be an integer, got {expected_raw!r}.",
+                file=sys.stderr,
+            )
+            return 2
+
+    # Resolution is EAGER — before auditing, and before closing anything. A
+    # guard that fires after the sweep is a post-mortem, and this function has
+    # no "selection" step to assert after: it iterates every wallet and closes
+    # as it goes. The cost is one JWT mint per key, on the multi-key path only.
+    # `run()` still derives its own address from its own key rather than taking
+    # one from here, because "the key does not scope the response, the chain
+    # query does" is the invariant this whole file rests on — a path where the
+    # address and the key could disagree is not worth saving a round trip.
+    if len(keys) <= 1:
+        wallets = [(None, key) for key in keys]
+        unresolved: list[int] = []
+    else:
+        wallets, unresolved = _resolve_distinct_accounts(keys)
+
+    if unresolved:
+        # An unmeasurable wallet is not an absent one. With a key we cannot
+        # identify we cannot say whether the next step audits three wallets or
+        # one wallet three times, and one of those closes 3x the cap.
+        print(
+            f"Error: could not resolve the account behind Console key(s) at position(s) "
+            f"{', '.join(str(p) for p in unresolved)} of {len(keys)}.\n"
+            "  A key that cannot be identified makes the wallet set unknowable: "
+            "duplicate aliases cannot be told from distinct wallets, and the "
+            "per-run close cap is applied once per DISTINCT account. Refusing to sweep.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if expected is not None and len(wallets) != expected:
+        # Deliberately BEFORE the not-keys check below. Reordering would report
+        # a declared pool that did not arrive as an ordinary unconfigured run,
+        # dropping the fact that N wallets were expected — which IS the #167
+        # scenario. So the zero-key case names both facts here instead.
+        no_credential = (
+            "  Neither AKASH_API_KEY nor AKASH_API_KEYS is set, so no credential arrived at all.\n"
+            if not keys
+            else ""
+        )
+        print(
+            f"Error: AKASH_WALLETS_EXPECTED={expected} but "
+            f"{len(wallets)} Console wallet(s) resolved from {len(keys)} key(s).\n"
+            f"{no_credential}"
+            "  A pool was intended and did not arrive. The usual cause is a "
+            "caller pinned to a ref that predates the pool, where "
+            "AKASH_API_KEYS reads as empty and this would otherwise audit "
+            "one wallet and report green about the rest (just-akash#167). "
+            "Several keys resolving to ONE account counts as one wallet.",
+            file=sys.stderr,
+        )
+        return 2
+
     if not keys:
         print("Error: neither AKASH_API_KEY nor AKASH_API_KEYS is set.", file=sys.stderr)
         return 2
 
     # Say how many wallets are in scope BEFORE auditing any. "1 wallet, clean"
     # and "3 wallets, only 1 audited" must never render the same way.
-    print(f"Console wallets configured: {len(keys)}\n")
+    if len(wallets) != len(keys):
+        print(
+            f"Console wallets configured: {len(wallets)} "
+            f"({len(keys)} keys, {len(keys) - len(wallets)} alias(es) of an account "
+            "already in scope)\n"
+        )
+    else:
+        print(f"Console wallets configured: {len(wallets)}\n")
     worst = 0
-    for index, key in enumerate(keys, start=1):
-        print(f"===== wallet {index}/{len(keys)} =====")
+    for index, (account, key) in enumerate(wallets, start=1):
+        label = f" ({account})" if account else ""
+        print(f"===== wallet {index}/{len(wallets)}{label} =====")
         rc = run(api_key=key, **kwargs)
         worst = max(worst, rc)
         print()
-    if len(keys) > 1:
-        print(f"audited {len(keys)} wallet(s); worst exit code {worst}")
+    if len(wallets) > 1:
+        print(f"audited {len(wallets)} wallet(s); worst exit code {worst}")
     return worst
 
 
