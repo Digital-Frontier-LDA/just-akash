@@ -1904,3 +1904,44 @@ class TestTheVerdictDoesNotBlameAProviderForOurCredential:
         out, _log = _verdict_script(tmp_path, "dial tcp: i/o timeout")
         assert "failure_reason=INDETERMINATE" in out
         assert "failure_reason=RUNNER_NEVER_REGISTERED" not in out
+
+
+class TestTheVerdictCannotFabricateAStatus:
+    """⛔ A NON-HTTP FIRST LINE MUST NOT BECOME A STATUS CODE.
+
+    `awk 'NR==1{print $2}'` takes the second WORD of whatever the first line is.
+    A transport failure emits a plain error string, so `dial tcp: lookup ...
+    i/o timeout` yields `tcp:` — and that word then SELECTS A CASE ARM in the
+    step that decides whether to accuse a provider.
+
+    ⚠ It matters more here than at the preflight, which captures `|| RC=$?` and
+    branches on it. This capture ends `|| true`, so the status line is the ONLY
+    evidence — an unguarded parse is the whole input, not one input of two.
+    """
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    @pytest.mark.parametrize(
+        "junk",
+        [
+            "dial tcp: lookup api.github.com: i/o timeout",
+            "error: 403 something",
+            "gh: command failed",
+        ],
+    )
+    def test_a_non_http_first_line_reaches_no_accusatory_arm(self, tmp_path, junk):
+        out, log = _verdict_script(tmp_path, junk)
+        assert "failure_reason=INDETERMINATE" in out, (
+            f"{junk!r} was parsed into a status instead of being rejected"
+        )
+        assert "failure_reason=RUNNER_NEVER_REGISTERED" not in out
+        assert "do not runner_deny" in log.lower()
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_the_word_that_would_have_been_taken_is_not_reported_as_a_status(self, tmp_path):
+        """`error: 403 something` has `403` as its second word. Unguarded, that
+        selects the rate-limit arm and reports a status the server never sent —
+        a fabricated fact presented as a measurement."""
+
+        _out, log = _verdict_script(tmp_path, "error: 403 something")
+        assert "HTTP 403" not in log, "a status was invented from an error string"
+        assert "no status" in log.lower()

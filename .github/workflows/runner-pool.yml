@@ -1156,7 +1156,21 @@ jobs:
             # a registration token on success.
             VERDICT_MINTED=$(printf '%s' "$VERDICT_RESP" | sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p' | head -1)
             [ -n "$VERDICT_MINTED" ] && echo "::add-mask::${VERDICT_MINTED}"
-            VERDICT_CODE=$(printf '%s' "$VERDICT_RESP" | awk 'NR==1{print $2}')
+            # ⛔ THE SAME GUARD AS THE PREFLIGHT, AND IT MATTERS MORE HERE.
+            # Without `$1 ~ /^HTTP/`, awk prints the second WORD of an arbitrary
+            # error string as though it were a status: `dial tcp: lookup ... timeout`
+            # yields `tcp:`, which then SELECTS A CASE ARM. I added this guard at the
+            # preflight, wrote the comment explaining it, and left the sibling site
+            # unguarded in the same change.
+            #
+            # ⚠ AND THIS SITE HAS NO SECOND SIGNAL. The preflight captures `|| RC=$?`
+            # and branches on it; the capture above ends `|| true`, discarding the
+            # return code deliberately — a non-zero gh exit must not kill the step
+            # before the case can classify it. That leaves the status line as the ONLY
+            # evidence, so an unguarded parse is the whole input, not one input of two.
+            # With the guard, no status line yields an EMPTY code, `${VERDICT_CODE:-000}`
+            # sends it to `*)`, and the run reports INDETERMINATE and accuses nobody.
+            VERDICT_CODE=$(printf '%s' "$VERDICT_RESP" | awk 'NR==1 && $1 ~ /^HTTP/ {print $2}')
             case "${VERDICT_CODE:-000}" in
               # ⛔ 201, NOT 200. A successful mint is 201 Created. Leaving this as 200
               # would send every HEALTHY credential to the `*)` arm and report
