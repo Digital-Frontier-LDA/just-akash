@@ -1227,7 +1227,12 @@ def _run_preflight(tmp_path, response: str, rc: int) -> tuple[str, str]:
         "FAKE_RESP": response,
         "FAKE_RC": str(rc),
     }
-    subprocess.run(["bash", str(script)], env=env, capture_output=True, check=False)
+    # ⛔ `-e` IS THE POINT, NOT A DETAIL. Actions runs this step as `bash -e {0}`,
+    # and the regression being guarded — a bare `RESP=$(gh ...)` followed by
+    # `RC=$?` — only misbehaves under `-e`, where the failing assignment kills the
+    # shell before RC is ever read. A harness without `-e` cannot reproduce it, so
+    # it would pass forever INCLUDING on the exact regression it exists to stop.
+    subprocess.run(["bash", "-e", str(script)], env=env, capture_output=True, check=False)
     return (
         out.read_text(encoding="utf-8") if out.exists() else "",
         summary.read_text(encoding="utf-8") if summary.exists() else "",

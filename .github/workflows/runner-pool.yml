@@ -412,6 +412,7 @@ jobs:
                 TITLE="unexpected HTTP ${CODE} from the GitHub API"
                 FIX="Read the response below before concluding anything about the PAT." ;;
             esac
+            CODE_TEXT="${CODE:-none received}"
             echo "failure_reason=${REASON}" >> "$GITHUB_OUTPUT"
             if [ "$REASON" = "RUNNER_PAT_INVALID" ]; then
               CLASS="a CREDENTIAL failure, not a provider or Akash failure"
@@ -423,7 +424,7 @@ jobs:
               echo
               echo "**CI is not broken, Akash is fine, and no provider is at fault.**"
               echo "\`GH_RUNNER_PAT\` could not read \`orgs/${ORG}/actions/runners\`."
-              echo "HTTP status: ${CODE:-none received}. Classified: \`${REASON}\`."
+              echo "HTTP status: ${CODE_TEXT}. Classified: \`${REASON}\`."
               echo
               echo "Without this check the runner would simply never register, the pool would"
               echo "time out after ~15 minutes, and the run would report"
@@ -431,7 +432,7 @@ jobs:
               echo
               echo "**Fix:** ${FIX}"
             } >> "$GITHUB_STEP_SUMMARY"
-            echo "::error title=${TITLE} (HTTP ${CODE:-none})::This is ${CLASS}. Untreated it surfaces 15 minutes later as 'runner did not come online'."
+            echo "::error title=${TITLE} (HTTP status: ${CODE_TEXT})::This is ${CLASS}. Untreated it surfaces 15 minutes later as 'runner did not come online'."
             exit 1
           fi
           echo "runner PAT valid for ${ORG}"
