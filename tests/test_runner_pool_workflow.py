@@ -1343,6 +1343,11 @@ def _run_preflight(tmp_path, response: str, rc: int) -> tuple[str, str]:
     # Captured so the fallback arm's emitted response can be asserted; without it
     # a test can only check that the guidance MENTIONS output, never that it exists.
     (tmp_path / "stdout.txt").write_bytes(proc.stdout + proc.stderr)
+    # ⛔ A block that is not valid bash produces NO output — which every
+    # absence-assertion in this file is trivially satisfied by. Fail here instead.
+    assert b"unexpected EOF" not in proc.stderr, (
+        f"the extracted preflight is not valid bash:\n{proc.stderr.decode()}"
+    )
     return (
         out.read_text(encoding="utf-8") if out.exists() else "",
         summary.read_text(encoding="utf-8") if summary.exists() else "",
@@ -1374,9 +1379,20 @@ def test_a_transport_failure_does_not_invent_an_http_status(tmp_path):
 @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
 def test_a_valid_pat_emits_no_failure_reason(tmp_path):
     """The success path must stay silent — a reason emitted on success would make
-    every run look like a fallback."""
+    every run look like a fallback.
+
+    ⛔ AN ABSENCE ASSERTION NEEDS A VALIDITY PRECONDITION. "no failure_reason" is
+    also what an EMPTY output file says, so this passed if the step exited before
+    reaching the success path at all — a moved slice anchor, or the missing-PAT
+    branch firing. An absence is evidence only once the code that would produce a
+    presence is shown to have run.
+    """
 
     out, _ = _run_preflight(tmp_path, "HTTP/2.0 200 OK", rc=0)
+    log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
+    assert "runner PAT valid for" in log, (
+        "the success path never ran, so 'no failure_reason' proves nothing"
+    )
     assert "failure_reason=" not in out
 
 
