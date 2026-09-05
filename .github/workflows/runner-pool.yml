@@ -972,10 +972,10 @@ jobs:
               # `grep -cvx` counts 1 wrong and `grep -cvxF` counts 2. The regex form treats
               # 2X337X0 as CORRECT, so it UNDER-counts wrong versions — a gate failing open,
               # which is the direction that lets a bad pool through.
-              GATE_DEAD=$(printf '%s\n' "$RUNNER_VERSIONS" | grep -cxF "null" || true)
+              GATE_DEAD=$(printf '%s\n' "$RUNNER_VERSIONS" | grep -cxF -- "null" || true)
               GATE_WRONG=0
               if [ -n "${EXPECTED_RUNNER_VERSION:-}" ]; then
-                GATE_WRONG=$(printf '%s\n' "$RUNNER_VERSIONS" | grep -vxF "null" | grep -cvxF "${EXPECTED_RUNNER_VERSION}" || true)
+                GATE_WRONG=$(printf '%s\n' "$RUNNER_VERSIONS" | grep -vxF -- "null" | grep -cvxF -- "${EXPECTED_RUNNER_VERSION}" || true)
               fi
               if [ "${GATE_DEAD:-0}" -gt 0 ] || [ "${GATE_WRONG:-0}" -gt 0 ]; then
                 echo "::warning title=Landing gate: registered runners are not running::attempt $attempt: ${GATE_DEAD} online runner(s) report NO version and ${GATE_WRONG} report an unexpected one on $PROVIDER — discarding this lease rather than handing the caller a pool of corpses."

@@ -46,6 +46,28 @@ _GREP_SEGMENT = re.compile(r"grep\b([^|;]*)")
 _SHORT_FLAGS = re.compile(r"(?<!\S)-([a-zA-Z]+)")
 
 
+def _greps_without_option_terminator(line: str) -> list[str]:
+    """Segments of `line` whose grep does not end option parsing with `--`.
+
+    ⛔ THE THIRD FAIL-OPEN IN THIS GATE, and the most quietly destructive.
+    `EXPECTED_RUNNER_VERSION` is a workflow input (`runner-pool.yml:586`,
+    `inputs.expected-runner-version`). If it ever begins with `-`, grep reads it as an
+    OPTION rather than a pattern. Measured:
+
+        EXPECTED="-v"   grep -cvxF "$E"  -> rc=2, "no search PATTERN specified", NO output
+
+    `|| true` then swallows rc=2, `GATE_WRONG` is set to the empty string, and
+    `[ "${GATE_WRONG:-0}" -gt 0 ]` reads that empty as 0 — so the gate ACCEPTS a pool it
+    never examined. Note the last link is the `:-0` default that was added for safety: a
+    defensive fallback is exactly what converts the error into a pass.
+    """
+    bad = []
+    for seg in _GREP_SEGMENT.findall(line):
+        if not re.search(r"(?<!\S)--(?=\s)", seg):
+            bad.append(seg.strip())
+    return bad
+
+
 def _greps_without_fixed_strings(line: str) -> list[str]:
     """Segments of `line` whose grep does NOT ask for literal matching.
 
@@ -131,7 +153,7 @@ def test_version_comparisons_use_fixed_string_matching():
         for ln in _uncommented(wf)
         if ("RUNNER_VERSIONS" in ln or "EXPECTED_RUNNER_VERSION" in ln)
         and "grep" in ln
-        and _greps_without_fixed_strings(ln)
+        and (_greps_without_fixed_strings(ln) or _greps_without_option_terminator(ln))
     ]
     assert not offenders, (
         "a version comparison greps without -F, so `.` matches any character and wrong "
@@ -155,13 +177,20 @@ def test_version_comparisons_use_fixed_string_matching():
 # to catch a fail-open.
 _FIXED_STRING_CASES = [
     # (label, line, is_offender)
-    ("combined flags", 'X=$(printf "%s" "$V" | grep -cvxF "${EXP}")', False),
-    ("separated flags", 'X=$(printf "%s" "$V" | grep -c -x -F "${EXP}")', False),
-    ("long option", 'X=$(printf "%s" "$V" | grep -c --fixed-strings "${EXP}")', False),
-    ("two greps, both fixed", 'printf "%s" "$V" | grep -vxF "n" | grep -cvxF "${EXP}"', False),
+    ("combined flags", 'X=$(printf "%s" "$V" | grep -cvxF -- "${EXP}")', False),
+    ("separated flags", 'X=$(printf "%s" "$V" | grep -c -x -F -- "${EXP}")', False),
+    ("long option", 'X=$(printf "%s" "$V" | grep -c --fixed-strings -- "${EXP}")', False),
+    (
+        "two greps, both fixed",
+        'printf "%s" "$V" | grep -vxF -- "n" | grep -cvxF -- "${EXP}"',
+        False,
+    ),
     ("regex comparison", 'X=$(printf "%s" "$V" | grep -cvx "${EXP}")', True),
     ("no flags at all", 'X=$(printf "%s" "$V" | grep "${EXP}")', True),
-    ("second grep unfixed", 'printf "%s" "$V" | grep -vxF "n" | grep -cvx "${EXP}"', True),
+    ("second grep unfixed", 'printf "%s" "$V" | grep -vxF -- "n" | grep -cvx -- "${EXP}"', True),
+    # ⛔ the option-terminator half: a pattern beginning with `-` is read as a FLAG
+    ("no -- terminator", 'X=$(printf "%s" "$V" | grep -cvxF "${EXP}")', True),
+    ("terminator present", 'X=$(printf "%s" "$V" | grep -cvxF -- "${EXP}")', False),
 ]
 
 
@@ -175,8 +204,11 @@ def test_that_matcher_would_catch_a_regex_comparison(label, line, is_offender):
     what it must reject. Testing rejection alone is how a matcher that flagged correct
     code and passed `grep "$E"` read as working.
     """
-    offenders = _greps_without_fixed_strings(line)
+    offenders = _greps_without_fixed_strings(line) + _greps_without_option_terminator(line)
     if is_offender:
-        assert offenders, f"{label}: must be rejected — this grep matches a version as a REGEX"
+        assert offenders, (
+            f"{label}: must be rejected — this grep either matches a version as a REGEX "
+            f"or lets a pattern beginning with `-` be read as an option"
+        )
     else:
         assert not offenders, f"{label}: must be accepted — this grep already matches literally"
