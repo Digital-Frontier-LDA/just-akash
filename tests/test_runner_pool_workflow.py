@@ -1339,7 +1339,10 @@ def _run_preflight(tmp_path, response: str, rc: int) -> tuple[str, str]:
     # `RC=$?` — only misbehaves under `-e`, where the failing assignment kills the
     # shell before RC is ever read. A harness without `-e` cannot reproduce it, so
     # it would pass forever INCLUDING on the exact regression it exists to stop.
-    subprocess.run(["bash", "-e", str(script)], env=env, capture_output=True, check=False)
+    proc = subprocess.run(["bash", "-e", str(script)], env=env, capture_output=True, check=False)
+    # Captured so the fallback arm's emitted response can be asserted; without it
+    # a test can only check that the guidance MENTIONS output, never that it exists.
+    (tmp_path / "stdout.txt").write_bytes(proc.stdout + proc.stderr)
     return (
         out.read_text(encoding="utf-8") if out.exists() else "",
         summary.read_text(encoding="utf-8") if summary.exists() else "",
@@ -1695,3 +1698,63 @@ def test_the_inner_run_does_not_inherit_addopts():
         "the inner pytest invocation must pass `-o addopts=` as ADJACENT arguments so it "
         f"does not inherit pyproject's addopts. Parsed argv: {argv}"
     )
+
+
+class TestTheFallbackArmPrintsWhatItPromises:
+    """⛔ THE DEFAULT ARM IS WHERE A FIX'S OWN DEFECT HIDES.
+
+    The `*)` branch fires when the status is UNRECOGNISED — precisely when the
+    operator has least to go on. Its fix text said "read the response below",
+    and `RESP` was captured, parsed twice, and never emitted. So the one arm
+    that exists for the unexplained case sent the reader to output that did not
+    exist, in a PR whose entire subject is a preflight that could not report why
+    it failed.
+
+    It is the branch least likely to have been exercised, which is exactly why
+    it was the one still broken. Check the default arm first, not last.
+    """
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_an_unexpected_status_emits_the_response(self, tmp_path):
+        out, summary = _run_preflight(tmp_path, "HTTP/2.0 418 I'm a teapot\nx-trace: abc123", rc=1)
+        log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
+        assert "::group::Unexpected preflight response" in log
+        assert "x-trace: abc123" in log, "the guidance names a response that must be printed"
+        assert "log" in summary, "the summary must say WHERE the response is"
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_the_echoed_response_cannot_forge_a_workflow_command(self, tmp_path):
+        """⛔ CWE-117 again. A response body echoed raw into an Actions log can
+        forge commands — `::error::` at line start is a COMMAND, not text. Same
+        shape as just-akash#252, reached by a different route: there the payload
+        arrived in an exception message, here in an HTTP body.
+
+        Asserted as the property that matters — the payload IS printed (the
+        operator needs it) but is wrapped in `::stop-commands::`, which is
+        GitHub's documented neutraliser. Deleting the payload would trade one
+        blind spot for another.
+        """
+        forged = "HTTP/2.0 418 Teapot\n::error title=forged::a provider is down"
+        _out, _summary = _run_preflight(tmp_path, forged, rc=1)
+        log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
+
+        assert "::error title=forged::" in log, "the evidence must still reach the operator"
+        stop = re.search(r"::stop-commands::([0-9a-f]{32})", log)
+        assert stop, "untrusted output was echoed without ::stop-commands::"
+        token = stop.group(1)
+        body_start = log.index(f"::stop-commands::{token}")
+        body_end = log.index(f"::{token}::")
+        assert body_start < log.index("::error title=forged::") < body_end, (
+            "the forged command fell outside the neutralised block"
+        )
+        assert log.index(f"::{token}::") < log.index("::endgroup::"), (
+            "commands must be resumed BEFORE ::endgroup::, or the group never closes"
+        )
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_a_recognised_status_does_not_dump_the_response(self, tmp_path):
+        """401 has specific guidance and does not promise the raw body — dumping
+        it for every failure would bury the named diagnosis this PR added."""
+        _run_preflight(tmp_path, "HTTP/2.0 401 Unauthorized\nx-trace: nope", rc=1)
+        log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
+        assert "::group::Unexpected preflight response" not in log
