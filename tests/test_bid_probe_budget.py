@@ -34,7 +34,20 @@ WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "bid-
 # Re-declaring the numbers here would have been the same hand-copied-constant
 # defect this file exists to catch, one layer up. So each is read from the place
 # that actually decides it.
-_CLI_DEFAULTS = {a.dest: a.default for a in _build_parser()._actions}
+_PARSER = _build_parser()
+
+
+def _cli_default(dest: str) -> int:
+    """A CLI default, through argparse's PUBLIC api.
+
+    `parser._actions` is private and has changed shape across CPython versions.
+    A guard that breaks on a Python upgrade stops guarding at exactly the moment
+    nobody is looking at it — and this one's failure mode is a leaked order.
+    """
+
+    value = _PARSER.get_default(dest)
+    assert value is not None, f"--{dest.replace('_', '-')} has no default to derive from"
+    return int(value)
 
 
 def _workflow_text() -> str:
@@ -56,10 +69,35 @@ def _confirm_delay_s(text: str) -> int:
     return int(m.group(1))
 
 
+def _cli_invocation(text: str) -> str:
+    """The full shell command the workflow runs, continuations included.
+
+    Deliberately NOT a fixed-size window into the file. An earlier cut sliced
+    400 characters, which is one more constant chosen by hand in a file about
+    constants chosen by hand: an invocation that grew past it would hide a
+    later `--wait` and the guard would pass while blind.
+    """
+
+    marker = "python -m just_akash.bid_probe"
+    start = text.find(marker)
+    assert start != -1, (
+        "could not find the bid-probe CLI invocation in the workflow. If the "
+        "command was renamed or restructured, this guard is no longer reading "
+        "the command that actually runs — fix the marker, do not delete this."
+    )
+    lines = text[start:].splitlines()
+    collected = [lines[0]]
+    for line in lines[1:]:
+        if not collected[-1].rstrip().endswith("\\"):
+            break
+        collected.append(line)
+    return "\n".join(collected)
+
+
 def _worst_case_per_pair_s(text: str) -> int:
     # run_probe re-probes a NO-BID with wait_s=wait_s (verified in source), so a
     # retried pair costs a full wait, the confirm delay, then another full wait.
-    wait = int(_CLI_DEFAULTS["wait"])
+    wait = _cli_default("wait")
     return wait + _confirm_delay_s(text) + wait
 
 
@@ -144,7 +182,7 @@ def test_the_workflow_does_not_pass_wait(workflow_text: str):
     """The budget's `--wait` term comes from the argparse default because the
     workflow never overrides it. If that ever changes, the model must read the
     passed value instead — and this assertion is how anyone finds out."""
-    invocation = workflow_text[workflow_text.index("python -m just_akash.bid_probe") :][:400]
+    invocation = _cli_invocation(workflow_text)
     assert "--wait" not in invocation, (
         "the workflow now passes --wait, so the argparse default is no longer "
         "the operative value — derive the budget from the passed value"
@@ -155,7 +193,7 @@ def test_the_two_retry_defaults_agree(workflow_text: str):
     """The workflow's shell fallback and the CLI default are separate values
     that happen to match. A divergence would make the model quietly wrong for
     whichever caller it did not describe, so pin them together."""
-    assert _confirm_delay_s(workflow_text) == int(_CLI_DEFAULTS["retry_delay"]), (
+    assert _confirm_delay_s(workflow_text) == _cli_default("retry_delay"), (
         "the workflow's RETRY_DELAY_INPUT fallback and --retry-delay's argparse "
         "default have diverged; the budget arithmetic describes only one of them"
     )
