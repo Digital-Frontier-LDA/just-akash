@@ -1398,17 +1398,29 @@ def test_the_nested_teardown_pin_matches_the_file_it_calls():
 @pytest.mark.parametrize(
     "returncode,out,reason_fragment",
     [
-        (4, "ERROR: usage: pytest [options]\nunrecognized arguments: --cov=just_akash\n", "exited 4"),
+        (
+            4,
+            "ERROR: usage: pytest [options]\nunrecognized arguments: --cov=just_akash\n",
+            "exited 4",
+        ),
         (5, "no tests ran in 0.01s\n", "exited 5"),
         (3, "INTERNALERROR> Traceback\n", "exited 3"),
         (2, "!!! KeyboardInterrupt !!!\n", "exited 2"),
         (1, "ERROR tests/x.py\n1 errors during collection\n", "COLLECT"),
         (0, "", "no test outcomes"),
     ],
-    ids=["usage-error", "nothing-collected", "internal-error", "interrupted",
-         "collection-error", "silent-success"],
+    ids=[
+        "usage-error",
+        "nothing-collected",
+        "internal-error",
+        "interrupted",
+        "collection-error",
+        "silent-success",
+    ],
 )
-def test_an_inner_run_that_did_not_execute_is_UNREADABLE_not_a_verdict(returncode, out, reason_fragment):
+def test_an_inner_run_that_did_not_execute_is_UNREADABLE_not_a_verdict(
+    returncode, out, reason_fragment
+):
     """★ THE FALSE-ACCUSATION SIDE.
 
     None of these say anything about a guard. Reporting any of them as "the guard
