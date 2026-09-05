@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -1168,12 +1169,100 @@ def test_the_pat_is_validated_before_provisioning():
 
 def test_an_expired_pat_is_not_reported_as_a_provider_failure():
     body = _step("PAT must still be valid")["run"]
-    assert "failure_reason=RUNNER_PAT_INVALID" in body
+    assert "REASON=RUNNER_PAT_INVALID" in body
     assert "RUNNER_NEVER_REGISTERED" in body, (
         "the message must name the symptom it prevents, or the next reader will not "
         "connect a 15-minute timeout to a credential"
     )
     assert "not a provider" in body.lower() and "rotate" in body.lower()
+
+
+# ⛔ TEXT ASSERTIONS COULD NOT SEE THE DEFECT ABOVE.
+# The original test asserted that the string "failure_reason=RUNNER_PAT_INVALID"
+# appeared in the step. It does — and it appeared for 401, 403, 404, 429, 5xx AND a
+# transport failure with no HTTP response at all, because every nonzero exit took the
+# same branch. "A 401 maps to PAT_INVALID" and "EVERYTHING maps to PAT_INVALID" are
+# indistinguishable to a substring check, so the collapse the preflight exists to
+# prevent shipped inside the preflight, past a green test.
+#
+# These run the actual shell against a stubbed `gh`, because the only assertion that
+# can tell those two apart is one that varies the input.
+
+_CASES = [
+    ("HTTP/2.0 401 Unauthorized", "RUNNER_PAT_INVALID", "an expired or revoked PAT"),
+    ("HTTP/2.0 403 Forbidden", "RUNNER_PAT_INVALID", "403 without rate-limit evidence"),
+    (
+        "HTTP/2.0 403 Forbidden\nx-ratelimit-remaining: 0",
+        "GITHUB_API_UNAVAILABLE",
+        "403 that IS a rate limit",
+    ),
+    ("HTTP/2.0 404 Not Found", "RUNNER_PAT_INVALID", "an org the token cannot see"),
+    ("HTTP/2.0 429 Too Many Requests", "GITHUB_API_UNAVAILABLE", "rate limiting"),
+    ("HTTP/2.0 503 Service Unavailable", "GITHUB_API_UNAVAILABLE", "a GitHub outage"),
+    ("dial tcp: lookup api.github.com: i/o timeout", "GITHUB_API_UNAVAILABLE", "no response"),
+]
+
+
+def _run_preflight(tmp_path, response: str, rc: int) -> tuple[str, str]:
+    """Execute the preflight's classification half with `gh` stubbed out."""
+
+    body = _step("PAT must still be valid")["run"]
+    script = tmp_path / "preflight.sh"
+    out, summary = tmp_path / "out.txt", tmp_path / "sum.txt"
+    script.write_text(
+        "set -uo pipefail\nORG=testorg\n"
+        f'GITHUB_OUTPUT="{out}"\nGITHUB_STEP_SUMMARY="{summary}"\n' + body[body.index("RC=0") :],
+        encoding="utf-8",
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text(
+        '#!/usr/bin/env bash\nprintf "%s\\n" "$FAKE_RESP"\nexit "$FAKE_RC"\n',
+        encoding="utf-8",
+    )
+    (fake_bin / "gh").chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        "FAKE_RESP": response,
+        "FAKE_RC": str(rc),
+    }
+    subprocess.run(["bash", str(script)], env=env, capture_output=True, check=False)
+    return (
+        out.read_text(encoding="utf-8") if out.exists() else "",
+        summary.read_text(encoding="utf-8") if summary.exists() else "",
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize(("response", "expected", "label"), _CASES)
+def test_each_failure_cause_is_classified_not_collapsed(tmp_path, response, expected, label):
+    out, _ = _run_preflight(tmp_path, response, rc=1)
+    assert f"failure_reason={expected}" in out, (
+        f"{label} must classify as {expected}; a preflight whose purpose is saying "
+        "WHY it failed cannot report five causes as one"
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_a_transport_failure_does_not_invent_an_http_status(tmp_path):
+    """⛔ `${CODE:-401}` ASSERTED a 401 that was never received. Reporting a status
+    the server never sent is worse than reporting none: it is a fabricated fact that
+    sends the reader to rotate a credential which may be perfectly valid."""
+
+    out, summary = _run_preflight(tmp_path, "dial tcp: i/o timeout", rc=1)
+    assert "401" not in summary, "a status was invented for a response that never arrived"
+    assert "none received" in summary
+    assert "failure_reason=GITHUB_API_UNAVAILABLE" in out
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_a_valid_pat_emits_no_failure_reason(tmp_path):
+    """The success path must stay silent — a reason emitted on success would make
+    every run look like a fallback."""
+
+    out, _ = _run_preflight(tmp_path, "HTTP/2.0 200 OK", rc=0)
+    assert "failure_reason=" not in out
 
 
 def test_a_missing_pat_is_distinct_from_an_invalid_one():
