@@ -70,7 +70,7 @@ jobs:
     # Backstop only. The real bound is the step timeout below: a JOB timeout
     # cancels the whole job and the always()-reap step would never run, leaking
     # every open order this run created.
-    timeout-minutes: 45
+    timeout-minutes: 50
     steps:
       # FIRST step, before anything slow, so this is as close to "when the run
       # actually began" as the runner can report. It exists because
@@ -124,11 +124,18 @@ jobs:
           age-key: ${{ secrets.SOPS_AGE_KEY }}
 
       # Worst case is every pair no-bidding AND being retried:
-      # 9 x (45s wait + 60s confirm delay + 45s retry wait) = 1350s = 22.5 min,
-      # plus order create/close overhead. 25m would clip that, so 35m — still
-      # well inside the 45m job backstop so the always()-reap step always runs.
+      # 12 x (45s wait + 60s confirm delay + 45s retry wait) = 1800s = 30 min,
+      # plus order create/close overhead. 35m would clip that, so 40m — still
+      # 10 min inside the 50m job backstop so the always()-reap step always runs.
+      #
+      # ⛔ THIS ARITHMETIC IS DERIVED FROM THE PAIR COUNT AND WENT STALE ONCE.
+      # #257 took it from 9 pairs to 12 and 35m stopped being enough. A budget
+      # that silently under-provisions does not fail loudly — the step is KILLED
+      # mid-run, and per the job comment above that leaks every order still open.
+      # tests/test_bid_probe_budget.py pins the 12 to len(eligible_pairs()) so
+      # the next scenario added fails a test instead of a production run.
       - name: Run bid probe
-        timeout-minutes: 35
+        timeout-minutes: 40
         env:
           BIDPROBE_PROM: ${{ github.workspace }}/bidprobe-metrics.prom
           BIDPROBE_JSONL: ${{ github.workspace }}/bidprobe.jsonl
