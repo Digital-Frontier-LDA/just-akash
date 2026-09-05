@@ -46,6 +46,9 @@ def _raise_http(monkeypatch, client, code: int, body: str):
     def _boom(*_a, **_k):
         raise urllib.error.HTTPError("u", code, "err", {}, io.BytesIO(body.encode()))  # type: ignore[arg-type]
 
+    # Caught as RuntimeError ON PURPOSE — that is the type every caller in the
+    # tree catches today, so catching the subclass here would stop proving it.
+    # Tests needing the extra fields narrow with an explicit isinstance.
     monkeypatch.setattr("urllib.request.urlopen", _boom)
     with pytest.raises(RuntimeError) as exc:
         client._request("POST", "/v1/deployments", {"x": 1})
@@ -75,16 +78,20 @@ class TestTheErrorCarriesEnoughToApportionBlame:
 
     def test_an_origin_response_timeout_counts_even_without_524(self, monkeypatch, client):
         body = json.dumps({"message": "x", "error_name": "origin_response_timeout"})
-        assert _raise_http(monkeypatch, client, 500, body).is_upstream_timeout()
+        err = _raise_http(monkeypatch, client, 500, body)
+        assert isinstance(err, AkashAPIError)
+        assert err.is_upstream_timeout()
 
     def test_the_upstreams_claim_is_recorded_not_believed(self, monkeypatch, client):
         """`retryable` is kept for the operator to read, and is NOT what
         is_upstream_timeout() consults — nothing may retry on the strength of a
         flag the proxy is not in a position to assert."""
         err = _raise_http(monkeypatch, client, 524, _CF_524)
+        assert isinstance(err, AkashAPIError)
         assert err.retryable is True
         assert err.retry_after == 120
         no_flag = _raise_http(monkeypatch, client, 524, json.dumps({"message": "x"}))
+        assert isinstance(no_flag, AkashAPIError)
         assert no_flag.retryable is None, "absent must stay absent, not become False"
         assert no_flag.is_upstream_timeout(), "classification must not depend on the flag"
 
