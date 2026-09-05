@@ -22,6 +22,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from just_akash import cleanup_stale as cs
 
 NOW = time.time()
@@ -419,7 +421,13 @@ class TestTripwireDenominator:
         client.close_deployment.assert_not_called()
         err = capsys.readouterr().err
         assert "CLASSIFIED" in err, "the refusal must say which denominator it used"
-        assert "unreadable and excluded" in err
+        # ⛔ THE COUNTS ARE NAMED SEPARATELY. The message used to call the whole
+        # shortfall "unreadable", but `classified` is skipped by TWO paths — no
+        # dseq, and a failed detail read — so the subtraction spanned both while
+        # the word named one. A label that asserts a cause it did not measure
+        # misleads at the exact moment an operator is debugging a refusal.
+        assert f"{n * 2} unreadable" in err, "the unreadable count must be measured, not implied"
+        assert "0 without a dseq" in err, "the other skip path must be reported, not folded in"
 
 
 # ── the pool-arrival guard (#259, landmine from just-akash#167) ──────────
@@ -593,3 +601,248 @@ class TestDeclaredPoolWithNoCredential:
         err = capsys.readouterr().err
         assert "neither AKASH_API_KEY nor AKASH_API_KEYS is set" in err
         assert "AKASH_WALLETS_EXPECTED" not in err
+
+
+# ── the dry run must predict the execute run (#250) ─────────────────────
+
+
+def _plan(
+    stale, *, classified=100, max_close=cs.MAX_CLOSE_PER_RUN, verdicts=None, enumerated=None
+):
+    # ⛔ MATERIALISE ONCE. This consumed `stale` twice — `list(stale)` then
+    # `enumerate(stale)` — so a generator would give the second pass NOTHING:
+    # empty stale_ages, every age defaulting to -1.0, and the oldest-first
+    # ordering silently INVERTING. The cap would then drain the newest end of
+    # the backlog and every assertion about counts would still pass. A fixture
+    # that returns a confident wrong answer is worse than one that raises.
+    items = list(stale)
+    return cs._execution_plan(
+        stale=items,
+        stale_ages={d: float(i) for i, d in enumerate(items)},
+        seen_verdicts=verdicts if verdicts is not None else {"STALE-e2e"},
+        classified=classified,
+        enumerated=enumerated if enumerated is not None else classified,
+        max_close=max_close,
+    )
+
+
+class TestCapConstrainsAtTheBoundary:
+    """⛔ This file has already produced TWO rail inversions — `--max-close -1`
+    EXPANDED the cap via `stale[:-1]`, and the key/address collapse DOUBLED it
+    by auditing one account once per alias. So the cap is asserted AT the
+    boundary and ONE PAST IT in both directions, not merely 'somewhere in the
+    middle', which is where both inversions hid.
+    """
+
+    def test_exactly_at_the_cap_is_not_capped(self):
+        plan = _plan([f"d{i}" for i in range(25)], max_close=25)
+        assert plan.capped is False
+        assert plan.would_close == 25, "N == cap must close all N, not N-1"
+
+    def test_one_past_the_cap_closes_exactly_the_cap(self):
+        plan = _plan([f"d{i}" for i in range(26)], max_close=25)
+        assert plan.capped is True
+        assert plan.would_close == 25
+        assert plan.closable == 26, "the pre-cap total must survive for the report"
+
+    def test_one_under_the_cap_closes_everything(self):
+        plan = _plan([f"d{i}" for i in range(24)], max_close=25)
+        assert plan.capped is False
+        assert plan.would_close == 24
+
+    def test_a_cap_of_one_closes_one(self):
+        plan = _plan([f"d{i}" for i in range(9)], max_close=1)
+        assert plan.would_close == 1, "the smallest legal cap must still constrain"
+
+    @pytest.mark.parametrize("bad", [0, -1, -25])
+    def test_a_non_positive_cap_closes_NOTHING_rather_than_inverting(self, bad):
+        """The measured inversion: `stale[:-1]` closed 54 of 55. A bound that
+        EXPANDS blast radius given a bad value is worse than no bound, because
+        its presence is what makes an operator believe the run is capped."""
+        plan = _plan([f"d{i}" for i in range(9)], max_close=bad)
+        assert plan.refusal is not None
+        assert plan.would_close == 0
+        assert plan.to_close == []
+
+    def test_the_cap_takes_the_OLDEST(self):
+        """A partial pass must free the escrow locked longest, or the backlog
+        drains newest-first and the oldest lease never leaves."""
+        stale = [f"d{i}" for i in range(30)]
+        plan = cs._execution_plan(
+            stale=stale,
+            stale_ages={d: float(i) for i, d in enumerate(stale)},
+            seen_verdicts={"STALE-e2e"},
+            classified=100,
+            enumerated=100,
+            max_close=3,
+        )
+        assert plan.to_close == ["d29", "d28", "d27"]
+
+
+class TestTripwireBoundary:
+    def test_exactly_at_the_tripwire_does_not_refuse(self):
+        """`>` not `>=`: at exactly the threshold the run proceeds. Asserted so
+        a later `>=` 'tidy-up' is a test failure rather than a silent change to
+        when this reaper refuses."""
+        n = 100
+        stale = [f"d{i}" for i in range(int(n * cs.MAX_STALE_FRACTION))]
+        plan = _plan(stale, classified=n)
+        assert plan.refusal is None
+
+    def test_one_past_the_tripwire_refuses(self):
+        n = 100
+        stale = [f"d{i}" for i in range(int(n * cs.MAX_STALE_FRACTION) + 1)]
+        plan = _plan(stale, classified=n)
+        assert plan.refusal is not None and "tripwire" in plan.refusal
+
+    def test_below_the_minimum_audited_the_fraction_rail_is_not_applied(self):
+        """A small account is legitimately 100% stale; an ungated fraction rail
+        deadlocks it permanently."""
+        n = cs.MIN_AUDITED_FOR_FRACTION_RAIL - 1
+        plan = _plan([f"d{i}" for i in range(n)], classified=n)
+        assert plan.refusal is None
+
+
+class TestDryRunPredictsExecute:
+    """⛔ THE DRY RUN RETURNED BEFORE EVERY RAIL. It printed the CLASSIFICATION
+    count and stopped, so `stale (closable): 55` did not mean 55 would close —
+    with the cap it meant 25, and above the tripwire it meant zero and a
+    refusal. The documented protocol is "dispatch dry-run, review the verdict
+    table, then dispatch execute=true": the review step was reading a figure
+    that does not predict the step it authorises."""
+
+    def _dry(self, deployments, capsys, **kw):
+        client = _mock_client(deployments)
+        rc = _run(client, execute=False, **kw)
+        return rc, capsys.readouterr().out, client
+
+    def test_the_dry_run_states_what_execute_would_close(self, capsys):
+        deployments = {_dseq(3 * 86400 + i): _detail(["backtest"]) for i in range(30)}
+        deployments.update({_dseq(60 + i): _detail(["node"]) for i in range(30)})
+        rc, out, client = self._dry(deployments, capsys)
+        assert rc == 0
+        assert "WOULD EXECUTE:" in out
+        assert f"would close {cs.MAX_CLOSE_PER_RUN}" in out, (
+            "a dry run reporting only the closable count does not predict the "
+            "capped outcome it is authorising"
+        )
+        client.close_deployment.assert_not_called()
+
+    def test_the_dry_run_warns_that_execute_would_refuse(self, capsys):
+        """The costliest surprise: review 'N closable', dispatch execute, and
+        get a refusal instead — with the backlog untouched and the operator
+        believing they have acted."""
+        n = cs.MIN_AUDITED_FOR_FRACTION_RAIL + 10
+        deployments = {_dseq(3 * 86400 + i): _detail(["backtest"]) for i in range(n)}
+        rc, out, client = self._dry(deployments, capsys)
+        assert rc == 0, "reporting a would-refuse is not itself a failure"
+        assert "would REFUSE" in out and "tripwire" in out
+        client.close_deployment.assert_not_called()
+
+    def test_a_dry_run_still_closes_nothing_whatever_the_plan_says(self, capsys):
+        deployments = {_dseq(3 * 86400 + i): _detail(["backtest"]) for i in range(5)}
+        deployments.update({_dseq(60 + i): _detail(["node"]) for i in range(5)})
+        _, _, client = self._dry(deployments, capsys)
+        client.close_deployment.assert_not_called()
+
+
+class TestTheReportUsesTheCapTheRunWillUse:
+    """⛔ THE REPORT MISREPORTED THE THING THIS PR EXISTS TO REPORT ACCURATELY.
+
+    `_report_plan` read the module constant `MAX_CLOSE_PER_RUN` while the plan
+    was computed with the CALLER's `max_close`, so `--max-close 5` announced
+    "cap 25" and closed 5. An operator reviewing that preview would authorise a
+    run on a number no part of the system was using.
+
+    Every existing test missed it because the harness defaults `max_close` to
+    the constant — the two values were equal in every case exercised, so the
+    bug was invisible to a suite that never varied them. Hence the explicit
+    non-default here: the cap and the constant must be able to DISAGREE for the
+    assertion to mean anything.
+    """
+
+    def test_a_custom_cap_is_reported_not_the_module_default(self, capsys):
+        custom = 5
+        assert custom != cs.MAX_CLOSE_PER_RUN, "the test is vacuous if these agree"
+        plan = _plan([f"d{i}" for i in range(30)], max_close=custom)
+        cs._report_plan(plan, execute=False)
+        out = capsys.readouterr().out
+        assert f"cap {custom}" in out
+        assert f"cap {cs.MAX_CLOSE_PER_RUN}" not in out, (
+            "the preview announced a cap the run will not use"
+        )
+        assert plan.would_close == custom
+
+    def test_the_plan_carries_the_cap_it_was_built_with(self):
+        """Carried ON the plan rather than re-read at the report, so the two
+        cannot diverge again — the same structural move as computing the rails
+        once for both paths."""
+        for cap in (1, 7, cs.MAX_CLOSE_PER_RUN, 100):
+            assert _plan([f"d{i}" for i in range(30)], max_close=cap).cap == cap
+
+
+def test_the_plan_helper_survives_a_single_pass_iterable():
+    """⛔ The helper consumed `stale` twice, so a generator emptied the second
+    pass: no stale_ages, every age -1.0, and oldest-first silently inverted —
+    the cap draining the NEWEST end while every count assertion still passed.
+
+    Asserted against a generator specifically, because a list cannot express
+    the bug: the defect only appears for a single-pass iterable.
+    """
+
+    dseqs = [f"d{i}" for i in range(cs.MAX_CLOSE_PER_RUN + 3)]
+    from_list = _plan(dseqs, max_close=3)
+    from_gen = _plan((d for d in dseqs), max_close=3)
+
+    assert from_gen.to_close == from_list.to_close, (
+        "a generator produced a different plan than the identical list"
+    )
+    # OLDEST first: `_plan` assigns age = index, so the LAST three dseqs are the
+    # oldest and must come back in descending-age order. Written reversed on
+    # purpose — `dseqs[-3:]` is the same SET in the wrong ORDER, and asserting
+    # the set would pass on exactly the inversion this test exists to catch.
+    assert from_gen.to_close == list(reversed(dseqs[-3:])), "oldest-first ordering was lost"
+
+
+class TestTheClosingLineAgreesWithThePlan:
+    """⛔ TWO CONSECUTIVE LINES OF THE SAME OUTPUT CONTRADICTED EACH OTHER.
+
+    `_report_plan` printed "would REFUSE to execute — ..." and the very next
+    line printed "Re-run with --execute to close the stale set" unconditionally.
+    This PR exists BECAUSE the dry run did not predict the execute run; routing
+    both paths through `_execution_plan()` and then leaving the closing
+    instruction unconditional reproduced the defect inside its own fix.
+
+    The refusal case is the RARE arm — the one nobody exercises — which is why
+    it survived. Check the default arm first.
+    """
+
+    def _dry(self, deployments, capsys):
+        rc = _run(_mock_client(deployments), execute=False)
+        return rc, capsys.readouterr().out
+
+    def test_a_would_refuse_plan_does_not_tell_the_operator_to_re_run(self, capsys):
+        n = cs.MIN_AUDITED_FOR_FRACTION_RAIL + 10
+        _rc, out = self._dry(
+            {_dseq(3 * 86400 + i): _detail(["backtest"]) for i in range(n)}, capsys
+        )
+        assert "would REFUSE" in out, "the plan must still say execute would refuse"
+        assert "Re-run with --execute to close" not in out, (
+            "the closing line told the operator to do the thing the line above "
+            "just said would be refused"
+        )
+        assert "will not close anything" in out
+
+    def test_a_closable_plan_still_names_the_next_step_and_the_count(self, capsys):
+        deployments = {_dseq(3 * 86400 + i): _detail(["backtest"]) for i in range(30)}
+        deployments.update({_dseq(60 + i): _detail(["node"]) for i in range(30)})
+        _rc, out = self._dry(deployments, capsys)
+        assert "Re-run with --execute to close" in out
+        assert f"close {cs.MAX_CLOSE_PER_RUN} of them" in out, (
+            "the instruction must carry the capped number, not the closable total"
+        )
+
+    def test_an_empty_account_does_not_invite_an_execute_run(self, capsys):
+        _rc, out = self._dry({_dseq(60 + i): _detail(["node"]) for i in range(3)}, capsys)
+        assert "nothing is closable" in out
+        assert "Re-run with --execute" not in out
