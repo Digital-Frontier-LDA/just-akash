@@ -174,7 +174,10 @@ def pr_commits_mention(repo: Path, base: str, head: str, name: str) -> bool:
     except subprocess.CalledProcessError:
         return False
     keywords = ("delete", "remove", "drop", "deprecate", "retire")
-    name_pat = re.compile(rf"\b{re.escape(name)}\b")
+    # Lowercase the symbol name to match the lowercased commit subject
+    # (so `FOO` is matched inside a message saying "foo" next to a
+    # delete keyword, not just exactly "FOO").
+    name_pat = re.compile(rf"\b{re.escape(name.lower())}\b")
     for line in log.splitlines():
         lc = line.lower()
         if name_pat.search(lc) and any(k in lc for k in keywords):

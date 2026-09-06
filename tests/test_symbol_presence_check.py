@@ -2,7 +2,7 @@
 
 The check exists because a merge that silently drops content produces no
 conflict, no failing test, and no undefined symbol. These tests construct
-eight scenarios and verify the check distinguishes them:
+nine scenarios and verify the check distinguishes them:
 
   - drop             : branch rebased onto main with conflict resolution
                        that took "ours" and discarded main's new symbols
@@ -30,6 +30,11 @@ eight scenarios and verify the check distinguishes them:
                        dropping `rest` MUST be detected (Starred inside
                        Tuple, not just plain Name targets)
                        → MUST exit 1 with FAIL POSSIBLE_DROP
+  - case_insensitive : commit-message check must match the symbol name
+                       case-insensitively (lower('Foo') against the
+                       lowercased message), so a commit subject saying
+                       "remove foo" mentions a symbol named `Foo`
+                       → MUST exit 0 with OK INTENTIONAL_DELETE
 
 Plus one edge case (no Python files modified) which is the early-return
 "no work to do" path.
@@ -367,6 +372,36 @@ def test_starred_unpacking_target_detected(sandbox: Path) -> None:
         f"missing starred-unpack symbol MUST exit 1; got {result.returncode}\n{result.stdout}"
     )
     assert "rest" in result.stdout, result.stdout
+
+
+# --- Scenario I: case-insensitive symbol mention in commit subject ---
+
+
+def test_case_insensitive_symbol_match(sandbox: Path) -> None:
+    """The PR commit-message mention check is case-insensitive: a
+    symbol named `Foo` (PascalCase) must match a commit subject that
+    says 'foo' next to a delete keyword. Without normalisation, the
+    regex was searching for `Foo` against a lowercased message and
+    never matched."""
+    _write(
+        sandbox,
+        "main",
+        "def Foo():\n    return 1\n\n\ndef helper():\n    return 'h'\n",
+        "main: add Foo() + helper()",
+    )
+
+    _git(sandbox, "checkout", "-q", "-b", "branch-I", "main")
+    (sandbox / "bar.py").write_text("def helper():\n    return 'h'\n")
+    _git(sandbox, "add", "bar.py")
+    _git(sandbox, "commit", "-q", "-m", "I: remove foo (case-insensitive mention)")
+
+    result = _run_check(sandbox, "main", "branch-I")
+    assert result.returncode == 0, (
+        f"symbol mentioned case-insensitively in commit subject MUST exit 0 "
+        f"with INTENTIONAL_DELETE; got {result.returncode}\n{result.stdout}"
+    )
+    assert "INTENTIONAL_DELETE" in result.stdout, result.stdout
+    assert "Foo" in result.stdout, result.stdout
 
 
 # --- Edge case: empty diff (no Python files modified) ---
