@@ -15,6 +15,8 @@ Requires: AKASH_API_KEY, AKASH_PROVIDERS, SSH_PUBKEY in environment.
 import json
 import os
 import re
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -63,6 +65,287 @@ def run(cmd: str, timeout: int = 60, input_text: str | None = None) -> subproces
     )
 
 
+#: The deployment SUMMARY line, `DSEQ: 12345` (deploy.py's closing `print`). It is
+#: block-buffered — stdout is a pipe here, not a tty — so it is the FIRST thing lost
+#: when the child is killed. Authoritative when it arrives, absent when it matters.
+_DSEQ_SUMMARY_RE = re.compile(r"DSEQ[:\s]+(\d+)")
+
+# ⛔ `(\d+)` IN BOTH PATTERNS IS A SHELL-INJECTION BARRIER, not a tidy way to say
+# "a number". The captured DSEQ is interpolated UNQUOTED into every `run(f"uv run
+# just-akash ... --dseq {dseq} ...")` in `main` — `run` passes shell=True — and into
+# the `verify it is ours before closing:` line in `report_unnamed_deployment`, which
+# prints a command for a HUMAN to paste into their own terminal.
+#
+# ⛔ CITED BY ANCHOR, NOT BY LINE NUMBER, on purpose: the first version of this note
+# gave line numbers, and they were already wrong in the commit that added them —
+# the note's own insertion shifted the code it pointed at. A stale pointer sends the
+# next reader somewhere else entirely, which is worse than no pointer.
+#
+# ⛔ SO DO NOT WIDEN THE CAPTURE. `(\d+)` -> `(\S+)` is the natural-looking edit the
+# first time a DSEQ turns up in an unexpected shape, and it is one character between
+# a world-writable /tmp file and a shell. Widen the SEPARATOR class if you must;
+# never the capture. `test_the_dseq_capture_is_digits_only_because_it_reaches_a_shell`
+# fails on exactly that edit.
+#: Every shape deploy.py writes a DSEQ in, notably `DSEQ=12345` from the flush=True
+#: `_log` at deploy.py:1104 — the one emission that SURVIVES a kill. Failure path only;
+#: see the comment at its use site for why widening the success path would be a bug.
+_DSEQ_ANY_RE = re.compile(r"DSEQ[=:\s]+(\d+)")
+
+
+#: `O_NOFOLLOW` is POSIX-only; absent it, the S_ISREG check below still applies.
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+#: Most bytes read from the tee log in one poll. The path is world-writable, so its
+#: size is chosen by whoever wrote it, not by us — and since the poll re-reads once a
+#: second until the deadline, an unbounded read is paid for repeatedly. A real deploy
+#: log is tens of KB; this is far above that and far below "fills memory".
+_TEE_READ_LIMIT = 1 << 20
+
+
+def _search_streams(pattern: re.Pattern[str], *streams: str) -> re.Match[str] | None:
+    """Search each stream on its own — NEVER their concatenation.
+
+    ⛔ `stdout + stderr` joined with no separator can FABRICATE a match across the
+    seam, and this is the one code path where that is likely rather than exotic:
+    SIGKILL truncates stdout mid-line, so a stdout ending `DSEQ=` beside a stderr
+    beginning with digits yields a number **neither stream emitted**. Measured:
+
+        out = "... Deployment created  DSEQ="
+        err = "1234567890 bytes written to socket"
+        concatenated -> ['1234567890']      <- in neither stream
+        per-stream   -> []
+
+    On the failure path that invented value lands in dseq_ref and reaches
+    `robust_destroy`. (Reported by CodeRabbit on #279.)
+    """
+    for stream in streams:
+        found = pattern.search(stream)
+        if found:
+            return found
+    return None
+
+
+def _findall_streams(pattern: re.Pattern[str], *streams: str) -> list[str]:
+    """Every match, per stream, never across the seam. See `_search_streams`."""
+    out: list[str] = []
+    for stream in streams:
+        out.extend(pattern.findall(stream))
+    return out
+
+
+def _decoded(stream: object) -> str:
+    """`TimeoutExpired.stdout` is BYTES even when the call passed `text=True`.
+
+    ⛔ Measured, because it is silent either way: `subprocess.run(..., text=True,
+    timeout=N)` raises with `.stdout` as bytes, so `exc.stdout + exc.stderr` is a
+    TypeError and a `str` pattern over it matches nothing at all. Both failures look
+    like "the deployment had no DSEQ" and neither is about the deployment.
+    """
+    if stream is None:
+        return ""
+    if isinstance(stream, (bytes, bytearray)):
+        return bytes(stream).decode("utf-8", "replace")
+    return str(stream)
+
+
+#: `just up` pipes the deploy through `tee` to this FIXED path (see the `up` recipe in
+#: the justfile, which then greps the same file for the DSEQ). It is on disk, so unlike
+#: the pipe it survives the parent giving up.
+_DEPLOY_TEE_LOG = "/tmp/.akash-last-deploy.log"
+
+
+def _read_tee_log(started_at: float) -> tuple[str, ...]:
+    """Read the tee log if it is a regular file this run could have produced.
+
+    ⛔ A WORLD-WRITABLE FIXED PATH IN /tmp IS NOT A TRUSTED FILE. A plain `open()`
+    on a FIFO planted at that path BLOCKS FOREVER — verified — which turns a
+    recovery attempt into a hang; a symlink redirects the read somewhere else
+    entirely. (Reported by CodeRabbit on #279.)
+
+    So: `O_NONBLOCK` so a FIFO cannot wedge us, `O_NOFOLLOW` so a symlink is
+    refused outright, and `fstat` on the DESCRIPTOR rather than `stat` on the path
+    — which also closes the TOCTOU gap between checking and opening. Anything that
+    predates this run reads as no file at all.
+
+    ⚠ `S_ISREG` CHANGES NO BEHAVIOUR TODAY, AND IS STILL WORTH KEEPING — but not for
+    "defence in depth", which is the phrase that lets dead layers accumulate. The
+    real reason: **O_NONBLOCK's protection is a side effect; S_ISREG states the
+    requirement.** What this function needs is "the thing I am reading is a regular
+    file". `O_NONBLOCK` never says that — it happens to make a FIFO read raise
+    `BlockingIOError` and a directory raise `IsADirectoryError`, and those happen to
+    land in the `except OSError` below. Platform behaviour, not a check anyone wrote.
+
+    Measured, so the claim is checkable rather than a slogan:
+
+        FIFO (no writer / live writer)  -> BlockingIOError   via O_NONBLOCK
+        directory                       -> IsADirectoryError via O_NONBLOCK
+        symlink                         -> refused outright  via O_NOFOLLOW
+        anything the above miss         -> S_ISREG
+
+    Deleting `S_ISREG` leaves the entire suite green; a FIFO-with-a-writer test was
+    written specifically to isolate it and could not. So it is not covering a
+    reachable case on this platform — it is stating the precondition the open flags
+    must keep satisfying, and `O_NONBLOCK` is one unrelated edit away from being
+    dropped by someone tidying.
+
+    ⛔ Which makes THIS the load-bearing sentence: do NOT delete `O_NONBLOCK` on the
+    grounds that `S_ISREG` is here. The type check is the statement of intent; the
+    flag is what currently enforces it. Removing the enforcement because the
+    statement exists is the exact inversion that makes overlapping guards dangerous.
+    """
+    try:
+        fd = os.open(_DEPLOY_TEE_LOG, os.O_RDONLY | os.O_NONBLOCK | _O_NOFOLLOW)
+    except OSError:
+        return ()
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_mtime < started_at:
+            return ()
+        # ⛔ BINARY, not text. A text stream's `seek` only accepts opaque cookies from
+        # `tell()`, so the tail read below cannot be expressed in text mode at all.
+        # Each segment is decoded on its own; a multi-byte character split by the cut
+        # becomes U+FFFD, which no DSEQ pattern can match.
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1  # fdopen owns it now
+            if st.st_size <= _TEE_READ_LIMIT:
+                # +1 so a file that grew between fstat and read is still bounded.
+                return (fh.read(_TEE_READ_LIMIT + 1).decode("utf-8", "replace"),)
+            half = _TEE_READ_LIMIT // 2
+            head = fh.read(half)
+            fh.seek(-half, os.SEEK_END)
+            tail = fh.read(half)
+            # ⛔ TWO SEGMENTS, RETURNED APART, NEVER JOINED. A head+tail concatenation
+            # is the same defect as the stdout+stderr one closed above: it invents a
+            # byte range no writer produced, and a DSEQ matched across that cut would
+            # be pure fabrication. A separator sentinel would work only for as long as
+            # nobody widened the pattern to match across it — keeping them apart
+            # cannot be undone by a later edit to the regex.
+            return (head.decode("utf-8", "replace"), tail.decode("utf-8", "replace"))
+    except OSError:
+        return ()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _dseq_from_deploy_log(started_at: float, *, wait: float = 15.0) -> str | None:
+    """Recover the DSEQ from the file `just up` tees to, once the pipe has yielded none.
+
+    ⛔ TWO MEASURED FACTS, both counter-intuitive, make this the better source:
+
+      1. `subprocess.run(timeout=)` SIGKILLs its DIRECT child only. `sh -c "just up"`
+         execs, so `just` IS that child — but the bash recipe it runs, and the
+         `uv run just-akash deploy` inside that, are GRANDchildren. Measured: a
+         grandchild ran to completion and wrote its work AFTER the parent gave up.
+         So the deploy is probably still going, and this file is still growing.
+      2. Which is why this WAITS instead of reading once. The instant of the timeout
+         is the moment the file is least complete.
+
+    ⛔ THE mtime CHECK PROVES ONE DIRECTION ONLY, and the other direction is what a
+    caller would want. `mtime >= started_at` rules out a file OLDER than this run.
+    It does NOT establish that a newer file BELONGS to this run — and fact (1) above
+    is a direct counterexample: a PREVIOUS run's abandoned grandchild is still alive
+    and still writing to this same fixed path, so its output lands after our
+    started_at and looks fresh. Overlapping E2E runs are an observed state here, not
+    a thought experiment.
+
+    So what comes back is a CANDIDATE, not an identification. It is good enough to
+    tell a human where to look and not good enough to destroy anything: the caller
+    routes it to `report_unnamed_deployment`, never to `robust_destroy`. Corroborating
+    it would need a second source attributable to this run, and by construction there
+    is none — we are only here because this run's own output produced nothing.
+    """
+    deadline = time.monotonic() + wait
+    seen: set[str] = set()
+    truncated = False
+    while True:
+        segments = _read_tee_log(started_at)
+        # More than one segment means the file exceeded the read limit and only its
+        # head and tail were taken. Say so ONCE: a tee log that large is itself a
+        # fact worth a human's attention, not something to quietly read around.
+        if len(segments) > 1 and not truncated:
+            truncated = True
+            log_info(
+                f"{_DEPLOY_TEE_LOG} exceeds {_TEE_READ_LIMIT} bytes; reading only its "
+                "head and tail, so a DSEQ written between them will not be seen."
+            )
+        seen.update(_findall_streams(_DSEQ_ANY_RE, *segments))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        # ⛔ POLL TO THE DEADLINE BEFORE DECIDING, rather than returning on the first
+        # unique hit. The whole premise is that the deploy is STILL WRITING, so a
+        # second DSEQ (a re-deploy round supersedes an earlier one) can arrive inside
+        # the same window. Returning early means the ambiguity check never observes
+        # the ambiguity it exists for, and which answer you get depends on timing.
+        # (Reported by CodeRabbit on #279.)
+        time.sleep(min(1.0, remaining))
+
+    if len(seen) == 1:
+        return next(iter(seen))
+    if seen:
+        log_fail(
+            f"{_DEPLOY_TEE_LOG} names more than one DSEQ ({', '.join(sorted(seen))}); "
+            "a re-deploy round supersedes an earlier one and this file cannot say "
+            "which is live. Naming none of them."
+        )
+    return None
+
+
+def report_unnamed_deployment(
+    started_at: float, ended_at: float, candidate: str | None = None
+) -> None:
+    """State, greppably, that a deployment may exist which this run cannot name.
+
+    ⛔ REPORTS, NEVER CLOSES. Naming a thing and closing it are different
+    authorities: the harness may destroy the deployment IT created and can identify,
+    but a deployment it cannot identify is not its to guess at. Closing an
+    unidentified deployment means closing someone else's, and the Console listing
+    cannot tell them apart — `list_deployments()` is not scoped server-side (three
+    distinct API keys returned byte-identical bodies, measured 2026-08-30; see
+    cleanup_stale.py). Owner-scoped enumeration exists on the CHAIN, and that is the
+    instrument this window is meant to feed.
+
+    The parent survives the child's death, so this line always gets written even when
+    every byte the child produced was lost. A time window plus an owner is enough to
+    find the deployment later; nothing at all is what #278 was about.
+    """
+    log_fail(
+        "UNNAMED DEPLOYMENT POSSIBLE — `just up` may have created a deployment that "
+        "this run cannot identify."
+    )
+    if candidate:
+        # ⛔ NAMED, NOT CLOSED. This DSEQ came from a fixed path that concurrent runs
+        # share, and a previous run's abandoned deploy writes there after our start
+        # time (see _dseq_from_deploy_log). "Probably ours" is enough to point a human
+        # at it and not enough to authorise destroying it — closing the wrong one is
+        # worse than closing none, because it takes down a live deployment and reports
+        # success while doing so.
+        log_info(f"  candidate DSEQ (UNVERIFIED, not closed): {candidate}")
+        # ⛔ THIS PRINTS A COMMAND FOR A HUMAN TO PASTE, so it runs with THEIR
+        # privileges, not CI's — the only sink here that escapes this process's
+        # constraints. Safe for the same one reason as the rest: `candidate` is
+        # digits by construction, coming only from a `(\d+)` capture. It is a
+        # separate path from `dseq`, so the note at that binding does not cover it.
+        log_info(f"  verify it is ours before closing: just-akash status --dseq {candidate}")
+    log_info(
+        f"  created-between: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(started_at))}"
+        f" .. OPEN (this run gave up at "
+        f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(ended_at))})"
+    )
+    # ⛔ OPEN-ENDED ON PURPOSE, and getting this wrong would be worse than saying
+    # nothing. The timeout SIGKILLs only the DIRECT child; the deploy runs two levels
+    # down and survives (measured). So it may create the deployment AFTER this run has
+    # exited, and a window closed at the moment we gave up would exclude the very
+    # event it is meant to help find.
+    log_info(f"  the deploy may still be running; its own log is {_DEPLOY_TEE_LOG}")
+    log_info(
+        "  to resolve: enumerate OWNER-SCOPED FROM CHAIN (not the Console listing, "
+        "which is not scoped server-side) for deployments created at or after the "
+        "start time, and close by hand if one is ours."
+    )
+
+
 def main():
     failures = []
     dseq_ref: dict = {"dseq": None}
@@ -87,26 +370,121 @@ def main():
     # ── Step 2: Deploy via `just up` ─────────────────────────
     log_step(2, "Deploy via `just up`")
 
-    r = run("just up", timeout=300)
-    output = r.stdout + r.stderr
+    # ⛔ THE PARENT CANNOT RELY ON ANYTHING THE CHILD PROMISED TO DO. That is the
+    # class, and this one call held three instances of it (#278):
+    #
+    #   1. `subprocess.run(timeout=)` kills with SIGKILL. Measured: a child that
+    #      installs SIGTERM/SIGINT/SIGHUP handlers AND an atexit AND a try/finally
+    #      logs only "CHILD STARTED". So all SEVEN cleanup sites in deploy.py are
+    #      guaranteed dead here — and `install_signal_cleanup` above cannot help
+    #      either: it is signal-driven, and it reads a dseq_ref populated BELOW.
+    #   2. The exception was never caught, so it escaped before the DSEQ was parsed
+    #      and before main's try/finally, taking the run with it and leaving a
+    #      deployment nothing could name.
+    #   3. `TimeoutExpired` CARRIES the output flushed before the kill, and it was
+    #      discarded — the identifier was in hand and thrown away.
+    #
+    # The DSEQ is assigned SERVER-SIDE (POST /v1/deployments returns it), so the
+    # parent cannot pre-record it and no amount of local bookkeeping closes the
+    # window. What it can do is keep whatever the child flushed, and say so loudly
+    # when that is nothing.
+    deploy_started_at = time.time()
+    try:
+        r = run("just up", timeout=300)
+        deploy_out, deploy_err, returncode = r.stdout, r.stderr, r.returncode
+    except subprocess.TimeoutExpired as exc:
+        # ⛔ KEPT APART, not concatenated. `TimeoutExpired` carries the two streams
+        # separately, so the timeout path can report the same evidence as every other
+        # failure path — and #274's invariant requires it: a failure that names its
+        # returncode must name its stdout and stderr too, or it is unactionable.
+        # Collapsing them into one blob passed every human read of this diff and was
+        # caught by that test.
+        deploy_out, deploy_err = _decoded(exc.stdout), _decoded(exc.stderr)
+        # ⛔ THE REAL SIGNAL, not a placeholder. A negative returncode names the signal
+        # that killed the process, so the -1 this used to carry decodes to SIGHUP — a
+        # cause that did not happen, asserted by a value nobody would think to check.
+        # `subprocess.run` kills a timed-out child with `Popen.kill()`; measured, that
+        # child's returncode is -9. We are not guessing what killed it, we sent it.
+        returncode = -int(signal.SIGKILL)
+        log_fail(
+            f"`just up` exceeded its {exc.timeout:.0f}s timeout; its DIRECT CHILD "
+            "was SIGKILLed. The deploy runs a level below that and may still be "
+            "running — anything it creates is on chain and unattended by this run."
+        )
+    deploy_ended_at = time.time()
+    output = deploy_out + deploy_err
     print(output)
 
-    m = re.search(r"DSEQ[:\s]+(\d+)", output)
+    m = _search_streams(_DSEQ_SUMMARY_RE, deploy_out, deploy_err)
     if m:
         dseq_ref["dseq"] = m.group(1)
+    elif returncode != 0:
+        # ⛔ WIDER PATTERN, FAILURE PATH ONLY — and the asymmetry is the finding.
+        # `DSEQ=` (deploy.py:1104) goes through `_log`, which prints with flush=True,
+        # so it is the ONE emission that survives a kill. `DSEQ: ` (deploy.py:2116)
+        # is an unflushed print and is the first thing lost. The recoverable line was
+        # the one the pattern did not match; the matched line was the one that never
+        # arrived. Both halves had to be true for the DSEQ to go missing.
+        #
+        # ⛔ NOT widened on the success path, deliberately: deploy.py's re-deploy round
+        # emits a second `DSEQ=` (deploy.py:1928), so a first-match search would name
+        # the SUPERSEDED deployment. Where the summary line exists it is authoritative
+        # and nothing here should second-guess it.
+        candidates = sorted(set(_findall_streams(_DSEQ_ANY_RE, deploy_out, deploy_err)))
+        if len(candidates) == 1:
+            dseq_ref["dseq"] = candidates[0]
+            log_info(f"Recovered DSEQ={candidates[0]} from what the child flushed before dying")
+        elif candidates:
+            log_fail(
+                "More than one candidate DSEQ survived in the killed child's output — "
+                f"{', '.join(candidates)}. Closing none of them: a re-deploy round "
+                "supersedes an earlier DSEQ and this output cannot say which is live."
+            )
 
-    if r.returncode != 0:
+    # ⛔ THE PIPE IS NOT THE ONLY COPY. Before declaring a deployment unnameable, read
+    # the file `just up` tees to — it is on disk, the deploy is probably still writing
+    # to it, and the recipe already trusts it enough to grep it for the DSEQ itself.
+    # ⛔ DELIBERATELY NOT `dseq_ref`. A recovered DSEQ is a CANDIDATE, not this run's
+    # identifier, and dseq_ref is what both the destroy branch below and the SIGINT
+    # handler act on. Naming it is useful; destroying it is not ours to do — see
+    # report_unnamed_deployment for why mtime cannot establish provenance.
+    #
+    # The condition is just "we have no DSEQ". An earlier draft also tested
+    # `(returncode != 0 or not m)`, which is dead: the only assignments to
+    # dseq_ref["dseq"] above come from a match, and `\d+` cannot capture a falsy
+    # string — so arriving here without a DSEQ already means `m` was None. The extra
+    # conjunct implied two cases where there is one, and hid that recovery is meant
+    # to run on ANY DSEQ-less exit rather than only on a failing one.
+    recovered_dseq = None
+    if not dseq_ref["dseq"]:
+        recovered_dseq = _dseq_from_deploy_log(deploy_started_at)
+        if recovered_dseq:
+            log_info(f"Candidate DSEQ={recovered_dseq} found in {_DEPLOY_TEE_LOG}")
+
+    if returncode != 0:
         log_fail(
-            f"just up failed (rc={r.returncode}):\nstdout: {r.stdout!r}\nstderr: {r.stderr!r}"
+            f"just up failed (rc={returncode}):\nstdout: {deploy_out!r}\nstderr: {deploy_err!r}"
         )
         if dseq_ref["dseq"]:
             robust_destroy(dseq_ref["dseq"])
+        else:
+            report_unnamed_deployment(deploy_started_at, deploy_ended_at, recovered_dseq)
         sys.exit(1)
 
     if not dseq_ref["dseq"]:
         log_fail("Could not parse DSEQ from `just up` output")
+        report_unnamed_deployment(deploy_started_at, deploy_ended_at, recovered_dseq)
         sys.exit(1)
 
+    # ⛔ EVERYTHING BELOW INTERPOLATES `dseq` INTO A SHELL. `run` uses shell=True, and
+    # every `run(f"uv run just-akash ... {dseq} ...")` below takes it unquoted. It is
+    # safe for exactly one reason: it is digits BY CONSTRUCTION — the only writers of
+    # `dseq_ref["dseq"]` are `(\d+)` captures, and the /tmp-derived `recovered_dseq` is
+    # deliberately kept out of `dseq_ref` (see step 2), so a world-writable file cannot
+    # reach these lines. That containment was written for the escrow rule — an
+    # unverified value must not reach a privileged sink — and `shell=True` is the
+    # second such sink. If you ever assign to `dseq_ref` from a new source, or widen
+    # the capture, you are editing this too.
     dseq = dseq_ref["dseq"]
     log_pass(f"Deployed DSEQ={dseq}")
 
