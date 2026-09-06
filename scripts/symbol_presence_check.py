@@ -114,11 +114,15 @@ def run(cmd: list[str], cwd: Path) -> str:
 
 def _names(target: ast.expr) -> Iterator[str]:
     """Yield Name ids from an assignment target, recursing into Tuple /
-    List unpacking. Does not descend into attribute / subscript targets
-    (foo.bar = ... and foo[0] = ... are not namespace bindings at module
-    level for our purposes)."""
+    List unpacking (including starred unpacks like `a, *rest = ...`).
+    Does not descend into attribute / subscript targets (foo.bar = ...
+    and foo[0] = ... are not namespace bindings at module level for
+    our purposes)."""
     if isinstance(target, ast.Name):
         yield target.id
+    elif isinstance(target, ast.Starred):
+        # Starred unwraps one layer (e.g. `a, *rest = ...`).
+        yield from _names(target.value)
     elif isinstance(target, (ast.Tuple, ast.List)):
         for elt in target.elts:
             yield from _names(elt)

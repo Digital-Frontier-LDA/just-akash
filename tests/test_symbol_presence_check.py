@@ -2,7 +2,7 @@
 
 The check exists because a merge that silently drops content produces no
 conflict, no failing test, and no undefined symbol. These tests construct
-seven scenarios and verify the check distinguishes them:
+eight scenarios and verify the check distinguishes them:
 
   - drop             : branch rebased onto main with conflict resolution
                        that took "ours" and discarded main's new symbols
@@ -26,6 +26,10 @@ seven scenarios and verify the check distinguishes them:
                        because it appears as a substring inside "embargo"
                        → MUST exit 1 with FAIL POSSIBLE_DROP, never
                          INTENTIONAL_DELETE
+  - starred_unpack   : main has `a, *rest = range(10)` at module level;
+                       dropping `rest` MUST be detected (Starred inside
+                       Tuple, not just plain Name targets)
+                       → MUST exit 1 with FAIL POSSIBLE_DROP
 
 Plus one edge case (no Python files modified) which is the early-return
 "no work to do" path.
@@ -336,6 +340,33 @@ def test_substring_match_does_not_auto_downgrade(sandbox: Path) -> None:
     assert "POSSIBLE_DROP" in result.stdout, result.stdout
     assert "bar.py::bar" in result.stdout, result.stdout
     assert "INTENTIONAL_DELETE" not in result.stdout, result.stdout
+
+
+# --- Scenario H: starred unpacking target (`a, *rest = ...`) ---
+
+
+def test_starred_unpacking_target_detected(sandbox: Path) -> None:
+    """Main defines `a, *rest = range(10)` at module level (Starred
+    inside Tuple). Both `a` and `rest` are namespace bindings at module
+    level; `_names` must recurse into `Starred.value` so `rest` is not
+    silently missed as a top-level symbol."""
+    _write(
+        sandbox,
+        "main",
+        "def kept():\n    return 'k'\n\n\na, *rest = range(10)\n",
+        "main: add starred-unpack `a, *rest = range(10)`",
+    )
+
+    _git(sandbox, "checkout", "-q", "-b", "branch-H", "main")
+    (sandbox / "bar.py").write_text("def kept():\n    return 'k'\n")
+    _git(sandbox, "add", "bar.py")
+    _git(sandbox, "commit", "-q", "-m", "H: drop starred unbind target")
+
+    result = _run_check(sandbox, "main", "branch-H")
+    assert result.returncode == 1, (
+        f"missing starred-unpack symbol MUST exit 1; got {result.returncode}\n{result.stdout}"
+    )
+    assert "rest" in result.stdout, result.stdout
 
 
 # --- Edge case: empty diff (no Python files modified) ---
