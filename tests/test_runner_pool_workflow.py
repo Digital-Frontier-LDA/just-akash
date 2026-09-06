@@ -16,8 +16,11 @@ import ast
 import os
 import pathlib
 import re
+import shlex
+import shutil
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -781,7 +784,7 @@ def test_the_guard_actually_runs_and_decides(key, accepted, tmp_path):
         "EPHEMERAL": "true",
         "PLACEMENT_KEY": key,
     }
-    proc = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True)
+    proc = subprocess.run(["bash", "-e", str(script)], env=env, capture_output=True, text=True)
     if accepted:
         assert proc.returncode == 0, f"{key!r} was refused: {proc.stdout} {proc.stderr}"
     else:
@@ -789,7 +792,190 @@ def test_the_guard_actually_runs_and_decides(key, accepted, tmp_path):
         assert "::error" in (proc.stdout + proc.stderr), "refused without saying why"
 
 
+@pytest.mark.parametrize("n", [3999, 4000, 4001])
+def test_resume_token_survives_an_exact_4000_byte_body(n, tmp_path):
+    """⛔ The ONE body length at which the CWE-117 guard never turns itself back off.
+
+    `head -c` cuts by BYTES and `<<<` appends exactly one newline, so at a body of
+    EXACTLY 4000 the cut keeps the payload and discards that newline, leaving the
+    cursor mid-line. `::<token>::` is honoured only at the start of a line, so the
+    resume never registers and `::stop-commands::` stays active for the REST OF THE JOB
+    — `pool` runs to ~line 1246 and contains the `::add-mask::` on the minted verdict
+    token. So this fails OPEN on secret masking, not closed on injection.
+
+    3999 and 4001 both work. Only 4000 does not, which is why this is pinned to the
+    exact bound: a test at "a large body" cannot express it, and neither can one at
+    3999 or 4001.
+
+    The fragment is read FROM the workflow rather than restated here, so an edit to the
+    emit sequence is tested rather than diverged from.
+    """
+    m = re.search(
+        r"head -c 4000 <<< \"\$RESP\".*?echo \"::\$\{RESP_TOKEN\}::\"",
+        SRC,
+        re.S,
+    )
+    assert m, "the bounded-echo fragment moved — re-anchor this test rather than deleting it"
+    body = "\n".join(
+        line.strip() for line in m.group(0).splitlines() if not line.strip().startswith("#")
+    )
+
+    script = tmp_path / "emit.sh"
+    script.write_text(body, encoding="utf-8")
+    proc = subprocess.run(
+        ["bash", "-e", str(script)],
+        env={**os.environ, "RESP": "A" * n, "RESP_TOKEN": "TESTTOKEN"},
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert any(line == "::TESTTOKEN::" for line in proc.stdout.splitlines()), (
+        f"at {n} bytes the resume token is not at the start of a line, so "
+        "::stop-commands:: is never lifted and stays active for the rest of the job"
+    )
+
+
+def test_a_huge_unexpected_body_does_not_kill_the_step(tmp_path):
+    """⛔ The bounded echo must not SIGPIPE the step it is protecting.
+
+    `printf ... | head -c 4000` sends printf SIGPIPE once the body exceeds the PIPE
+    BUFFER. This step opens `set -uo pipefail`, and Actions runs `run:` under
+    `bash -e`, so the pipeline's 141 killed the step outright — before the resume
+    token, before ::endgroup::, and before `failure_reason` was written, which is
+    the entire purpose of #253. Workflow commands then stay disabled for the rest
+    of `jobs.pool`, including the ::add-mask:: ~700 lines later.
+
+    ⚠ NOT a >4000 problem, which is why this test uses 512 KiB. Measured on macOS:
+    130000 bytes survives, 150000 dies; a Linux runner's 64 KiB buffer trips
+    earlier. A test at 8000 bytes PASSES against the broken code and proves
+    nothing — the same "near the bound is not the bound" trap as the 4000 case,
+    one level up.
+
+    Drives the real step under errexit + pipefail, which is the configuration the
+    fragment-level test could not express.
+    """
+    run = _step("Preflight")["run"]
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    # 418 falls to the `*)` arm. NOT 5xx or "" — those have their own arms and never
+    # reach the echo block, which is what this test is about.
+    (bindir / "gh").write_text(
+        "#!/usr/bin/env bash\n"
+        "printf 'HTTP/2 418\\n\\n'\n"
+        "python3 -c \"print('A'*524288, end='')\"\n"
+        # non-zero: the unexpected-status arm is gated on `RC -ne 0`
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    (bindir / "gh").chmod(0o755)
+
+    script = tmp_path / "preflight.sh"
+    script.write_text(run, encoding="utf-8")
+    out_file = tmp_path / "gh_output"
+    out_file.touch()
+    proc = subprocess.run(
+        ["bash", "-e", str(script)],
+        env={
+            **os.environ,
+            "PATH": f"{bindir}:{os.environ['PATH']}",
+            "GH_TOKEN": "x",
+            "ORG": "o",
+            "GITHUB_OUTPUT": str(out_file),
+            "GITHUB_STEP_SUMMARY": str(tmp_path / "summary"),
+        },
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode != 141, (
+        "the step died on SIGPIPE — pipefail promoted head's early close to 141 and "
+        "bash -e aborted before anything below the echo ran"
+    )
+    token = re.search(r"::stop-commands::([0-9a-f]{32})", proc.stdout)
+    assert token, "stop-commands was never emitted"
+    assert any(line == f"::{token.group(1)}::" for line in proc.stdout.splitlines()), (
+        "the resume token is missing or not at the start of a line, so workflow "
+        "commands stay disabled for the rest of the job"
+    )
+    assert "[truncated at 4000 bytes]" in proc.stdout, "the truncation notice never ran"
+    assert "::endgroup::" in proc.stdout, "the group was never closed"
+    assert "failure_reason=GITHUB_API_UNAVAILABLE" in out_file.read_text(encoding="utf-8"), (
+        "failure_reason was never written — the step reported nothing, which is the "
+        "defect #253 exists to fix"
+    )
+
+
+def test_no_guard_is_satisfied_by_prose(tmp_path):
+    """Re-run every guard against a workflow with ALL comments stripped, and require green.
+
+    ⛔ These guards assert on the shell body, and a body contains its own explanation.
+    A PRESENCE assertion against the raw text can therefore be satisfied by the comment
+    describing the construct rather than the construct — it reports that a behaviour
+    exists when only its description does, and it keeps passing after the behaviour is
+    deleted. `_code()` exists for this, but nothing required its use, so one assertion
+    drifted onto the raw body and went unnoticed.
+
+    This is the complement of test_the_guards_are_not_vacuous: that one breaks the CODE
+    and demands red, this one removes the PROSE and demands green. Between them a guard
+    must depend on the code and only on the code.
+    """
+    # ⛔ RUN ONCE, AGAINST THE REAL WORKFLOW. test_the_guards_are_not_vacuous spawns an
+    # inner pytest of this whole file per mutation with no -k filter, so without this
+    # skip each of those ~29 runs would spawn ANOTHER full suite from here — roughly
+    # tripling CI time to re-answer a question about the committed workflow that only
+    # has one answer. RUNNER_POOL_WF is set exactly when we are that inner run.
+    if os.environ.get("RUNNER_POOL_WF"):
+        pytest.skip("inner run of the mutation harness; this guard runs once, outermost")
+
+    stripped = "\n".join(ln for ln in SRC.splitlines() if not ln.lstrip().startswith("#"))
+    assert stripped != SRC, "no comments were stripped — this guard would be vacuous"
+    copy = tmp_path / "runner-pool.yml"
+    copy.write_text(stripped + "\n", encoding="utf-8")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            __file__,
+            "-q",
+            "--no-header",
+            "-p",
+            "no:cacheprovider",
+            "--no-cov",
+            "-k",
+            "not vacuous and not prose",
+        ],
+        env={**os.environ, "RUNNER_POOL_WF": str(copy)},
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, (
+        "a guard passes on the commented workflow and fails without comments, so it is "
+        "asserting on prose rather than on code:\n" + proc.stdout[-3000:]
+    )
+
+
 MUTATIONS = [
+    (
+        "the bounded echo does not go through a pipe",
+        # Restores the SIGPIPE-able pipeline; the >4000 test must go red.
+        lambda s: s.replace(
+            'head -c 4000 <<< "$RESP"',
+            "printf '%s\\n' \"$RESP\" | head -c 4000",
+        ),
+    ),
+    (
+        "the resume token is unconditionally at line start",
+        # Removes the unconditional newline, restoring the exact-4000-byte hole.
+        lambda s: s.replace(
+            "                printf '\\n'\n"
+            '                if [ "$(printf \'%s\' "$RESP" | wc -c)" -gt 4000 ]; then\n'
+            "                  printf '[truncated at 4000 bytes]\\n'",
+            '                if [ "$(printf \'%s\' "$RESP" | wc -c)" -gt 4000 ]; then\n'
+            "                  printf '\\n[truncated at 4000 bytes]\\n'",
+        ),
+    ),
     (
         "placement-key keeps its default",
         lambda s: s.replace(
@@ -1157,7 +1343,15 @@ def test_wallet_policy_is_not_reimplemented_in_workflow_shell():
     code = _code(PROVISION["run"]) + _code(TD_CLOSE["run"])
     assert "RUN_ID %" not in code
     assert "mapfile -t KEYS" not in code
-    assert "richest funded account" in PROVISION["run"]
+    # ⛔ ON _code(), NOT THE RAW BODY. This asserted "richest funded account", which
+    # appears ONLY in the comment above the delegation — so it passed by reading prose
+    # and would have kept passing with the delegation deleted. Its two siblings above
+    # already use _code(); this line did not, and that asymmetry is the whole bug.
+    # (Found by test_no_guard_is_satisfied_by_prose. Reported by CodeRabbit on #253.)
+    assert "JA=(uv run --with . just-akash)" in _code(PROVISION["run"]), (
+        "wallet selection must be DELEGATED — the workflow invokes just-akash rather "
+        "than ranking balances in shell"
+    )
 
 
 def test_the_wallet_key_never_leaves_via_an_output():
@@ -1275,12 +1469,124 @@ def test_the_pat_is_validated_before_provisioning():
 
 def test_an_expired_pat_is_not_reported_as_a_provider_failure():
     body = _step("PAT must still be valid")["run"]
-    assert "failure_reason=RUNNER_PAT_INVALID" in body
+    assert "REASON=RUNNER_PAT_INVALID" in body
     assert "RUNNER_NEVER_REGISTERED" in body, (
         "the message must name the symptom it prevents, or the next reader will not "
         "connect a 15-minute timeout to a credential"
     )
     assert "not a provider" in body.lower() and "rotate" in body.lower()
+
+
+# ⛔ TEXT ASSERTIONS COULD NOT SEE THE DEFECT ABOVE.
+# The original test asserted that the string "failure_reason=RUNNER_PAT_INVALID"
+# appeared in the step. It does — and it appeared for 401, 403, 404, 429, 5xx AND a
+# transport failure with no HTTP response at all, because every nonzero exit took the
+# same branch. "A 401 maps to PAT_INVALID" and "EVERYTHING maps to PAT_INVALID" are
+# indistinguishable to a substring check, so the collapse the preflight exists to
+# prevent shipped inside the preflight, past a green test.
+#
+# These run the actual shell against a stubbed `gh`, because the only assertion that
+# can tell those two apart is one that varies the input.
+
+_CASES = [
+    ("HTTP/2.0 401 Unauthorized", "RUNNER_PAT_INVALID", "an expired or revoked PAT"),
+    ("HTTP/2.0 403 Forbidden", "RUNNER_PAT_INVALID", "403 without rate-limit evidence"),
+    (
+        "HTTP/2.0 403 Forbidden\nx-ratelimit-remaining: 0",
+        "GITHUB_API_UNAVAILABLE",
+        "403 that IS a rate limit",
+    ),
+    ("HTTP/2.0 404 Not Found", "RUNNER_PAT_INVALID", "an org the token cannot see"),
+    ("HTTP/2.0 429 Too Many Requests", "GITHUB_API_UNAVAILABLE", "rate limiting"),
+    ("HTTP/2.0 503 Service Unavailable", "GITHUB_API_UNAVAILABLE", "a GitHub outage"),
+    ("dial tcp: lookup api.github.com: i/o timeout", "GITHUB_API_UNAVAILABLE", "no response"),
+]
+
+
+def _run_preflight(tmp_path, response: str, rc: int, org: str = "testorg") -> tuple[str, str]:
+    """Execute the preflight's classification half with `gh` stubbed out."""
+
+    body = _step("PAT must still be valid")["run"]
+    script = tmp_path / "preflight.sh"
+    out, summary = tmp_path / "out.txt", tmp_path / "sum.txt"
+    script.write_text(
+        f"set -uo pipefail\nORG={shlex.quote(org)}\n"
+        f'GITHUB_OUTPUT="{out}"\nGITHUB_STEP_SUMMARY="{summary}"\n' + body[body.index("RC=0") :],
+        encoding="utf-8",
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text(
+        '#!/usr/bin/env bash\nprintf "%s\\n" "$FAKE_RESP"\nexit "$FAKE_RC"\n',
+        encoding="utf-8",
+    )
+    (fake_bin / "gh").chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        "FAKE_RESP": response,
+        "FAKE_RC": str(rc),
+    }
+    # ⛔ `-e` IS THE POINT, NOT A DETAIL. Actions runs this step as `bash -e {0}`,
+    # and the regression being guarded — a bare `RESP=$(gh ...)` followed by
+    # `RC=$?` — only misbehaves under `-e`, where the failing assignment kills the
+    # shell before RC is ever read. A harness without `-e` cannot reproduce it, so
+    # it would pass forever INCLUDING on the exact regression it exists to stop.
+    proc = subprocess.run(["bash", "-e", str(script)], env=env, capture_output=True, check=False)
+    # Captured so the fallback arm's emitted response can be asserted; without it
+    # a test can only check that the guidance MENTIONS output, never that it exists.
+    (tmp_path / "stdout.txt").write_bytes(proc.stdout + proc.stderr)
+    # ⛔ A block that is not valid bash produces NO output — which every
+    # absence-assertion in this file is trivially satisfied by. Fail here instead.
+    assert b"unexpected EOF" not in proc.stderr, (
+        f"the extracted preflight is not valid bash:\n{proc.stderr.decode()}"
+    )
+    return (
+        out.read_text(encoding="utf-8") if out.exists() else "",
+        summary.read_text(encoding="utf-8") if summary.exists() else "",
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize(("response", "expected", "label"), _CASES)
+def test_each_failure_cause_is_classified_not_collapsed(tmp_path, response, expected, label):
+    out, _ = _run_preflight(tmp_path, response, rc=1)
+    assert f"failure_reason={expected}" in out, (
+        f"{label} must classify as {expected}; a preflight whose purpose is saying "
+        "WHY it failed cannot report five causes as one"
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_a_transport_failure_does_not_invent_an_http_status(tmp_path):
+    """⛔ `${CODE:-401}` ASSERTED a 401 that was never received. Reporting a status
+    the server never sent is worse than reporting none: it is a fabricated fact that
+    sends the reader to rotate a credential which may be perfectly valid."""
+
+    out, summary = _run_preflight(tmp_path, "dial tcp: i/o timeout", rc=1)
+    assert "401" not in summary, "a status was invented for a response that never arrived"
+    assert "none received" in summary
+    assert "failure_reason=GITHUB_API_UNAVAILABLE" in out
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_a_valid_pat_emits_no_failure_reason(tmp_path):
+    """The success path must stay silent — a reason emitted on success would make
+    every run look like a fallback.
+
+    ⛔ AN ABSENCE ASSERTION NEEDS A VALIDITY PRECONDITION. "no failure_reason" is
+    also what an EMPTY output file says, so this passed if the step exited before
+    reaching the success path at all — a moved slice anchor, or the missing-PAT
+    branch firing. An absence is evidence only once the code that would produce a
+    presence is shown to have run.
+    """
+
+    out, _ = _run_preflight(tmp_path, "HTTP/2.0 200 OK", rc=0)
+    log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
+    assert "runner PAT valid for" in log, (
+        "the success path never ran, so 'no failure_reason' proves nothing"
+    )
+    assert "failure_reason=" not in out
 
 
 def test_a_missing_pat_is_distinct_from_an_invalid_one():
@@ -1601,3 +1907,384 @@ def test_the_inner_run_does_not_inherit_addopts():
         "the inner pytest invocation must pass `-o addopts=` as ADJACENT arguments so it "
         f"does not inherit pyproject's addopts. Parsed argv: {argv}"
     )
+
+
+class TestTheFallbackArmPrintsWhatItPromises:
+    """⛔ THE DEFAULT ARM IS WHERE A FIX'S OWN DEFECT HIDES.
+
+    The `*)` branch fires when the status is UNRECOGNISED — precisely when the
+    operator has least to go on. Its fix text said "read the response below",
+    and `RESP` was captured, parsed twice, and never emitted. So the one arm
+    that exists for the unexplained case sent the reader to output that did not
+    exist, in a PR whose entire subject is a preflight that could not report why
+    it failed.
+
+    It is the branch least likely to have been exercised, which is exactly why
+    it was the one still broken. Check the default arm first, not last.
+    """
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_an_unexpected_status_emits_the_response(self, tmp_path):
+        out, summary = _run_preflight(tmp_path, "HTTP/2.0 418 I'm a teapot\nx-trace: abc123", rc=1)
+        log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
+        assert "::group::Unexpected preflight response" in log
+        assert "x-trace: abc123" in log, "the guidance names a response that must be printed"
+        assert "log" in summary, "the summary must say WHERE the response is"
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_the_echoed_response_cannot_forge_a_workflow_command(self, tmp_path):
+        """⛔ CWE-117 again. A response body echoed raw into an Actions log can
+        forge commands — `::error::` at line start is a COMMAND, not text. Same
+        shape as just-akash#252, reached by a different route: there the payload
+        arrived in an exception message, here in an HTTP body.
+
+        Asserted as the property that matters — the payload IS printed (the
+        operator needs it) but is wrapped in `::stop-commands::`, which is
+        GitHub's documented neutraliser. Deleting the payload would trade one
+        blind spot for another.
+        """
+        forged = "HTTP/2.0 418 Teapot\n::error title=forged::a provider is down"
+        _out, _summary = _run_preflight(tmp_path, forged, rc=1)
+        log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
+
+        assert "::error title=forged::" in log, "the evidence must still reach the operator"
+        stop = re.search(r"::stop-commands::([0-9a-f]{32})", log)
+        assert stop, "untrusted output was echoed without ::stop-commands::"
+        token = stop.group(1)
+        body_start = log.index(f"::stop-commands::{token}")
+        body_end = log.index(f"::{token}::")
+        assert body_start < log.index("::error title=forged::") < body_end, (
+            "the forged command fell outside the neutralised block"
+        )
+        assert log.index(f"::{token}::") < log.index("::endgroup::"), (
+            "commands must be resumed BEFORE ::endgroup::, or the group never closes"
+        )
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_a_recognised_status_does_not_dump_the_response(self, tmp_path):
+        """401 has specific guidance and does not promise the raw body — dumping
+        it for every failure would bury the named diagnosis this PR added."""
+        _run_preflight(tmp_path, "HTTP/2.0 401 Unauthorized\nx-trace: nope", rc=1)
+        log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
+        assert "::group::Unexpected preflight response" not in log
+
+
+class TestTheAnnotationCannotBeSplitByCallerInput:
+    """⛔ `${ORG}` IS A CALLER-SUPPLIED `workflow_call` INPUT.
+
+    It flows into TITLE, which is interpolated into `::error title=...::`. A CR
+    or LF in it ends that line, and whatever follows starts a NEW workflow
+    command — forging annotations, or `::stop-commands::` to switch command
+    processing off entirely.
+
+    Third entry point for this class in one day: an exception message
+    (just-akash#252), an HTTP response body (this PR's fallback arm), and now a
+    workflow input. Same defect, three doors.
+    """
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_a_newline_in_the_org_cannot_start_a_second_command(self, tmp_path):
+        _run_preflight(
+            tmp_path,
+            # ⛔ 404, NOT 401. Only the 404 arm interpolates ${ORG} into TITLE
+            # ("org ${ORG} is not visible..."); 401's TITLE is a fixed string. With
+            # 401 this test passed with the flattening REMOVED — the fixture could
+            # not carry the tainted value into the sink, so it proved nothing.
+            "HTTP/2.0 404 Not Found",
+            rc=1,
+            org="evil\n::error title=forged::a provider is down",
+        )
+        log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
+        annotations = [ln for ln in log.splitlines() if ln.startswith("::error")]
+        assert annotations, "the step emitted no annotation at all"
+        assert len(annotations) == 1, (
+            f"one failure must produce ONE annotation, got {len(annotations)}"
+        )
+        line = annotations[0]
+        # ⛔ ASSERT THE PROPERTY, NOT THE OLD PROXY. This used to read
+        # `"forged" not in ln.split("::")[1]`, which worked only because a RAW '::'
+        # split the line into pieces. Now that ':' is escaped, the forged text sits
+        # inert inside the title and that proxy fires on CORRECT behaviour. What
+        # actually matters is that no second command is emitted and that the caller's
+        # '::' cannot escape the property it was placed in.
+        assert "::error title=forged" not in line, "caller input started its own workflow command"
+        assert "%3A%3A" in line, (
+            "the caller's '::' was left raw inside a command property, so it truncates "
+            "the property list instead of being carried as text"
+        )
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_a_percent_escape_cannot_smuggle_a_newline_past_the_flattener(self, tmp_path):
+        """⛔ `tr -d` SEES LITERAL CONTROL CHARACTERS; THE RUNNER DECODES ESCAPES.
+
+        A caller who sends the four ordinary text characters `%0A` walks through the
+        flattener untouched — there is no control character there to delete — and an
+        unescaped `%` then leaves the runner free to decode them back into a newline
+        when it reads the property. Same for `::`, which truncates the property list,
+        and `,`, which appends a property (`file=...` re-points the annotation at a
+        file of the caller's choosing). (Reported by Copilot on #253.)
+
+        ⚠ The stdout-line assertions in the sibling test above cannot express this:
+        `%0A` produces ONE line either way, so `len(annotations) == 1` stays true with
+        the escaping removed. This asserts on the EMITTED ENCODING instead.
+        """
+        _run_preflight(
+            tmp_path,
+            "HTTP/2.0 404 Not Found",
+            rc=1,
+            org="evil%0A::error title=forged::x,file=/etc/passwd",
+        )
+        log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
+        annotations = [ln for ln in log.splitlines() if ln.startswith("::error")]
+        assert len(annotations) == 1, f"expected ONE annotation, got {len(annotations)}"
+        line = annotations[0]
+
+        assert "%250A" in line, (
+            "the '%' was left raw, so the runner decodes '%0A' into a newline inside "
+            "the annotation property"
+        )
+        assert ",file=" not in line, (
+            "an unescaped ',' injected a further command property — the annotation can "
+            "be re-pointed at an arbitrary file"
+        )
+        title = line.split("::", 2)[1]
+        assert "%3A%3A" in title, (
+            "an embedded '::' was left raw and truncates the property list early"
+        )
+        # ⛔ ORDERING PIN. Escaping ':' before '%' re-escapes the '%' in the '%3A' just
+        # written, so every value double-encodes and the annotation renders '%3A'
+        # instead of ':'. This fixture carries no literal '%3A', so the sequence can
+        # only appear if the sed expressions were reordered.
+        assert "%253A" not in line, (
+            "':' was escaped before '%': the '%' in '%3A' got escaped again, so every "
+            "value is double-encoded"
+        )
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_a_carriage_return_from_the_response_cannot_reach_the_annotation(self, tmp_path):
+        """⛔ CODE_TEXT's `tr -d` was the only guard on it, and nothing tested it.
+
+        Found by mutating `tr -d` off each variable in turn: TITLE is caught by the
+        test above, CLASS is two string literals and cannot be tainted at all, and
+        this one survived the ENTIRE file. Two guards over one value hid it — once ':'
+        is escaped, an injected '::' is neutralised whether or not the CR survived, so
+        only the variable where `tr -d` stands ALONE can fail for its own reason.
+
+        `CODE` is `awk 'NR==1 && $1 ~ /^HTTP/ {print $2}'` over the response. An awk
+        FIELD cannot span a newline — records are newline-delimited — so LF genuinely
+        cannot arrive here and no test could show it. `\r` is NOT a field separator,
+        so it can: a first line of `HTTP/2.0 403\rforged Forbidden` yields
+        CODE=`403\rforged`.
+
+        A lone CR does not end a line, so this is not command injection. It is log
+        SPOOFING — the CR returns the cursor to column 0 and what follows overwrites
+        the rendered line. That is the other half of CWE-117 and the half that
+        survives once the newline path is closed.
+        """
+        _run_preflight(tmp_path, "HTTP/2.0 403\rforged Forbidden", rc=1)
+        # ⛔ newline="" AND split("\n"). TWO separate ways this fixture destroys the very
+        # character it exists to detect, and the first one is invisible:
+        #   - `read_text()` applies UNIVERSAL NEWLINE TRANSLATION, silently rewriting the
+        #     \r to \n before any assertion sees it. Measured: with the guard mutated
+        #     off, the CR still never reached the test — the fixture, not the workflow,
+        #     was cleaning the input.
+        #   - `splitlines()` then breaks on \r as well, consuming whatever survived.
+        # A test for a control character has to read bytes the way the runner would.
+        with open(tmp_path / "stdout.txt", encoding="utf-8", newline="") as fh:
+            log = fh.read()
+        annotations = [ln for ln in log.split("\n") if ln.startswith("::error")]
+        assert annotations, "the step emitted no annotation at all"
+        assert not any("\r" in ln for ln in annotations), (
+            "a CR from the HTTP response reached the annotation: it returns the cursor "
+            "to column 0, so following text overwrites what was rendered"
+        )
+
+
+# ── #260: the probes must exercise the verb the containers use ──────────
+
+
+def _verdict_script(tmp_path, response: str) -> tuple[str, str]:
+    """Run the verdict step's credential re-check with `gh` stubbed.
+
+    Extracted rather than run whole: the block lives inside a 501-line `run:`
+    scalar. The slice is delimited by the VERDICT_RESP capture and the
+    RUNNER_NEVER_REGISTERED line that follows the case, so a restructure that
+    moves either one fails here rather than silently testing nothing.
+    """
+
+    body = _step("Provision")["run"]
+    start = body.index("VERDICT_RESP=")
+    # Cut at the LINE boundary, not the substring: ending mid-`echo "..."` leaves
+    # an unterminated quote and bash dies at EOF with an empty output file — which
+    # a test asserting "X not in out" would read as PASSING. An extractor that
+    # produces a broken script fails the wrong way round.
+    end = body.rindex("\n", 0, body.index("failure_reason=RUNNER_NEVER_REGISTERED")) + 1
+    block = textwrap.dedent(body[start:end])
+    tail = 'echo "failure_reason=RUNNER_NEVER_REGISTERED" >> "$GITHUB_OUTPUT"\n'
+
+    out = tmp_path / "out.txt"
+    script = tmp_path / "verdict.sh"
+    script.write_text(
+        f'set -uo pipefail\nORG=testorg\nGITHUB_OUTPUT="{out}"\n: > "{out}"\n' + block + tail,
+        encoding="utf-8",
+    )
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "gh").write_text(
+        '#!/usr/bin/env bash\nprintf "%s\\n" "$FAKE_RESP"\nexit "$FAKE_RC"\n', encoding="utf-8"
+    )
+    (fake / "gh").chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{fake}{os.pathsep}{os.environ['PATH']}",
+        "FAKE_RESP": response,
+        "FAKE_RC": "0" if response.split()[1:2] in (["200"], ["201"]) else "1",
+    }
+    proc = subprocess.run(["bash", "-e", str(script)], env=env, capture_output=True, check=False)
+    combined = (proc.stdout + proc.stderr).decode()
+    # ⛔ VACUITY GUARD. Every test here asserts a reason is ABSENT, and absence is
+    # what a broken extractor produces: a slice ending mid-`echo "..."` leaves an
+    # unterminated quote, bash dies at EOF, and the output file is empty — so
+    # `"RUNNER_NEVER_REGISTERED" not in out` passes while proving nothing. Measured:
+    # that is exactly what happened on the first cut of this harness.
+    assert "unexpected EOF" not in combined, f"the extracted block is not valid bash:\n{combined}"
+    # ⛔ CONTENT, not existence. `out.exists()` was ALWAYS true: the generated script
+    # runs `: > "$out"` on its 4th line, before the extracted block, so the file is
+    # created on every invocation. `combined.strip() or out.exists()` was therefore
+    # `<anything> or True` — a guard that could not fail on any input ever given to it.
+    #
+    # ⚠ AND IT PROTECTS NOTHING TODAY. Measured, not assumed. The comment this replaces
+    # asserted "Every test here asserts a reason is ABSENT"; that is false. All six
+    # callers also assert a PRESENCE — "runner_deny" in log, RUNNER_PAT_INVALID in out,
+    # RUNNER_NEVER_REGISTERED in out, INDETERMINATE in out (x2), "no status" in log —
+    # and a presence assertion already fails on empty output. Mutating the extractor to
+    # emit nothing turns all six red with this line or without it.
+    #
+    # So this is a net for a caller that does not exist yet: an absence-ONLY one, which
+    # the false premise above claims is the normal case here. Worth keeping correct
+    # rather than deleting, because a guard that cannot fire advertises a protection
+    # nothing provides — but do not credit it with catching anything that ships today.
+    #
+    # (Reported by Copilot on #253. See line 1257: the anti-vacuity harness for
+    # runner-teardown was itself vacuous as well, for an unrelated reason. Twice.)
+    produced = out.read_text(encoding="utf-8") if out.exists() else ""
+    assert combined.strip() or produced.strip(), "the verdict block produced no output at all"
+    return (produced, combined)
+
+
+class TestBothProbesUseTheWriteVerb:
+    """⛔ THE PREFLIGHT TESTED A READ; EVERY CONTAINER DOES A WRITE.
+
+    `gh api orgs/{org}/actions/runners` is a GET — it proves the PAT can LIST
+    runners. Each container gets `ACCESS_TOKEN=${GH_RUNNER_PAT}` and the image
+    exchanges it via POST .../actions/runners/registration-token, once per
+    replica because of `count: ${POOL_SIZE}`. So a PAT with read but not write
+    passed the gate and 403'd in all N replicas — the exact failure the gate
+    exists to prevent (#260).
+    """
+
+    def test_both_sites_post_a_registration_token(self):
+        preflight = _step("PAT must still be valid")["run"]
+        provision = _step("Provision")["run"]
+        for label, body in (("preflight", preflight), ("verdict", provision)):
+            assert "actions/runners/registration-token" in body, f"{label} still reads"
+            assert "--method POST" in body, f"{label} is not using the write verb"
+
+    def test_the_preflight_no_longer_probes_with_a_bare_list_read(self):
+        body = _step("PAT must still be valid")["run"]
+        assert "actions/runners?per_page=1" not in body, (
+            "a GET proves only that the PAT can LIST runners; the workload mints"
+        )
+
+
+class TestTheVerdictDoesNotBlameAProviderForOurCredential:
+    """⛔ THE MORE SERIOUS SITE. This step decides whether to accuse a PROVIDER.
+
+    Its own 401 text already said the container "mints its registration token
+    with this same credential" — it NAMED the write path while testing a read.
+    So a PAT that could list but not mint returned 200 here, the check fell
+    through, and the run blamed a host that did nothing wrong.
+
+    A preflight failing a run is recoverable and self-evident. A fabricated
+    provider fault is somebody else's reputation, decided by a check that was
+    asking the wrong question.
+    """
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_a_write_403_does_NOT_produce_a_provider_verdict(self, tmp_path):
+        out, log = _verdict_script(tmp_path, "HTTP/2.0 403 Forbidden")
+        assert "failure_reason=RUNNER_NEVER_REGISTERED" not in out, (
+            "the credential was the fault and the run accused a provider"
+        )
+        assert "runner_deny" in log.lower()
+        assert "do not runner_deny" in log.lower(), (
+            "the operator must be told explicitly not to act on this"
+        )
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_a_write_401_does_NOT_produce_a_provider_verdict(self, tmp_path):
+        out, _log = _verdict_script(tmp_path, "HTTP/2.0 401 Unauthorized")
+        assert "failure_reason=RUNNER_PAT_INVALID" in out
+        assert "failure_reason=RUNNER_NEVER_REGISTERED" not in out
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_201_is_success_so_a_healthy_credential_is_not_INDETERMINATE(self, tmp_path):
+        """⛔ 201, NOT 200. A successful mint is `201 Created`. Leaving the case
+        arm at 200 would send every HEALTHY credential to the `*)` arm and
+        report INDETERMINATE — 'the credential could not be re-checked' — on a
+        run where it was re-checked and was fine. That is not a safe default:
+        it converts a real provider fault into 'no evidence either way' and the
+        provider is never qualified."""
+
+        out, _log = _verdict_script(tmp_path, "HTTP/2.0 201 Created")
+        assert "failure_reason=INDETERMINATE" not in out
+        assert "failure_reason=RUNNER_NEVER_REGISTERED" in out, (
+            "with the credential proven healthy, the provider verdict must stand"
+        )
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_an_unreadable_check_still_refuses_to_accuse(self, tmp_path):
+        out, _log = _verdict_script(tmp_path, "dial tcp: i/o timeout")
+        assert "failure_reason=INDETERMINATE" in out
+        assert "failure_reason=RUNNER_NEVER_REGISTERED" not in out
+
+
+class TestTheVerdictCannotFabricateAStatus:
+    """⛔ A NON-HTTP FIRST LINE MUST NOT BECOME A STATUS CODE.
+
+    `awk 'NR==1{print $2}'` takes the second WORD of whatever the first line is.
+    A transport failure emits a plain error string, so `dial tcp: lookup ...
+    i/o timeout` yields `tcp:` — and that word then SELECTS A CASE ARM in the
+    step that decides whether to accuse a provider.
+
+    ⚠ It matters more here than at the preflight, which captures `|| RC=$?` and
+    branches on it. This capture ends `|| true`, so the status line is the ONLY
+    evidence — an unguarded parse is the whole input, not one input of two.
+    """
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    @pytest.mark.parametrize(
+        "junk",
+        [
+            "dial tcp: lookup api.github.com: i/o timeout",
+            "error: 403 something",
+            "gh: command failed",
+        ],
+    )
+    def test_a_non_http_first_line_reaches_no_accusatory_arm(self, tmp_path, junk):
+        out, log = _verdict_script(tmp_path, junk)
+        assert "failure_reason=INDETERMINATE" in out, (
+            f"{junk!r} was parsed into a status instead of being rejected"
+        )
+        assert "failure_reason=RUNNER_NEVER_REGISTERED" not in out
+        assert "do not runner_deny" in log.lower()
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_the_word_that_would_have_been_taken_is_not_reported_as_a_status(self, tmp_path):
+        """`error: 403 something` has `403` as its second word. Unguarded, that
+        selects the rate-limit arm and reports a status the server never sent —
+        a fabricated fact presented as a measurement."""
+
+        _out, log = _verdict_script(tmp_path, "error: 403 something")
+        assert "HTTP 403" not in log, "a status was invented from an error string"
+        assert "no status" in log.lower()
