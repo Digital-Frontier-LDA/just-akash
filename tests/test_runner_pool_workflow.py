@@ -2053,8 +2053,28 @@ def _verdict_script(tmp_path, response: str) -> tuple[str, str]:
     # `"RUNNER_NEVER_REGISTERED" not in out` passes while proving nothing. Measured:
     # that is exactly what happened on the first cut of this harness.
     assert "unexpected EOF" not in combined, f"the extracted block is not valid bash:\n{combined}"
-    assert combined.strip() or out.exists(), "the verdict block produced no output at all"
-    return (out.read_text(encoding="utf-8") if out.exists() else "", combined)
+    # ⛔ CONTENT, not existence. `out.exists()` was ALWAYS true: the generated script
+    # runs `: > "$out"` on its 4th line, before the extracted block, so the file is
+    # created on every invocation. `combined.strip() or out.exists()` was therefore
+    # `<anything> or True` — a guard that could not fail on any input ever given to it.
+    #
+    # ⚠ AND IT PROTECTS NOTHING TODAY. Measured, not assumed. The comment this replaces
+    # asserted "Every test here asserts a reason is ABSENT"; that is false. All six
+    # callers also assert a PRESENCE — "runner_deny" in log, RUNNER_PAT_INVALID in out,
+    # RUNNER_NEVER_REGISTERED in out, INDETERMINATE in out (x2), "no status" in log —
+    # and a presence assertion already fails on empty output. Mutating the extractor to
+    # emit nothing turns all six red with this line or without it.
+    #
+    # So this is a net for a caller that does not exist yet: an absence-ONLY one, which
+    # the false premise above claims is the normal case here. Worth keeping correct
+    # rather than deleting, because a guard that cannot fire advertises a protection
+    # nothing provides — but do not credit it with catching anything that ships today.
+    #
+    # (Reported by Copilot on #253. See line 1257: the anti-vacuity harness for
+    # runner-teardown was itself vacuous as well, for an unrelated reason. Twice.)
+    produced = out.read_text(encoding="utf-8") if out.exists() else ""
+    assert combined.strip() or produced.strip(), "the verdict block produced no output at all"
+    return (produced, combined)
 
 
 class TestBothProbesUseTheWriteVerb:
