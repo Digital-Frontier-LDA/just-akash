@@ -97,23 +97,42 @@ jobs:
   # conflict resolution that takes "ours" across a region and discards
   # what another PR just landed looks identical to a clean PR. This
   # check extracts top-level symbols (functions / classes / module-level
-  # assignments) from each Python file the PR modifies at main, at PR
-  # head, and at merge-base, and flags every symbol main has that PR
-  # head doesn't. Categorisation (three reachable cases):
+  # assignments / annotated assignments with a value / tuple-unpacked
+  # targets) from each Python file the PR modifies at main, at PR head,
+  # and at merge-base, and flags every symbol main has that PR head
+  # doesn't. Categorisation (three reachable cases + one diagnostic):
   #
-  #   FAIL (exits 1, blocks merge) - POSSIBLE_DROP.
-  #     The branch is up to date but a symbol that should be there
-  #     (was at branch time, or was added to main after fork and the
-  #     branch has caught up via rebase) is missing. Reviewer MUST
-  #     verify before merging -- either the deletion was intentional
-  #     and documented in a commit message (auto-downgrades to OK), or
-  #     the symbol was lost in a conflict resolution and must be
-  #     restored (the FAIL output names the symbol, the file, and the
-  #     remediation: redo the conflict resolution keeping both sides).
+  #   FAIL (exits 1) - POSSIBLE_DROP.
+  #     Branch is up to date but a symbol that should be there (was at
+  #     branch time, or was added to main after fork and the branch has
+  #     caught up via rebase) is missing. Three causes produce the
+  #     same PR diff shape: (a) intentional delete by the PR author --
+  #     auto-downgrades to INTENTIONAL_DELETE when a commit message
+  #     names the symbol with delete / remove / drop / deprecate /
+  #     retire; (b) lost in conflict resolution -- branch rebased onto
+  #     newer main, conflict was resolved by taking "ours", main's
+  #     symbol was discarded (remediation: redo the resolution keeping
+  #     both sides); (c) whole-file deletion -- the PR removed an
+  #     entire module. The FAIL output names the symbol, the file, and
+  #     the remediation for each cause.
+  #
+  #     ADVISORY IN v1 (does not block merge). The required status
+  #     contexts on main remain: Ruff lint + format, Unit tests,
+  #     Gitleaks, TruffleHog, detect-secrets, Pyright type check. The
+  #     promotion trigger is named in the PR body: first true positive
+  #     -> propose making it required.
+  #
   #   WARN (exits 0, informational) - STALE_BRANCH / LEGACY_STALE.
   #     The branch has not rebased onto current main. Reviewer may ask
   #     the author to rebase; the PR can still merge safely because
   #     the missing symbols are main-only and rebase would surface them.
+  #
+  #   WARN (exits 0, abstention) - SYNTAX_PARSE_FAIL.
+  #     A file in the PR diff does not parse at one or more of
+  #     (merge-base, head, main). "I couldn't look" must not look
+  #     like "nothing was there"; the check explicitly abstains and
+  #     reviewer must manually inspect.
+  #
   #   OK (exits 0) - no missing symbols, or INTENTIONAL_DELETE
   #     auto-detected via PR commit message naming the symbol with a
   #     delete / remove / drop / deprecate / retire keyword.

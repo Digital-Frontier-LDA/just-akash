@@ -2,7 +2,7 @@
 
 The check exists because a merge that silently drops content produces no
 conflict, no failing test, and no undefined symbol. These tests construct
-six scenarios and verify the check distinguishes them:
+seven scenarios and verify the check distinguishes them:
 
   - drop             : branch rebased onto main with conflict resolution
                        that took "ours" and discarded main's new symbols
@@ -21,6 +21,14 @@ six scenarios and verify the check distinguishes them:
   - annotated_unpack : main has `FOO: int = 1` and `a, b = ...` style
                        module-level symbols; PR drops them
                        → MUST exit 1 with FAIL POSSIBLE_DROP for each
+  - substring_guard  : commit-message check must use word boundaries; a
+                       symbol named "bar" must NOT auto-downgrade just
+                       because it appears as a substring inside "embargo"
+                       → MUST exit 1 with FAIL POSSIBLE_DROP, never
+                         INTENTIONAL_DELETE
+
+Plus one edge case (no Python files modified) which is the early-return
+"no work to do" path.
 """
 
 from __future__ import annotations
@@ -295,6 +303,39 @@ def test_annotated_and_tuple_symbols_detected(sandbox: Path) -> None:
     assert "BAR" in result.stdout, result.stdout
     assert "first" in result.stdout, result.stdout
     assert "second" in result.stdout, result.stdout
+
+
+# --- Scenario G: substring false positive guard on commit-message check ---
+
+
+def test_substring_match_does_not_auto_downgrade(sandbox: Path) -> None:
+    """`pr_commits_mention` must use word boundaries -- a symbol named
+    'bar' must NOT match inside 'embargo'. Without word boundaries, the
+    old substring check would auto-downgrade a real drop to OK just
+    because a delete-keyword appeared anywhere on a line that happened
+    to contain the symbol's characters as a substring."""
+    _write(
+        sandbox,
+        "main",
+        "def bar():\n    return 1\n\n\ndef helper():\n    return 'h'\n",
+        "main: add bar() + helper()",
+    )
+
+    _git(sandbox, "checkout", "-q", "-b", "branch-G", "main")
+    (sandbox / "bar.py").write_text("def helper():\n    return 'h'\n")
+    _git(sandbox, "add", "bar.py")
+    _git(sandbox, "commit", "-q", "-m", "G: remove embargo logic")
+
+    result = _run_check(sandbox, "main", "branch-G")
+    # 'bar' inside 'embargo' must NOT match: auto-downgrade requires
+    # the symbol name to appear as a whole token next to a delete keyword.
+    assert result.returncode == 1, (
+        f"substring false positive MUST NOT auto-downgrade; "
+        f"got {result.returncode}\n{result.stdout}"
+    )
+    assert "POSSIBLE_DROP" in result.stdout, result.stdout
+    assert "bar.py::bar" in result.stdout, result.stdout
+    assert "INTENTIONAL_DELETE" not in result.stdout, result.stdout
 
 
 # --- Edge case: empty diff (no Python files modified) ---

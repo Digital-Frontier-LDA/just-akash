@@ -95,6 +95,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import re
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -159,16 +160,20 @@ def pr_commits_mention(repo: Path, base: str, head: str, name: str) -> bool:
     """Return True if any commit on the PR branch (reachable from head
     but not from base) mentions `name` together with a delete/remove/drop
     keyword. Heuristic only — used to down-weight POSSIBLE_DROP cases
-    where the PR author explicitly documented the deletion."""
+    where the PR author explicitly documented the deletion.
+
+    Word-boundary matching on the symbol name prevents false positives
+    from substring overlap (e.g. a symbol named "mit" matching inside
+    "submit" or a symbol named "bar" matching inside "embargo")."""
     try:
         log = run(["git", "log", "--format=%s", f"{base}..{head}"], repo)
     except subprocess.CalledProcessError:
         return False
     keywords = ("delete", "remove", "drop", "deprecate", "retire")
-    name_lower = name.lower()
+    name_pat = re.compile(rf"\b{re.escape(name)}\b")
     for line in log.splitlines():
         lc = line.lower()
-        if name_lower in lc and any(k in lc for k in keywords):
+        if name_pat.search(lc) and any(k in lc for k in keywords):
             return True
     return False
 
