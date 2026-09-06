@@ -91,6 +91,56 @@ jobs:
       - name: Run unit tests
         run: uv run pytest tests/ --tb=short -q
 
+  # The symbol-presence check exists because a merge that silently drops
+  # content produces no conflict, no failing test, and no undefined
+  # symbol: every existing check evaluates the file as it now is, so a
+  # conflict resolution that takes "ours" across a region and discards
+  # what another PR just landed looks identical to a clean PR. This
+  # check extracts top-level symbols (functions / classes / module-level
+  # assignments) from each Python file the PR modifies at main, at PR
+  # head, and at merge-base, and flags every symbol main has that PR
+  # head doesn't. Categorisation:
+  #
+  #   FAIL (exits 1, blocks merge) - POSSIBLE_DROP / CONFLICT_RESOLUTION_DROP.
+  #     The branch is up to date but a symbol that should be there
+  #     (was at branch time, or was added to main after fork and the
+  #     branch has caught up via rebase) is missing. Reviewer MUST
+  #     verify before merging -- either the deletion was intentional
+  #     and documented in a commit message (auto-downgrades to OK), or
+  #     the symbol was lost in a conflict resolution and must be
+  #     restored.
+  #   WARN (exits 0, informational) - STALE_BRANCH / LEGACY_STALE.
+  #     The branch has not rebased onto current main. Reviewer may ask
+  #     the author to rebase; the PR can still merge safely because
+  #     the missing symbols are main-only and rebase would surface them.
+  #   OK (exits 0) - no missing symbols, or INTENTIONAL_DELETE
+  #     auto-detected via PR commit message naming the symbol with a
+  #     delete / remove / drop / deprecate / retire keyword.
+  #
+  # See tests/test_symbol_presence_check.py for the synthetic scenarios
+  # the check was designed to distinguish.
+  symbol-presence-check:
+    name: Symbol-presence check (Python files)
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 because `git merge-base origin/main HEAD` needs
+      # to walk back through history. Default shallow clone can't.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+
+      # The script only uses stdlib (ast, subprocess, argparse); no
+      # project deps required. Run it directly with the system python.
+      - name: Run symbol-presence check
+        run: python scripts/symbol_presence_check.py --repo . --base origin/main --head HEAD
+
   # DEPENDABOT CANNOT REACH SOPS, so these two jobs could never pass on its PRs.
   # GitHub withholds repository secrets from dependabot by design -- a malicious
   # dependency update must not be able to exfiltrate them -- so SOPS_AGE_KEY arrives
