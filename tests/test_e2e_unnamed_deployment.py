@@ -802,11 +802,14 @@ _SHELL_PAYLOADS = [
 def test_the_dseq_capture_is_digits_only_because_it_reaches_a_shell(payload):
     """⛔ `(\\d+)` IS THE WHOLE BARRIER BETWEEN PARSED OUTPUT AND `shell=True`.
 
-    The captured DSEQ is interpolated into six commands run through
-    `subprocess.run(..., shell=True)` — `test_shell_e2e.py:476, 510, 547, 562, 580,
-    621` — and into a log line at :309 that invites a human to paste it into their
-    own terminal. Nothing between the patterns and those sites says so; they are
-    ~400 lines apart.
+    The captured DSEQ is interpolated UNQUOTED into every
+    `run(f"uv run just-akash ... --dseq {dseq} ...")` in `main` (`run` passes
+    shell=True), and into the `verify it is ours before closing:` line in
+    `report_unnamed_deployment` — which prints a command for a HUMAN to paste into
+    their own terminal, so it runs with their privileges rather than CI's.
+
+    Anchored by symbol rather than line number: the first version cited lines that
+    were already wrong when written, because adding the note shifted them.
 
     ⚠ THIS PR WIDENS DSEQ EXTRACTION, which makes the dangerous edit the natural
     one: the first time a DSEQ appears in an unexpected shape, `(\\d+)` -> `(\\S+)`
@@ -819,8 +822,9 @@ def test_the_dseq_capture_is_digits_only_because_it_reaches_a_shell(payload):
     for name, pattern in (("_DSEQ_SUMMARY_RE", _DSEQ_SUMMARY_RE), ("_DSEQ_ANY_RE", _DSEQ_ANY_RE)):
         for capture in pattern.findall(payload):
             assert capture.isdigit(), (
-                f"{name} captured {capture!r} from {payload!r} — a non-digit capture is "
-                "interpolated into `shell=True` commands at :476/:510/:547/:562/:580/:621"
+                f"{name} captured {capture!r} from {payload!r} — a non-digit capture "
+                'is interpolated unquoted into every `run(f"uv run just-akash ... '
+                '{dseq} ...")` in main, which passes shell=True'
             )
 
 

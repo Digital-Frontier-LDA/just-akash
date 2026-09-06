@@ -71,11 +71,15 @@ def run(cmd: str, timeout: int = 60, input_text: str | None = None) -> subproces
 _DSEQ_SUMMARY_RE = re.compile(r"DSEQ[:\s]+(\d+)")
 
 # ⛔ `(\d+)` IN BOTH PATTERNS IS A SHELL-INJECTION BARRIER, not a tidy way to say
-# "a number". The captured DSEQ is interpolated into six commands run through
-# `subprocess.run(..., shell=True)` (see `run`, and the call sites around :476,
-# :510, :547, :562, :580, :621) and into a log line that invites a human to paste
-# it into their own terminal. Those sites are ~400 lines away and say nothing about
-# it, which is why this says it here.
+# "a number". The captured DSEQ is interpolated UNQUOTED into every `run(f"uv run
+# just-akash ... --dseq {dseq} ...")` in `main` — `run` passes shell=True — and into
+# the `verify it is ours before closing:` line in `report_unnamed_deployment`, which
+# prints a command for a HUMAN to paste into their own terminal.
+#
+# ⛔ CITED BY ANCHOR, NOT BY LINE NUMBER, on purpose: the first version of this note
+# gave line numbers, and they were already wrong in the commit that added them —
+# the note's own insertion shifted the code it pointed at. A stale pointer sends the
+# next reader somewhere else entirely, which is worse than no pointer.
 #
 # ⛔ SO DO NOT WIDEN THE CAPTURE. `(\d+)` -> `(\S+)` is the natural-looking edit the
 # first time a DSEQ turns up in an unexpected shape, and it is one character between
@@ -318,6 +322,11 @@ def report_unnamed_deployment(
         # worse than closing none, because it takes down a live deployment and reports
         # success while doing so.
         log_info(f"  candidate DSEQ (UNVERIFIED, not closed): {candidate}")
+        # ⛔ THIS PRINTS A COMMAND FOR A HUMAN TO PASTE, so it runs with THEIR
+        # privileges, not CI's — the only sink here that escapes this process's
+        # constraints. Safe for the same one reason as the rest: `candidate` is
+        # digits by construction, coming only from a `(\d+)` capture. It is a
+        # separate path from `dseq`, so the note at that binding does not cover it.
         log_info(f"  verify it is ours before closing: just-akash status --dseq {candidate}")
     log_info(
         f"  created-between: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(started_at))}"
@@ -468,7 +477,7 @@ def main():
         sys.exit(1)
 
     # ⛔ EVERYTHING BELOW INTERPOLATES `dseq` INTO A SHELL. `run` uses shell=True, and
-    # `dseq` goes in unquoted at :510, :547, :562, :580 and the two status polls. It is
+    # every `run(f"uv run just-akash ... {dseq} ...")` below takes it unquoted. It is
     # safe for exactly one reason: it is digits BY CONSTRUCTION — the only writers of
     # `dseq_ref["dseq"]` are `(\d+)` captures, and the /tmp-derived `recovered_dseq` is
     # deliberately kept out of `dseq_ref` (see step 2), so a world-writable file cannot
