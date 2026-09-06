@@ -63,6 +63,120 @@ def run(cmd: str, timeout: int = 60, input_text: str | None = None) -> subproces
     )
 
 
+#: The deployment SUMMARY line, `DSEQ: 12345` (deploy.py's closing `print`). It is
+#: block-buffered — stdout is a pipe here, not a tty — so it is the FIRST thing lost
+#: when the child is killed. Authoritative when it arrives, absent when it matters.
+_DSEQ_SUMMARY_RE = re.compile(r"DSEQ[:\s]+(\d+)")
+
+#: Every shape deploy.py writes a DSEQ in, notably `DSEQ=12345` from the flush=True
+#: `_log` at deploy.py:1104 — the one emission that SURVIVES a kill. Failure path only;
+#: see the comment at its use site for why widening the success path would be a bug.
+_DSEQ_ANY_RE = re.compile(r"DSEQ[=:\s]+(\d+)")
+
+
+def _decoded(stream: object) -> str:
+    """`TimeoutExpired.stdout` is BYTES even when the call passed `text=True`.
+
+    ⛔ Measured, because it is silent either way: `subprocess.run(..., text=True,
+    timeout=N)` raises with `.stdout` as bytes, so `exc.stdout + exc.stderr` is a
+    TypeError and a `str` pattern over it matches nothing at all. Both failures look
+    like "the deployment had no DSEQ" and neither is about the deployment.
+    """
+    if stream is None:
+        return ""
+    if isinstance(stream, (bytes, bytearray)):
+        return bytes(stream).decode("utf-8", "replace")
+    return str(stream)
+
+
+#: `just up` pipes the deploy through `tee` to this FIXED path (see the `up` recipe in
+#: the justfile, which then greps the same file for the DSEQ). It is on disk, so unlike
+#: the pipe it survives the parent giving up.
+_DEPLOY_TEE_LOG = "/tmp/.akash-last-deploy.log"
+
+
+def _dseq_from_deploy_log(started_at: float, *, wait: float = 15.0) -> str | None:
+    """Recover the DSEQ from the file `just up` tees to, once the pipe has yielded none.
+
+    ⛔ TWO MEASURED FACTS, both counter-intuitive, make this the better source:
+
+      1. `subprocess.run(timeout=)` SIGKILLs its DIRECT child only. `sh -c "just up"`
+         execs, so `just` IS that child — but the bash recipe it runs, and the
+         `uv run just-akash deploy` inside that, are GRANDchildren. Measured: a
+         grandchild ran to completion and wrote its work AFTER the parent gave up.
+         So the deploy is probably still going, and this file is still growing.
+      2. Which is why this WAITS instead of reading once. The instant of the timeout
+         is the moment the file is least complete.
+
+    ⛔ A FIXED PATH MAKES STALE DATA INDISTINGUISHABLE FROM FRESH. Every `just up`
+    truncates and rewrites this path, so a file older than this run belongs to a
+    PREVIOUS one, and naming its DSEQ would attribute another run's deployment to
+    this one — then hand it to `robust_destroy`. mtime is the only thing separating
+    them, so a file that predates us is treated as no file at all.
+    """
+    deadline = time.monotonic() + wait
+    while True:
+        text = None
+        try:
+            if os.stat(_DEPLOY_TEE_LOG).st_mtime >= started_at:
+                with open(_DEPLOY_TEE_LOG, encoding="utf-8", errors="replace") as fh:
+                    text = fh.read()
+        except OSError:
+            text = None
+        if text is not None:
+            found = sorted(set(_DSEQ_ANY_RE.findall(text)))
+            if len(found) == 1:
+                return found[0]
+            if len(found) > 1:
+                log_fail(
+                    f"{_DEPLOY_TEE_LOG} names more than one DSEQ ({', '.join(found)}); "
+                    "a re-deploy round supersedes an earlier one and this file cannot "
+                    "say which is live. Closing none of them."
+                )
+                return None
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(1.0)
+
+
+def report_unnamed_deployment(started_at: float, ended_at: float) -> None:
+    """State, greppably, that a deployment may exist which this run cannot name.
+
+    ⛔ REPORTS, NEVER CLOSES. Naming a thing and closing it are different
+    authorities: the harness may destroy the deployment IT created and can identify,
+    but a deployment it cannot identify is not its to guess at. Closing an
+    unidentified deployment means closing someone else's, and the Console listing
+    cannot tell them apart — `list_deployments()` is not scoped server-side (three
+    distinct API keys returned byte-identical bodies, measured 2026-08-30; see
+    cleanup_stale.py). Owner-scoped enumeration exists on the CHAIN, and that is the
+    instrument this window is meant to feed.
+
+    The parent survives the child's death, so this line always gets written even when
+    every byte the child produced was lost. A time window plus an owner is enough to
+    find the deployment later; nothing at all is what #278 was about.
+    """
+    log_fail(
+        "UNNAMED DEPLOYMENT POSSIBLE — `just up` may have created a deployment that "
+        "this run cannot identify. No DSEQ was recoverable from anything it flushed."
+    )
+    log_info(
+        f"  created-between: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(started_at))}"
+        f" .. OPEN (this run gave up at "
+        f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(ended_at))})"
+    )
+    # ⛔ OPEN-ENDED ON PURPOSE, and getting this wrong would be worse than saying
+    # nothing. The timeout SIGKILLs only the DIRECT child; the deploy runs two levels
+    # down and survives (measured). So it may create the deployment AFTER this run has
+    # exited, and a window closed at the moment we gave up would exclude the very
+    # event it is meant to help find.
+    log_info(f"  the deploy may still be running; its own log is {_DEPLOY_TEE_LOG}")
+    log_info(
+        "  to resolve: enumerate OWNER-SCOPED FROM CHAIN (not the Console listing, "
+        "which is not scoped server-side) for deployments created at or after the "
+        "start time, and close by hand if one is ours."
+    )
+
+
 def main():
     failures = []
     dseq_ref: dict = {"dseq": None}
@@ -87,24 +201,93 @@ def main():
     # ── Step 2: Deploy via `just up` ─────────────────────────
     log_step(2, "Deploy via `just up`")
 
-    r = run("just up", timeout=300)
-    output = r.stdout + r.stderr
+    # ⛔ THE PARENT CANNOT RELY ON ANYTHING THE CHILD PROMISED TO DO. That is the
+    # class, and this one call held three instances of it (#278):
+    #
+    #   1. `subprocess.run(timeout=)` kills with SIGKILL. Measured: a child that
+    #      installs SIGTERM/SIGINT/SIGHUP handlers AND an atexit AND a try/finally
+    #      logs only "CHILD STARTED". So all SEVEN cleanup sites in deploy.py are
+    #      guaranteed dead here — and `install_signal_cleanup` above cannot help
+    #      either: it is signal-driven, and it reads a dseq_ref populated BELOW.
+    #   2. The exception was never caught, so it escaped before the DSEQ was parsed
+    #      and before main's try/finally, taking the run with it and leaving a
+    #      deployment nothing could name.
+    #   3. `TimeoutExpired` CARRIES the output flushed before the kill, and it was
+    #      discarded — the identifier was in hand and thrown away.
+    #
+    # The DSEQ is assigned SERVER-SIDE (POST /v1/deployments returns it), so the
+    # parent cannot pre-record it and no amount of local bookkeeping closes the
+    # window. What it can do is keep whatever the child flushed, and say so loudly
+    # when that is nothing.
+    deploy_started_at = time.time()
+    try:
+        r = run("just up", timeout=300)
+        deploy_out, deploy_err, returncode = r.stdout, r.stderr, r.returncode
+    except subprocess.TimeoutExpired as exc:
+        # ⛔ KEPT APART, not concatenated. `TimeoutExpired` carries the two streams
+        # separately, so the timeout path can report the same evidence as every other
+        # failure path — and #274's invariant requires it: a failure that names its
+        # returncode must name its stdout and stderr too, or it is unactionable.
+        # Collapsing them into one blob passed every human read of this diff and was
+        # caught by that test.
+        deploy_out, deploy_err = _decoded(exc.stdout), _decoded(exc.stderr)
+        returncode = -1
+        log_fail(
+            f"`just up` exceeded its {exc.timeout:.0f}s timeout and was SIGKILLed. "
+            "Anything it created is still on chain and none of its own cleanup ran."
+        )
+    deploy_ended_at = time.time()
+    output = deploy_out + deploy_err
     print(output)
 
-    m = re.search(r"DSEQ[:\s]+(\d+)", output)
+    m = _DSEQ_SUMMARY_RE.search(output)
     if m:
         dseq_ref["dseq"] = m.group(1)
+    elif returncode != 0:
+        # ⛔ WIDER PATTERN, FAILURE PATH ONLY — and the asymmetry is the finding.
+        # `DSEQ=` (deploy.py:1104) goes through `_log`, which prints with flush=True,
+        # so it is the ONE emission that survives a kill. `DSEQ: ` (deploy.py:2116)
+        # is an unflushed print and is the first thing lost. The recoverable line was
+        # the one the pattern did not match; the matched line was the one that never
+        # arrived. Both halves had to be true for the DSEQ to go missing.
+        #
+        # ⛔ NOT widened on the success path, deliberately: deploy.py's re-deploy round
+        # emits a second `DSEQ=` (deploy.py:1928), so a first-match search would name
+        # the SUPERSEDED deployment. Where the summary line exists it is authoritative
+        # and nothing here should second-guess it.
+        candidates = sorted(set(_DSEQ_ANY_RE.findall(output)))
+        if len(candidates) == 1:
+            dseq_ref["dseq"] = candidates[0]
+            log_info(f"Recovered DSEQ={candidates[0]} from what the child flushed before dying")
+        elif candidates:
+            log_fail(
+                "More than one candidate DSEQ survived in the killed child's output — "
+                f"{', '.join(candidates)}. Closing none of them: a re-deploy round "
+                "supersedes an earlier DSEQ and this output cannot say which is live."
+            )
 
-    if r.returncode != 0:
+    # ⛔ THE PIPE IS NOT THE ONLY COPY. Before declaring a deployment unnameable, read
+    # the file `just up` tees to — it is on disk, the deploy is probably still writing
+    # to it, and the recipe already trusts it enough to grep it for the DSEQ itself.
+    if not dseq_ref["dseq"] and (returncode != 0 or not m):
+        recovered = _dseq_from_deploy_log(deploy_started_at)
+        if recovered:
+            dseq_ref["dseq"] = recovered
+            log_info(f"Recovered DSEQ={recovered} from {_DEPLOY_TEE_LOG}")
+
+    if returncode != 0:
         log_fail(
-            f"just up failed (rc={r.returncode}):\nstdout: {r.stdout!r}\nstderr: {r.stderr!r}"
+            f"just up failed (rc={returncode}):\nstdout: {deploy_out!r}\nstderr: {deploy_err!r}"
         )
         if dseq_ref["dseq"]:
             robust_destroy(dseq_ref["dseq"])
+        else:
+            report_unnamed_deployment(deploy_started_at, deploy_ended_at)
         sys.exit(1)
 
     if not dseq_ref["dseq"]:
         log_fail("Could not parse DSEQ from `just up` output")
+        report_unnamed_deployment(deploy_started_at, deploy_ended_at)
         sys.exit(1)
 
     dseq = dseq_ref["dseq"]
