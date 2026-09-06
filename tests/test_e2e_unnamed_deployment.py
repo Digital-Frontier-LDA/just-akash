@@ -488,3 +488,226 @@ def test_the_timeout_returncode_names_the_signal_that_was_actually_sent():
             f"negative literal asserts whichever signal it decodes to (-1 is SIGHUP) "
             f"— got {ast.unparse(a.value)!r}, a cause that did not happen"
         )
+
+
+# ── review round 2: the seam, the untrusted path, and a message that lied ────
+
+import threading  # noqa: E402
+
+from just_akash.test_shell_e2e import _findall_streams, _search_streams  # noqa: E402
+
+
+def test_a_dseq_cannot_be_fabricated_across_the_stdout_stderr_seam():
+    """⛔ CONCATENATION INVENTS BYTE RANGES NO WRITER EMITTED.
+
+    SIGKILL cuts stdout wherever it lands, so "stdout truncated mid-`DSEQ=`" is not
+    an exotic input — it is the exact state this recovery path exists to handle. Join
+    it to a stderr that happens to begin with digits and the pattern matches a number
+    **neither stream produced**. On the failure path that invented value would land in
+    dseq_ref and reach `robust_destroy`. (Reported by CodeRabbit on #279.)
+
+    The invariant, stated generally: a match must come from a byte range that one
+    writer actually produced.
+    """
+    out = "…deploying\n[2026-09-06T18:00:00Z] DSEQ="
+    err = "1788999999 is not a valid provider\n"
+
+    assert _DSEQ_ANY_RE.findall(out + err) == ["1788999999"], (
+        "the seam no longer fabricates — if the inputs changed, re-derive this test "
+        "rather than deleting it; it documents why the streams are kept apart"
+    )
+    assert _findall_streams(_DSEQ_ANY_RE, out, err) == [], (
+        "a DSEQ was matched across the stream boundary; it belongs to neither writer"
+    )
+    assert _search_streams(_DSEQ_SUMMARY_RE, out, err) is None
+    # and a genuine match in either stream is still found
+    assert _findall_streams(_DSEQ_ANY_RE, "DSEQ=111", "noise") == ["111"]
+    assert _findall_streams(_DSEQ_ANY_RE, "noise", "  DSEQ: 222") == ["222"]
+
+
+def test_a_fifo_at_the_tee_path_cannot_wedge_the_recovery(monkeypatch, tmp_path):
+    """⛔ A PLAIN open() ON A FIFO BLOCKS FOREVER.
+
+    `/tmp/.akash-last-deploy.log` is a world-writable fixed path. A FIFO planted
+    there turns a recovery attempt into a hang — which is worse than failing to
+    recover, because the run never ends to report anything at all.
+
+    ⚠ Run in a thread with a join timeout ON PURPOSE: without O_NONBLOCK this
+    regression HANGS rather than fails, and a hung suite reports nothing useful.
+    A test for a blocking bug must not be able to block.
+    """
+    fifo = tmp_path / "akash-last-deploy.log"
+    os.mkfifo(fifo)
+    monkeypatch.setattr(_tse, "_DEPLOY_TEE_LOG", str(fifo))
+
+    result: list[str] = []
+    t = threading.Thread(target=lambda: result.append(_tse._read_tee_log(0.0)), daemon=True)
+    t.start()
+    t.join(timeout=10)
+    assert not t.is_alive(), (
+        "the read blocked on a FIFO — O_NONBLOCK is gone, and this path can now wedge "
+        "a run instead of failing it"
+    )
+    assert result == [""], "a FIFO is not a regular file and must read as no file"
+
+
+def test_a_symlink_at_the_tee_path_is_refused(monkeypatch, tmp_path):
+    """O_NOFOLLOW: the path is world-writable, so the file it names is not ours."""
+    real = tmp_path / "elsewhere.log"
+    real.write_text("Deployment created  DSEQ=7777777777777\n", encoding="utf-8")
+    link = tmp_path / "akash-last-deploy.log"
+    link.symlink_to(real)
+    monkeypatch.setattr(_tse, "_DEPLOY_TEE_LOG", str(link))
+    assert _tse._read_tee_log(0.0) == "", (
+        "a symlink was followed — the read went somewhere this run did not write"
+    )
+
+
+def test_a_directory_at_the_tee_path_is_not_a_log(monkeypatch, tmp_path):
+    """S_ISREG covers the shapes O_NOFOLLOW does not."""
+    d = tmp_path / "akash-last-deploy.log"
+    d.mkdir()
+    monkeypatch.setattr(_tse, "_DEPLOY_TEE_LOG", str(d))
+    assert _tse._read_tee_log(0.0) == ""
+
+
+def test_a_second_dseq_arriving_late_is_still_seen_as_ambiguous(monkeypatch, tmp_path):
+    """⛔ RETURNING ON THE FIRST UNIQUE HIT NEVER OBSERVES THE AMBIGUITY.
+
+    The premise of this whole helper is that the deploy is STILL WRITING, so a
+    re-deploy round's second DSEQ can arrive inside the same wait window. Returning
+    early made the ambiguity refusal depend on timing — and a guard that fires
+    sometimes is worse than one that never fires, because a green run says nothing
+    about the next one. (Reported by CodeRabbit on #279.)
+    """
+    path = _tee_log(monkeypatch, tmp_path, "Deployment created  DSEQ=111\n")
+    started = time.time() - 5
+
+    def supersede():
+        time.sleep(0.5)
+        path.write_text(
+            "Deployment created  DSEQ=111\nRe-deployed: new order DSEQ=222\n",
+            encoding="utf-8",
+        )
+
+    threading.Thread(target=supersede, daemon=True).start()
+    assert _tse._dseq_from_deploy_log(started, wait=3.0) is None, (
+        "the late second DSEQ was never observed — recovery returned before the "
+        "window closed, so which answer you get depends on timing"
+    )
+
+
+def test_the_timeout_message_does_not_claim_the_deploy_is_dead():
+    """⛔ A WRONG LINE IN A LOG OUTLIVES A WRONG LINE IN CODE — nobody diffs it.
+
+    This message used to say "none of its own cleanup ran". The measurement that
+    motivates this entire PR says the opposite: only the DIRECT child is SIGKILLed,
+    and the deploy one level below survives, so its cleanup may well run. The
+    sentence taught the next reader precisely the false model the rest of the change
+    exists to correct. (Reported by Copilot on #279.)
+    """
+    # ⛔ THE ASSEMBLED STRING, not the source text. The first version of this test
+    # grepped the handler's source and failed on a CORRECT message, because the
+    # sentence is split across two adjacent string literals — "may still be " then
+    # "running". Reading the file as text asks a question about the source; the
+    # subject here is the message, so join the constants the parser produced.
+    handler_node = next(
+        h
+        for n in ast.walk(_TREE)
+        if isinstance(n, ast.Try)
+        for h in n.handlers
+        if "TimeoutExpired" in (ast.get_source_segment(_SRC, h) or "")
+    )
+    handler = "".join(
+        c.value
+        for c in ast.walk(handler_node)
+        if isinstance(c, ast.Constant) and isinstance(c.value, str)
+    )
+    assert "none of its own cleanup ran" not in handler, (
+        "the timeout message asserts the deploy's cleanup did not run; the grandchild "
+        "survives the kill, so that is a claim this PR's own measurement refutes"
+    )
+    assert "may still be running" in handler, (
+        "the timeout message no longer says the deploy may still be running, which is "
+        "the fact that makes an unattended deployment possible in the first place"
+    )
+
+
+def test_the_patterns_are_never_applied_to_a_joined_stream():
+    """⛔ The helpers are only worth having if the call sites use them.
+
+    `test_a_dseq_cannot_be_fabricated_across_the_stdout_stderr_seam` proves
+    `_search_streams`/`_findall_streams` are safe. It says nothing about whether
+    `main` still calls `.search(output)` on the concatenation — which is the actual
+    defect. Pin the call sites, not just the helper.
+    """
+    fn = next(n for n in ast.walk(_TREE) if isinstance(n, ast.FunctionDef) and n.name == "main")
+    offenders = []
+    for n in ast.walk(fn):
+        if (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr in {"search", "findall", "finditer", "match"}
+            and isinstance(n.func.value, ast.Name)
+            and n.func.value.id.startswith("_DSEQ")
+        ):
+            offenders.append(ast.unparse(n))
+    assert not offenders, (
+        f"a DSEQ pattern is applied directly in main ({offenders}) — it must go "
+        "through _search_streams/_findall_streams, or a match can be fabricated "
+        "across the stdout/stderr seam"
+    )
+
+
+def test_a_fifo_with_a_writer_cannot_feed_us_a_dseq(monkeypatch, tmp_path):
+    """A live FIFO planted at the world-writable path cannot feed us a DSEQ.
+
+    `/tmp` is world-writable, so anyone can plant a FIFO here and write to it. This
+    asserts the outcome that matters: whatever they send, the recovery reads nothing
+    and reports no candidate.
+
+    ⚠ IT DOES NOT ISOLATE `S_ISREG`, and I am not going to pretend otherwise.
+    Measured: deleting that check leaves every test here green, because `O_NONBLOCK`
+    already makes the FIFO read raise `BlockingIOError` and a directory raise
+    `IsADirectoryError` — both caught, both returning "". The type check has no
+    reachable unique contribution on this platform. It is kept as defence in depth
+    (see `_read_tee_log`), not because anything here proves it fires.
+    """
+    fifo = tmp_path / "akash-last-deploy.log"
+    os.mkfifo(fifo)
+    monkeypatch.setattr(_tse, "_DEPLOY_TEE_LOG", str(fifo))
+
+    stop = threading.Event()
+
+    def feed():
+        # opening for write blocks until a reader arrives; if none does, give up
+        try:
+            fd = os.open(str(fifo), os.O_WRONLY | os.O_NONBLOCK)
+        except OSError:
+            return
+        try:
+            while not stop.is_set():
+                try:
+                    os.write(fd, b"Deployment created  DSEQ=6666666666666\n")
+                except OSError:
+                    return
+                time.sleep(0.02)
+        finally:
+            os.close(fd)
+
+    writer = threading.Thread(target=feed, daemon=True)
+    writer.start()
+    try:
+        result: list[str] = []
+        t = threading.Thread(target=lambda: result.append(_tse._read_tee_log(0.0)), daemon=True)
+        t.start()
+        t.join(timeout=10)
+        assert not t.is_alive(), "the read blocked on a live FIFO"
+    finally:
+        stop.set()
+        writer.join(timeout=2)
+
+    assert result == [""], (
+        f"read {result!r} from a FIFO — content supplied by whoever planted it at a "
+        "world-writable path was about to be scanned for a DSEQ and reported as ours"
+    )

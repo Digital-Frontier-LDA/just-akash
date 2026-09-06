@@ -16,6 +16,7 @@ import json
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -75,6 +76,41 @@ _DSEQ_SUMMARY_RE = re.compile(r"DSEQ[:\s]+(\d+)")
 _DSEQ_ANY_RE = re.compile(r"DSEQ[=:\s]+(\d+)")
 
 
+#: `O_NOFOLLOW` is POSIX-only; absent it, the S_ISREG check below still applies.
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def _search_streams(pattern: re.Pattern[str], *streams: str) -> re.Match[str] | None:
+    """Search each stream on its own — NEVER their concatenation.
+
+    ⛔ `stdout + stderr` joined with no separator can FABRICATE a match across the
+    seam, and this is the one code path where that is likely rather than exotic:
+    SIGKILL truncates stdout mid-line, so a stdout ending `DSEQ=` beside a stderr
+    beginning with digits yields a number **neither stream emitted**. Measured:
+
+        out = "... Deployment created  DSEQ="
+        err = "1234567890 bytes written to socket"
+        concatenated -> ['1234567890']      <- in neither stream
+        per-stream   -> []
+
+    On the failure path that invented value lands in dseq_ref and reaches
+    `robust_destroy`. (Reported by CodeRabbit on #279.)
+    """
+    for stream in streams:
+        found = pattern.search(stream)
+        if found:
+            return found
+    return None
+
+
+def _findall_streams(pattern: re.Pattern[str], *streams: str) -> list[str]:
+    """Every match, per stream, never across the seam. See `_search_streams`."""
+    out: list[str] = []
+    for stream in streams:
+        out.extend(pattern.findall(stream))
+    return out
+
+
 def _decoded(stream: object) -> str:
     """`TimeoutExpired.stdout` is BYTES even when the call passed `text=True`.
 
@@ -94,6 +130,45 @@ def _decoded(stream: object) -> str:
 #: the justfile, which then greps the same file for the DSEQ). It is on disk, so unlike
 #: the pipe it survives the parent giving up.
 _DEPLOY_TEE_LOG = "/tmp/.akash-last-deploy.log"
+
+
+def _read_tee_log(started_at: float) -> str:
+    """Read the tee log if it is a regular file this run could have produced.
+
+    ⛔ A WORLD-WRITABLE FIXED PATH IN /tmp IS NOT A TRUSTED FILE. A plain `open()`
+    on a FIFO planted at that path BLOCKS FOREVER — verified — which turns a
+    recovery attempt into a hang; a symlink redirects the read somewhere else
+    entirely. (Reported by CodeRabbit on #279.)
+
+    So: `O_NONBLOCK` so a FIFO cannot wedge us, `O_NOFOLLOW` so a symlink is
+    refused outright, and `fstat` on the DESCRIPTOR rather than `stat` on the path
+    — which also closes the TOCTOU gap between checking and opening. Anything that
+    predates this run reads as no file at all.
+
+    ⚠ `S_ISREG` IS DEFENCE IN DEPTH, NOT A LOAD-BEARING GUARD, and the difference is
+    measured: deleting it leaves the whole suite green, because `O_NONBLOCK` already
+    makes a FIFO read raise `BlockingIOError` and a directory raise
+    `IsADirectoryError`, both of which land in the `except OSError` below. It is kept
+    because correctness should not rest on the incidental failure modes of a
+    non-blocking read on one platform — but do not mistake it for the thing doing the
+    work, and do not delete `O_NONBLOCK` on the strength of it being here.
+    """
+    try:
+        fd = os.open(_DEPLOY_TEE_LOG, os.O_RDONLY | os.O_NONBLOCK | _O_NOFOLLOW)
+    except OSError:
+        return ""
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_mtime < started_at:
+            return ""
+        with os.fdopen(fd, encoding="utf-8", errors="replace") as fh:
+            fd = -1  # fdopen owns it now
+            return fh.read()
+    except OSError:
+        return ""
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def _dseq_from_deploy_log(started_at: float, *, wait: float = 15.0) -> str | None:
@@ -124,28 +199,29 @@ def _dseq_from_deploy_log(started_at: float, *, wait: float = 15.0) -> str | Non
     is none — we are only here because this run's own output produced nothing.
     """
     deadline = time.monotonic() + wait
+    seen: set[str] = set()
     while True:
-        text = None
-        try:
-            if os.stat(_DEPLOY_TEE_LOG).st_mtime >= started_at:
-                with open(_DEPLOY_TEE_LOG, encoding="utf-8", errors="replace") as fh:
-                    text = fh.read()
-        except OSError:
-            text = None
-        if text is not None:
-            found = sorted(set(_DSEQ_ANY_RE.findall(text)))
-            if len(found) == 1:
-                return found[0]
-            if len(found) > 1:
-                log_fail(
-                    f"{_DEPLOY_TEE_LOG} names more than one DSEQ ({', '.join(found)}); "
-                    "a re-deploy round supersedes an earlier one and this file cannot "
-                    "say which is live. Closing none of them."
-                )
-                return None
-        if time.monotonic() >= deadline:
-            return None
-        time.sleep(1.0)
+        seen.update(_DSEQ_ANY_RE.findall(_read_tee_log(started_at)))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        # ⛔ POLL TO THE DEADLINE BEFORE DECIDING, rather than returning on the first
+        # unique hit. The whole premise is that the deploy is STILL WRITING, so a
+        # second DSEQ (a re-deploy round supersedes an earlier one) can arrive inside
+        # the same window. Returning early means the ambiguity check never observes
+        # the ambiguity it exists for, and which answer you get depends on timing.
+        # (Reported by CodeRabbit on #279.)
+        time.sleep(min(1.0, remaining))
+
+    if len(seen) == 1:
+        return next(iter(seen))
+    if seen:
+        log_fail(
+            f"{_DEPLOY_TEE_LOG} names more than one DSEQ ({', '.join(sorted(seen))}); "
+            "a re-deploy round supersedes an earlier one and this file cannot say "
+            "which is live. Naming none of them."
+        )
+    return None
 
 
 def report_unnamed_deployment(
@@ -258,14 +334,15 @@ def main():
         # child's returncode is -9. We are not guessing what killed it, we sent it.
         returncode = -int(signal.SIGKILL)
         log_fail(
-            f"`just up` exceeded its {exc.timeout:.0f}s timeout and was SIGKILLed. "
-            "Anything it created is still on chain and none of its own cleanup ran."
+            f"`just up` exceeded its {exc.timeout:.0f}s timeout; its DIRECT CHILD "
+            "was SIGKILLed. The deploy runs a level below that and may still be "
+            "running — anything it creates is on chain and unattended by this run."
         )
     deploy_ended_at = time.time()
     output = deploy_out + deploy_err
     print(output)
 
-    m = _DSEQ_SUMMARY_RE.search(output)
+    m = _search_streams(_DSEQ_SUMMARY_RE, deploy_out, deploy_err)
     if m:
         dseq_ref["dseq"] = m.group(1)
     elif returncode != 0:
@@ -280,7 +357,7 @@ def main():
         # emits a second `DSEQ=` (deploy.py:1928), so a first-match search would name
         # the SUPERSEDED deployment. Where the summary line exists it is authoritative
         # and nothing here should second-guess it.
-        candidates = sorted(set(_DSEQ_ANY_RE.findall(output)))
+        candidates = sorted(set(_findall_streams(_DSEQ_ANY_RE, deploy_out, deploy_err)))
         if len(candidates) == 1:
             dseq_ref["dseq"] = candidates[0]
             log_info(f"Recovered DSEQ={candidates[0]} from what the child flushed before dying")
