@@ -540,7 +540,7 @@ def test_a_fifo_at_the_tee_path_cannot_wedge_the_recovery(monkeypatch, tmp_path)
     os.mkfifo(fifo)
     monkeypatch.setattr(_tse, "_DEPLOY_TEE_LOG", str(fifo))
 
-    result: list[str] = []
+    result: list[tuple[str, ...]] = []
     t = threading.Thread(target=lambda: result.append(_tse._read_tee_log(0.0)), daemon=True)
     t.start()
     t.join(timeout=10)
@@ -548,7 +548,7 @@ def test_a_fifo_at_the_tee_path_cannot_wedge_the_recovery(monkeypatch, tmp_path)
         "the read blocked on a FIFO — O_NONBLOCK is gone, and this path can now wedge "
         "a run instead of failing it"
     )
-    assert result == [""], "a FIFO is not a regular file and must read as no file"
+    assert result == [()], "a FIFO is not a regular file and must read as no file"
 
 
 def test_a_symlink_at_the_tee_path_is_refused(monkeypatch, tmp_path):
@@ -558,7 +558,7 @@ def test_a_symlink_at_the_tee_path_is_refused(monkeypatch, tmp_path):
     link = tmp_path / "akash-last-deploy.log"
     link.symlink_to(real)
     monkeypatch.setattr(_tse, "_DEPLOY_TEE_LOG", str(link))
-    assert _tse._read_tee_log(0.0) == "", (
+    assert _tse._read_tee_log(0.0) == (), (
         "a symlink was followed — the read went somewhere this run did not write"
     )
 
@@ -568,7 +568,7 @@ def test_a_directory_at_the_tee_path_is_not_a_log(monkeypatch, tmp_path):
     d = tmp_path / "akash-last-deploy.log"
     d.mkdir()
     monkeypatch.setattr(_tse, "_DEPLOY_TEE_LOG", str(d))
-    assert _tse._read_tee_log(0.0) == ""
+    assert _tse._read_tee_log(0.0) == ()
 
 
 def test_a_second_dseq_arriving_late_is_still_seen_as_ambiguous(monkeypatch, tmp_path):
@@ -698,7 +698,7 @@ def test_a_fifo_with_a_writer_cannot_feed_us_a_dseq(monkeypatch, tmp_path):
     writer = threading.Thread(target=feed, daemon=True)
     writer.start()
     try:
-        result: list[str] = []
+        result: list[tuple[str, ...]] = []
         t = threading.Thread(target=lambda: result.append(_tse._read_tee_log(0.0)), daemon=True)
         t.start()
         t.join(timeout=10)
@@ -707,7 +707,75 @@ def test_a_fifo_with_a_writer_cannot_feed_us_a_dseq(monkeypatch, tmp_path):
         stop.set()
         writer.join(timeout=2)
 
-    assert result == [""], (
+    assert result == [()], (
         f"read {result!r} from a FIFO — content supplied by whoever planted it at a "
         "world-writable path was about to be scanned for a DSEQ and reported as ours"
     )
+
+
+# ── review round 3: two correct fixes composed into an unbounded cost ────────
+
+
+def test_an_oversized_tee_log_is_read_bounded_and_in_two_pieces(monkeypatch, tmp_path):
+    """⛔ THE DEFECT WAS THE INTERACTION, not either change.
+
+    `fh.read()` on a world-writable path was already unbounded. Then the
+    accumulate-to-the-deadline fix — correct on its own, and the right answer to a
+    non-deterministic ambiguity check — turned one unbounded read into one PER
+    SECOND until the deadline. Neither change is wrong alone; their product is.
+
+    Bounded now, and the bound is checked against a file far larger than the limit.
+    """
+    path = tmp_path / "akash-last-deploy.log"
+    limit = _tse._TEE_READ_LIMIT
+    filler = b"x" * (limit * 2)
+    path.write_bytes(b"HEAD DSEQ=1111111111111\n" + filler + b"\nTAIL DSEQ=2222222222222\n")
+    monkeypatch.setattr(_tse, "_DEPLOY_TEE_LOG", str(path))
+
+    segments = _tse._read_tee_log(time.time() - 5)
+    assert len(segments) == 2, "an oversized file must come back as head and tail"
+    assert sum(len(seg) for seg in segments) <= limit + 1, (
+        f"read {sum(len(seg) for seg in segments)} chars from a "
+        f"{path.stat().st_size}-byte file; the bound is not holding"
+    )
+    # both ends are still reachable: a DSEQ written late by the still-running deploy
+    # is exactly the case this recovery exists for, so a head-only bound would miss it
+    found = set(_findall_streams(_DSEQ_ANY_RE, *segments))
+    assert found == {"1111111111111", "2222222222222"}, f"lost an end: {found}"
+
+
+def test_the_head_and_tail_are_never_joined(monkeypatch, tmp_path):
+    """⛔ THE SAME SEAM, ONE LAYER DOWN.
+
+    Joining head and tail — with or without a sentinel — invents a byte range no
+    writer produced, which is the defect already closed at the stdout/stderr join.
+    A sentinel would hold only until someone widened the pattern to match across it;
+    returning the pieces apart cannot be undone by an edit to the regex.
+    """
+    path = tmp_path / "akash-last-deploy.log"
+    limit = _tse._TEE_READ_LIMIT
+    half = limit // 2
+    # The cut points are exact: the head's LAST bytes are "DSEQ=" and the tail's FIRST
+    # bytes are digits, so the two pieces abut into a number present in neither.
+    head_seg = b"x" * (half - 5) + b"DSEQ="
+    tail_seg = b"9999999999" + b"z" * (half - 10)
+    path.write_bytes(head_seg + b"m" * 1000 + tail_seg)
+    monkeypatch.setattr(_tse, "_DEPLOY_TEE_LOG", str(path))
+    segments = _tse._read_tee_log(time.time() - 5)
+    assert len(segments) == 2
+
+    assert _DSEQ_ANY_RE.findall("".join(segments)) == ["9999999999"], (
+        "the joined form no longer fabricates — re-derive this fixture rather than "
+        "deleting it; it documents why the pieces are kept apart"
+    )
+    assert _findall_streams(_DSEQ_ANY_RE, *segments) == [], (
+        "a DSEQ was matched across the truncation cut — it belongs to no writer"
+    )
+
+
+def test_a_normal_sized_tee_log_still_comes_back_whole(monkeypatch, tmp_path):
+    """The bound must not change the ordinary case: one segment, everything in it."""
+    _tee_log(monkeypatch, tmp_path, "Deployment created  DSEQ=1788999000555\n")
+    segments = _tse._read_tee_log(time.time() - 5)
+    assert len(segments) == 1, "a small file was split; the bound is firing too early"
+    assert _findall_streams(_DSEQ_ANY_RE, *segments) == ["1788999000555"]

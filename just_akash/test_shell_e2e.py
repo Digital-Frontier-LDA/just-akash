@@ -79,6 +79,12 @@ _DSEQ_ANY_RE = re.compile(r"DSEQ[=:\s]+(\d+)")
 #: `O_NOFOLLOW` is POSIX-only; absent it, the S_ISREG check below still applies.
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
+#: Most bytes read from the tee log in one poll. The path is world-writable, so its
+#: size is chosen by whoever wrote it, not by us — and since the poll re-reads once a
+#: second until the deadline, an unbounded read is paid for repeatedly. A real deploy
+#: log is tens of KB; this is far above that and far below "fills memory".
+_TEE_READ_LIMIT = 1 << 20
+
 
 def _search_streams(pattern: re.Pattern[str], *streams: str) -> re.Match[str] | None:
     """Search each stream on its own — NEVER their concatenation.
@@ -132,7 +138,7 @@ def _decoded(stream: object) -> str:
 _DEPLOY_TEE_LOG = "/tmp/.akash-last-deploy.log"
 
 
-def _read_tee_log(started_at: float) -> str:
+def _read_tee_log(started_at: float) -> tuple[str, ...]:
     """Read the tee log if it is a regular file this run could have produced.
 
     ⛔ A WORLD-WRITABLE FIXED PATH IN /tmp IS NOT A TRUSTED FILE. A plain `open()`
@@ -145,27 +151,62 @@ def _read_tee_log(started_at: float) -> str:
     — which also closes the TOCTOU gap between checking and opening. Anything that
     predates this run reads as no file at all.
 
-    ⚠ `S_ISREG` IS DEFENCE IN DEPTH, NOT A LOAD-BEARING GUARD, and the difference is
-    measured: deleting it leaves the whole suite green, because `O_NONBLOCK` already
-    makes a FIFO read raise `BlockingIOError` and a directory raise
-    `IsADirectoryError`, both of which land in the `except OSError` below. It is kept
-    because correctness should not rest on the incidental failure modes of a
-    non-blocking read on one platform — but do not mistake it for the thing doing the
-    work, and do not delete `O_NONBLOCK` on the strength of it being here.
+    ⚠ `S_ISREG` CHANGES NO BEHAVIOUR TODAY, AND IS STILL WORTH KEEPING — but not for
+    "defence in depth", which is the phrase that lets dead layers accumulate. The
+    real reason: **O_NONBLOCK's protection is a side effect; S_ISREG states the
+    requirement.** What this function needs is "the thing I am reading is a regular
+    file". `O_NONBLOCK` never says that — it happens to make a FIFO read raise
+    `BlockingIOError` and a directory raise `IsADirectoryError`, and those happen to
+    land in the `except OSError` below. Platform behaviour, not a check anyone wrote.
+
+    Measured, so the claim is checkable rather than a slogan:
+
+        FIFO (no writer / live writer)  -> BlockingIOError   via O_NONBLOCK
+        directory                       -> IsADirectoryError via O_NONBLOCK
+        symlink                         -> refused outright  via O_NOFOLLOW
+        anything the above miss         -> S_ISREG
+
+    Deleting `S_ISREG` leaves the entire suite green; a FIFO-with-a-writer test was
+    written specifically to isolate it and could not. So it is not covering a
+    reachable case on this platform — it is stating the precondition the open flags
+    must keep satisfying, and `O_NONBLOCK` is one unrelated edit away from being
+    dropped by someone tidying.
+
+    ⛔ Which makes THIS the load-bearing sentence: do NOT delete `O_NONBLOCK` on the
+    grounds that `S_ISREG` is here. The type check is the statement of intent; the
+    flag is what currently enforces it. Removing the enforcement because the
+    statement exists is the exact inversion that makes overlapping guards dangerous.
     """
     try:
         fd = os.open(_DEPLOY_TEE_LOG, os.O_RDONLY | os.O_NONBLOCK | _O_NOFOLLOW)
     except OSError:
-        return ""
+        return ()
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_mtime < started_at:
-            return ""
-        with os.fdopen(fd, encoding="utf-8", errors="replace") as fh:
+            return ()
+        # ⛔ BINARY, not text. A text stream's `seek` only accepts opaque cookies from
+        # `tell()`, so the tail read below cannot be expressed in text mode at all.
+        # Each segment is decoded on its own; a multi-byte character split by the cut
+        # becomes U+FFFD, which no DSEQ pattern can match.
+        with os.fdopen(fd, "rb") as fh:
             fd = -1  # fdopen owns it now
-            return fh.read()
+            if st.st_size <= _TEE_READ_LIMIT:
+                # +1 so a file that grew between fstat and read is still bounded.
+                return (fh.read(_TEE_READ_LIMIT + 1).decode("utf-8", "replace"),)
+            half = _TEE_READ_LIMIT // 2
+            head = fh.read(half)
+            fh.seek(-half, os.SEEK_END)
+            tail = fh.read(half)
+            # ⛔ TWO SEGMENTS, RETURNED APART, NEVER JOINED. A head+tail concatenation
+            # is the same defect as the stdout+stderr one closed above: it invents a
+            # byte range no writer produced, and a DSEQ matched across that cut would
+            # be pure fabrication. A separator sentinel would work only for as long as
+            # nobody widened the pattern to match across it — keeping them apart
+            # cannot be undone by a later edit to the regex.
+            return (head.decode("utf-8", "replace"), tail.decode("utf-8", "replace"))
     except OSError:
-        return ""
+        return ()
     finally:
         if fd >= 0:
             os.close(fd)
@@ -200,8 +241,19 @@ def _dseq_from_deploy_log(started_at: float, *, wait: float = 15.0) -> str | Non
     """
     deadline = time.monotonic() + wait
     seen: set[str] = set()
+    truncated = False
     while True:
-        seen.update(_DSEQ_ANY_RE.findall(_read_tee_log(started_at)))
+        segments = _read_tee_log(started_at)
+        # More than one segment means the file exceeded the read limit and only its
+        # head and tail were taken. Say so ONCE: a tee log that large is itself a
+        # fact worth a human's attention, not something to quietly read around.
+        if len(segments) > 1 and not truncated:
+            truncated = True
+            log_info(
+                f"{_DEPLOY_TEE_LOG} exceeds {_TEE_READ_LIMIT} bytes; reading only its "
+                "head and tail, so a DSEQ written between them will not be seen."
+            )
+        seen.update(_findall_streams(_DSEQ_ANY_RE, *segments))
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
