@@ -207,13 +207,20 @@ def main():
         # pass or fail, because a histogram built only from failures is not a
         # histogram.
         gate_attempt: int | None = None
-        # ⛔ _NOPOLL, not None and not _ABSENT. These start as "no document was
-        # ever parsed"; a successful parse overwrites them with the key's value or
-        # with _ABSENT. Keeping those two apart is the point: for ssh_host, ABSENT
-        # is the ordinary "no endpoint yet" reading — it is DATA — and a plain None
-        # or False would make it indistinguishable from a poll that never landed.
-        gate_status: object = _NOPOLL
-        gate_ssh: object = _NOPOLL
+        # ⛔ ONE TUPLE, ASSIGNED ATOMICALLY. `gate_attempt` advances on EVERY attempt
+        # while a parse succeeds only on SOME, so holding the observation in its own
+        # variables let a run report `attempt=18` beside a status actually read at
+        # attempt 3 — two numbers describing different moments, printed as one
+        # measurement. (Reported by Copilot on #276.) A tuple makes that disagreement
+        # UNREPRESENTABLE rather than merely detectable. Fifth instance of this PR's
+        # own defect class, so the class gets the fix and not the line.
+        #
+        # ⛔ Stays None when nothing ever parsed, and unpacks to _NOPOLL — not to None
+        # and not to _ABSENT. A successful parse supplies the key's value or _ABSENT.
+        # Keeping those apart is the point: for ssh_host, ABSENT is the ordinary "no
+        # endpoint yet" reading — it is DATA — and a plain None or False would make it
+        # indistinguishable from a poll that never landed.
+        last_obs: tuple[int, object, object] | None = None
         # Provider workload activation can lag well past 35s on a busy provider;
         # poll up to ~95s before declaring a timeout to avoid flaky CI failures.
         max_attempts = 18
@@ -241,11 +248,14 @@ def main():
                 r = run(f"uv run just-akash status --dseq {dseq} --json", timeout=30)
                 status_data = json.loads(r.stdout)
                 provider_addr = status_data.get("provider")
-                gate_status = status_data.get("status", _ABSENT)
                 # NOT bool(...): bool() maps an ABSENT key and a present-but-empty
                 # value onto the same False, and "unreported must not render as
                 # False" is the whole discipline here.
-                gate_ssh = status_data.get("ssh_host", _ABSENT)
+                last_obs = (
+                    attempt,
+                    status_data.get("status", _ABSENT),
+                    status_data.get("ssh_host", _ABSENT),
+                )
                 if status_data.get("status") == "ready" or status_data.get("ssh_host"):
                     lease_ready = True
                     break
@@ -289,10 +299,16 @@ def main():
         # distinction this measurement exists to make.
         #
         # ⚠ `elapsed` includes the fixed 10s propagation sleep — see gate_t0.
+        # ⛔ Unpacked TOGETHER: `observed_at` is the attempt that produced the status
+        # beside it, which is not necessarily the last attempt made.
+        obs_attempt, gate_status, gate_ssh = (
+            last_obs if last_obs is not None else (None, _NOPOLL, _NOPOLL)
+        )
         log_info(
-            "GATE dseq={} attempt={} elapsed={} status={} ssh_host={}".format(
+            "GATE dseq={} attempt={} observed_at={} elapsed={} status={} ssh_host={}".format(
                 dseq,
                 gate_attempt if gate_attempt is not None else "unreported",
+                obs_attempt if obs_attempt is not None else "unreported",
                 f"{gate_elapsed:.1f}s",
                 _render(gate_status),
                 _render(gate_ssh, lambda v: "present" if v else "empty"),

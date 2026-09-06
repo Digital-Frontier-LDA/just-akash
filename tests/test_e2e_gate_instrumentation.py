@@ -258,3 +258,56 @@ def test_the_reported_wait_is_measured_not_scheduled():
         "the timeout message does not report the measured wait; arithmetic over "
         "max_attempts/poll_interval claimed 95s for a ~635s all-timeout run"
     )
+
+
+def test_the_observation_and_its_attempt_cannot_be_recorded_apart():
+    """⛔ Two numbers printed as one measurement must describe the same moment.
+
+    `gate_attempt` advances on EVERY attempt; a parse succeeds only on SOME. While
+    the status lived in its own variable, a run that parsed at attempt 3 and then
+    timed out through attempt 18 printed `attempt=18` beside a status actually read
+    at attempt 3. Nothing in the line said so. (Reported by Copilot on #276.)
+
+    The fix is structural rather than careful: one tuple, assigned once, so the
+    disagreement cannot be expressed at all. This pins that structure — a later edit
+    splitting them back into separate variables is precisely the regression, and it
+    would look like a tidy-up.
+    """
+    loop = next(
+        n
+        for n in ast.walk(_TREE)
+        if isinstance(n, ast.For)
+        and "just-akash status" in (ast.get_source_segment(_SRC, n) or "")
+    )
+
+    obs = [
+        n
+        for n in ast.walk(loop)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "last_obs" for t in n.targets)
+    ]
+    assert len(obs) == 1, f"expected ONE last_obs assignment in the poll loop, found {len(obs)}"
+    assert isinstance(obs[0].value, ast.Tuple) and len(obs[0].value.elts) == 3, (
+        "last_obs is no longer a 3-tuple — the attempt and the observation it produced "
+        "must be written in a single statement or they will drift apart again"
+    )
+    first = obs[0].value.elts[0]
+    assert isinstance(first, ast.Name) and first.id == "attempt", (
+        "the first element of last_obs must be the loop's own `attempt`, so the status "
+        "carries the attempt that actually produced it rather than the last one tried"
+    )
+
+    for name in ("gate_status", "gate_ssh"):
+        stray = [
+            n
+            for n in ast.walk(loop)
+            if isinstance(n, (ast.Assign, ast.AnnAssign))
+            and any(
+                isinstance(t, ast.Name) and t.id == name
+                for t in (n.targets if isinstance(n, ast.Assign) else [n.target])
+            )
+        ]
+        assert not stray, (
+            f"{name} is assigned inside the poll loop again — that split is exactly how "
+            "the observation and the attempt number came to describe different moments"
+        )
