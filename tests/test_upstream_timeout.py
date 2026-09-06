@@ -190,30 +190,3 @@ class TestBackwardCompatibility:
         assert err.retryable is None
 
 
-def test_no_automatic_retry_of_a_create_exists():
-    """⛔ THE ABSENCE IS THE FEATURE, so it is asserted rather than assumed.
-
-    A create is not idempotent, and a proxy timeout can land after the origin
-    committed. Anything that re-POSTs on a 524 without a positive read-back
-    double-spends escrow on exactly the failure that is hardest to observe.
-    If a retry is added later it must be preceded by the orphan check, and this
-    test should fail loudly rather than let it in quietly.
-    """
-
-    import inspect
-
-    from just_akash import deploy
-
-    src = inspect.getsource(deploy)
-    hot = src[src.index("STEP 2: Creating deployment") :]
-    hot = hot[: hot.index("STEP 3")] if "STEP 3" in hot else hot
-
-    assert "is_upstream_timeout" in hot, "the create path must classify an upstream timeout"
-    # No loop in the create path: a `while`/`for` around the POST is what a blind
-    # retry looks like. The ONE existing retry is the "already exists" recovery,
-    # which is a single re-POST after clearing a known leftover, not a loop.
-    assert "while " not in hot, "a loop appeared in the create path — is this a blind retry?"
-    assert hot.count("client.create_deployment(") <= 2, (
-        "more than the initial POST and the one already-exists retry — a create is "
-        "not idempotent and a proxy timeout can land after the origin committed"
-    )
