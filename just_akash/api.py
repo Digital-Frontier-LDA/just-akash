@@ -108,11 +108,19 @@ class AkashAPIError(RuntimeError):
     So an upstream outage read as a test failure, the E2E leg looked "flaky", and
     it got re-run by hand at real Akash cost per round (#266).
 
-    ⚠ STILL A RuntimeError, DELIBERATELY. Callers match on `str(e)` today —
-    `"already exists" in str(e).lower()` in deploy.py, `_is_credit_error` in
-    cleanup_stale — and every `except RuntimeError` in the tree must keep working.
-    This adds structure beside the message; it changes neither the type callers
-    catch nor the string they read.
+    ⚠ STILL A RuntimeError SUBCLASS, DELIBERATELY — and the distinction is worth
+    stating precisely, because an earlier wording here was not. `except
+    RuntimeError` still catches it, so every handler in the tree keeps working.
+    But `type(e)` is now `AkashAPIError`, NOT `RuntimeError`: a caller testing
+    `type(e) is RuntimeError` would break. Nothing does today. Saying this
+    "changes neither the type callers catch" was true of the CATCH and false of
+    the TYPE — accurate enough to be believed and imprecise enough to mislead.
+
+    WHAT IS CONTRACTUALLY PRESERVED IS THE STRING. `str(e)` is byte-identical to
+    the message this used to raise, because parsing it is what callers actually
+    do — `"already exists" in str(e).lower()` in deploy.py, `_is_credit_error` in
+    cleanup_stale. The structured fields are added BESIDE the message, never
+    inside it, so no substring match can shift underneath those callers.
     """
 
     def __init__(
