@@ -102,30 +102,39 @@ def test_the_readiness_probe_cannot_escape_past_the_gate_line():
 
     So: the probe must be inside a `try`, and that `try` must name TimeoutExpired.
     """
-    poll = None
-    for node in ast.walk(_TREE):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "run"
-        ):
-            seg = ast.get_source_segment(_SRC, node) or ""
-            if "just-akash status" in seg and "--json" in seg:
-                poll = node
-                break
-    assert poll is not None, "readiness probe not found — re-anchor, do not delete"
+    # ⛔ EVERY PROBE, NOT THE FIRST ONE FOUND. This originally took the first match and
+    # stopped — while the commit it belongs to claims it "swept the class rather than
+    # the line", because the step-6 SSH cross-check has the identical shape. There are
+    # TWO of these calls; the test pinned one, so deleting the guard from the other
+    # would have stayed green. A test whose name says "the probe" while the code has
+    # several is the same defect the GATE work is about, in the test layer.
+    #
+    # Not asserting a COUNT: a third probe is a legitimate change, and a hard-coded 2
+    # would fail on it for the wrong reason. Every probe found must be guarded.
+    polls = [
+        node
+        for node in ast.walk(_TREE)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "run"
+        and "just-akash status" in (ast.get_source_segment(_SRC, node) or "")
+        and "--json" in (ast.get_source_segment(_SRC, node) or "")
+    ]
+    assert polls, "no readiness probe found — re-anchor, do not delete"
 
-    tries = [a for a in _ancestors(poll) if isinstance(a, ast.Try)]
-    assert tries, (
-        "the readiness probe is not inside a try — a TimeoutExpired will escape the "
-        "loop and skip the GATE line, so 'recorded on every run' becomes false on "
-        "exactly the runs worth recording"
-    )
-    handled = ast.dump(tries[0])
-    assert "TimeoutExpired" in handled, (
-        "the enclosing try does not name TimeoutExpired, so a hung status probe "
-        "still escapes past the GATE emission"
-    )
+    for poll in polls:
+        where = f"line {poll.lineno}"
+        tries = [a for a in _ancestors(poll) if isinstance(a, ast.Try)]
+        assert tries, (
+            f"the status probe at {where} is not inside a try — a TimeoutExpired will "
+            "escape the loop and skip the GATE line, so 'recorded on every run' becomes "
+            "false on exactly the runs worth recording"
+        )
+        handled = ast.dump(tries[0])
+        assert "TimeoutExpired" in handled, (
+            f"the try enclosing the status probe at {where} does not name "
+            "TimeoutExpired, so a hung probe still escapes past the GATE emission"
+        )
 
 
 def test_every_streaming_probe_is_time_bounded():
