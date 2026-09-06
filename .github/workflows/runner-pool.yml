@@ -388,7 +388,25 @@ jobs:
           # ⚠ `|| RC=$?` keeps the assignment inside a list, which `-e` does not act
           #   on. Do NOT simplify to a bare `RESP=$(...)`; see the note above.
           RC=0
-          RESP=$(gh api "orgs/${ORG}/actions/runners?per_page=1" -i 2>&1) || RC=$?
+          # ⛔ THE WRITE VERB, NOT THE READ. Every container does
+          # POST .../actions/runners/registration-token (the image exchanges
+          # ACCESS_TOKEN=<PAT> for one), and `count: ${POOL_SIZE}` means EVERY replica
+          # does it independently. A GET only proves the PAT can LIST runners, so a
+          # read-only PAT passed this gate and then 403'd in all N replicas — the exact
+          # failure this step exists to prevent (#260).
+          #
+          # ⚠ PARITY, NOT OVER-DEMANDING. Minting a registration token is precisely what
+          # the container does; this asks for no scope the workload does not already use.
+          # Demanding more than the workload needs is a different bug, and it bites
+          # whoever provisions the next token.
+          RESP=$(gh api --method POST "orgs/${ORG}/actions/runners/registration-token" -i 2>&1) || RC=$?
+          # ⛔ THE RESPONSE CARRIES A LIVE CREDENTIAL. A successful mint returns
+          # {"token":"A...","expires_at":...} — a registration token valid ~1h. Mask it
+          # the instant it is captured, BEFORE any branch can print it: this same step
+          # now echoes the raw response in its unexpected-status arm (#253), so the verb
+          # change and that arm would otherwise combine into a token in a public log.
+          MINTED=$(printf '%s' "$RESP" | sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p' | head -1)
+          [ -n "$MINTED" ] && echo "::add-mask::${MINTED}"
           # $1 ~ /^HTTP/ guards the no-response case: without it, awk prints the
           # second WORD of an arbitrary error string as though it were a status.
           CODE=$(printf '%s' "$RESP" | awk 'NR==1 && $1 ~ /^HTTP/ {print $2}')
@@ -406,12 +424,12 @@ jobs:
                   FIX="Wait for the limit to reset and re-run. The PAT is not implicated."
                 else
                   REASON=RUNNER_PAT_INVALID
-                  TITLE="GH_RUNNER_PAT lacks org runner access"
-                  FIX="Grant the PAT org runner-registration rights, or rotate it."
+                  TITLE="GH_RUNNER_PAT cannot mint a runner registration token"
+                  FIX="Grant the PAT org runner-registration (WRITE) rights. Read access to the runner list is not enough — every container mints a token."
                 fi ;;
               404)
                 REASON=RUNNER_PAT_INVALID
-                TITLE="org ${ORG} is not visible to GH_RUNNER_PAT"
+                TITLE="org ${ORG} is not visible to GH_RUNNER_PAT, or it cannot register runners there"
                 FIX="Check the org name, then the PAT's org access. GitHub returns 404 rather than 403 for resources a token may not see." ;;
               429)
                 TITLE="GitHub API rate limit reached"
@@ -453,13 +471,13 @@ jobs:
             if [ "$REASON" = "RUNNER_PAT_INVALID" ]; then
               CLASS="a CREDENTIAL failure, not a provider or Akash failure"
             else
-              CLASS="a GITHUB API failure — the runner listing was never readable, so the PAT is UNPROVEN, not disproven"
+              CLASS="a GITHUB API failure — the token mint was never attempted successfully, so the PAT is UNPROVEN, not disproven"
             fi
             {
               echo "## ${TITLE}"
               echo
               echo "**CI is not broken, Akash is fine, and no provider is at fault.**"
-              echo "\`GH_RUNNER_PAT\` could not read \`orgs/${ORG}/actions/runners\`."
+              echo "\`GH_RUNNER_PAT\` could not mint a runner registration token for \`orgs/${ORG}\`."
               echo "HTTP status: ${CODE_TEXT}. Classified: \`${REASON}\`."
               echo
               echo "Without this check the runner would simply never register, the pool would"
@@ -1139,10 +1157,39 @@ jobs:
             # ⛔ ONE request, not two — same reason the preflight says so: two calls can
             # disagree, and reporting a status line from a call that succeeded while
             # branching on one that failed names a code that never belonged to the failure.
-            VERDICT_RESP=$(gh api "orgs/${ORG}/actions/runners?per_page=1" -i 2>&1) || true
-            VERDICT_CODE=$(printf '%s' "$VERDICT_RESP" | awk 'NR==1{print $2}')
+            # ⛔ THE WRITE VERB HERE TOO, AND THIS SITE IS THE MORE SERIOUS ONE.
+            # This step decides whether to blame a PROVIDER. Its own 401 text says the
+            # container "mints its registration token with this same credential" — it
+            # NAMED the write path while testing a read. So a PAT that can list runners
+            # but cannot mint returned 200 here, the check fell through, and the run
+            # accused a host that did nothing wrong. A preflight failing a run is
+            # recoverable; a fabricated provider fault is somebody else's reputation.
+            VERDICT_RESP=$(gh api --method POST "orgs/${ORG}/actions/runners/registration-token" -i 2>&1) || true
+            # Same live-credential masking as the preflight; this response body carries
+            # a registration token on success.
+            VERDICT_MINTED=$(printf '%s' "$VERDICT_RESP" | sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p' | head -1)
+            [ -n "$VERDICT_MINTED" ] && echo "::add-mask::${VERDICT_MINTED}"
+            # ⛔ THE SAME GUARD AS THE PREFLIGHT, AND IT MATTERS MORE HERE.
+            # Without `$1 ~ /^HTTP/`, awk prints the second WORD of an arbitrary
+            # error string as though it were a status: `dial tcp: lookup ... timeout`
+            # yields `tcp:`, which then SELECTS A CASE ARM. I added this guard at the
+            # preflight, wrote the comment explaining it, and left the sibling site
+            # unguarded in the same change.
+            #
+            # ⚠ AND THIS SITE HAS NO SECOND SIGNAL. The preflight captures `|| RC=$?`
+            # and branches on it; the capture above ends `|| true`, discarding the
+            # return code deliberately — a non-zero gh exit must not kill the step
+            # before the case can classify it. That leaves the status line as the ONLY
+            # evidence, so an unguarded parse is the whole input, not one input of two.
+            # With the guard, no status line yields an EMPTY code, `${VERDICT_CODE:-000}`
+            # sends it to `*)`, and the run reports INDETERMINATE and accuses nobody.
+            VERDICT_CODE=$(printf '%s' "$VERDICT_RESP" | awk 'NR==1 && $1 ~ /^HTTP/ {print $2}')
             case "${VERDICT_CODE:-000}" in
-              200)
+              # ⛔ 201, NOT 200. A successful mint is 201 Created. Leaving this as 200
+              # would send every HEALTHY credential to the `*)` arm and report
+              # INDETERMINATE — "the credential could not be re-checked" — on a run
+              # where it was re-checked and was fine.
+              200|201)
                 : ;;   # the credential still works, so the provider verdict below stands
               401)
                 echo "failure_reason=RUNNER_PAT_INVALID" >> "$GITHUB_OUTPUT"
