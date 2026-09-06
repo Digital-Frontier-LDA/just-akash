@@ -784,7 +784,7 @@ def test_the_guard_actually_runs_and_decides(key, accepted, tmp_path):
         "EPHEMERAL": "true",
         "PLACEMENT_KEY": key,
     }
-    proc = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True)
+    proc = subprocess.run(["bash", "-e", str(script)], env=env, capture_output=True, text=True)
     if accepted:
         assert proc.returncode == 0, f"{key!r} was refused: {proc.stdout} {proc.stderr}"
     else:
@@ -796,9 +796,9 @@ def test_the_guard_actually_runs_and_decides(key, accepted, tmp_path):
 def test_resume_token_survives_an_exact_4000_byte_body(n, tmp_path):
     """⛔ The ONE body length at which the CWE-117 guard never turns itself back off.
 
-    `head -c` cuts by BYTES. `printf '%s\\n' "$RESP"` emits len+1 of them, so at a body
-    of EXACTLY 4000 the cut keeps the payload and discards the appended newline, leaving
-    the cursor mid-line. `::<token>::` is honoured only at the start of a line, so the
+    `head -c` cuts by BYTES and `<<<` appends exactly one newline, so at a body of
+    EXACTLY 4000 the cut keeps the payload and discards that newline, leaving the
+    cursor mid-line. `::<token>::` is honoured only at the start of a line, so the
     resume never registers and `::stop-commands::` stays active for the REST OF THE JOB
     — `pool` runs to ~line 1246 and contains the `::add-mask::` on the minted verdict
     token. So this fails OPEN on secret masking, not closed on injection.
@@ -811,7 +811,7 @@ def test_resume_token_survives_an_exact_4000_byte_body(n, tmp_path):
     emit sequence is tested rather than diverged from.
     """
     m = re.search(
-        r"printf '%s\\n' \"\$RESP\" \| head -c 4000.*?echo \"::\$\{RESP_TOKEN\}::\"",
+        r"head -c 4000 <<< \"\$RESP\".*?echo \"::\$\{RESP_TOKEN\}::\"",
         SRC,
         re.S,
     )
@@ -823,7 +823,7 @@ def test_resume_token_survives_an_exact_4000_byte_body(n, tmp_path):
     script = tmp_path / "emit.sh"
     script.write_text(body, encoding="utf-8")
     proc = subprocess.run(
-        ["bash", str(script)],
+        ["bash", "-e", str(script)],
         env={**os.environ, "RESP": "A" * n, "RESP_TOKEN": "TESTTOKEN"},
         capture_output=True,
         text=True,
@@ -835,7 +835,136 @@ def test_resume_token_survives_an_exact_4000_byte_body(n, tmp_path):
     )
 
 
+def test_a_huge_unexpected_body_does_not_kill_the_step(tmp_path):
+    """⛔ The bounded echo must not SIGPIPE the step it is protecting.
+
+    `printf ... | head -c 4000` sends printf SIGPIPE once the body exceeds the PIPE
+    BUFFER. This step opens `set -uo pipefail`, and Actions runs `run:` under
+    `bash -e`, so the pipeline's 141 killed the step outright — before the resume
+    token, before ::endgroup::, and before `failure_reason` was written, which is
+    the entire purpose of #253. Workflow commands then stay disabled for the rest
+    of `jobs.pool`, including the ::add-mask:: ~700 lines later.
+
+    ⚠ NOT a >4000 problem, which is why this test uses 512 KiB. Measured on macOS:
+    130000 bytes survives, 150000 dies; a Linux runner's 64 KiB buffer trips
+    earlier. A test at 8000 bytes PASSES against the broken code and proves
+    nothing — the same "near the bound is not the bound" trap as the 4000 case,
+    one level up.
+
+    Drives the real step under errexit + pipefail, which is the configuration the
+    fragment-level test could not express.
+    """
+    run = _step("Preflight")["run"]
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    # 418 falls to the `*)` arm. NOT 5xx or "" — those have their own arms and never
+    # reach the echo block, which is what this test is about.
+    (bindir / "gh").write_text(
+        "#!/usr/bin/env bash\n"
+        "printf 'HTTP/2 418\\n\\n'\n"
+        "python3 -c \"print('A'*524288, end='')\"\n"
+        # non-zero: the unexpected-status arm is gated on `RC -ne 0`
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    (bindir / "gh").chmod(0o755)
+
+    script = tmp_path / "preflight.sh"
+    script.write_text(run, encoding="utf-8")
+    out_file = tmp_path / "gh_output"
+    out_file.touch()
+    proc = subprocess.run(
+        ["bash", "-e", str(script)],
+        env={
+            **os.environ,
+            "PATH": f"{bindir}:{os.environ['PATH']}",
+            "GH_TOKEN": "x",
+            "ORG": "o",
+            "GITHUB_OUTPUT": str(out_file),
+            "GITHUB_STEP_SUMMARY": str(tmp_path / "summary"),
+        },
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode != 141, (
+        "the step died on SIGPIPE — pipefail promoted head's early close to 141 and "
+        "bash -e aborted before anything below the echo ran"
+    )
+    token = re.search(r"::stop-commands::([0-9a-f]{32})", proc.stdout)
+    assert token, "stop-commands was never emitted"
+    assert any(line == f"::{token.group(1)}::" for line in proc.stdout.splitlines()), (
+        "the resume token is missing or not at the start of a line, so workflow "
+        "commands stay disabled for the rest of the job"
+    )
+    assert "[truncated at 4000 bytes]" in proc.stdout, "the truncation notice never ran"
+    assert "::endgroup::" in proc.stdout, "the group was never closed"
+    assert "failure_reason=GITHUB_API_UNAVAILABLE" in out_file.read_text(encoding="utf-8"), (
+        "failure_reason was never written — the step reported nothing, which is the "
+        "defect #253 exists to fix"
+    )
+
+
+def test_no_guard_is_satisfied_by_prose(tmp_path):
+    """Re-run every guard against a workflow with ALL comments stripped, and require green.
+
+    ⛔ These guards assert on the shell body, and a body contains its own explanation.
+    A PRESENCE assertion against the raw text can therefore be satisfied by the comment
+    describing the construct rather than the construct — it reports that a behaviour
+    exists when only its description does, and it keeps passing after the behaviour is
+    deleted. `_code()` exists for this, but nothing required its use, so one assertion
+    drifted onto the raw body and went unnoticed.
+
+    This is the complement of test_the_guards_are_not_vacuous: that one breaks the CODE
+    and demands red, this one removes the PROSE and demands green. Between them a guard
+    must depend on the code and only on the code.
+    """
+    # ⛔ RUN ONCE, AGAINST THE REAL WORKFLOW. test_the_guards_are_not_vacuous spawns an
+    # inner pytest of this whole file per mutation with no -k filter, so without this
+    # skip each of those ~29 runs would spawn ANOTHER full suite from here — roughly
+    # tripling CI time to re-answer a question about the committed workflow that only
+    # has one answer. RUNNER_POOL_WF is set exactly when we are that inner run.
+    if os.environ.get("RUNNER_POOL_WF"):
+        pytest.skip("inner run of the mutation harness; this guard runs once, outermost")
+
+    stripped = "\n".join(ln for ln in SRC.splitlines() if not ln.lstrip().startswith("#"))
+    assert stripped != SRC, "no comments were stripped — this guard would be vacuous"
+    copy = tmp_path / "runner-pool.yml"
+    copy.write_text(stripped + "\n", encoding="utf-8")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            __file__,
+            "-q",
+            "--no-header",
+            "-p",
+            "no:cacheprovider",
+            "--no-cov",
+            "-k",
+            "not vacuous and not prose",
+        ],
+        env={**os.environ, "RUNNER_POOL_WF": str(copy)},
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, (
+        "a guard passes on the commented workflow and fails without comments, so it is "
+        "asserting on prose rather than on code:\n" + proc.stdout[-3000:]
+    )
+
+
 MUTATIONS = [
+    (
+        "the bounded echo does not go through a pipe",
+        # Restores the SIGPIPE-able pipeline; the >4000 test must go red.
+        lambda s: s.replace(
+            'head -c 4000 <<< "$RESP"',
+            "printf '%s\\n' \"$RESP\" | head -c 4000",
+        ),
+    ),
     (
         "the resume token is unconditionally at line start",
         # Removes the unconditional newline, restoring the exact-4000-byte hole.
@@ -1214,7 +1343,15 @@ def test_wallet_policy_is_not_reimplemented_in_workflow_shell():
     code = _code(PROVISION["run"]) + _code(TD_CLOSE["run"])
     assert "RUN_ID %" not in code
     assert "mapfile -t KEYS" not in code
-    assert "richest funded account" in PROVISION["run"]
+    # ⛔ ON _code(), NOT THE RAW BODY. This asserted "richest funded account", which
+    # appears ONLY in the comment above the delegation — so it passed by reading prose
+    # and would have kept passing with the delegation deleted. Its two siblings above
+    # already use _code(); this line did not, and that asymmetry is the whole bug.
+    # (Found by test_no_guard_is_satisfied_by_prose. Reported by CodeRabbit on #253.)
+    assert "JA=(uv run --with . just-akash)" in _code(PROVISION["run"]), (
+        "wallet selection must be DELEGATED — the workflow invokes just-akash rather "
+        "than ranking balances in shell"
+    )
 
 
 def test_the_wallet_key_never_leaves_via_an_output():
@@ -1908,7 +2045,7 @@ def _verdict_script(tmp_path, response: str) -> tuple[str, str]:
         "FAKE_RESP": response,
         "FAKE_RC": "0" if response.split()[1:2] in (["200"], ["201"]) else "1",
     }
-    proc = subprocess.run(["bash", str(script)], env=env, capture_output=True, check=False)
+    proc = subprocess.run(["bash", "-e", str(script)], env=env, capture_output=True, check=False)
     combined = (proc.stdout + proc.stderr).decode()
     # ⛔ VACUITY GUARD. Every test here asserts a reason is ABSENT, and absence is
     # what a broken extractor produces: a slice ending mid-`echo "..."` leaves an

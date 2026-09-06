@@ -405,7 +405,11 @@ jobs:
           # the instant it is captured, BEFORE any branch can print it: this same step
           # now echoes the raw response in its unexpected-status arm (#253), so the verb
           # change and that arm would otherwise combine into a token in a public log.
-          MINTED=$(printf '%s' "$RESP" | sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p' | head -1)
+          # ⛔ `|| true` for the same reason as the BAD_PAGES assignment below: `| head -1`
+          # can SIGPIPE sed on a large enough match set, `pipefail` is on, and a non-zero
+          # command substitution under `bash -e` aborts AT THE ASSIGNMENT — here that
+          # would skip the ::add-mask:: on the very token this line exists to find.
+          MINTED=$(printf '%s' "$RESP" | sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p' | head -1) || true
           [ -n "$MINTED" ] && echo "::add-mask::${MINTED}"
           # $1 ~ /^HTTP/ guards the no-response case: without it, awk prints the
           # second WORD of an arbitrary error string as though it were a status.
@@ -459,10 +463,26 @@ jobs:
                 RESP_TOKEN=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d " \n")
                 echo "::group::Unexpected preflight response (HTTP ${CODE:-none received})"
                 echo "::stop-commands::${RESP_TOKEN}"
-                printf '%s\n' "$RESP" | head -c 4000
+                # ⛔ NO PIPE, and that is the point. `printf ... | head -c` SIGPIPEs
+                # printf once the body exceeds the pipe buffer; `pipefail` is on
+                # (set -uo pipefail, top of this step) so the pipeline returns 141,
+                # and Actions runs `run:` under `bash -e`, so THE STEP DIES THERE —
+                # before the resume token, before ::endgroup::, and before
+                # failure_reason is written, which is this step's entire purpose.
+                # Measured: survives 130000 bytes, dies at 150000 on macOS; the
+                # Linux runner's 64KiB buffer makes it earlier. NOT >4000 — a test
+                # at 8000 passes and proves nothing.
+                # This file already documented the hazard ~500 lines below (the
+                # BAD_PAGES guarded assignment, "pipefail IS ON HERE") and this arm
+                # had the same shape unguarded. A here-string is a file, not a pipe,
+                # so there is no reader to close early and no signal to survive —
+                # removing the pipe removes the class, where `|| true` would only
+                # mask it and would also swallow real errors.
+                head -c 4000 <<< "$RESP"
                 # ⛔ UNCONDITIONAL, and it must STAY unconditional. `head -c` cuts by
-                # BYTES, so at EXACTLY 4000 bytes of $RESP it consumes the payload and
-                # discards the newline printf appended — leaving the cursor mid-line.
+                # BYTES, and `<<<` appends one newline, so at EXACTLY 4000 bytes of
+                # $RESP the cut keeps the payload and discards that newline — leaving
+                # the cursor mid-line.
                 # The resume token below is honoured only at line start, so at exactly
                 # that length ::stop-commands:: would never be lifted and workflow
                 # commands would stay disabled for the REST OF THIS JOB — which runs to
@@ -1178,7 +1198,10 @@ jobs:
             VERDICT_RESP=$(gh api --method POST "orgs/${ORG}/actions/runners/registration-token" -i 2>&1) || true
             # Same live-credential masking as the preflight; this response body carries
             # a registration token on success.
-            VERDICT_MINTED=$(printf '%s' "$VERDICT_RESP" | sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p' | head -1)
+            # ⛔ `|| true` — same SIGPIPE-under-pipefail hazard as MINTED above. This one
+            # guards the VERDICT token's mask, so an abort here loses the masking of a
+            # live credential AND kills the step.
+            VERDICT_MINTED=$(printf '%s' "$VERDICT_RESP" | sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p' | head -1) || true
             [ -n "$VERDICT_MINTED" ] && echo "::add-mask::${VERDICT_MINTED}"
             # ⛔ THE SAME GUARD AS THE PREFLIGHT, AND IT MATTERS MORE HERE.
             # Without `$1 ~ /^HTTP/`, awk prints the second WORD of an arbitrary
