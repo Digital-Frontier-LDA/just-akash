@@ -527,9 +527,22 @@ jobs:
             # Normalised HERE, at the point of emission, rather than at ORG — any
             # future value interpolated into this line is covered too, which
             # sanitising one input would not do.
-            TITLE=$(printf '%s' "$TITLE" | tr -d '\r\n')
-            CLASS=$(printf '%s' "$CLASS" | tr -d '\r\n')
-            CODE_TEXT=$(printf '%s' "$CODE_TEXT" | tr -d '\r\n')
+            # ⛔ ORDER IS LOAD-BEARING: '%' FIRST, ALWAYS. The runner percent-DECODES
+            # command properties and data, so escaping ':' to '%3A' before escaping '%'
+            # would re-escape the '%' we just wrote and double-encode every value. The
+            # toolkit's own escapeProperty does '%' -> CR -> LF -> ':' -> ',' for this
+            # reason. Escape '%' last and the annotation renders as '%253A'.
+            #
+            # CR/LF are DELETED rather than encoded (see above): a multi-line annotation
+            # is not wanted here, and deleting cannot be undone by a later decode.
+            #
+            # TITLE and CODE_TEXT land in the PROPERTY section (`title=...`), which also
+            # needs ':' and ',' — an embedded '::' truncates the property list and ','
+            # injects a further property (e.g. file=/etc/passwd, which re-points the
+            # annotation). CLASS lands in the DATA section, where neither is special.
+            TITLE=$(printf '%s' "$TITLE" | tr -d '\r\n' | sed -e 's/%/%25/g' -e 's/:/%3A/g' -e 's/,/%2C/g')
+            CODE_TEXT=$(printf '%s' "$CODE_TEXT" | tr -d '\r\n' | sed -e 's/%/%25/g' -e 's/:/%3A/g' -e 's/,/%2C/g')
+            CLASS=$(printf '%s' "$CLASS" | tr -d '\r\n' | sed -e 's/%/%25/g')
             echo "::error title=${TITLE} (HTTP status: ${CODE_TEXT})::This is ${CLASS}. Untreated it surfaces 15 minutes later as 'runner did not come online'."
             exit 1
           fi

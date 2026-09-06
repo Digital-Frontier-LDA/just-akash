@@ -1997,11 +1997,106 @@ class TestTheAnnotationCannotBeSplitByCallerInput:
         log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
         annotations = [ln for ln in log.splitlines() if ln.startswith("::error")]
         assert annotations, "the step emitted no annotation at all"
-        assert not any("forged" in ln.split("::")[1] for ln in annotations if "::" in ln), (
-            "caller input started its own workflow command"
-        )
         assert len(annotations) == 1, (
             f"one failure must produce ONE annotation, got {len(annotations)}"
+        )
+        line = annotations[0]
+        # ⛔ ASSERT THE PROPERTY, NOT THE OLD PROXY. This used to read
+        # `"forged" not in ln.split("::")[1]`, which worked only because a RAW '::'
+        # split the line into pieces. Now that ':' is escaped, the forged text sits
+        # inert inside the title and that proxy fires on CORRECT behaviour. What
+        # actually matters is that no second command is emitted and that the caller's
+        # '::' cannot escape the property it was placed in.
+        assert "::error title=forged" not in line, "caller input started its own workflow command"
+        assert "%3A%3A" in line, (
+            "the caller's '::' was left raw inside a command property, so it truncates "
+            "the property list instead of being carried as text"
+        )
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_a_percent_escape_cannot_smuggle_a_newline_past_the_flattener(self, tmp_path):
+        """⛔ `tr -d` SEES LITERAL CONTROL CHARACTERS; THE RUNNER DECODES ESCAPES.
+
+        A caller who sends the four ordinary text characters `%0A` walks through the
+        flattener untouched — there is no control character there to delete — and an
+        unescaped `%` then leaves the runner free to decode them back into a newline
+        when it reads the property. Same for `::`, which truncates the property list,
+        and `,`, which appends a property (`file=...` re-points the annotation at a
+        file of the caller's choosing). (Reported by Copilot on #253.)
+
+        ⚠ The stdout-line assertions in the sibling test above cannot express this:
+        `%0A` produces ONE line either way, so `len(annotations) == 1` stays true with
+        the escaping removed. This asserts on the EMITTED ENCODING instead.
+        """
+        _run_preflight(
+            tmp_path,
+            "HTTP/2.0 404 Not Found",
+            rc=1,
+            org="evil%0A::error title=forged::x,file=/etc/passwd",
+        )
+        log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
+        annotations = [ln for ln in log.splitlines() if ln.startswith("::error")]
+        assert len(annotations) == 1, f"expected ONE annotation, got {len(annotations)}"
+        line = annotations[0]
+
+        assert "%250A" in line, (
+            "the '%' was left raw, so the runner decodes '%0A' into a newline inside "
+            "the annotation property"
+        )
+        assert ",file=" not in line, (
+            "an unescaped ',' injected a further command property — the annotation can "
+            "be re-pointed at an arbitrary file"
+        )
+        title = line.split("::", 2)[1]
+        assert "%3A%3A" in title, (
+            "an embedded '::' was left raw and truncates the property list early"
+        )
+        # ⛔ ORDERING PIN. Escaping ':' before '%' re-escapes the '%' in the '%3A' just
+        # written, so every value double-encodes and the annotation renders '%3A'
+        # instead of ':'. This fixture carries no literal '%3A', so the sequence can
+        # only appear if the sed expressions were reordered.
+        assert "%253A" not in line, (
+            "':' was escaped before '%': the '%' in '%3A' got escaped again, so every "
+            "value is double-encoded"
+        )
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_a_carriage_return_from_the_response_cannot_reach_the_annotation(self, tmp_path):
+        """⛔ CODE_TEXT's `tr -d` was the only guard on it, and nothing tested it.
+
+        Found by mutating `tr -d` off each variable in turn: TITLE is caught by the
+        test above, CLASS is two string literals and cannot be tainted at all, and
+        this one survived the ENTIRE file. Two guards over one value hid it — once ':'
+        is escaped, an injected '::' is neutralised whether or not the CR survived, so
+        only the variable where `tr -d` stands ALONE can fail for its own reason.
+
+        `CODE` is `awk 'NR==1 && $1 ~ /^HTTP/ {print $2}'` over the response. An awk
+        FIELD cannot span a newline — records are newline-delimited — so LF genuinely
+        cannot arrive here and no test could show it. `\r` is NOT a field separator,
+        so it can: a first line of `HTTP/2.0 403\rforged Forbidden` yields
+        CODE=`403\rforged`.
+
+        A lone CR does not end a line, so this is not command injection. It is log
+        SPOOFING — the CR returns the cursor to column 0 and what follows overwrites
+        the rendered line. That is the other half of CWE-117 and the half that
+        survives once the newline path is closed.
+        """
+        _run_preflight(tmp_path, "HTTP/2.0 403\rforged Forbidden", rc=1)
+        # ⛔ newline="" AND split("\n"). TWO separate ways this fixture destroys the very
+        # character it exists to detect, and the first one is invisible:
+        #   - `read_text()` applies UNIVERSAL NEWLINE TRANSLATION, silently rewriting the
+        #     \r to \n before any assertion sees it. Measured: with the guard mutated
+        #     off, the CR still never reached the test — the fixture, not the workflow,
+        #     was cleaning the input.
+        #   - `splitlines()` then breaks on \r as well, consuming whatever survived.
+        # A test for a control character has to read bytes the way the runner would.
+        with open(tmp_path / "stdout.txt", encoding="utf-8", newline="") as fh:
+            log = fh.read()
+        annotations = [ln for ln in log.split("\n") if ln.startswith("::error")]
+        assert annotations, "the step emitted no annotation at all"
+        assert not any("\r" in ln for ln in annotations), (
+            "a CR from the HTTP response reached the annotation: it returns the cursor "
+            "to column 0, so following text overwrites what was rendered"
         )
 
 
