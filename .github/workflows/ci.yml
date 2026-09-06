@@ -99,16 +99,17 @@ jobs:
   # check extracts top-level symbols (functions / classes / module-level
   # assignments) from each Python file the PR modifies at main, at PR
   # head, and at merge-base, and flags every symbol main has that PR
-  # head doesn't. Categorisation:
+  # head doesn't. Categorisation (three reachable cases):
   #
-  #   FAIL (exits 1, blocks merge) - POSSIBLE_DROP / CONFLICT_RESOLUTION_DROP.
+  #   FAIL (exits 1, blocks merge) - POSSIBLE_DROP.
   #     The branch is up to date but a symbol that should be there
   #     (was at branch time, or was added to main after fork and the
   #     branch has caught up via rebase) is missing. Reviewer MUST
   #     verify before merging -- either the deletion was intentional
   #     and documented in a commit message (auto-downgrades to OK), or
   #     the symbol was lost in a conflict resolution and must be
-  #     restored.
+  #     restored (the FAIL output names the symbol, the file, and the
+  #     remediation: redo the conflict resolution keeping both sides).
   #   WARN (exits 0, informational) - STALE_BRANCH / LEGACY_STALE.
   #     The branch has not rebased onto current main. Reviewer may ask
   #     the author to rebase; the PR can still merge safely because
@@ -116,6 +117,13 @@ jobs:
   #   OK (exits 0) - no missing symbols, or INTENTIONAL_DELETE
   #     auto-detected via PR commit message naming the symbol with a
   #     delete / remove / drop / deprecate / retire keyword.
+  #
+  # The fourth combination (NOT in_merge_base AND NOT branch_stale) is
+  # unreachable by construction -- if main is an ancestor of HEAD then
+  # merge-base(branch, main) == main, so every main symbol IS in the
+  # merge-base. A guard that never fires would produce no evidence of
+  # not firing, so it is removed rather than left as documented coverage
+  # that never runs.
   #
   # See tests/test_symbol_presence_check.py for the synthetic scenarios
   # the check was designed to distinguish.
