@@ -63,22 +63,39 @@ def run(cmd: str, timeout: int = 60, input_text: str | None = None) -> subproces
     )
 
 
-#: Distinct from None BY DESIGN. None is a value the provider can legitimately
-#: report; this marks a field we never got to read at all.
-_UNSET = object()
+#: TWO sentinels, because "we never got a reading" and "we got a reading and the
+#: key was not in it" are different facts and one of them is normal.
+#:
+#: ⛔ Measured against `just-akash status --json` (cli.py), NOT assumed:
+#:   "status"   is ALWAYS present and ALWAYS a string — "ready" / "down" /
+#:              "unknown". It is never absent and never JSON null.
+#:   "ssh_host" is set only `if ssh:`, so it is OMITTED when there is no SSH
+#:              endpoint yet. Absent is the ordinary negative reading — it is
+#:              DATA, and it is most of what this instrument will see early in a
+#:              lease's life.
+#: So an earlier revision here was wrong to call JSON null "a legitimate provider
+#: reading": null is not currently producible for either key. What IS producible,
+#: and what must stay distinguishable, is no-poll vs key-absent.
+_NOPOLL = object()  #: no status document was successfully parsed at all
+_ABSENT = object()  #: a document WAS parsed and did not carry this key
 
 
 def _render(value: object, present=repr) -> str:
-    """Three outcomes, three renderings — never two facts sharing one string.
+    """Four outcomes, four strings — never two facts sharing one.
 
-    ⛔ `unreported` (we never obtained a parseable reading) and `null` (we read the
-    document and the field was empty) are DIFFERENT FACTS, and the second is the
-    one the GATE line exists to detect. Collapsing them — which `None`, `False` or
-    `0` all do — would leave the instrument unable to report the ambiguity it was
-    built to resolve.
+    `unreported` (no parseable poll) and `absent` (polled, key not present) are
+    the two that actually occur, and collapsing them is the defect this helper
+    exists to prevent: for ssh_host, `absent` is the ordinary "no endpoint yet"
+    reading and would otherwise be indistinguishable from a failed poll.
+
+    `null` is retained as a distinct rendering for an explicit JSON null.
+    Defensive: neither key produces one today, and if one ever does, it should
+    not silently read as either of the other two.
     """
-    if value is _UNSET:
+    if value is _NOPOLL:
         return "unreported"
+    if value is _ABSENT:
+        return "absent"
     if value is None:
         return "null"
     return present(value)
@@ -191,13 +208,13 @@ def main():
         # histogram.
         gate_attempt: int | None = None
         gate_elapsed: float | None = None
-        # ⛔ _UNSET, not None. None is a LEGITIMATE READING here — the provider
-        # returned a status document whose field was null — and it is precisely the
-        # reading this instrument exists to detect. Initialising to None would make
-        # "we never got a parseable poll" indistinguishable in a grep from "we polled
-        # and the field was empty", which is the one ambiguity the GATE line is for.
-        gate_status: object = _UNSET
-        gate_ssh: object = _UNSET
+        # ⛔ _NOPOLL, not None and not _ABSENT. These start as "no document was
+        # ever parsed"; a successful parse overwrites them with the key's value or
+        # with _ABSENT. Keeping those two apart is the point: for ssh_host, ABSENT
+        # is the ordinary "no endpoint yet" reading — it is DATA — and a plain None
+        # or False would make it indistinguishable from a poll that never landed.
+        gate_status: object = _NOPOLL
+        gate_ssh: object = _NOPOLL
         # Provider workload activation can lag well past 35s on a busy provider;
         # poll up to ~95s before declaring a timeout to avoid flaky CI failures.
         max_attempts = 18
@@ -211,11 +228,11 @@ def main():
                 # still reports what the last poll actually saw.
                 gate_attempt = attempt
                 gate_elapsed = time.monotonic() - gate_t0
-                gate_status = status_data.get("status", _UNSET)
+                gate_status = status_data.get("status", _ABSENT)
                 # NOT bool(...): bool() maps an ABSENT key and a present-but-empty
                 # value onto the same False, and "unreported must not render as
                 # False" is the whole discipline here.
-                gate_ssh = status_data.get("ssh_host", _UNSET)
+                gate_ssh = status_data.get("ssh_host", _ABSENT)
                 if status_data.get("status") == "ready" or status_data.get("ssh_host"):
                     lease_ready = True
                     break

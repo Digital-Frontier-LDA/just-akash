@@ -124,14 +124,17 @@ def test_every_streaming_probe_is_time_bounded():
         )
 
 
-def test_absent_and_null_and_present_render_as_three_different_strings():
-    """⛔ `unreported` and `null` are DIFFERENT FACTS and must not share a string.
+def test_no_poll_and_key_absent_and_value_render_as_different_strings():
+    """⛔ The three facts that actually occur must not share a string.
 
-    "we never obtained a parseable reading" and "we read the document and the field
-    was empty" are the two states the GATE line exists to tell apart — the second is
-    a legitimate provider reading and the evidence #273 is waiting on. `None`,
-    `False` and `0` all collapse them, which is why the renderer takes a sentinel
-    rather than defaulting to None.
+    Measured against `just-akash status --json` (cli.py), not assumed:
+    `"status"` is always present and always a string; `"ssh_host"` is set only
+    `if ssh:`, so it is OMITTED when there is no endpoint yet. That makes
+    key-absent the ORDINARY negative reading for ssh_host — data, not an error —
+    and collapsing it with "no poll landed" is the defect this guards.
+
+    An earlier revision used ONE sentinel and rendered key-absent as
+    `unreported`, reintroducing exactly the collapse it was written to remove.
 
     Imported rather than restated, so a change to the renderer is tested and not
     diverged from.
@@ -139,17 +142,19 @@ def test_absent_and_null_and_present_render_as_three_different_strings():
     import importlib
 
     mod = importlib.import_module("just_akash.test_shell_e2e")
-    unset, render = mod._UNSET, mod._render
+    nopoll, absent, render = mod._NOPOLL, mod._ABSENT, mod._render
 
-    assert render(unset) == "unreported"
-    assert render(None) == "null"
+    assert render(nopoll) == "unreported"
+    assert render(absent) == "absent"
     assert render("ready") == "'ready'"
-    # the three must be mutually distinguishable, which is the actual invariant
-    assert len({render(unset), render(None), render("ready")}) == 3
+    assert render(None) == "null"
 
-    # and the ssh_host variant must not map an absent key onto the same string as
-    # a present-but-falsy value — the "must not render as False" rule
-    truthy = render({"host": "h"}, lambda v: "present" if v else "empty")
-    falsy = render({}, lambda v: "present" if v else "empty")
-    assert render(unset) != falsy, "an absent ssh_host reads the same as an empty one"
-    assert truthy != falsy
+    # the real invariant: every outcome is mutually distinguishable
+    rendered = [render(nopoll), render(absent), render(None), render("ready")]
+    assert len(set(rendered)) == 4, f"two facts share a rendering: {rendered}"
+
+    # and for ssh_host's presence formatter, absent must not read as empty
+    fmt = lambda v: "present" if v else "empty"  # noqa: E731
+    assert render(absent, fmt) != render({}, fmt), (
+        "an ssh_host key that was never sent reads the same as one sent empty"
+    )
