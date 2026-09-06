@@ -137,8 +137,12 @@ def symbols_from_source(source: str) -> set[str]:
     out: set[str] = set()
     # `ast.TypeAlias` is the `type X = Y` statement, added in Python 3.12.
     # `requires-python` in pyproject is ">=3.10", so guard the lookup
-    # for forward/backward compatibility.
-    type_alias = getattr(ast, "TypeAlias", None)
+    # for forward/backward compatibility. Explicit annotation is required
+    # so pyright can narrow `node` after the isinstance check below:
+    # `getattr(ast, "TypeAlias", None)` is typed `Any` to pyright, which
+    # would otherwise leave `node` as `ast.stmt` and the `.name` access
+    # would fail static analysis on classes that don't have it.
+    type_alias: type[ast.stmt] | None = getattr(ast, "TypeAlias", None)
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             out.add(node.name)
@@ -155,7 +159,12 @@ def symbols_from_source(source: str) -> set[str]:
             # (Python 3.12+). The alias name lives on `node.name`, which
             # is itself an `ast.Name`. Reuse `_names` so a type alias
             # with attribute / subscript shape still reports its root.
-            out.update(_names(node.name))
+            # `# type: ignore[attr-defined]` is necessary because pyright
+            # does not narrow `node` through the dynamic `getattr` lookup
+            # even with the explicit `type[ast.stmt] | None` annotation;
+            # the runtime isinstance check above guarantees `node.name`
+            # is safe.
+            out.update(_names(node.name))  # type: ignore[attr-defined]
     return out
 
 
