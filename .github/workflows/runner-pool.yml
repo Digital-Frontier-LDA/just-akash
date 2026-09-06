@@ -635,7 +635,7 @@ jobs:
               # means the pool trusts a measurement taken of something else. `:latest`
               # made that gap permanent and silent — the tag can move between the
               # qualification and the run that relies on it.
-              image: ghcr.io/akash-network/github-runner@sha256:7509763af8209796f3e7fde5fb536c742075ec1a59ad1b36e3c9c27bc3bafc67
+              image: ghcr.io/digital-frontier-lda/df-akash-runner@sha256:bdf7b15256a41156d1227510e4e4d8c9e28d79d685e14907132fe439b85bef64
               env:
                 - ACCESS_TOKEN=${GH_RUNNER_PAT}
                 - ORG_NAME=${ORG}

@@ -1018,7 +1018,7 @@ MUTATIONS = [
     (
         "pool image matches the probe",
         lambda s: s.replace(
-            "github-runner@sha256:7509763af8209796f3e7fde5fb536c742075ec1a59ad1b36e3c9c27bc3bafc67",
+            "df-akash-runner@sha256:bdf7b15256a41156d1227510e4e4d8c9e28d79d685e14907132fe439b85bef64",
             "github-runner:latest",
         ),
     ),
