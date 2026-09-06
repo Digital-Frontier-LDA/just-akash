@@ -283,10 +283,21 @@ def test_the_observation_and_its_attempt_cannot_be_recorded_apart():
     would look like a tidy-up.
     """
     loop = next(
-        n
-        for n in ast.walk(_TREE)
-        if isinstance(n, ast.For)
-        and "just-akash status" in (ast.get_source_segment(_SRC, n) or "")
+        (
+            (
+                n
+                for n in ast.walk(_TREE)
+                if isinstance(n, ast.For)
+                and "just-akash status" in (ast.get_source_segment(_SRC, n) or "")
+            )
+        ),
+        None,
+    )
+    assert loop is not None, (
+        "loop locator matched nothing — the shape it anchors to has moved. "
+        "Re-anchor it rather than deleting the test, and do not let this "
+        "arrive as a bare StopIteration with no statement of what was "
+        "being looked for."
     )
 
     obs = [
@@ -320,3 +331,63 @@ def test_the_observation_and_its_attempt_cannot_be_recorded_apart():
             f"{name} is assigned inside the poll loop again — that split is exactly how "
             "the observation and the attempt number came to describe different moments"
         )
+
+
+def test_step_six_names_why_the_ssh_cross_check_was_skipped():
+    """⛔ THE SAME COLLAPSE THIS PR EXISTS TO REMOVE, one function further down.
+
+    `_NOPOLL`/`_ABSENT` exist because "we never got a reading" and "we got one and
+    the key was absent" are different facts. Step 6 was still merging them: a hung
+    probe and an ordinary "no endpoint yet" both printed *"SSH key or endpoint not
+    available"*. One is a lease that is not ready; the other is an instrument that
+    never ran, and only the second means the cross-check was not actually attempted.
+
+    Sweeping the try into step 6 fixed the ESCAPE and left the REPORTING collapse —
+    the class was half-swept, which is exactly what "swept the class" should not mean.
+    (Reported by CodeRabbit on #276.)
+
+    Two halves, because either alone is satisfiable by the bug: the handler must
+    separate a timeout from a parse failure, AND the skip line must actually say
+    which happened. Recording a cause nothing reports is not reporting it.
+    """
+    # ⛔ INNERMOST, by span. The steps-3-5 `try:` encloses all of step 6, so its own
+    # source segment contains this string too — a naive match finds the wrapper as
+    # well as the probe and then asserts about the wrong node.
+    candidates = [
+        n
+        for n in ast.walk(_TREE)
+        if isinstance(n, ast.Try)
+        and "ssh_host = status_data.get" in (ast.get_source_segment(_SRC, n) or "")
+    ]
+    assert candidates, "the step-6 ssh probe try moved — re-anchor, do not delete"
+    probe = min(candidates, key=lambda n: (n.end_lineno or 0) - n.lineno)
+    probes = [probe]
+
+    # ⛔ A HANDLER CATCHING A TUPLE is the collapse; one catching TimeoutExpired ALONE
+    # is the fix. Checking the names inside the handler is not enough — `subprocess.
+    # TimeoutExpired` contributes "subprocess" too, so a naive "only one name" test
+    # fails on correct code. The shape of `h.type` is what distinguishes them.
+    timeout_alone = [
+        h
+        for h in probes[0].handlers
+        if h.type is not None
+        and not isinstance(h.type, ast.Tuple)
+        and "TimeoutExpired" in (ast.get_source_segment(_SRC, h.type) or "")
+    ]
+    assert timeout_alone, (
+        "TimeoutExpired does not have a handler of its own, so a hung probe and an "
+        "unparsable one are recorded as the same thing — the collapse this PR removes "
+        "upstream. handlers: "
+        f"{[ast.get_source_segment(_SRC, h.type) for h in probes[0].handlers if h.type]}"
+    )
+
+    skip = [ln for ln in _SRC.splitlines() if "SSH cross-check skipped" in ln]
+    assert skip, "the step-6 skip line moved — re-anchor, do not delete"
+    assert any("ssh_probe" in ln for ln in skip), (
+        "the skip line does not report the probe outcome, so the distinction the "
+        "handler now records is discarded before anyone can read it"
+    )
+    assert any("missing=" in ln for ln in skip), (
+        "the skip line does not say WHICH input was missing; ssh_key, ssh_host and "
+        "ssh_port shared one sentence and the reader could not tell them apart"
+    )

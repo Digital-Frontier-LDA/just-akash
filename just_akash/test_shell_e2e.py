@@ -818,17 +818,42 @@ def main():
             # rather than by being told: the probe belongs inside the try, or a
             # TimeoutExpired escapes as a traceback instead of the reported
             # "could not resolve ssh host" failure below.
+            # ⛔ WHY the probe yielded nothing is a different fact from THAT it did,
+            # and this handler was collapsing them. A hung probe and an ordinary "no
+            # endpoint yet" both printed "SSH key or endpoint not available" — one is
+            # a lease that is not ready, the other is an instrument that did not run,
+            # and only the second means the cross-check was never actually attempted.
+            #
+            # This is the exact collapse `_NOPOLL`/`_ABSENT` removes in the readiness
+            # gate above. Sweeping the try into step 6 fixed the ESCAPE here and left
+            # the REPORTING collapse behind — the same class, one function down.
+            # (Reported by CodeRabbit on #276.)
+            ssh_probe = "ok"
             try:
                 r = run(f"uv run just-akash status --dseq {dseq} --json", timeout=30)
                 status_data = json.loads(r.stdout)
                 ssh_host = status_data.get("ssh_host")
                 ssh_port = str(status_data.get("ssh_port", ""))
-            except (subprocess.TimeoutExpired, json.JSONDecodeError, TypeError):
-                pass
+            except subprocess.TimeoutExpired:
+                ssh_probe = "timed-out"
+            except (json.JSONDecodeError, TypeError):
+                ssh_probe = "unparsable"
 
             if not ssh_key or not ssh_host or not ssh_port:
+                # Name WHICH input was missing as well as how the probe fared: three
+                # different absences shared one sentence, so the line could not say
+                # whether the key was unset or the lease had no endpoint.
+                missing = ", ".join(
+                    name
+                    for name, value in (
+                        ("ssh_key", ssh_key),
+                        ("ssh_host", ssh_host),
+                        ("ssh_port", ssh_port),
+                    )
+                    if not value
+                )
                 log_info(
-                    "SSH key or endpoint not available — skipping SSH cross-check (non-fatal)"
+                    f"SSH cross-check skipped (non-fatal): probe={ssh_probe} missing={missing}"
                 )
             else:
                 remote_path = "/tmp/e2e-test.env"
