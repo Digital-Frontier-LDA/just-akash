@@ -330,3 +330,95 @@ def test_it_waits_because_the_deploy_outlives_the_run_that_gave_up(monkeypatch, 
 
     threading.Thread(target=append_later, daemon=True).start()
     assert _tse._dseq_from_deploy_log(started, wait=5.0) == "1788999000444"
+
+
+def test_a_file_newer_than_this_run_is_not_thereby_this_runs(monkeypatch, tmp_path):
+    """⛔ THE mtime GUARD PROVES ONE DIRECTION AND THE CALLER WANTS THE OTHER.
+
+    `mtime >= started_at` rules out a file OLDER than this run. It cannot establish
+    that a NEWER file belongs to this run — and this repo's own abandoned-grandchild
+    behaviour is the counterexample:
+
+        T1  run A times out, abandons its grandchild
+        T2  run B starts                        started_at = T2
+        T3  run A's grandchild writes DSEQ_A    mtime = T3 > T2  -> looks FRESH
+        T4  run B recovers DSEQ_A
+
+    Overlapping E2E runs are an observed state here, not a hypothetical.
+
+    ⚠ THIS TEST PASSES, AND THAT IS THE POINT. It asserts the limit rather than a
+    fix: nothing available at T4 can tell DSEQ_A from ours, because we are only on
+    this path when this run's own output produced nothing to corroborate against.
+    The safety therefore cannot live here — it lives in what the caller DOES with
+    the answer, which `test_a_recovered_dseq_is_reported_and_never_destroyed` pins.
+    """
+    started = time.time()
+    # a previous run's deploy, still alive, writes AFTER we started
+    _tee_log(monkeypatch, tmp_path, "Deployment created  DSEQ=9999999999999\n")
+    assert _tse._dseq_from_deploy_log(started, wait=0.0) == "9999999999999", (
+        "recovery is expected to return the foreign DSEQ — if this now returns None, "
+        "provenance became establishable and the report-only rule can be revisited"
+    )
+
+
+def test_a_recovered_dseq_is_reported_and_never_destroyed():
+    """⛔ THE ESCROW BOUNDARY, where the previous test proves it has to be.
+
+    Recovery yields a candidate whose provenance cannot be established. Closing the
+    wrong one is worse than closing none: it takes down a live deployment belonging
+    to another run and reports success. So the recovered value must reach the report
+    and must not reach `robust_destroy` — nor `dseq_ref`, which is what BOTH the
+    destroy branch and the SIGINT handler act on.
+
+    An earlier revision of this PR assigned it straight into `dseq_ref["dseq"]`, so
+    it took the destroy branch while the PR description said "reports, never closes".
+    """
+    fn = next(n for n in ast.walk(_TREE) if isinstance(n, ast.FunctionDef) and n.name == "main")
+    assigns = [
+        n
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Assign)
+        and isinstance(n.value, ast.Call)
+        and isinstance(n.value.func, ast.Name)
+        and n.value.func.id == "_dseq_from_deploy_log"
+    ]
+    assert len(assigns) == 1, f"expected one recovery call, found {len(assigns)}"
+    target = assigns[0].targets[0]
+    assert isinstance(target, ast.Name), (
+        "the recovered DSEQ is assigned into a subscript — if that is dseq_ref, it "
+        "arms both the destroy branch and the signal handler against an unverified id"
+    )
+    name = target.id
+
+    def _args_of(callee: str) -> set[str]:
+        out: set[str] = set()
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == callee:
+                out |= {a.id for a in n.args if isinstance(a, ast.Name)}
+        return out
+
+    assert name in _args_of("report_unnamed_deployment"), (
+        f"{name!r} never reaches the report — recovering the DSEQ and then not saying "
+        "it is the same as not recovering it"
+    )
+    assert name not in _args_of("robust_destroy"), (
+        f"{name!r} is passed to robust_destroy — a candidate from a shared fixed path "
+        "is not an identification and must not authorise closing anything"
+    )
+    assigned_into_ref = [
+        n
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Assign)
+        and any(
+            isinstance(t, ast.Subscript)
+            and isinstance(t.value, ast.Name)
+            and t.value.id == "dseq_ref"
+            for t in n.targets
+        )
+        and isinstance(n.value, ast.Name)
+        and n.value.id == name
+    ]
+    assert not assigned_into_ref, (
+        f"{name!r} is written into dseq_ref, which the destroy branch and the SIGINT "
+        "handler both act on"
+    )

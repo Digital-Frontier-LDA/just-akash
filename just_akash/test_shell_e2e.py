@@ -108,11 +108,19 @@ def _dseq_from_deploy_log(started_at: float, *, wait: float = 15.0) -> str | Non
       2. Which is why this WAITS instead of reading once. The instant of the timeout
          is the moment the file is least complete.
 
-    ⛔ A FIXED PATH MAKES STALE DATA INDISTINGUISHABLE FROM FRESH. Every `just up`
-    truncates and rewrites this path, so a file older than this run belongs to a
-    PREVIOUS one, and naming its DSEQ would attribute another run's deployment to
-    this one — then hand it to `robust_destroy`. mtime is the only thing separating
-    them, so a file that predates us is treated as no file at all.
+    ⛔ THE mtime CHECK PROVES ONE DIRECTION ONLY, and the other direction is what a
+    caller would want. `mtime >= started_at` rules out a file OLDER than this run.
+    It does NOT establish that a newer file BELONGS to this run — and fact (1) above
+    is a direct counterexample: a PREVIOUS run's abandoned grandchild is still alive
+    and still writing to this same fixed path, so its output lands after our
+    started_at and looks fresh. Overlapping E2E runs are an observed state here, not
+    a thought experiment.
+
+    So what comes back is a CANDIDATE, not an identification. It is good enough to
+    tell a human where to look and not good enough to destroy anything: the caller
+    routes it to `report_unnamed_deployment`, never to `robust_destroy`. Corroborating
+    it would need a second source attributable to this run, and by construction there
+    is none — we are only here because this run's own output produced nothing.
     """
     deadline = time.monotonic() + wait
     while True:
@@ -139,7 +147,9 @@ def _dseq_from_deploy_log(started_at: float, *, wait: float = 15.0) -> str | Non
         time.sleep(1.0)
 
 
-def report_unnamed_deployment(started_at: float, ended_at: float) -> None:
+def report_unnamed_deployment(
+    started_at: float, ended_at: float, candidate: str | None = None
+) -> None:
     """State, greppably, that a deployment may exist which this run cannot name.
 
     ⛔ REPORTS, NEVER CLOSES. Naming a thing and closing it are different
@@ -157,8 +167,17 @@ def report_unnamed_deployment(started_at: float, ended_at: float) -> None:
     """
     log_fail(
         "UNNAMED DEPLOYMENT POSSIBLE — `just up` may have created a deployment that "
-        "this run cannot identify. No DSEQ was recoverable from anything it flushed."
+        "this run cannot identify."
     )
+    if candidate:
+        # ⛔ NAMED, NOT CLOSED. This DSEQ came from a fixed path that concurrent runs
+        # share, and a previous run's abandoned deploy writes there after our start
+        # time (see _dseq_from_deploy_log). "Probably ours" is enough to point a human
+        # at it and not enough to authorise destroying it — closing the wrong one is
+        # worse than closing none, because it takes down a live deployment and reports
+        # success while doing so.
+        log_info(f"  candidate DSEQ (UNVERIFIED, not closed): {candidate}")
+        log_info(f"  verify it is ours before closing: just-akash status --dseq {candidate}")
     log_info(
         f"  created-between: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(started_at))}"
         f" .. OPEN (this run gave up at "
@@ -269,11 +288,15 @@ def main():
     # ⛔ THE PIPE IS NOT THE ONLY COPY. Before declaring a deployment unnameable, read
     # the file `just up` tees to — it is on disk, the deploy is probably still writing
     # to it, and the recipe already trusts it enough to grep it for the DSEQ itself.
+    # ⛔ DELIBERATELY NOT `dseq_ref`. A recovered DSEQ is a CANDIDATE, not this run's
+    # identifier, and dseq_ref is what both the destroy branch below and the SIGINT
+    # handler act on. Naming it is useful; destroying it is not ours to do — see
+    # report_unnamed_deployment for why mtime cannot establish provenance.
+    recovered_dseq = None
     if not dseq_ref["dseq"] and (returncode != 0 or not m):
-        recovered = _dseq_from_deploy_log(deploy_started_at)
-        if recovered:
-            dseq_ref["dseq"] = recovered
-            log_info(f"Recovered DSEQ={recovered} from {_DEPLOY_TEE_LOG}")
+        recovered_dseq = _dseq_from_deploy_log(deploy_started_at)
+        if recovered_dseq:
+            log_info(f"Candidate DSEQ={recovered_dseq} found in {_DEPLOY_TEE_LOG}")
 
     if returncode != 0:
         log_fail(
@@ -282,12 +305,12 @@ def main():
         if dseq_ref["dseq"]:
             robust_destroy(dseq_ref["dseq"])
         else:
-            report_unnamed_deployment(deploy_started_at, deploy_ended_at)
+            report_unnamed_deployment(deploy_started_at, deploy_ended_at, recovered_dseq)
         sys.exit(1)
 
     if not dseq_ref["dseq"]:
         log_fail("Could not parse DSEQ from `just up` output")
-        report_unnamed_deployment(deploy_started_at, deploy_ended_at)
+        report_unnamed_deployment(deploy_started_at, deploy_ended_at, recovered_dseq)
         sys.exit(1)
 
     dseq = dseq_ref["dseq"]
