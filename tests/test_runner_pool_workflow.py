@@ -792,7 +792,61 @@ def test_the_guard_actually_runs_and_decides(key, accepted, tmp_path):
         assert "::error" in (proc.stdout + proc.stderr), "refused without saying why"
 
 
+@pytest.mark.parametrize("n", [3999, 4000, 4001])
+def test_resume_token_survives_an_exact_4000_byte_body(n, tmp_path):
+    """⛔ The ONE body length at which the CWE-117 guard never turns itself back off.
+
+    `head -c` cuts by BYTES. `printf '%s\\n' "$RESP"` emits len+1 of them, so at a body
+    of EXACTLY 4000 the cut keeps the payload and discards the appended newline, leaving
+    the cursor mid-line. `::<token>::` is honoured only at the start of a line, so the
+    resume never registers and `::stop-commands::` stays active for the REST OF THE JOB
+    — `pool` runs to ~line 1246 and contains the `::add-mask::` on the minted verdict
+    token. So this fails OPEN on secret masking, not closed on injection.
+
+    3999 and 4001 both work. Only 4000 does not, which is why this is pinned to the
+    exact bound: a test at "a large body" cannot express it, and neither can one at
+    3999 or 4001.
+
+    The fragment is read FROM the workflow rather than restated here, so an edit to the
+    emit sequence is tested rather than diverged from.
+    """
+    m = re.search(
+        r"printf '%s\\n' \"\$RESP\" \| head -c 4000.*?echo \"::\$\{RESP_TOKEN\}::\"",
+        SRC,
+        re.S,
+    )
+    assert m, "the bounded-echo fragment moved — re-anchor this test rather than deleting it"
+    body = "\n".join(
+        line.strip() for line in m.group(0).splitlines() if not line.strip().startswith("#")
+    )
+
+    script = tmp_path / "emit.sh"
+    script.write_text(body, encoding="utf-8")
+    proc = subprocess.run(
+        ["bash", str(script)],
+        env={**os.environ, "RESP": "A" * n, "RESP_TOKEN": "TESTTOKEN"},
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert any(line == "::TESTTOKEN::" for line in proc.stdout.splitlines()), (
+        f"at {n} bytes the resume token is not at the start of a line, so "
+        "::stop-commands:: is never lifted and stays active for the rest of the job"
+    )
+
+
 MUTATIONS = [
+    (
+        "the resume token is unconditionally at line start",
+        # Removes the unconditional newline, restoring the exact-4000-byte hole.
+        lambda s: s.replace(
+            "                printf '\\n'\n"
+            '                if [ "$(printf \'%s\' "$RESP" | wc -c)" -gt 4000 ]; then\n'
+            "                  printf '[truncated at 4000 bytes]\\n'",
+            '                if [ "$(printf \'%s\' "$RESP" | wc -c)" -gt 4000 ]; then\n'
+            "                  printf '\\n[truncated at 4000 bytes]\\n'",
+        ),
+    ),
     (
         "placement-key keeps its default",
         lambda s: s.replace(

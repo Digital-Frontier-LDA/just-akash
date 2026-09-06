@@ -460,8 +460,19 @@ jobs:
                 echo "::group::Unexpected preflight response (HTTP ${CODE:-none received})"
                 echo "::stop-commands::${RESP_TOKEN}"
                 printf '%s\n' "$RESP" | head -c 4000
+                # ⛔ UNCONDITIONAL, and it must STAY unconditional. `head -c` cuts by
+                # BYTES, so at EXACTLY 4000 bytes of $RESP it consumes the payload and
+                # discards the newline printf appended — leaving the cursor mid-line.
+                # The resume token below is honoured only at line start, so at exactly
+                # that length ::stop-commands:: would never be lifted and workflow
+                # commands would stay disabled for the REST OF THIS JOB — which runs to
+                # line ~1246 and includes the `::add-mask::` on the minted verdict
+                # token. That fails OPEN on secret masking, not closed on injection.
+                # 3999 and 4001 both work; only 4000 does not, so a test NEAR the bound
+                # cannot express it — see test_resume_token_survives_an_exact_4000_byte_body.
+                printf '\n'
                 if [ "$(printf '%s' "$RESP" | wc -c)" -gt 4000 ]; then
-                  printf '\n[truncated at 4000 bytes]\n'
+                  printf '[truncated at 4000 bytes]\n'
                 fi
                 echo "::${RESP_TOKEN}::"
                 echo "::endgroup::" ;;
