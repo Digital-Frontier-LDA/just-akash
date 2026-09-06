@@ -298,8 +298,15 @@ def main():
     # identifier, and dseq_ref is what both the destroy branch below and the SIGINT
     # handler act on. Naming it is useful; destroying it is not ours to do — see
     # report_unnamed_deployment for why mtime cannot establish provenance.
+    #
+    # The condition is just "we have no DSEQ". An earlier draft also tested
+    # `(returncode != 0 or not m)`, which is dead: the only assignments to
+    # dseq_ref["dseq"] above come from a match, and `\d+` cannot capture a falsy
+    # string — so arriving here without a DSEQ already means `m` was None. The extra
+    # conjunct implied two cases where there is one, and hid that recovery is meant
+    # to run on ANY DSEQ-less exit rather than only on a failing one.
     recovered_dseq = None
-    if not dseq_ref["dseq"] and (returncode != 0 or not m):
+    if not dseq_ref["dseq"]:
         recovered_dseq = _dseq_from_deploy_log(deploy_started_at)
         if recovered_dseq:
             log_info(f"Candidate DSEQ={recovered_dseq} found in {_DEPLOY_TEE_LOG}")
