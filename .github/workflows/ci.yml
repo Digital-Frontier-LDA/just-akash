@@ -149,6 +149,13 @@ jobs:
   symbol-presence-check:
     name: Symbol-presence check (Python files)
     runs-on: ubuntu-latest
+    # Read-only: the job checks out the repo and shells to `git` for
+    # merge-base / diff / log; it writes nothing and needs nothing
+    # else. Explicit per-job permissions also scope the new job
+    # against CKV2_GHA_1 in case the workflow-level default ever
+    # changes (see peer note 2026-09-07: latent org-level flip risk).
+    permissions:
+      contents: read
     steps:
       # fetch-depth: 0 because `git merge-base origin/main HEAD` needs
       # to walk back through history. Default shallow clone can't.
