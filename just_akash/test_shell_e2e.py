@@ -70,6 +70,18 @@ def run(cmd: str, timeout: int = 60, input_text: str | None = None) -> subproces
 #: when the child is killed. Authoritative when it arrives, absent when it matters.
 _DSEQ_SUMMARY_RE = re.compile(r"DSEQ[:\s]+(\d+)")
 
+# ⛔ `(\d+)` IN BOTH PATTERNS IS A SHELL-INJECTION BARRIER, not a tidy way to say
+# "a number". The captured DSEQ is interpolated into six commands run through
+# `subprocess.run(..., shell=True)` (see `run`, and the call sites around :476,
+# :510, :547, :562, :580, :621) and into a log line that invites a human to paste
+# it into their own terminal. Those sites are ~400 lines away and say nothing about
+# it, which is why this says it here.
+#
+# ⛔ SO DO NOT WIDEN THE CAPTURE. `(\d+)` -> `(\S+)` is the natural-looking edit the
+# first time a DSEQ turns up in an unexpected shape, and it is one character between
+# a world-writable /tmp file and a shell. Widen the SEPARATOR class if you must;
+# never the capture. `test_the_dseq_capture_is_digits_only_because_it_reaches_a_shell`
+# fails on exactly that edit.
 #: Every shape deploy.py writes a DSEQ in, notably `DSEQ=12345` from the flush=True
 #: `_log` at deploy.py:1104 — the one emission that SURVIVES a kill. Failure path only;
 #: see the comment at its use site for why widening the success path would be a bug.
@@ -455,6 +467,15 @@ def main():
         report_unnamed_deployment(deploy_started_at, deploy_ended_at, recovered_dseq)
         sys.exit(1)
 
+    # ⛔ EVERYTHING BELOW INTERPOLATES `dseq` INTO A SHELL. `run` uses shell=True, and
+    # `dseq` goes in unquoted at :510, :547, :562, :580 and the two status polls. It is
+    # safe for exactly one reason: it is digits BY CONSTRUCTION — the only writers of
+    # `dseq_ref["dseq"]` are `(\d+)` captures, and the /tmp-derived `recovered_dseq` is
+    # deliberately kept out of `dseq_ref` (see step 2), so a world-writable file cannot
+    # reach these lines. That containment was written for the escrow rule — an
+    # unverified value must not reach a privileged sink — and `shell=True` is the
+    # second such sink. If you ever assign to `dseq_ref` from a new source, or widen
+    # the capture, you are editing this too.
     dseq = dseq_ref["dseq"]
     log_pass(f"Deployed DSEQ={dseq}")
 
