@@ -96,7 +96,9 @@ def main():
         dseq_ref["dseq"] = m.group(1)
 
     if r.returncode != 0:
-        log_fail(f"just up failed (rc={r.returncode})")
+        log_fail(
+            f"just up failed (rc={r.returncode}):\nstdout: {r.stdout!r}\nstderr: {r.stderr!r}"
+        )
         if dseq_ref["dseq"]:
             robust_destroy(dseq_ref["dseq"])
         sys.exit(1)
@@ -163,8 +165,19 @@ def main():
             if r.returncode == 0 and "hello from lease-shell" in r.stdout:
                 log_pass("exec: output verified")
             else:
-                log_fail(f"exec failed (rc={r.returncode}):\n{r.stderr}")
-                failures.append("exec_failed")
+                # ⛔ NEUTRAL LABEL AND ALL THREE STREAMS. This said "exec failed
+                # (rc={rc})" and printed stderr only. The condition is a CONJUNCTION
+                # — the command ran AND the output arrived — so when the second limb
+                # fails it printed "exec failed (rc=0)", a cause its own evidence
+                # refutes, followed by an empty stderr, while hiding the stdout it
+                # actually judged. That is what a real failure on main looked like on
+                # 2026-09-06 and it told the reader nothing. The token carried the
+                # same wrong cause into `failures`.
+                log_fail(
+                    f"exec: expected output not verified (rc={r.returncode}):"
+                    f"\nstdout: {r.stdout!r}\nstderr: {r.stderr!r}"
+                )
+                failures.append("exec_output_unverified")
         else:
             log_info("Skipping exec step due to prior failures")
 
@@ -188,7 +201,10 @@ def main():
                     timeout=30,
                 )
                 if r.returncode != 0:
-                    log_fail(f"inject failed (rc={r.returncode}):\n{r.stderr}")
+                    log_fail(
+                        f"inject failed (rc={r.returncode}):"
+                        f"\nstdout: {r.stdout!r}\nstderr: {r.stderr!r}"
+                    )
                     failures.append("inject_failed")
                 else:
                     log_pass("inject: env file uploaded")
@@ -220,7 +236,15 @@ def main():
                     if r.returncode == 0 and perms == "600":
                         log_pass("inject: file permissions are 600")
                     else:
-                        log_fail(f"inject: expected permissions 600, got: {perms!r}")
+                        # ⛔ The mirror of the exec defect above: this named the
+                        # permissions limb and printed `perms` only, so a NON-ZERO rc
+                        # rendered as "expected permissions 600, got: ''" with the
+                        # actual failure invisible.
+                        log_fail(
+                            f"inject: permissions not verified as 600 "
+                            f"(rc={r.returncode}, parsed={perms!r}):"
+                            f"\nstdout: {r.stdout!r}\nstderr: {r.stderr!r}"
+                        )
                         failures.append("inject_permissions_failed")
             finally:
                 if env_file and os.path.exists(env_file):
@@ -291,10 +315,13 @@ def main():
                             "SSH cross-check: file content matches — lease-shell inject is real"
                         )
                     else:
+                        # stdout folded INTO the failure, not a following log_info:
+                        # one line carries the whole verdict, and a truncating helper
+                        # cannot drop the evidence separately from the message.
                         log_fail(
-                            f"SSH cross-check failed (rc={xr.returncode}): {xr.stderr.strip()}"
+                            f"SSH cross-check failed (rc={xr.returncode}):"
+                            f"\nstdout: {xr.stdout[:200]!r}\nstderr: {xr.stderr!r}"
                         )
-                        log_info(f"Content: {xr.stdout[:200]}")
                         failures.append("ssh_crosscheck_failed")
                 except subprocess.TimeoutExpired:
                     log_fail("SSH cross-check timed out")
