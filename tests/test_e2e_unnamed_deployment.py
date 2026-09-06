@@ -61,13 +61,21 @@ def test_a_sigkilled_child_still_yields_the_dseq_it_flushed():
 
 
 def test_the_timeout_carries_bytes_even_though_the_call_asked_for_text():
-    """⛔ Measured, because both failure modes are silent.
+    """⛔ AN OBSERVATION OF CURRENT CPython, and deliberately so.
 
     `subprocess.run(..., text=True, timeout=N)` raises with `.stdout` as BYTES.
-    So `exc.stdout + exc.stderr` is a TypeError, and a `str` pattern applied to
-    it matches nothing — and both look exactly like "the deployment had no
-    DSEQ", which is a statement about the deployment rather than about the
-    plumbing. `_decoded` exists for this and nothing else.
+    That is an implementation detail rather than a documented contract — and it
+    is the entire reason `_decoded` exists, so pinning it is the point. If this
+    test ever fails, nothing here is broken: CPython changed and `_decoded`'s
+    motivation has evaporated, so read it as "the platform moved", not as "we
+    regressed". The behaviour `_decoded` must actually guarantee is pinned
+    separately by `test_decoded_accepts_every_shape_it_can_be_handed`, which
+    does not depend on this detail at all.
+
+    Both failure modes it guards are silent: `exc.stdout + exc.stderr` is a
+    TypeError, and a `str` pattern over bytes matches nothing. Each looks like
+    "the deployment had no DSEQ" — a claim about the deployment rather than
+    about the plumbing.
     """
     exc = _kill_after_timeout(f"""
         import time
@@ -80,6 +88,23 @@ def test_the_timeout_carries_bytes_even_though_the_call_asked_for_text():
     )
     assert _decoded(exc.stdout).startswith("DSEQ=1788999000222")
     assert _decoded(None) == ""
+
+
+def test_decoded_accepts_every_shape_it_can_be_handed():
+    """The contract, independent of how CPython happens to type the exception.
+
+    This is the half that must keep passing whatever the platform does: bytes
+    decode, str passes through, absent streams become empty rather than the
+    string "None" — which would otherwise be searched for a DSEQ and quietly
+    match nothing. Undecodable bytes must not raise: losing the whole output to
+    a UnicodeDecodeError would discard the identifier for a reason that has
+    nothing to do with the deployment.
+    """
+    assert _decoded(b"DSEQ=1") == "DSEQ=1"
+    assert _decoded("DSEQ=1") == "DSEQ=1"
+    assert _decoded(bytearray(b"DSEQ=1")) == "DSEQ=1"
+    assert _decoded(None) == ""
+    assert "\ufffd" in _decoded(b"DSEQ=1 \xff\xfe"), "undecodable bytes must not raise"
 
 
 def test_the_child_is_given_no_chance_to_clean_up_after_itself():
@@ -422,3 +447,44 @@ def test_a_recovered_dseq_is_reported_and_never_destroyed():
         f"{name!r} is written into dseq_ref, which the destroy branch and the SIGINT "
         "handler both act on"
     )
+
+
+def test_the_timeout_returncode_names_the_signal_that_was_actually_sent():
+    """⛔ A NEGATIVE RETURNCODE IS A CLAIM ABOUT A CAUSE, not a spare slot.
+
+    By convention a negative returncode is `-signal`, so the `-1` this once
+    carried decodes to SIGHUP — naming a cause that did not happen, in a value
+    almost nobody thinks to decode. `subprocess.run` kills a timed-out child
+    with `Popen.kill()`; measured, that child's returncode is -9. We are not
+    inferring what killed it, we sent it.
+
+    Pinned as an expression over `signal.SIGKILL` rather than the literal -9, so
+    the code states the cause instead of encoding it.
+    """
+    # ⛔ THE ASSIGNED VALUE, not the handler's text. The first version of this test
+    # searched the source for "SIGKILL" and passed with `returncode = -1` restored,
+    # because the log_fail one line above says "was SIGKILLed". A guard satisfied by
+    # the prose beside the code is not a guard on the code.
+    assigns = []
+    for n in ast.walk(_TREE):
+        if not isinstance(n, ast.Try):
+            continue
+        for h in n.handlers:
+            if "TimeoutExpired" not in (ast.get_source_segment(_SRC, h) or ""):
+                continue
+            for inner in ast.walk(h):
+                if isinstance(inner, ast.Assign) and any(
+                    isinstance(t, ast.Name) and t.id == "returncode" for t in inner.targets
+                ):
+                    assigns.append(inner)
+    assert assigns, "no timeout handler assigns a returncode — re-anchor, do not delete"
+    for a in assigns:
+        names = {
+            m.attr if isinstance(m, ast.Attribute) else getattr(m, "id", "")
+            for m in ast.walk(a.value)
+        }
+        assert "SIGKILL" in names, (
+            "the timeout returncode is not derived from signal.SIGKILL; a bare "
+            f"negative literal asserts whichever signal it decodes to (-1 is SIGHUP) "
+            f"— got {ast.unparse(a.value)!r}, a cause that did not happen"
+        )

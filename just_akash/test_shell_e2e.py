@@ -15,6 +15,7 @@ Requires: AKASH_API_KEY, AKASH_PROVIDERS, SSH_PUBKEY in environment.
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -250,7 +251,12 @@ def main():
         # Collapsing them into one blob passed every human read of this diff and was
         # caught by that test.
         deploy_out, deploy_err = _decoded(exc.stdout), _decoded(exc.stderr)
-        returncode = -1
+        # ⛔ THE REAL SIGNAL, not a placeholder. A negative returncode names the signal
+        # that killed the process, so the -1 this used to carry decodes to SIGHUP — a
+        # cause that did not happen, asserted by a value nobody would think to check.
+        # `subprocess.run` kills a timed-out child with `Popen.kill()`; measured, that
+        # child's returncode is -9. We are not guessing what killed it, we sent it.
+        returncode = -int(signal.SIGKILL)
         log_fail(
             f"`just up` exceeded its {exc.timeout:.0f}s timeout and was SIGKILLed. "
             "Anything it created is still on chain and none of its own cleanup ran."
