@@ -63,6 +63,44 @@ def run(cmd: str, timeout: int = 60, input_text: str | None = None) -> subproces
     )
 
 
+def _diagnose_exec_failure(dseq: str) -> None:
+    """Out-of-band battery, run ONLY after an exec failure and BEFORE destroy (#273).
+
+    ⛔ WHY OUT-OF-BAND. The exec reports `rc=0` with empty stdout and empty stderr —
+    a connection that returned nothing. That signature is produced by at least two
+    different mechanisms (the workload not yet serving; the provider restarting
+    underneath), and NOTHING in the run distinguishes them, so every occurrence has
+    so far yielded another round of inference. These three probes are the cheapest
+    evidence that discriminates, and they must be taken before `destroy` because
+    afterwards the lease is gone and the question is unanswerable.
+
+    ⚠ EVERY PROBE IS INDIVIDUALLY WRAPPED. A diagnostic that raises would abort the
+    run it is explaining and destroy the very evidence it was added to collect —
+    turning a bad exec into a lost lease. Nothing here may change the verdict:
+    `failures` is not touched, and the caller has already recorded the outcome.
+
+    ⚠ `--duration` IS NOT OPTIONAL. `logs` and `events` are streaming commands; the
+    CLI's own help says the flag exists to avoid "hanging when the provider holds a
+    non-follow connection open". Unbounded, this battery would stall for the full
+    subprocess timeout on every failure — a diagnostic that costs more than the bug.
+    """
+    probes = (
+        ("status", f"uv run just-akash status --dseq {dseq} --json"),
+        ("logs", f"uv run just-akash logs --dseq {dseq} --tail 50 --duration 10"),
+        ("events", f"uv run just-akash events --dseq {dseq} --duration 10"),
+    )
+    for name, cmd in probes:
+        try:
+            pr = run(cmd, timeout=45)
+            log_info(
+                f"DIAG {name} rc={pr.returncode}"
+                f"\nstdout: {(pr.stdout or '')[:1500]!r}"
+                f"\nstderr: {(pr.stderr or '')[:600]!r}"
+            )
+        except Exception as e:  # noqa: BLE001 — a probe must never abort the run
+            log_info(f"DIAG {name} probe raised ({type(e).__name__}: {e}) — continuing")
+
+
 def main():
     failures = []
     dseq_ref: dict = {"dseq": None}
@@ -116,10 +154,24 @@ def main():
         log_step(3, f"Wait for lease readiness + verify provider tier (DSEQ={dseq})")
 
         log_info("Waiting 10s for lease propagation...")
+        # ⛔ MEASURED FROM HERE, not from the first poll: the 10s is part of
+        # time-to-ready and excluding it would understate every sample by a
+        # constant. Every reported elapsed therefore has a 10s floor.
+        gate_t0 = time.monotonic()
         time.sleep(10)
 
         lease_ready = False
         provider_addr = None
+        # ── #273 instrumentation. NOT a gate change: the condition below is
+        # byte-identical to before. These four values are recorded so a
+        # time-to-ready DISTRIBUTION exists — no cap or stricter condition can be
+        # sized without one, and none exists today. Recorded on EVERY run,
+        # pass or fail, because a histogram built only from failures is not a
+        # histogram.
+        gate_attempt: int | None = None
+        gate_elapsed: float | None = None
+        gate_status: object = None
+        gate_ssh: bool | None = None
         # Provider workload activation can lag well past 35s on a busy provider;
         # poll up to ~95s before declaring a timeout to avoid flaky CI failures.
         max_attempts = 18
@@ -129,6 +181,12 @@ def main():
             try:
                 status_data = json.loads(r.stdout)
                 provider_addr = status_data.get("provider")
+                # Captured BEFORE the condition so a run that never satisfies it
+                # still reports what the last poll actually saw.
+                gate_attempt = attempt
+                gate_elapsed = time.monotonic() - gate_t0
+                gate_status = status_data.get("status")
+                gate_ssh = bool(status_data.get("ssh_host"))
                 if status_data.get("status") == "ready" or status_data.get("ssh_host"):
                     lease_ready = True
                     break
@@ -149,6 +207,26 @@ def main():
             log_fail(f"Lease not active after {max_wait} seconds")
         else:
             log_pass("Lease is active and ready")
+
+        # ⛔ ONE GREPPABLE LINE PER RUN, whatever the outcome. `status` and
+        # `ssh_host` are reported SEPARATELY because they are not equally
+        # informative: `status == "ready"` is `deployment.state == "active"`
+        # renamed (cli.py), true from the create transaction onward, so it is
+        # ~always true here; `ssh_host` requires the provider to have forwarded
+        # port 22 and reported host AND externalPort (api.py `_extract_ssh_info`).
+        # Collapsing them into one "ready" boolean would destroy the only
+        # distinction this measurement exists to make.
+        #
+        # ⚠ `elapsed` includes the fixed 10s propagation sleep — see gate_t0.
+        log_info(
+            "GATE dseq={} attempt={} elapsed={} status={!r} ssh_host={}".format(
+                dseq,
+                gate_attempt if gate_attempt is not None else "unreported",
+                f"{gate_elapsed:.1f}s" if gate_elapsed is not None else "unreported",
+                gate_status,
+                gate_ssh if gate_ssh is not None else "unreported",
+            )
+        )
 
         if not assert_provider_in_tiers(provider_addr, preferred, backup):
             failures.append("status: foreign or missing provider")
@@ -178,6 +256,7 @@ def main():
                     f"\nstdout: {r.stdout!r}\nstderr: {r.stderr!r}"
                 )
                 failures.append("exec_output_unverified")
+                _diagnose_exec_failure(dseq)
         else:
             log_info("Skipping exec step due to prior failures")
 
