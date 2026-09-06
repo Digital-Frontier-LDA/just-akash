@@ -135,6 +135,10 @@ def symbols_from_source(source: str) -> set[str]:
     'I couldn't look' indistinguishable from 'nothing was there'."""
     tree = ast.parse(source)
     out: set[str] = set()
+    # `ast.TypeAlias` is the `type X = Y` statement, added in Python 3.12.
+    # `requires-python` in pyproject is ">=3.10", so guard the lookup
+    # for forward/backward compatibility.
+    type_alias = getattr(ast, "TypeAlias", None)
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             out.add(node.name)
@@ -146,41 +150,73 @@ def symbols_from_source(source: str) -> set[str]:
             # module-level binding. Bare annotation (x: int, no = ...)
             # is a declaration only and is not counted.
             out.update(_names(node.target))
+        elif type_alias is not None and isinstance(node, type_alias):
+            # `type UserId = int` is a module-level binding under PEP 695
+            # (Python 3.12+). The alias name lives on `node.name`, which
+            # is itself an `ast.Name`. Reuse `_names` so a type alias
+            # with attribute / subscript shape still reports its root.
+            out.update(_names(node.name))
     return out
 
 
 def symbols_at(repo: Path, rev: str, path: str) -> set[str]:
     """Return top-level symbols at rev:path. Returns an empty set if
     the file does not exist at that rev (e.g., deleted at HEAD, or
-    added between fork and main). Raises SyntaxError on parse failure."""
+    added between fork and main, or absent in one rev because it was
+    renamed away to a different path). Raises SyntaxError on parse
+    failure, or re-raises subprocess.CalledProcessError on unexpected
+    git failures (corrupt repo, malformed rev, IO error) so the caller
+    can exit 2 instead of silently treating the file as empty."""
     try:
         src = run(["git", "show", f"{rev}:{path}"], repo)
-    except subprocess.CalledProcessError:
-        return set()
+    except subprocess.CalledProcessError as e:
+        # git show returns non-zero when the path doesn't exist at the
+        # requested rev. There are TWO shapes of that error:
+        #
+        #   1. "fatal: path '<path>' does not exist in '<rev>'"
+        #      -- file isn't tracked at that rev (added between fork
+        #      and main, or deleted at HEAD).
+        #   2. "fatal: path '<path>' exists on disk, but not in '<rev>'"
+        #      -- the working tree has the file (because the test is
+        #      sitting in the renamed-to path on disk) but the rev
+        #      points at a tree where the file lived under a different
+        #      name. Both are legitimate "absent at this rev" outcomes;
+        #      anything else (malformed rev, corrupt repo) must propagate
+        #      so the check exits 2, not 0/1.
+        stderr = e.stderr or ""
+        if "does not exist" in stderr or "exists on disk, but not in" in stderr:
+            return set()
+        raise
     return symbols_from_source(src)
 
 
-def pr_commits_mention(repo: Path, base: str, head: str, name: str) -> bool:
-    """Return True if any commit on the PR branch (reachable from head
-    but not from base) mentions `name` together with a delete/remove/drop
-    keyword. Heuristic only — used to down-weight POSSIBLE_DROP cases
-    where the PR author explicitly documented the deletion.
+def commit_subjects(repo: Path, base: str, head: str) -> list[str]:
+    """Subjects of every commit reachable from head but not from base.
+    Raises subprocess.CalledProcessError on unexpected git failures
+    so the caller can exit 2 -- previously this was caught and treated
+    as 'symbol unmentioned', which could mask a real failure (rev
+    typo, corrupt repo, ...) as a missing-event that the check then
+    flagged as POSSIBLE_DROP on an otherwise-clean PR."""
+    return run(["git", "log", "--format=%s", f"{base}..{head}"], repo).splitlines()
 
-    Word-boundary matching on the symbol name prevents false positives
-    from substring overlap (e.g. a symbol named "mit" matching inside
-    "submit" or a symbol named "bar" matching inside "embargo")."""
-    try:
-        log = run(["git", "log", "--format=%s", f"{base}..{head}"], repo)
-    except subprocess.CalledProcessError:
-        return False
-    keywords = ("delete", "remove", "drop", "deprecate", "retire")
-    # Lowercase the symbol name to match the lowercased commit subject
-    # (so `FOO` is matched inside a message saying "foo" next to a
-    # delete keyword, not just exactly "FOO").
+
+def commit_mentions_symbol(subjects: list[str], name: str) -> bool:
+    """True iff any subject names `name` next to a delete keyword.
+    Heuristic only — used to down-weight POSSIBLE_DROP cases where
+    the PR author explicitly documented the deletion.
+
+    Word-boundary matching on BOTH the symbol name and the keyword:
+      - The symbol-name regex matches whole tokens so `bar` does not
+        match inside `embargo` (substring overlap false positive).
+      - The keyword regex matches whole tokens so `delete` does not
+        match inside `undelete` (substring overlap the other way).
+    Subject and name are both lowercased here so a PascalCase symbol
+    names `Foo` matches the lower-cased subject saying `foo`."""
     name_pat = re.compile(rf"\b{re.escape(name.lower())}\b")
-    for line in log.splitlines():
+    keyword_pat = re.compile(r"\b(?:delete|remove|drop|deprecate|retire)\b")
+    for line in subjects:
         lc = line.lower()
-        if name_pat.search(lc) and any(k in lc for k in keywords):
+        if name_pat.search(lc) and keyword_pat.search(lc):
             return True
     return False
 
@@ -200,10 +236,19 @@ def main() -> int:
     # files: a PR that drops a whole module is the maximal drop and
     # MUST be reported, not silently skipped. (Working-tree .exists()
     # filter would have hidden this — see tests/test_*.py scenario D.)
+    #
+    # `--no-renames`: rename detection collapses old.py -> new.py into
+    # one path, so a renamed-and-edited file's missing symbols live
+    # only in the OLD path. Disabling rename detection forces git to
+    # list both, so the check still inspects the old file at HEAD (=
+    # empty set) and catches every symbol main had there.
     try:
         files = [
             f
-            for f in run(["git", "diff", "--name-only", f"{base}...{head}"], repo).splitlines()
+            for f in run(
+                ["git", "diff", "--no-renames", "--name-only", f"{base}...{head}"],
+                repo,
+            ).splitlines()
             if f.endswith(".py")
         ]
     except subprocess.CalledProcessError as e:
@@ -212,6 +257,17 @@ def main() -> int:
     if not files:
         print("OK: no Python files modified by this PR")
         return 0
+
+    # Fetch commit subjects ONCE up front. Catching a `git log` failure
+    # per-symbol (the old behaviour) would silently mask a real git
+    # error as 'symbol unmentioned', and then flag POSSIBLE_DROP on an
+    # otherwise-clean PR -- a false positive caused by the check being
+    # too quiet. Surface the failure as a documented internal error.
+    try:
+        subjects = commit_subjects(repo, base, head)
+    except subprocess.CalledProcessError as e:
+        print(f"git log failed: {e.stderr}", file=sys.stderr)
+        return 2
 
     try:
         merge_base = run(["git", "merge-base", base, head], repo).strip()
@@ -227,7 +283,21 @@ def main() -> int:
     except FileNotFoundError as e:
         print(f"git not found: {e}", file=sys.stderr)
         return 2
-    is_stale = ancestor_proc.returncode != 0
+    # `merge-base --is-ancestor` returns:
+    #   0   -> base is an ancestor of head (not stale)
+    #   1   -> base is NOT an ancestor of head (the legitimate "stale" signal)
+    #   2+  -> invocation error (corrupt repo, bad args, ...); we must
+    #          surface this rather than silently mark the branch stale,
+    #          which would misroute every finding into STALE_BRANCH.
+    if ancestor_proc.returncode not in (0, 1):
+        print(
+            f"git merge-base --is-ancestor failed (exit "
+            f"{ancestor_proc.returncode}): "
+            f"{ancestor_proc.stderr.decode('utf-8', errors='replace')}",
+            file=sys.stderr,
+        )
+        return 2
+    is_stale = ancestor_proc.returncode == 1
 
     findings: list[tuple[str, str, str, str, str]] = []
     # (file, symbol, in_base, mentioned, category)
@@ -244,6 +314,13 @@ def main() -> int:
             if path not in {p for p, _ in parse_failures}:
                 parse_failures.append((path, str(e)))
             continue
+        except subprocess.CalledProcessError as e:
+            # Unexpected `git show` failure (rev is malformed, repo
+            # is corrupt, IO error, ...). The per-file loop has run
+            # for at least one file already; bail with exit 2 before
+            # producing findings that may already be misleading.
+            print(f"git show failed: {e.stderr}", file=sys.stderr)
+            return 2
 
         # Deleted file at HEAD: s_head is set(), so missing = s_main --
         # every main symbol is reported missing. Categorisation below
@@ -251,7 +328,7 @@ def main() -> int:
         missing = s_main - s_head
         for sym in sorted(missing):
             in_base = sym in s_base
-            mentioned = pr_commits_mention(repo, base, head, sym)
+            mentioned = commit_mentions_symbol(subjects, sym)
             # The fourth combination (not in_base and not is_stale) is
             # structurally unreachable: if main is an ancestor of HEAD
             # then merge-base(branch, main) == main, so every symbol
