@@ -236,7 +236,16 @@ def test_every_dseq_less_exit_reports_the_unnamed_deployment():
     Both DSEQ-less exits in step 2 are the whole issue: the run stops, and unless
     it states the window, nothing anywhere points at what it may have created.
     """
-    fn = next(n for n in ast.walk(_TREE) if isinstance(n, ast.FunctionDef) and n.name == "main")
+    fn = next(
+        ((n for n in ast.walk(_TREE) if isinstance(n, ast.FunctionDef) and n.name == "main")),
+        None,
+    )
+    assert fn is not None, (
+        "fn locator matched nothing — the shape it anchors to has moved. "
+        "Re-anchor it rather than deleting the test, and do not let this "
+        "arrive as a bare StopIteration with no statement of what was "
+        "being looked for."
+    )
     reports = [
         n
         for n in ast.walk(fn)
@@ -259,9 +268,20 @@ def test_the_report_states_the_window_and_closes_nothing():
     is the whole remit of this function and it must stay that way.
     """
     fn = next(
-        n
-        for n in ast.walk(_TREE)
-        if isinstance(n, ast.FunctionDef) and n.name == "report_unnamed_deployment"
+        (
+            (
+                n
+                for n in ast.walk(_TREE)
+                if isinstance(n, ast.FunctionDef) and n.name == "report_unnamed_deployment"
+            )
+        ),
+        None,
+    )
+    assert fn is not None, (
+        "fn locator matched nothing — the shape it anchors to has moved. "
+        "Re-anchor it rather than deleting the test, and do not let this "
+        "arrive as a bare StopIteration with no statement of what was "
+        "being looked for."
     )
     # ⛔ CALLS, not a substring over the source. The first version of this test
     # searched the text and fired on the word "destroy" in this function's own
@@ -400,7 +420,16 @@ def test_a_recovered_dseq_is_reported_and_never_destroyed():
     An earlier revision of this PR assigned it straight into `dseq_ref["dseq"]`, so
     it took the destroy branch while the PR description said "reports, never closes".
     """
-    fn = next(n for n in ast.walk(_TREE) if isinstance(n, ast.FunctionDef) and n.name == "main")
+    fn = next(
+        ((n for n in ast.walk(_TREE) if isinstance(n, ast.FunctionDef) and n.name == "main")),
+        None,
+    )
+    assert fn is not None, (
+        "fn locator matched nothing — the shape it anchors to has moved. "
+        "Re-anchor it rather than deleting the test, and do not let this "
+        "arrive as a bare StopIteration with no statement of what was "
+        "being looked for."
+    )
     assigns = [
         n
         for n in ast.walk(fn)
@@ -614,11 +643,22 @@ def test_the_timeout_message_does_not_claim_the_deploy_is_dead():
     # "running". Reading the file as text asks a question about the source; the
     # subject here is the message, so join the constants the parser produced.
     handler_node = next(
-        h
-        for n in ast.walk(_TREE)
-        if isinstance(n, ast.Try)
-        for h in n.handlers
-        if "TimeoutExpired" in (ast.get_source_segment(_SRC, h) or "")
+        (
+            (
+                h
+                for n in ast.walk(_TREE)
+                if isinstance(n, ast.Try)
+                for h in n.handlers
+                if "TimeoutExpired" in (ast.get_source_segment(_SRC, h) or "")
+            )
+        ),
+        None,
+    )
+    assert handler_node is not None, (
+        "handler_node locator matched nothing — the shape it anchors to has moved. "
+        "Re-anchor it rather than deleting the test, and do not let this "
+        "arrive as a bare StopIteration with no statement of what was "
+        "being looked for."
     )
     handler = "".join(
         c.value
@@ -643,7 +683,16 @@ def test_the_patterns_are_never_applied_to_a_joined_stream():
     `main` still calls `.search(output)` on the concatenation — which is the actual
     defect. Pin the call sites, not just the helper.
     """
-    fn = next(n for n in ast.walk(_TREE) if isinstance(n, ast.FunctionDef) and n.name == "main")
+    fn = next(
+        ((n for n in ast.walk(_TREE) if isinstance(n, ast.FunctionDef) and n.name == "main")),
+        None,
+    )
+    assert fn is not None, (
+        "fn locator matched nothing — the shape it anchors to has moved. "
+        "Re-anchor it rather than deleting the test, and do not let this "
+        "arrive as a bare StopIteration with no statement of what was "
+        "being looked for."
+    )
     offenders = []
     for n in ast.walk(fn):
         if (
@@ -840,7 +889,16 @@ def test_the_tmp_derived_candidate_never_reaches_a_shell_interpolation():
     unverified value must not reach a privileged sink. This pins the second sink,
     which nobody enumerated when the fix was written.
     """
-    fn = next(n for n in ast.walk(_TREE) if isinstance(n, ast.FunctionDef) and n.name == "main")
+    fn = next(
+        ((n for n in ast.walk(_TREE) if isinstance(n, ast.FunctionDef) and n.name == "main")),
+        None,
+    )
+    assert fn is not None, (
+        "fn locator matched nothing — the shape it anchors to has moved. "
+        "Re-anchor it rather than deleting the test, and do not let this "
+        "arrive as a bare StopIteration with no statement of what was "
+        "being looked for."
+    )
     shell_calls = [
         n
         for n in ast.walk(fn)

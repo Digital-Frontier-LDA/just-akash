@@ -346,6 +346,82 @@ def report_unnamed_deployment(
     )
 
 
+#: TWO sentinels, because "we never got a reading" and "we got a reading and the
+#: key was not in it" are different facts and one of them is normal.
+#:
+#: ⛔ Measured against `just-akash status --json` (cli.py), NOT assumed:
+#:   "status"   is ALWAYS present and ALWAYS a string — "ready" / "down" /
+#:              "unknown". It is never absent and never JSON null.
+#:   "ssh_host" is set only `if ssh:`, so it is OMITTED when there is no SSH
+#:              endpoint yet. Absent is the ordinary negative reading — it is
+#:              DATA, and it is most of what this instrument will see early in a
+#:              lease's life.
+#: So an earlier revision here was wrong to call JSON null "a legitimate provider
+#: reading": null is not currently producible for either key. What IS producible,
+#: and what must stay distinguishable, is no-poll vs key-absent.
+_NOPOLL = object()  #: no status document was successfully parsed at all
+_ABSENT = object()  #: a document WAS parsed and did not carry this key
+
+
+def _render(value: object, present=repr) -> str:
+    """Four outcomes, four strings — never two facts sharing one.
+
+    `unreported` (no parseable poll) and `absent` (polled, key not present) are
+    the two that actually occur, and collapsing them is the defect this helper
+    exists to prevent: for ssh_host, `absent` is the ordinary "no endpoint yet"
+    reading and would otherwise be indistinguishable from a failed poll.
+
+    `null` is retained as a distinct rendering for an explicit JSON null.
+    Defensive: neither key produces one today, and if one ever does, it should
+    not silently read as either of the other two.
+    """
+    if value is _NOPOLL:
+        return "unreported"
+    if value is _ABSENT:
+        return "absent"
+    if value is None:
+        return "null"
+    return present(value)
+
+
+def _diagnose_exec_failure(dseq: str) -> None:
+    """Out-of-band battery, run ONLY after an exec failure and BEFORE destroy (#273).
+
+    ⛔ WHY OUT-OF-BAND. The exec reports `rc=0` with empty stdout and empty stderr —
+    a connection that returned nothing. That signature is produced by at least two
+    different mechanisms (the workload not yet serving; the provider restarting
+    underneath), and NOTHING in the run distinguishes them, so every occurrence has
+    so far yielded another round of inference. These three probes are the cheapest
+    evidence that discriminates, and they must be taken before `destroy` because
+    afterwards the lease is gone and the question is unanswerable.
+
+    ⚠ EVERY PROBE IS INDIVIDUALLY WRAPPED. A diagnostic that raises would abort the
+    run it is explaining and destroy the very evidence it was added to collect —
+    turning a bad exec into a lost lease. Nothing here may change the verdict:
+    `failures` is not touched, and the caller has already recorded the outcome.
+
+    ⚠ `--duration` IS NOT OPTIONAL. `logs` and `events` are streaming commands; the
+    CLI's own help says the flag exists to avoid "hanging when the provider holds a
+    non-follow connection open". Unbounded, this battery would stall for the full
+    subprocess timeout on every failure — a diagnostic that costs more than the bug.
+    """
+    probes = (
+        ("status", f"uv run just-akash status --dseq {dseq} --json"),
+        ("logs", f"uv run just-akash logs --dseq {dseq} --tail 50 --duration 10"),
+        ("events", f"uv run just-akash events --dseq {dseq} --duration 10"),
+    )
+    for name, cmd in probes:
+        try:
+            pr = run(cmd, timeout=45)
+            log_info(
+                f"DIAG {name} rc={pr.returncode}"
+                f"\nstdout: {(pr.stdout or '')[:1500]!r}"
+                f"\nstderr: {(pr.stderr or '')[:600]!r}"
+            )
+        except Exception as e:  # noqa: BLE001 — a probe must never abort the run
+            log_info(f"DIAG {name} probe raised ({type(e).__name__}: {e}) — continuing")
+
+
 def main():
     failures = []
     dseq_ref: dict = {"dseq": None}
@@ -494,23 +570,74 @@ def main():
         log_step(3, f"Wait for lease readiness + verify provider tier (DSEQ={dseq})")
 
         log_info("Waiting 10s for lease propagation...")
+        # ⛔ MEASURED FROM HERE, not from the first poll: the 10s is part of
+        # time-to-ready and excluding it would understate every sample by a
+        # constant. Every reported elapsed therefore has a 10s floor.
+        gate_t0 = time.monotonic()
         time.sleep(10)
 
         lease_ready = False
         provider_addr = None
+        # ── #273 instrumentation. NOT a gate change: the condition below is
+        # byte-identical to before. These four values are recorded so a
+        # time-to-ready DISTRIBUTION exists — no cap or stricter condition can be
+        # sized without one, and none exists today. Recorded on EVERY run,
+        # pass or fail, because a histogram built only from failures is not a
+        # histogram.
+        gate_attempt: int | None = None
+        # ⛔ ONE TUPLE, ASSIGNED ATOMICALLY. `gate_attempt` advances on EVERY attempt
+        # while a parse succeeds only on SOME, so holding the observation in its own
+        # variables let a run report `attempt=18` beside a status actually read at
+        # attempt 3 — two numbers describing different moments, printed as one
+        # measurement. (Reported by Copilot on #276.) A tuple makes that disagreement
+        # UNREPRESENTABLE rather than merely detectable. Fifth instance of this PR's
+        # own defect class, so the class gets the fix and not the line.
+        #
+        # ⛔ Stays None when nothing ever parsed, and unpacks to _NOPOLL — not to None
+        # and not to _ABSENT. A successful parse supplies the key's value or _ABSENT.
+        # Keeping those apart is the point: for ssh_host, ABSENT is the ordinary "no
+        # endpoint yet" reading — it is DATA — and a plain None or False would make it
+        # indistinguishable from a poll that never landed.
+        last_obs: tuple[int, object, object] | None = None
         # Provider workload activation can lag well past 35s on a busy provider;
         # poll up to ~95s before declaring a timeout to avoid flaky CI failures.
         max_attempts = 18
         poll_interval = 5
         for attempt in range(1, max_attempts + 1):
-            r = run(f"uv run just-akash status --dseq {dseq} --json", timeout=30)
+            # ⛔ THE PROBE IS INSIDE THE TRY. `run(..., timeout=30)` raises
+            # subprocess.TimeoutExpired, and with the call outside, that exception
+            # escaped the loop, skipped the GATE emission below, and went straight
+            # to cleanup — so the run that most needs a verdict, one where the
+            # status probe hangs, was the one that emitted none. "Recorded on EVERY
+            # run" was true of every BRANCH and false of the exception path.
+            # (Reported by CodeRabbit on #276.)
+            #
+            # A timeout is a spent ATTEMPT, not a fatal error, so the loop continues
+            # and the sentinels stay _NOPOLL — an all-timeout run then reports
+            # `attempt=18 elapsed=635.0s status=unreported`, which says what happened.
+            # (635 = 10s propagation + 18 probes each hitting the 30s timeout + 17
+            # x 5s sleeps. This comment first said 95s — the figure you get by
+            # assuming the probe returns instantly, the same schedule-not-clock
+            # error as the gate_elapsed capture below it. Both are fixed.)
             try:
+                # Per ATTEMPT, not per successful parse: this describes the poll we
+                # made, which is true whether or not it returned anything.
+                gate_attempt = attempt
+                r = run(f"uv run just-akash status --dseq {dseq} --json", timeout=30)
                 status_data = json.loads(r.stdout)
                 provider_addr = status_data.get("provider")
+                # NOT bool(...): bool() maps an ABSENT key and a present-but-empty
+                # value onto the same False, and "unreported must not render as
+                # False" is the whole discipline here.
+                last_obs = (
+                    attempt,
+                    status_data.get("status", _ABSENT),
+                    status_data.get("ssh_host", _ABSENT),
+                )
                 if status_data.get("status") == "ready" or status_data.get("ssh_host"):
                     lease_ready = True
                     break
-            except (json.JSONDecodeError, TypeError):
+            except (subprocess.TimeoutExpired, json.JSONDecodeError, TypeError):
                 pass
             if attempt < max_attempts:
                 log_info(
@@ -519,14 +646,52 @@ def main():
                 )
                 time.sleep(poll_interval)
 
+        # ⛔ MEASURED OFF THE CLOCK WHERE IT IS REPORTED — never snapshotted per
+        # attempt, never computed from the schedule. Both mistakes were here:
+        #
+        #   - `gate_elapsed` was captured at the TOP of each iteration, so it excluded
+        #     that attempt's own probe. An all-timeout run — the exact failure this
+        #     instrumentation exists to characterise — under-reported by a full 30s
+        #     timeout, in the reassuring direction. (Reported by Copilot on #276.)
+        #   - `max_wait` was arithmetic over max_attempts and poll_interval, which
+        #     silently assumes the probe returns instantly. On the timeout path it
+        #     claimed 95s for a wait that really ran ~635s.
+        #
+        # A duration comes off the clock at the moment it is reported. One measured
+        # value now feeds both messages, so they cannot drift apart.
+        gate_elapsed = time.monotonic() - gate_t0
+
         if not lease_ready:
             failures.append("lease_timeout")
-            # 10s initial sleep + a poll_interval sleep after every attempt but
-            # the last (the final check has no trailing sleep).
-            max_wait = 10 + (max_attempts - 1) * poll_interval
-            log_fail(f"Lease not active after {max_wait} seconds")
+            log_fail(f"Lease not active after {gate_elapsed:.1f}s")
         else:
             log_pass("Lease is active and ready")
+
+        # ⛔ ONE GREPPABLE LINE PER RUN, whatever the outcome. `status` and
+        # `ssh_host` are reported SEPARATELY because they are not equally
+        # informative: `status == "ready"` is `deployment.state == "active"`
+        # renamed (cli.py), true from the create transaction onward, so it is
+        # ~always true here; `ssh_host` requires the provider to have forwarded
+        # port 22 and reported host AND externalPort (api.py `_extract_ssh_info`).
+        # Collapsing them into one "ready" boolean would destroy the only
+        # distinction this measurement exists to make.
+        #
+        # ⚠ `elapsed` includes the fixed 10s propagation sleep — see gate_t0.
+        # ⛔ Unpacked TOGETHER: `observed_at` is the attempt that produced the status
+        # beside it, which is not necessarily the last attempt made.
+        obs_attempt, gate_status, gate_ssh = (
+            last_obs if last_obs is not None else (None, _NOPOLL, _NOPOLL)
+        )
+        log_info(
+            "GATE dseq={} attempt={} observed_at={} elapsed={} status={} ssh_host={}".format(
+                dseq,
+                gate_attempt if gate_attempt is not None else "unreported",
+                obs_attempt if obs_attempt is not None else "unreported",
+                f"{gate_elapsed:.1f}s",
+                _render(gate_status),
+                _render(gate_ssh, lambda v: "present" if v else "empty"),
+            )
+        )
 
         if not assert_provider_in_tiers(provider_addr, preferred, backup):
             failures.append("status: foreign or missing provider")
@@ -556,6 +721,7 @@ def main():
                     f"\nstdout: {r.stdout!r}\nstderr: {r.stderr!r}"
                 )
                 failures.append("exec_output_unverified")
+                _diagnose_exec_failure(dseq)
         else:
             log_info("Skipping exec step due to prior failures")
 
@@ -648,17 +814,46 @@ def main():
 
             ssh_host = None
             ssh_port = None
-            r = run(f"uv run just-akash status --dseq {dseq} --json", timeout=30)
+            # Same shape as the readiness poll above, found by sweeping for it
+            # rather than by being told: the probe belongs inside the try, or a
+            # TimeoutExpired escapes as a traceback instead of the reported
+            # "could not resolve ssh host" failure below.
+            # ⛔ WHY the probe yielded nothing is a different fact from THAT it did,
+            # and this handler was collapsing them. A hung probe and an ordinary "no
+            # endpoint yet" both printed "SSH key or endpoint not available" — one is
+            # a lease that is not ready, the other is an instrument that did not run,
+            # and only the second means the cross-check was never actually attempted.
+            #
+            # This is the exact collapse `_NOPOLL`/`_ABSENT` removes in the readiness
+            # gate above. Sweeping the try into step 6 fixed the ESCAPE here and left
+            # the REPORTING collapse behind — the same class, one function down.
+            # (Reported by CodeRabbit on #276.)
+            ssh_probe = "ok"
             try:
+                r = run(f"uv run just-akash status --dseq {dseq} --json", timeout=30)
                 status_data = json.loads(r.stdout)
                 ssh_host = status_data.get("ssh_host")
                 ssh_port = str(status_data.get("ssh_port", ""))
+            except subprocess.TimeoutExpired:
+                ssh_probe = "timed-out"
             except (json.JSONDecodeError, TypeError):
-                pass
+                ssh_probe = "unparsable"
 
             if not ssh_key or not ssh_host or not ssh_port:
+                # Name WHICH input was missing as well as how the probe fared: three
+                # different absences shared one sentence, so the line could not say
+                # whether the key was unset or the lease had no endpoint.
+                missing = ", ".join(
+                    name
+                    for name, value in (
+                        ("ssh_key", ssh_key),
+                        ("ssh_host", ssh_host),
+                        ("ssh_port", ssh_port),
+                    )
+                    if not value
+                )
                 log_info(
-                    "SSH key or endpoint not available — skipping SSH cross-check (non-fatal)"
+                    f"SSH cross-check skipped (non-fatal): probe={ssh_probe} missing={missing}"
                 )
             else:
                 remote_path = "/tmp/e2e-test.env"
