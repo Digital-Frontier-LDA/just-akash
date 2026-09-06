@@ -63,6 +63,27 @@ def run(cmd: str, timeout: int = 60, input_text: str | None = None) -> subproces
     )
 
 
+#: Distinct from None BY DESIGN. None is a value the provider can legitimately
+#: report; this marks a field we never got to read at all.
+_UNSET = object()
+
+
+def _render(value: object, present=repr) -> str:
+    """Three outcomes, three renderings — never two facts sharing one string.
+
+    ⛔ `unreported` (we never obtained a parseable reading) and `null` (we read the
+    document and the field was empty) are DIFFERENT FACTS, and the second is the
+    one the GATE line exists to detect. Collapsing them — which `None`, `False` or
+    `0` all do — would leave the instrument unable to report the ambiguity it was
+    built to resolve.
+    """
+    if value is _UNSET:
+        return "unreported"
+    if value is None:
+        return "null"
+    return present(value)
+
+
 def _diagnose_exec_failure(dseq: str) -> None:
     """Out-of-band battery, run ONLY after an exec failure and BEFORE destroy (#273).
 
@@ -170,8 +191,13 @@ def main():
         # histogram.
         gate_attempt: int | None = None
         gate_elapsed: float | None = None
-        gate_status: object = None
-        gate_ssh: bool | None = None
+        # ⛔ _UNSET, not None. None is a LEGITIMATE READING here — the provider
+        # returned a status document whose field was null — and it is precisely the
+        # reading this instrument exists to detect. Initialising to None would make
+        # "we never got a parseable poll" indistinguishable in a grep from "we polled
+        # and the field was empty", which is the one ambiguity the GATE line is for.
+        gate_status: object = _UNSET
+        gate_ssh: object = _UNSET
         # Provider workload activation can lag well past 35s on a busy provider;
         # poll up to ~95s before declaring a timeout to avoid flaky CI failures.
         max_attempts = 18
@@ -185,8 +211,11 @@ def main():
                 # still reports what the last poll actually saw.
                 gate_attempt = attempt
                 gate_elapsed = time.monotonic() - gate_t0
-                gate_status = status_data.get("status")
-                gate_ssh = bool(status_data.get("ssh_host"))
+                gate_status = status_data.get("status", _UNSET)
+                # NOT bool(...): bool() maps an ABSENT key and a present-but-empty
+                # value onto the same False, and "unreported must not render as
+                # False" is the whole discipline here.
+                gate_ssh = status_data.get("ssh_host", _UNSET)
                 if status_data.get("status") == "ready" or status_data.get("ssh_host"):
                     lease_ready = True
                     break
@@ -219,12 +248,12 @@ def main():
         #
         # ⚠ `elapsed` includes the fixed 10s propagation sleep — see gate_t0.
         log_info(
-            "GATE dseq={} attempt={} elapsed={} status={!r} ssh_host={}".format(
+            "GATE dseq={} attempt={} elapsed={} status={} ssh_host={}".format(
                 dseq,
                 gate_attempt if gate_attempt is not None else "unreported",
                 f"{gate_elapsed:.1f}s" if gate_elapsed is not None else "unreported",
-                gate_status,
-                gate_ssh if gate_ssh is not None else "unreported",
+                _render(gate_status),
+                _render(gate_ssh, lambda v: "present" if v else "empty"),
             )
         )
 

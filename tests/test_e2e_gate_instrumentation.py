@@ -108,8 +108,48 @@ def test_every_streaming_probe_is_time_bounded():
     body = ast.get_source_segment(_SRC, fn) or ""
     for streaming in ("just-akash logs", "just-akash events"):
         assert streaming in body, f"{streaming!r} probe missing"
-        line = next(ln for ln in body.splitlines() if streaming in ln)
+        # ⛔ DEFAULT, not a bare next(). Without it a refactor that splits the
+        # probe command across lines raises StopIteration — a traceback instead of
+        # the assert message below, which is the one thing that tells the next
+        # reader what broke and what to do. A test enforcing "say what you
+        # measured" must not fail by crashing.
+        line = next((ln for ln in body.splitlines() if streaming in ln), None)
+        assert line is not None, (
+            f"{streaming!r} is no longer on a single line — re-anchor this check "
+            f"rather than deleting it; the --duration invariant still applies"
+        )
         assert "--duration" in line, (
             f"{streaming!r} is invoked without --duration — it streams, so this "
             f"hangs until the subprocess timeout on every exec failure:\n{line.strip()}"
         )
+
+
+def test_absent_and_null_and_present_render_as_three_different_strings():
+    """⛔ `unreported` and `null` are DIFFERENT FACTS and must not share a string.
+
+    "we never obtained a parseable reading" and "we read the document and the field
+    was empty" are the two states the GATE line exists to tell apart — the second is
+    a legitimate provider reading and the evidence #273 is waiting on. `None`,
+    `False` and `0` all collapse them, which is why the renderer takes a sentinel
+    rather than defaulting to None.
+
+    Imported rather than restated, so a change to the renderer is tested and not
+    diverged from.
+    """
+    import importlib
+
+    mod = importlib.import_module("just_akash.test_shell_e2e")
+    unset, render = mod._UNSET, mod._render
+
+    assert render(unset) == "unreported"
+    assert render(None) == "null"
+    assert render("ready") == "'ready'"
+    # the three must be mutually distinguishable, which is the actual invariant
+    assert len({render(unset), render(None), render("ready")}) == 3
+
+    # and the ssh_host variant must not map an absent key onto the same string as
+    # a present-but-falsy value — the "must not render as False" rule
+    truthy = render({"host": "h"}, lambda v: "present" if v else "empty")
+    falsy = render({}, lambda v: "present" if v else "empty")
+    assert render(unset) != falsy, "an absent ssh_host reads the same as an empty one"
+    assert truthy != falsy
