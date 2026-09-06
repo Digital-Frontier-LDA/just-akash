@@ -220,14 +220,25 @@ def main():
         max_attempts = 18
         poll_interval = 5
         for attempt in range(1, max_attempts + 1):
-            r = run(f"uv run just-akash status --dseq {dseq} --json", timeout=30)
+            # ⛔ THE PROBE IS INSIDE THE TRY. `run(..., timeout=30)` raises
+            # subprocess.TimeoutExpired, and with the call outside, that exception
+            # escaped the loop, skipped the GATE emission below, and went straight
+            # to cleanup — so the run that most needs a verdict, one where the
+            # status probe hangs, was the one that emitted none. "Recorded on EVERY
+            # run" was true of every BRANCH and false of the exception path.
+            # (Reported by CodeRabbit on #276.)
+            #
+            # A timeout is a spent ATTEMPT, not a fatal error, so the loop continues
+            # and the sentinels stay _NOPOLL — an all-timeout run then reports
+            # `attempt=18 elapsed=95.0s status=unreported`, which says what happened.
             try:
-                status_data = json.loads(r.stdout)
-                provider_addr = status_data.get("provider")
-                # Captured BEFORE the condition so a run that never satisfies it
-                # still reports what the last poll actually saw.
+                # Per ATTEMPT, not per successful parse: these describe the poll we
+                # made, which is true whether or not it returned anything.
                 gate_attempt = attempt
                 gate_elapsed = time.monotonic() - gate_t0
+                r = run(f"uv run just-akash status --dseq {dseq} --json", timeout=30)
+                status_data = json.loads(r.stdout)
+                provider_addr = status_data.get("provider")
                 gate_status = status_data.get("status", _ABSENT)
                 # NOT bool(...): bool() maps an ABSENT key and a present-but-empty
                 # value onto the same False, and "unreported must not render as
@@ -236,7 +247,7 @@ def main():
                 if status_data.get("status") == "ready" or status_data.get("ssh_host"):
                     lease_ready = True
                     break
-            except (json.JSONDecodeError, TypeError):
+            except (subprocess.TimeoutExpired, json.JSONDecodeError, TypeError):
                 pass
             if attempt < max_attempts:
                 log_info(
@@ -395,12 +406,16 @@ def main():
 
             ssh_host = None
             ssh_port = None
-            r = run(f"uv run just-akash status --dseq {dseq} --json", timeout=30)
+            # Same shape as the readiness poll above, found by sweeping for it
+            # rather than by being told: the probe belongs inside the try, or a
+            # TimeoutExpired escapes as a traceback instead of the reported
+            # "could not resolve ssh host" failure below.
             try:
+                r = run(f"uv run just-akash status --dseq {dseq} --json", timeout=30)
                 status_data = json.loads(r.stdout)
                 ssh_host = status_data.get("ssh_host")
                 ssh_port = str(status_data.get("ssh_port", ""))
-            except (json.JSONDecodeError, TypeError):
+            except (subprocess.TimeoutExpired, json.JSONDecodeError, TypeError):
                 pass
 
             if not ssh_key or not ssh_host or not ssh_port:

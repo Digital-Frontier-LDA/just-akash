@@ -89,6 +89,45 @@ def test_the_gate_verdict_is_recorded_on_every_run():
     )
 
 
+def test_the_readiness_probe_cannot_escape_past_the_gate_line():
+    """⛔ A conditional is not the only way to skip an unconditional statement.
+
+    The first version of this file checked only that the GATE emission was outside
+    any `if`. It was — and `run(..., timeout=30)` still sat OUTSIDE the poll's try,
+    so a `subprocess.TimeoutExpired` escaped the loop, skipped GATE entirely and
+    went to cleanup. The run that most needs a verdict — the one where the status
+    probe hangs — was the one that emitted none. The guard passed while the
+    invariant it names was violated, which is the defect this whole PR is about.
+    (Reported by CodeRabbit on #276.)
+
+    So: the probe must be inside a `try`, and that `try` must name TimeoutExpired.
+    """
+    poll = None
+    for node in ast.walk(_TREE):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "run"
+        ):
+            seg = ast.get_source_segment(_SRC, node) or ""
+            if "just-akash status" in seg and "--json" in seg:
+                poll = node
+                break
+    assert poll is not None, "readiness probe not found — re-anchor, do not delete"
+
+    tries = [a for a in _ancestors(poll) if isinstance(a, ast.Try)]
+    assert tries, (
+        "the readiness probe is not inside a try — a TimeoutExpired will escape the "
+        "loop and skip the GATE line, so 'recorded on every run' becomes false on "
+        "exactly the runs worth recording"
+    )
+    handled = ast.dump(tries[0])
+    assert "TimeoutExpired" in handled, (
+        "the enclosing try does not name TimeoutExpired, so a hung status probe "
+        "still escapes past the GATE emission"
+    )
+
+
 def test_every_streaming_probe_is_time_bounded():
     """`logs` and `events` stream. The CLI's own help says `--duration` exists to
     avoid "hanging when the provider holds a non-follow connection open".
