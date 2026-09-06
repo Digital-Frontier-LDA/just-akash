@@ -197,3 +197,64 @@ def test_no_poll_and_key_absent_and_value_render_as_different_strings():
     assert render(absent, fmt) != render({}, fmt), (
         "an ssh_host key that was never sent reads the same as one sent empty"
     )
+
+
+def _assigns_to(name):
+    """Every Assign/AnnAssign in the module binding `name`."""
+
+    def targets(n):
+        if isinstance(n, ast.Assign):
+            return n.targets
+        if isinstance(n, ast.AnnAssign):
+            return [n.target]
+        return []
+
+    return [
+        n
+        for n in ast.walk(_TREE)
+        if any(isinstance(t, ast.Name) and t.id == name for t in targets(n))
+    ]
+
+
+def test_the_reported_wait_is_measured_not_scheduled():
+    """⛔ A duration comes off the clock WHERE IT IS REPORTED.
+
+    Two independent versions of one error lived in this block, and both reported
+    short — the reassuring direction:
+
+      - `gate_elapsed` was snapshotted at the TOP of each poll iteration, so it
+        excluded that attempt's own 30s probe. On an all-timeout run — precisely
+        the hung-probe case this instrumentation exists to measure — the sample
+        under-reported by a full timeout. (Reported by Copilot on #276.)
+      - the timeout message computed `10 + (max_attempts - 1) * poll_interval`,
+        which silently assumes the probe returns instantly: it claimed 95s for a
+        wait that really runs ~635s.
+
+    All three assertions are kept because each is satisfiable by the other bugs:
+    a per-iteration snapshot still derives from `time.monotonic()`, and a value
+    correctly measured at emission can still be ignored by the line below it.
+    """
+    assigns = _assigns_to("gate_elapsed")
+    assert len(assigns) == 1, (
+        f"expected exactly one gate_elapsed assignment, found {len(assigns)} — a "
+        "second one is how the per-iteration snapshot comes back"
+    )
+
+    looped = [a for a in _ancestors(assigns[0]) if isinstance(a, (ast.For, ast.While))]
+    assert not looped, (
+        "gate_elapsed is assigned inside the poll loop, so it excludes that attempt's "
+        "own probe and under-reports an all-timeout run by a full 30s timeout"
+    )
+
+    seg = ast.get_source_segment(_SRC, assigns[0]) or ""
+    assert "time.monotonic()" in seg, (
+        "gate_elapsed no longer comes off the clock — a duration derived from "
+        "max_attempts/poll_interval assumes the probe returns instantly"
+    )
+
+    waits = [ln for ln in _SRC.splitlines() if "Lease not active after" in ln]
+    assert len(waits) == 1, "the timeout message moved — re-anchor, do not delete"
+    assert "gate_elapsed" in waits[0], (
+        "the timeout message does not report the measured wait; arithmetic over "
+        "max_attempts/poll_interval claimed 95s for a ~635s all-timeout run"
+    )

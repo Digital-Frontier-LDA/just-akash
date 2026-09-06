@@ -207,7 +207,6 @@ def main():
         # pass or fail, because a histogram built only from failures is not a
         # histogram.
         gate_attempt: int | None = None
-        gate_elapsed: float | None = None
         # ⛔ _NOPOLL, not None and not _ABSENT. These start as "no document was
         # ever parsed"; a successful parse overwrites them with the key's value or
         # with _ABSENT. Keeping those two apart is the point: for ssh_host, ABSENT
@@ -230,12 +229,15 @@ def main():
             #
             # A timeout is a spent ATTEMPT, not a fatal error, so the loop continues
             # and the sentinels stay _NOPOLL — an all-timeout run then reports
-            # `attempt=18 elapsed=95.0s status=unreported`, which says what happened.
+            # `attempt=18 elapsed=635.0s status=unreported`, which says what happened.
+            # (635 = 10s propagation + 18 probes each hitting the 30s timeout + 17
+            # x 5s sleeps. This comment first said 95s — the figure you get by
+            # assuming the probe returns instantly, the same schedule-not-clock
+            # error as the gate_elapsed capture below it. Both are fixed.)
             try:
-                # Per ATTEMPT, not per successful parse: these describe the poll we
+                # Per ATTEMPT, not per successful parse: this describes the poll we
                 # made, which is true whether or not it returned anything.
                 gate_attempt = attempt
-                gate_elapsed = time.monotonic() - gate_t0
                 r = run(f"uv run just-akash status --dseq {dseq} --json", timeout=30)
                 status_data = json.loads(r.stdout)
                 provider_addr = status_data.get("provider")
@@ -256,12 +258,24 @@ def main():
                 )
                 time.sleep(poll_interval)
 
+        # ⛔ MEASURED OFF THE CLOCK WHERE IT IS REPORTED — never snapshotted per
+        # attempt, never computed from the schedule. Both mistakes were here:
+        #
+        #   - `gate_elapsed` was captured at the TOP of each iteration, so it excluded
+        #     that attempt's own probe. An all-timeout run — the exact failure this
+        #     instrumentation exists to characterise — under-reported by a full 30s
+        #     timeout, in the reassuring direction. (Reported by Copilot on #276.)
+        #   - `max_wait` was arithmetic over max_attempts and poll_interval, which
+        #     silently assumes the probe returns instantly. On the timeout path it
+        #     claimed 95s for a wait that really ran ~635s.
+        #
+        # A duration comes off the clock at the moment it is reported. One measured
+        # value now feeds both messages, so they cannot drift apart.
+        gate_elapsed = time.monotonic() - gate_t0
+
         if not lease_ready:
             failures.append("lease_timeout")
-            # 10s initial sleep + a poll_interval sleep after every attempt but
-            # the last (the final check has no trailing sleep).
-            max_wait = 10 + (max_attempts - 1) * poll_interval
-            log_fail(f"Lease not active after {max_wait} seconds")
+            log_fail(f"Lease not active after {gate_elapsed:.1f}s")
         else:
             log_pass("Lease is active and ready")
 
@@ -279,7 +293,7 @@ def main():
             "GATE dseq={} attempt={} elapsed={} status={} ssh_host={}".format(
                 dseq,
                 gate_attempt if gate_attempt is not None else "unreported",
-                f"{gate_elapsed:.1f}s" if gate_elapsed is not None else "unreported",
+                f"{gate_elapsed:.1f}s",
                 _render(gate_status),
                 _render(gate_ssh, lambda v: "present" if v else "empty"),
             )
