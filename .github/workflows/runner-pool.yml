@@ -1320,7 +1320,7 @@ jobs:
     # check it. Commit DISTANCE is not enforceable here: a multi-commit PR or a squash
     # merge breaks it while the pin stays correct. IDENTITY is the property that matters,
     # and it is the one asserted. The test docstring records the same correction.
-    uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@c2cad20a3aae242781518538c8ea637dbbb81ae2
+    uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@0dae0fbdf6e411d0ae2c6a49ba1ed39763bd9a21
     with:
       dseq: ${{ needs.pool.outputs.dseq }}
       tag-prefix: ${{ inputs.tag-prefix }}
