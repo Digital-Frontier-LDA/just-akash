@@ -633,6 +633,19 @@ class TestSnapshotDuration:
                 self.sent_messages: list = []
 
             def recv(self, timeout=None):
+                # ⛔ BACKPRESSURE, restored deliberately. The original fake slept for
+                # real, which throttled the loop; charging the wait to a fake clock
+                # removed that, so a REGRESSED `stream_events` would busy-spin as fast
+                # as the interpreter allows. That only bites on the failure path — but
+                # the failure path is the whole point of this test, and handing someone
+                # a pegged core at the moment they start debugging a regression is how
+                # a guard gets muted instead of read. (Reported by Copilot on #301.)
+                #
+                # So the worker is given a way out: once the main thread has stopped
+                # waiting it sets `stop`, and the next recv ends the stream cleanly
+                # rather than spinning until the process exits.
+                if stop.is_set():
+                    raise ConnectionClosedOK(None, None)
                 self.timeouts.append(timeout)
                 if timeout:
                     clock.advance(timeout)
@@ -663,6 +676,7 @@ class TestSnapshotDuration:
             # which is a race. An assertion cannot catch a hang from after the call,
             # so the call has to run where it can be abandoned.
             done = threading.Event()
+            stop = threading.Event()
 
             def _run():
                 try:
@@ -672,11 +686,27 @@ class TestSnapshotDuration:
 
             worker = threading.Thread(target=_run, daemon=True)
             worker.start()
-            returned = done.wait(timeout=10.0)
+            try:
+                returned = done.wait(timeout=10.0)
+            finally:
+                # Unconditional: on the pass path the worker is already finished and
+                # this is a no-op; on the fail path it is the only thing that stops it.
+                stop.set()
+                worker.join(timeout=5.0)
+                worker_still_running = worker.is_alive()
 
         assert returned, (
             "stream_events did not return — the duration bound is not cutting the "
-            "stream off, which is the hang this parameter exists to prevent"
+            "stream off, which is the hang this parameter exists to prevent.\n"
+            "worker cleaned up after `stop`: "
+            f"{'no — it is STILL SPINNING' if worker_still_running else 'yes'}"
+        )
+        # ⛔ Asserted even on the pass path, because its value is on the FAIL path: a
+        # guard whose own failure leaves a core pegged gets deleted by the next person
+        # under time pressure, and then the regression it was catching ships.
+        assert not worker_still_running, (
+            "the worker outlived the assertion — `stop` did not end the stream, so a "
+            "regressed stream_events would spin until the process exits"
         )
 
         # ⛔ THE ACTUAL PROPERTY, in two parts: exactly one recv, and it was bounded by
