@@ -2434,3 +2434,78 @@ def test_the_read_loops_observation_survives_to_the_classifier():
         "the read loop never concludes GONE — then a propagated-out deployment can only "
         "be scored from destroy.log, which says 'destroyed.', not 'not found'"
     )
+
+
+def test_the_nested_teardown_pin_is_reachable_from_main():
+    """Byte-identity is not enough — the pinned commit must still be REACHABLE.
+
+    ⛔ THE FAILURE THIS EXISTS TO PREVENT, MEASURED. #308 was squash-merged. The
+    identity guard above requires the pin to name a commit whose runner-teardown.yml
+    matches this one byte for byte, which during the PR is the BRANCH commit
+    (d5e64da8). A squash merge does not keep that commit in main's history:
+
+        compare d5e64da8...main -> "diverged"      (orphaned)
+        compare c2cad20a...main -> "ahead"         (the previous pin, an ancestor)
+
+    The previous pin survived only because its PR was not squashed. Once orphaned,
+    GitHub Actions cannot resolve the nested `uses:` while building the job graph, and
+    every downstream caller dies as a STARTUP FAILURE — a run with ZERO jobs and no
+    logs, which renders as a grey X indistinguishable from a generic CI blip.
+
+    ⇒ blazing#927 hit exactly this: three commits, `jobs=0` on every one, no logs, no
+    annotation, and nothing anywhere naming the unresolvable ref. Cost far more to
+    diagnose than to prevent.
+
+    ★ Identity and reachability are independent properties and the identity guard
+    silently traded one for the other: it FORCES the pin onto a branch commit (that is
+    the only place the bytes match mid-PR), which is precisely the commit a squash
+    merge destroys. The two guards must therefore both hold, and the resolution is to
+    pin the post-merge main SHA — byte-identical AND an ancestor.
+    """
+    import os
+    import subprocess
+
+    uses = str(DOC["jobs"]["teardown"]["uses"])
+    pin = uses.rsplit("@", 1)[-1]
+    assert re.fullmatch(r"[0-9a-f]{40}", pin), f"teardown pinned to {pin!r}, not a 40-hex SHA"
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+
+    def _git(*args) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", "-C", str(root), *args], capture_output=True, text=True, timeout=60
+        )
+
+    # A PR's own head is legitimately not yet on main; what must never happen is a pin
+    # that is orphaned. Fetch on demand — CI checks out shallow.
+    if _git("cat-file", "-e", f"{pin}^{{commit}}").returncode != 0:
+        _git("fetch", "--quiet", "--depth", "200", "origin", pin)
+
+    if _git("cat-file", "-e", f"{pin}^{{commit}}").returncode != 0:
+        # ⛔ MUST NOT SKIP IN CI — that is the surface this protects.
+        assert not os.environ.get("CI"), (
+            f"the pinned teardown commit {pin[:8]} cannot be read even after a fetch. "
+            f"Under CI that is the orphaned-pin condition itself, not a local gap."
+        )
+        pytest.skip("pinned commit unavailable locally; this guard is enforced in CI")
+
+    for ref in ("origin/main", "main"):
+        probe = _git("merge-base", "--is-ancestor", pin, ref)
+        if _git("rev-parse", "--verify", "--quiet", ref).returncode != 0:
+            continue
+        head = _git("rev-parse", ref).stdout.strip()
+        if pin == head or probe.returncode == 0:
+            return  # reachable
+        # Not an ancestor. Allowed only while this very commit is the PR that will
+        # introduce it — i.e. the pin is an ancestor of HEAD but not yet of main.
+        if _git("merge-base", "--is-ancestor", pin, "HEAD").returncode == 0:
+            return
+        raise AssertionError(
+            f"the pinned teardown commit {pin[:8]} is not reachable from {ref} and is "
+            f"not on this branch either — it has been orphaned, most likely by a squash "
+            f"merge. Every downstream caller of runner-pool.yml will die as a STARTUP "
+            f"FAILURE: zero jobs, no logs, and nothing naming the unresolvable ref. "
+            f"Re-pin to the post-merge main SHA, which is both byte-identical and an "
+            f"ancestor."
+        )
+    pytest.skip("no main ref available to compare against")
