@@ -9,10 +9,27 @@ argument, and a naive `shlex.split` conversion of those looks right, reads right
 passes review, and changes the command's meaning.
 
 So the equivalence is asserted directly: every vector must equal `shlex.split` of
-the exact string the shell used to receive. `shlex.split` implements POSIX word
-splitting, which is what `shell=True` performed on these strings — none of them
-contain expansion, globbing or substitution after interpolation, so the two agree
-exactly. That turns "we think this is the same command" into a checkable claim.
+the exact string the shell used to receive. That turns "we think this is the same
+command" into a checkable claim.
+
+⚠ WHAT THAT CLAIM RESTS ON — READ THIS BEFORE EDITING ANY PAYLOAD BELOW.
+`shlex.split` is NOT a general model of what a shell does. It agrees with `sh -c`
+here because of two facts about these particular strings:
+
+  1. The three risky payloads were SINGLE-QUOTED in the previous form
+     (`exec 'cat {remote_path}'`), and single quotes suppress expansion — so there
+     was nothing for the shell to do that `shlex.split` does not.
+  2. `remote_path` is the literal `/tmp/e2e-test.env`. After interpolation these
+     strings contain no variable, glob, or command substitution.
+
+⛔ If either stops being true, THIS FILE KEEPS PASSING AND STOPS BEING EVIDENCE. A
+payload that gains `$VAR`, a `*`, or double quotes makes the two diverge, and every
+assertion here would go on comparing a vector against a `shlex.split` result that no
+longer describes what the shell did. Plausible and false, which is worse than
+absent — nothing would go red to tell you.
+
+The property being relied on is "no shell expansion after interpolation", not
+"shlex.split is what shells do". Re-derive it rather than trusting the green tick.
 """
 
 from __future__ import annotations
