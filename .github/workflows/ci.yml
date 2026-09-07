@@ -249,21 +249,27 @@ jobs:
       #
       # For pull_request we ALSO assert the script we are about to
       # run is provably the BASE's copy, not the HEAD's. The .check/
-      # commit SHA must differ from the HEAD commit SHA, because the
-      # two checkouts are pinned to different refs. Equal commits
-      # means the two checkouts resolved to the same commit -- the
-      # .check/ checkout silently failed (returned the wrong tree) or
-      # the PR has no diff against base, either of which leaves the
-      # script provenance unprovable -- refuse to run rather than
-      # run an unchecked check.
+      # commit SHA must differ from the HEAD commit SHA when the PR
+      # carries a non-empty diff, because the two checkouts are pinned
+      # to different refs and any divergence in commits proves the
+      # provenance chain. Equal commits WITH a non-empty diff means
+      # the .check/ checkout silently failed (returned the wrong
+      # commit) -- refuse to run rather than run an unchecked check.
       #
       # We compare COMMITS, not TREES. Different commits can have
       # the same tree (allow-empty commits, revert-only PRs) and a
       # tree-equal guard fires on those benign cases while labeling
       # its cause as a checkout failure -- a name for an unmeasured
       # cause. Commit comparison answers the actual question: are
-      # these two checkouts the same commit? If yes, fail loud.
-      # Tree SHAs are still printed for visibility / debugging.
+      # these two checkouts the same commit?
+      #
+      # Empty / no-op PRs (PR head == base tip, no diff) skip the
+      # guard and exit 0: the script has nothing to inspect, and the
+      # guard's purpose is to detect silent checkout failure, which
+      # can only matter when there IS something to check. A guard
+      # that fires on benign empty PRs is the same defect as the
+      # tree-SHA guard Copilot flagged in #294 -- a name for an
+      # unmeasured cause. Tree SHAs are still printed for visibility.
       #
       # This is the security property the issue asks for: the check
       # is base-side, not head-side.
@@ -274,8 +280,13 @@ jobs:
           echo "github.event.pull_request.base.ref: ${{ github.event.pull_request.base.ref }}"
           echo "github.event.pull_request.base.sha: ${{ github.event.pull_request.base.sha }}"
           echo "github.event.pull_request.head.sha: ${{ github.event.pull_request.head.sha }}"
-          current_main_sha="$(git ls-remote origin HEAD | awk '{print $1}')"
-          echo "remote origin main tip (now):      $current_main_sha"
+          # Query the EXPLICIT base ref rather than the remote's symbolic HEAD.
+          # The two are equal on just-akash today (default branch = main), but
+          # `git ls-remote origin HEAD` returns whatever the remote's HEAD
+          # points to -- it is a mislabel to log that as "main tip" when the
+          # CI can run against any base ref. The label must match the lookup.
+          current_base_sha="$(git ls-remote origin "refs/heads/${{ github.event.pull_request.base.ref }}" | awk '{print $1}')"
+          echo "remote origin ${{ github.event.pull_request.base.ref }} tip (now): $current_base_sha"
       - name: Run symbol-presence check (script from base, content from head)
         run: |
           set -euo pipefail
@@ -290,8 +301,21 @@ jobs:
             echo "checker .check tree:    $base_tree"
             echo "this PR head:           $head_commit"
             echo "this PR head tree:      $head_tree"
+            # No-diff PR (PR head == base tip, empty PRs, no-op pushes):
+            # the script has nothing to inspect -- print both SHAs for the
+            # audit trail and exit 0 without firing the guard. The guard's
+            # purpose is to detect SILENT CHECKOUT FAILURE (the .check/
+            # checkout returned the wrong commit), which can only matter
+            # when there IS something to check. A guard that fires on
+            # benign empty PRs is the same defect as the tree-SHA guard
+            # Copilot flagged in #294: a name for an unmeasured cause.
+            pr_diff_files="$(git diff --name-only "$base_commit..$head_commit" -- .)"
+            if [ -z "$pr_diff_files" ]; then
+              echo "no diff between .check HEAD ($base_commit) and PR head ($head_commit); symbol-presence check has nothing to inspect, skipping"
+              exit 0
+            fi
             if [ "$base_commit" = "$head_commit" ]; then
-              echo "::error::.check/ commit ($base_commit) equals HEAD commit; refusing to run. The two checkouts resolved to the same commit -- the .check/ checkout silently failed (returned the wrong tree) or the PR has no diff against base, either of which leaves the script provenance unprovable. The check would otherwise be running a script the PR controls. See #294."
+              echo "::error::.check/ commit ($base_commit) equals HEAD commit, AND there is a non-empty diff between them; refusing to run. The two checkouts resolved to the same commit despite the PR carrying changes -- the .check/ checkout silently failed (returned the wrong tree). The script provenance is unprovable; the check would otherwise be running a script the PR controls. See #294."
               exit 1
             fi
             if [ ! -f "$SCRIPT" ]; then
