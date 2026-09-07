@@ -1320,7 +1320,24 @@ jobs:
     # check it. Commit DISTANCE is not enforceable here: a multi-commit PR or a squash
     # merge breaks it while the pin stays correct. IDENTITY is the property that matters,
     # and it is the one asserted. The test docstring records the same correction.
-    uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@d5e64da88f4825dac0658fdbe6f5123fabaec85d
+    #
+    # ⛔ IDENTITY IS NOT SUFFICIENT ON ITS OWN, AND THIS COMMENT USED TO IMPLY IT WAS.
+    # The identity guard forces this pin onto a commit whose teardown matches byte for
+    # byte, and mid-PR the only such commit is the BRANCH commit — which is exactly
+    # what a SQUASH MERGE destroys. #308 was squashed, leaving this line pointing at
+    # d5e64da8 (`compare d5e64da8...main` -> "diverged"), so Actions could not resolve
+    # the nested `uses:` while building the job graph and every downstream caller died
+    # as a STARTUP FAILURE: jobs=0, no logs, nothing naming the missing ref. blazing#927
+    # burned three commits on it. The previous pin survived only because ITS PR was not
+    # squashed (`compare c2cad20a...main` -> "ahead").
+    #
+    # ⇒ So TWO independent properties are asserted, and both are required:
+    #   identity     — test_the_nested_teardown_pin_matches_the_file_it_calls
+    #   REACHABILITY — test_the_nested_teardown_pin_is_reachable_from_main
+    # The resolution that satisfies both is to pin the POST-MERGE main SHA: byte-identical
+    # to the branch commit, and an ancestor of main. Never re-pin to a branch commit after
+    # its PR has merged.
+    uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@85f85970c96258c9d31834098e44500c74cc58c1
     with:
       dseq: ${{ needs.pool.outputs.dseq }}
       tag-prefix: ${{ inputs.tag-prefix }}
