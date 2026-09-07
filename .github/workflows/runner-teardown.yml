@@ -191,7 +191,18 @@ jobs:
           # where the operator asserts the account hosts nothing but their own pools.
           echo "closing dseq=$DSEQ (created by this run; tagged ${TAG_PREFIX}-*)"
 
+          # ⛔ THE RETRY BUDGET WAS ON THE WRONG OPERATION. This loop retries the
+          # DESTROY three times; the verification below used to get exactly one
+          # immediate read. On blazing#920 (run 34138613280) destroy SUCCEEDED on
+          # attempt 1 — it printed "Deployment 1788795018717 destroyed." — and the
+          # read ~4s later still returned 'active', so the step failed with "Lease
+          # may still be OPEN and holding escrow". The lease was closed: the stale
+          # sweep 26 minutes later enumerated every live deployment and that dseq was
+          # not among them. The close was accepted and had not yet propagated. It is
+          # the OBSERVATION that needed patience, not the action.
+          DESTROY_TRIES=0
           for _try in 1 2 3; do
+            DESTROY_TRIES=$_try
             "${JA[@]}" destroy --dseq "$DSEQ" -y 2>&1 | tee /tmp/destroy.log && break
             # A non-zero exit whose output says the deployment is already closed IS a
             # success. Treating it as a failure sends the next reader looking for an
@@ -200,16 +211,44 @@ jobs:
             sleep 5
           done
 
-          # Verify rather than trust: read the state back.
-          STATE=$("${JA[@]}" status --dseq "$DSEQ" --json 2>/dev/null \
-                  | python3 -c "import json,sys;print((json.load(sys.stdin) or {}).get('state',''))" 2>/dev/null || true)
+          # Verify rather than trust: read the state back — but let the close
+          # propagate first. Retrying HERE can only convert a false red into a pass:
+          # a lease that is genuinely still open reads 'active' on every attempt and
+          # still fails below, byte for byte. This loop cannot manufacture a success
+          # it did not observe, which is why the retry belongs here and not on a
+          # wider acceptance rule.
+          GONE=no
+          grep -qiE "already closed|not found" /tmp/destroy.log 2>/dev/null && GONE=yes
+          STATE=""
+          READS=0
+          for _read in 1 2 3 4 5; do
+            READS=$_read
+            "${JA[@]}" status --dseq "$DSEQ" --json >/tmp/status.json 2>/tmp/status.err || true
+            STATE=$(python3 -c "import json,sys;print((json.load(sys.stdin) or {}).get('state',''))" \
+                    </tmp/status.json 2>/dev/null || true)
+            # A deployment that has fully propagated out of the API reads as
+            # not-found, NOT as state=closed. That is GONE — a positive observation
+            # that it no longer exists — and must not be scored as "unreadable".
+            # ⛔ THE 404 SHAPE, NOT THE WORDS "not found". A bare substring is wrong in BOTH
+            # directions: an unrelated failure whose text happens to contain "not found"
+            # (a missing config file, a provider message) would be scored as a positive
+            # GONE observation and report closed=true over an OPEN lease — a false GREEN,
+            # the one failure this whole step exists to prevent — while a genuine 404 whose
+            # wording differs would be missed. api.py formats every failure as
+            # "API Error (<code>): ..." (api.py:271) and matches that exact prefix itself at
+            # api.py:413, so it is a stable contract rather than a guess at prose.
+            if grep -qE 'API Error \(404\)|"code": *"not_found"|NotFoundError' /tmp/status.json /tmp/status.err 2>/dev/null; then
+              GONE=yes; STATE=""; break
+            fi
+            [ "$STATE" = closed ] && break
+            [ "$_read" = 5 ] || sleep 6
+          done
+          echo "verify: destroy attempts=$DESTROY_TRIES, state reads=$READS, final state=[$STATE], gone=$GONE"
           # "" means we could NOT READ the state — a transient API error, a non-zero
           # exit, unparseable JSON. Reporting closed=true on that is the exact failure
           # this step exists to prevent: a success we did not achieve, with the lease
           # still holding escrow. Only a deployment the destroy said is GONE may pass on
           # an empty read.
-          GONE=no
-          grep -qiE "already closed|not found" /tmp/destroy.log 2>/dev/null && GONE=yes
           case "$STATE" in
             closed)
               echo "closed=true" >> "$GITHUB_OUTPUT"
@@ -225,7 +264,7 @@ jobs:
               fi ;;
             *)
               echo "closed=false" >> "$GITHUB_OUTPUT"
-              echo "::error title=Lease may still be OPEN and holding escrow::dseq=$DSEQ reads state='$STATE' after 3 destroy attempts. It will keep escrow locked against the grant the next run spends from, so the next run's funding failure will look like a market outage. Close it manually: just-akash destroy --dseq $DSEQ -y"
+              echo "::error title=Lease may still be OPEN and holding escrow::dseq=$DSEQ reads state='$STATE' after $DESTROY_TRIES destroy attempt(s) and $READS state reads. Those are the counts this run actually made, not a fixed number: a destroy that SUCCEEDED on attempt 1 still prints here if the state never settled. It will keep escrow locked against the grant the next run spends from, so the next run's funding failure will look like a market outage. Close it manually: just-akash destroy --dseq $DSEQ -y"
               exit 1 ;;
           esac
 
