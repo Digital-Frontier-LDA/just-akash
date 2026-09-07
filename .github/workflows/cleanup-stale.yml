@@ -159,6 +159,23 @@ jobs:
           # would fire on the literal "false" and silently promote every
           # scheduled run to a live close. One careful comparison here is worth
           # more than any amount of care elsewhere in this file.
+          # ⛔ `--reap-owned` WAS BUILT FOR THIS AND NEVER PASSED. The module documents the
+          # class at cleanup_stale.py:84-96 — six Blazing-Back deployments sat 62-139h
+          # holding 28.28 ACT while this sweep reported `stale (closable): 0`, because
+          # "a service-name allowlist is a CONVENTION, not a fact about ownership".
+          # `STALE_OWNED_AGE_SECONDS` and the `STALE-owned` branch were added to fix exactly
+          # that, opt-in so no caller changed behaviour on upgrade — and no caller opted in.
+          #
+          # MEASURED 2026-09-07: four `just-akash-canary.*` leases active 324h (13.5 days).
+          # `just-akash-canary.940318403fae` carries the prefix, so ownership is PROVEN on
+          # chain, and the age is 6.7x the 48h threshold. classify() never reaches that
+          # branch: `services == ["canary"]` is not `["runner"]`, and the only other age
+          # gate sits behind `reap_owned`.
+          #
+          # ⚠ THIS CHANGES WHAT IS REPORTED, NOT WHAT IS CLOSED. CLEANUP_AUTO_EXECUTE is
+          # false, so the scheduled run stays a dry run — it will now SAY the canaries are
+          # closable instead of saying nothing is. Making that an actual close is a separate
+          # decision and deliberately not taken here.
           if [ "$EXECUTE" = "true" ] || [ "$AUTO_EXECUTE" = "true" ]; then
             # Record the mode where it cannot be inferred wrongly later. The job
             # label is deliberately neutral, so this is the audit trail's answer
@@ -169,7 +186,7 @@ jobs:
               echo "- \`execute\` input: \`${EXECUTE:-<unset>}\`"
               echo "- \`CLEANUP_AUTO_EXECUTE\`: \`${AUTO_EXECUTE:-<unset>}\`"
             } >> "$GITHUB_STEP_SUMMARY"
-            uv run python -m just_akash.cleanup_stale --reap-runners --execute
+            uv run python -m just_akash.cleanup_stale --reap-runners --reap-owned --execute
           else
             {
               echo "### Stale sweep: dry run (reported only, closed nothing)"
@@ -177,5 +194,5 @@ jobs:
               echo "- \`execute\` input: \`${EXECUTE:-<unset>}\`"
               echo "- \`CLEANUP_AUTO_EXECUTE\`: \`${AUTO_EXECUTE:-<unset>}\`"
             } >> "$GITHUB_STEP_SUMMARY"
-            uv run python -m just_akash.cleanup_stale --reap-runners
+            uv run python -m just_akash.cleanup_stale --reap-runners --reap-owned
           fi
