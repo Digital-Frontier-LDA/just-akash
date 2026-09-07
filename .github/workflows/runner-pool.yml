@@ -632,7 +632,7 @@ jobs:
               # THE SAME DIGEST sdl/github-runner-probe.yaml qualifies against, and a
               # test asserts they stay equal. A provider earns runner_host by scheduling
               # the probe image three consecutive times; running a different image here
-              # means the pool trusts a measurement taken of something else. `:latest`
+              # means the pool trusts a measurement taken of something else. ':latest'
               # made that gap permanent and silent — the tag can move between the
               # qualification and the run that relies on it.
               image: ghcr.io/digital-frontier-lda/df-akash-runner@sha256:bdf7b15256a41156d1227510e4e4d8c9e28d79d685e14907132fe439b85bef64
@@ -640,12 +640,12 @@ jobs:
                 - ACCESS_TOKEN=${GH_RUNNER_PAT}
                 - ORG_NAME=${ORG}
                 - RUNNER_SCOPE=org
-                # ⛔ `just-akash-`, NOT the shared `akash-`. This name prefix is the ONLY
+                # ⛔ 'just-akash-', NOT the shared 'akash-'. This name prefix is the ONLY
                 # thing a de-registration backstop can scope itself by — GitHub cannot
                 # filter runners by label — so a prefix shared with another repo's
                 # producers means either repo's reaper deletes the other's registrations.
                 # Blazing-Back/akash-runner.yml and blazing/akash-runner.yml both emit
-                # `akash-*` today. `just-akash-` matches this repo's own Akash placement
+                # 'akash-*' today. 'just-akash-' matches this repo's own Akash placement
                 # convention (just-akash-runner.*, just-akash-canary.*, just-akash-backtest.*),
                 # so it is adopted, not invented.
                 #
@@ -674,8 +674,8 @@ jobs:
                 # org listing fills with records while nothing ever runs, and why a paid
                 # lease burns for its whole life having executed nothing.
                 #
-                # ⚠ SETTING IT TO `false` DOES NOT WORK. Measured, run 31614227678: with
-                # `DISABLE_AUTO_UPDATE=false` the container still printed "Disable auto
+                # ⚠ SETTING IT TO 'false' DOES NOT WORK. Measured, run 31614227678: with
+                # 'DISABLE_AUTO_UPDATE=false' the container still printed "Disable auto
                 # update option is enabled" and stayed on 2.334.0. The entrypoint tests the
                 # variable's PRESENCE, not its value, so any non-empty string — including
                 # "false" — applies --disableupdate. The line must be ABSENT.
@@ -693,11 +693,11 @@ jobs:
                   cpu: { units: ${CPU} }
                   memory: { size: ${MEMORY} }
                   storage: { size: ${STORAGE} }
-            # PROVENANCE — the placement key becomes `group_spec.name` on chain, and
+            # PROVENANCE — the placement key becomes 'group_spec.name' on chain, and
             # it is what stops a sibling repo's sweeper closing this pool mid-CI. Our
             # Console wallet is shared, and Blazing-Back reaps any NON-GPU deployment
             # older than 12h as a presumed leak; a runner pool is non-GPU, and with
-            # `ephemeral: false` it legitimately outlives 12h. Unstamped, it matched
+            # 'ephemeral: false' it legitimately outlives 12h. Unstamped, it matched
             # that filter — and the symptom would be runners vanishing mid-job, read
             # back as RUNNER_NEVER_REGISTERED against a provider that did nothing wrong.
             # See just_akash/provenance.py for why the key, and not an attribute.
