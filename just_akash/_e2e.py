@@ -248,7 +248,10 @@ def robust_destroy(dseq: str, *, retries: int = 2, audit: bool = True) -> bool:
         try:
             r = _run(f"just destroy {shlex.quote(str(dseq))}", input_text="y\n", timeout=60)
             if _destroy_succeeded(r):
-                _pass(f"Deployment {dseq} closed (attempt {attempt})")
+                _pass(
+                    f"destroy reported success for {dseq} (attempt {attempt}) "
+                    f"— settlement not yet verified"
+                )
                 break
             last_err = (r.stderr or r.stdout).strip()
             _fail(f"destroy attempt {attempt} failed: {last_err[:200]}")
