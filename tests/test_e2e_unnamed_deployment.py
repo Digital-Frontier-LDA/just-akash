@@ -184,6 +184,9 @@ _SRC = (Path(__file__).resolve().parents[1] / "just_akash" / "test_shell_e2e.py"
     encoding="utf-8"
 )
 _TREE = ast.parse(_SRC)
+#: This file, parsed, so a test can assert about the TESTS rather than the module
+#: under test — see test_the_freshness_tripwire_does_not_compare_two_clocks.
+_TREE_TESTS = ast.parse(Path(__file__).read_text(encoding="utf-8"))
 _PARENT: dict = {}
 for _n in ast.walk(_TREE):
     for _c in ast.iter_child_nodes(_n):
@@ -342,6 +345,35 @@ def _tee_log(monkeypatch, tmp_path, content: str | None, *, age: float = 0.0):
     return path
 
 
+def _started_just_before(path) -> float:
+    """A `started_at` guaranteed to be at or before `path`'s mtime, from ONE clock.
+
+    ⛔ `time.time()` AND `st_mtime` ARE DIFFERENT CLOCKS ON LINUX, and comparing them
+    across a sub-second gap is a coin flip. File timestamps come from the kernel's
+    COARSE clock, updated on a timer tick; `time.time()` is fine-grained. Measured in
+    a Linux container:
+
+        filesystem mtime granularity: 1.000 ms  (307 distinct values / 3000 writes)
+        st_mtime - time.time():  p01 -1.63 ms, p50 -1.13 ms, p99 -0.62 ms
+        st_mtime < time.time() captured BEFORE the write: 19964/20000
+
+    So a file written immediately after `started = time.time()` reports an mtime
+    EARLIER than `started`, and `_dseq_from_deploy_log`'s `st_mtime >= started_at`
+    gate then rejects it as belonging to a previous run. How often depends on where
+    `started` falls in the tick and how far that host's coarse clock lags — near
+    certain in the container above, rare on GitHub's runners, which is why this
+    presented as a flake rather than a hard failure. (just-akash#291.)
+
+    Deriving `started` from the file's OWN mtime removes the second clock entirely,
+    so nothing here depends on tick granularity or host timing.
+
+    ⚠ The other call sites in this file pass `time.time() - 5`. That margin is
+    load-bearing, not decoration — five seconds against a 1 ms granularity. Do not
+    "tidy" it to a bare `time.time()`; that is the edit that produced #291.
+    """
+    return os.stat(path).st_mtime - 1.0
+
+
 def test_the_dseq_is_recovered_from_the_file_when_the_pipe_gave_nothing(monkeypatch, tmp_path):
     """The identifier was on disk the whole time; the run simply never looked."""
     _tee_log(monkeypatch, tmp_path, "[ts] Deployment created  DSEQ=1788999000333  x\n")
@@ -418,12 +450,25 @@ def test_a_file_newer_than_this_run_is_not_thereby_this_runs(monkeypatch, tmp_pa
     The safety therefore cannot live here — it lives in what the caller DOES with
     the answer, which `test_a_recovered_dseq_is_reported_and_never_destroyed` pins.
     """
-    started = time.time()
     # a previous run's deploy, still alive, writes AFTER we started
-    _tee_log(monkeypatch, tmp_path, "Deployment created  DSEQ=9999999999999\n")
+    path = _tee_log(monkeypatch, tmp_path, "Deployment created  DSEQ=9999999999999\n")
+    # ⛔ ONE CLOCK. `started = time.time()` here compared a fine-grained clock against
+    # a filesystem mtime taken from the kernel's coarse one, and lost that race often
+    # enough to flake in CI (#291). See `_started_just_before` for the measurements.
+    started = _started_just_before(path)
+
     assert _tse._dseq_from_deploy_log(started, wait=0.0) == "9999999999999", (
-        "recovery is expected to return the foreign DSEQ — if this now returns None, "
-        "provenance became establishable and the report-only rule can be revisited"
+        "recovery did not return the foreign DSEQ.\n"
+        "⛔ ESTABLISH WHY BEFORE CHANGING ANYTHING — two causes look identical here:\n"
+        "  (a) an environment or timing fault. This test used to compare two "
+        "different clocks and flaked for it (#291). Check that `started` still "
+        "derives from the file's own mtime, and re-run before concluding anything.\n"
+        "  (b) a real change in `_dseq_from_deploy_log` that makes provenance "
+        "establishable.\n"
+        "Only (b) would justify revisiting report-only, and REPORT-ONLY STANDS until "
+        "someone has shown it is (b). A red tripwire is a question, not a verdict — "
+        "acting on this one removes the guard keeping an unverified DSEQ away from "
+        "robust_destroy."
     )
 
 
@@ -940,3 +985,82 @@ def test_the_tmp_derived_candidate_never_reaches_a_shell_interpolation():
             "recovered_dseq is interpolated into a run() command; it is read from a "
             "world-writable /tmp path and reaches subprocess"
         )
+
+
+def test_the_freshness_tripwire_does_not_compare_two_clocks():
+    """⛔ #291 IN ONE ASSERTION: that test must not go back to `time.time()`.
+
+    `test_a_file_newer_than_this_run_is_not_thereby_this_runs` needs a `started_at`
+    at or before the tee-log's mtime. Taking it from `time.time()` compares a
+    fine-grained clock to a filesystem one, which on Linux is a coarse per-tick
+    clock — measured 25/25 failures in a container, rare enough on GitHub's runners
+    to present as a flake.
+
+    ⚠ Why this matters more than an ordinary flake: that test's assertion message
+    used to tell the reader a red result meant provenance had become establishable
+    and report-only could be revisited. So a timing fault issued a standing
+    invitation to remove the guard keeping an unverified DSEQ away from
+    `robust_destroy`. The message is fixed; this stops the fault recurring.
+
+    Reverting the setup to `started = time.time()` fails here immediately, on any
+    platform, rather than once a fortnight on Linux.
+    """
+    fn = next(
+        (
+            n
+            for n in ast.walk(_TREE_TESTS)
+            if isinstance(n, ast.FunctionDef)
+            and n.name == "test_a_file_newer_than_this_run_is_not_thereby_this_runs"
+        ),
+        None,
+    )
+    assert fn is not None, "the freshness tripwire is gone — re-anchor, do not delete"
+
+    # ⛔ THE POSITIVE PROPERTY, NOT A LIST OF FORBIDDEN SPELLINGS.
+    #
+    # This guard went through three review rounds as a denylist and lost every one,
+    # because syntax has unbounded spellings and an enumeration can only ever list
+    # the ones someone thought of:
+    #
+    #   round 1: matched `time.time()` — missed `time_ns()` and `monotonic()`
+    #   round 2: matched the module `time` — missed `import time as t; t.time()`
+    #   round 3: matched module references at all — missed
+    #            `from time import time as now`, which has none. And it accepted an
+    #            UNUSED `_started_just_before(path)` call, so the helper could be
+    #            invoked for show while `started = now()` did the real work.
+    #
+    # Each round added a pattern and the next reviewer found another. That is what a
+    # denylist over expressions does; it never closes.
+    #
+    # So assert what must be TRUE instead: `started` is assigned, once, directly from
+    # `_started_just_before(...)`. One node, one call. Aliasing becomes irrelevant —
+    # not because every alias is enumerated, but because the question is no longer
+    # "did anyone read a clock anywhere?" It is "is this variable derived from the one
+    # sanctioned source?", and `t.time()`, `now()`, `time.monotonic()` and a
+    # called-but-ignored helper all fail it without being named.
+    #
+    # Same move as the atomic tuple in #276: make the wrong thing UNEXPRESSIBLE rather
+    # than listing its spellings. (Rounds 2 and 3 reported by Copilot and CodeRabbit.)
+    assigns = [
+        n
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "started" for t in n.targets)
+    ]
+    assert len(assigns) == 1, (
+        f"expected exactly one assignment to `started`, found {len(assigns)} — more "
+        "than one means a later line can overwrite the sanctioned value"
+    )
+
+    value = assigns[0].value
+    assert (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "_started_just_before"
+    ), (
+        "`started` is not assigned directly from `_started_just_before(...)` — it is "
+        f"assigned from `{ast.unparse(value)}`. Any other source is a second clock "
+        "compared against a filesystem mtime (#291), and `time.monotonic()` is the "
+        "worst of them: its origin is arbitrary, so the comparison is not merely "
+        "imprecise but meaningless."
+    )
