@@ -309,9 +309,21 @@ jobs:
             # when there IS something to check. A guard that fires on
             # benign empty PRs is the same defect as the tree-SHA guard
             # Copilot flagged in #294: a name for an unmeasured cause.
-            pr_diff_files="$(git diff --name-only "$base_commit..$head_commit" -- .)"
+            #
+            # CRITICAL: the diff MUST be computed from SHAs independent of
+            # the .check/ checkout. If we used $base_commit..$head_commit
+            # (the same pair the guard compares), the silent-checkout-
+            # failure mode collapses both to A..A = empty, and the skip
+            # branch fires before the guard can see the failure -- turning
+            # the guard into a fail-open silent skip. Use the event-payload
+            # base/head SHAs instead: those are committed to the event at
+            # trigger time and do not depend on any checkout resolving
+            # correctly. (Copilot on #294, comment 3948174510.)
+            event_base_sha="${{ github.event.pull_request.base.sha }}"
+            event_head_sha="${{ github.event.pull_request.head.sha }}"
+            pr_diff_files="$(git diff --name-only "$event_base_sha..$event_head_sha" -- . 2>/dev/null || echo "")"
             if [ -z "$pr_diff_files" ]; then
-              echo "no diff between .check HEAD ($base_commit) and PR head ($head_commit); symbol-presence check has nothing to inspect, skipping"
+              echo "no diff between event-payload base ($event_base_sha) and head ($event_head_sha); symbol-presence check has nothing to inspect, skipping"
               exit 0
             fi
             if [ "$base_commit" = "$head_commit" ]; then
