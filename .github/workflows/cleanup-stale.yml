@@ -192,6 +192,15 @@ jobs:
           # ⛔ NOT passing --reap-owned on the live path would be worse, not safer: the dry
           # run would then report candidates the live run refuses to act on, which is a
           # preview that does not predict the thing it previews.
+          # ⚠ ONE DEFINITION OF THE ARGS, RECORDED AND THEN RUN. The summary previously
+          # logged the INPUTS and the mode, but not what was actually invoked — so an
+          # auditor reading "CLOSING (live)" could not tell which reaper flags were in
+          # effect, and this change widened exactly that. Two copies (one logged, one run)
+          # would drift; this is the same array either way.
+          SWEEP_ARGS=(--reap-runners --reap-owned)
+          if [ "$EXECUTE" = "true" ] || [ "$AUTO_EXECUTE" = "true" ]; then
+            SWEEP_ARGS+=(--execute)
+          fi
           if [ "$EXECUTE" = "true" ] || [ "$AUTO_EXECUTE" = "true" ]; then
             # Record the mode where it cannot be inferred wrongly later. The job
             # label is deliberately neutral, so this is the audit trail's answer
@@ -201,14 +210,16 @@ jobs:
               echo ""
               echo "- \`execute\` input: \`${EXECUTE:-<unset>}\`"
               echo "- \`CLEANUP_AUTO_EXECUTE\`: \`${AUTO_EXECUTE:-<unset>}\`"
+              echo "- args: \`${SWEEP_ARGS[*]}\`"
             } >> "$GITHUB_STEP_SUMMARY"
-            uv run python -m just_akash.cleanup_stale --reap-runners --reap-owned --execute
+            uv run python -m just_akash.cleanup_stale "${SWEEP_ARGS[@]}"
           else
             {
               echo "### Stale sweep: dry run (reported only, closed nothing)"
               echo ""
               echo "- \`execute\` input: \`${EXECUTE:-<unset>}\`"
               echo "- \`CLEANUP_AUTO_EXECUTE\`: \`${AUTO_EXECUTE:-<unset>}\`"
+              echo "- args: \`${SWEEP_ARGS[*]}\`"
             } >> "$GITHUB_STEP_SUMMARY"
-            uv run python -m just_akash.cleanup_stale --reap-runners --reap-owned
+            uv run python -m just_akash.cleanup_stale "${SWEEP_ARGS[@]}"
           fi
