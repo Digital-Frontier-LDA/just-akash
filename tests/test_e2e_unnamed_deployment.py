@@ -1016,45 +1016,51 @@ def test_the_freshness_tripwire_does_not_compare_two_clocks():
     )
     assert fn is not None, "the freshness tripwire is gone — re-anchor, do not delete"
 
-    called_names = {
-        n.func.attr if isinstance(n.func, ast.Attribute) else getattr(n.func, "id", "")
+    # ⛔ THE POSITIVE PROPERTY, NOT A LIST OF FORBIDDEN SPELLINGS.
+    #
+    # This guard went through three review rounds as a denylist and lost every one,
+    # because syntax has unbounded spellings and an enumeration can only ever list
+    # the ones someone thought of:
+    #
+    #   round 1: matched `time.time()` — missed `time_ns()` and `monotonic()`
+    #   round 2: matched the module `time` — missed `import time as t; t.time()`
+    #   round 3: matched module references at all — missed
+    #            `from time import time as now`, which has none. And it accepted an
+    #            UNUSED `_started_just_before(path)` call, so the helper could be
+    #            invoked for show while `started = now()` did the real work.
+    #
+    # Each round added a pattern and the next reviewer found another. That is what a
+    # denylist over expressions does; it never closes.
+    #
+    # So assert what must be TRUE instead: `started` is assigned, once, directly from
+    # `_started_just_before(...)`. One node, one call. Aliasing becomes irrelevant —
+    # not because every alias is enumerated, but because the question is no longer
+    # "did anyone read a clock anywhere?" It is "is this variable derived from the one
+    # sanctioned source?", and `t.time()`, `now()`, `time.monotonic()` and a
+    # called-but-ignored helper all fail it without being named.
+    #
+    # Same move as the atomic tuple in #276: make the wrong thing UNEXPRESSIBLE rather
+    # than listing its spellings. (Rounds 2 and 3 reported by Copilot and CodeRabbit.)
+    assigns = [
+        n
         for n in ast.walk(fn)
-        if isinstance(n, ast.Call)
-    }
-    assert "_started_just_before" in called_names, (
-        "the tripwire no longer derives `started` from the file's own mtime; if it "
-        "takes it from a clock function it is comparing two clocks again (#291)"
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "started" for t in n.targets)
+    ]
+    assert len(assigns) == 1, (
+        f"expected exactly one assignment to `started`, found {len(assigns)} — more "
+        "than one means a later line can overwrite the sanctioned value"
     )
 
-    # ⛔ MATCH THE MODULE, NOT THE SPELLING. An earlier version of this asserted
-    # `"time" not in called_names`, which is the ATTRIBUTE name — so it caught
-    # `time.time()` and let `time.time_ns()` and `time.monotonic()` straight through.
-    # A guard named for a class ("does not compare two clocks") that matches one
-    # spelling is the defect this PR is about, committed in the guard against it.
-    # (Reported by Copilot on #297.)
-    #
-    # ⚠ And it let the WORSE one through. `time.time()` at least measures the same
-    # wall-clock epoch as the filesystem, one tick out. `time.monotonic()` has an
-    # ARBITRARY ORIGIN — compared against an mtime it is not a 1 ms skew, it is
-    # meaningless. The guard blocked the bug already fixed and permitted the bigger.
-    clock_calls = sorted(
-        ast.unparse(n.func)
-        for n in ast.walk(fn)
-        if isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Attribute)
-        and isinstance(n.func.value, ast.Name)
-        and n.func.value.id == "time"
-    )
-    # `from time import monotonic` would arrive as a bare Name instead.
-    _BARE_CLOCKS = {"time", "time_ns", "monotonic", "monotonic_ns", "perf_counter"}
-    clock_calls += sorted(
-        n.func.id
-        for n in ast.walk(fn)
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in _BARE_CLOCKS
-    )
-    assert not clock_calls, (
-        f"the tripwire calls {clock_calls} — any clock read here is compared against "
-        "a filesystem mtime, which is a different clock (#291). time.monotonic() is "
-        "the worst of them: its origin is arbitrary, so the comparison is not merely "
-        "imprecise but meaningless. Use _started_just_before(path)."
+    value = assigns[0].value
+    assert (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "_started_just_before"
+    ), (
+        "`started` is not assigned directly from `_started_just_before(...)` — it is "
+        f"assigned from `{ast.unparse(value)}`. Any other source is a second clock "
+        "compared against a filesystem mtime (#291), and `time.monotonic()` is the "
+        "worst of them: its origin is arbitrary, so the comparison is not merely "
+        "imprecise but meaningless."
     )
