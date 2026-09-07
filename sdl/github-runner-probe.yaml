@@ -58,7 +58,7 @@ services:
     # provisions a qualification requires, so the streak would be measuring different
     # runner artifacts rather than one provider capability — and a provider promoted on
     # one image would be trusted while running another. Requalify when this digest moves.
-    image: ghcr.io/digital-frontier-lda/df-akash-runner@sha256:649718bae989eb0a3399a59660ada8041c1ba419aed4b792de62cd37aaf26c1c
+    image: ghcr.io/digital-frontier-lda/df-akash-runner@sha256:aaf3799b5e138abef0831bb8467ded7325164316f0cfde5c183fe6e129eae79e
     env:
       - {{TOKEN_ENV}}
       - ORG_NAME={{ORG_NAME}}
