@@ -159,6 +159,46 @@ jobs:
           # would fire on the literal "false" and silently promote every
           # scheduled run to a live close. One careful comparison here is worth
           # more than any amount of care elsewhere in this file.
+          # ⛔ `--reap-owned` WAS BUILT FOR THIS AND NEVER PASSED. The module documents the
+          # class at cleanup_stale.py:84-96 — six Blazing-Back deployments sat 62-139h
+          # holding 28.28 ACT while this sweep reported `stale (closable): 0`, because
+          # "a service-name allowlist is a CONVENTION, not a fact about ownership".
+          # `STALE_OWNED_AGE_SECONDS` and the `STALE-owned` branch were added to fix exactly
+          # that, opt-in so no caller changed behaviour on upgrade — and no caller opted in.
+          #
+          # MEASURED 2026-09-07: four `just-akash-canary.*` leases active 324h (13.5 days).
+          # `just-akash-canary.940318403fae` carries the prefix, so ownership is PROVEN on
+          # chain, and the age is 6.7x the 48h threshold. classify() never reaches that
+          # branch: `services == ["canary"]` is not `["runner"]`, and the only other age
+          # gate sits behind `reap_owned`.
+          #
+          # ⚠ TWO DIFFERENT EFFECTS, AND THE SECOND IS A WIDENED DESTRUCTIVE PATH.
+          #
+          #   SCHEDULED run (CLEANUP_AUTO_EXECUTE=false) — report only. It will now SAY the
+          #     canaries are closable instead of saying nothing is. Nothing is closed.
+          #
+          #   MANUAL dispatch with execute=true — CLOSES MORE THAN BEFORE. `--reap-owned` is
+          #     on this path too, so a live run now also closes STALE-owned deployments:
+          #     anything carrying PLACEMENT_PREFIX in its on-chain group name and older than
+          #     STALE_OWNED_AGE_SECONDS (48h), regardless of service name. Previously a live
+          #     run closed only STALE-runner/probe/e2e.
+          #
+          # ⇒ That widening is the POINT — it is what reaps the canaries — but an operator
+          # dispatching execute=true must know the close set grew. An earlier draft of this
+          # comment said "changes what is reported, not what is closed", which was true of
+          # the scheduled path and false of the dispatch path, and would have been read as
+          # covering both.
+          #
+          # ⛔ NOT passing --reap-owned on the live path would be worse, not safer: the dry
+          # run would then report candidates the live run refuses to act on, which is a
+          # preview that does not predict the thing it previews.
+          # ⚠ ARGS ARE LITERAL ON THE INVOCATION LINE, DELIBERATELY. An earlier revision of
+          # this PR built them into a `SWEEP_ARGS` array — tidier, and it broke
+          # tests/test_close_plane_is_scheduled.py, which reads these lines STATICALLY to
+          # prove the reaper flags are actually passed. That test exists because
+          # `--reap-runners` was once absent for months while the cron ran green and leases
+          # grew 13 -> 22 (65 -> 110 ACT). A form the guard cannot read is worse than a
+          # repeated string.
           if [ "$EXECUTE" = "true" ] || [ "$AUTO_EXECUTE" = "true" ]; then
             # Record the mode where it cannot be inferred wrongly later. The job
             # label is deliberately neutral, so this is the audit trail's answer
@@ -168,14 +208,16 @@ jobs:
               echo ""
               echo "- \`execute\` input: \`${EXECUTE:-<unset>}\`"
               echo "- \`CLEANUP_AUTO_EXECUTE\`: \`${AUTO_EXECUTE:-<unset>}\`"
+              echo "- args: \`--reap-runners --reap-owned --execute\`"
             } >> "$GITHUB_STEP_SUMMARY"
-            uv run python -m just_akash.cleanup_stale --reap-runners --execute
+            uv run python -m just_akash.cleanup_stale --reap-runners --reap-owned --execute
           else
             {
               echo "### Stale sweep: dry run (reported only, closed nothing)"
               echo ""
               echo "- \`execute\` input: \`${EXECUTE:-<unset>}\`"
               echo "- \`CLEANUP_AUTO_EXECUTE\`: \`${AUTO_EXECUTE:-<unset>}\`"
+              echo "- args: \`--reap-runners --reap-owned\`"
             } >> "$GITHUB_STEP_SUMMARY"
-            uv run python -m just_akash.cleanup_stale --reap-runners
+            uv run python -m just_akash.cleanup_stale --reap-runners --reap-owned
           fi
