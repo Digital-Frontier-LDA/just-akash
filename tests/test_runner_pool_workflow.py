@@ -2308,7 +2308,10 @@ def _assigns(var: str, text: str) -> list[str]:
     """Lines of `text` that actually ASSIGN `var` (not merely mention it)."""
     out = []
     for ln in text.splitlines():
-        stripped = re.sub(r"\b(?:echo|printf)\b.*$", "", ln)  # drop echoed mentions
+        # ⚠ STOP AT THE COMMAND SEPARATOR. `\b(?:echo|printf)\b.*$` swallowed the rest of
+        # the line, so a REAL assignment after an echo — `echo hi; GONE=yes` — vanished
+        # with it, reintroducing the false negative this helper exists to remove.
+        stripped = re.sub(r"\b(?:echo|printf)\b[^;&|]*", "", ln)
         if re.search(_CMD_POS + re.escape(var) + r"=", stripped):
             out.append(ln)
     return out
@@ -2341,7 +2344,13 @@ def test_the_verification_settles_before_it_calls_a_lease_open():
     )
     # ...and actually waits between reads. A loop with no sleep re-reads within
     # milliseconds and settles nothing, which would satisfy the assertion above alone.
-    reads = code[code.index("for _read in") :]
+    # ⚠ SLICE FROM THE MATCH, NOT FROM A LITERAL. The assertion above is
+    # whitespace-tolerant; `code.index("for _read in")` is not, so an extra space would
+    # raise ValueError here while the assertion it depends on passed — the test failing
+    # on its own scan rather than on the code.
+    loop_re = re.search(r"for\s+_read\s+in", code)
+    assert loop_re, "the read loop is gone"
+    reads = code[loop_re.start() :]
     assert re.search(r"\bsleep\s+\d+", reads), "the read loop never sleeps, so it cannot settle"
 
     # The classifier still REFUSES an unresolved state — the retry must not have been
