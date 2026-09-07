@@ -20,11 +20,19 @@ import contextlib
 import time
 from typing import Any
 
-# Minimal GPU order. alpine + `sleep` so that IF a lease were ever created the container
-# is trivial — but the probe closes the order before accepting a bid, so nothing runs.
-# Pricing is a generous per-block ceiling in uact (the Console credit denom) so that
-# *price* is never the reason a provider declines — we want a pure capacity signal.
-_PROBE_SDL = """\
+
+def build_probe_sdl(gpu_count: int, gpu_model: str | None) -> str:
+    """Render a minimal GPU order SDL. ``gpu_model`` empty/None → any NVIDIA GPU
+    (``nvidia: []``); otherwise pin the model (e.g. ``v100``, ``rtx4000ada``)."""
+    if gpu_count < 1:
+        raise ValueError("gpu_count must be >= 1")
+    models = f"[{{ model: {gpu_model} }}]" if gpu_model else "[]"
+    # Minimal GPU order. alpine + `sleep` so that IF a lease were ever created the
+    # container is trivial — but the probe closes the order before accepting a bid, so
+    # nothing runs. Pricing is a generous per-block ceiling in uact (the Console credit
+    # denom) so that *price* is never the reason a provider declines — we want a pure
+    # capacity signal.
+    template = """\
 version: "2.0"
 services:
   probe:
@@ -52,15 +60,7 @@ deployment:
   probe:
     dcloud: {{ profile: probe, count: 1 }}
 """
-
-
-def build_probe_sdl(gpu_count: int, gpu_model: str | None) -> str:
-    """Render a minimal GPU order SDL. ``gpu_model`` empty/None → any NVIDIA GPU
-    (``nvidia: []``); otherwise pin the model (e.g. ``v100``, ``rtx4000ada``)."""
-    if gpu_count < 1:
-        raise ValueError("gpu_count must be >= 1")
-    models = f"[{{ model: {gpu_model} }}]" if gpu_model else "[]"
-    return _PROBE_SDL.format(count=gpu_count, models=models)
+    return template.format(count=gpu_count, models=models)
 
 
 def capacity_probe(
