@@ -24,34 +24,10 @@ from typing import Any
 # is trivial — but the probe closes the order before accepting a bid, so nothing runs.
 # Pricing is a generous per-block ceiling in uact (the Console credit denom) so that
 # *price* is never the reason a provider declines — we want a pure capacity signal.
-_PROBE_SDL = """\
-version: "2.0"
-services:
-  probe:
-    image: alpine:3.19
-    command: ["sh", "-c", "sleep 30"]
-    expose:
-      - port: 80
-        as: 80
-        to: [{{ global: true }}]
-profiles:
-  compute:
-    probe:
-      resources:
-        cpu: {{ units: 1 }}
-        memory: {{ size: 1Gi }}
-        gpu:
-          units: {count}
-          attributes: {{ vendor: {{ nvidia: {models} }} }}
-        storage: [{{ size: 2Gi }}]
-  placement:
-    dcloud:
-      pricing:
-        probe: {{ denom: uact, amount: 1000000 }}
-deployment:
-  probe:
-    dcloud: {{ profile: probe, count: 1 }}
-"""
+# NOTE: the probe SDL is inlined in ``build_probe_sdl`` so the file no longer carries a
+# module-level ``_PROBE_SDL`` binding — that name was removed 2026-09-07 as the live
+# fixture for re-demonstrating ``symbol-presence-check`` under #294's checker-from-base
+# wiring.
 
 
 def build_probe_sdl(gpu_count: int, gpu_model: str | None) -> str:
@@ -60,7 +36,34 @@ def build_probe_sdl(gpu_count: int, gpu_model: str | None) -> str:
     if gpu_count < 1:
         raise ValueError("gpu_count must be >= 1")
     models = f"[{{ model: {gpu_model} }}]" if gpu_model else "[]"
-    return _PROBE_SDL.format(count=gpu_count, models=models)
+    return (
+        'version: "2.0"\n'
+        "services:\n"
+        "  probe:\n"
+        '    image: alpine:3.19\n'
+        '    command: ["sh", "-c", "sleep 30"]\n'
+        "    expose:\n"
+        "      - port: 80\n"
+        "        as: 80\n"
+        "        to: [{{ global: true }}]\n"
+        "profiles:\n"
+        "  compute:\n"
+        "    probe:\n"
+        "      resources:\n"
+        "        cpu: {{ units: 1 }}\n"
+        "        memory: {{ size: 1Gi }}\n"
+        "        gpu:\n"
+        "          units: {count}\n"
+        "          attributes: {{ vendor: {{ nvidia: {models} }} }}\n"
+        "        storage: [{{ size: 2Gi }}]\n"
+        "  placement:\n"
+        "    dcloud:\n"
+        "      pricing:\n"
+        "        probe: {{ denom: uact, amount: 1000000 }}\n"
+        "deployment:\n"
+        "  probe:\n"
+        "    dcloud: {{ profile: probe, count: 1 }}\n"
+    ).format(count=gpu_count, models=models)
 
 
 def capacity_probe(
