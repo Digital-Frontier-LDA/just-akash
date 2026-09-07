@@ -21,7 +21,6 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Sequence
 
 from ._e2e import (
     assert_provider_in_tiers,
@@ -103,7 +102,7 @@ def _cmd_inject(env_file: str, remote_path: str, dseq: str) -> list[str]:
 
 
 def run(
-    argv: Sequence[str], timeout: int = 60, input_text: str | None = None
+    argv: list[str], timeout: int = 60, input_text: str | None = None
 ) -> subprocess.CompletedProcess:
     r"""Run a command as an ARGUMENT VECTOR, with no shell between us and it.
 
@@ -119,6 +118,22 @@ def run(
     still catches a DSEQ parse that has gone wrong, and deleting a guard because a
     second one now covers it is how dead layers are made.
     """
+    # ⛔ `str` IS A `Sequence[str]`, so the obvious annotation accepts the exact thing
+    # this conversion removed — and accepts it SILENTLY. `list("uv run ...")` is
+    # ['u','v',' ',...], so the process tries to exec a program called `u` and the
+    # developer sees "No such file or directory: 'u'", which explains nothing.
+    #
+    # The annotation is `list[str]` so pyright rejects a string outright. This guard
+    # is here as well because annotations are erased at runtime, and the call site
+    # most likely to pass one is a leftover from the old string API — precisely the
+    # case a type checker will not see if it is added later without one being run.
+    # (Reported by Copilot on #293.)
+    if isinstance(argv, str):
+        raise TypeError(
+            "run() takes an argument vector, not a command string — a str would be "
+            f"split into single characters and exec'd as {argv[:1]!r}. Use one of the "
+            f"_cmd_* builders, or a list. Got: {argv[:60]!r}"
+        )
     return subprocess.run(
         list(argv),
         shell=False,

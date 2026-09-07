@@ -196,17 +196,32 @@ def _ancestors(node):
         yield node
 
 
+def _is_just_up(call: ast.Call) -> bool:
+    """Is this `run(["just", "up"], ...)`, judged on the SYNTAX TREE?
+
+    ⛔ NOT A SOURCE-TEXT MATCH. The command is an argument vector now (#282), and an
+    earlier version of this locator matched the literal substring `'"just", "up"'` —
+    which passes or fails on FORMATTING. Swap the quote style, add a line break, let
+    a formatter reflow it, and the locator reports the deploy call as GONE when it
+    has merely been reprinted. That is the prose-satisfied shape again: the file as
+    text is not the program. (Reported by Copilot on #293.)
+    """
+    if not call.args or not isinstance(call.args[0], ast.List):
+        return False
+    elts = call.args[0].elts
+    return [e.value for e in elts if isinstance(e, ast.Constant) and isinstance(e.value, str)] == [
+        "just",
+        "up",
+    ]
+
+
 def _deploy_call():
     for n in ast.walk(_TREE):
         if (
             isinstance(n, ast.Call)
             and isinstance(n.func, ast.Name)
             and n.func.id == "run"
-            # ⛔ TWO ELEMENTS, not the phrase. The command is an argument vector now
-            # (#282), so "just up" no longer appears contiguously — matching on the
-            # phrase would silently find nothing and the locator would report the deploy
-            # call as gone rather than as moved.
-            and '"just", "up"' in (ast.get_source_segment(_SRC, n) or "")
+            and _is_just_up(n)
         ):
             return n
     return None

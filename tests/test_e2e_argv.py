@@ -18,7 +18,6 @@ exactly. That turns "we think this is the same command" into a checkable claim.
 from __future__ import annotations
 
 import shlex
-import subprocess
 
 import pytest
 
@@ -165,14 +164,48 @@ def test_run_passes_a_vector_and_no_shell():
     )
 
 
-def test_a_command_string_is_rejected_rather_than_silently_reinterpreted():
-    """⛔ Passing the OLD form must fail loudly, not run something unintended.
+def test_a_command_string_is_rejected_loudly_and_by_name():
+    """⛔ `str` IS A `Sequence[str]` — the trap this conversion could have shipped.
 
-    `subprocess.run("uv run just-akash status ...", shell=False)` treats the WHOLE
-    string as a single executable name. It does not raise a TypeError — it raises
-    FileNotFoundError at exec time, which is a clear failure, but only if someone
-    actually runs it. This pins that the old calling convention cannot quietly do
-    something plausible instead.
+    The obvious annotation for a vector, `Sequence[str]`, accepts a plain string,
+    so a leftover call from the old API type-checks cleanly. `list("uv run ...")`
+    is `['u','v',' ',...]`, and under `shell=False` the process tries to exec a
+    program called `u`. Measured — the developer sees:
+
+        FileNotFoundError: [Errno 2] No such file or directory: 'u'
+
+    which says nothing about what went wrong. The annotation is `list[str]` now so
+    pyright refuses a string, and this guard covers the case pyright will not see:
+    a call site added later by someone who remembers the string API.
+
+    ⚠ The first version of this test asserted only that *something* raised, and its
+    docstring claimed subprocess "treats the WHOLE string as a single executable
+    name". That is what happens without the `list()` call — with it, the string is
+    split into characters. The test passed, for a reason that was not true.
+    (Reported by Copilot on #293.)
     """
-    with pytest.raises((FileNotFoundError, OSError, subprocess.SubprocessError)):
-        run("uv run just-akash status --dseq 1 --json", timeout=10)
+    with pytest.raises(TypeError) as excinfo:
+        # ⛔ THE TYPE ERROR HERE IS THE GUARANTEE, not an oversight. pyright rejects
+        # this line because `run` takes `list[str]` — which is the static half of the
+        # fix. The ignore is what lets the RUNTIME half be tested at all.
+        #
+        # ⚠ If this ignore ever becomes "unused", the annotation has been widened back
+        # to something that accepts `str` (e.g. `Sequence[str]`) and the static half is
+        # gone. Do not delete the ignore; find out why it stopped being needed.
+        run("uv run just-akash status --dseq 1 --json", timeout=10)  # type: ignore[arg-type]
+
+    message = str(excinfo.value)
+    assert "argument vector" in message, f"the rejection does not say what was wrong: {message!r}"
+    assert "_cmd_" in message, (
+        "the rejection does not point at the builders, so the reader is told what "
+        f"not to do and not what to do: {message!r}"
+    )
+    # ⛔ It must fail BEFORE reaching subprocess. If it reaches exec, the failure is
+    # FileNotFoundError('u') and the message above never appears.
+    assert "No such file" not in message
+
+
+def test_a_vector_is_still_accepted_after_that_guard():
+    """The guard must reject strings without rejecting the ordinary case."""
+    r = run(["printf", "%s", "vector-ok"], timeout=30)
+    assert r.returncode == 0 and r.stdout == "vector-ok"
