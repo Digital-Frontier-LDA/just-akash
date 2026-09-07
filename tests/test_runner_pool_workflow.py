@@ -2520,11 +2520,15 @@ def test_the_nested_teardown_pin_is_reachable_from_main():
         )
         pytest.skip("no main ref available locally; this guard is enforced in CI")
 
-    if _git("rev-parse", "--is-shallow-repository").stdout.strip() == "true":
-        # Deepen so merge-base has the history it needs. --unshallow is the reliable
-        # form; fall back to a bounded deepen if the remote refuses it.
-        if _git("fetch", "--quiet", "--unshallow", "origin").returncode != 0:
-            _git("fetch", "--quiet", "--deepen=1000", "origin")
+    # Deepen so merge-base has the history it needs. --unshallow is the reliable form;
+    # fall back to a bounded deepen if the remote refuses it. ⚠ The `and` short-circuits,
+    # so --unshallow is attempted ONLY on a shallow repo — same semantics as the nested
+    # ifs this replaced (ruff SIM102), not a widening.
+    if (
+        _git("rev-parse", "--is-shallow-repository").stdout.strip() == "true"
+        and _git("fetch", "--quiet", "--unshallow", "origin").returncode != 0
+    ):
+        _git("fetch", "--quiet", "--deepen=1000", "origin")
 
     head = _git("rev-parse", ref).stdout.strip()
     if pin == head or _git("merge-base", "--is-ancestor", pin, ref).returncode == 0:
