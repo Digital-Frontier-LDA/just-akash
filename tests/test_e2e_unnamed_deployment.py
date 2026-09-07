@@ -1016,16 +1016,45 @@ def test_the_freshness_tripwire_does_not_compare_two_clocks():
     )
     assert fn is not None, "the freshness tripwire is gone — re-anchor, do not delete"
 
-    calls = {
+    called_names = {
         n.func.attr if isinstance(n.func, ast.Attribute) else getattr(n.func, "id", "")
         for n in ast.walk(fn)
         if isinstance(n, ast.Call)
     }
-    assert "_started_just_before" in calls, (
+    assert "_started_just_before" in called_names, (
         "the tripwire no longer derives `started` from the file's own mtime; if it "
-        "takes it from time.time() it is comparing two clocks again (#291)"
+        "takes it from a clock function it is comparing two clocks again (#291)"
     )
-    assert "time" not in calls, (
-        "the tripwire calls time.time() — that is the two-clock comparison #291 was "
-        "filed for. Use _started_just_before(path)."
+
+    # ⛔ MATCH THE MODULE, NOT THE SPELLING. An earlier version of this asserted
+    # `"time" not in called_names`, which is the ATTRIBUTE name — so it caught
+    # `time.time()` and let `time.time_ns()` and `time.monotonic()` straight through.
+    # A guard named for a class ("does not compare two clocks") that matches one
+    # spelling is the defect this PR is about, committed in the guard against it.
+    # (Reported by Copilot on #297.)
+    #
+    # ⚠ And it let the WORSE one through. `time.time()` at least measures the same
+    # wall-clock epoch as the filesystem, one tick out. `time.monotonic()` has an
+    # ARBITRARY ORIGIN — compared against an mtime it is not a 1 ms skew, it is
+    # meaningless. The guard blocked the bug already fixed and permitted the bigger.
+    clock_calls = sorted(
+        ast.unparse(n.func)
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and isinstance(n.func.value, ast.Name)
+        and n.func.value.id == "time"
+    )
+    # `from time import monotonic` would arrive as a bare Name instead.
+    _BARE_CLOCKS = {"time", "time_ns", "monotonic", "monotonic_ns", "perf_counter"}
+    clock_calls += sorted(
+        n.func.id
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in _BARE_CLOCKS
+    )
+    assert not clock_calls, (
+        f"the tripwire calls {clock_calls} — any clock read here is compared against "
+        "a filesystem mtime, which is a different clock (#291). time.monotonic() is "
+        "the worst of them: its origin is arbitrary, so the comparison is not merely "
+        "imprecise but meaningless. Use _started_just_before(path)."
     )
