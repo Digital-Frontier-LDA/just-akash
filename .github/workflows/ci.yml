@@ -292,15 +292,19 @@ jobs:
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
             SCRIPT=.check/scripts/symbol_presence_check.py
-            # The check must run against the PR's actual base, not a literal
-            # origin/main. A stacked PR (#296 retargeted to fix/294-checker-
-            # from-base is the live fixture) targets a branch other than
-            # main; comparing against origin/main then evaluates symbols
-            # and merge-base state against a branch the PR is not
-            # targeting, producing either spurious FAILs (symbols the real
-            # base never had) or missed drops (relative to the actual
-            # base). Use the same base_ref the .check/ checkout uses.
-            # `GITHUB_BASE_REF` is only set on pull_request events.
+            # BASE_REF on pull_request: this workflow's trigger restricts
+            # it to PRs targeting `main` (`on.pull_request.branches:
+            # [main]`), so today `--base` and the `.check/` checkout
+            # agree by construction -- the literal `origin/main` would
+            # read the same as `origin/$GITHUB_BASE_REF`. The variable
+            # exists for two future-facing reasons: (1) if the
+            # `branches:` filter is ever widened, `--base` will already
+            # track the PR's actual base; (2) it removes a divergence
+            # between three places that read the base ref (`.check/`
+            # checkout, `--base`, the explicit `refs/heads/<base.ref>`
+            # probe above), so they cannot drift. `GITHUB_BASE_REF` is
+            # only set on `pull_request` events, which is why the push
+            # branch below stays on `origin/main`.
             BASE_REF="origin/$GITHUB_BASE_REF"
             base_commit="$(git -C .check rev-parse HEAD)"
             head_commit="$(git rev-parse HEAD)"
