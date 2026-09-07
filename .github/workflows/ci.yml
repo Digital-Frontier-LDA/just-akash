@@ -177,38 +177,114 @@ jobs:
     permissions:
       contents: read
     steps:
+      # ── HEAD checkout: the tree this check ANALYSES ──
       # fetch-depth: 0 because `git merge-base origin/main HEAD` needs
       # to walk back through history. Default shallow clone can't.
       #
-      # ref: ${{ github.event.pull_request.head.sha }} on pull_request
-      # events. Default actions/checkout on pull_request checks out
-      # `refs/pull/N/merge`, which is GitHub's own auto-merge of the PR
-      # branch into main. That commit already contains main's symbols,
-      # so a conflict-resolution drop on the branch is silently healed
-      # by the pre-merge, and this check would always see
-      # "nothing missing" -- making the check inert in CI on exactly
-      # the failure mode it exists to catch. Pinning to head.sha makes
-      # the checkout the PR's actual tip, against which main's symbols
-      # can be compared truthfully.
+      # ref: pinned to head.sha on pull_request events so the checkout
+      # is the PR's actual tip. Without the pin, actions/checkout
+      # resolves refs/pull/N/merge -- GitHub's own auto-merge of the
+      # PR into main, which already contains main's symbols. A
+      # conflict-resolution drop on the branch is silently healed by
+      # that pre-merge, and the check sees "nothing missing" even on
+      # a real drop. The pin is what makes the check ABLE to detect
+      # drops; see #283 + run 34067349293.
       #
       # Falls back to github.sha on push events where the event payload
       # has no head.sha.
-      - name: Checkout
+      - name: Checkout the PR head (the tree under check)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           fetch-tags: true
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
+      # ── BASE checkout: the source of the CHECKER SCRIPT ──
+      # The previous wiring checked out only the head. That made the
+      # check STRUCTURALLY unable to run on any branch cut before
+      # #283 merged: GitHub takes the workflow definition from the
+      # base branch on pull_request, so the new job runs everywhere
+      # immediately, but the job's single checkout pulled the HEAD's
+      # tree -- which predates #283 and has no `scripts/symbol_presence_check.py`.
+      # python3 died with "[Errno 2] No such file or directory" /
+      # exit 2, indistinguishable from a real FAIL POSSIBLE_DROP.
+      # #293 hit this four hours after #283 landed. See #294.
+      #
+      # A second checkout into `./.check/` brings the BASE's tree in
+      # under a separate path, so the script the PR is checked against
+      # comes from a commit the PR cannot modify. The HEAD checkout
+      # above is still what `--repo .` analyses. This is also a
+      # security improvement on its own: today a PR can edit the
+      # script that checks it, which is not a checker.
+      #
+      # On push events the pushed commit IS the new main, the script
+      # is already in `./scripts/`, and the head checkout above has
+      # it. The "PR can edit the script" risk applies only to PRs;
+      # push events are operator-controlled and skip this step.
+      - name: Checkout the PR base (for the checker script)
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          ref: ${{ github.base_ref }}
+          path: .check
+
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
 
-      # The script only uses stdlib (ast, subprocess, argparse); no
-      # project deps required. Run it directly with the system python.
-      - name: Run symbol-presence check
-        run: python scripts/symbol_presence_check.py --repo . --base origin/main --head HEAD
+      # The script is chosen at runtime:
+      #   pull_request: .check/scripts/symbol_presence_check.py  (base's copy)
+      #   push:         scripts/symbol_presence_check.py         (head's copy)
+      #
+      # If the script is missing, exit 1 with a clear error -- NOT
+      # fail-open. "I couldn't look" must not look like "nothing was
+      # there"; if the script is gone on either side, the check
+      # genuinely could not inspect the PR and we say so. The four
+      # absence-detector blind spots already in this file (#145,
+      # :89, :99, :161) are all in that direction, and `if [ -f ...
+      # ]` to skip would recreate the exact defect this check exists
+      # to catch. See #294.
+      #
+      # For pull_request we ALSO assert the script we are about to
+      # run is provably the BASE's copy, not the HEAD's: the .check/
+      # tree SHA must differ from the HEAD tree SHA, because the two
+      # checkouts are pinned to different commits. Equal trees means
+      # the .check/ checkout silently failed and the script
+      # provenance is unprovable -- refuse to run rather than run
+      # an unchecked check. This is the security property the issue
+      # asks for: the check is base-side, not head-side.
+      - name: Run symbol-presence check (script from base, content from head)
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            SCRIPT=.check/scripts/symbol_presence_check.py
+            base_tree="$(git -C .check rev-parse HEAD^{tree})"
+            head_tree="$(git rev-parse HEAD^{tree})"
+            echo "checker script source: $SCRIPT"
+            echo "checker .check HEAD:    $(git -C .check rev-parse HEAD)"
+            echo "checker .check tree:    $base_tree"
+            echo "this PR head:           $(git rev-parse HEAD)"
+            echo "this PR head tree:      $head_tree"
+            if [ "$base_tree" = "$head_tree" ]; then
+              echo "::error::.check/ tree equals HEAD tree; refusing to run -- the base checkout silently failed and the script provenance is unprovable. The check would otherwise be running a script the PR controls. See #294."
+              exit 1
+            fi
+            if [ ! -f "$SCRIPT" ]; then
+              echo "::error::$SCRIPT is missing on a pull_request event; refusing to fail-open. The base should always carry the checker once #283 has merged. See #294."
+              exit 1
+            fi
+          else
+            SCRIPT=scripts/symbol_presence_check.py
+            if [ ! -f "$SCRIPT" ]; then
+              echo "::error::$SCRIPT is missing on a push event; refusing to fail-open."
+              exit 1
+            fi
+          fi
+          # The script only uses stdlib (ast, subprocess, argparse); no
+          # project deps required. Run it directly with the system python.
+          python "$SCRIPT" --repo . --base origin/main --head HEAD
 
   # DEPENDABOT CANNOT REACH SOPS, so these two jobs could never pass on its PRs.
   # GitHub withholds repository secrets from dependabot by design -- a malicious
