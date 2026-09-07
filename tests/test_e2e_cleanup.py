@@ -1190,7 +1190,8 @@ class TestRobustDestroyTimeoutContract:
 class TestRobustDestroySuccessLogContent:
     """Angle #5: pin the operator-facing success log includes attempt number.
 
-    On first-try success, the log reads `Deployment {dseq} closed (attempt 1)`.
+    On first-try success, the log reads
+    `destroy reported success for {dseq} (attempt 1) — settlement not yet verified`.
     The attempt number is part of the audit trail — operators reviewing CI
     logs use it to distinguish "destroyed cleanly" from "needed retries"
     (which signals provider flakiness worth investigating).
@@ -1563,7 +1564,7 @@ class TestAuditPollsBecauseCloseIsNotInstant:
     That is not hypothetical — it broke the lease-shell E2E on this branch:
 
         [7/7] Cleanup: destroy DSEQ=1784294163119
-          PASS Deployment 1784294163119 closed (attempt 1)
+          PASS destroy reported success for 1784294163119 (attempt 1) — settlement not yet verified
           FAIL Audit: deployment 1784294163119 STILL ACTIVE after destroy
 
     So `active` inside the window means "not settled YET"; only `active` that
@@ -1622,3 +1623,145 @@ class TestAuditPollsBecauseCloseIsNotInstant:
                 _completed(0, stdout='{"state": "closed"}'),
             ]
             assert robust_destroy("12345") is True
+
+
+class TestAuditOverClaimsWhenReaderLagsChainTruth:
+    """Witness pin for issue #275: the audit fires ``STILL ACTIVE`` even
+    when the chain has settled. The shape has now been **measured
+    twice in two subsystems**, not estimated once:
+
+    * **#275 (this audit path)** — main @``e0a41cc8``, run
+      34026449786, 2026-09-06T10:05Z. Deployment settled at block
+      28502500 (10:07:15.204Z, escrow ``closed``, ``funds=0``,
+      lifetime cost 123 uact). Audit read ``state=active`` for all
+      8 probes and printed ``STILL ACTIVE``.
+    * **#299 (a different file, ``runner-teardown.yml``)** — settle
+      at 10:18:08.02Z, guard read ``active`` at 10:18:16.91Z (+8.9 s
+      lag). A second instance on blazing#915 measured +9.6 s. The
+      two lags landing within 0.7 s of each other is the strongest
+      signal: the lag is a consistent ~9 s property of the indexer,
+      not flake. (Issue #299 was filed by the same author as this PR
+      on the same evidence chain — public REST via polkachu, no
+      key, block height → wall clock.)
+
+    ``_e2e._confirm_settled`` already explicitly models the lag: its
+    docstring states the close takes ``~6-12 s`` to reflect and sizes
+    the polling window at ``8 × 3 s = 24 s`` to cover it. The defect on
+    run 34026449786 is **not** that the design is blind to lag; the
+    defect is that the design **bounded** the lag with a constant and
+    the constant was exceeded. All 8 probes positively read
+    ``state=active`` after settlement at block 28502500
+    (10:07:15.204Z) — the bounded assumption fired correctly, but the
+    bound was wrong for this run.
+
+    The wording PR in this branch only labels the destroy-CLI log
+    line; the audit itself is unchanged here and is hardened in issue
+    **#304**. #299 is owned by DEV3-tron (this repo, different file,
+    no overlap with this commit).
+
+    A fix that **lengthens the polling window** is the **wrong** fix:
+    24 s was chosen from a measurement, a longer fuse is the same
+    bounded assumption with more room to fail again the next time an
+    indexer is slower than the estimate. #299 independently measures a
+    ``+8.9 s`` lag in another subsystem, which tells you the variable
+    is not stable enough to size a constant for. The fix must **remove
+    the bounded constant** — corroborate via a higher-authority read
+    (gRPC state-proof, multi-reader, or height-aware), so an
+    unbounded lag cannot pin the verdict on a laggy reader. Issue #304
+    lands exactly this shape.
+
+    These tests pin the over-claim shape as observable. They assert
+    **current** behaviour — 8/8 active reads → ``STILL ACTIVE`` — and
+    exist so that:
+
+    1. the bug is observable and reproducible in unit-test form;
+    2. the audit-hardening PR has a precise RED to turn GREEN by
+       changing the assertion to require corroboration with chain
+       truth (gRPC state-proof, multi-reader, or a height-aware
+       read);
+    3. anyone editing ``_e2e._confirm_settled`` without updating this
+       test breaks a CI green they didn't intend to.
+
+    Tested in isolation here because the test cases below are the *only*
+    unit tests that exercise "STILL ACTIVE on unanimous open reads" with
+    mocked subprocess output and zero real chain interaction. The
+    existing audit tests (``TestAuditReadsTheAuthoritativeRecordNotTheList``,
+    ``TestAuditNeverRaisesFromCleanup``, ``TestUnknownStateIsNotAClaimOfLife``,
+    ``TestAuditPollsBecauseCloseIsNotInstant`` — all in this file above)
+    use scenarios where the output is mixed or settled, which is why the
+    over-claim shape has not been pinned before.
+    """
+
+    def test_eight_active_reads_fire_still_active_under_current_audit(self):
+        """Current behaviour: 8/8 active reads → ``STILL ACTIVE`` (False).
+
+        Mirrors the production chain-read lag that fired ``STILL ACTIVE``
+        on 2026-09-06T10:05Z run #34026449786 (issue #275) and on
+        2026-09-07T10:18:16Z (+8.9 s after settle, issue #299 — same
+        defect class, different file). The mock is the only difference
+        from production: the audit's reader (just-akash status via REST)
+        is presumed to be indexer-lagged, so the mocked subprocess
+        always returns ``state=active`` regardless of chain truth.
+        """
+        from just_akash._e2e import _confirm_settled
+
+        with (
+            patch("just_akash._e2e.subprocess.run") as mock_run,
+            patch("just_akash._e2e.time.sleep"),
+        ):
+            mock_run.side_effect = [_completed(0, stdout='{"state": "active"}') for _ in range(8)]
+            result = _confirm_settled("12345")
+        # Pin current over-claim behaviour. **Issue #304** is the
+        # audit-hardening PR that flips this assertion to require
+        # corroboration (or equivalent shape — gRPC state-proof,
+        # multi-reader, or height-aware). Until that issue lands,
+        # this test stays RED-free because it pins current behaviour.
+        assert result is False, (
+            "audit currently fires STILL ACTIVE on 8/8 active reads "
+            "regardless of chain truth — the over-claim shape pinned by "
+            "issue #275 / tracked for hardening in #304. A future PR on "
+            "#304 changes this to a corroboration-required shape; update "
+            "this test in the same PR."
+        )
+
+    def test_over_claim_shape_is_observable_end_to_end(self, capsys):
+        """Same shape, observed at the ``robust_destroy`` log-line level.
+
+        The two overclaiming labels that ran twenty lines apart on
+        2026-09-06T10:05Z are both pinned here:
+
+          * PASS line — now ``destroy reported success for {dseq} … ``
+            (the wording fix in this PR)
+          * FAIL line — ``Audit: deployment {dseq} STILL ACTIVE … ``
+
+        The PASS pin is exercised by tests in ``TestRobustDestroySuccessLogContent``
+        above. This test pins the FAIL pin under the over-claim shape:
+        a ``robust_destroy`` call where the audit reader is laggy fires
+        ``STILL ACTIVE`` even though the destroy succeeded and the chain
+        has settled.
+        """
+        with (
+            patch("just_akash._e2e.subprocess.run") as mock_run,
+            patch("just_akash._e2e.time.sleep"),
+        ):
+            # One successful destroy (PASS line) + 8 laggy active reads
+            # (STILL ACTIVE FAIL line). The destroy succeeded on chain;
+            # the audit over-claims because the reader is laggy.
+            mock_run.side_effect = [
+                _completed(0, stdout="Deployment 12345 closed"),
+                *(_completed(0, stdout='{"state": "active"}') for _ in range(8)),
+            ]
+            ok = robust_destroy("12345")
+        out = capsys.readouterr().out
+        assert ok is False, (
+            "robust_destroy returned False — the over-claim shape is "
+            "still observable end-to-end on the current audit."
+        )
+        assert "STILL ACTIVE" in out, (
+            "audit fired STILL ACTIVE despite the destroy having "
+            "succeeded — pins the over-claim shape end-to-end."
+        )
+        assert "settlement not yet verified" in out, (
+            "PASS line must use the new wording that reserves settled "
+            "language for the audit's positive confirmation."
+        )
