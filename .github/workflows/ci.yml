@@ -292,6 +292,16 @@ jobs:
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
             SCRIPT=.check/scripts/symbol_presence_check.py
+            # The check must run against the PR's actual base, not a literal
+            # origin/main. A stacked PR (#296 retargeted to fix/294-checker-
+            # from-base is the live fixture) targets a branch other than
+            # main; comparing against origin/main then evaluates symbols
+            # and merge-base state against a branch the PR is not
+            # targeting, producing either spurious FAILs (symbols the real
+            # base never had) or missed drops (relative to the actual
+            # base). Use the same base_ref the .check/ checkout uses.
+            # `GITHUB_BASE_REF` is only set on pull_request events.
+            BASE_REF="origin/$GITHUB_BASE_REF"
             base_commit="$(git -C .check rev-parse HEAD)"
             head_commit="$(git rev-parse HEAD)"
             base_tree="$(git -C .check rev-parse HEAD^{tree})"
@@ -363,6 +373,11 @@ jobs:
             fi
           else
             SCRIPT=scripts/symbol_presence_check.py
+            # Push events are operator-controlled (a merged PR or a direct
+            # push); there is no PR base to compare against, so the
+            # pushed branch IS the new main and the script's --base is
+            # origin/main.
+            BASE_REF="origin/main"
             if [ ! -f "$SCRIPT" ]; then
               echo "::error::$SCRIPT is missing on a push event; refusing to fail-open."
               exit 1
@@ -370,7 +385,7 @@ jobs:
           fi
           # The script only uses stdlib (ast, subprocess, argparse); no
           # project deps required. Run it directly with the system python.
-          python "$SCRIPT" --repo . --base origin/main --head HEAD
+          python "$SCRIPT" --repo . --base "$BASE_REF" --head HEAD
 
   # DEPENDABOT CANNOT REACH SOPS, so these two jobs could never pass on its PRs.
   # GitHub withholds repository secrets from dependabot by design -- a malicious
