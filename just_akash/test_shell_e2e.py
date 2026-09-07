@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Sequence
 
 from ._e2e import (
     assert_provider_in_tiers,
@@ -54,10 +55,73 @@ def log_info(msg):
     print(f"  {YELLOW}INFO{RESET} {msg}")
 
 
-def run(cmd: str, timeout: int = 60, input_text: str | None = None) -> subprocess.CompletedProcess:
+#: The CLI invocation every command here shares.
+_JA = ("uv", "run", "just-akash")
+
+
+def _cmd_status(dseq: str) -> list[str]:
+    return [*_JA, "status", "--dseq", str(dseq), "--json"]
+
+
+def _cmd_logs(dseq: str, *, tail: int, duration: int) -> list[str]:
+    return [*_JA, "logs", "--dseq", str(dseq), "--tail", str(tail), "--duration", str(duration)]
+
+
+def _cmd_events(dseq: str, *, duration: int) -> list[str]:
+    return [*_JA, "events", "--dseq", str(dseq), "--duration", str(duration)]
+
+
+def _cmd_exec(payload: str, dseq: str) -> list[str]:
+    """⛔ `payload` IS ONE ARGUMENT. It contains spaces — `cat /tmp/x`,
+    `stat -c %a /tmp/x` — and under the previous `shell=True` form it was written
+    as `exec 'cat {path}'`, where the SHELL turned the quoted span into a single
+    argv entry. Splitting it here (shlex.split, or interpolating it into a joined
+    string) changes the command's meaning: `just-akash exec` would receive `cat`
+    and `/tmp/x` as separate arguments.
+
+    This is the one thing about this conversion that cannot be checked by running
+    the suite, because the E2E needs live Akash credentials. It is checked instead
+    by asserting the vector equals `shlex.split` of the exact string the shell used
+    to receive — see tests/test_e2e_argv.py.
+    """
+    return [*_JA, "exec", payload, "--dseq", str(dseq), "--transport", "lease-shell"]
+
+
+def _cmd_inject(env_file: str, remote_path: str, dseq: str) -> list[str]:
+    return [
+        *_JA,
+        "inject",
+        "--env-file",
+        str(env_file),
+        "--remote-path",
+        remote_path,
+        "--dseq",
+        str(dseq),
+        "--transport",
+        "lease-shell",
+    ]
+
+
+def run(
+    argv: Sequence[str], timeout: int = 60, input_text: str | None = None
+) -> subprocess.CompletedProcess:
+    r"""Run a command as an ARGUMENT VECTOR, with no shell between us and it.
+
+    ⛔ WHY NOT `shell=True`. Every command here interpolates a DSEQ, and one of the
+    consumers prints a command for a human to paste, so it would run with that
+    person's privileges rather than CI's. Under a shell the only thing standing
+    between parsed process output and command execution was the `(\d+)` capture in
+    a pattern ~400 lines away — a real barrier, and one character from not being
+    one. With a vector there is no shell to inject into, so the barrier stops being
+    load-bearing for that. (just-akash#282; raised repeatedly by Sentinel.)
+
+    ⚠ The digits-only test stays regardless. It no longer guards injection, but it
+    still catches a DSEQ parse that has gone wrong, and deleting a guard because a
+    second one now covers it is how dead layers are made.
+    """
     return subprocess.run(
-        cmd,
-        shell=True,
+        list(argv),
+        shell=False,
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -70,11 +134,21 @@ def run(cmd: str, timeout: int = 60, input_text: str | None = None) -> subproces
 #: when the child is killed. Authoritative when it arrives, absent when it matters.
 _DSEQ_SUMMARY_RE = re.compile(r"DSEQ[:\s]+(\d+)")
 
-# ⛔ `(\d+)` IN BOTH PATTERNS IS A SHELL-INJECTION BARRIER, not a tidy way to say
-# "a number". The captured DSEQ is interpolated UNQUOTED into every `run(f"uv run
-# just-akash ... --dseq {dseq} ...")` in `main` — `run` passes shell=True — and into
-# the `verify it is ours before closing:` line in `report_unnamed_deployment`, which
-# prints a command for a HUMAN to paste into their own terminal.
+# ⛔ `(\d+)` STILL MATTERS, BUT FOR ONE SINK NOW — read this before deleting it.
+# It used to be the whole shell-injection barrier, because `run` passed shell=True
+# and the DSEQ went unquoted into every command. `run` now takes an ARGUMENT VECTOR
+# with `shell=False` (just-akash#282), so there is no shell for those to inject into
+# and the capture is no longer load-bearing there.
+#
+# ⛔ IT IS STILL LOAD-BEARING FOR THE ONE SINK THIS CONVERSION CANNOT REACH: the
+# `verify it is ours before closing:` line in `report_unnamed_deployment` prints a
+# command for a HUMAN to paste into their own terminal. That is a shell we do not
+# own, run with that person's privileges, aimed at someone who has been told the
+# value is a DSEQ. `shell=False` here does nothing for it.
+#
+# So: widen the SEPARATOR class if you must, never the capture. And do not delete
+# the digits-only test on the grounds that the vector conversion made it redundant —
+# it did so for six sinks out of seven.
 #
 # ⛔ CITED BY ANCHOR, NOT BY LINE NUMBER, on purpose: the first version of this note
 # gave line numbers, and they were already wrong in the commit that added them —
@@ -406,9 +480,9 @@ def _diagnose_exec_failure(dseq: str) -> None:
     subprocess timeout on every failure — a diagnostic that costs more than the bug.
     """
     probes = (
-        ("status", f"uv run just-akash status --dseq {dseq} --json"),
-        ("logs", f"uv run just-akash logs --dseq {dseq} --tail 50 --duration 10"),
-        ("events", f"uv run just-akash events --dseq {dseq} --duration 10"),
+        ("status", _cmd_status(dseq)),
+        ("logs", _cmd_logs(dseq, tail=50, duration=10)),
+        ("events", _cmd_events(dseq, duration=10)),
     )
     for name, cmd in probes:
         try:
@@ -466,7 +540,7 @@ def main():
     # when that is nothing.
     deploy_started_at = time.time()
     try:
-        r = run("just up", timeout=300)
+        r = run(["just", "up"], timeout=300)
         deploy_out, deploy_err, returncode = r.stdout, r.stderr, r.returncode
     except subprocess.TimeoutExpired as exc:
         # ⛔ KEPT APART, not concatenated. `TimeoutExpired` carries the two streams
@@ -552,15 +626,15 @@ def main():
         report_unnamed_deployment(deploy_started_at, deploy_ended_at, recovered_dseq)
         sys.exit(1)
 
-    # ⛔ EVERYTHING BELOW INTERPOLATES `dseq` INTO A SHELL. `run` uses shell=True, and
-    # every `run(f"uv run just-akash ... {dseq} ...")` below takes it unquoted. It is
-    # safe for exactly one reason: it is digits BY CONSTRUCTION — the only writers of
-    # `dseq_ref["dseq"]` are `(\d+)` captures, and the /tmp-derived `recovered_dseq` is
-    # deliberately kept out of `dseq_ref` (see step 2), so a world-writable file cannot
-    # reach these lines. That containment was written for the escrow rule — an
-    # unverified value must not reach a privileged sink — and `shell=True` is the
-    # second such sink. If you ever assign to `dseq_ref` from a new source, or widen
-    # the capture, you are editing this too.
+    # ⛔ `dseq` REACHES SUBPROCESS BELOW, but no longer through a shell: `run` takes an
+    # argument vector with shell=False (#282), so a value with spaces or metacharacters
+    # arrives as one argument rather than as syntax. The containment still holds and is
+    # still worth knowing — the only writers of `dseq_ref["dseq"]` are `(\d+)` captures,
+    # and the /tmp-derived `recovered_dseq` is deliberately kept out of `dseq_ref` (see
+    # step 2), so a world-writable file cannot reach these calls. That was written for
+    # the escrow rule — an unverified value must not reach a privileged sink — and it
+    # closed the injection path as a side effect, before this conversion removed the
+    # path itself. If you assign to `dseq_ref` from a new source, you are editing this.
     dseq = dseq_ref["dseq"]
     log_pass(f"Deployed DSEQ={dseq}")
 
@@ -623,7 +697,7 @@ def main():
                 # Per ATTEMPT, not per successful parse: this describes the poll we
                 # made, which is true whether or not it returned anything.
                 gate_attempt = attempt
-                r = run(f"uv run just-akash status --dseq {dseq} --json", timeout=30)
+                r = run(_cmd_status(dseq), timeout=30)
                 status_data = json.loads(r.stdout)
                 provider_addr = status_data.get("provider")
                 # NOT bool(...): bool() maps an ABSENT key and a present-but-empty
@@ -700,11 +774,7 @@ def main():
         log_step(4, f"exec: echo hello from lease-shell (DSEQ={dseq})")
 
         if not failures:
-            r = run(
-                f"uv run just-akash exec 'echo hello from lease-shell'"
-                f" --dseq {dseq} --transport lease-shell",
-                timeout=30,
-            )
+            r = run(_cmd_exec("echo hello from lease-shell", dseq), timeout=30)
             if r.returncode == 0 and "hello from lease-shell" in r.stdout:
                 log_pass("exec: output verified")
             else:
@@ -739,9 +809,7 @@ def main():
 
                 remote_path = "/tmp/e2e-test.env"
                 r = run(
-                    f"uv run just-akash inject --env-file {env_file}"
-                    f" --remote-path {remote_path} --dseq {dseq}"
-                    f" --transport lease-shell",
+                    _cmd_inject(env_file, remote_path, dseq),
                     timeout=30,
                 )
                 if r.returncode != 0:
@@ -753,11 +821,7 @@ def main():
                 else:
                     log_pass("inject: env file uploaded")
 
-                    r = run(
-                        f"uv run just-akash exec 'cat {remote_path}'"
-                        f" --dseq {dseq} --transport lease-shell",
-                        timeout=30,
-                    )
+                    r = run(_cmd_exec(f"cat {remote_path}", dseq), timeout=30)
                     if (
                         r.returncode == 0
                         and "injected_value" in r.stdout
@@ -771,11 +835,7 @@ def main():
                         )
                         failures.append("inject_verify_failed")
 
-                    r = run(
-                        f"uv run just-akash exec 'stat -c %a {remote_path}'"
-                        f" --dseq {dseq} --transport lease-shell",
-                        timeout=30,
-                    )
+                    r = run(_cmd_exec(f"stat -c %a {remote_path}", dseq), timeout=30)
                     perms = r.stdout.strip()
                     if r.returncode == 0 and perms == "600":
                         log_pass("inject: file permissions are 600")
@@ -830,7 +890,7 @@ def main():
             # (Reported by CodeRabbit on #276.)
             ssh_probe = "ok"
             try:
-                r = run(f"uv run just-akash status --dseq {dseq} --json", timeout=30)
+                r = run(_cmd_status(dseq), timeout=30)
                 status_data = json.loads(r.stdout)
                 ssh_host = status_data.get("ssh_host")
                 ssh_port = str(status_data.get("ssh_port", ""))
