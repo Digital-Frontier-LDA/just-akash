@@ -1018,8 +1018,12 @@ MUTATIONS = [
     (
         "pool image matches the probe",
         lambda s: s.replace(
-            "github-runner@sha256:7509763af8209796f3e7fde5fb536c742075ec1a59ad1b36e3c9c27bc3bafc67",
-            "github-runner:latest",
+            "df-akash-runner@sha256:aaf3799b5e138abef0831bb8467ded7325164316f0cfde5c183fe6e129eae79e",
+            # ⚠ SAME repository, de-pinned. Replacing with "github-runner:latest" left the
+            # `ghcr.io/digital-frontier-lda/` prefix intact and produced a DIFFERENT repo,
+            # so the mutation tested "wrong image" rather than the "`:latest` can move
+            # between qualification and use" hazard the guard is actually about.
+            "df-akash-runner:latest",
         ),
     ),
     # The count must survive a multi-page org. Both shapes below are what a reader
