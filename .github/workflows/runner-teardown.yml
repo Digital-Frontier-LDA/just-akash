@@ -241,8 +241,6 @@ jobs:
           # this step exists to prevent: a success we did not achieve, with the lease
           # still holding escrow. Only a deployment the destroy said is GONE may pass on
           # an empty read.
-          GONE=no
-          grep -qiE "already closed|not found" /tmp/destroy.log 2>/dev/null && GONE=yes
           case "$STATE" in
             closed)
               echo "closed=true" >> "$GITHUB_OUTPUT"

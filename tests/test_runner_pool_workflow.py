@@ -2358,3 +2358,50 @@ def test_the_teardown_error_does_not_assert_a_count_it_never_made():
     assert re.search(r"for _read in[\s\S]{0,200}READS=\$_read", code), (
         "READS is not assigned inside the read loop, so it counts nothing"
     )
+
+
+def test_the_read_loops_observation_survives_to_the_classifier():
+    """Nothing may reassign GONE between the read loop and the `case`.
+
+    ⛔ THIS IS THE BUG MY OWN GUARDS MISSED, AND WHY THEY MISSED IT. The first revision
+    of the settle-loop change left the ORIGINAL `GONE=no` derivation sitting after the
+    loop, so the sequence was:
+
+        GONE=no; grep destroy.log ... && GONE=yes     # before the loop  (correct)
+        for _read ...; GONE=yes; break; done          # loop observes not-found
+        GONE=no; grep destroy.log ... && GONE=yes     # AFTER the loop   (clobbers it)
+
+    A deployment that had fully propagated out of the API set GONE=yes in the loop, had
+    it reset to `no` two lines later, and — because a successful destroy prints
+    "destroyed." rather than "not found" — fell into `Could not VERIFY the lease is
+    closed` and exited 1. A false red introduced inside the fix for a false red.
+
+    ⚠ Every guard in this file passed on that code. They asserted the loop EXISTS, the
+    sleep EXISTS, the counters EXIST, the classifier branches EXIST — presence of parts,
+    never the DATAFLOW between them. A duplicated assignment satisfies all of them. So
+    this asserts the one property those cannot: what the loop concluded is what the
+    classifier reads. Copilot caught it on just-akash#308; the tests did not.
+    """
+    code = _code(TD_CLOSE["run"])
+    lines = code.splitlines()
+
+    loop_start = next(i for i, ln in enumerate(lines) if "for _read in" in ln)
+    loop_end = next(i for i in range(loop_start, len(lines)) if lines[i].strip() == "done")
+    case_at = next(i for i, ln in enumerate(lines) if ln.strip().startswith('case "$STATE"'))
+    assert loop_start < loop_end < case_at, "the read loop no longer precedes the classifier"
+
+    between = [ln for ln in lines[loop_end + 1 : case_at] if re.match(r"\s*GONE=", ln)]
+    assert not between, (
+        f"GONE is reassigned {len(between)} time(s) between the read loop and the "
+        f"classifier: {between!r}. That discards what the loop observed — a deployment "
+        f"the API has already dropped is scored 'unreadable' instead of gone, and the "
+        f"step fails on a lease that is closed."
+    )
+
+    # And the loop must still be able to reach that conclusion at all, or the assertion
+    # above is satisfied by a loop that never sets GONE.
+    in_loop = "\n".join(lines[loop_start : loop_end + 1])
+    assert re.search(r"GONE=yes", in_loop), (
+        "the read loop never concludes GONE — then a propagated-out deployment can only "
+        "be scored from destroy.log, which says 'destroyed.', not 'not found'"
+    )
