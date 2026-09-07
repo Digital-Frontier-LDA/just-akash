@@ -2479,7 +2479,11 @@ def test_the_nested_teardown_pin_is_reachable_from_main():
     # A PR's own head is legitimately not yet on main; what must never happen is a pin
     # that is orphaned. Fetch on demand — CI checks out shallow.
     if _git("cat-file", "-e", f"{pin}^{{commit}}").returncode != 0:
-        _git("fetch", "--quiet", "--depth", "200", "origin", pin)
+        # ⚠ DEPTH 1 IS ENOUGH HERE, and depth 200 was cargo. This fetch only has to
+        # MATERIALISE the pinned object; the ancestry walk below runs over MAIN's
+        # history, which the unshallow deepens separately. Matches the identity guard
+        # above, which has always used depth 1.
+        _git("fetch", "--quiet", "--depth", "1", "origin", pin)
 
     if _git("cat-file", "-e", f"{pin}^{{commit}}").returncode != 0:
         # ⛔ MUST NOT SKIP IN CI — that is the surface this protects.
