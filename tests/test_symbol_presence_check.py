@@ -2,7 +2,7 @@
 
 The check exists because a merge that silently drops content produces no
 conflict, no failing test, and no undefined symbol. These tests construct
-twenty scenarios and verify the check distinguishes them:
+twenty-one scenarios and verify the check distinguishes them:
 
   A. drop             : branch rebased onto main with conflict resolution
                         that took "ours" and discarded main's new symbols
@@ -103,6 +103,16 @@ twenty scenarios and verify the check distinguishes them:
                         with `foo` dropped, NO declaration. The
                         parenthetical reads as a protective aside;
                         same rule.
+  U. case_insensitive : the `Intentional-Delete:` prefix is matched
+                        case-insensitively BY DESIGN. A lower- or
+                        mixed-case `intentional-delete: foo` MUST
+                        downgrade the same way the canonical capital
+                        form does. The contract is documented in the
+                        function docstring; this test pins it in
+                        executable form against a future "tightening"
+                        that thinks the case-insensitivity is an
+                        oversight rather than an intentional risk-
+                        direction choice.
 
 Plus one edge case (no Python files modified) which is the early-return
 "no work to do" path.
@@ -946,3 +956,54 @@ def test_prose_parens_shape_does_not_downgrade(sandbox: Path) -> None:
     assert "POSSIBLE_DROP" in result.stdout, result.stdout
     assert "bar.py::foo" in result.stdout, result.stdout
     assert "INTENTIONAL_DELETE" not in result.stdout, result.stdout
+
+
+# --- Scenario U: trailer prefix is case-insensitive BY DESIGN ---
+
+
+def test_intentional_delete_trailer_prefix_is_case_insensitive(sandbox: Path) -> None:
+    """The `Intentional-Delete:` prefix is matched case-insensitively
+    BY DESIGN. A mixed-case declaration line MUST downgrade the same
+    way the canonical `Intentional-Delete:` does.
+
+    This is not a tolerance -- it is the contract. The risk direction
+    is accidental downgrade, and someone typing the literal declaration
+    string (lower- or mixed-case) plus the exact symbol name is
+    unambiguously declaring intent. Tightening this later -- e.g.
+    adding an exact-case prefix requirement -- would re-silence every
+    PR that uses the lowercase shape today. The docstring of
+    commit_mentions_symbol pins this as a contract; this test pins the
+    contract in executable form.
+
+    Construction: same as P, but the declaration line uses lowercase
+    `intentional-delete: foo`."""
+    _write(
+        sandbox,
+        "main",
+        "def foo():\n    return 1\n\n\n"
+        "def helper():\n    return 'h'\n\n\n"
+        "def obsolete_parser():\n    return 'p'\n",
+        "main: add obsolete_parser() alongside foo + helper",
+    )
+    _git(sandbox, "checkout", "-q", "-b", "branch-U", "main")
+    (sandbox / "bar.py").write_text(
+        "def helper():\n    return 'h'\n\n\ndef obsolete_parser():\n    return 'p'\n"
+    )
+    _git(sandbox, "add", "bar.py")
+    _git(
+        sandbox,
+        "commit",
+        "-q",
+        "-m",
+        "U: drop obsolete_parser\n\nintentional-delete: foo",
+    )
+
+    result = _run_check(sandbox, "main", "branch-U")
+    assert result.returncode == 0, (
+        f"lowercase `intentional-delete: foo` MUST downgrade the same "
+        f"way canonical case does; got {result.returncode}\n"
+        f"{result.stdout}"
+    )
+    assert "INTENTIONAL_DELETE" in result.stdout, result.stdout
+    assert "bar.py::foo" in result.stdout, result.stdout
+    assert "POSSIBLE_DROP" not in result.stdout, result.stdout

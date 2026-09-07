@@ -285,6 +285,15 @@ def commit_mentions_symbol(subjects: list[str], name: str) -> bool:
 
     Word-boundary matching on the declared symbol name ensures
     `bar` is not counted by a declaration of `embargo`.
+
+    The `Intentional-Delete:` prefix is matched case-insensitively
+    BY DESIGN, not by tolerance: the risk direction is accidental
+    downgrade, and someone typing the literal declaration string
+    (lower- or mixed-case) plus the exact symbol name is unambiguously
+    declaring intent. Tightening this later -- e.g. requiring an
+    exact-case prefix -- would re-silence every PR that uses the
+    lowercase shape today, so the case-insensitivity is a contract
+    pinned by scenario U, not an oversight.
     """
     name_lc = name.lower()
     name_pat = re.compile(rf"\b{re.escape(name_lc)}\b")
