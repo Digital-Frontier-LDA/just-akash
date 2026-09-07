@@ -196,13 +196,32 @@ def _ancestors(node):
         yield node
 
 
+def _is_just_up(call: ast.Call) -> bool:
+    """Is this `run(["just", "up"], ...)`, judged on the SYNTAX TREE?
+
+    ⛔ NOT A SOURCE-TEXT MATCH. The command is an argument vector now (#282), and an
+    earlier version of this locator matched the literal substring `'"just", "up"'` —
+    which passes or fails on FORMATTING. Swap the quote style, add a line break, let
+    a formatter reflow it, and the locator reports the deploy call as GONE when it
+    has merely been reprinted. That is the prose-satisfied shape again: the file as
+    text is not the program. (Reported by Copilot on #293.)
+    """
+    if not call.args or not isinstance(call.args[0], ast.List):
+        return False
+    elts = call.args[0].elts
+    return [e.value for e in elts if isinstance(e, ast.Constant) and isinstance(e.value, str)] == [
+        "just",
+        "up",
+    ]
+
+
 def _deploy_call():
     for n in ast.walk(_TREE):
         if (
             isinstance(n, ast.Call)
             and isinstance(n.func, ast.Name)
             and n.func.id == "run"
-            and "just up" in (ast.get_source_segment(_SRC, n) or "")
+            and _is_just_up(n)
         ):
             return n
     return None
@@ -849,13 +868,22 @@ _SHELL_PAYLOADS = [
 
 @pytest.mark.parametrize("payload", _SHELL_PAYLOADS)
 def test_the_dseq_capture_is_digits_only_because_it_reaches_a_shell(payload):
-    """⛔ `(\\d+)` IS THE WHOLE BARRIER BETWEEN PARSED OUTPUT AND `shell=True`.
+    """⛔ `(\\d+)` STILL GUARDS ONE SINK — the one the vector conversion cannot reach.
 
-    The captured DSEQ is interpolated UNQUOTED into every
-    `run(f"uv run just-akash ... --dseq {dseq} ...")` in `main` (`run` passes
-    shell=True), and into the `verify it is ours before closing:` line in
-    `report_unnamed_deployment` — which prints a command for a HUMAN to paste into
-    their own terminal, so it runs with their privileges rather than CI's.
+    It used to guard all seven consumers, because `run` passed `shell=True` and the
+    DSEQ went in unquoted. `run` now takes an argument VECTOR with `shell=False`
+    (#282), so six of them cannot be injected into at all.
+
+    ⛔ THE SEVENTH IS NOT COVERED BY THAT AND CANNOT BE: the `verify it is ours
+    before closing:` line in `report_unnamed_deployment` prints a command for a HUMAN
+    to paste into their own terminal. That shell is not ours, it runs with that
+    person's privileges, and it is aimed at someone told the value is a DSEQ. So this
+    keeps its full force for that sink, and keeps catching a bad DSEQ parse for the
+    rest.
+
+    ⚠ Do not delete it because #282 "made it redundant". It did so for six of seven,
+    which is exactly the reasoning that leaves a dead layer nobody notices is
+    load-bearing until the seventh case arrives.
 
     Anchored by symbol rather than line number: the first version cited lines that
     were already wrong when written, because adding the note shifted them.
@@ -872,13 +900,14 @@ def test_the_dseq_capture_is_digits_only_because_it_reaches_a_shell(payload):
         for capture in pattern.findall(payload):
             assert capture.isdigit(), (
                 f"{name} captured {capture!r} from {payload!r} — a non-digit capture "
-                'is interpolated unquoted into every `run(f"uv run just-akash ... '
-                '{dseq} ...")` in main, which passes shell=True'
+                "is printed into a command a human is invited to paste into their "
+                "own shell (report_unnamed_deployment), which #282's vector "
+                "conversion does not protect"
             )
 
 
 def test_the_tmp_derived_candidate_never_reaches_a_shell_interpolation():
-    """⛔ The value read from a WORLD-WRITABLE path must not reach `shell=True`.
+    """⛔ The value read from a WORLD-WRITABLE path must not reach a privileged sink.
 
     `recovered_dseq` comes from `/tmp/.akash-last-deploy.log`, which anyone can
     write. It was kept out of `dseq_ref` so an unverified candidate could not reach
@@ -909,5 +938,5 @@ def test_the_tmp_derived_candidate_never_reaches_a_shell_interpolation():
         names = {m.id for m in ast.walk(call) if isinstance(m, ast.Name)}
         assert "recovered_dseq" not in names, (
             "recovered_dseq is interpolated into a run() command; it is read from a "
-            "world-writable /tmp path and reaches subprocess with shell=True"
+            "world-writable /tmp path and reaches subprocess"
         )

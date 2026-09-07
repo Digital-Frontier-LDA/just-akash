@@ -12,6 +12,8 @@ from __future__ import annotations
 import ast
 import pathlib
 
+from just_akash.test_shell_e2e import _cmd_events, _cmd_logs
+
 _MODULE = pathlib.Path(__file__).resolve().parents[1] / "just_akash" / "test_shell_e2e.py"
 _SRC = _MODULE.read_text(encoding="utf-8")
 _TREE = ast.parse(_SRC)
@@ -117,8 +119,11 @@ def test_the_readiness_probe_cannot_escape_past_the_gate_line():
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id == "run"
-        and "just-akash status" in (ast.get_source_segment(_SRC, node) or "")
-        and "--json" in (ast.get_source_segment(_SRC, node) or "")
+        # ⛔ ANCHORED ON THE BUILDER, not the command text. The commands are argument
+        # VECTORS now (#282), so "just-akash status" no longer appears contiguously
+        # anywhere — `_cmd_status` is what a reader greps for and what a refactor
+        # would have to rename deliberately.
+        and "_cmd_status(" in (ast.get_source_segment(_SRC, node) or "")
     ]
     assert polls, "no readiness probe found — re-anchor, do not delete"
 
@@ -143,7 +148,29 @@ def test_every_streaming_probe_is_time_bounded():
 
     Unbounded, the diagnostic battery would stall for the full subprocess timeout on
     every failure — a diagnostic costing more than the bug it explains.
+
+    ⛔ Now asserted on the BUILDER'S OUTPUT, not on a line of source. The previous
+    form grepped `_diagnose_exec_failure` for a line containing "just-akash logs"
+    and checked "--duration" was on it. Commands are argument vectors now (#282), so
+    that substring does not exist anywhere and the check could only fail — it was
+    pinned to the spelling, not the property.
+
+    The property is stronger than the old one, too: the flag cannot be omitted at a
+    call site, because the builder always emits it. So this checks the builder, then
+    checks the battery actually goes through the builder.
     """
+    for name, argv in (
+        ("logs", _cmd_logs("123", tail=50, duration=10)),
+        ("events", _cmd_events("123", duration=10)),
+    ):
+        assert "--duration" in argv, (
+            f"the {name} probe is built without --duration — it streams, so this "
+            f"hangs until the subprocess timeout on every exec failure: {argv}"
+        )
+        assert argv[argv.index("--duration") + 1] == "10", (
+            f"the {name} probe's --duration has no value after it: {argv}"
+        )
+
     fn = next(
         (
             n
@@ -154,21 +181,11 @@ def test_every_streaming_probe_is_time_bounded():
     )
     assert fn is not None, "the diagnostic battery is gone — re-anchor, do not delete"
     body = ast.get_source_segment(_SRC, fn) or ""
-    for streaming in ("just-akash logs", "just-akash events"):
-        assert streaming in body, f"{streaming!r} probe missing"
-        # ⛔ DEFAULT, not a bare next(). Without it a refactor that splits the
-        # probe command across lines raises StopIteration — a traceback instead of
-        # the assert message below, which is the one thing that tells the next
-        # reader what broke and what to do. A test enforcing "say what you
-        # measured" must not fail by crashing.
-        line = next((ln for ln in body.splitlines() if streaming in ln), None)
-        assert line is not None, (
-            f"{streaming!r} is no longer on a single line — re-anchor this check "
-            f"rather than deleting it; the --duration invariant still applies"
-        )
-        assert "--duration" in line, (
-            f"{streaming!r} is invoked without --duration — it streams, so this "
-            f"hangs until the subprocess timeout on every exec failure:\n{line.strip()}"
+    for builder in ("_cmd_logs(", "_cmd_events("):
+        assert builder in body, (
+            f"the battery no longer builds its probe with {builder} — if it "
+            "constructs the vector inline, the --duration guarantee above stops "
+            "applying to it"
         )
 
 
@@ -288,7 +305,7 @@ def test_the_observation_and_its_attempt_cannot_be_recorded_apart():
                 n
                 for n in ast.walk(_TREE)
                 if isinstance(n, ast.For)
-                and "just-akash status" in (ast.get_source_segment(_SRC, n) or "")
+                and "_cmd_status(" in (ast.get_source_segment(_SRC, n) or "")
             )
         ),
         None,
