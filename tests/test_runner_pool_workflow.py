@@ -2292,3 +2292,69 @@ class TestTheVerdictCannotFabricateAStatus:
         _out, log = _verdict_script(tmp_path, "error: 403 something")
         assert "HTTP 403" not in log, "a status was invented from an error string"
         assert "no status" in log.lower()
+
+
+def test_the_verification_settles_before_it_calls_a_lease_open():
+    """The state read-back must retry, because the destroy it verifies is asynchronous.
+
+    ⛔ THE RETRY BUDGET WAS ON THE WRONG OPERATION. The destroy loop has always run up
+    to three times with a sleep between; the verification got exactly one immediate
+    read. On blazing#920 (run 34138613280) destroy succeeded on attempt 1 — it printed
+    "Deployment 1788795018717 destroyed." — and the read ~4s later returned 'active',
+    so teardown failed with "Lease may still be OPEN and holding escrow". It was not
+    open: the stale sweep 26 minutes later enumerated every live deployment and that
+    dseq was absent. The close was accepted and had not propagated.
+
+    ⚠ Why retrying here cannot manufacture a pass, which is the obvious objection: a
+    lease that is genuinely still open reads 'active' on every attempt and falls
+    through to the same `*)` branch and the same `exit 1`. This loop only spends time.
+    It widens no acceptance rule — note the assertions below pin the classifier's
+    branches unchanged, so a future edit that buys green by ACCEPTING 'active' fails
+    here rather than passing.
+    """
+    code = _code(TD_CLOSE["run"])
+
+    # The verification reads more than once.
+    assert re.search(r"for\s+_read\s+in\s+1 2 3 4 5", code), (
+        "the state read-back does not loop — a close that has not yet propagated "
+        "reads 'active' once and is reported as an open lease holding escrow"
+    )
+    # ...and actually waits between reads. A loop with no sleep re-reads within
+    # milliseconds and settles nothing, which would satisfy the assertion above alone.
+    reads = code[code.index("for _read in") :]
+    assert re.search(r"\bsleep\s+\d+", reads), "the read loop never sleeps, so it cannot settle"
+
+    # The classifier still REFUSES an unresolved state — the retry must not have been
+    # bought by widening what counts as closed.
+    assert re.search(r'\*\)\s*\n\s*echo "closed=false"', code), (
+        "the catch-all branch no longer reports closed=false — retrying is only safe "
+        "while a still-open lease still fails"
+    )
+    assert code.count("exit 1") >= 2, "a failure path stopped exiting non-zero"
+
+
+def test_the_teardown_error_does_not_assert_a_count_it_never_made():
+    """The 'may still be open' error must report the attempts this run actually made.
+
+    It used to read "after 3 destroy attempts" — fixed text on a path reachable when
+    the destroy SUCCEEDED on attempt 1, which is exactly what happened on blazing#920.
+    An operator reading that log concludes the destroy was tried three times and failed
+    three times. It was tried once and worked. Same shape as the Fast Tests Gate naming
+    a cause it had not measured: a message that states a fact it did not observe.
+    """
+    code = _code(TD_CLOSE["run"])
+    err = next((ln for ln in code.splitlines() if "Lease may still be OPEN" in ln), None)
+    assert err is not None, "the open-lease error line is gone"
+    assert "after 3 destroy attempts" not in err, (
+        "the error hardcodes a count of 3 that it never measured"
+    )
+    assert "$DESTROY_TRIES" in err and "$READS" in err, (
+        "the error must cite the counters this run incremented, not a literal"
+    )
+    # The counters must be real: assigned inside the loops they claim to count.
+    assert re.search(r"for _try in[\s\S]{0,200}DESTROY_TRIES=\$_try", code), (
+        "DESTROY_TRIES is not assigned inside the destroy loop, so it counts nothing"
+    )
+    assert re.search(r"for _read in[\s\S]{0,200}READS=\$_read", code), (
+        "READS is not assigned inside the read loop, so it counts nothing"
+    )
