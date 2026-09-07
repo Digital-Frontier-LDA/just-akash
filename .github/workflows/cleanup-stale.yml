@@ -172,10 +172,26 @@ jobs:
           # branch: `services == ["canary"]` is not `["runner"]`, and the only other age
           # gate sits behind `reap_owned`.
           #
-          # ⚠ THIS CHANGES WHAT IS REPORTED, NOT WHAT IS CLOSED. CLEANUP_AUTO_EXECUTE is
-          # false, so the scheduled run stays a dry run — it will now SAY the canaries are
-          # closable instead of saying nothing is. Making that an actual close is a separate
-          # decision and deliberately not taken here.
+          # ⚠ TWO DIFFERENT EFFECTS, AND THE SECOND IS A WIDENED DESTRUCTIVE PATH.
+          #
+          #   SCHEDULED run (CLEANUP_AUTO_EXECUTE=false) — report only. It will now SAY the
+          #     canaries are closable instead of saying nothing is. Nothing is closed.
+          #
+          #   MANUAL dispatch with execute=true — CLOSES MORE THAN BEFORE. `--reap-owned` is
+          #     on this path too, so a live run now also closes STALE-owned deployments:
+          #     anything carrying PLACEMENT_PREFIX in its on-chain group name and older than
+          #     STALE_OWNED_AGE_SECONDS (48h), regardless of service name. Previously a live
+          #     run closed only STALE-runner/probe/e2e.
+          #
+          # ⇒ That widening is the POINT — it is what reaps the canaries — but an operator
+          # dispatching execute=true must know the close set grew. An earlier draft of this
+          # comment said "changes what is reported, not what is closed", which was true of
+          # the scheduled path and false of the dispatch path, and would have been read as
+          # covering both.
+          #
+          # ⛔ NOT passing --reap-owned on the live path would be worse, not safer: the dry
+          # run would then report candidates the live run refuses to act on, which is a
+          # preview that does not predict the thing it previews.
           if [ "$EXECUTE" = "true" ] || [ "$AUTO_EXECUTE" = "true" ]; then
             # Record the mode where it cannot be inferred wrongly later. The job
             # label is deliberately neutral, so this is the audit trail's answer
