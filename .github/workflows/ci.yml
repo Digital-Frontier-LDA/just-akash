@@ -177,38 +177,219 @@ jobs:
     permissions:
       contents: read
     steps:
+      # ── HEAD checkout: the tree this check ANALYSES ──
       # fetch-depth: 0 because `git merge-base origin/main HEAD` needs
       # to walk back through history. Default shallow clone can't.
       #
-      # ref: ${{ github.event.pull_request.head.sha }} on pull_request
-      # events. Default actions/checkout on pull_request checks out
-      # `refs/pull/N/merge`, which is GitHub's own auto-merge of the PR
-      # branch into main. That commit already contains main's symbols,
-      # so a conflict-resolution drop on the branch is silently healed
-      # by the pre-merge, and this check would always see
-      # "nothing missing" -- making the check inert in CI on exactly
-      # the failure mode it exists to catch. Pinning to head.sha makes
-      # the checkout the PR's actual tip, against which main's symbols
-      # can be compared truthfully.
+      # ref: pinned to head.sha on pull_request events so the checkout
+      # is the PR's actual tip. Without the pin, actions/checkout
+      # resolves refs/pull/N/merge -- GitHub's own auto-merge of the
+      # PR into main, which already contains main's symbols. A
+      # conflict-resolution drop on the branch is silently healed by
+      # that pre-merge, and the check sees "nothing missing" even on
+      # a real drop. The pin is what makes the check ABLE to detect
+      # drops; see #283 + run 34067349293.
       #
       # Falls back to github.sha on push events where the event payload
       # has no head.sha.
-      - name: Checkout
+      - name: Checkout the PR head (the tree under check)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           fetch-tags: true
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
+      # ── BASE checkout: the source of the CHECKER SCRIPT ──
+      # The previous wiring checked out only the head. That made the
+      # check STRUCTURALLY unable to run on any branch cut before
+      # #283 merged: GitHub takes the workflow definition from the
+      # base branch on pull_request, so the new job runs everywhere
+      # immediately, but the job's single checkout pulled the HEAD's
+      # tree -- which predates #283 and has no `scripts/symbol_presence_check.py`.
+      # python3 died with "[Errno 2] No such file or directory" /
+      # exit 2, indistinguishable from a real FAIL POSSIBLE_DROP.
+      # #293 hit this four hours after #283 landed. See #294.
+      #
+      # A second checkout into `./.check/` brings the BASE's tree in
+      # under a separate path, so the script the PR is checked against
+      # comes from a commit the PR cannot modify. The HEAD checkout
+      # above is still what `--repo .` analyses. This is also a
+      # security improvement on its own: today a PR can edit the
+      # script that checks it, which is not a checker.
+      #
+      # On push events the pushed commit IS the new main, the script
+      # is already in `./scripts/`, and the head checkout above has
+      # it. The "PR can edit the script" risk applies only to PRs;
+      # push events are operator-controlled and skip this step.
+      - name: Checkout the PR base (for the checker script)
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          ref: ${{ github.base_ref }}
+          path: .check
+
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
 
-      # The script only uses stdlib (ast, subprocess, argparse); no
-      # project deps required. Run it directly with the system python.
-      - name: Run symbol-presence check
-        run: python scripts/symbol_presence_check.py --repo . --base origin/main --head HEAD
+      # The script is chosen at runtime:
+      #   pull_request: .check/scripts/symbol_presence_check.py  (base's copy)
+      #   push:         scripts/symbol_presence_check.py         (head's copy)
+      #
+      # If the script is missing, exit 1 with a clear error -- NOT
+      # fail-open. "I couldn't look" must not look like "nothing was
+      # there"; if the script is gone on either side, the check
+      # genuinely could not inspect the PR and we say so. The four
+      # absence-detector blind spots already in this file (#145,
+      # :89, :99, :161) are all in that direction, and `if [ -f ...
+      # ]` to skip would recreate the exact defect this check exists
+      # to catch. See #294.
+      #
+      # For pull_request we ALSO assert the script we are about to
+      # run is provably the BASE's copy, not the HEAD's. The .check/
+      # commit SHA must differ from the HEAD commit SHA when the PR
+      # carries a non-empty diff, because the two checkouts are pinned
+      # to different refs and any divergence in commits proves the
+      # provenance chain. Equal commits WITH a non-empty diff means
+      # the .check/ checkout silently failed (returned the wrong
+      # commit) -- refuse to run rather than run an unchecked check.
+      #
+      # We compare COMMITS, not TREES. Different commits can have
+      # the same tree (allow-empty commits, revert-only PRs) and a
+      # tree-equal guard fires on those benign cases while labeling
+      # its cause as a checkout failure -- a name for an unmeasured
+      # cause. Commit comparison answers the actual question: are
+      # these two checkouts the same commit?
+      #
+      # Empty / no-op PRs (PR head == base tip, no diff) skip the
+      # guard and exit 0: the script has nothing to inspect, and the
+      # guard's purpose is to detect silent checkout failure, which
+      # can only matter when there IS something to check. A guard
+      # that fires on benign empty PRs is the same defect as the
+      # tree-SHA guard Copilot flagged in #294 -- a name for an
+      # unmeasured cause. Tree SHAs are still printed for visibility.
+      #
+      # This is the security property the issue asks for: the check
+      # is base-side, not head-side.
+      - name: Probe base/head provenance for #294 audit
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          echo "github.event.pull_request.base.ref: ${{ github.event.pull_request.base.ref }}"
+          echo "github.event.pull_request.base.sha: ${{ github.event.pull_request.base.sha }}"
+          echo "github.event.pull_request.head.sha: ${{ github.event.pull_request.head.sha }}"
+          # Query the EXPLICIT base ref rather than the remote's symbolic HEAD.
+          # The two are equal on just-akash today (default branch = main), but
+          # `git ls-remote origin HEAD` returns whatever the remote's HEAD
+          # points to -- it is a mislabel to log that as "main tip" when the
+          # CI can run against any base ref. The label must match the lookup.
+          current_base_sha="$(git ls-remote origin "refs/heads/${{ github.event.pull_request.base.ref }}" | awk '{print $1}')"
+          echo "remote origin ${{ github.event.pull_request.base.ref }} tip (now): $current_base_sha"
+      - name: Run symbol-presence check (script from base, content from head)
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            SCRIPT=.check/scripts/symbol_presence_check.py
+            # BASE_REF on pull_request: this workflow's trigger restricts
+            # it to PRs targeting `main` (`on.pull_request.branches:
+            # [main]`), so today `--base` and the `.check/` checkout
+            # agree by construction -- the literal `origin/main` would
+            # read the same as `origin/$GITHUB_BASE_REF`. The variable
+            # exists for two future-facing reasons: (1) if the
+            # `branches:` filter is ever widened, `--base` will already
+            # track the PR's actual base; (2) it removes a divergence
+            # between three places that read the base ref (`.check/`
+            # checkout, `--base`, the explicit `refs/heads/<base.ref>`
+            # probe above), so they cannot drift. `GITHUB_BASE_REF` is
+            # only set on `pull_request` events, which is why the push
+            # branch below stays on `origin/main`.
+            BASE_REF="origin/$GITHUB_BASE_REF"
+            base_commit="$(git -C .check rev-parse HEAD)"
+            head_commit="$(git rev-parse HEAD)"
+            base_tree="$(git -C .check rev-parse HEAD^{tree})"
+            head_tree="$(git rev-parse HEAD^{tree})"
+            echo "checker script source: $SCRIPT"
+            echo "checker .check HEAD:    $base_commit"
+            echo "checker .check tree:    $base_tree"
+            echo "this PR head:           $head_commit"
+            echo "this PR head tree:      $head_tree"
+            # No-diff PR (PR head == base tip, empty PRs, no-op pushes):
+            # the script has nothing to inspect -- print both SHAs for the
+            # audit trail and exit 0 without firing the guard. The guard's
+            # purpose is to detect SILENT CHECKOUT FAILURE (the .check/
+            # checkout returned the wrong commit), which can only matter
+            # when there IS something to check. A guard that fires on
+            # benign empty PRs is the same defect as the tree-SHA guard
+            # Copilot flagged in #294: a name for an unmeasured cause.
+            #
+            # CRITICAL: the diff MUST be computed from SHAs independent of
+            # the .check/ checkout. If we used $base_commit..$head_commit
+            # (the same pair the guard compares), the silent-checkout-
+            # failure mode collapses both to A..A = empty, and the skip
+            # branch fires before the guard can see the failure -- turning
+            # the guard into a fail-open silent skip. Use the event-payload
+            # base/head SHAs instead: those are committed to the event at
+            # trigger time and do not depend on any checkout resolving
+            # correctly. (Copilot on #294, comment 3948174510.)
+            event_base_sha="${{ github.event.pull_request.base.sha }}"
+            event_head_sha="${{ github.event.pull_request.head.sha }}"
+            # Compute the no-diff PR check from event-payload SHAs (independent
+            # of any checkout resolving correctly) AND capture git's exit code.
+            # stdout-empty and git-failure produce the same empty string here,
+            # and the skip branch can't tell them apart -- that is the
+            # fail-open shape that would let any "couldn't compute the diff"
+            # path green out the job. Fail closed: a non-zero git exit means
+            # we cannot prove "nothing to inspect", so refuse to skip rather
+            # than guess. (Copilot on #294, comment 3948278713 -- thread 6;
+            # same defect class as #294 itself / thread 5.)
+            #
+            # ⚠ SHELL ERROR-HANDLING TRAP, same shape as runner-pool.yml
+            # pre-#253 / post-#253: under `set -e`, a bare `VAR=$(cmd)` whose
+            # command fails IS itself a failing command, so the shell exits
+            # at the assignment and `RC=$?` on the next line never reaches.
+            # The carefully-written `::error::` below would then be
+            # unreachable exactly when it should print. The fix is the
+            # `RC=0; ... || RC=$?` form -- the `||` keeps the assignment
+            # inside a list that `set -e` does not act on, so the script
+            # reaches the explicit `if [ "$RC" -ne 0 ]` and can print a
+            # diagnostic. Do NOT simplify to a bare `$(...)` + `$?` on the
+            # next line; the diagnostic is the whole point.
+            pr_diff_rc=0
+            pr_diff_output="$(git diff --name-only "$event_base_sha..$event_head_sha" -- .)" || pr_diff_rc=$?
+            if [ "$pr_diff_rc" -ne 0 ]; then
+              echo "::error::git diff --name-only $event_base_sha..$event_head_sha exited $pr_diff_rc; refusing to skip. The 'no diff to inspect' decision is unprovable when git cannot compute the diff -- 'couldn't compute' and 'diff is empty' produce the same stdout, and conflating them is fail-open. Git's own stderr is in the runner log just above this line. See #294 / comment 3948278713."
+              exit 1
+            fi
+            pr_diff_files="$pr_diff_output"
+            if [ -z "$pr_diff_files" ]; then
+              echo "no diff between event-payload base ($event_base_sha) and head ($event_head_sha); symbol-presence check has nothing to inspect, skipping"
+              exit 0
+            fi
+            if [ "$base_commit" = "$head_commit" ]; then
+              echo "::error::.check/ commit ($base_commit) equals HEAD commit, AND there is a non-empty diff between them; refusing to run. The two checkouts resolved to the same commit despite the PR carrying changes -- the .check/ checkout silently failed (returned the wrong tree). The script provenance is unprovable; the check would otherwise be running a script the PR controls. See #294."
+              exit 1
+            fi
+            if [ ! -f "$SCRIPT" ]; then
+              echo "::error::$SCRIPT is missing on a pull_request event; refusing to fail-open. The base should always carry the checker once #283 has merged. See #294."
+              exit 1
+            fi
+          else
+            SCRIPT=scripts/symbol_presence_check.py
+            # Push events are operator-controlled (a merged PR or a direct
+            # push); there is no PR base to compare against, so the
+            # pushed branch IS the new main and the script's --base is
+            # origin/main.
+            BASE_REF="origin/main"
+            if [ ! -f "$SCRIPT" ]; then
+              echo "::error::$SCRIPT is missing on a push event; refusing to fail-open."
+              exit 1
+            fi
+          fi
+          # The script only uses stdlib (ast, subprocess, argparse); no
+          # project deps required. Run it directly with the system python.
+          python "$SCRIPT" --repo . --base "$BASE_REF" --head HEAD
 
   # DEPENDABOT CANNOT REACH SOPS, so these two jobs could never pass on its PRs.
   # GitHub withholds repository secrets from dependabot by design -- a malicious
