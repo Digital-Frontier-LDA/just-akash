@@ -2489,23 +2489,56 @@ def test_the_nested_teardown_pin_is_reachable_from_main():
         )
         pytest.skip("pinned commit unavailable locally; this guard is enforced in CI")
 
-    for ref in ("origin/main", "main"):
-        probe = _git("merge-base", "--is-ancestor", pin, ref)
-        if _git("rev-parse", "--verify", "--quiet", ref).returncode != 0:
-            continue
-        head = _git("rev-parse", ref).stdout.strip()
-        if pin == head or probe.returncode == 0:
-            return  # reachable
-        # Not an ancestor. Allowed only while this very commit is the PR that will
-        # introduce it — i.e. the pin is an ancestor of HEAD but not yet of main.
-        if _git("merge-base", "--is-ancestor", pin, "HEAD").returncode == 0:
-            return
-        raise AssertionError(
-            f"the pinned teardown commit {pin[:8]} is not reachable from {ref} and is "
-            f"not on this branch either — it has been orphaned, most likely by a squash "
-            f"merge. Every downstream caller of runner-pool.yml will die as a STARTUP "
-            f"FAILURE: zero jobs, no logs, and nothing naming the unresolvable ref. "
-            f"Re-pin to the post-merge main SHA, which is both byte-identical and an "
-            f"ancestor."
+    # ⛔ THE MAIN REF MUST BE MADE TO EXIST, NOT ASSUMED. The first version of this
+    # guard ended in `pytest.skip("no main ref available")`, and `actions/checkout`
+    # is shallow by default with no guarantee of `origin/main` — so under CI, the one
+    # surface this protects, it would have SKIPPED rather than enforced. That is the
+    # same "a check that cannot fail" defect this file keeps finding, committed inside
+    # the guard written to prevent it. Copilot and CodeRabbit both caught it.
+    #
+    # ⚠ AND DEPTH MATTERS INDEPENDENTLY OF PRESENCE. A depth-1 `main` makes
+    # `merge-base --is-ancestor` answer NO for a genuinely older ancestor, because the
+    # parent history it needs is simply absent — a false ORPHAN report, which would
+    # fail honest PRs and teach the next person to delete this test. So deepen before
+    # concluding anything.
+    def _main_ref() -> str | None:
+        for ref in ("origin/main", "main"):
+            if _git("rev-parse", "--verify", "--quiet", ref).returncode == 0:
+                return ref
+        _git("fetch", "--quiet", "origin", "+refs/heads/main:refs/remotes/origin/main")
+        for ref in ("origin/main", "main"):
+            if _git("rev-parse", "--verify", "--quiet", ref).returncode == 0:
+                return ref
+        return None
+
+    ref = _main_ref()
+    if ref is None:
+        assert not os.environ.get("CI"), (
+            "no main ref is available even after an explicit fetch. Under CI this is a "
+            "broken checkout, not an excuse to skip: the reachability property would go "
+            "unchecked on the exact surface this guard exists to protect."
         )
-    pytest.skip("no main ref available to compare against")
+        pytest.skip("no main ref available locally; this guard is enforced in CI")
+
+    if _git("rev-parse", "--is-shallow-repository").stdout.strip() == "true":
+        # Deepen so merge-base has the history it needs. --unshallow is the reliable
+        # form; fall back to a bounded deepen if the remote refuses it.
+        if _git("fetch", "--quiet", "--unshallow", "origin").returncode != 0:
+            _git("fetch", "--quiet", "--deepen=1000", "origin")
+
+    head = _git("rev-parse", ref).stdout.strip()
+    if pin == head or _git("merge-base", "--is-ancestor", pin, ref).returncode == 0:
+        return  # reachable from main
+
+    # Not on main. Legitimate ONLY while this is the PR that will put it there — the
+    # pin is an ancestor of HEAD but not yet of main.
+    if _git("merge-base", "--is-ancestor", pin, "HEAD").returncode == 0:
+        return
+
+    raise AssertionError(
+        f"the pinned teardown commit {pin[:8]} is not reachable from {ref} and is not "
+        f"on this branch either — it has been orphaned, most likely by a squash merge. "
+        f"Every downstream caller of runner-pool.yml will die as a STARTUP FAILURE: "
+        f"zero jobs, no logs, and nothing naming the unresolvable ref. Re-pin to the "
+        f"post-merge main SHA, which is both byte-identical and an ancestor."
+    )
