@@ -2,7 +2,7 @@
 
 The check exists because a merge that silently drops content produces no
 conflict, no failing test, and no undefined symbol. These tests construct
-thirteen scenarios and verify the check distinguishes them:
+fifteen scenarios and verify the check distinguishes them:
 
   A. drop             : branch rebased onto main with conflict resolution
                         that took "ours" and discarded main's new symbols
@@ -54,6 +54,31 @@ thirteen scenarios and verify the check distinguishes them:
                         process. `--no-renames` must be in effect so
                         `old.py` is in the diff and the drop is caught.
                         → MUST exit 1 with FAIL POSSIBLE_DROP for `bar`
+  N. clause_guard     : the auto-downgrade to INTENTIONAL_DELETE must
+                        require the deletion keyword AND the symbol to
+                        appear in the SAME clause (bounded by `;` or `.`),
+                        not merely both somewhere in the commit message.
+                        Subject "remove obsolete parser; keep foo" with
+                        `foo` genuinely dropped must NOT auto-downgrade —
+                        the protective `; keep foo` clause is not a
+                        mention of an intentional delete, so the drop
+                        MUST surface as POSSIBLE_DROP. This is the
+                        acceptance criterion for promoting the check
+                        from advisory to required (issue #288): the
+                        downgrade rule must be a structural property a
+                        protective-clause shape cannot satisfy, not a
+                        denylist over message syntax.
+  O. import_binding   : `import x` and `from x import y` create
+                        module-level bindings (the imported names are
+                        in the module namespace at import time). If
+                        main has such a binding and the PR drops the
+                        import line, the dropped name MUST be reported
+                        as POSSIBLE_DROP. Previously
+                        `symbols_from_source` did not look at
+                        Import / ImportFrom AST nodes, so import
+                        drops were silently missed -- the same
+                        "did not look" shape the prior four blind
+                        spots had.
 
 Plus one edge case (no Python files modified) which is the early-return
 "no work to do" path.
@@ -616,3 +641,101 @@ def test_renamed_python_file_still_flags_dropped_symbols(sandbox: Path) -> None:
     )
     assert "POSSIBLE_DROP" in result.stdout, result.stdout
     assert "bar" in result.stdout, result.stdout
+
+
+# --- Scenario N: clause-boundary guard on INTENTIONAL_DELETE mention ---
+
+
+def test_intentional_delete_mention_must_share_clause_with_symbol(sandbox: Path) -> None:
+    """The auto-downgrade to INTENTIONAL_DELETE must require the
+    deletion keyword AND the symbol name to appear in the SAME clause
+    of the commit subject (clauses bounded by `;` or `.`). Without
+    that property, a subject like `remove obsolete parser; keep foo`
+    auto-downgrades the drop of `foo` because both `remove` (keyword)
+    and `foo` (symbol) appear in the message — even though the
+    protective `; keep foo` clause suggests the author intended `foo`
+    to stay. The downgrade rule must be a structural property that
+    this shape cannot satisfy.
+
+    Construction: main has foo + helper + obsolete_parser. The branch
+    drops `foo` and commits with subject EXACTLY `remove obsolete
+    parser; keep foo` (the shape that defeats the current logic).
+
+    Expectation: exit 1 with POSSIBLE_DROP for `foo`, NOT
+    INTENTIONAL_DELETE. The protective `keep foo` clause is the
+    author's stated intent; the missing `foo` from the PR head is
+    contrary to that intent and must surface as a flag."""
+    _write(
+        sandbox,
+        "main",
+        "def foo():\n    return 1\n\n\n"
+        "def helper():\n    return 'h'\n\n\n"
+        "def obsolete_parser():\n    return 'p'\n",
+        "main: add obsolete_parser() alongside foo + helper",
+    )
+
+    _git(sandbox, "checkout", "-q", "-b", "branch-N", "main")
+    (sandbox / "bar.py").write_text(
+        "def helper():\n    return 'h'\n\n\ndef obsolete_parser():\n    return 'p'\n"
+    )
+    _git(sandbox, "add", "bar.py")
+    # EXACT subject per the issue-#288 acceptance criterion.
+    _git(sandbox, "commit", "-q", "-m", "remove obsolete parser; keep foo")
+
+    result = _run_check(sandbox, "main", "branch-N")
+    assert result.returncode == 1, (
+        f"drop with `; keep foo` protective clause MUST exit 1 with "
+        f"POSSIBLE_DROP; got {result.returncode}\n{result.stdout}"
+    )
+    assert "POSSIBLE_DROP" in result.stdout, result.stdout
+    assert "bar.py::foo" in result.stdout, result.stdout
+    # The protective clause `keep foo` means the deletion keyword
+    # `remove` is NOT in the same clause as `foo` -- so the symbol
+    # must NOT auto-downgrade. The structural guard, not a syntax
+    # denylist, is what rejects this case.
+    assert "INTENTIONAL_DELETE" not in result.stdout, result.stdout
+
+
+# --- Scenario O: module-level import bindings (the 5th absence-detector blind spot) ---
+
+
+def test_import_binding_drop_detected_as_possible_drop(sandbox: Path) -> None:
+    """Module-level imports ARE module-level bindings: `import x`
+    binds `x` in the module namespace; `from x import y` binds `y`;
+    `from x import y as z` binds `z`; `import x.y` binds `x`. If
+    main has such a binding and the PR drops the import line, the
+    dropped name MUST be reported as POSSIBLE_DROP.
+
+    Previously `symbols_from_source` walked FunctionDef /
+    AsyncFunctionDef / ClassDef / Assign / AnnAssign / TypeAlias but
+    not Import / ImportFrom. The bound name was therefore invisible
+    to the check, and a PR that removed a `from x import y` line
+    exited 0 silently -- the canonical absence-detector "did not
+    look" failure that the prior four blind spots also had.
+
+    Without the fix: `s_main` does NOT contain `path` or `json`
+    (the AST branches never produce them), so `missing = s_main -
+    s_head = ∅` and the check exits 0 with no findings. With the
+    fix: `path` and `json` are counted as top-level bindings, the
+    drop surfaces as POSSIBLE_DROP, exit 1."""
+    _write(
+        sandbox,
+        "main",
+        "from os import path\n\n\nimport json\n\n\ndef kept():\n    return 'k'\n",
+        "main: add import bindings path + json",
+    )
+
+    _git(sandbox, "checkout", "-q", "-b", "branch-O", "main")
+    (sandbox / "bar.py").write_text("def kept():\n    return 'k'\n")
+    _git(sandbox, "add", "bar.py")
+    _git(sandbox, "commit", "-q", "-m", "O: drop import-only bindings")
+
+    result = _run_check(sandbox, "main", "branch-O")
+    assert result.returncode == 1, (
+        f"dropped import-binding MUST exit 1; got {result.returncode}\n{result.stdout}"
+    )
+    assert "POSSIBLE_DROP" in result.stdout, result.stdout
+    # `from os import path` binds `path`.
+    assert "bar.py::path" in result.stdout, result.stdout
+    # `import json` binds `json`.
+    assert "bar.py::json" in result.stdout, result.stdout

@@ -15,10 +15,13 @@ For each missing symbol we record:
                     delete/remove/drop/deprecate/retire keyword?
 
 Symbol extraction supports FunctionDef, AsyncFunctionDef, ClassDef,
-plain Assign (with tuple / list targets), and annotated assignments
-with a value (AnnAssign where node.value is not None). Bare
-annotations (x: int with no = ...) are declarations, not symbols;
-they are not counted.
+plain Assign (with tuple / list targets), annotated assignments
+with a value (AnnAssign where node.value is not None), module-level
+imports (Import: `import x` binds `x`, `import x.y` binds `x`,
+`import x.y as z` binds `z`), and ImportFrom (`from x import y`
+binds `y`, `from x import y as z` binds `z`). Bare annotations
+(x: int with no = ...) are declarations, not symbols; they are
+not counted.
 
 Categorisation (three reachable cases):
   - in_merge_base + branch_stale           -> LEGACY_STALE   (WARN)
@@ -132,7 +135,14 @@ def symbols_from_source(source: str) -> set[str]:
     """Return the set of top-level symbol names defined in `source`.
     Raises SyntaxError on parse failure — the caller decides how to
     surface that. Silently swallowing parse errors would make
-    'I couldn't look' indistinguishable from 'nothing was there'."""
+    'I couldn't look' indistinguishable from 'nothing was there'.
+
+    Includes Import / ImportFrom: `import x` and `from x import y`
+    create module-level bindings at import time, and dropping such
+    a line is a real (silent) drop without this branch -- the fifth
+    absence-detector blind spot (the first four being whole-file-
+    deletion skip, fail-open SyntaxError, invisible AnnAssign, and
+    the clause-unbounded INTENTIONAL_DELETE downgrade)."""
     tree = ast.parse(source)
     out: set[str] = set()
     # `ast.TypeAlias` is the `type X = Y` statement, added in Python 3.12.
@@ -154,6 +164,23 @@ def symbols_from_source(source: str) -> set[str]:
             # module-level binding. Bare annotation (x: int, no = ...)
             # is a declaration only and is not counted.
             out.update(_names(node.target))
+        elif isinstance(node, ast.Import):
+            # `import x` binds `x` in the module namespace.
+            # `import x.y` binds `x` (the head of the dotted path).
+            # `import x.y as z` binds `z` (the explicit `as` wins).
+            for alias in node.names:
+                bound = alias.asname or alias.name.split(".")[0]
+                out.add(bound)
+        elif isinstance(node, ast.ImportFrom):
+            # `from x import y` binds `y`.
+            # `from x import y as z` binds `z`.
+            # `from . import y` binds `y`; the `module` field and the
+            # `level` (relative-import dot count) describe WHERE the
+            # import came from, not WHAT is bound -- only the alias
+            # names matter for namespace bindings.
+            for alias in node.names:
+                bound = alias.asname or alias.name
+                out.add(bound)
         elif type_alias is not None and isinstance(node, type_alias):
             # `type UserId = int` is a module-level binding under PEP 695
             # (Python 3.12+). The alias name lives on `node.name`, which
@@ -210,9 +237,18 @@ def commit_subjects(repo: Path, base: str, head: str) -> list[str]:
 
 
 def commit_mentions_symbol(subjects: list[str], name: str) -> bool:
-    """True iff any subject names `name` next to a delete keyword.
-    Heuristic only — used to down-weight POSSIBLE_DROP cases where
-    the PR author explicitly documented the deletion.
+    """True iff some subject has the symbol AND a delete keyword
+    in the SAME CLAUSE, where clause boundaries are `;` or `.` or
+    end-of-line. Heuristic only — used to down-weight POSSIBLE_DROP
+    cases where the PR author explicitly documented the deletion.
+
+    Positive property: a deletion is only genuinely intentional when
+    the keyword AND the symbol co-occur in one bounded phrase, not
+    merely both somewhere in the message. The `; keep foo` shape is
+    defeated because the `keep foo` clause has no deletion keyword;
+    dropping `foo` against a subject that names `foo` only inside a
+    protective clause surfaces as POSSIBLE_DROP rather than getting
+    silently auto-downgraded.
 
     Word-boundary matching on BOTH the symbol name and the keyword:
       - The symbol-name regex matches whole tokens so `bar` does not
@@ -220,13 +256,24 @@ def commit_mentions_symbol(subjects: list[str], name: str) -> bool:
       - The keyword regex matches whole tokens so `delete` does not
         match inside `undelete` (substring overlap the other way).
     Subject and name are both lowercased here so a PascalCase symbol
-    names `Foo` matches the lower-cased subject saying `foo`."""
+    names `Foo` matches the lower-cased subject saying `foo`.
+
+    The clause split is structural (sentence punctuation), not a
+    denylist over message syntax. There is no list of separators
+    that needs to anticipate every phrasing — `;` and `.` are the
+    English clause-and-sentence boundaries, and end-of-line is a
+    boundary by construction. The property the check asserts is
+    "the keyword acts on the symbol", which the protective-clause
+    shape structurally cannot satisfy.
+    """
     name_pat = re.compile(rf"\b{re.escape(name.lower())}\b")
     keyword_pat = re.compile(r"\b(?:delete|remove|drop|deprecate|retire)\b")
+    clause_split = re.compile(r"[;.]")
     for line in subjects:
         lc = line.lower()
-        if name_pat.search(lc) and keyword_pat.search(lc):
-            return True
+        for clause in clause_split.split(lc):
+            if name_pat.search(clause) and keyword_pat.search(clause):
+                return True
     return False
 
 
