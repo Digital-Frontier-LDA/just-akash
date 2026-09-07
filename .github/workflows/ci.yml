@@ -248,27 +248,50 @@ jobs:
       # to catch. See #294.
       #
       # For pull_request we ALSO assert the script we are about to
-      # run is provably the BASE's copy, not the HEAD's: the .check/
-      # tree SHA must differ from the HEAD tree SHA, because the two
-      # checkouts are pinned to different commits. Equal trees means
-      # the .check/ checkout silently failed and the script
-      # provenance is unprovable -- refuse to run rather than run
-      # an unchecked check. This is the security property the issue
-      # asks for: the check is base-side, not head-side.
+      # run is provably the BASE's copy, not the HEAD's. The .check/
+      # commit SHA must differ from the HEAD commit SHA, because the
+      # two checkouts are pinned to different refs. Equal commits
+      # means the two checkouts resolved to the same commit -- the
+      # .check/ checkout silently failed (returned the wrong tree) or
+      # the PR has no diff against base, either of which leaves the
+      # script provenance unprovable -- refuse to run rather than
+      # run an unchecked check.
+      #
+      # We compare COMMITS, not TREES. Different commits can have
+      # the same tree (allow-empty commits, revert-only PRs) and a
+      # tree-equal guard fires on those benign cases while labeling
+      # its cause as a checkout failure -- a name for an unmeasured
+      # cause. Commit comparison answers the actual question: are
+      # these two checkouts the same commit? If yes, fail loud.
+      # Tree SHAs are still printed for visibility / debugging.
+      #
+      # This is the security property the issue asks for: the check
+      # is base-side, not head-side.
+      - name: Probe base/head provenance for #294 audit
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          echo "github.event.pull_request.base.ref: ${{ github.event.pull_request.base.ref }}"
+          echo "github.event.pull_request.base.sha: ${{ github.event.pull_request.base.sha }}"
+          echo "github.event.pull_request.head.sha: ${{ github.event.pull_request.head.sha }}"
+          current_main_sha="$(git ls-remote origin HEAD | awk '{print $1}')"
+          echo "remote origin main tip (now):      $current_main_sha"
       - name: Run symbol-presence check (script from base, content from head)
         run: |
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
             SCRIPT=.check/scripts/symbol_presence_check.py
+            base_commit="$(git -C .check rev-parse HEAD)"
+            head_commit="$(git rev-parse HEAD)"
             base_tree="$(git -C .check rev-parse HEAD^{tree})"
             head_tree="$(git rev-parse HEAD^{tree})"
             echo "checker script source: $SCRIPT"
-            echo "checker .check HEAD:    $(git -C .check rev-parse HEAD)"
+            echo "checker .check HEAD:    $base_commit"
             echo "checker .check tree:    $base_tree"
-            echo "this PR head:           $(git rev-parse HEAD)"
+            echo "this PR head:           $head_commit"
             echo "this PR head tree:      $head_tree"
-            if [ "$base_tree" = "$head_tree" ]; then
-              echo "::error::.check/ tree equals HEAD tree; refusing to run -- the base checkout silently failed and the script provenance is unprovable. The check would otherwise be running a script the PR controls. See #294."
+            if [ "$base_commit" = "$head_commit" ]; then
+              echo "::error::.check/ commit ($base_commit) equals HEAD commit; refusing to run. The two checkouts resolved to the same commit -- the .check/ checkout silently failed (returned the wrong tree) or the PR has no diff against base, either of which leaves the script provenance unprovable. The check would otherwise be running a script the PR controls. See #294."
               exit 1
             fi
             if [ ! -f "$SCRIPT" ]; then
