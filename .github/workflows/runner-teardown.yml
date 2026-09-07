@@ -229,7 +229,15 @@ jobs:
             # A deployment that has fully propagated out of the API reads as
             # not-found, NOT as state=closed. That is GONE — a positive observation
             # that it no longer exists — and must not be scored as "unreadable".
-            if grep -qiE "not found|NotFoundError|\"code\": *\"not_found\"" /tmp/status.json /tmp/status.err 2>/dev/null; then
+            # ⛔ THE 404 SHAPE, NOT THE WORDS "not found". A bare substring is wrong in BOTH
+            # directions: an unrelated failure whose text happens to contain "not found"
+            # (a missing config file, a provider message) would be scored as a positive
+            # GONE observation and report closed=true over an OPEN lease — a false GREEN,
+            # the one failure this whole step exists to prevent — while a genuine 404 whose
+            # wording differs would be missed. api.py formats every failure as
+            # "API Error (<code>): ..." (api.py:271) and matches that exact prefix itself at
+            # api.py:413, so it is a stable contract rather than a guess at prose.
+            if grep -qE 'API Error \(404\)|"code": *"not_found"|NotFoundError' /tmp/status.json /tmp/status.err 2>/dev/null; then
               GONE=yes; STATE=""; break
             fi
             [ "$STATE" = closed ] && break

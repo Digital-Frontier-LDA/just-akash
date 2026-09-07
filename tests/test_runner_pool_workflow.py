@@ -2294,6 +2294,26 @@ class TestTheVerdictCannotFabricateAStatus:
         assert "no status" in log.lower()
 
 
+# ⛔ AN ASSIGNMENT IS NOT A LINE. `re.match(r"\s*GONE=", ln)` — what this file used first —
+# is a text matcher pointed at shell: it MISSES `then GONE=no`, `cmd; GONE=no` and
+# `export GONE=no`, and it ACCEPTS `echo "GONE=yes"`, which assigns nothing. CodeRabbit
+# caught it on just-akash#308. It is the same instrument-shape error as a `head -6` that
+# made four build sites look like three, and a line scan that cannot see a multi-line
+# call: a text instrument aimed at a structured artefact. Match the assignment TOKEN —
+# at a command position, and never inside an echo/printf argument.
+_CMD_POS = r"(?:^|[;&|]|\b(?:then|do|else|elif|export|local|declare|readonly)\s+)\s*"
+
+
+def _assigns(var: str, text: str) -> list[str]:
+    """Lines of `text` that actually ASSIGN `var` (not merely mention it)."""
+    out = []
+    for ln in text.splitlines():
+        stripped = re.sub(r"\b(?:echo|printf)\b.*$", "", ln)  # drop echoed mentions
+        if re.search(_CMD_POS + re.escape(var) + r"=", stripped):
+            out.append(ln)
+    return out
+
+
 def test_the_verification_settles_before_it_calls_a_lease_open():
     """The state read-back must retry, because the destroy it verifies is asynchronous.
 
@@ -2390,7 +2410,7 @@ def test_the_read_loops_observation_survives_to_the_classifier():
     case_at = next(i for i, ln in enumerate(lines) if ln.strip().startswith('case "$STATE"'))
     assert loop_start < loop_end < case_at, "the read loop no longer precedes the classifier"
 
-    between = [ln for ln in lines[loop_end + 1 : case_at] if re.match(r"\s*GONE=", ln)]
+    between = _assigns("GONE", "\n".join(lines[loop_end + 1 : case_at]))
     assert not between, (
         f"GONE is reassigned {len(between)} time(s) between the read loop and the "
         f"classifier: {between!r}. That discards what the loop observed — a deployment "
@@ -2401,7 +2421,7 @@ def test_the_read_loops_observation_survives_to_the_classifier():
     # And the loop must still be able to reach that conclusion at all, or the assertion
     # above is satisfied by a loop that never sets GONE.
     in_loop = "\n".join(lines[loop_start : loop_end + 1])
-    assert re.search(r"GONE=yes", in_loop), (
+    assert _assigns("GONE", in_loop), (
         "the read loop never concludes GONE — then a propagated-out deployment can only "
         "be scored from destroy.log, which says 'destroyed.', not 'not found'"
     )
