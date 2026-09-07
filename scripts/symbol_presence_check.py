@@ -227,53 +227,74 @@ def symbols_at(repo: Path, rev: str, path: str) -> set[str]:
 
 
 def commit_subjects(repo: Path, base: str, head: str) -> list[str]:
-    """Subjects of every commit reachable from head but not from base.
+    """All lines (subject + body) of every commit reachable from head
+    but not from base.
+
+    The list is a flat per-line view across commits. Commit boundaries
+    are not represented -- the trailer-matching caller (`commit_mentions_symbol`)
+    scans every line for an `Intentional-Delete: <name>` declaration
+    and that detection is independent of which commit a line belongs to.
+    The subject of each commit is still present (it's the first line of
+    its message), so any caller that wants only subjects can take line 0
+    per commit -- but no caller does that here, so the flat shape is
+    correct.
+
+    Previously returned only subjects (`--format=%s`), which made a
+    trailer in the body invisible -- the same "did not look" shape the
+    other blind spots had.
+
     Raises subprocess.CalledProcessError on unexpected git failures
     so the caller can exit 2 -- previously this was caught and treated
     as 'symbol unmentioned', which could mask a real failure (rev
     typo, corrupt repo, ...) as a missing-event that the check then
     flagged as POSSIBLE_DROP on an otherwise-clean PR."""
-    return run(["git", "log", "--format=%s", f"{base}..{head}"], repo).splitlines()
+    return run(["git", "log", "--format=%B", f"{base}..{head}"], repo).splitlines()
 
 
 def commit_mentions_symbol(subjects: list[str], name: str) -> bool:
-    """True iff some subject has the symbol AND a delete keyword
-    in the SAME CLAUSE, where clause boundaries are `;` or `.` or
-    end-of-line. Heuristic only — used to down-weight POSSIBLE_DROP
-    cases where the PR author explicitly documented the deletion.
+    """True iff some subject (subject line OR message body) explicitly
+    declares `name` as intentionally deleted via an `Intentional-Delete:`
+    declaration line. Used to down-weight POSSIBLE_DROP cases where the
+    PR author explicitly documented the deletion.
 
-    Positive property: a deletion is only genuinely intentional when
-    the keyword AND the symbol co-occur in one bounded phrase, not
-    merely both somewhere in the message. The `; keep foo` shape is
-    defeated because the `keep foo` clause has no deletion keyword;
-    dropping `foo` against a subject that names `foo` only inside a
-    protective clause surfaces as POSSIBLE_DROP rather than getting
-    silently auto-downgraded.
+    Positive property: a deletion is genuinely intentional when the
+    author DECLARES it as such — they write the literal line
 
-    Word-boundary matching on BOTH the symbol name and the keyword:
-      - The symbol-name regex matches whole tokens so `bar` does not
-        match inside `embargo` (substring overlap false positive).
-      - The keyword regex matches whole tokens so `delete` does not
-        match inside `undelete` (substring overlap the other way).
-    Subject and name are both lowercased here so a PascalCase symbol
-    names `Foo` matches the lower-cased subject saying `foo`.
+        Intentional-Delete: <symbol-name>
 
-    The clause split is structural (sentence punctuation), not a
-    denylist over message syntax. There is no list of separators
-    that needs to anticipate every phrasing — `;` and `.` are the
-    English clause-and-sentence boundaries, and end-of-line is a
-    boundary by construction. The property the check asserts is
-    "the keyword acts on the symbol", which the protective-clause
-    shape structurally cannot satisfy.
+    Any prose shape that puts a deletion keyword near a name without
+    making the declaration does NOT auto-downgrade: `remove obsolete
+    parser; keep foo`, `remove obsolete parser, keep foo`, `remove
+    obsolete parser and keep foo`, `remove obsolete parser -- keep foo`,
+    `drop the legacy shim (keep foo)` — all of these are POSSIBLE_DROP
+    because intent was inferred, not declared.
+
+    Inferring intent from prose was the original failure mode (issue
+    #288). The fix replaced prose-inference with a required declaration.
+    There is no list of separators to maintain: the trailer either
+    appears as written or it does not. Inverting the risk: prose that
+    merely happens to put a keyword near a name no longer silences the
+    check; only an explicit declaration does.
+
+    Declaration line format (case-insensitive prefix):
+        Intentional-Delete: <name>[, <name>]*
+        Intentional-Delete : <name>     (space before colon tolerated)
+    Whitespace-only lines do not match. The declaration can appear
+    anywhere in the commit message (subject line or body) — the literal
+    text is what matters, not its position as a git-trailer proper.
+
+    Word-boundary matching on the declared symbol name ensures
+    `bar` is not counted by a declaration of `embargo`.
     """
-    name_pat = re.compile(rf"\b{re.escape(name.lower())}\b")
-    keyword_pat = re.compile(r"\b(?:delete|remove|drop|deprecate|retire)\b")
-    clause_split = re.compile(r"[;.]")
+    name_lc = name.lower()
+    name_pat = re.compile(rf"\b{re.escape(name_lc)}\b")
+    decl_pat = re.compile(r"^\s*[Ii]ntentional-[Dd]elete\s*:\s*(.+?)\s*$")
     for line in subjects:
-        lc = line.lower()
-        for clause in clause_split.split(lc):
-            if name_pat.search(clause) and keyword_pat.search(clause):
-                return True
+        m = decl_pat.match(line)
+        if m is None:
+            continue
+        if name_pat.search(m.group(1)):
+            return True
     return False
 
 

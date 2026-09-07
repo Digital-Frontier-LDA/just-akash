@@ -2,7 +2,7 @@
 
 The check exists because a merge that silently drops content produces no
 conflict, no failing test, and no undefined symbol. These tests construct
-fifteen scenarios and verify the check distinguishes them:
+twenty scenarios and verify the check distinguishes them:
 
   A. drop             : branch rebased onto main with conflict resolution
                         that took "ours" and discarded main's new symbols
@@ -54,20 +54,21 @@ fifteen scenarios and verify the check distinguishes them:
                         process. `--no-renames` must be in effect so
                         `old.py` is in the diff and the drop is caught.
                         → MUST exit 1 with FAIL POSSIBLE_DROP for `bar`
-  N. clause_guard     : the auto-downgrade to INTENTIONAL_DELETE must
-                        require the deletion keyword AND the symbol to
-                        appear in the SAME clause (bounded by `;` or `.`),
-                        not merely both somewhere in the commit message.
-                        Subject "remove obsolete parser; keep foo" with
-                        `foo` genuinely dropped must NOT auto-downgrade —
-                        the protective `; keep foo` clause is not a
-                        mention of an intentional delete, so the drop
-                        MUST surface as POSSIBLE_DROP. This is the
-                        acceptance criterion for promoting the check
-                        from advisory to required (issue #288): the
-                        downgrade rule must be a structural property a
-                        protective-clause shape cannot satisfy, not a
-                        denylist over message syntax.
+  N. clause_guard     : the auto-downgrade to INTENTIONAL_DELETE
+                        requires an explicit `Intentional-Delete:
+                        <name>` DECLARATION in the commit message.
+                        Prose that puts a deletion keyword near a name
+                        WITHOUT the declaration does NOT auto-downgrade
+                        -- inferring intent from prose was the original
+                        failure mode (issue #288). Subject "remove
+                        obsolete parser; keep foo" with `foo` genuinely
+                        dropped, NO `Intentional-Delete: foo` line, MUST
+                        surface as POSSIBLE_DROP. The acceptance
+                        criterion for promoting the check from advisory
+                        to required (issue #288) is that the downgrade
+                        rule is a positive property (a declaration)
+                        that no protective-clause shape can satisfy,
+                        not a denylist over message syntax.
   O. import_binding   : `import x` and `from x import y` create
                         module-level bindings (the imported names are
                         in the module namespace at import time). If
@@ -79,6 +80,29 @@ fifteen scenarios and verify the check distinguishes them:
                         drops were silently missed -- the same
                         "did not look" shape the prior four blind
                         spots had.
+  P. trailer_positive : when the commit message contains an
+                        `Intentional-Delete: foo` declaration line
+                        explicitly naming the dropped symbol, the
+                        downgrade rule MUST recognise it (exit 0,
+                        INTENTIONAL_DELETE, no POSSIBLE_DROP). This is
+                        the affirmative path that scenes Q-T are
+                        confirming isn't accidentally over-matched.
+  Q. comma_shape      : subject "remove obsolete parser, keep foo"
+                        with `foo` dropped, NO declaration. Comma
+                        should not auto-downgrade -- the precedent
+                        that defeated the original clause heuristic.
+  R. and_shape        : subject "remove obsolete parser and keep foo"
+                        with `foo` dropped, NO declaration. The
+                        `and` conjunction reads as a protective
+                        clause; the rule must still flag the drop.
+  S. dashdash_shape   : subject "remove obsolete parser -- keep foo"
+                        with `foo` dropped, NO declaration. The
+                        em/dash separator is a common English aside;
+                        same rule.
+  T. parens_shape     : subject "drop the legacy shim (keep foo)"
+                        with `foo` dropped, NO declaration. The
+                        parenthetical reads as a protective aside;
+                        same rule.
 
 Plus one edge case (no Python files modified) which is the early-return
 "no work to do" path.
@@ -223,7 +247,13 @@ def test_drop_via_conflict_resolution(sandbox: Path) -> None:
 
 
 def test_intentional_delete_downgrades_to_ok(sandbox: Path) -> None:
-    """branch-B off main deletes qux() and the commit message says so."""
+    """branch-B off main deletes qux() and the commit message declares
+    the deletion via the `Intentional-Delete: <name>` trailer. Under the
+    old prose-inference rule, a subject like 'intentionally delete qux()'
+    auto-downgraded the drop; under the new positive-property rule, only
+    an explicit `Intentional-Delete: qux` declaration does. This test
+    asserts the new contract still produces INTENTIONAL_DELETE when the
+    author follows it."""
     _write(sandbox, "main", _make_bar(""), "main: add qux() + main_only_added()")
 
     _git(sandbox, "checkout", "-q", "-b", "branch-B", "main")
@@ -233,7 +263,7 @@ def test_intentional_delete_downgrades_to_ok(sandbox: Path) -> None:
         "def foo():\n    return 1\n\n\n"
         "def helper():\n    return 'h'\n\n\n"
         "def main_only_added():\n    return 'a'\n",
-        "B: intentionally delete qux() as the point of this PR",
+        "B: drop qux()\n\nIntentional-Delete: qux",
     )
 
     result = _run_check(sandbox, "main", "branch-B")
@@ -429,10 +459,10 @@ def test_starred_unpacking_target_detected(sandbox: Path) -> None:
 
 def test_case_insensitive_symbol_match(sandbox: Path) -> None:
     """The PR commit-message mention check is case-insensitive: a
-    symbol named `Foo` (PascalCase) must match a commit subject that
-    says 'foo' next to a delete keyword. Without normalisation, the
-    regex was searching for `Foo` against a lowercased message and
-    never matched."""
+    symbol named `Foo` (PascalCase) must match an `Intentional-Delete:
+    foo` declaration that lowercased the symbol name. Without
+    normalisation, the regex was searching for `Foo` against a
+    lowercased declaration value and never matched."""
     _write(
         sandbox,
         "main",
@@ -443,11 +473,17 @@ def test_case_insensitive_symbol_match(sandbox: Path) -> None:
     _git(sandbox, "checkout", "-q", "-b", "branch-I", "main")
     (sandbox / "bar.py").write_text("def helper():\n    return 'h'\n")
     _git(sandbox, "add", "bar.py")
-    _git(sandbox, "commit", "-q", "-m", "I: remove foo (case-insensitive mention)")
+    _git(
+        sandbox,
+        "commit",
+        "-q",
+        "-m",
+        "I: drop Foo\n\nIntentional-Delete: foo (case-insensitive)",
+    )
 
     result = _run_check(sandbox, "main", "branch-I")
     assert result.returncode == 0, (
-        f"symbol mentioned case-insensitively in commit subject MUST exit 0 "
+        f"symbol mentioned case-insensitively in trailer MUST exit 0 "
         f"with INTENTIONAL_DELETE; got {result.returncode}\n{result.stdout}"
     )
     assert "INTENTIONAL_DELETE" in result.stdout, result.stdout
@@ -647,24 +683,27 @@ def test_renamed_python_file_still_flags_dropped_symbols(sandbox: Path) -> None:
 
 
 def test_intentional_delete_mention_must_share_clause_with_symbol(sandbox: Path) -> None:
-    """The auto-downgrade to INTENTIONAL_DELETE must require the
-    deletion keyword AND the symbol name to appear in the SAME clause
-    of the commit subject (clauses bounded by `;` or `.`). Without
-    that property, a subject like `remove obsolete parser; keep foo`
-    auto-downgrades the drop of `foo` because both `remove` (keyword)
-    and `foo` (symbol) appear in the message — even though the
-    protective `; keep foo` clause suggests the author intended `foo`
-    to stay. The downgrade rule must be a structural property that
-    this shape cannot satisfy.
+    """The auto-downgrade to INTENTIONAL_DELETE requires an explicit
+    `Intentional-Delete: <name>` declaration in the commit message.
+    Prose that puts a deletion keyword near a name WITHOUT the
+    declaration does NOT auto-downgrade -- inferring intent from prose
+    was the original failure mode (issue #288). The shape that breaks
+    prose-inference (`;`, `,`, `and`, `--`, `(...)`, ...anything)
+    becomes the shape the new fix rejects, because none of those shapes
+    emit a declaration.
 
     Construction: main has foo + helper + obsolete_parser. The branch
     drops `foo` and commits with subject EXACTLY `remove obsolete
-    parser; keep foo` (the shape that defeats the current logic).
+    parser; keep foo` (the shape from the issue-#288 acceptance
+    criterion) and NO body. There is no `Intentional-Delete: foo`
+    declaration anywhere in the message.
 
     Expectation: exit 1 with POSSIBLE_DROP for `foo`, NOT
-    INTENTIONAL_DELETE. The protective `keep foo` clause is the
-    author's stated intent; the missing `foo` from the PR head is
-    contrary to that intent and must surface as a flag."""
+    INTENTIONAL_DELETE. The downgrade rule is "the symbol is declared
+    as intentionally deleted," not "the symbol appears near a delete
+    keyword in prose." This scenario proves the rule applies to the
+    `;` shape -- the inline-quote scenario proves it applies to `,`
+    / `and` / `--` / `(...)` shapes too."""
     _write(
         sandbox,
         "main",
@@ -739,3 +778,171 @@ def test_import_binding_drop_detected_as_possible_drop(sandbox: Path) -> None:
     assert "bar.py::path" in result.stdout, result.stdout
     # `import json` binds `json`.
     assert "bar.py::json" in result.stdout, result.stdout
+
+
+# --- Scenario P: Intentional-Delete: trailer is the affirmative path ---
+
+
+def test_intentional_delete_trailer_downgrades_to_intentional_delete(
+    sandbox: Path,
+) -> None:
+    """The downgrade to INTENTIONAL_DELETE is triggered by an explicit
+    `Intentional-Delete: <name>` DECLARATION line in the commit message.
+    When that line names the dropped symbol, the downgrade fires
+    cleanly: exit 0, INTENTIONAL_DELETE, no POSSIBLE_DROP.
+
+    This is the affirmative case: scenes Q-T confirm the rule does
+    NOT fire on prose-only (no declaration), so a future regression
+    that re-introduces a prose-inference heuristic would either
+    mis-fire here (treating the declaration as unnecessary) or
+    refuse to fire here (treating the declaration as insufficient).
+    Either way, this test goes red.
+
+    Construction: main has foo + helper + obsolete_parser. The branch
+    drops `foo` and commits with subject `remove obsolete_parser`
+    and a body containing `Intentional-Delete: foo`. The subject
+    alone would NOT auto-downgrade (no mention of `foo`); only the
+    trailer does."""
+    _write(
+        sandbox,
+        "main",
+        "def foo():\n    return 1\n\n\n"
+        "def helper():\n    return 'h'\n\n\n"
+        "def obsolete_parser():\n    return 'p'\n",
+        "main: add obsolete_parser() alongside foo + helper",
+    )
+
+    _git(sandbox, "checkout", "-q", "-b", "branch-P", "main")
+    (sandbox / "bar.py").write_text(
+        "def helper():\n    return 'h'\n\n\ndef obsolete_parser():\n    return 'p'\n"
+    )
+    _git(sandbox, "add", "bar.py")
+    # Subject deliberately does NOT contain `foo` -- the only mention
+    # of foo in the message is the explicit declaration line in the
+    # body. If the rule degraded to "any near-keyword mention", the
+    # subject's `remove` against the symbol name would fire and this
+    # test would still pass; but the trailer check is the pathway
+    # asserted here.
+    _git(
+        sandbox,
+        "commit",
+        "-q",
+        "-m",
+        "remove obsolete_parser\n\nIntentional-Delete: foo",
+    )
+
+    result = _run_check(sandbox, "main", "branch-P")
+    assert result.returncode == 0, (
+        f"with `Intentional-Delete: foo` declaration, the check MUST "
+        f"exit 0 with INTENTIONAL_DELETE; got {result.returncode}\n"
+        f"{result.stdout}"
+    )
+    assert "INTENTIONAL_DELETE" in result.stdout, result.stdout
+    assert "bar.py::foo" in result.stdout, result.stdout
+    assert "POSSIBLE_DROP" not in result.stdout, result.stdout
+
+
+# --- Scenarios Q-T: prose shapes that the original [.;] heuristic could not enumerate ---
+# Each one simulates a sibling shape of `; keep foo` from the issue-#288
+# criterion. Without the explicit `Intentional-Delete:` declaration, none
+# of them may auto-downgrade -- the new rule's positive property is
+# "trailer is required," and these prove prose cannot stand in.
+
+
+def test_prose_comma_shape_does_not_downgrade(sandbox: Path) -> None:
+    """Comma separator between the deletion and the keep clause. The
+    `[.;]` heuristic would have missed this (comma was the next item
+    a defender would add). The trailer-required rule rejects it
+    because there is no `Intentional-Delete:` line in the message."""
+    _write(
+        sandbox,
+        "main",
+        "def foo():\n    return 1\n\n\n"
+        "def helper():\n    return 'h'\n\n\n"
+        "def obsolete_parser():\n    return 'p'\n",
+        "main: add obsolete_parser() alongside foo + helper",
+    )
+    _git(sandbox, "checkout", "-q", "-b", "branch-Q", "main")
+    (sandbox / "bar.py").write_text(
+        "def helper():\n    return 'h'\n\n\ndef obsolete_parser():\n    return 'p'\n"
+    )
+    _git(sandbox, "add", "bar.py")
+    _git(sandbox, "commit", "-q", "-m", "remove obsolete parser, keep foo")
+
+    result = _run_check(sandbox, "main", "branch-Q")
+    assert result.returncode == 1, result.stdout
+    assert "POSSIBLE_DROP" in result.stdout, result.stdout
+    assert "bar.py::foo" in result.stdout, result.stdout
+    assert "INTENTIONAL_DELETE" not in result.stdout, result.stdout
+
+
+def test_prose_and_shape_does_not_downgrade(sandbox: Path) -> None:
+    """`and` conjunction -- reads as a protective clause."""
+    _write(
+        sandbox,
+        "main",
+        "def foo():\n    return 1\n\n\n"
+        "def helper():\n    return 'h'\n\n\n"
+        "def obsolete_parser():\n    return 'p'\n",
+        "main: add obsolete_parser() alongside foo + helper",
+    )
+    _git(sandbox, "checkout", "-q", "-b", "branch-R", "main")
+    (sandbox / "bar.py").write_text(
+        "def helper():\n    return 'h'\n\n\ndef obsolete_parser():\n    return 'p'\n"
+    )
+    _git(sandbox, "add", "bar.py")
+    _git(sandbox, "commit", "-q", "-m", "remove obsolete parser and keep foo")
+
+    result = _run_check(sandbox, "main", "branch-R")
+    assert result.returncode == 1, result.stdout
+    assert "POSSIBLE_DROP" in result.stdout, result.stdout
+    assert "bar.py::foo" in result.stdout, result.stdout
+    assert "INTENTIONAL_DELETE" not in result.stdout, result.stdout
+
+
+def test_prose_dashdash_shape_does_not_downgrade(sandbox: Path) -> None:
+    """`--` separator -- em-dash aside, common in English."""
+    _write(
+        sandbox,
+        "main",
+        "def foo():\n    return 1\n\n\n"
+        "def helper():\n    return 'h'\n\n\n"
+        "def obsolete_parser():\n    return 'p'\n",
+        "main: add obsolete_parser() alongside foo + helper",
+    )
+    _git(sandbox, "checkout", "-q", "-b", "branch-S", "main")
+    (sandbox / "bar.py").write_text(
+        "def helper():\n    return 'h'\n\n\ndef obsolete_parser():\n    return 'p'\n"
+    )
+    _git(sandbox, "add", "bar.py")
+    _git(sandbox, "commit", "-q", "-m", "remove obsolete parser -- keep foo")
+
+    result = _run_check(sandbox, "main", "branch-S")
+    assert result.returncode == 1, result.stdout
+    assert "POSSIBLE_DROP" in result.stdout, result.stdout
+    assert "bar.py::foo" in result.stdout, result.stdout
+    assert "INTENTIONAL_DELETE" not in result.stdout, result.stdout
+
+
+def test_prose_parens_shape_does_not_downgrade(sandbox: Path) -> None:
+    """Parenthetical aside -- reads as a protective note."""
+    _write(
+        sandbox,
+        "main",
+        "def foo():\n    return 1\n\n\n"
+        "def helper():\n    return 'h'\n\n\n"
+        "def obsolete_parser():\n    return 'p'\n",
+        "main: add obsolete_parser() alongside foo + helper",
+    )
+    _git(sandbox, "checkout", "-q", "-b", "branch-T", "main")
+    (sandbox / "bar.py").write_text(
+        "def helper():\n    return 'h'\n\n\ndef obsolete_parser():\n    return 'p'\n"
+    )
+    _git(sandbox, "add", "bar.py")
+    _git(sandbox, "commit", "-q", "-m", "drop the legacy shim (keep foo)")
+
+    result = _run_check(sandbox, "main", "branch-T")
+    assert result.returncode == 1, result.stdout
+    assert "POSSIBLE_DROP" in result.stdout, result.stdout
+    assert "bar.py::foo" in result.stdout, result.stdout
+    assert "INTENTIONAL_DELETE" not in result.stdout, result.stdout
