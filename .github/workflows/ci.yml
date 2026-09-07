@@ -321,7 +321,22 @@ jobs:
             # correctly. (Copilot on #294, comment 3948174510.)
             event_base_sha="${{ github.event.pull_request.base.sha }}"
             event_head_sha="${{ github.event.pull_request.head.sha }}"
-            pr_diff_files="$(git diff --name-only "$event_base_sha..$event_head_sha" -- . 2>/dev/null || echo "")"
+            # Compute the no-diff PR check from event-payload SHAs (independent
+            # of any checkout resolving correctly) AND capture git's exit code
+            # explicitly. stdout-empty and git-failure produce the same empty
+            # string here, and the skip branch can't tell them apart -- that is
+            # the fail-open shape that would let any "couldn't compute the
+            # diff" path green out the job. Fail closed: a non-zero git exit
+            # means we cannot prove "nothing to inspect", so refuse to skip
+            # rather than guess. (Copilot on #294, comment 3948278713 --
+            # thread 6; same defect class as #294 itself / thread 5.)
+            pr_diff_output="$(git diff --name-only "$event_base_sha..$event_head_sha" -- .)"
+            pr_diff_rc=$?
+            if [ "$pr_diff_rc" -ne 0 ]; then
+              echo "::error::git diff --name-only $event_base_sha..$event_head_sha exited $pr_diff_rc; refusing to skip. The 'no diff to inspect' decision is unprovable when git cannot compute the diff -- 'couldn't compute' and 'diff is empty' produce the same stdout, and conflating them is fail-open. See #294 / comment 3948278713."
+              exit 1
+            fi
+            pr_diff_files="$pr_diff_output"
             if [ -z "$pr_diff_files" ]; then
               echo "no diff between event-payload base ($event_base_sha) and head ($event_head_sha); symbol-presence check has nothing to inspect, skipping"
               exit 0
