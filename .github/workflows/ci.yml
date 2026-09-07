@@ -10,6 +10,26 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Top-level permissions: required by CKV2_GHA_1 (Sentinel on #283), which
+# has cited this finding nine times on this PR. Sentinel bills the
+# absence of any top-level `permissions:` block as a single count,
+# regardless of job-by-job correctness; the only path through a clean
+# Sentinel run is to declare one here.
+#
+# Job-level `permissions:` blocks REPLACE this top-level block entirely
+# -- they do not intersect with it. The two jobs in this file that
+# already declare job-level blocks (symbol-presence-check: contents:
+# read; dependabot-coverage-note: {}) keep their own scopes unchanged.
+# The remaining five jobs (lint, typecheck, unit-tests, e2e-shell,
+# e2e-secrets) inherit `contents: read` from this block; none of them
+# push, comment, upload SARIF, or publish to GHCR, so the change is a
+# runtime no-op. Verified 2026-09-07 against the `uses:` lines on
+# actions/checkout, astral-sh/setup-uv, actions/setup-python,
+# actions/cache, taiki-e/install-action, and the local sops-env
+# composite -- none of those write to the GitHub API.
+permissions:
+  contents: read
+
 jobs:
   lint:
     name: Ruff lint + format
