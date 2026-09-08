@@ -31,9 +31,33 @@
 # grows the bill. Every failure here names which world it came from.
 #
 # ── TAG-PREFIX IS REQUIRED AND HAS NO DEFAULT ───────────────────────────────────
-# Deployments are tagged `<tag-prefix>-<run_id>` so a sweeper can reap this run's lease
-# and NOTHING else. A shared default once caused a sibling repo's cleanup to destroy a
-# live deployment, because both used the same `ci-<id>` shape. Put your repo name in it.
+# A shared default once caused a sibling repo's cleanup to destroy a live deployment,
+# because both used the same `ci-<id>` shape. Put your repo name in it.
+#
+# ⛔ CORRECTED. This said "Deployments are tagged `<tag-prefix>-<run_id>` SO A SWEEPER CAN
+# REAP THIS RUN'S LEASE and nothing else." That is not what happens. `just-akash tag`
+# writes `.tags.json` inside the INSTALLED PACKAGE DIRECTORY (`just_akash/api.py:31`),
+# and every CI job installs the CLI freshly via `uvx`, so the file is destroyed before any
+# later job or any sweeper reads it. The run id never leaves the runner and never reaches
+# the chain.
+#
+# ⚠ THE PROSE WAS LOAD-BEARING AND WRONG, WHICH IS WORSE THAN ABSENT. A consumer built an
+# hourly sweeper selecting on that tag. It reported:
+#
+#     [sweeper] 47 active deployments
+#     [sweeper] 0 carry a ci-<run_id> tag
+#               (47 with other tags, 0 untagged). Filter is working as designed; nothing to sweep.
+#
+# It had never reclaimed a lease. Both readings were artefacts of `""` vs `null`, and the
+# alarm branch was unreachable, so the reassuring branch ran every hour.
+#
+# ⇒ WHAT ACTUALLY CARRIES THE RUN ID IS `placement-key`, stamped below. It is
+# author-controlled, written ATOMICALLY inside MsgCreateDeployment, immutable afterwards,
+# and readable from the chain with ZERO auth — which is what a sweeper in another repo,
+# holding no key for this wallet, actually has. See #311.
+#
+# `tag-prefix` remains required because it still namespaces the local tag file and callers
+# pass it today; it is simply not the reaping key.
 name: Akash runner pool
 
 on:
@@ -574,6 +598,9 @@ jobs:
           STORAGE: ${{ inputs.storage }}
           EPHEMERAL: ${{ inputs.ephemeral }}
           PLACEMENT_KEY: ${{ inputs.placement-key }}
+          # Required for the attribution stamp below. github.run_id is numeric and
+          # server-supplied; it is not caller-controlled.
+          GH_RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
           # ⛔ FAIL CLOSED ON THE ONE INPUT WHOSE FAILURE MODE IS SILENT. An empty or
@@ -620,6 +647,73 @@ jobs:
           case "${PLACEMENT_KEY}" in
             dcloud|dcloud-*) echo "::error title=runner-pool::placement-key '${PLACEMENT_KEY}' is the Akash-wide default placement name, owned by nobody. A reaper aimed at it would match strangers' deployments. Namespace it to your repo." >&2; exit 2 ;;
             dfci-infra-*)    echo "::error title=runner-pool::placement-key '${PLACEMENT_KEY}' is the SIBLING repo's prefix, which its sweeper reaps on a schedule. Stamping it would have that sweeper close this pool mid-CI." >&2; exit 2 ;;
+          esac
+          # ── ATTRIBUTION IS NOT OPTIONAL ─────────────────────────────────────────────
+          # ⛔ THIS IS WHAT MAKES A LEAKED POOL IMPOSSIBLE TO CREATE RATHER THAN MERELY
+          # DETECTABLE. Before this, `placement-key` said WHOSE a deployment is and nothing
+          # said WHETHER IT IS STILL NEEDED, so every reaper had to fall back to age -- a
+          # proxy. Measured on one shared wallet 2026-09-08: 112 of 128 active deployments
+          # carried no run reference at all, and a consumer's 6h age floor left 69 of 83
+          # pools protected-and-unreapable at any instant, because a floor as the PRIMARY
+          # rule guarantees a standing population of `floor x leak-rate`.
+          #
+          # ⚠ AND `tag-prefix` DOES NOT DO THIS, THOUGH ITS DOCS AT THE TOP OF THIS FILE SAY
+          # IT DOES. `just-akash tag` writes .tags.json inside the INSTALLED PACKAGE
+          # DIRECTORY (api.py:31), which every fresh `uvx` install destroys, so the run id
+          # never leaves the runner. A consumer built an hourly sweeper on that tag and it
+          # reported "47 active deployments, 0 carry a ci-<run_id> tag ... Filter is working
+          # as designed; nothing to sweep" while having never reclaimed a lease. See #311.
+          #
+          # ⇒ The placement key is the only marker that is author-controlled, written
+          # ATOMICALLY inside MsgCreateDeployment, immutable afterwards, and readable from
+          # the chain with ZERO auth -- which is what a sweeper in another repo, holding no
+          # key for this wallet, actually has.
+          #
+          # ⚠ IDEMPOTENT ON PURPOSE. blazing#962 stamps caller-side, and Blazing-Back has
+          # shipped `dfci-infra-runner-run-<id>-end` for months. Double-stamping would give
+          # them a name their own sweeper's `run-(\d+)` no longer matches -- so a callee
+          # that "improved" attribution would silently DISABLE it for the two consumers
+          # already doing it right.
+          # ⛔ THE IDEMPOTENCY TEST MUST VALIDATE THE SEGMENT, NOT JUST SPOT `-run-`.
+          #    `*-run-[0-9]*` also matches `foo-run-1abc-end`, which would be treated as
+          #    already attributed and skip stamping -- producing a pool whose run segment
+          #    no sweeper's `run-([0-9]+)` can resolve. That is an UNATTRIBUTABLE pool
+          #    created by the very block whose job is to make attribution mandatory, and it
+          #    would look stamped to a human reading the name.
+          #
+          #    So: extract the segment after the LAST `-run-`, up to the next `-`, and
+          #    require it to be digits. Malformed REFUSES rather than stamping on top --
+          #    `foo-run-1abc-end-run-123-end` carries two run segments and the first one
+          #    wins for any greedy matcher.
+          _rest="${PLACEMENT_KEY##*-run-}"
+          _seg="${_rest%%-*}"
+          case "${PLACEMENT_KEY}" in
+            *-run-*)
+              case "${_seg}" in
+                ""|*[!0-9]*)
+                  echo "::error title=runner-pool::placement-key '${PLACEMENT_KEY}' contains a '-run-' segment that is not a plain run id ('${_seg}'). Refusing rather than stamping a second one: a key with two run segments resolves to whichever a sweeper matches first, and a key with a malformed one resolves to nothing." >&2
+                  exit 2 ;;
+              esac
+              ;;  # already attributed, and the segment is a real run id
+            *)
+              # ⚠ `:-` so an unset var reaches the check below instead of killing the
+              #    step on `set -u` with "unbound variable". Both refuse, but only one
+              #    says WHY -- and an unattributed pool is the thing this exists to stop.
+              case "${GH_RUN_ID:-}" in
+                ""|*[!0-9]*)
+                  echo "::error title=runner-pool::GH_RUN_ID is '${GH_RUN_ID:-}', not a plain run id. The attribution stamp is interpolated into the SDL, and an unattributed pool is one no sweeper can prove is closable." >&2
+                  exit 2 ;;
+              esac
+              PLACEMENT_KEY="${PLACEMENT_KEY}-run-${GH_RUN_ID:-}-end"
+              ;;
+          esac
+          # Re-assert the shape AFTER the stamp. The appended segment is digits and dashes,
+          # so this cannot fail today -- which is exactly why it is here: a future change to
+          # the stamp must not be able to restructure the SDL document.
+          case "${PLACEMENT_KEY}" in
+            *[!A-Za-z0-9._-]*|-*|.*|"")
+              echo "::error title=runner-pool::placement key after the attribution stamp is '${PLACEMENT_KEY}', which is not a plain placement key." >&2
+              exit 2 ;;
           esac
           echo "placement key (on-chain group_spec.name): ${PLACEMENT_KEY}"
           # All N replicas share ONE label carrying run identity; the runner image

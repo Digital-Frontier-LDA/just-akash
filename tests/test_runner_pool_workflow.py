@@ -783,6 +783,9 @@ def test_the_guard_actually_runs_and_decides(key, accepted, tmp_path):
         "STORAGE": "1Gi",
         "EPHEMERAL": "true",
         "PLACEMENT_KEY": key,
+        # The step sets this from `github.run_id` for the attribution stamp (#311). The
+        # harness must supply what the real step supplies, or it tests a different script.
+        "GH_RUN_ID": "34228480597",
     }
     proc = subprocess.run(["bash", "-e", str(script)], env=env, capture_output=True, text=True)
     if accepted:
