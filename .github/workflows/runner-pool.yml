@@ -674,15 +674,34 @@ jobs:
           # them a name their own sweeper's `run-(\d+)` no longer matches -- so a callee
           # that "improved" attribution would silently DISABLE it for the two consumers
           # already doing it right.
+          # ⛔ THE IDEMPOTENCY TEST MUST VALIDATE THE SEGMENT, NOT JUST SPOT `-run-`.
+          #    `*-run-[0-9]*` also matches `foo-run-1abc-end`, which would be treated as
+          #    already attributed and skip stamping -- producing a pool whose run segment
+          #    no sweeper's `run-([0-9]+)` can resolve. That is an UNATTRIBUTABLE pool
+          #    created by the very block whose job is to make attribution mandatory, and it
+          #    would look stamped to a human reading the name.
+          #
+          #    So: extract the segment after the LAST `-run-`, up to the next `-`, and
+          #    require it to be digits. Malformed REFUSES rather than stamping on top --
+          #    `foo-run-1abc-end-run-123-end` carries two run segments and the first one
+          #    wins for any greedy matcher.
+          _rest="${PLACEMENT_KEY##*-run-}"
+          _seg="${_rest%%-*}"
           case "${PLACEMENT_KEY}" in
-            *-run-[0-9]*) : ;;  # already attributed by the caller
+            *-run-*)
+              case "${_seg}" in
+                ""|*[!0-9]*)
+                  echo "::error title=runner-pool::placement-key '${PLACEMENT_KEY}' contains a '-run-' segment that is not a plain run id ('${_seg}'). Refusing rather than stamping a second one: a key with two run segments resolves to whichever a sweeper matches first, and a key with a malformed one resolves to nothing." >&2
+                  exit 2 ;;
+              esac
+              ;;  # already attributed, and the segment is a real run id
             *)
               # ⚠ `:-` so an unset var reaches the check below instead of killing the
               #    step on `set -u` with "unbound variable". Both refuse, but only one
               #    says WHY -- and an unattributed pool is the thing this exists to stop.
               case "${GH_RUN_ID:-}" in
                 ""|*[!0-9]*)
-                  echo "::error title=runner-pool::GH_RUN_ID is '${GH_RUN_ID}', not a plain run id. The attribution stamp is interpolated into the SDL, and an unattributed pool is one no sweeper can prove is closable." >&2
+                  echo "::error title=runner-pool::GH_RUN_ID is '${GH_RUN_ID:-}', not a plain run id. The attribution stamp is interpolated into the SDL, and an unattributed pool is one no sweeper can prove is closable." >&2
                   exit 2 ;;
               esac
               PLACEMENT_KEY="${PLACEMENT_KEY}-run-${GH_RUN_ID:-}-end"

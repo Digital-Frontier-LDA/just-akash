@@ -36,7 +36,7 @@ stamp "$1" "$2"
 def _stamp_body() -> str:
     text = WORKFLOW.read_text(encoding="utf-8")
     m = re.search(
-        r"^(\s*)case \"\$\{PLACEMENT_KEY\}\" in\n\s*\*-run-\[0-9\]\*\).*?^\1esac\n",
+        r"^(\s*)_rest=\"\$\{PLACEMENT_KEY##\*-run-\}\".*?^\1esac\n",
         text,
         re.M | re.S,
     )
@@ -62,7 +62,7 @@ def test_the_block_was_actually_found() -> None:
     """POPULATION FLOOR — an empty extraction would make every case below vacuously pass."""
     body = _stamp_body()
     assert "-run-${GH_RUN_ID:-}-end" in body
-    assert "*-run-[0-9]*" in body
+    assert '_seg="${_rest%%-*}"' in body
 
 
 def test_an_unattributed_key_gets_the_run_id() -> None:
@@ -110,3 +110,28 @@ def test_the_docs_no_longer_claim_tag_prefix_carries_the_run_id() -> None:
         "the tag-prefix docs still claim it carries the run id to a sweeper; the placement "
         "key does that now, and the tag does not reach the chain at all"
     )
+
+
+def test_a_malformed_run_segment_REFUSES_rather_than_bypassing_the_stamp() -> None:
+    """⛔ THE BYPASS CASE. The first version tested `*-run-[0-9]*`, which also matches
+    `foo-run-1abc-end`. That key would be treated as already attributed, skip stamping, and
+    produce a pool whose run segment no sweeper's `run-([0-9]+)` can resolve — an
+    UNATTRIBUTABLE pool created by the block whose job is to make attribution mandatory, and
+    one that looks stamped to a human reading the name.
+
+    ⚠ Stamping a SECOND segment on top would be worse than refusing:
+    `foo-run-1abc-end-run-123-end` carries two, and the first one wins for a greedy matcher.
+    """
+    for bad in ("foo-run-1abc-end", "foo-run--end", "foo-run-x-end"):
+        rc, _ = _run(bad, "34228480597")
+        assert rc == 2, f"malformed run segment {bad!r} was not refused"
+
+
+def test_the_error_path_survives_set_u() -> None:
+    """⛔ The guard used `${GH_RUN_ID:-}` in its TEST and `${GH_RUN_ID}` in its ERROR
+    MESSAGE. Under `set -u` the message line dies before printing, so the one case the block
+    exists to explain would exit with "unbound variable" and no explanation."""
+    body = _stamp_body()
+    assert "${GH_RUN_ID}'" not in body, "the error message must use ${GH_RUN_ID:-}"
+    rc, out = _run("borduas-pool", "")
+    assert rc == 2
