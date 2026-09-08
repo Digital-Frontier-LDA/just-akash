@@ -12,7 +12,7 @@ recurrent defect across these repos, and here it sat in the one place callers ac
 self-terminating TTL requiring no reaper, no event, no credential and no correct code — the
 only bound that holds when every other layer fails.
 
-MEASURED on chain 2026-09-09 (zero auth, repeatable by anyone): blazing's active stamped
+MEASURED on chain 2026-09-08 (zero auth, repeatable by anyone): blazing's active stamped
 pools each held funds 1,988,192 uact against a lease rate of 69 uact/block = 28,814 blocks
 ≈ 48.0h, identical across every one. The longest run they provision for is ~2h, so an
 undetected leak bills for ~24x the job it served. The chain's own floor is
