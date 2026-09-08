@@ -54,16 +54,14 @@ def _stamp_body() -> str:
 
 def _run(key: str, run_id: str) -> tuple[int, str]:
     script = _HARNESS.format(body=_stamp_body())
-    p = subprocess.run(
-        ["bash", "-c", script, "bash", key, run_id], capture_output=True, text=True
-    )
+    p = subprocess.run(["bash", "-c", script, "bash", key, run_id], capture_output=True, text=True)
     return p.returncode, p.stdout.strip()
 
 
 def test_the_block_was_actually_found() -> None:
     """POPULATION FLOOR — an empty extraction would make every case below vacuously pass."""
     body = _stamp_body()
-    assert "-run-${GH_RUN_ID}-end" in body
+    assert "-run-${GH_RUN_ID:-}-end" in body
     assert "*-run-[0-9]*" in body
 
 

@@ -677,12 +677,15 @@ jobs:
           case "${PLACEMENT_KEY}" in
             *-run-[0-9]*) : ;;  # already attributed by the caller
             *)
-              case "${GH_RUN_ID}" in
+              # ⚠ `:-` so an unset var reaches the check below instead of killing the
+              #    step on `set -u` with "unbound variable". Both refuse, but only one
+              #    says WHY -- and an unattributed pool is the thing this exists to stop.
+              case "${GH_RUN_ID:-}" in
                 ""|*[!0-9]*)
                   echo "::error title=runner-pool::GH_RUN_ID is '${GH_RUN_ID}', not a plain run id. The attribution stamp is interpolated into the SDL, and an unattributed pool is one no sweeper can prove is closable." >&2
                   exit 2 ;;
               esac
-              PLACEMENT_KEY="${PLACEMENT_KEY}-run-${GH_RUN_ID}-end"
+              PLACEMENT_KEY="${PLACEMENT_KEY}-run-${GH_RUN_ID:-}-end"
               ;;
           esac
           # Re-assert the shape AFTER the stamp. The appended segment is digits and dashes,
