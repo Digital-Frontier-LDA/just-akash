@@ -193,6 +193,12 @@ def test_empty_history_does_not_bypass_any_proof(monkeypatch, capsys, case):
     assert calls
 
 
+def test_zero_total_with_continuation_is_rejected_before_following_cursor(monkeypatch, capsys):
+    rc, proof, calls = actual_cli(monkeypatch, capsys, "cursor_loop")
+    assert rc == 1 and proof["closed"] is False
+    assert len(calls) == 2  # one contradictory lease read per independent source
+
+
 def test_exact_deployment_proof_omission_changes_actual_cli_effect(monkeypatch, capsys):
     rc, proof, _ = actual_cli(monkeypatch, capsys, "open_escrow")
     assert rc == 1 and proof["closed"] is False
