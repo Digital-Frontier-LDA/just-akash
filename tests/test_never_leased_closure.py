@@ -74,7 +74,7 @@ def read_fixture(case, calls):
                 return None
             return doc
         assert "/leases/list?" in url
-        doc = {"leases": [], "pagination": {"next_key": None, "total": "0"}}
+        doc: dict = {"leases": [], "pagination": {"next_key": None, "total": "0"}}
         if case == "unreadable":
             raise OSError("offline failure")
         if case == "missing_population":
@@ -86,9 +86,9 @@ def read_fixture(case, calls):
         if case == "positive_total":
             doc["pagination"]["total"] = "1"
         if case == "invalid_total":
-            doc["pagination"]["total"] = False
+            doc["pagination"] = {"next_key": None, "total": False}
         if case == "invalid_cursor":
-            doc["pagination"]["next_key"] = []
+            doc["pagination"] = {"next_key": [], "total": "0"}
         if case == "cursor_loop":
             doc["pagination"]["next_key"] = "again"
         if case == "page_limit":
@@ -202,7 +202,7 @@ def test_exact_deployment_proof_omission_changes_actual_cli_effect(monkeypatch, 
     namespace = dict(vars(verifier))
     exec(source.replace(needle, "True", 1), namespace)
     mutant = namespace["verdict"]
-    function = types.FunctionType(mutant.__code__, vars(verifier), argdefs=mutant.__defaults__)
+    function = types.FunctionType(mutant.__code__, verifier.__dict__, argdefs=mutant.__defaults__)
     function.__kwdefaults__ = mutant.__kwdefaults__
     monkeypatch.setattr(verifier, "verdict", function)
     rc, proof, calls = actual_cli(monkeypatch, capsys, "open_escrow")
