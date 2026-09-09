@@ -9,6 +9,10 @@ smoke's sweep only reaps service-set ``{probe}`` deployments; e2e leftovers
 (service ``backtest``) and older leaks accumulate with no reaper. This is that
 reaper, as an on-demand maintenance command.
 
+Service/age classification finds candidates only. Every close additionally requires
+an explicit ownership register, agreeing all-group chain identity and fresh same-attempt
+completed CI run evidence. Legacy/unclassified, staging and production remain HELD.
+
 Classification is deliberately conservative — close ONLY what is unambiguously
 disposable test residue; when in doubt, leave it and say so:
 
@@ -43,12 +47,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
 from dataclasses import dataclass
 
-from . import chain
+from . import chain, cleanup_identity
 from .api import AkashConsoleAPI, _extract_dseq, escrow_locked
 from .provenance import PLACEMENT_PREFIX
 from .smoke_providers import (
@@ -514,6 +519,7 @@ def run(
     reap_owned: bool = False,
     api_key: str | None = None,
     max_close: int = MAX_CLOSE_PER_RUN,
+    ownership_register: dict | None = None,
 ) -> int:
     """Audit (and optionally close) stale test deployments.
 
@@ -605,6 +611,7 @@ def run(
     # the enumerated count as the tripwire denominator understates the stale
     # FRACTION, so a provider having a bad day would silently loosen the safety
     # margin — read failures making a rail LESS likely to fire is backwards.
+    identity_held = 0
     classified = 0
     no_dseq = 0
     unreadable = 0
@@ -659,11 +666,19 @@ def run(
             protected.append(dseq)
             continue
         if verdict in STALE_VERDICTS and not filtered:
+            allowed, reason = cleanup_identity.eligible(
+                address, str(dseq), placement_prefix, ownership_register
+            )
+            if not allowed:
+                identity_held += 1
+                print(f"  {dseq} HELD: {reason}")
+                continue
             stale.append(dseq)
             # -1.0 sorts an unaged deployment LAST, never first: an unknown age
             # must not win a race to be closed under a cap.
             stale_ages[dseq] = age if age is not None else -1.0
 
+    print(f"identity HELD: {identity_held} (unclassified is not non-production)")
     if protected:
         print(f"\nPROTECTED (never-close list): {len(protected)} -> {', '.join(protected)}")
     print(f"\nstale (closable): {len(stale)}")
@@ -710,7 +725,7 @@ def run(
             )
         else:
             print("DRY RUN — nothing closed, and nothing is closable.")
-        return 0
+        return 2 if identity_held else 0
 
     if plan.refusal:
         print(f"\nREFUSING TO EXECUTE: {plan.refusal}", file=sys.stderr)
@@ -727,6 +742,13 @@ def run(
 
     closed, failed = 0, 0
     for dseq in stale:
+        allowed, reason = cleanup_identity.eligible(
+            address, str(dseq), placement_prefix, ownership_register
+        )
+        if not allowed:
+            identity_held += 1
+            print(f"  {dseq} HELD before close: {reason}")
+            continue
         try:
             client.close_deployment(dseq)
             closed += 1
@@ -741,7 +763,7 @@ def run(
     # AFTER line reflects the releases.
     time.sleep(10)
     print(f"credit AFTER:  {_credit_line(client, address)}")
-    return 0 if failed == 0 else 1
+    return 1 if failed else 2 if identity_held else 0
 
 
 def _resolve_distinct_accounts(
@@ -996,9 +1018,19 @@ def main(argv: list[str] | None = None) -> int:
             "STAMPED. A blank value is refused — it would match everything."
         ),
     )
+    ap.add_argument(
+        "--ownership-register",
+        type=json.loads,
+        default=None,
+        help=(
+            "Explicit JSON mapping of registered placement prefixes to owning GitHub "
+            "repositories; absent means HELD"
+        ),
+    )
     args = ap.parse_args(argv)
     return run_all_wallets(
         execute=args.execute,
+        ownership_register=args.ownership_register,
         max_close=args.max_close,
         reap_runners=args.reap_runners,
         reap_owned=args.reap_owned,
