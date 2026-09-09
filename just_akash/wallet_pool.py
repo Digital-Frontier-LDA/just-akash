@@ -277,13 +277,23 @@ def select_client_for_dseq(
     *,
     client_factory: Callable[[str], AkashConsoleAPI] = AkashConsoleAPI,
 ) -> AkashConsoleAPI:
-    """Find the configured wallet that owns ``dseq`` by positive read-back."""
+    """Find the configured wallet that positively owns ``dseq`` by read-back.
+
+    Every candidate key is read against the DSEQ, including the only
+    candidate when the pool holds exactly one key. The previous one-key
+    fastpath returned the client without calling ``get_deployment`` —
+    the wallet then claimed positive ownership of a DSEQ it had never
+    actually read, and the verify-closed chain verification would have
+    proceeded against an unproven owner. With a single-key pool that
+    misconfigures (or rotates the key out from under the deployment),
+    every read in the close step would still pass through `account_address()`
+    and produce a syntactically valid `akash1...` address for a wallet
+    that has no business touching this lease.
+    """
 
     keys = configured_api_keys()
     if not keys:
         raise RuntimeError("AKASH_API_KEY or AKASH_API_KEYS must be set")
-    if len(keys) == 1:
-        return client_factory(keys[0])
     for key in keys:
         client = client_factory(key)
         try:

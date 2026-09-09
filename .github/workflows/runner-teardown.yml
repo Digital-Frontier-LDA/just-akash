@@ -29,10 +29,10 @@
 #    job; it does nothing for one that registered and was never used.
 #
 # ── WHY IT VERIFIES INSTEAD OF TRUSTING THE EXIT CODE ───────────────────────────
-# "Deployment closed" on stderr with a non-zero exit is a SUCCESS, and a zero exit is
-# not proof the lease is gone. This reads the deployment's state back and reports
-# `closed` on that, because a teardown that reports success it did not achieve is how
-# leases accumulate silently for weeks.
+# Neither destroy text nor its exit code proves closure. Two distinct chain hosts
+# must agree on the complete owner-scoped lease population, with every lease terminal,
+# and positively read both deployment and escrow closed.
+# Unreadable, empty, partial, active, or disagreeing populations remain unverified.
 name: Akash runner teardown
 
 on:
@@ -191,6 +191,33 @@ jobs:
           # where the operator asserts the account hosts nothing but their own pools.
           echo "closing dseq=$DSEQ (created by this run; tagged ${TAG_PREFIX}-*)"
 
+          # ⛔ RESOLVE OWNER BEFORE DESTROY. After destroy the Console API may
+          # 404 — the deployment is gone, the wallet pool read returns empty,
+          # and a verify-closed call that depends on resolving the owner at
+          # verify-time will fail precisely when it matters. Capture the
+          # positively-owning account now while the deployment still reads.
+          # ⛔ bash `-e` is the DEFAULT (set -uo pipefail does not disable it);
+          # an unguarded non-zero exit from resolve-owner would terminate the
+          # script BEFORE OWNER_RC is captured and BEFORE closed=unknown is
+          # written — the harness reproduces this as empty GITHUB_OUTPUT.
+          # `|| OWNER_RC=$?` makes the failure non-fatal so we can branch on
+          # it below. Same pattern applies to verify-closed below.
+          "${JA[@]}" resolve-owner --dseq "$DSEQ" --json >/tmp/owner.json 2>/tmp/owner.err || OWNER_RC=$?
+          OWNER_RC=${OWNER_RC:-0}
+          if [ "$OWNER_RC" -ne 0 ]; then
+            echo "::error title=Could not resolve owner before destroy::dseq=$DSEQ — resolve-owner exited $OWNER_RC. Without a captured owner, closure verification cannot proceed safely after destroy."
+            echo "closed=unknown" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          OWNER=$(python3 -c "import json,sys;print(json.load(sys.stdin).get('owner',''))" \
+                  </tmp/owner.json 2>/dev/null || echo "")
+          if [ -z "$OWNER" ]; then
+            echo "::error title=No owner captured::dseq=$DSEQ — resolve-owner returned empty owner"
+            echo "closed=unknown" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "captured owner=$OWNER"
+
           # ⛔ THE RETRY BUDGET WAS ON THE WRONG OPERATION. This loop retries the
           # DESTROY three times; the verification below used to get exactly one
           # immediate read. On blazing#920 (run 34138613280) destroy SUCCEEDED on
@@ -207,66 +234,53 @@ jobs:
             # A non-zero exit whose output says the deployment is already closed IS a
             # success. Treating it as a failure sends the next reader looking for an
             # outage that never happened.
-            grep -qiE "Deployment closed|already closed|not found" /tmp/destroy.log && break
+            # ⛔ Match just-akash's CONTRACT strings only — "Deployment closed" and
+            # "already closed". "not found" is a generic substring that false-greens on
+            # any error message containing those words ("credentials file not found",
+            # missing config file, etc.) and would exit this loop on a destroy that
+            # never actually closed the lease.
+            grep -qiE "Deployment closed|already closed" /tmp/destroy.log && break
             sleep 5
           done
 
-          # Verify rather than trust: read the state back — but let the close
-          # propagate first. Retrying HERE can only convert a false red into a pass:
-          # a lease that is genuinely still open reads 'active' on every attempt and
-          # still fails below, byte for byte. This loop cannot manufacture a success
-          # it did not observe, which is why the retry belongs here and not on a
-          # wider acceptance rule.
-          GONE=no
-          grep -qiE "already closed|not found" /tmp/destroy.log 2>/dev/null && GONE=yes
-          STATE=""
-          READS=0
-          for _read in 1 2 3 4 5; do
-            READS=$_read
-            "${JA[@]}" status --dseq "$DSEQ" --json >/tmp/status.json 2>/tmp/status.err || true
-            STATE=$(python3 -c "import json,sys;print((json.load(sys.stdin) or {}).get('state',''))" \
-                    </tmp/status.json 2>/dev/null || true)
-            # A deployment that has fully propagated out of the API reads as
-            # not-found, NOT as state=closed. That is GONE — a positive observation
-            # that it no longer exists — and must not be scored as "unreadable".
-            # ⛔ THE 404 SHAPE, NOT THE WORDS "not found". A bare substring is wrong in BOTH
-            # directions: an unrelated failure whose text happens to contain "not found"
-            # (a missing config file, a provider message) would be scored as a positive
-            # GONE observation and report closed=true over an OPEN lease — a false GREEN,
-            # the one failure this whole step exists to prevent — while a genuine 404 whose
-            # wording differs would be missed. api.py formats every failure as
-            # "API Error (<code>): ..." (api.py:271) and matches that exact prefix itself at
-            # api.py:413, so it is a stable contract rather than a guess at prose.
-            if grep -qE 'API Error \(404\)|"code": *"not_found"|NotFoundError' /tmp/status.json /tmp/status.err 2>/dev/null; then
-              GONE=yes; STATE=""; break
-            fi
-            [ "$STATE" = closed ] && break
-            [ "$_read" = 5 ] || sleep 6
-          done
-          echo "verify: destroy attempts=$DESTROY_TRIES, state reads=$READS, final state=[$STATE], gone=$GONE"
-          # "" means we could NOT READ the state — a transient API error, a non-zero
-          # exit, unparseable JSON. Reporting closed=true on that is the exact failure
-          # this step exists to prevent: a success we did not achieve, with the lease
-          # still holding escrow. Only a deployment the destroy said is GONE may pass on
-          # an empty read.
-          case "$STATE" in
-            closed)
-              echo "closed=true" >> "$GITHUB_OUTPUT"
-              echo "lease $DSEQ confirmed closed" ;;
-            "")
-              if [ "$GONE" = yes ]; then
-                echo "closed=true" >> "$GITHUB_OUTPUT"
-                echo "lease $DSEQ no longer exists — treating as closed"
-              else
-                echo "closed=unknown" >> "$GITHUB_OUTPUT"
-                echo "::error title=Could not VERIFY the lease is closed::dseq=$DSEQ — the destroy ran but the state read back empty, so this is 'unverified', not 'closed'. If it is still open it holds escrow against the grant the next run spends from. Check: just-akash status --dseq $DSEQ"
-                exit 1
-              fi ;;
-            *)
-              echo "closed=false" >> "$GITHUB_OUTPUT"
-              echo "::error title=Lease may still be OPEN and holding escrow::dseq=$DSEQ reads state='$STATE' after $DESTROY_TRIES destroy attempt(s) and $READS state reads. Those are the counts this run actually made, not a fixed number: a destroy that SUCCEEDED on attempt 1 still prints here if the state never settled. It will keep escrow locked against the grant the next run spends from, so the next run's funding failure will look like a market outage. Close it manually: just-akash destroy --dseq $DSEQ -y"
-              exit 1 ;;
-          esac
+          # ⛔ CLOSURE PROOF MUST COME FROM TWO-ENDPOINT CHAIN AGREEMENT, NOT FROM
+          # THIS STEP'S OWN OBSERVATIONS. A single Console API read, a destroy text
+          # match, or a partial read can all read as success over an OPEN lease (the
+          # exact failure #952 reproduced 2026-09-09: Console GET 404 with the chain
+          # still showing state=active). The verify-closed subcommand paginates the
+          # owner/dseq intersection from two distinct HTTPS chain origins and only
+          # returns closed=true when BOTH return the SAME complete identity map and
+          # every entry's state is terminal. The owner is the one captured by
+          # resolve-owner BEFORE destroy, so a Console 404 at verify-time does not
+          # blind the verifier.
+          # ⛔ `|| VERIFY_RC=$?` so a verify-closed exit 1 does not abort the
+          # script under bash `-e` (set -uo pipefail does not disable -e).
+          # Without this, a non-zero exit skips VERIFY_RC capture and the
+          # closed=unknown branch below — reproducing the empty-GITHUB_OUTPUT
+          # failure mode the harness exercises.
+          "${JA[@]}" verify-closed --dseq "$DSEQ" --owner "$OWNER" --json \
+            >/tmp/verify.json 2>/tmp/verify.err || VERIFY_RC=$?
+          VERIFY_RC=${VERIFY_RC:-0}
+          # ⛔ Typed check: only Python's literal True counts as "closed". The
+          # JSON `closed: true` is a Python True; the JSON `closed: false` is
+          # a Python False; anything else (None, missing, string) is unknown.
+          # Using `is True` here — and echoing `True`/`False` to bash — means
+          # a future JSON shape like `closed: "True"` (string) cannot pass.
+          VERDICT=$(python3 -c "import json,sys;print(json.load(sys.stdin).get('closed') is True)" \
+                    </tmp/verify.json 2>/dev/null || echo "False")
+          REASON=$(python3 -c "import json,sys;print(json.load(sys.stdin).get('reason',''))" \
+                   </tmp/verify.json 2>/dev/null || echo "")
+          echo "verify: destroy attempts=$DESTROY_TRIES, chain verdict=$VERDICT reason=$REASON"
+          # ⛔ BOTH the typed closed=True AND a zero exit are required. stdout True
+          # alone must not override a non-zero exit.
+          if [ "$VERIFY_RC" -eq 0 ] && [ "$VERDICT" = "True" ]; then
+            echo "closed=true" >> "$GITHUB_OUTPUT"
+            echo "lease $DSEQ closed; verifier returned terminal states across two endpoints"
+            exit 0
+          fi
+          echo "closed=unknown" >> "$GITHUB_OUTPUT"
+          echo "::error title=Could not VERIFY the lease is closed::dseq=$DSEQ verifier said '$REASON' (rc=$VERIFY_RC). The destroy ran but the chain did not agree on a terminal state across two endpoints. If it is still open it holds escrow against the grant the next run spends from. Check: just-akash verify-closed --dseq $DSEQ --owner $OWNER"
+          exit 1
 
       # Separate step, and always: the registration outlives the pod, so it must be
       # cleaned even when the lease close failed.

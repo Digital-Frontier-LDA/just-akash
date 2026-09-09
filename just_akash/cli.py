@@ -591,6 +591,86 @@ def main():
     destroy_p.add_argument("--dseq", default="")
     destroy_p.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompts")
 
+    # ── verify-closed ──────────────────────────────────
+    verify_closed_p = subparsers.add_parser(
+        "verify-closed",
+        help=(
+            "Verify a lease is closed by owner-scoped agreement across TWO distinct chain "
+            "endpoints. Returns {closed: bool, sources: [...], reason: ...}. closed=true "
+            "ONLY when both endpoints return the SAME complete (owner/dseq/gseq/oseq/"
+            "bseq/provider) identity map AND every entry's state is terminal "
+            "(closed or insufficient_funds), with deployment and escrow both closed. "
+            "A single Console read, a destroy text match, "
+            "or a partial chain read is never sufficient proof."
+        ),
+    )
+    verify_closed_p.add_argument("--dseq", required=True, help="Deployment sequence to verify")
+    verify_closed_p.add_argument(
+        "--owner",
+        required=False,
+        default=None,
+        help=(
+            "Owner Akash address (akash1...). If omitted, derived from the configured "
+            "Console wallet pool via _resolve_deployment_client — same path destroy uses."
+        ),
+    )
+    verify_closed_p.add_argument(
+        "--endpoint",
+        action="append",
+        dest="endpoints",
+        default=None,
+        metavar="URL",
+        help=(
+            "Chain endpoint to consult (repeatable). Two distinct HTTPS origins are "
+            "required for a positive verdict. Defaults to the proven Akash REST endpoints "
+            "(Polkachu + cosmos.directory/akash)."
+        ),
+    )
+    verify_closed_p.add_argument(
+        "--retries",
+        type=int,
+        default=5,
+        help="Bounded retries for chain-lag propagation (default: 5).",
+    )
+    verify_closed_p.add_argument(
+        "--retry-sleep",
+        dest="retry_sleep_s",
+        type=float,
+        default=2.0,
+        help=(
+            "Seconds to sleep between retry attempts when the chain still "
+            "shows an active lease or an endpoint is unreadable (default: 2). "
+            "Set to 0 to disable the delay (the close step's destroy loop "
+            "already has its own retry patience; this is the observation-side "
+            "counterpart for chain-propagation lag)."
+        ),
+    )
+    verify_closed_p.add_argument(
+        "--json",
+        action="store_true",
+        default=True,
+        help="Emit JSON verdict (default; preserved for explicitness).",
+    )
+
+    # ── resolve-owner ───────────────────────────────────
+    resolve_owner_p = subparsers.add_parser(
+        "resolve-owner",
+        help=(
+            "Resolve the Akash account that positively owns a DSEQ by walking the "
+            "configured Console wallet pool. Read-only: emits JSON {owner, dseq, source} "
+            "and exits 0; exits 1 when no wallet in the pool claims the DSEQ. Used by "
+            "the close step BEFORE destroy so closure verification has a captured owner "
+            "even after the deployment has closed/Console404."
+        ),
+    )
+    resolve_owner_p.add_argument("--dseq", default="")
+    resolve_owner_p.add_argument(
+        "--json",
+        action="store_true",
+        default=True,
+        help="Emit JSON {owner, dseq, source: 'wallet_pool'} (default).",
+    )
+
     # ── destroy-all ────────────────────────────────────
     destroy_all_p = subparsers.add_parser("destroy-all", help="Destroy all deployments")
     destroy_all_p.add_argument(
@@ -1756,6 +1836,77 @@ def main():
         except RuntimeError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
+
+    # ── verify-closed ──────────────────────────────────
+    elif args.command == "verify-closed":
+        import json as _json
+        from urllib import request as _urlrequest
+
+        from ._lease_verification import DEFAULT_ENDPOINTS
+        from ._lease_verification import verdict as _verdict
+        from .api import AkashConsoleAPI
+
+        owner = args.owner
+        if not owner:
+            # ⇒ Derive owner via the SAME machinery destroy uses —
+            # _resolve_deployment_client walks the configured Console wallet pool
+            # and returns the client that positively owns the DSEQ. The client's
+            # account_address is read from the JWT iss claim (a side-effect-free
+            # identity probe). This is the owner the chain is queried against.
+            client, dseq = _resolve_deployment_client(args.dseq)
+            owner = client.account_address()
+            if args.dseq and args.dseq != dseq:
+                print(
+                    f"::warning --dseq {args.dseq} did not match the resolved {dseq}",
+                    file=sys.stderr,
+                )
+
+        endpoints = args.endpoints or list(DEFAULT_ENDPOINTS)
+
+        def _get(url: str):
+            req = _urlrequest.Request(  # noqa: S310 — consensus admits HTTPS endpoints only
+                url,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "just-akash-verify-closed/1.0",
+                },
+            )
+            with _urlrequest.urlopen(req, timeout=15) as resp:  # noqa: S310 — HTTPS only
+                return _json.loads(resp.read().decode("utf-8"))
+
+        # ⇒ Bounded retries cover chain-lag propagation — the same patience
+        # the destroy retry loop has, on the observation side. Default
+        # retry-sleep is non-zero so an active observation right after
+        # destroy is given a chance to propagate before being declared
+        # permanent.
+        result = _verdict(
+            args.dseq,
+            owner,
+            endpoints,
+            _get,
+            retries=max(1, args.retries),
+            retry_sleep_s=max(0.0, args.retry_sleep_s),
+        )
+        print(_json.dumps(result))
+        # ⛔ BOTH the typed closed=True AND a zero exit are required.
+        # Stdout True alone must not override a non-zero exit (the harness's
+        # endpoint-disagreement case proves this — the verifier writes
+        # closed=false on disagreement, and the workflow must NOT report
+        # closed=true over an unverified verdict).
+        if result.get("closed") is not True:
+            sys.exit(1)
+
+    # ── resolve-owner ──────────────────────────────────
+    elif args.command == "resolve-owner":
+        import json as _json
+
+        try:
+            client, dseq = _resolve_deployment_client(args.dseq)
+            owner = client.account_address()
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(_json.dumps({"owner": owner, "dseq": dseq, "source": "wallet_pool"}))
 
     # ── destroy-all ────────────────────────────────────
     elif args.command == "destroy-all":

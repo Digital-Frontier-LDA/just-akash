@@ -294,6 +294,7 @@ class TestDestroySuccessMatchesTheRealCLI:
 
         monkeypatch.setenv("AKASH_API_KEY", "test-key")
         monkeypatch.setattr("builtins.input", lambda _: "y")
+        MockAPI.return_value.get_deployment.return_value = {"dseq": "12345"}
         monkeypatch.setattr(sys, "argv", ["just-akash", "destroy", "--dseq", "12345"])
         main()
 
@@ -318,6 +319,7 @@ class TestDestroySuccessMatchesTheRealCLI:
 
         monkeypatch.setenv("AKASH_API_KEY", "test-key")
         monkeypatch.setattr("builtins.input", lambda _: "n")
+        MockAPI.return_value.get_deployment.return_value = {"dseq": "12345"}
         monkeypatch.setattr(sys, "argv", ["just-akash", "destroy", "--dseq", "12345"])
         main()
 
