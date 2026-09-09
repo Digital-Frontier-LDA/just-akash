@@ -147,3 +147,91 @@ def test_typed_verdict_is_required(lifecycle, monkeypatch, capsys):
     assert _main() == 1
     assert "closed=0 failed=0 unverified=1" in capsys.readouterr().out
     assert len([event for event in lifecycle["events"] if event[0] == "DELETE"]) == 1
+
+
+def test_mixed_wallet_closure_keeps_first_failure(lifecycle, monkeypatch, capsys):
+    """Real pool iteration must not let the last wallet's success erase an earlier failure."""
+    owners = [OWNER, "akash1" + "b" * 38]
+    dseqs = [DSEQ, str(int(DSEQ) + 1)]
+    keys = ["offline-first", "offline-second"]
+    monkeypatch.delenv("AKASH_API_KEY")
+    monkeypatch.setenv("AKASH_API_KEYS", ",".join(keys))
+    monkeypatch.setenv("AKASH_WALLETS_EXPECTED", "2")
+    deleted = set()
+    events = []
+    samples = {}
+    before = {}
+    clients = {}
+    name = format_identity(Identity(PREFIX, REPO, "ci-payload", 1, run=99, attempt=2), REGISTER)
+    for key, owner, dseq, sample in zip(
+        keys, owners, dseqs, ["open_escrow", "closed"], strict=True
+    ):
+        # Reuse recorded field structure, changing only the synthetic owner/dseq binding.
+        samples[owner] = json.loads(
+            json.dumps(lifecycle["samples"][sample]).replace(OWNER, owner).replace(DSEQ, dseq)
+        )
+        before[owner] = {
+            "deployment": {"id": {"owner": owner, "dseq": dseq}, "state": "active"},
+            "groups": [
+                {"id": {"owner": owner, "dseq": dseq, "gseq": 1}, "group_spec": {"name": name}}
+            ],
+        }
+        client = AkashConsoleAPI(key)
+        monkeypatch.setattr(client, "account_address", lambda owner=owner: owner)
+
+        def request(method, path, *args, owner=owner, dseq=dseq, **kwargs):
+            assert path == f"/v1/deployments/{dseq}"
+            events.append((owner, method, path))
+            if method == "GET":
+                return {"data": {"leases": [{"status": {"services": {"probe": {}}}}]}}
+            assert method == "DELETE"
+            deleted.add(owner)
+            return {"data": {"accepted": True}}
+
+        monkeypatch.setattr(client, "_request", request)
+        clients[key] = client
+    monkeypatch.setattr(cs, "AkashConsoleAPI", lambda key: clients[key])
+    by_owner = dict(zip(owners, dseqs, strict=True))
+    monkeypatch.setattr(
+        cs.chain, "list_active_deployments", lambda owner: [{"dseq": by_owner[owner]}]
+    )
+
+    def urlopen(request, timeout=15):
+        parsed = urlsplit(request.full_url)
+        assert parsed.hostname in {"one.test", "two.test"}
+        assert parsed.scheme == "https"
+        query = parse_qs(parsed.query)
+        is_deployment = parsed.path.endswith("/deployments/info")
+        owner_key, dseq_key = (
+            ("id.owner", "id.dseq")
+            if is_deployment
+            else (
+                "filters.owner",
+                "filters.dseq",
+            )
+        )
+        owner = query[owner_key][0]
+        assert owner in by_owner
+        assert query[dseq_key] == [by_owner[owner]]
+        phase = "after" if owner in deleted else "before"
+        events.append((owner, phase, request.full_url))
+        if is_deployment:
+            doc = samples[owner]["deployment"] if owner in deleted else before[owner]
+        else:
+            assert parsed.path.endswith("/leases/list")
+            assert owner in deleted
+            doc = samples[owner]["leases"]
+        return io.BytesIO(json.dumps(doc).encode())
+
+    monkeypatch.setattr(cs.chain.urllib.request, "urlopen", urlopen)
+    assert _main() == 1
+    output = capsys.readouterr().out
+    assert "closed=0 failed=0 unverified=1" in output
+    assert "closed=1 failed=0 unverified=0" in output
+    assert "audited 2 wallet(s); worst exit code 1" in output
+    assert [(owner, path) for owner, method, path in events if method == "DELETE"] == [
+        (owner, f"/v1/deployments/{dseq}") for owner, dseq in zip(owners, dseqs, strict=True)
+    ]
+    for owner in owners:
+        assert sum(phase == "before" for who, phase, _ in events if who == owner) == 4
+        assert any(who == owner and phase == "after" for who, phase, _ in events)
