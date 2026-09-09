@@ -173,6 +173,7 @@ def _run_level_mocks(client, group_names, dseq):
         patch.object(cs.chain, "deployment_group_names", return_value=group_names),
         patch.dict("os.environ", {"AKASH_API_KEY": "k"}),
         patch.object(cs.time, "sleep", lambda s: None),
+        patch.object(cs._lease_verification, "verdict", return_value={"closed": True}),
         patch.object(cs.chain, "rest_urls", return_value=["https://one.test", "https://two.test"]),
         patch.object(
             cs.chain,

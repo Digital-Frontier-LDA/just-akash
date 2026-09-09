@@ -205,6 +205,7 @@ def _run(client, execute: bool) -> int:
         ),
         patch.dict("os.environ", {"AKASH_API_KEY": "k"}),
         patch.object(cs.time, "sleep", lambda s: None),
+        patch.object(cs._lease_verification, "verdict", return_value={"closed": True}),
         # CI authorization is isolated here; test_cleanup_identity exercises real evidence.
         patch.object(
             cs.cleanup_identity, "eligible", return_value=(True, "authorized CI fixture")
@@ -283,6 +284,7 @@ class TestChainEnumerationIsAuthoritative:
             ),
             patch.dict("os.environ", {"AKASH_API_KEY": "k"}),
             patch.object(cs.time, "sleep", lambda s: None),
+            patch.object(cs._lease_verification, "verdict", return_value={"closed": True}),
             # CI authorization is isolated here; test_cleanup_identity exercises real evidence.
             patch.object(
                 cs.cleanup_identity, "eligible", return_value=(True, "authorized CI fixture")
@@ -333,6 +335,7 @@ class TestChainEnumerationIsAuthoritative:
             ),
             patch.dict("os.environ", {"AKASH_API_KEY": "k"}),
             patch.object(cs.time, "sleep", lambda s: None),
+            patch.object(cs._lease_verification, "verdict", return_value={"closed": True}),
             # CI authorization is isolated here; test_cleanup_identity exercises real evidence.
             patch.object(
                 cs.cleanup_identity, "eligible", return_value=(True, "authorized CI fixture")
@@ -371,6 +374,7 @@ class TestProtectedDseqs:
             ),
             patch.dict("os.environ", environ),
             patch.object(cs.time, "sleep", lambda s: None),
+            patch.object(cs._lease_verification, "verdict", return_value={"closed": True}),
             # CI authorization is isolated here; test_cleanup_identity exercises real evidence.
             patch.object(
                 cs.cleanup_identity, "eligible", return_value=(True, "authorized CI fixture")
@@ -530,6 +534,7 @@ class TestPlacementPrefixIsAReapParameter:
             ),
             patch.dict("os.environ", {"AKASH_API_KEY": "k"}),
             patch.object(cs.time, "sleep", lambda s: None),
+            patch.object(cs._lease_verification, "verdict", return_value={"closed": True}),
             # CI authorization is isolated here; test_cleanup_identity exercises real evidence.
             patch.object(
                 cs.cleanup_identity, "eligible", return_value=(True, "authorized CI fixture")

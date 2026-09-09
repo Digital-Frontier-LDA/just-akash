@@ -37,6 +37,8 @@ def _document(names):
 
 @pytest.fixture
 def setup(monkeypatch):
+    # This suite isolates authorization; closure has separate real HTTP controls.
+    monkeypatch.setattr(cs._lease_verification, "verdict", lambda *a, **k: {"closed": True})
     client = MagicMock()
     client.account_address.return_value = OWNER
     client.get_deployment.return_value = {"leases": [{"status": {"services": {"probe": {}}}}]}
