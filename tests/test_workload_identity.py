@@ -23,12 +23,9 @@ REGISTER = {
 
 
 def identity(prefix="borduas", workload_class="ci-runner", group=1):
-    fields = (
-        {"run": 12345, "attempt": 2}
-        if workload_class.startswith("ci-")
-        else {"release": "abc123.v1_2"}
-    )
-    return Identity(prefix, REGISTER[prefix], workload_class, group, **fields)
+    if workload_class.startswith("ci-"):
+        return Identity(prefix, REGISTER[prefix], workload_class, group, run=12345, attempt=2)
+    return Identity(prefix, REGISTER[prefix], workload_class, group, release="abc123.v1_2")
 
 
 @pytest.mark.parametrize("prefix", list(REGISTER))
