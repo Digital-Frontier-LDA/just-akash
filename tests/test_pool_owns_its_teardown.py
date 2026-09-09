@@ -1,35 +1,10 @@
-"""The pool OWNS its teardown — the leak of 2026-08-23 closed at the structural layer.
+"""The pool owns failed/cancelled provisioning rollback until successful handoff.
 
-★ THE MEASURED DEFECT (census 2026-08-23 13:20Z, TEAMLEAD): 13 `just-akash-runner.<hash>`
-deployments held 65 ACT of escrow for up to 23.5h — eleven created in EIGHT MINUTES
-(2026-08-22 14:16-14:24Z). Root cause, two layers:
-
-  1. runner-teardown.yml existed, was correct, and was called by ZERO workflows — the
-     pool→work→teardown pairing lived only in ITS OWN DOCSTRING. Documentation asserted
-     a property nothing implemented.
-  2. Even a wired teardown would have seen an EMPTY dseq on the runs that leaked most:
-     the pool publishes `dseq` to GITHUB_OUTPUT only in the success block (:685-695,
-     ending `exit 0`). A cancelled or failed run — exactly the runs that leave a lease
-     alive — produced no output at all.
-
-THE FIX (two parts, both pinned here):
-  A. An INTERNALIZED teardown job in runner-pool.yml: `needs: [pool]`, `if: always()`,
-     calling the existing runner-teardown.yml. Every future caller INHERITS correct
-     teardown instead of remembering to assemble it — the same inversion #1439/#1390
-     applied to close-follows-creation. This also CORRECTS THE C5 STANDARD: the
-     addendum's three-job protocol assumes the CONSUMER assembles pool→work→teardown;
-     internalizing removes that assumption.
-  B. EARLY dseq publication: the dseq is written to GITHUB_OUTPUT IMMEDIATELY after
-     lease creation, before tagging/registration, so a later failure or cancellation
-     still leaves the close identity available. (DEV5's #1439 pattern; empirically
-     confirmed there by the failed-provision CI run.)
-
-⚠ THE NO-OP DISCIPLINE (TEAMLEAD's explicit requirement): a pool that fails BEFORE
-creating a lease must produce a teardown that exits 0 saying "nothing to close", NOT a
-red. A teardown that reds on every failed pool trains people to gate it back on
-success — which is precisely how the Blazing-Back defect was born. runner-teardown.yml
-already implements this (`if [ -z "${DSEQ}" ]` → noop exit 0); the wiring must not
-add a non-empty precondition that re-breaks it.
+The caller cannot start consumers until the reusable workflow finishes. Internal
+unconditional close therefore destroys a healthy pool before its consumers run.
+Early dseq publication still matters: rollback must receive the lease created before
+registration or validation fails. Abrupt cancellation can suppress job outputs or
+cleanup scheduling, so independent scheduled cleanup remains required.
 """
 
 from __future__ import annotations
@@ -76,21 +51,13 @@ def test_the_pool_workflow_declares_a_teardown_job():
     )
 
 
-def test_teardown_needs_the_pool_and_runs_always():
-    """if: always() — the whole point. A success-gated teardown skips exactly the
-    runs that failed, which are the ones holding a live lease. (The Blazing-Back
-    twin of this defect: `if: always() && needs...result == 'success'` under a
-    comment saying 'Always runs (even on failure/cancel)'.)"""
+def test_teardown_needs_the_pool_and_only_rolls_back_failed_handoff():
     td = JOBS.get("teardown", {})
     needs = td.get("needs")
-    cond = str(td.get("if", ""))
-    assert "pool" in (needs if isinstance(needs, list) else [needs] if needs else []), (
-        f"teardown does not need the pool job: {needs!r}"
-    )
-    assert re.search(r"always\(\)", cond), f"teardown is not if: always(): {cond!r}"
-    assert "result" not in cond and "success" not in cond, (
-        f"teardown's predicate gates on an upstream result — the exact defect this "
-        f"fix exists to remove: {cond!r}"
+    assert "pool" in (needs if isinstance(needs, list) else [needs] if needs else [])
+    assert td.get("if") == "always() && needs.pool.result != 'success'", (
+        "internal cleanup must run for failed/cancelled provisioning and leave successful "
+        "handoff alive until caller consumers finish"
     )
 
 
@@ -294,7 +261,7 @@ def test_teardown_has_no_nonempty_dseq_precondition():
     """⚠ TEAMLEAD's explicit requirement: the WIRING must not add a precondition like
     `needs.pool.outputs.dseq != ''`. runner-teardown.yml already treats empty as a
     successful no-op; gating it in the caller would re-train the success-gating this
-    fix removes. The if: must be always() and nothing else conditional on the dseq."""
+    fix removes. Rollback must not add an identity-presence condition."""
     td = JOBS.get("teardown", {})
     cond = str(td.get("if", ""))
     assert "dseq" not in cond, (

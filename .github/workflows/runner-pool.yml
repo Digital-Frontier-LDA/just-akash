@@ -19,6 +19,11 @@
 #       needs: pool
 #       runs-on: ${{ fromJSON(needs.pool.outputs.runner-targets) }}
 #
+# Successful provisioning hands a live pool to the caller. The caller MUST run its
+# runner-teardown job with always(), needing the pool and every consumer job; it must
+# also adopt the independent scheduled cleanup backstop. Internal cleanup below is
+# rollback for failed/cancelled provisioning, not cleanup after successful handoff.
+#
 # `runner-targets` is the whole ergonomic point: it is the pool's label set when the
 # pool is healthy and ["ubuntu-latest"] when it is not, so a caller's `runs-on` degrades
 # to hosted runners instead of failing. That fallback COSTS MONEY, so this workflow works
@@ -1367,28 +1372,19 @@ jobs:
           fi
           exit 1
 
-  # ── THE POOL CLOSES ITS OWN LEASE ──────────────────────────────────────────────
-  #
-  # ⭐ INTERNALISED TEARDOWN (2026-08-23). runner-teardown.yml existed, was correct,
-  # and was called by ZERO workflows — the pool→work→teardown pairing lived only in
-  # its own docstring, so every pool run abandoned its lease at job end. Measured:
-  # 13 × just-akash-runner.<hash> held 65 ACT for up to 23.5h; eleven were created
-  # in eight minutes (2026-08-22 14:16-14:24Z) by runs whose teardown never existed.
-  #
-  # This job makes teardown a PROPERTY OF THE POOL rather than a duty of the caller.
-  # The docstring's consumer-assembled protocol assumed every caller remembers the
-  # three-job shape; internalising removes that assumption — a future caller cannot
-  # forget what it never had to add. (Same inversion #1439/#1390 applied to
-  # close-follows-creation; also a correction to the C5 addendum's standard.)
-  #
-  # `if: always()` UNCONDITIONALLY — no result gate, no dseq precondition. A pool
-  # that fails before leasing produces an EMPTY dseq, and runner-teardown.yml treats
-  # empty as a successful no-op ("nothing to close"). Gating here would re-train the
-  # success-gating this job exists to remove.
+  # ── ROLLBACK BEFORE SUCCESSFUL HANDOFF ────────────────────────────────────────
+  # The reusable workflow must finish before caller consumer jobs can start.
+  # Closing on successful provisioning here would hand them already-dead runners.
+  # Failed/cancelled provisioning keeps its internal rollback; successful provision
+  # transfers cleanup to the caller's always() teardown after every consumer finishes.
+  # Publish dseq early: rollback needs the created lease even if validation fails.
+  # Abrupt cancellation can prevent GitHub from exposing job outputs or scheduling
+  # cleanup despite always(). The independently scheduled backstop remains required;
+  # this predicate does not make cancellation delivery or output retention reliable.
   teardown:
-    name: Close lease and de-register runners (the pool owns this)
+    name: Roll back failed or cancelled pool provisioning
     needs: [pool]
-    if: always()
+    if: always() && needs.pool.result != 'success'
     # ⛔ FULL PATH AT A PINNED SHA, NEVER `./`. A reusable workflow's job runs in the
     # CALLER's context, so a bare `./` resolves inside the CALLER's tree — where this
     # file does not exist. The job then cannot be created, the graph cannot be built,
