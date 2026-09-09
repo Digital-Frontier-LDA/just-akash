@@ -173,6 +173,7 @@ def _make_https_server(
     else:
         server = HTTPServer((host, 0), handler)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.load_cert_chain(certfile=str(_CERTFILE), keyfile=str(_KEYFILE))
     server.socket = ctx.wrap_socket(server.socket, server_side=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -424,6 +425,7 @@ def test_cli_subprocess_active_first_then_closed_closes_via_retry():
         cls = type(f"_H_{host}", (_StageHandler,), {"host_marker": host})
         server = _IPv6HTTPServer(("::1", 0), cls) if ":" in host else HTTPServer((host, 0), cls)
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         ctx.load_cert_chain(certfile=str(_CERTFILE), keyfile=str(_KEYFILE))
         server.socket = ctx.wrap_socket(server.socket, server_side=True)
         threading.Thread(target=server.serve_forever, daemon=True).start()
