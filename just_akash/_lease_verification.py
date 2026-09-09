@@ -91,6 +91,7 @@ def lease_snapshot(
                 return None
             leases[key] = lease["state"]
         pagination = doc.get("pagination")
+        reported_total_zero = False
         if pagination is not None and not isinstance(pagination, dict):
             return None
         # Empty history needs explicit end-of-collection evidence. Missing pagination
@@ -101,8 +102,10 @@ def lease_snapshot(
             total = pagination["total"]
             if isinstance(total, bool) or not isinstance(total, (str, int)) or str(total) != "0":
                 empty_complete = False
+            else:
+                reported_total_zero = True
         cursor = pagination.get("next_key") if pagination is not None else None
-        if empty_complete and cursor not in (None, "") and str(pagination.get("total")) == "0":
+        if empty_complete and cursor not in (None, "") and reported_total_zero:
             # A server cannot simultaneously prove an empty collection and advertise
             # another page. Treat the response as contradictory rather than following
             # the cursor and potentially blessing a fabricated empty history.
