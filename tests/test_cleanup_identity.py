@@ -29,7 +29,7 @@ def _document(names):
     return {
         "deployment": {"id": {"owner": OWNER, "dseq": DSEQ}, "state": "active"},
         "groups": [
-            {"group_id": {"owner": OWNER, "dseq": DSEQ, "gseq": n}, "group_spec": {"name": name}}
+            {"id": {"owner": OWNER, "dseq": DSEQ, "gseq": n}, "group_spec": {"name": name}}
             for n, name in enumerate(names, 1)
         ],
     }
@@ -142,7 +142,7 @@ def test_chain_identity_must_be_complete_and_agree(setup, monkeypatch, case):
     if case == "wrong-owner":
         other["deployment"]["id"]["owner"] = "other"
     elif case == "wrong-dseq":
-        other["groups"][0]["group_id"]["dseq"] = "12"
+        other["groups"][0]["id"]["dseq"] = "12"
     elif case == "missing-group":
         other["groups"] = []
     elif case == "duplicate-group":
@@ -221,7 +221,7 @@ def test_embedded_group_id_must_match_actual_chain_group(setup):
     doc["groups"][0]["group_spec"]["name"] = format_identity(_identity(group=2), REGISTER)
     assert _run() == 2
     client.close_deployment.assert_not_called()
-    doc["groups"][0]["group_id"]["gseq"] = 2
+    doc["groups"][0]["id"]["gseq"] = 2
     assert _run() == 0
     client.close_deployment.assert_called_once_with(DSEQ)
 
@@ -274,4 +274,22 @@ def test_endpoint_aliases_cannot_supply_two_independent_observations(
     monkeypatch.setattr(guard.chain, "rest_urls", lambda: [endpoints[0], "https://two.test"])
     assert _run() == 0
     assert len(reads) == 4  # plan and immediate pre-close evidence each read both hosts
+    client.close_deployment.assert_called_once_with(DSEQ)
+
+
+def test_recorded_chain_wire_identity_reaches_real_cleanup_gate(setup, monkeypatch):
+    import json
+    from pathlib import Path
+
+    client, _, _ = setup
+    fixture = Path(__file__).with_name("fixtures") / "chain_deployment_info_identity.json"
+    recorded = json.loads(fixture.read_text())
+    assert len(recorded["groups"]) == 1
+    assert recorded["groups"][0]["id"]["gseq"] == 1
+    monkeypatch.setattr(guard.chain, "_lcd_get", lambda *a, **k: recorded)
+    # The observed legacy class must remain held; only the explicit versioned CI control qualifies.
+    assert _run() == 2
+    client.close_deployment.assert_not_called()
+    recorded["groups"][0]["group_spec"]["name"] = format_identity(_identity(), REGISTER)
+    assert _run() == 0
     client.close_deployment.assert_called_once_with(DSEQ)

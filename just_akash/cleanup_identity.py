@@ -86,7 +86,7 @@ def agreeing_group_names(owner: str, dseq: str) -> dict[str, str] | None:
                 return None
             names = {}
             for group in groups:
-                gid = group["group_id"]
+                gid = group["id"]
                 gseq = gid["gseq"]
                 name = group["group_spec"]["name"]
                 if (
