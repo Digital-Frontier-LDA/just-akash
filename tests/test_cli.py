@@ -321,6 +321,8 @@ class TestCliDeployPassesArgs:
             # multi-region deployment across distinct providers instead of stacking
             # every group on the single cheapest one.
             already_selected=[],
+            cleanup_ownership_register=None,
+            cleanup_placement_prefix="just-akash-",
         )
 
     @patch("just_akash.deploy.deploy")

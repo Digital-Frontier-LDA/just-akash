@@ -26,12 +26,15 @@ Subcommands:
 """
 
 import argparse
+import json as cleanup_json
 import logging
 import math
 import os
 import shlex
 import subprocess
 import sys
+
+from .provenance import PLACEMENT_PREFIX
 
 NO_SSH_MSG = (
     "No SSH port found on this deployment.\n"
@@ -275,6 +278,8 @@ def main():
 
     # ── deploy ─────────────────────────────────────────
     deploy_p = subparsers.add_parser("deploy", help="Deploy to Akash Network")
+    deploy_p.add_argument("--cleanup-ownership-register", type=cleanup_json.loads, default=None)
+    deploy_p.add_argument("--cleanup-placement-prefix", default=PLACEMENT_PREFIX)
     deploy_p.add_argument("--sdl", default="sdl/cpu-backtest.yaml", help="Path to SDL file")
     deploy_p.add_argument("--gpu", action="store_true", help="Use GPU variant SDL")
     deploy_p.add_argument("--image", default=None, help="Override container image")
@@ -864,6 +869,8 @@ def main():
                 deposit=args.deposit,
                 select=args.select,
                 already_selected=args.already_selected,
+                cleanup_ownership_register=args.cleanup_ownership_register,
+                cleanup_placement_prefix=args.cleanup_placement_prefix,
             )
             sys.exit(0)
         except RuntimeError as e:

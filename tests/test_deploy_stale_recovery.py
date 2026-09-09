@@ -22,7 +22,6 @@ hole with the suite still green.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -73,18 +72,18 @@ def _client(details: dict[str, dict] | None = None, address: str = "akash1me"):
     return c
 
 
-def _run(client, chain_rows, *, names: str | Callable[..., list[str]] = OURS, now=NOW):
-    """Names default to OURS so a test that varies something ELSE is not
-    silently passing because provenance happened to reject everything."""
+def _run(client, chain_rows, *, allowed=True, now=NOW):
+    """Isolate age/lease/cap rails; the shared-reader suite supplies actual identities."""
     with (
+        patch.object(dp.cleanup_identity, "eligible", return_value=(allowed, "isolated rail")),
+        patch.object(dp._lease_verification, "verdict", return_value={"closed": True}),
         patch.object(dp.chain, "list_active_deployments", return_value=chain_rows),
-        patch.object(
-            dp.chain,
-            "deployment_group_names",
-            side_effect=(names if callable(names) else (lambda o, d: [names] if names else [])),
-        ),
     ):
-        return dp._close_stale_for_retry(client, now=now)
+        return dp._close_stale_for_retry(
+            client,
+            now=now,
+            ownership_register={dp.PLACEMENT_PREFIX: "Digital-Frontier-LDA/just-akash"},
+        ).closed
 
 
 def _rows(*dseqs):
@@ -129,15 +128,12 @@ class TestEachGuardOnItsOwn:
         """The shared wallet hosts other repos — a live read found six
         `dfci-infra-runner` among eleven active."""
         client = _client()
-        assert _run(client, _rows(_dseq(OLD)), names="dfci-infra-runner-xyz") == []
+        assert _run(client, _rows(_dseq(OLD)), allowed=False) == []
         client.close_deployment.assert_not_called()
 
     def test_guard4_unreadable_provenance_is_unproven_ownership(self):
-        def _boom(owner, dseq):
-            raise RuntimeError("every LCD failed")
-
         client = _client()
-        assert _run(client, _rows(_dseq(OLD)), names=_boom) == []
+        assert _run(client, _rows(_dseq(OLD)), allowed=False) == []
 
     def test_the_happy_path_still_closes_what_it_can_prove(self):
         """Every guard rejecting everything would pass all of the above while
@@ -203,7 +199,14 @@ def test_the_recovery_never_raises_into_the_callers_error_path():
     replace the caller's real error with its own."""
     client = _client()
     client.account_address.side_effect = RuntimeError("console down")
-    assert dp._close_stale_for_retry(client, now=NOW) == []
+    assert (
+        dp._close_stale_for_retry(
+            client,
+            now=NOW,
+            ownership_register={dp.PLACEMENT_PREFIX: "Digital-Frontier-LDA/just-akash"},
+        ).closed
+        == []
+    )
 
 
 class TestTheRecoveryNeverEscapesIntoTheCallersError:
@@ -228,7 +231,14 @@ class TestTheRecoveryNeverEscapesIntoTheCallersError:
         with patch.object(
             dp.chain, "list_active_deployments", side_effect=RuntimeError("bad AKASH_REST_URL")
         ):
-            assert dp._close_stale_for_retry(client, now=NOW) == []
+            assert (
+                dp._close_stale_for_retry(
+                    client,
+                    now=NOW,
+                    ownership_register={dp.PLACEMENT_PREFIX: "Digital-Frontier-LDA/just-akash"},
+                ).closed
+                == []
+            )
         client.close_deployment.assert_not_called()
 
     def test_the_contract_holds_WITHOUT_the_callers_wrapper(self):
@@ -251,7 +261,14 @@ class TestTheRecoveryNeverEscapesIntoTheCallersError:
         client = _client()
         for boom in (RuntimeError("bad AKASH_REST_URL"), ValueError("x"), OSError("y")):
             with patch.object(dp.chain, "list_active_deployments", side_effect=boom):
-                assert dp._close_stale_for_retry(client, now=NOW) == [], (
-                    f"{type(boom).__name__} escaped a function documented as never raising"
-                )
+                assert (
+                    dp._close_stale_for_retry(
+                        client,
+                        now=NOW,
+                        ownership_register={
+                            dp.PLACEMENT_PREFIX: "Digital-Frontier-LDA/just-akash"
+                        },
+                    ).closed
+                    == []
+                ), f"{type(boom).__name__} escaped a function documented as never raising"
         client.close_deployment.assert_not_called()

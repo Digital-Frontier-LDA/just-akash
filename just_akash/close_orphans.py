@@ -1,62 +1,34 @@
 #!/usr/bin/env python3
-"""Close a NAMED list of orphaned deployments to release their escrow.
+"""Close explicitly named CI orphans with fresh identity and closure proof.
 
-WHY THIS EXISTS
----------------
-``cleanup_stale`` reaps deployments it can positively identify as test residue, by service
-set. That classifier is deliberately conservative and it cannot help with an orphan,
-because of a property the orphan itself has: with no active lease there is no provider, so
-the provider reports no services, so ``classify()`` returns ``LEAVE-unclassifiable`` and
-moves on. Measured 2026-08-22 against 84 active deployments: 26 held $104.33 with no active
-lease and no open order, and the reaper's verdict on every one of them was
-``services=- -> LEAVE-unclassifiable``, ``stale (closable): 0``.
+This is an operator-dispatched path, never an implicit account sweep. An explicit
+prefix-to-repository register is required. Every group must carry agreeing versioned
+CI identity whose owning run/attempt has completed. Production, staging, legacy and
+unreadable identities are HELD. Orphan detection remains an independent condition,
+rechecked before the final identity gate and DELETE.
 
-So the fleet had a reaper that could not see orphans, and an orphan scan that reported zero
-(see the ``active_lease_count`` fix in ``api._reconcile_lease_row`` for why). This is the
-third piece: an operator names the dseqs, and this verifies each one INDEPENDENTLY before
-closing it.
-
-WHAT IT REFUSES
----------------
-Everything it was not explicitly given, and then most of what it was:
-
-  * there is no ``--all``, no glob and no age sweep. The dseq list is the whole input, so a
-    bug here cannot widen its own blast radius.
-  * each dseq is re-classified through ``orphan_detect.classify_deployment`` at close time,
-    against ``active_lease_count`` — not the caller's belief, and not the list's age. Only
-    ``DeploymentVerdict.reapable`` is closed, which requires ORPHANED **and** agreement from
-    ``MIN_CONFIRMATIONS`` independent LCD endpoints.
-  * a dseq that is not in the active set is reported and skipped, never closed. Already
-    closed, or never ours: both are refusals, not errors.
-
-That last property is the one that matters on this account. The wallet is SHARED — a live
-read on 2026-08-22 found ``just-akash-*``, ``dfci-infra-*`` and ``borduas`` placements on it
-— and ``cleanup_stale`` carries the scar of a sweep that destroyed 14 third-party
-deployments. Naming dseqs explicitly and re-verifying each is what makes a wrong entry in
-the list a refusal instead of somebody else's outage.
-
-VERIFICATION IS ON READ-BACK, NOT ON THE EXIT CODE
---------------------------------------------------
-``runner-teardown.yml`` learned this the hard way and says so: a destroy against an account
-that does not own the lease succeeds trivially. So a close is only reported as a close once
-the deployment reads back in a terminal state.
+DELETE acceptance never counts as success: two bound chain sources must verify complete
+terminal (or empty) lease history plus closed deployment and escrow. No writer is enabled
+here. Existing legacy workloads require separate migration and remain held.
 
 Usage:
-    uv run python -m just_akash.close_orphans --dseq 1787240589224,1787240613971
-    uv run python -m just_akash.close_orphans --dseq-file orphans.txt --execute
+    python -m just_akash.close_orphans --dseq 1787240589224 \
+        --ownership-register '{"just-akash-":"Digital-Frontier-LDA/just-akash"}'
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
 
-from ._states import TERMINAL_DEPLOYMENT_STATES
-from .api import AkashConsoleAPI, _reconcile_lease_row, lease_status
+from . import _lease_verification, chain, cleanup_identity
+from .api import AkashConsoleAPI, lease_status
 from .cleanup_stale import _credit_line
 from .orphan_detect import Classification, classify_deployment
+from .provenance import PLACEMENT_PREFIX
 
 # Escrow settlement can lag a block or two; the AFTER line is read after this pause so it
 # reflects the releases rather than the moment before them. Same value cleanup_stale uses.
@@ -78,7 +50,13 @@ def parse_dseqs(raw: list[str]) -> list[str]:
     return out
 
 
-def run(*, dseqs: list[str], execute: bool = False) -> int:
+def run(
+    *,
+    dseqs: list[str],
+    execute: bool = False,
+    ownership_register: dict | None = None,
+    placement_prefix: str = PLACEMENT_PREFIX,
+) -> int:
     if not dseqs:
         print("Error: no dseqs given. This command has no implicit target.", file=sys.stderr)
         return 2
@@ -109,13 +87,21 @@ def run(*, dseqs: list[str], execute: bool = False) -> int:
         rows[str(key)] = r
 
     reapable: list[str] = []
+    held_identity: list[str] = []
     for dseq in dseqs:
+        allowed, reason = cleanup_identity.eligible(
+            address, dseq, placement_prefix, ownership_register
+        )
+        if not allowed:
+            held_identity.append(dseq)
+            print(f"  {dseq} HELD: {reason}")
+            continue
         row = rows.get(dseq)
         if row is None:
-            # `active_only=True` filters on deployment.state == "active", so absence means
-            # closed OR any other non-active state OR never ours. Naming only the first
-            # would send an operator reconciling a list looking for the wrong thing.
-            print(f"  {dseq}  not in the active set -> SKIP (closed, not active, or not ours)")
+            # The bound identity reader just proved this deployment active. A missing
+            # Console row is conflicting instrumentation, not proof it was already closed.
+            held_identity.append(dseq)
+            print(f"  {dseq} HELD: active chain identity absent from Console population")
             continue
         # ADVISORY ONLY. Since #173 the classifier reads lease state from the chain and
         # uses this Console-derived count solely as a fallback when the chain cannot be
@@ -153,38 +139,59 @@ def run(*, dseqs: list[str], execute: bool = False) -> int:
     print(f"\nverified orphans (closable): {len(reapable)} of {len(dseqs)} requested")
     if not execute:
         print("DRY RUN — nothing closed. Re-run with --execute to close the verified set.")
-        return 0
+        return 2 if held_identity else 0
     if not reapable:
         print("Nothing verified as an orphan; nothing to do.")
-        return 0
+        return 2 if held_identity else 0
 
     closed, failed = 0, 0
     for dseq in reapable:
+        # Recheck the orphan condition: an order may have opened since planning.
+        fresh = classify_deployment(
+            dseq, address, deployment_state="active", console_lease_count=0, escrow_uact=0
+        )
+        if not fresh.reapable:
+            held_identity.append(dseq)
+            print(f"  {dseq} HELD before DELETE: orphan condition changed")
+            continue
+        # Final identity authorization immediately precedes DELETE.
+        allowed, reason = cleanup_identity.eligible(
+            address, dseq, placement_prefix, ownership_register
+        )
+        if not allowed:
+            held_identity.append(dseq)
+            print(f"  {dseq} HELD before DELETE: {reason}")
+            continue
         try:
             client.close_deployment(dseq)
         except Exception as exc:  # noqa: BLE001 — keep going; failures are tallied below
             failed += 1
             print(f"  FAILED to close {dseq}: {exc}")
             continue
-        # Read it back. A DELETE that returns 200 against a deployment we do not own is
-        # indistinguishable from a real close until the state says so.
         try:
-            state = str(_reconcile_lease_row(client.get_deployment(dseq)).get("deployment_state"))
-        except Exception as exc:  # noqa: BLE001
+            proof = _lease_verification.verdict(
+                dseq,
+                address,
+                chain.rest_urls(),
+                lambda url: chain._lcd_get("", base=url),
+                retries=5,
+                retry_sleep_s=2.0,
+            )
+            if proof.get("closed") is not True:
+                failed += 1
+                print(f"  {dseq}: close UNVERIFIED: {proof.get('reason')}")
+                continue
+        except Exception as exc:  # noqa: BLE001 — failed observation is never closure
             failed += 1
-            print(f"  {dseq}: close sent but state UNREADABLE ({exc}) — verify by hand")
+            print(f"  {dseq}: close UNVERIFIED ({exc})")
             continue
-        if state in TERMINAL_DEPLOYMENT_STATES:
-            closed += 1
-            print(f"  closed {dseq} (read back: {state})")
-        else:
-            failed += 1
-            print(f"  {dseq}: close sent but state is still {state!r} — NOT counted as closed")
+        closed += 1
+        print(f"  closed {dseq} (chain deployment, lease and escrow proof)")
 
     print(f"\nclosed={closed} failed={failed}")
     time.sleep(SETTLE_PAUSE_SECONDS)
     print(f"credit AFTER:  {_credit_line(client, address)}")
-    return 0 if failed == 0 else 1
+    return 1 if failed else 2 if held_identity else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -209,6 +216,8 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Actually close the verified orphans (default: dry-run report only).",
     )
+    ap.add_argument("--ownership-register", type=json.loads, default=None)
+    ap.add_argument("--placement-prefix", default=PLACEMENT_PREFIX)
     args = ap.parse_args(argv)
 
     raw = list(args.dseq)
@@ -220,7 +229,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Error: cannot read --dseq-file {args.dseq_file}: {exc}", file=sys.stderr)
             return 2
 
-    return run(dseqs=parse_dseqs(raw), execute=args.execute)
+    return run(
+        dseqs=parse_dseqs(raw),
+        execute=args.execute,
+        ownership_register=args.ownership_register,
+        placement_prefix=args.placement_prefix,
+    )
 
 
 if __name__ == "__main__":

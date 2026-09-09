@@ -38,6 +38,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 # Same group as cleanup-stale and the smoke/canary: all of them spend from ONE Console
 # wallet, a single Cosmos account whose sequence number cannot carry two transactions at
@@ -75,8 +76,12 @@ jobs:
         env:
           DSEQS: ${{ inputs.dseqs }}
           EXECUTE: ${{ inputs.execute }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          ARGS=(--dseq "$DSEQS")
+          # Explicit owning repository; namespace comes from this repo's producer declaration.
+          PREFIX=$(uv run python -c 'from just_akash.provenance import PLACEMENT_PREFIX; print(PLACEMENT_PREFIX)')
+          REGISTER=$(uv run python -c 'import json; from just_akash.provenance import PLACEMENT_PREFIX; print(json.dumps({PLACEMENT_PREFIX: "Digital-Frontier-LDA/just-akash"}))')
+          ARGS=(--dseq "$DSEQS" --placement-prefix "$PREFIX" --ownership-register "$REGISTER")
           if [ "$EXECUTE" = "true" ]; then ARGS+=(--execute); fi
           uv run python -m just_akash.close_orphans "${ARGS[@]}"

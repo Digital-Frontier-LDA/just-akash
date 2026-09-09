@@ -62,12 +62,21 @@ def _row(dseq, *, dep_state="active", active_leases=0, escrow=5_000_000):
 @pytest.fixture
 def _wired(monkeypatch):
     """Install a fake client + a credit line that needs no chain, and return a setter."""
+    # This suite isolates orphan selection; real identity/closure wiring has separate controls.
+    monkeypatch.setattr(
+        close_orphans.cleanup_identity, "eligible", lambda *a, **k: (True, "isolated orphan rail")
+    )
     monkeypatch.setenv("AKASH_API_KEY", "test-key")
     monkeypatch.setattr(close_orphans, "_credit_line", lambda client, address: "granted=0.00")
     monkeypatch.setattr(close_orphans, "SETTLE_PAUSE_SECONDS", 0)
 
     def install(rows, verdicts, states=None):
         client = _FakeClient(rows, states)
+        monkeypatch.setattr(
+            close_orphans._lease_verification,
+            "verdict",
+            lambda dseq, *a, **k: {"closed": (states or {}).get(dseq, "closed") == "closed"},
+        )
         monkeypatch.setattr(close_orphans, "AkashConsoleAPI", lambda key: client)
         monkeypatch.setattr(
             close_orphans,
@@ -151,7 +160,7 @@ def test_dseq_not_in_active_set_is_skipped_not_closed(_wired):
     """Someone else's dseq, or one already closed. Both are refusals."""
     rows = [_row("1")]
     client = _wired(rows, {"1": _verdict("1", Classification.ORPHANED)})
-    assert close_orphans.run(dseqs=["999"], execute=True) == 0
+    assert close_orphans.run(dseqs=["999"], execute=True) == 2
     assert client.closed == []
 
 
@@ -230,6 +239,6 @@ def test_row_without_a_dseq_cannot_collide_in_the_index(_wired, capsys):
     del bad_a["deployment"]["id"]["dseq"]
     del bad_b["deployment"]["id"]["dseq"]
     client = _wired([bad_a, bad_b, _row("1")], {"1": _verdict("1", Classification.ORPHANED)})
-    assert close_orphans.run(dseqs=["None"], execute=True) == 0
+    assert close_orphans.run(dseqs=["None"], execute=True) == 2
     assert client.closed == []
-    assert "not in the active set" in capsys.readouterr().out
+    assert "absent from Console population" in capsys.readouterr().out

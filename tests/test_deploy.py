@@ -1044,6 +1044,11 @@ class TestStaleDeploymentRecovery:
             {"deployment": {"id": {"owner": "akash1me", "dseq": d}}} for d in (old, leased, fresh)
         ]
         with (
+            # Full identity and HTTP proof live in test_automatic_cleanup_identity.
+            patch.object(
+                dp_mod.cleanup_identity, "eligible", return_value=(True, "isolated deploy flow")
+            ),
+            patch.object(dp_mod._lease_verification, "verdict", return_value={"closed": True}),
             patch.object(dp_mod.chain, "list_active_deployments", return_value=rows),
             patch.object(
                 dp_mod.chain,
@@ -1051,7 +1056,14 @@ class TestStaleDeploymentRecovery:
                 return_value=[f"{dp_mod.PLACEMENT_PREFIX}-run"],
             ),
         ):
-            result = deploy(sdl_path=str(sdl_file), bid_wait=10, bid_wait_retry=10)
+            result = deploy(
+                sdl_path=str(sdl_file),
+                bid_wait=10,
+                bid_wait_retry=10,
+                cleanup_ownership_register={
+                    dp_mod.PLACEMENT_PREFIX: "Digital-Frontier-LDA/just-akash"
+                },
+            )
 
         assert result["dseq"] == "999"
         closed_args = [c.args[0] for c in client.close_deployment.call_args_list]
@@ -1065,7 +1077,7 @@ class TestStaleDeploymentRecovery:
 
     @patch("just_akash.deploy.time")
     @patch("just_akash.deploy.AkashConsoleAPI")
-    def test_already_exists_cleanup_failure_then_retry_succeeds(
+    def test_already_exists_cleanup_failure_blocks_retry(
         self, MockAPI, mock_time, tmp_path, monkeypatch
     ):
         monkeypatch.setenv("AKASH_API_KEY", "test-key")
@@ -1086,8 +1098,21 @@ class TestStaleDeploymentRecovery:
         mock_time.time.side_effect = t
         mock_time.sleep.return_value = None
 
-        result = deploy(sdl_path=str(sdl_file), bid_wait=10, bid_wait_retry=10)
-        assert result["dseq"] == "777"
+        with (
+            patch.object(
+                dp_mod.chain, "list_active_deployments", side_effect=RuntimeError("unreadable")
+            ),
+            pytest.raises(RuntimeError, match="refusing replacement"),
+        ):
+            deploy(
+                sdl_path=str(sdl_file),
+                bid_wait=10,
+                bid_wait_retry=10,
+                cleanup_ownership_register={
+                    dp_mod.PLACEMENT_PREFIX: "Digital-Frontier-LDA/just-akash"
+                },
+            )
+        assert client.create_deployment.call_count == 1
 
     @patch("just_akash.deploy.AkashConsoleAPI")
     def test_already_exists_retry_also_fails(self, MockAPI, tmp_path, monkeypatch):
@@ -1103,7 +1128,14 @@ class TestStaleDeploymentRecovery:
         ]
         client.list_deployments.return_value = []
 
-        with pytest.raises(RuntimeError, match="after retry"):
+        with (
+            patch.object(
+                dp_mod,
+                "_close_stale_for_retry",
+                return_value=dp_mod.StaleRecovery(closed=["fixture-closed"]),
+            ),
+            pytest.raises(RuntimeError, match="after retry"),
+        ):
             deploy(sdl_path=str(sdl_file))
 
 

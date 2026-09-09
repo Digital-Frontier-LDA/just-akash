@@ -20,6 +20,7 @@ import re
 import sys
 import time
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict
@@ -28,7 +29,7 @@ from akash_lease_core import Auction, AuctionPolicy, AuctionStatus, BidObservati
 from akash_lease_core.auction import PreferredSelection
 from akash_lease_core.capacity import ProviderCapacity
 
-from . import chain
+from . import _lease_verification, chain, cleanup_identity
 from ._diagnostics import Code, emit, enabled
 from .api import (
     AkashAPIError,
@@ -186,24 +187,44 @@ STALE_RETRY_MIN_AGE_SECONDS = 15 * 60
 STALE_RETRY_MAX_CLOSE = 5
 
 
-def _close_stale_for_retry(client, *, now: float | None = None) -> list[str]:
-    """Close OUR OWN abandoned, lease-less deployments so a create can retry.
+@dataclass
+class StaleRecovery:
+    """Separate verified closure from refusal and uncertain destructive outcomes."""
 
-    Returns the dseqs closed. Never raises: this runs on an error path and must
-    not replace the caller's real failure with its own.
+    closed: list[str] = field(default_factory=list)
+    held: list[str] = field(default_factory=list)
+    unverified: list[str] = field(default_factory=list)
 
-    ⚠ IT FAILS TOWARDS NOT CLOSING. A leftover younger than the age floor is
-    left alone and the retry may fail — a recoverable outcome. Destroying a
-    concurrent run's in-flight deployment is not recoverable, and that is the
-    one this function used to produce.
+    @property
+    def safe_to_retry(self) -> bool:
+        return bool(self.closed) and not self.held and not self.unverified
+
+
+def _close_stale_for_retry(
+    client,
+    *,
+    now: float | None = None,
+    ownership_register: dict | None = None,
+    placement_prefix: str = PLACEMENT_PREFIX,
+) -> StaleRecovery:
+    """Close versioned, completed CI residue; uncertainty forbids replacement.
+
+    Age, no-lease and cap remain additional restrictions. Neither legacy names nor
+    age authorize retirement. Missing explicit registration is a loud hold.
     """
+    result = StaleRecovery()
+    if not isinstance(ownership_register, dict) or placement_prefix not in ownership_register:
+        result.held.append("missing ownership register")
+        _log(logging.ERROR, "Stale recovery HELD: explicit ownership register required")
+        return result
 
     now = time.time() if now is None else now
     try:
         owner = client.account_address()
     except Exception as exc:  # noqa: BLE001 — never mask the caller's error
         _log(logging.WARNING, f"Stale recovery: could not resolve the account ({exc}) — skipped")
-        return []
+        result.held.append("unreadable owner or chain population")
+        return result
 
     # GUARD 1 — enumerate from the CHAIN, owner-scoped and authoritative.
     # ⛔ None IS NOT []. "Could not ask the chain" must never be swept as "holds
@@ -226,10 +247,12 @@ def _close_stale_for_retry(client, *, now: float | None = None) -> list[str]:
         active = chain.list_active_deployments(owner)
     except Exception as exc:  # noqa: BLE001 — never mask the caller's error
         _log(logging.WARNING, f"Stale recovery: chain enumeration raised ({exc}) — skipped")
-        return []
+        result.held.append("unreadable owner or chain population")
+        return result
     if active is None:
         _log(logging.WARNING, "Stale recovery: chain enumeration failed — closing nothing")
-        return []
+        result.held.append("unreadable owner or chain population")
+        return result
 
     candidates: list[tuple[float, str]] = []
     for dep in active:
@@ -248,19 +271,17 @@ def _close_stale_for_retry(client, *, now: float | None = None) -> list[str]:
         except Exception as exc:  # noqa: BLE001 — unreadable is not closable
             # DEBUG, matching _report_suspected_orphans: a skipped dseq must not
             # appear in human-facing output, but a silent skip is untraceable.
-            _log(logging.DEBUG, f"  stale recovery: {dseq} unreadable ({exc}) — left alone")
+            result.held.append(str(dseq))
+            _log(logging.WARNING, f"  stale recovery HELD: {dseq} unreadable ({exc})")
             continue
         if (detail or {}).get("leases") or (detail or {}).get("lease"):
             continue
-        # GUARD 4 — provenance, read from chain. Repo-level is enough HERE only
-        # because the age floor has already excluded our own concurrent runs;
-        # on its own it is not, and _report_suspected_orphans says so.
-        try:
-            names = chain.deployment_group_names(owner, str(dseq))
-        except Exception as exc:  # noqa: BLE001 — unreadable provenance is unproven
-            _log(logging.DEBUG, f"  stale recovery: {dseq} provenance unreadable ({exc})")
-            continue
-        if not any(n.startswith(PLACEMENT_PREFIX) for n in names):
+        allowed, reason = cleanup_identity.eligible(
+            owner, str(dseq), placement_prefix, ownership_register
+        )
+        if not allowed:
+            result.held.append(str(dseq))
+            _log(logging.WARNING, f"Stale recovery HELD {dseq}: {reason}")
             continue
         candidates.append((age, str(dseq)))
 
@@ -268,21 +289,40 @@ def _close_stale_for_retry(client, *, now: float | None = None) -> list[str]:
     # unblock ONE create means something else is wrong and wants looking at,
     # not bulldozing.
     candidates.sort(reverse=True)
-    closed: list[str] = []
     for _age, dseq in candidates[:STALE_RETRY_MAX_CLOSE]:
+        allowed, reason = cleanup_identity.eligible(
+            owner, dseq, placement_prefix, ownership_register
+        )
+        if not allowed:
+            result.held.append(dseq)
+            _log(logging.WARNING, f"Stale recovery HELD {dseq}: {reason}")
+            continue
         try:
             client.close_deployment(dseq)
-            closed.append(dseq)
-            _log(logging.INFO, f"Closed stale deployment {dseq}")
-        except Exception as exc:  # noqa: BLE001 — keep going; report at the end
-            _log(logging.WARNING, f"Could not close stale deployment {dseq}: {exc}")
+            proof = _lease_verification.verdict(
+                dseq,
+                owner,
+                chain.rest_urls(),
+                lambda url: chain._lcd_get("", base=url),
+                retries=5,
+                retry_sleep_s=2.0,
+            )
+            if proof.get("closed") is not True:
+                result.unverified.append(dseq)
+                _log(logging.ERROR, f"Stale recovery UNVERIFIED {dseq}: {proof.get('reason')}")
+                continue
+            result.closed.append(dseq)
+            _log(logging.INFO, f"Closed stale deployment {dseq} (chain verified)")
+        except Exception as exc:  # noqa: BLE001 — preserve uncertainty for the actual caller
+            result.unverified.append(dseq)
+            _log(logging.WARNING, f"Could not verify close of stale deployment {dseq}: {exc}")
     if len(candidates) > STALE_RETRY_MAX_CLOSE:
         _log(
             logging.WARNING,
             f"Stale recovery: {len(candidates)} eligible, closed the "
-            f"{len(closed)} oldest (cap {STALE_RETRY_MAX_CLOSE}).",
+            f"{len(result.closed)} oldest (cap {STALE_RETRY_MAX_CLOSE}).",
         )
-    return closed
+    return result
 
 
 def _report_suspected_orphans(client, since_epoch_s: float, run_id: str = "") -> list[str]:
@@ -870,7 +910,9 @@ def _check_wallet_credit(client: AkashConsoleAPI, deposit: float) -> None:
         # Skip the JWT-mint + LCD round-trip entirely when diagnostics are silent
         # (e.g. an interactive terminal) — the probe is only useful to a consumer.
         return
-    from . import chain  # lazy: chain.py queries the public LCD only for this probe
+    from . import (  # lazy: chain.py queries the public LCD only for this probe
+        chain,
+    )
 
     try:
         address = client.account_address()
@@ -930,6 +972,8 @@ def deploy(
     deposit: float = 5.0,
     select: str = "cheapest",
     already_selected: list[str] | None = None,
+    cleanup_ownership_register: dict | None = None,
+    cleanup_placement_prefix: str = PLACEMENT_PREFIX,
 ) -> dict:
     # deposit is user-controlled (--deposit); reject non-finite/non-positive
     # values before they reach json.dumps (which would emit invalid NaN/Infinity).
@@ -1017,10 +1061,21 @@ def deploy(
                 # clock read. If the recovery runs long after, deployments then
                 # compare as YOUNGER and fewer qualify — the conservative
                 # direction for a function whose next act is to close things.
-                _close_stale_for_retry(client, now=_create_started)
+                recovery = _close_stale_for_retry(
+                    client,
+                    now=_create_started,
+                    ownership_register=cleanup_ownership_register,
+                    placement_prefix=cleanup_placement_prefix,
+                )
             except Exception as cleanup_err:  # noqa: BLE001 — documented as never raising
-                _log(logging.ERROR, f"Stale deployment cleanup failed: {cleanup_err}")
-            # Retry once after cleanup
+                raise RuntimeError(
+                    "Stale recovery unreadable; refusing replacement create"
+                ) from cleanup_err
+            if not recovery.safe_to_retry:
+                raise RuntimeError(
+                    "Stale recovery HELD or UNVERIFIED; refusing replacement create"
+                ) from e
+            # Retry only after verified cleanup, never after an uncertain close.
             try:
                 deployment_response = client.create_deployment(sdl_content, deposit=deposit)
             except RuntimeError as retry_err:
@@ -2253,6 +2308,8 @@ def deploy_main():
         "tier. Ignores AKASH_PROVIDERS_BACKUP entirely.",
     )
 
+    parser.add_argument("--cleanup-ownership-register", type=json.loads, default=None)
+    parser.add_argument("--cleanup-placement-prefix", default=PLACEMENT_PREFIX)
     args = parser.parse_args()
 
     if args.no_backup_fallback and args.backup_providers:
@@ -2284,6 +2341,8 @@ def deploy_main():
     try:
         deploy(
             sdl_path=args.sdl,
+            cleanup_ownership_register=args.cleanup_ownership_register,
+            cleanup_placement_prefix=args.cleanup_placement_prefix,
             gpu=args.gpu,
             image=args.image,
             bid_wait=args.bid_wait,
