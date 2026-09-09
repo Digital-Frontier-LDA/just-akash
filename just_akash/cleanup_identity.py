@@ -63,15 +63,16 @@ def agreeing_group_names(owner: str, dseq: str) -> dict[str, str] | None:
             parsed = urlsplit(base)
         except (TypeError, ValueError):
             continue
+        hostname = (parsed.hostname or "").lower().rstrip(".")
         if (
             parsed.scheme != "https"
-            or not parsed.hostname
+            or not hostname
             or parsed.username
             or parsed.password
-            or parsed.hostname in hosts
+            or hostname in hosts
         ):
             continue
-        hosts.add(parsed.hostname)
+        hosts.add(hostname)
         try:
             doc = chain._lcd_get(path, base=base)
             deployment = doc["deployment"]

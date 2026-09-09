@@ -244,3 +244,34 @@ def test_malformed_enumeration_never_becomes_clean_or_partial(setup, monkeypatch
     rows.append({"deployment": doc["deployment"]})
     assert _run() == 0
     client.close_deployment.assert_called_once_with(DSEQ)
+
+
+@pytest.mark.parametrize(
+    "endpoints",
+    [
+        ["https://one.test", "https://one.test."],
+        ["https://ONE.TEST", "https://one.test"],
+        ["https://one.test:443", "https://one.test:8443"],
+        ["https://ONE.TEST.:443/a", "https://one.test:8443/b"],
+    ],
+)
+def test_endpoint_aliases_cannot_supply_two_independent_observations(
+    setup, monkeypatch, endpoints
+):
+    client, doc, _ = setup
+    reads = []
+
+    def read(path, *, base):
+        reads.append(base)
+        return doc
+
+    monkeypatch.setattr(guard.chain, "rest_urls", lambda: endpoints)
+    monkeypatch.setattr(guard.chain, "_lcd_get", read)
+    assert _run() == 2
+    assert len(reads) == 1
+    client.close_deployment.assert_not_called()
+    reads.clear()
+    monkeypatch.setattr(guard.chain, "rest_urls", lambda: [endpoints[0], "https://two.test"])
+    assert _run() == 0
+    assert len(reads) == 4  # plan and immediate pre-close evidence each read both hosts
+    client.close_deployment.assert_called_once_with(DSEQ)
