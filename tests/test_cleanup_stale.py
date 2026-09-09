@@ -205,6 +205,10 @@ def _run(client, execute: bool) -> int:
         ),
         patch.dict("os.environ", {"AKASH_API_KEY": "k"}),
         patch.object(cs.time, "sleep", lambda s: None),
+        # CI authorization is isolated here; test_cleanup_identity exercises real evidence.
+        patch.object(
+            cs.cleanup_identity, "eligible", return_value=(True, "authorized CI fixture")
+        ),
     ):
         return cs.run(execute=execute, now=NOW)
 
@@ -279,6 +283,10 @@ class TestChainEnumerationIsAuthoritative:
             ),
             patch.dict("os.environ", {"AKASH_API_KEY": "k"}),
             patch.object(cs.time, "sleep", lambda s: None),
+            # CI authorization is isolated here; test_cleanup_identity exercises real evidence.
+            patch.object(
+                cs.cleanup_identity, "eligible", return_value=(True, "authorized CI fixture")
+            ),
         ):
             return cs.run(execute=execute, now=NOW), client
 
@@ -325,6 +333,10 @@ class TestChainEnumerationIsAuthoritative:
             ),
             patch.dict("os.environ", {"AKASH_API_KEY": "k"}),
             patch.object(cs.time, "sleep", lambda s: None),
+            # CI authorization is isolated here; test_cleanup_identity exercises real evidence.
+            patch.object(
+                cs.cleanup_identity, "eligible", return_value=(True, "authorized CI fixture")
+            ),
         ):
             cs.run(now=NOW)
         assert seen == ["akash1me"], f"chain was asked about {seen!r}, not the key's own owner"
@@ -359,6 +371,10 @@ class TestProtectedDseqs:
             ),
             patch.dict("os.environ", environ),
             patch.object(cs.time, "sleep", lambda s: None),
+            # CI authorization is isolated here; test_cleanup_identity exercises real evidence.
+            patch.object(
+                cs.cleanup_identity, "eligible", return_value=(True, "authorized CI fixture")
+            ),
         ):
             rc = cs.run(execute=execute, now=NOW)
         return rc, client
@@ -514,6 +530,10 @@ class TestPlacementPrefixIsAReapParameter:
             ),
             patch.dict("os.environ", {"AKASH_API_KEY": "k"}),
             patch.object(cs.time, "sleep", lambda s: None),
+            # CI authorization is isolated here; test_cleanup_identity exercises real evidence.
+            patch.object(
+                cs.cleanup_identity, "eligible", return_value=(True, "authorized CI fixture")
+            ),
         ):
             cs.run(now=NOW, placement_prefix="dfci-infra-")
         assert "ownership prefix: 'dfci-infra-'" in capsys.readouterr().out

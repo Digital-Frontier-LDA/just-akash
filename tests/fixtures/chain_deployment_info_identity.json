@@ -1,0 +1,26 @@
+{
+  "_evidence": {
+    "observed_at": "2026-09-09T13:46:53.786204+00:00",
+    "source": "Recorded deployment/v1beta4 info response; identity values sanitized; unused resources/escrow omitted."
+  },
+  "deployment": {
+    "id": {
+      "owner": "akash1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "dseq": "1780000000000"
+    },
+    "state": "active"
+  },
+  "groups": [
+    {
+      "id": {
+        "owner": "akash1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "dseq": "1780000000000",
+        "gseq": 1
+      },
+      "state": "paused",
+      "group_spec": {
+        "name": "dfci-infra-app"
+      }
+    }
+  ]
+}

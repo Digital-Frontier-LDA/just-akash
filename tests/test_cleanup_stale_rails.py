@@ -74,6 +74,10 @@ def _run(client, *, execute: bool, env: dict | None = None, **kw) -> int:
         ),
         patch.dict("os.environ", env or {"AKASH_API_KEY": FAKE_KEY}, clear=True),
         patch.object(cs.time, "sleep", lambda s: None),
+        # CI authorization is isolated here; test_cleanup_identity exercises real evidence.
+        patch.object(
+            cs.cleanup_identity, "eligible", return_value=(True, "authorized CI fixture")
+        ),
     ):
         return cs.run(execute=execute, now=NOW, **kw)
 
@@ -110,6 +114,10 @@ def _pool(clients: dict, env: dict):
         ),
         patch.dict("os.environ", env, clear=True),
         patch.object(cs.time, "sleep", lambda s: None),
+        # CI authorization is isolated here; test_cleanup_identity exercises real evidence.
+        patch.object(
+            cs.cleanup_identity, "eligible", return_value=(True, "authorized CI fixture")
+        ),
     ):
         yield
 
@@ -293,6 +301,10 @@ class TestWalletPoolScope:
             ),
             patch.dict("os.environ", {"AKASH_API_KEY": FAKE_KEY}, clear=True),
             patch.object(cs.time, "sleep", lambda s: None),
+            # CI authorization is isolated here; test_cleanup_identity exercises real evidence.
+            patch.object(
+                cs.cleanup_identity, "eligible", return_value=(True, "authorized CI fixture")
+            ),
         ):
             rc = cs.run_all_wallets(execute=False, now=NOW)
         assert rc == 0

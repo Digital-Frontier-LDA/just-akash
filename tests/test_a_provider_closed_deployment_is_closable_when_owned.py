@@ -29,6 +29,7 @@ existing margin over every deploy→lease→manifest window in this fleet's pipe
 from __future__ import annotations
 
 import time
+from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
 from just_akash import cleanup_stale as cs
@@ -38,6 +39,7 @@ from just_akash.cleanup_stale import (
     _wants_owned_provenance,
     classify,
 )
+from just_akash.workload_identity import Identity, format_identity
 
 NOW = time.time()
 OLD = MIN_ORPHAN_AGE_SECONDS + 3600  # past the probe floor
@@ -47,6 +49,9 @@ YOUNG = 600  # 10 min: inside the read-race window
 # repos' deployments, so "ours" is a parameter of the reap — here, the sibling's
 # vocabulary, standing in for any repo's declared prefix.
 OURS = "dfci-infra-"
+OWNER = "akash1" + "a" * 38
+REPO = "Borduas-Holdings/Blazing-Back"
+REGISTER = {OURS: REPO}
 
 
 def _detail_closed() -> dict:
@@ -155,7 +160,7 @@ def _run_level_mocks(client, group_names, dseq):
     # like "d1" is an UNAGED deployment that classifies LEAVE-young-or-unaged by the
     # module's own never-mis-age rule — a fixture that forgot this would pass the mock
     # and fail the close, looking like a wiring bug.
-    records = [{"deployment": {"state": "active", "id": {"owner": "akash1me", "dseq": dseq}}}]
+    records = [{"deployment": {"state": "active", "id": {"owner": OWNER, "dseq": dseq}}}]
     return (
         patch.object(cs, "AkashConsoleAPI", return_value=client),
         patch.object(cs.chain, "list_active_deployments", return_value=records),
@@ -168,6 +173,28 @@ def _run_level_mocks(client, group_names, dseq):
         patch.object(cs.chain, "deployment_group_names", return_value=group_names),
         patch.dict("os.environ", {"AKASH_API_KEY": "k"}),
         patch.object(cs.time, "sleep", lambda s: None),
+        patch.object(cs.chain, "rest_urls", return_value=["https://one.test", "https://two.test"]),
+        patch.object(
+            cs.chain,
+            "_lcd_get",
+            return_value={
+                "deployment": records[0]["deployment"],
+                "groups": [
+                    {"id": {"owner": OWNER, "dseq": dseq, "gseq": n}, "group_spec": {"name": name}}
+                    for n, name in enumerate(group_names, 1)
+                ],
+            },
+        ),
+        patch.object(
+            cs.cleanup_identity,
+            "completed_run",
+            return_value={
+                "id": 99,
+                "run_attempt": 1,
+                "status": "completed",
+                "repository": {"full_name": REPO},
+            },
+        ),
     )
 
 
@@ -180,19 +207,28 @@ def test_run_closes_it_prints_the_group_and_spares_the_unreadable(capsys) -> Non
 
     def _client() -> MagicMock:
         c = MagicMock()
-        c.account_address.return_value = "akash1me"
+        c.account_address.return_value = OWNER
         c.get_deployment.side_effect = lambda d: _detail_closed()
         return c
 
-    for dseq, groups in ((closed_owned, [f"{OURS}app"]), (closed_unreadable, [])):
+    name = format_identity(Identity(OURS, REPO, "ci-payload", 1, run=99, attempt=1), REGISTER)
+    for dseq, groups in ((closed_owned, [name]), (closed_unreadable, [])):
         client = _client()
         patches = _run_level_mocks(client, groups, dseq)
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
-            rc = cs.run(execute=True, now=NOW, reap_owned=True, placement_prefix=OURS)
+        with ExitStack() as stack:
+            for context in patches:
+                stack.enter_context(context)
+            rc = cs.run(
+                execute=True,
+                now=NOW,
+                reap_owned=True,
+                placement_prefix=OURS,
+                ownership_register=REGISTER,
+            )
         assert rc == 0
         if groups:
             client.close_deployment.assert_called_once_with(dseq)
-            assert f"group={OURS}app" in capsys.readouterr().out
+            assert f"group={name}" in capsys.readouterr().out
         else:
             client.close_deployment.assert_not_called()
             out = capsys.readouterr().out
