@@ -1,0 +1,202 @@
+{
+  "open_escrow": {
+    "deployment": {
+      "deployment": {
+        "id": {
+          "owner": "akash1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "dseq": "7"
+        },
+        "state": "active",
+        "created_at": "28428315",
+        "reclamation": null
+      },
+      "escrow_account": {
+        "id": {
+          "scope": "deployment",
+          "xid": "akash1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/7"
+        },
+        "state": {
+          "owner": "akash1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "state": "open",
+          "transferred": [
+            {
+              "denom": "uact",
+              "amount": "3955875.000000000000000000"
+            }
+          ],
+          "settled_at": "28548235",
+          "funds": [
+            {
+              "denom": "uact",
+              "amount": "1044125.000000000000000000"
+            }
+          ],
+          "deposits": [
+            {
+              "owner": "akash1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "height": "28428315",
+              "source": "grant",
+              "balance": {
+                "denom": "uact",
+                "amount": "1044125.000000000000000000"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "leases": {
+      "leases": [
+        {
+          "lease": {
+            "id": {
+              "owner": "akash1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "dseq": "7",
+              "gseq": 1,
+              "oseq": 1,
+              "provider": "akash1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "bseq": 0
+            },
+            "state": "closed",
+            "price": {
+              "denom": "uact",
+              "amount": "33.000000000000000000"
+            },
+            "created_at": "28428360",
+            "closed_on": "28548235",
+            "reason": "lease_closed_reason_unstable",
+            "reclamation": null
+          },
+          "escrow_payment": {
+            "id": {
+              "aid": {
+                "scope": "deployment",
+                "xid": "akash1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/7"
+              },
+              "xid": "1/1/akash1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            },
+            "state": {
+              "owner": "akash1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "state": "closed",
+              "rate": {
+                "denom": "uact",
+                "amount": "33.000000000000000000"
+              },
+              "balance": {
+                "denom": "uact",
+                "amount": "0.000000000000000000"
+              },
+              "unsettled": {
+                "denom": "uact",
+                "amount": "0.000000000000000000"
+              },
+              "withdrawn": {
+                "denom": "uact",
+                "amount": "3955875"
+              }
+            }
+          }
+        }
+      ],
+      "pagination": {
+        "next_key": null,
+        "total": "1"
+      }
+    }
+  },
+  "closed": {
+    "deployment": {
+      "deployment": {
+        "id": {
+          "owner": "akash1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "dseq": "7"
+        },
+        "state": "closed",
+        "created_at": "28548586",
+        "reclamation": null
+      },
+      "escrow_account": {
+        "id": {
+          "scope": "deployment",
+          "xid": "akash1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/7"
+        },
+        "state": {
+          "owner": "akash1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "state": "closed",
+          "transferred": [
+            {
+              "denom": "uact",
+              "amount": "15.000000000000000000"
+            }
+          ],
+          "settled_at": "28548603",
+          "funds": [
+            {
+              "denom": "uact",
+              "amount": "0.000000000000000000"
+            }
+          ],
+          "deposits": []
+        }
+      }
+    },
+    "leases": {
+      "leases": [
+        {
+          "lease": {
+            "id": {
+              "owner": "akash1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "dseq": "7",
+              "gseq": 1,
+              "oseq": 1,
+              "provider": "akash1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "bseq": 0
+            },
+            "state": "closed",
+            "price": {
+              "denom": "uact",
+              "amount": "3.000000000000000000"
+            },
+            "created_at": "28548598",
+            "closed_on": "28548603",
+            "reason": "lease_closed_owner",
+            "reclamation": null
+          },
+          "escrow_payment": {
+            "id": {
+              "aid": {
+                "scope": "deployment",
+                "xid": "akash1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/7"
+              },
+              "xid": "1/1/akash1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            },
+            "state": {
+              "owner": "akash1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "state": "closed",
+              "rate": {
+                "denom": "uact",
+                "amount": "3.000000000000000000"
+              },
+              "balance": {
+                "denom": "uact",
+                "amount": "0.000000000000000000"
+              },
+              "unsettled": {
+                "denom": "uact",
+                "amount": "0.000000000000000000"
+              },
+              "withdrawn": {
+                "denom": "uact",
+                "amount": "15"
+              }
+            }
+          }
+        }
+      ],
+      "pagination": {
+        "next_key": null,
+        "total": "1"
+      }
+    }
+  }
+}

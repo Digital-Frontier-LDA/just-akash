@@ -11,7 +11,13 @@ def _run_cli(monkeypatch, args):
     monkeypatch.setattr(sys, "argv", args)
     from just_akash.cli import main
 
-    return main()
+    # Dispatch-only fixtures model ownership separately from command behavior.
+    # Positive ownership is exercised through wallet_pool and resolve-owner CLI tests.
+    with patch(
+        "just_akash.wallet_pool.select_client_for_dseq",
+        side_effect=lambda dseq, *, client_factory: client_factory("test-key"),
+    ):
+        return main()
 
 
 class TestCliNoCommand:

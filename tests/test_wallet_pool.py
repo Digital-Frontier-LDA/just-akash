@@ -122,6 +122,47 @@ def test_dseq_owner_requires_positive_matching_identity(monkeypatch):
     assert client is clients["owner"]
 
 
+def test_single_key_dseq_owner_still_requires_positive_read(monkeypatch):
+    """A single-key wallet pool must still positively read the DSEQ.
+
+    The previous one-key fastpath returned the client without calling
+    `get_deployment` — the wallet then claimed positive ownership of a
+    DSEQ it had never actually read, and `client.account_address()` (the
+    value resolve-owner emits to the workflow) would have come from a
+    key that has no business touching this lease. A regression that
+    re-introduces the fastpath lands here: the only configured wallet
+    is NOT allowed to be returned without a positive read that confirms
+    the deployment belongs to it.
+    """
+    monkeypatch.delenv("AKASH_API_KEYS", raising=False)
+    monkeypatch.setenv("AKASH_API_KEY", "only")
+    only = MagicMock(api_key="only")
+    only.get_deployment.side_effect = RuntimeError("API Error (404): not yours")
+
+    with pytest.raises(RuntimeError, match="not readable"):
+        select_client_for_dseq("123", client_factory=lambda key: only)
+    # ⇒ The fastpath bug would have skipped this call entirely.
+    only.get_deployment.assert_called_once_with("123")
+
+
+def test_single_key_dseq_owner_returns_client_on_positive_read(monkeypatch):
+    """A single-key wallet pool returns the client when the read matches.
+
+    The fix is symmetric with multi-key: positive read required, but a
+    matching read IS a sufficient proof. Without this, every single-key
+    pool would always fail — which the previous fastpath was
+    (incorrectly) avoiding.
+    """
+    monkeypatch.delenv("AKASH_API_KEYS", raising=False)
+    monkeypatch.setenv("AKASH_API_KEY", "only")
+    only = MagicMock(api_key="only")
+    only.get_deployment.return_value = {"deployment": {"id": {"dseq": "123"}}}
+
+    client = select_client_for_dseq("123", client_factory=lambda key: only)
+    assert client is only
+    only.get_deployment.assert_called_once_with("123")
+
+
 def test_owner_lookup_failure_names_attempt_count_without_exposing_keys(monkeypatch):
     monkeypatch.setenv("AKASH_API_KEYS", "secret-a,secret-b")
     monkeypatch.delenv("AKASH_API_KEY", raising=False)
