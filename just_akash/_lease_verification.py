@@ -102,6 +102,11 @@ def lease_snapshot(
             if isinstance(total, bool) or not isinstance(total, (str, int)) or str(total) != "0":
                 empty_complete = False
         cursor = pagination.get("next_key") if pagination is not None else None
+        if empty_complete and cursor not in (None, "") and str(pagination.get("total")) == "0":
+            # A server cannot simultaneously prove an empty collection and advertise
+            # another page. Treat the response as contradictory rather than following
+            # the cursor and potentially blessing a fabricated empty history.
+            return None
         if cursor in (None, ""):
             return leases if leases or empty_complete else None
         if not isinstance(cursor, str) or cursor in visited:
