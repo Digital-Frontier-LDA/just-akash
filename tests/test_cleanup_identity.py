@@ -16,11 +16,13 @@ PREFIX = "just-akash-"
 REPO = "Digital-Frontier-LDA/just-akash"
 REGISTER = {PREFIX: REPO}
 NOW = 1781000000
+REAL_LIST_ACTIVE_DEPLOYMENTS = cs.chain.list_active_deployments
 
 
 def _identity(workload_class="ci-runner", group=1):
-    fields = {"run": 99, "attempt": 2} if workload_class.startswith("ci-") else {"release": "abc"}
-    return Identity(PREFIX, REPO, workload_class, group, **fields)
+    if workload_class.startswith("ci-"):
+        return Identity(PREFIX, REPO, workload_class, group, run=99, attempt=2)
+    return Identity(PREFIX, REPO, workload_class, group, release="abc")
 
 
 def _document(names):
@@ -212,3 +214,33 @@ def test_cli_forwards_explicit_register(monkeypatch):
     )
     assert len(calls) == 1
     assert calls[0]["ownership_register"] == REGISTER
+
+
+def test_embedded_group_id_must_match_actual_chain_group(setup):
+    client, doc, _ = setup
+    doc["groups"][0]["group_spec"]["name"] = format_identity(_identity(group=2), REGISTER)
+    assert _run() == 2
+    client.close_deployment.assert_not_called()
+    doc["groups"][0]["group_id"]["gseq"] = 2
+    assert _run() == 0
+    client.close_deployment.assert_called_once_with(DSEQ)
+
+
+@pytest.mark.parametrize("include_valid", [False, True])
+def test_malformed_enumeration_never_becomes_clean_or_partial(setup, monkeypatch, include_valid):
+    client, doc, _ = setup
+    rows = [None] + ([{"deployment": doc["deployment"]}] if include_valid else [])
+    monkeypatch.setattr(cs.chain, "list_active_deployments", REAL_LIST_ACTIVE_DEPLOYMENTS)
+    monkeypatch.setattr(
+        cs.chain,
+        "_lcd_get",
+        lambda path, **kwargs: {"deployments": rows} if "/deployments/list?" in path else doc,
+    )
+    assert _run() == 2
+    client.close_deployment.assert_not_called()
+    rows.clear()
+    assert _run() == 0  # actual empty list is measurable and closes nothing
+    client.close_deployment.assert_not_called()
+    rows.append({"deployment": doc["deployment"]})
+    assert _run() == 0
+    client.close_deployment.assert_called_once_with(DSEQ)

@@ -218,7 +218,10 @@ def list_active_deployments(owner: str, timeout: int = 15) -> list[dict[str, Any
             if not isinstance(deployments, list):
                 ok = False
                 break
-            out.extend(d for d in deployments if isinstance(d, dict))
+            if any(not isinstance(d, dict) for d in deployments):
+                ok = False
+                break  # a malformed sibling is an incomplete population, never an empty one
+            out.extend(deployments)
             # ⛔ A MALFORMED CURSOR IS "UNKNOWN", NOT "DONE". Treating an unreadable
             # `pagination` as end-of-list returns a PARTIAL set that looks complete — the
             # same empty-vs-failed collapse this function refuses one level up, and the

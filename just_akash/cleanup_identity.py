@@ -43,7 +43,7 @@ def completed_run(repository: str, run: int) -> dict | None:
         return None
 
 
-def agreeing_group_names(owner: str, dseq: str) -> list[str] | None:
+def agreeing_group_names(owner: str, dseq: str) -> dict[str, str] | None:
     """Two distinct HTTPS hosts must agree on all group IDs/names for this owner/dseq."""
     if not re.fullmatch(r"akash1[a-z0-9]{38,58}", owner) or not re.fullmatch(
         r"[1-9][0-9]{0,31}", dseq
@@ -105,7 +105,7 @@ def agreeing_group_names(owner: str, dseq: str) -> list[str] | None:
         except (KeyError, TypeError, ValueError):
             return None
         if len(snapshots) == 2:
-            return list(names.values()) if snapshots[0] == snapshots[1] else None
+            return names if snapshots[0] == snapshots[1] else None
     return None
 
 
@@ -115,14 +115,21 @@ def eligible(owner: str, dseq: str, prefix: str, register: dict | None) -> tuple
         if not isinstance(register, dict) or prefix not in register:
             return False, "missing ownership register or requested prefix"
         names = agreeing_group_names(owner, dseq)
-        population = classify_groups(names, register)
+        population = classify_groups(list(names.values()) if names else None, register)
         if population.held:
             return False, population.reason
+        if names is None or any(
+            identity.group != int(gseq)
+            for gseq, identity in zip(names, population.identities, strict=True)
+        ):
+            return False, "embedded group identity disagrees with chain group ID"
         identity = population.identities[0]
         if identity.prefix != prefix:
             return False, "different registered repository namespace"
         if identity.workload_class not in {"ci-runner", "ci-payload"}:
             return False, "protected staging or production class"
+        if identity.run is None or identity.attempt is None:
+            return False, "CI identity is missing its run or attempt"
         state = completed_run(identity.owner, identity.run)
         if not state or state.get("repository", {}).get("full_name") != identity.owner:
             return False, "owning repository run unreadable or mismatched"
