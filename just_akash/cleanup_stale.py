@@ -53,7 +53,7 @@ import sys
 import time
 from dataclasses import dataclass
 
-from . import chain, cleanup_identity
+from . import _lease_verification, chain, cleanup_identity
 from .api import AkashConsoleAPI, _extract_dseq, escrow_locked
 from .provenance import PLACEMENT_PREFIX
 from .smoke_providers import (
@@ -740,7 +740,7 @@ def run(
     stale = plan.to_close
     capped = plan.capped
 
-    closed, failed = 0, 0
+    closed, failed, unverified = 0, 0, 0
     for dseq in stale:
         allowed, reason = cleanup_identity.eligible(
             address, str(dseq), placement_prefix, ownership_register
@@ -751,19 +751,39 @@ def run(
             continue
         try:
             client.close_deployment(dseq)
-            closed += 1
-            print(f"  closed {dseq}")
         except Exception as exc:  # noqa: BLE001 — keep reaping; report failures at the end
             failed += 1
             print(f"  FAILED to close {dseq}: {exc}")
+            continue
+        try:
+            # DELETE acceptance is not closure proof. Read fresh chain evidence after
+            # the write; the authorization reads above describe the pre-close state.
+            result = _lease_verification.verdict(
+                str(dseq),
+                address,
+                chain.rest_urls(),
+                lambda url: chain._lcd_get("", base=url),
+                retries=5,
+                retry_sleep_s=2.0,
+            )
+            verified = result.get("closed") is True
+            reason = result.get("reason", "missing closure verdict")
+        except Exception as exc:  # noqa: BLE001 — failed observation is never success
+            verified, reason = False, str(exc)
+        if not verified:
+            unverified += 1
+            print(f"  UNVERIFIED close {dseq}: {reason}")
+            continue
+        closed += 1
+        print(f"  closed {dseq}")
 
     remaining = " (CAPPED — more remain, re-run to continue)" if capped else ""
-    print(f"\nclosed={closed} failed={failed}{remaining}")
+    print(f"\nclosed={closed} failed={failed} unverified={unverified}{remaining}")
     # Escrow settlement can lag a block or two; read after a short pause so the
     # AFTER line reflects the releases.
     time.sleep(10)
     print(f"credit AFTER:  {_credit_line(client, address)}")
-    return 1 if failed else 2 if identity_held else 0
+    return 1 if failed or unverified else 2 if identity_held else 0
 
 
 def _resolve_distinct_accounts(
