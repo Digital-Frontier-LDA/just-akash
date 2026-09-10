@@ -67,6 +67,33 @@ def _active_lease() -> dict:
     return _terminal_lease(state="active")
 
 
+PROVIDER_2 = "akashprovider2abc"
+PROVIDER_3 = "akashprovider3def"
+
+
+def _lease(provider: str, state: str, *, gseq: int = 1, oseq: int = 1, bseq: int = 0) -> dict:
+    """A single Akash lease row, ready for embedding in a `leases` page."""
+    return {
+        "lease": {
+            "id": {
+                "owner": OWNER,
+                "dseq": DSEQ,
+                "gseq": gseq,
+                "oseq": oseq,
+                "bseq": bseq,
+                "provider": provider,
+            },
+            "state": state,
+            "price": {"denom": "uakt", "amount": "1000"},
+        }
+    }
+
+
+def _multi_lease_page(leases: list[dict], *, next_key: str = "") -> dict:
+    """A leases/list page containing N rows, one per provider (or state shape)."""
+    return {"leases": leases, "pagination": {"next_key": next_key}}
+
+
 def _stub_get(responses: dict):
     """Return a `get` callable that maps URL prefixes to canned responses."""
 
@@ -374,3 +401,388 @@ def test_deployment_escrow_identity_and_state_are_required(path, value, bad_endp
     assert result["closed"] is False
     assert any("/deployments/info?" in url for url in calls)
     assert len([url for url in calls if "/leases/list?" in url]) == 2
+
+
+# ── MULTI-LEASE AGGREGATION (A2) ─────────────────────────────────────────────
+#
+# An Akash deployment can win bids on multiple providers, leaving a single
+# (owner, dseq) tuple with several leases. The shared closure contract must
+# aggregate the COMPLETE identity-keyed map across providers, refuse to
+# claim closed=true while any single provider is still active, and treat
+# an asymmetric count between the two endpoints as unverified — a partial
+# read on either side reads as agreement only by accident.
+
+
+def test_two_leases_on_different_providers_both_terminal_means_closed():
+    """Both endpoints return two leases on two providers, both closed.
+
+    `lease_snapshot()` collects every row on the page into a single map
+    keyed by the (owner, dseq, gseq, oseq, bseq, provider) identity tuple,
+    so two providers with the same gseq/oseq/bseq collapse to distinct
+    keys and the verdict's `all(states ⊆ TERMINAL_STATES)` predicate is
+    forced to walk the whole map.
+    """
+    page = _multi_lease_page(
+        [
+            _lease("akashprovider1xyz", "closed"),
+            _lease(PROVIDER_2, "closed"),
+        ]
+    )
+    responses = {
+        "akash-api.polkachu.com": page,
+        "rest.cosmos.directory/akash": page,
+    }
+    snap, sources = verifier.consensus(
+        DSEQ, OWNER, list(verifier.DEFAULT_ENDPOINTS), _stub_get(responses)
+    )
+    assert snap is not None
+    # ⇒ Two distinct identity keys, both terminal.
+    assert len(snap) == 2
+    assert all(state == "closed" for state in snap.values())
+    v = verifier.verdict(DSEQ, OWNER, list(verifier.DEFAULT_ENDPOINTS), _stub_get(responses))
+    assert v["closed"] is True
+    assert "agreeing terminal" in v["reason"]
+
+
+def test_two_leases_one_active_means_not_closed():
+    """One provider closed, one provider still active → closed=false.
+
+    The whole-map predicate must not short-circuit on the first terminal
+    state; if either provider still has an active lease, the deployment
+    is not closed. A regression that walks only `min(states)` or `any()`
+    passes the all-terminal test but breaks this one.
+    """
+    page = _multi_lease_page(
+        [
+            _lease("akashprovider1xyz", "closed"),
+            _lease(PROVIDER_2, "active"),
+        ]
+    )
+    responses = {
+        "akash-api.polkachu.com": page,
+        "rest.cosmos.directory/akash": page,
+    }
+    snap, _sources = verifier.consensus(
+        DSEQ, OWNER, list(verifier.DEFAULT_ENDPOINTS), _stub_get(responses)
+    )
+    # ⇒ Endpoints agree on the mixed-state population, so consensus
+    # succeeds but verdict refuses closed=true.
+    assert snap is not None
+    assert len(snap) == 2
+    states = set(snap.values())
+    assert states == {"closed", "active"}
+    v = verifier.verdict(DSEQ, OWNER, list(verifier.DEFAULT_ENDPOINTS), _stub_get(responses))
+    assert v["closed"] is False
+    assert "active" in v["reason"].lower()
+
+
+def test_two_leases_closed_and_insufficient_funds_means_closed():
+    """`insufficient_funds` is in TERMINAL_STATES; mixed with closed is closed.
+
+    Pinning the contract: a lease whose provider ran out of funds to keep
+    the bid alive is on equal closure footing with a lease whose provider
+    chose to close. The deployment is closed iff the whole identity map is
+    ⊆ {closed, insufficient_funds}.
+    """
+    page = _multi_lease_page(
+        [
+            _lease("akashprovider1xyz", "closed"),
+            _lease(PROVIDER_2, "insufficient_funds"),
+        ]
+    )
+    responses = {
+        "akash-api.polkachu.com": page,
+        "rest.cosmos.directory/akash": page,
+    }
+    v = verifier.verdict(DSEQ, OWNER, list(verifier.DEFAULT_ENDPOINTS), _stub_get(responses))
+    assert v["closed"] is True
+    assert "agreeing terminal" in v["reason"]
+
+
+def test_asymmetric_endpoint_counts_means_unverified():
+    """Endpoint A returns two leases; endpoint B returns only one.
+
+    A partial read on either side cannot establish agreement: the missing
+    provider may be still active on the lagging endpoint, or already
+    closed — the verifier has no way to tell, so the population is treated
+    as unverified and verdict returns closed=false with `unverified`.
+
+    A regression that returns agreement on the intersection (only the
+    leases both endpoints happened to return) would read as closed=true
+    for a deployment whose third provider is still active — the exact
+    shape of the cross-host single-channel defect this verifier exists
+    to refuse.
+    """
+    two_providers = _multi_lease_page(
+        [
+            _lease("akashprovider1xyz", "closed"),
+            _lease(PROVIDER_2, "closed"),
+        ]
+    )
+    one_provider = _multi_lease_page(
+        [
+            _lease("akashprovider1xyz", "closed"),
+        ]
+    )
+    responses = {
+        "akash-api.polkachu.com": two_providers,
+        "rest.cosmos.directory/akash": one_provider,
+    }
+    snap, sources = verifier.consensus(
+        DSEQ, OWNER, list(verifier.DEFAULT_ENDPOINTS), _stub_get(responses)
+    )
+    assert snap is None, (
+        "asymmetric endpoint counts must NOT be reported as agreement; a partial read is no read"
+    )
+    assert sources == ()
+    v = verifier.verdict(DSEQ, OWNER, list(verifier.DEFAULT_ENDPOINTS), _stub_get(responses))
+    assert v["closed"] is False
+    assert v["reason"] == "unverified"
+
+
+def test_multi_page_pagination_aggregates_across_providers():
+    """Provider A on page 1, provider B on page 2 — both endpoints paginate.
+
+    Pagination must not lose leases; a regression that returned on the
+    first page (page-truncation mutant in PR #1024) would treat the
+    multi-lease deployment as single-lease, missing provider B entirely.
+    Pinning the multi-page, multi-provider aggregation in one test.
+    """
+    page1 = _multi_lease_page([_lease("akashprovider1xyz", "closed")], next_key="cursor-1")
+    page2 = _multi_lease_page([_lease(PROVIDER_2, "closed")])
+
+    def paging_get(url: str):
+        if "/deployments/info?" in url:
+            return _closed_deployment()
+        if "pagination.key=cursor-1" in url:
+            return page2
+        return page1
+
+    snap = verifier.lease_snapshot("https://akash-api.polkachu.com", DSEQ, OWNER, paging_get)
+    assert snap is not None
+    assert len(snap) == 2
+    assert all(state == "closed" for state in snap.values())
+
+
+def test_all_leases_terminal_but_escrow_open_means_not_closed():
+    """Lease-level agreement is necessary but not sufficient.
+
+    A lease can read as `closed` while the deployment's escrow is still
+    `open` (the lease closed but the account-side funds were not
+    returned). The verdict's deployment/escrow gate is a second-line
+    refusal that must fire when the lease-level predicate accepts but
+    escrow-level does not.
+    """
+    page = _multi_lease_page(
+        [
+            _lease("akashprovider1xyz", "closed"),
+            _lease(PROVIDER_2, "closed"),
+        ]
+    )
+
+    def open_escrow_get(url: str):
+        if "/deployments/info?" in url:
+            return {
+                "deployment": {"id": {"owner": OWNER, "dseq": DSEQ}, "state": "closed"},
+                "escrow_account": {
+                    "id": {"scope": "deployment", "xid": f"{OWNER}/{DSEQ}"},
+                    "state": {"owner": OWNER, "state": "open"},
+                },
+            }
+        return page
+
+    snap, sources = verifier.consensus(
+        DSEQ, OWNER, list(verifier.DEFAULT_ENDPOINTS), open_escrow_get
+    )
+    assert snap is not None
+    v = verifier.verdict(DSEQ, OWNER, list(verifier.DEFAULT_ENDPOINTS), open_escrow_get, retries=1)
+    assert v["closed"] is False
+    assert "escrow" in v["reason"].lower() or "deployment or escrow" in v["reason"].lower()
+
+
+def test_lease_on_different_dseq_is_excluded_from_aggregation():
+    """A row whose identity does NOT match the requested (owner, dseq)
+    is a structural defect, not a multi-lease row.
+
+    `lease_snapshot()` filters at line `if numbers[0] != str(int(dseq))
+    or owner_field != owner: return None` — a cross-dseq row inside a
+    page is treated as unreadable rather than silently included. Pinning
+    that filter here so a regression that drops it cannot quietly
+    aggregate a sibling deployment's leases into the verdict.
+    """
+
+    def cross_dseq_get(url: str):
+        if "/deployments/info?" in url:
+            return _closed_deployment()
+        return {
+            "leases": [
+                {
+                    "lease": {
+                        "id": {
+                            "owner": OWNER,
+                            "dseq": str(int(DSEQ) + 1),  # ← different dseq
+                            "gseq": 1,
+                            "oseq": 1,
+                            "bseq": 0,
+                            "provider": "akashprovider1xyz",
+                        },
+                        "state": "closed",
+                        "price": {"denom": "uakt", "amount": "1000"},
+                    }
+                }
+            ],
+            "pagination": {"next_key": ""},
+        }
+
+    snap = verifier.lease_snapshot("https://akash-api.polkachu.com", DSEQ, OWNER, cross_dseq_get)
+    assert snap is None, "a cross-dseq row inside the page must read as no read"
+
+
+def test_lease_on_different_owner_is_excluded_from_aggregation():
+    """A row whose owner field differs from the requested owner is
+    a structural defect (cross-owner bleed), not a multi-lease row.
+    Same shape as the cross-dseq case.
+    """
+    other_owner = "akash1" + "b" * 38
+
+    def cross_owner_get(url: str):
+        if "/deployments/info?" in url:
+            return _closed_deployment()
+        return {
+            "leases": [
+                {
+                    "lease": {
+                        "id": {
+                            "owner": other_owner,  # ← different owner
+                            "dseq": DSEQ,
+                            "gseq": 1,
+                            "oseq": 1,
+                            "bseq": 0,
+                            "provider": "akashprovider1xyz",
+                        },
+                        "state": "closed",
+                        "price": {"denom": "uakt", "amount": "1000"},
+                    }
+                }
+            ],
+            "pagination": {"next_key": ""},
+        }
+
+    snap = verifier.lease_snapshot("https://akash-api.polkachu.com", DSEQ, OWNER, cross_owner_get)
+    assert snap is None, "a cross-owner row inside the page must read as no read"
+
+
+def test_asymmetric_page_counts_same_final_map_consensus():
+    """Endpoint A paginates across 2 pages; endpoint B returns a single page.
+
+    Both endpoints end with the same two-lease map (provider1 closed,
+    provider2 closed). The COMPLETE map comparison must consensus; a
+    regression that compared only the first page returned by either
+    side would diverge here even though the population agrees.
+    """
+    page1 = _multi_lease_page([_lease("akashprovider1xyz", "closed")], next_key="cursor-1")
+    page2 = _multi_lease_page([_lease(PROVIDER_2, "closed")])
+    one_page = _multi_lease_page(
+        [
+            _lease("akashprovider1xyz", "closed"),
+            _lease(PROVIDER_2, "closed"),
+        ]
+    )
+
+    def paging_get(url: str):
+        if "/deployments/info?" in url:
+            return _closed_deployment()
+        if "akash-api.polkachu.com" in url:
+            if "pagination.key=cursor-1" in url:
+                return page2
+            return page1
+        return one_page
+
+    snap, sources = verifier.consensus(DSEQ, OWNER, list(verifier.DEFAULT_ENDPOINTS), paging_get)
+    assert snap is not None, (
+        "asymmetric page counts producing the same final map must consensus; "
+        "otherwise chain lag on a paginating endpoint would permanently lock out close"
+    )
+    assert len(snap) == 2
+    v = verifier.verdict(DSEQ, OWNER, list(verifier.DEFAULT_ENDPOINTS), paging_get)
+    assert v["closed"] is True
+
+
+def test_identity_collision_only_provider_differs_keeps_two_entries():
+    """Two leases whose identity tuples differ ONLY in provider stay as two entries.
+
+    The key tuple is `(owner, dseq, gseq, oseq, bseq, provider)`. A
+    regression that dropped `provider` from the key would collapse the
+    two leases into a single entry, and the verdict's `states ⊆
+    TERMINAL_STATES` predicate would walk only one row — the same
+    population-agreement defect the multi-lease path exists to refuse.
+    """
+    page = _multi_lease_page(
+        [
+            _lease("akashprovider1xyz", "closed"),
+            _lease(PROVIDER_2, "closed"),
+        ]
+    )
+    responses = {
+        "akash-api.polkachu.com": page,
+        "rest.cosmos.directory/akash": page,
+    }
+    snap, _sources = verifier.consensus(
+        DSEQ, OWNER, list(verifier.DEFAULT_ENDPOINTS), _stub_get(responses)
+    )
+    assert snap is not None
+    assert len(snap) == 2, (
+        "two leases differing only in provider must stay as two identity keys; "
+        "collapsing them to one silently closes a deployment whose second provider is still active"
+    )
+    keys = list(snap.keys())
+    assert keys[0][-1] != keys[-1], "the two keys must differ in the provider slot"
+
+
+def test_strict_subset_with_matching_values_means_unverified():
+    """Endpoint B is a strict subset of A — every key B returns is in A with the same value.
+
+    Three leases on A (provider1/provider2/provider3, all closed); B
+    returns only provider1 and provider2 with matching values, missing
+    provider3 entirely. With dict equality the key sets diverge and
+    consensus returns None. The natural items-loop refactor —
+    iterating A's keys and checking B.get(key) == value, with a skip
+    on missing entries — passes this case silently, returning A's full
+    three-row map as agreement. verdict then walks A's three states
+    (all terminal) over B's actual one-or-two observed leases, and
+    reports closed=true for a deployment whose third provider is still
+    burning escrow.
+
+    This is the inverse shape from `test_asymmetric_endpoint_counts_means_unverified`:
+    that test uses 2-vs-1 with one missing key; this one uses 3-vs-2
+    with values that match on the shared keys. The values-match is
+    what lets a careless items-loop refactor miss it.
+    """
+    three_providers_a = _multi_lease_page(
+        [
+            _lease("akashprovider1xyz", "closed"),
+            _lease(PROVIDER_2, "closed"),
+            _lease(PROVIDER_3, "closed"),
+        ]
+    )
+    two_providers_b = _multi_lease_page(
+        [
+            _lease("akashprovider1xyz", "closed"),
+            _lease(PROVIDER_2, "closed"),
+        ]
+    )
+    responses = {
+        "akash-api.polkachu.com": three_providers_a,
+        "rest.cosmos.directory/akash": two_providers_b,
+    }
+    snap, sources = verifier.consensus(
+        DSEQ, OWNER, list(verifier.DEFAULT_ENDPOINTS), _stub_get(responses)
+    )
+    assert snap is None, (
+        "B returning a strict subset of A (matching values on shared keys) "
+        "must NOT be reported as agreement; the missing key on B may still be active"
+    )
+    assert sources == ()
+    v = verifier.verdict(DSEQ, OWNER, list(verifier.DEFAULT_ENDPOINTS), _stub_get(responses))
+    assert v["closed"] is False
+    assert v["reason"] == "unverified"
