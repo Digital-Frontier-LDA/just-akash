@@ -670,3 +670,70 @@ def test_lease_on_different_owner_is_excluded_from_aggregation():
 
     snap = verifier.lease_snapshot("https://akash-api.polkachu.com", DSEQ, OWNER, cross_owner_get)
     assert snap is None, "a cross-owner row inside the page must read as no read"
+
+
+def test_asymmetric_page_counts_same_final_map_consensus():
+    """Endpoint A paginates across 2 pages; endpoint B returns a single page.
+
+    Both endpoints end with the same two-lease map (provider1 closed,
+    provider2 closed). The COMPLETE map comparison must consensus; a
+    regression that compared only the first page returned by either
+    side would diverge here even though the population agrees.
+    """
+    page1 = _multi_lease_page([_lease("akashprovider1xyz", "closed")], next_key="cursor-1")
+    page2 = _multi_lease_page([_lease(PROVIDER_2, "closed")])
+    one_page = _multi_lease_page(
+        [
+            _lease("akashprovider1xyz", "closed"),
+            _lease(PROVIDER_2, "closed"),
+        ]
+    )
+
+    def paging_get(url: str):
+        if "/deployments/info?" in url:
+            return _closed_deployment()
+        if "akash-api.polkachu.com" in url:
+            if "pagination.key=cursor-1" in url:
+                return page2
+            return page1
+        return one_page
+
+    snap, sources = verifier.consensus(DSEQ, OWNER, list(verifier.DEFAULT_ENDPOINTS), paging_get)
+    assert snap is not None, (
+        "asymmetric page counts producing the same final map must consensus; "
+        "otherwise chain lag on a paginating endpoint would permanently lock out close"
+    )
+    assert len(snap) == 2
+    v = verifier.verdict(DSEQ, OWNER, list(verifier.DEFAULT_ENDPOINTS), paging_get)
+    assert v["closed"] is True
+
+
+def test_identity_collision_only_provider_differs_keeps_two_entries():
+    """Two leases whose identity tuples differ ONLY in provider stay as two entries.
+
+    The key tuple is `(owner, dseq, gseq, oseq, bseq, provider)`. A
+    regression that dropped `provider` from the key would collapse the
+    two leases into a single entry, and the verdict's `states ⊆
+    TERMINAL_STATES` predicate would walk only one row — the same
+    population-agreement defect the multi-lease path exists to refuse.
+    """
+    page = _multi_lease_page(
+        [
+            _lease("akashprovider1xyz", "closed"),
+            _lease(PROVIDER_2, "closed"),
+        ]
+    )
+    responses = {
+        "akash-api.polkachu.com": page,
+        "rest.cosmos.directory/akash": page,
+    }
+    snap, _sources = verifier.consensus(
+        DSEQ, OWNER, list(verifier.DEFAULT_ENDPOINTS), _stub_get(responses)
+    )
+    assert snap is not None
+    assert len(snap) == 2, (
+        "two leases differing only in provider must stay as two identity keys; "
+        "collapsing them to one silently closes a deployment whose second provider is still active"
+    )
+    keys = list(snap.keys())
+    assert keys[0][-1] != keys[-1], "the two keys must differ in the provider slot"
