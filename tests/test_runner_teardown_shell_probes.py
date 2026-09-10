@@ -298,6 +298,30 @@ def test_real_close_step(tmp_path, case):
             f"GITHUB_OUTPUT so the runner's environment block reflects the "
             f"real state. reported={reported!r}"
         )
+        # ⛔ THE CAPTURED STDERR MUST REACH A HUMAN. resolve-owner's stderr is
+        # redirected to /tmp/owner.err on the invocation line; for a long time
+        # NOTHING read that file back, so this branch reported an exit code and
+        # nothing else. Six real teardown failures in Borduas-Holdings/blazing on
+        # 2026-09-10 produced logs saying only "resolve-owner exited 1" — a
+        # resolver bug, a wallet_pool multi-key case and a plain endpoint outage
+        # are indistinguishable in that message, and telling them apart meant
+        # re-deriving by hand what the step had already been handed.
+        #
+        # ⚠ ASSERTED ON THE COMBINED OUTPUT, not on the file: a fix that writes
+        # the text somewhere nobody reads is the defect, not the remedy. The
+        # fixture's stderr for this case is "no wallet in pool claims that DSEQ".
+        combined = result.stdout + result.stderr
+        assert "no wallet in pool claims that DSEQ" in combined, (
+            f"{case}: resolve-owner's stderr never reached the step output. It is "
+            f"captured to /tmp/owner.err and must be reported — an error that "
+            f"says WHAT failed but not WHY costs every later reader the same "
+            f"investigation.\nstdout={result.stdout!r}\nstderr={result.stderr!r}"
+        )
+        assert "::error" in combined and "resolve-owner exited 1" in combined, (
+            f"{case}: the annotation itself must still name the failure and its "
+            f"exit code; the stderr is an addition to it, not a replacement.\n"
+            f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
+        )
         return  # ⇒ resolve_owner_unavailable does its own assertions
 
     assert "destroy" in subcommands, f"{case}: destroy subcommand never invoked"
