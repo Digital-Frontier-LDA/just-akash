@@ -737,3 +737,52 @@ def test_identity_collision_only_provider_differs_keeps_two_entries():
     )
     keys = list(snap.keys())
     assert keys[0][-1] != keys[-1], "the two keys must differ in the provider slot"
+
+
+def test_strict_subset_with_matching_values_means_unverified():
+    """Endpoint B is a strict subset of A — every key B returns is in A with the same value.
+
+    Three leases on A (provider1/provider2/provider3, all closed); B
+    returns only provider1 and provider2 with matching values, missing
+    provider3 entirely. With dict equality the key sets diverge and
+    consensus returns None. The natural items-loop refactor —
+    iterating A's keys and checking B.get(key) == value, with a skip
+    on missing entries — passes this case silently, returning A's full
+    three-row map as agreement. verdict then walks A's three states
+    (all terminal) over B's actual one-or-two observed leases, and
+    reports closed=true for a deployment whose third provider is still
+    burning escrow.
+
+    This is the inverse shape from `test_asymmetric_endpoint_counts_means_unverified`:
+    that test uses 2-vs-1 with one missing key; this one uses 3-vs-2
+    with values that match on the shared keys. The values-match is
+    what lets a careless items-loop refactor miss it.
+    """
+    three_providers_a = _multi_lease_page(
+        [
+            _lease("akashprovider1xyz", "closed"),
+            _lease(PROVIDER_2, "closed"),
+            _lease(PROVIDER_3, "closed"),
+        ]
+    )
+    two_providers_b = _multi_lease_page(
+        [
+            _lease("akashprovider1xyz", "closed"),
+            _lease(PROVIDER_2, "closed"),
+        ]
+    )
+    responses = {
+        "akash-api.polkachu.com": three_providers_a,
+        "rest.cosmos.directory/akash": two_providers_b,
+    }
+    snap, sources = verifier.consensus(
+        DSEQ, OWNER, list(verifier.DEFAULT_ENDPOINTS), _stub_get(responses)
+    )
+    assert snap is None, (
+        "B returning a strict subset of A (matching values on shared keys) "
+        "must NOT be reported as agreement; the missing key on B may still be active"
+    )
+    assert sources == ()
+    v = verifier.verdict(DSEQ, OWNER, list(verifier.DEFAULT_ENDPOINTS), _stub_get(responses))
+    assert v["closed"] is False
+    assert v["reason"] == "unverified"
