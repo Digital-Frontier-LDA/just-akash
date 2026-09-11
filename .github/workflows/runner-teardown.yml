@@ -161,6 +161,15 @@ jobs:
             exit 0
           fi
 
+          # DSEQ is a workflow input and is later interpolated into GitHub
+          # workflow-command annotations. Accept only the canonical decimal
+          # representation so control characters cannot inject a command.
+          if [[ ! "${DSEQ}" =~ ^[0-9]+$ ]]; then
+            echo "::error title=Invalid DSEQ::dseq must contain digits only"
+            echo "closed=unknown" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
           # DSEQ ownership is resolved inside just-akash. It positively reads the
           # deployment under the configured accounts and routes both destroy and the
           # verification read to its owner. A reordered pool cannot turn this into a
