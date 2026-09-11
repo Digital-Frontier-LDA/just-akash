@@ -196,7 +196,40 @@ on:
         type: boolean
         default: true
       required-deposit-usd:
-        description: 'Free credit needed before attempting a deploy.'
+        # ⛔ THIS IS THE ESCROW DEPOSIT, AND IT IS THE POOL'S HARD LIFETIME. It is passed
+        # straight to `just-akash deploy --deposit` (below) and NOWHERE ELSE — there is no
+        # balance precondition in this workflow. The old description said "free credit needed
+        # before attempting a deploy", which named a check that does not exist here, so a
+        # caller reading it would believe lowering this weakens a safety gate. It does not:
+        # it shortens how long a LEAKED pool keeps billing.
+        #
+        # ⇒ WHY THAT MATTERS. Akash closes a deployment when its escrow is exhausted, so the
+        # deposit is a self-terminating TTL that needs no reaper, no event, no credential and
+        # no correct code — the only leak bound that holds when every other layer fails. It is
+        # also the only one nobody had chosen: this default was inherited, not sized.
+        #
+        # MEASURED on chain 2026-09-08, blazing's runner pools (zero auth, anyone can repeat
+        # it): funds 1,988,192 uact against a lease rate of 69 uact/block = 28,814 blocks
+        # ~= 48.0h, identical across every active stamped pool. The longest CI run this
+        # provisions for is ~2h. So an undetected leak bills for 24x the job it served.
+        #
+        # ⇒ The chain's own floor is `min_deposits` = 500,000 uact (akash/deployment params),
+        # which is ~12.1h at that rate. So the bound is tunable between ~12h and whatever you
+        # fund, and 48h is not a decision anyone made.
+        #
+        # ⚠ WHY THIS IS NOT SIMPLY LOWERED HERE. The input is denominated in USD and the
+        # deposit lands in uact, so the TTL a given number buys FLOATS with price. A value
+        # chosen close to the chain floor becomes a REJECTED DEPLOY when the price moves, and
+        # this input gates every CI pool in every consuming repo. Tightening it is a real
+        # improvement to a last-resort bound traded against live-CI breakage, which is a
+        # decision for whoever owns that trade — not a tidy-up. Denominating it in uact would
+        # remove the coupling and is the better fix.
+        description: >-
+          Escrow deposit for the pool, in USD, passed to `just-akash deploy --deposit`.
+          ⛔ NOT a credit precondition — this is the pool's self-terminating lifetime:
+          escrow exhaustion closes the deployment, so this is the hard bound on how long a
+          LEAKED pool bills. Measured 2026-09-08: the '5' default buys ~48h against a ~2h
+          job. The chain floor is 500,000 uact (~12h at the same rate).
         required: false
         type: string
         default: '5'
