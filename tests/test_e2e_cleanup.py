@@ -136,7 +136,7 @@ class TestRobustDestroy:
     def test_first_try_success(self):
         with patch("just_akash._e2e.subprocess.run") as mock_run:
             mock_run.side_effect = [
-                _completed(0, stdout="Deployment 12345 closed"),  # destroy
+                _completed(0, stdout="Deployment 12345 destroyed"),  # destroy
                 _completed(0, stdout='{"state": "closed"}'),  # authoritative audit: settled
             ]
             assert robust_destroy("12345") is True
@@ -149,7 +149,7 @@ class TestRobustDestroy:
         ):
             mock_run.side_effect = [
                 _completed(1, stderr="API down"),  # 1st destroy fails
-                _completed(0, stdout="Deployment 12345 closed"),  # 2nd destroy ok
+                _completed(0, stdout="Deployment 12345 destroyed"),  # 2nd destroy ok
                 _completed(0, stdout='{"state": "closed"}'),  # authoritative audit: settled
             ]
             assert robust_destroy("12345", retries=2) is True
@@ -1192,7 +1192,8 @@ class TestRobustDestroyTimeoutContract:
 class TestRobustDestroySuccessLogContent:
     """Angle #5: pin the operator-facing success log includes attempt number.
 
-    On first-try success, the log reads `Deployment {dseq} closed (attempt 1)`.
+    On first-try success, the log reads
+    `destroy reported success for {dseq} (attempt 1) — settlement not yet verified`.
     The attempt number is part of the audit trail — operators reviewing CI
     logs use it to distinguish "destroyed cleanly" from "needed retries"
     (which signals provider flakiness worth investigating).
@@ -1207,7 +1208,7 @@ class TestRobustDestroySuccessLogContent:
             patch("just_akash._e2e.time.sleep"),
         ):
             mock_run.side_effect = [
-                _completed(0, stdout="Deployment 12345 closed"),
+                _completed(0, stdout="Deployment 12345 destroyed"),
                 _completed(0, stdout='{"state": "closed"}'),
             ]
             assert robust_destroy("12345") is True
@@ -1229,7 +1230,7 @@ class TestRobustDestroySuccessLogContent:
         ):
             mock_run.side_effect = [
                 _completed(1, stderr="API down"),  # attempt 1 fails
-                _completed(0, stdout="Deployment 12345 closed"),  # attempt 2 ok
+                _completed(0, stdout="Deployment 12345 destroyed"),  # attempt 2 ok
                 _completed(0, stdout='{"state": "closed"}'),  # authoritative audit
             ]
             assert robust_destroy("12345", retries=2) is True
@@ -1565,7 +1566,7 @@ class TestAuditPollsBecauseCloseIsNotInstant:
     That is not hypothetical — it broke the lease-shell E2E on this branch:
 
         [7/7] Cleanup: destroy DSEQ=1784294163119
-          PASS Deployment 1784294163119 closed (attempt 1)
+          PASS destroy reported success for 1784294163119 (attempt 1) — settlement not yet verified
           FAIL Audit: deployment 1784294163119 STILL ACTIVE after destroy
 
     So `active` inside the window means "not settled YET"; only `active` that
@@ -1624,3 +1625,133 @@ class TestAuditPollsBecauseCloseIsNotInstant:
                 _completed(0, stdout='{"state": "closed"}'),
             ]
             assert robust_destroy("12345") is True
+
+
+class TestAuditOverClaimsWhenReaderLagsChainTruth:
+    """Witness pin for issue #275: the audit fires ``STILL ACTIVE`` even
+    when the chain has settled. The shape has now been **measured
+    twice in two subsystems**, not estimated once:
+
+    * **#275 (this audit path)** — main @``e0a41cc8``, run
+      34026449786, 2026-09-06T10:05Z. Deployment settled at block
+      28502500 (10:07:15.204Z, escrow ``closed``, ``funds=0``,
+      lifetime cost 123 uact). Audit read ``state=active`` for all
+      8 probes and printed ``STILL ACTIVE``.
+    * **#299 (a different file, ``runner-teardown.yml``)** — settle
+      at 10:18:08.02Z, guard read ``active`` at 10:18:16.91Z (+8.9 s
+      lag). A second instance on blazing#915 measured +9.6 s. The
+      two lags landing within 0.7 s of each other is the strongest
+      signal: the lag is a consistent ~9 s property of the indexer,
+      not flake. (Issue #299 was filed by the same author as this PR
+      on the same evidence chain — public REST via polkachu, no
+      key, block height → wall clock.)
+
+    The audit helper ``just_akash._e2e._confirm_settled`` currently allows this
+    over-claim. On the #275 run it did. This PR only labels the destroy-CLI log
+    line; the audit itself
+    remains the load-bearing defect and is the subject of issue
+    **#304** ("harden ``_confirm_settled`` against REST indexer-lag
+    false-positive"). #299 is owned by DEV3-tron (this repo,
+    different file, no overlap with this commit).
+
+    A fix that only lengthens the probe window is **insufficient**
+    against the evidence above: a 9 s lag is short relative to
+    current operator patience but long relative to a probe schedule
+    that starts polling immediately after destroy. The property
+    that needs to be asserted is settlement observed positively —
+    poll until escrow reads ``closed``, and on timeout report
+    "close issued, settlement not observed within N s" rather
+    than "STILL ACTIVE". An unconfirmed close and a failed close
+    are different facts and need different words.
+
+    These tests pin the over-claim shape as observable. They assert
+    **current** behaviour — 8/8 active reads → ``STILL ACTIVE`` — and
+    exist so that:
+
+    1. the bug is observable and reproducible in unit-test form;
+    2. the audit-hardening PR has a precise RED to turn GREEN by
+       changing the assertion to require corroboration with chain
+       truth (gRPC state-proof, multi-reader, or a height-aware
+       read);
+    3. anyone editing ``just_akash._e2e._confirm_settled`` without updating
+       this test breaks a CI green they didn't intend to.
+
+    The focused cases below use mocked subprocess output and zero real chain
+    interaction. Other audit tests exercise related mixed, transient, and
+    settled scenarios; these cases specifically preserve the unanimous-open
+    persistence shape that produces the stronger ``STILL ACTIVE`` message.
+    """
+
+    def test_eight_active_reads_fire_still_active_under_current_audit(self):
+        """Current behaviour: 8/8 active reads → ``STILL ACTIVE`` (False).
+
+        Mirrors the production chain-read lag that fired ``STILL ACTIVE``
+        on 2026-09-06T10:05Z run #34026449786 (issue #275) and on
+        2026-09-07T10:18:16Z (+8.9 s after settle, issue #299 — same
+        defect class, different file). The mock is the only difference
+        from production: the audit's reader (just-akash status via REST)
+        is presumed to be indexer-lagged, so the mocked subprocess
+        always returns ``state=active`` regardless of chain truth.
+        """
+        from just_akash._e2e import _confirm_settled
+
+        with (
+            patch("just_akash._e2e.subprocess.run") as mock_run,
+            patch("just_akash._e2e.time.sleep"),
+        ):
+            mock_run.side_effect = [_completed(0, stdout='{"state": "active"}') for _ in range(8)]
+            result = _confirm_settled("12345")
+        # Pin current over-claim behaviour. **Issue #304** is the
+        # audit-hardening PR that flips this assertion to require
+        # corroboration (or equivalent shape — gRPC state-proof,
+        # multi-reader, or height-aware). Until that issue lands,
+        # this test stays RED-free because it pins current behaviour.
+        assert result is False, (
+            "audit currently fires STILL ACTIVE on 8/8 active reads "
+            "regardless of chain truth — the over-claim shape pinned by "
+            "issue #275 / tracked for hardening in #304. A future PR on "
+            "#304 changes this to a corroboration-required shape; update "
+            "this test in the same PR."
+        )
+
+    def test_over_claim_shape_is_observable_end_to_end(self, capsys):
+        """Same shape, observed at the ``robust_destroy`` log-line level.
+
+        The two overclaiming labels that ran twenty lines apart on
+        2026-09-06T10:05Z are both pinned here:
+
+          * PASS line — now ``destroy reported success for {dseq} … ``
+            (the wording fix in this PR)
+          * FAIL line — ``Audit: deployment {dseq} STILL ACTIVE … ``
+
+        The PASS pin is exercised by tests in ``TestRobustDestroySuccessLogContent``
+        above. This test pins the FAIL pin under the over-claim shape:
+        a ``robust_destroy`` call where the audit reader is laggy fires
+        ``STILL ACTIVE`` even though the destroy succeeded and the chain
+        has settled.
+        """
+        with (
+            patch("just_akash._e2e.subprocess.run") as mock_run,
+            patch("just_akash._e2e.time.sleep"),
+        ):
+            # One successful destroy (PASS line) + 8 laggy active reads
+            # (STILL ACTIVE FAIL line). The destroy succeeded on chain;
+            # the audit over-claims because the reader is laggy.
+            mock_run.side_effect = [
+                _completed(0, stdout="Deployment 12345 destroyed"),
+                *(_completed(0, stdout='{"state": "active"}') for _ in range(8)),
+            ]
+            ok = robust_destroy("12345")
+        out = capsys.readouterr().out
+        assert ok is False, (
+            "robust_destroy returned False — the over-claim shape is "
+            "still observable end-to-end on the current audit."
+        )
+        assert "STILL ACTIVE" in out, (
+            "audit fired STILL ACTIVE despite the destroy having "
+            "succeeded — pins the over-claim shape end-to-end."
+        )
+        assert "settlement not yet verified" in out, (
+            "PASS line must use the new wording that reserves settled "
+            "language for the audit's positive confirmation."
+        )
