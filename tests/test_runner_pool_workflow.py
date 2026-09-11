@@ -128,7 +128,7 @@ def test_the_lease_is_tagged_before_the_wait_not_after():
 # --------------------------------------------------------------------------
 
 
-def test_teardown_targets_one_locally_parsed_dseq_and_its_create_time_owner():
+def test_teardown_targets_one_locally_parsed_dseq():
     """A sweep destroyed 14 third-party deployments once. Every destroy here must name
     a single DSEQ parsed from this job's own deploy output and carry the owner emitted by
     that same create attempt. The count pins every immediate rollback call site."""
@@ -1395,7 +1395,7 @@ def test_a_single_key_behaves_exactly_as_before():
     assert CALL["secrets"]["AKASH_API_KEY"]["required"] is False
 
 
-def test_teardown_routes_by_bound_owner_and_dseq_instead_of_wallet_position():
+def test_teardown_routes_by_dseq_instead_of_wallet_position():
     """The resolver and mutating process must receive the same DSEQ and bound owner."""
     body = _code(TD_CLOSE["run"])
     assert 'DESTROY_ARGS=(--dseq "$DSEQ" -y)' in body
