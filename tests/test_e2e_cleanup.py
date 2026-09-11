@@ -273,7 +273,7 @@ class TestDestroySuccessMatchesTheRealCLI:
     So every successful destroy was scored a failure, two redundant destroys fired
     against an already-closed deployment, and each E2E run printed three red FAILs
     while the audit quietly passed. The unit tests missed it because their fixtures
-    asserted against a hand-written "Deployment 12345 destroyed" that the CLI has never
+    asserted against a hand-written "Deployment 12345 closed" that the CLI has never
     printed -- self-consistent, and wrong about reality.
 
     So don't hand-write the output here. Run the real CLI, capture what it really
