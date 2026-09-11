@@ -161,6 +161,15 @@ jobs:
             exit 0
           fi
 
+          # DSEQ is a workflow input and is later interpolated into GitHub
+          # workflow-command annotations. Accept only the canonical decimal
+          # representation so control characters cannot inject a command.
+          if [[ ! "${DSEQ}" =~ ^[0-9]+$ ]]; then
+            echo "::error title=Invalid DSEQ::dseq must contain digits only"
+            echo "closed=unknown" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
           # DSEQ ownership is resolved inside just-akash. It positively reads the
           # deployment under the configured accounts and routes both destroy and the
           # verification read to its owner. A reordered pool cannot turn this into a
@@ -204,15 +213,44 @@ jobs:
           # it below. Same pattern applies to verify-closed below.
           "${JA[@]}" resolve-owner --dseq "$DSEQ" --json >/tmp/owner.json 2>/tmp/owner.err || OWNER_RC=$?
           OWNER_RC=${OWNER_RC:-0}
+          # ⛔ THE STDERR IS THE WHOLE DIAGNOSIS, AND IT USED TO BE THROWN AWAY.
+          # resolve-owner's stderr was captured to /tmp/owner.err on the line
+          # above and then read by NOTHING — the two failure branches below
+          # reported only the exit code. Six teardown failures across
+          # Borduas-Holdings/blazing on 2026-09-10 said exactly
+          # "resolve-owner exited 1" and nothing else, so whether the cause was
+          # a resolver bug, a wallet_pool multi-key case or an endpoint outage
+          # could not be told from any log — diagnosing it meant re-deriving by
+          # hand what this step had already been told.
+          #
+          # ⇒ An error that says a thing could not be done, while discarding the
+          # reason it could not, costs every future reader the same
+          # investigation. One line into the annotation, the full text into the
+          # step log.
+          #
+          # ⚠ Newlines are folded and the annotation excerpt is capped: `::error`
+          # is a SINGLE-LINE protocol, and a multi-line value silently truncates
+          # at the first newline — which would drop exactly the detail this adds.
+          OWNER_ERR=""
+          if [ -s /tmp/owner.err ]; then
+            OWNER_ERR=$(tr '\n' ' ' < /tmp/owner.err | cut -c1-400)
+          fi
           if [ "$OWNER_RC" -ne 0 ]; then
-            echo "::error title=Could not resolve owner before destroy::dseq=$DSEQ — resolve-owner exited $OWNER_RC. Without a captured owner, closure verification cannot proceed safely after destroy."
+            echo "::error title=Could not resolve owner before destroy::dseq=$DSEQ — resolve-owner exited $OWNER_RC. Without a captured owner, closure verification cannot proceed safely after destroy. stderr: ${OWNER_ERR:-<empty>}"
+            echo "--- resolve-owner stderr (dseq=$DSEQ) ---" >&2
+            sed -e 's/^/    /' /tmp/owner.err >&2 || true
             echo "closed=unknown" >> "$GITHUB_OUTPUT"
             exit 1
           fi
           OWNER=$(python3 -c "import json,sys;print(json.load(sys.stdin).get('owner',''))" \
                   </tmp/owner.json 2>/dev/null || echo "")
           if [ -z "$OWNER" ]; then
-            echo "::error title=No owner captured::dseq=$DSEQ — resolve-owner returned empty owner"
+            # ⚠ EXIT 0 WITH NO OWNER IS THE QUIETER HALF OF THE SAME FAULT: the
+            # resolver succeeded and returned nothing usable, so there is no exit
+            # code to report and the stderr is the only evidence there is.
+            echo "::error title=No owner captured::dseq=$DSEQ — resolve-owner exited 0 but returned an empty owner. stderr: ${OWNER_ERR:-<empty>}"
+            echo "--- resolve-owner stderr (dseq=$DSEQ) ---" >&2
+            sed -e 's/^/    /' /tmp/owner.err >&2 || true
             echo "closed=unknown" >> "$GITHUB_OUTPUT"
             exit 1
           fi
