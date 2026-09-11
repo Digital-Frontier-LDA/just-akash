@@ -172,6 +172,11 @@ def symbols_from_source(source: str) -> set[str]:
                 bound = alias.asname or alias.name.split(".")[0]
                 out.add(bound)
         elif isinstance(node, ast.ImportFrom):
+            # Future imports are compile-time directives and do not create
+            # runtime bindings. Star imports likewise do not expose a named
+            # binding we can safely attribute to this module.
+            if node.module == "__future__":
+                continue
             # `from x import y` binds `y`.
             # `from x import y as z` binds `z`.
             # `from . import y` binds `y`; the `module` field and the
@@ -179,6 +184,8 @@ def symbols_from_source(source: str) -> set[str]:
             # import came from, not WHAT is bound -- only the alias
             # names matter for namespace bindings.
             for alias in node.names:
+                if alias.name == "*":
+                    continue
                 bound = alias.asname or alias.name
                 out.add(bound)
         elif type_alias is not None and isinstance(node, type_alias):
@@ -295,9 +302,8 @@ def commit_mentions_symbol(subjects: list[str], name: str) -> bool:
     lowercase shape today, so the case-insensitivity is a contract
     pinned by scenario U, not an oversight.
     """
-    name_lc = name.lower()
-    name_pat = re.compile(rf"\b{re.escape(name_lc)}\b")
-    decl_pat = re.compile(r"^\s*[Ii]ntentional-[Dd]elete\s*:\s*(.+?)\s*$")
+    name_pat = re.compile(rf"\b{re.escape(name)}\b", re.IGNORECASE)
+    decl_pat = re.compile(r"^\s*intentional-delete\s*:\s*(.+?)\s*$", re.IGNORECASE)
     for line in subjects:
         m = decl_pat.match(line)
         if m is None:

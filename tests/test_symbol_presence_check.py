@@ -689,7 +689,7 @@ def test_renamed_python_file_still_flags_dropped_symbols(sandbox: Path) -> None:
     assert "bar" in result.stdout, result.stdout
 
 
-# --- Scenario N: clause-boundary guard on INTENTIONAL_DELETE mention ---
+# --- Scenario N: prose must not masquerade as an intentional-delete trailer ---
 
 
 def test_intentional_delete_mention_must_share_clause_with_symbol(sandbox: Path) -> None:
