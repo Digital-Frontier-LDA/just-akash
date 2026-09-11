@@ -308,7 +308,7 @@ class TestAnUnanswerableRequestIsNotAVerdict:
     def _raise(code: int):
         def _open(*_a, **_k):
             raise urllib.error.HTTPError(
-                url="https://api.github.com/x", code=code, msg="stub", hdrs={}, fp=None
+                url="https://api.github.com/x", code=code, msg="stub", hdrs=_hdrs(), fp=None
             )
 
         return _open
@@ -334,7 +334,7 @@ class TestAnUnanswerableRequestIsNotAVerdict:
         def _open(*_a, **_k):
             calls.append(1)
             raise urllib.error.HTTPError(
-                url="https://api.github.com/x", code=403, msg="s", hdrs={}, fp=None
+                url="https://api.github.com/x", code=403, msg="s", hdrs=_hdrs(), fp=None
             )
 
         monkeypatch.setattr(urllib.request, "urlopen", _open)
@@ -356,7 +356,7 @@ class TestAnUnanswerableRequestIsNotAVerdict:
         def _open(*_a, **_k):
             calls.append(1)
             raise urllib.error.HTTPError(
-                url="https://api.github.com/x", code=401, msg="s", hdrs={}, fp=None
+                url="https://api.github.com/x", code=401, msg="s", hdrs=_hdrs(), fp=None
             )
 
         monkeypatch.setattr(urllib.request, "urlopen", _open)
