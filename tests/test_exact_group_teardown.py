@@ -35,16 +35,14 @@ def _assert_group_handoffs(pool_source: str, teardown_source: str) -> None:
     nested = pool["jobs"]["teardown"]
     teardown_call = _on(teardown)["workflow_call"]
     close = next(
-        step
-        for step in teardown["jobs"]["teardown"]["steps"]
-        if step.get("id") == "close"
+        step for step in teardown["jobs"]["teardown"]["steps"] if step.get("id") == "close"
     )
 
     assert render.get("id") == "render"
     render_code = _code(render["run"])
     publication = 'echo "deployment_group=${PLACEMENT_KEY}" >> "$GITHUB_OUTPUT"'
     assert render_code.count(publication) == 1
-    assert render_code.index("PLACEMENT_KEY=\"${PLACEMENT_KEY}-run-${GH_RUN_ID:-}-end\"") < (
+    assert render_code.index('PLACEMENT_KEY="${PLACEMENT_KEY}-run-${GH_RUN_ID:-}-end"') < (
         render_code.index(publication)
     )
     assert render_code.index(publication) < render_code.index("cat > /tmp/runner-sdl.yaml")
@@ -71,9 +69,7 @@ def _assert_group_handoffs(pool_source: str, teardown_source: str) -> None:
     for line in rollback_lines:
         assert line.count('--expected-group "$DEPLOYMENT_GROUP"') == 1
 
-    assert nested["with"].get("deployment-group") == (
-        "${{ needs.pool.outputs.deployment_group }}"
-    )
+    assert nested["with"].get("deployment-group") == ("${{ needs.pool.outputs.deployment_group }}")
     group_input = teardown_call["inputs"].get("deployment-group", {})
     assert group_input.get("required") is False
     assert group_input.get("default") == ""
@@ -87,9 +83,7 @@ def _assert_group_handoffs(pool_source: str, teardown_source: str) -> None:
 def test_render_publishes_the_name_used_by_both_sdl_group_maps(tmp_path):
     pool = yaml.safe_load(POOL_SRC)
     render = next(
-        step
-        for step in pool["jobs"]["pool"]["steps"]
-        if step.get("name") == "Render runner SDL"
+        step for step in pool["jobs"]["pool"]["steps"] if step.get("name") == "Render runner SDL"
     )
     output = tmp_path / "output"
     result = subprocess.run(
