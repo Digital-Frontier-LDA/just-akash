@@ -264,6 +264,13 @@ def test_real_close_step(tmp_path, case):
     assert "--dseq" in resolve_call, (
         f"{case}: resolve-owner was invoked without --dseq; argv={resolve_call}"
     )
+    assert resolve_call.count("--expected-owner") == 1, (
+        f"{case}: the create-time owner was not wired once into resolve-owner; "
+        f"without this call-site binding teardown returns to the failing Console "
+        f"rediscovery path. argv={resolve_call}"
+    )
+    expected_owner_idx = resolve_call.index("--expected-owner")
+    assert resolve_call[expected_owner_idx + 1] == "akash1" + "a" * 38
     if case == "resolve_owner_unavailable":
         # ⇒ bash `-e` guard: when resolve-owner exits non-zero, the script
         # must abort AT THAT POINT. destroy and verify-closed must NOT

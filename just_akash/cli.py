@@ -118,14 +118,23 @@ def _resolve_deployment(client, dseq_arg):
     return dseq
 
 
-def _resolve_deployment_client(dseq_arg):
+def _resolve_deployment_client(dseq_arg, expected_owner=None):
     """Resolve a DSEQ and the configured Console wallet that positively owns it."""
 
     from .api import AkashConsoleAPI, _extract_dseq, _interactive_pick, _resolve_dseq
-    from .wallet_pool import configured_api_keys, select_client_for_dseq
+    from .wallet_pool import (
+        configured_api_keys,
+        select_client_for_bound_owner,
+        select_client_for_dseq,
+    )
 
     dseq = _resolve_dseq(dseq_arg)
     if dseq:
+        if expected_owner:
+            client = select_client_for_bound_owner(
+                dseq, expected_owner, client_factory=AkashConsoleAPI
+            )
+            return client, dseq
         return select_client_for_dseq(dseq, client_factory=AkashConsoleAPI), dseq
 
     deployments = []
@@ -664,6 +673,14 @@ def main():
         ),
     )
     resolve_owner_p.add_argument("--dseq", default="")
+    resolve_owner_p.add_argument(
+        "--expected-owner",
+        default="",
+        help=(
+            "Create-time owner candidate. It is accepted only when a configured signer "
+            "and an exact owner/DSEQ chain read both confirm it."
+        ),
+    )
     resolve_owner_p.add_argument(
         "--json",
         action="store_true",
@@ -1901,12 +1918,16 @@ def main():
         import json as _json
 
         try:
-            client, dseq = _resolve_deployment_client(args.dseq)
+            if args.expected_owner:
+                client, dseq = _resolve_deployment_client(args.dseq, args.expected_owner)
+            else:
+                client, dseq = _resolve_deployment_client(args.dseq)
             owner = client.account_address()
         except RuntimeError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
-        print(_json.dumps({"owner": owner, "dseq": dseq, "source": "wallet_pool"}))
+        source = "bound_owner_chain" if args.expected_owner else "wallet_pool"
+        print(_json.dumps({"owner": owner, "dseq": dseq, "source": source}))
 
     # ── destroy-all ────────────────────────────────────
     elif args.command == "destroy-all":

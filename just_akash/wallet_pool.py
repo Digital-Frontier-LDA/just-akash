@@ -305,3 +305,52 @@ def select_client_for_dseq(
     raise RuntimeError(
         f"deployment {dseq} was not readable under any of {len(keys)} configured Console wallets"
     )
+
+
+def select_client_for_bound_owner(
+    dseq: str,
+    expected_owner: str,
+    *,
+    client_factory: Callable[[str], AkashConsoleAPI] = AkashConsoleAPI,
+    group_reader: Callable[[str, str], list[str]] = chain.deployment_group_names,
+) -> AkashConsoleAPI:
+    """Resolve a persisted owner to a configured signer and exact chain deployment.
+
+    The runner provisioner learns the selected wallet before handing a DSEQ to a
+    separate teardown job.  A later Console deployment read can be unavailable even
+    while the deployment remains active.  In that case rediscovering the owner through
+    ``get_deployment`` strands the lease despite already having its create-time owner.
+
+    The persisted value is a candidate, not authority by itself.  This path accepts it
+    only when a configured Console key resolves to that exact owner and an owner/DSEQ
+    chain read returns a complete non-empty group population.  Either missing proof is
+    a refusal; it never falls back to another owner.
+    """
+
+    if not re.fullmatch(r"akash1[a-z0-9]{38,58}", expected_owner):
+        raise RuntimeError("expected owner is not a canonical Akash account shape")
+    keys = configured_api_keys()
+    if not keys:
+        raise RuntimeError("AKASH_API_KEY or AKASH_API_KEYS must be set")
+
+    matching: list[AkashConsoleAPI] = []
+    for key in keys:
+        client = client_factory(key)
+        try:
+            owner = client.account_address()
+        except RuntimeError:
+            continue
+        if owner == expected_owner:
+            matching.append(client)
+    if not matching:
+        raise RuntimeError(
+            f"expected owner is not controlled by any of {len(keys)} configured Console wallets"
+        )
+
+    try:
+        names = group_reader(expected_owner, str(dseq))
+    except RuntimeError as exc:
+        raise RuntimeError("exact owner/DSEQ chain identity could not be read") from exc
+    if not names:
+        raise RuntimeError("exact owner/DSEQ chain identity has no complete group population")
+    return matching[0]

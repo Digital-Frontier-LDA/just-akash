@@ -1394,10 +1394,14 @@ def test_teardown_routes_by_dseq_instead_of_wallet_position():
     assert "WANT_ADDR" not in body
 
 
-def test_wallet_address_is_optional_compatibility_data_not_a_safety_dependency():
+def test_wallet_address_is_optional_but_has_a_bound_owner_safety_path():
     td_call = (TD.get("on") or TD.get(True))["workflow_call"]
     assert td_call["inputs"]["wallet-address"]["required"] is False
-    assert "Deprecated compatibility" in td_call["inputs"]["wallet-address"]["description"]
+    description = td_call["inputs"]["wallet-address"]["description"]
+    assert "configured signer" in description
+    assert "exact owner/DSEQ chain read" in description
+    body = TD_CLOSE["run"]
+    assert body.count('RESOLVE_ARGS+=(--expected-owner "$WALLET_ADDRESS")') == 1
 
 
 def test_teardown_does_not_claim_an_ownership_check_it_cannot_perform():

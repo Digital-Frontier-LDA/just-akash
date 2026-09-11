@@ -10,7 +10,7 @@
 #         tag-prefix:     ci-myrepo
 #         runner-label:   fast-pool-${{ github.run_id }}
 #         github-org:     my-org
-#         wallet-address: ${{ needs.pool.outputs.wallet_address }}   # optional audit data
+#         wallet-address: ${{ needs.pool.outputs.wallet_address }}   # create-time owner candidate
 #       secrets:
 #         AKASH_API_KEY:  ${{ secrets.AKASH_API_KEY }}
 #         AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}              # only with a pool
@@ -79,8 +79,10 @@ on:
         default: ''
       wallet-address:
         description: >-
-          Deprecated compatibility/audit input. just-akash now locates the DSEQ owner by
-          positive read-back across the configured wallet pool before destroying it.
+          Create-time owner candidate emitted by runner-pool. When present, teardown
+          requires both a configured signer for this exact owner and a complete exact
+          owner/DSEQ chain read before destroying. Empty preserves the legacy Console
+          deployment-read path for older callers.
         required: false
         type: string
         default: ''
@@ -147,6 +149,7 @@ jobs:
           AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
           AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}
           DSEQ: ${{ inputs.dseq }}
+          WALLET_ADDRESS: ${{ inputs.wallet-address }}
           TAG_PREFIX: ${{ inputs.tag-prefix }}
         run: |
           set -uo pipefail
@@ -202,7 +205,11 @@ jobs:
           # written — the harness reproduces this as empty GITHUB_OUTPUT.
           # `|| OWNER_RC=$?` makes the failure non-fatal so we can branch on
           # it below. Same pattern applies to verify-closed below.
-          "${JA[@]}" resolve-owner --dseq "$DSEQ" --json >/tmp/owner.json 2>/tmp/owner.err || OWNER_RC=$?
+          RESOLVE_ARGS=(--dseq "$DSEQ" --json)
+          if [ -n "${WALLET_ADDRESS:-}" ]; then
+            RESOLVE_ARGS+=(--expected-owner "$WALLET_ADDRESS")
+          fi
+          "${JA[@]}" resolve-owner "${RESOLVE_ARGS[@]}" >/tmp/owner.json 2>/tmp/owner.err || OWNER_RC=$?
           OWNER_RC=${OWNER_RC:-0}
           if [ "$OWNER_RC" -ne 0 ]; then
             echo "::error title=Could not resolve owner before destroy::dseq=$DSEQ — resolve-owner exited $OWNER_RC. Without a captured owner, closure verification cannot proceed safely after destroy."
