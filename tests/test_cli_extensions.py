@@ -51,6 +51,31 @@ class TestCliDestroyOwnerBinding:
         resolve.assert_called_once_with("12345", owner, "borduas-runner-run-7-end")
         client.close_deployment.assert_called_once_with("12345")
 
+    @patch("just_akash.cli._resolve_deployment_client")
+    def test_resolve_owner_forwards_the_expected_group_to_the_same_api_boundary(
+        self, resolve, monkeypatch
+    ):
+        owner = "akash1" + "a" * 38
+        client = MagicMock()
+        client.account_address.return_value = owner
+        resolve.return_value = (client, "12345")
+
+        _run_cli(
+            monkeypatch,
+            [
+                "just-akash",
+                "resolve-owner",
+                "--dseq",
+                "12345",
+                "--expected-owner",
+                owner,
+                "--expected-group",
+                "borduas-runner-run-7-end",
+            ],
+        )
+
+        resolve.assert_called_once_with("12345", owner, "borduas-runner-run-7-end")
+
     @pytest.mark.parametrize("command", ["destroy", "resolve-owner"])
     def test_expected_group_without_expected_owner_is_rejected_before_client_selection(
         self, command, monkeypatch, capsys
