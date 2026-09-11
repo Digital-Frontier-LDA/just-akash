@@ -310,6 +310,7 @@ def select_client_for_dseq(
 def select_client_for_bound_owner(
     dseq: str,
     expected_owner: str,
+    expected_group: str | None = None,
     *,
     client_factory: Callable[[str], AkashConsoleAPI] = AkashConsoleAPI,
     group_reader: Callable[[str, str], list[str]] = chain.deployment_group_names,
@@ -323,9 +324,12 @@ def select_client_for_bound_owner(
 
     The persisted value is a candidate, not authority by itself.  This path accepts it
     only when a configured Console key's JWT reports that exact owner and an owner/DSEQ
-    chain read returns a complete non-empty group population. Either missing check is a
-    refusal; it never falls back to another owner. The JWT issuer is an assertion by
-    Console, not local cryptographic proof that the caller possesses an Akash private key.
+    chain read returns a complete non-empty group population. When ``expected_group`` is
+    supplied, that complete population must be exactly the expected singleton. Containment
+    is insufficient: an extra group means the DSEQ is not the deployment the create path
+    described. Either missing check is a refusal; it never falls back to another owner. The
+    JWT issuer is an assertion by Console, not local cryptographic proof that the caller
+    possesses an Akash private key.
     """
 
     if not re.fullmatch(r"akash1[a-z0-9]{38,58}", expected_owner):
@@ -354,4 +358,8 @@ def select_client_for_bound_owner(
         raise RuntimeError("exact owner/DSEQ chain identity could not be read") from exc
     if not names:
         raise RuntimeError("exact owner/DSEQ chain identity has no complete group population")
+    if expected_group is not None and names != [expected_group]:
+        raise RuntimeError(
+            "exact owner/DSEQ chain group population does not equal the expected singleton"
+        )
     return matching[0]

@@ -62,6 +62,7 @@ WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "runn
         "resolve_owner_unavailable",
         "verifier_false_nonzero",
         "verifier_true_nonzero",
+        "legacy_without_group",
     ],
 )
 def test_real_close_step(tmp_path, case):
@@ -169,6 +170,7 @@ def test_real_close_step(tmp_path, case):
             **cases["closed"],
             "verify-closed": [json.dumps({"closed": value}), "verifier failed", 1],
         }
+    cases["legacy_without_group"] = cases["closed"]
     fixture = tmp_path / "fixture.json"
     fixture.write_text(json.dumps(cases[case]))
 
@@ -223,6 +225,9 @@ def test_real_close_step(tmp_path, case):
             **os.environ,
             "DSEQ": "7",
             "WALLET_ADDRESS": "akash1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "DEPLOYMENT_GROUP": (
+                "" if case == "legacy_without_group" else "borduas-runner-run-7-end"
+            ),
             "TAG_PREFIX": "review",
             "GITHUB_OUTPUT": str(output),
             "TASK_CALLS": str(calls),
@@ -271,6 +276,15 @@ def test_real_close_step(tmp_path, case):
     )
     expected_owner_idx = resolve_call.index("--expected-owner")
     assert resolve_call[expected_owner_idx + 1] == "akash1" + "a" * 38
+    if case == "legacy_without_group":
+        assert "--expected-group" not in resolve_call
+    else:
+        assert resolve_call.count("--expected-group") == 1, (
+            f"{case}: the create-time group was not wired once into resolve-owner; "
+            f"argv={resolve_call}"
+        )
+        expected_group_idx = resolve_call.index("--expected-group")
+        assert resolve_call[expected_group_idx + 1] == "borduas-runner-run-7-end"
     if case == "resolve_owner_unavailable":
         # ⇒ bash `-e` guard: when resolve-owner exits non-zero, the script
         # must abort AT THAT POINT. destroy and verify-closed must NOT
@@ -345,6 +359,14 @@ def test_real_close_step(tmp_path, case):
     )
     destroy_owner_idx = destroy_call.index("--expected-owner")
     assert destroy_call[destroy_owner_idx + 1] == "akash1" + "a" * 38
+    if case == "legacy_without_group":
+        assert "--expected-group" not in destroy_call
+    else:
+        assert destroy_call.count("--expected-group") == 1, (
+            f"{case}: the mutation did not retain the group binding; argv={destroy_call}"
+        )
+        destroy_group_idx = destroy_call.index("--expected-group")
+        assert destroy_call[destroy_group_idx + 1] == "borduas-runner-run-7-end"
     # ⇒ The verify-closed call must carry the owner captured by resolve-owner.
     # A regression that drops the --owner handoff would force the verifier to
     # re-resolve through a wallet pool that may now Console 404 (the exact
@@ -369,7 +391,7 @@ def test_real_close_step(tmp_path, case):
 
     # ⇒ POSITIVE controls: close step exits 0 with closed=true written to
     # GITHUB_OUTPUT. These two pin what "the lease is closed" looks like.
-    if case in ("closed", "agreeing_terminal"):
+    if case in ("closed", "agreeing_terminal", "legacy_without_group"):
         assert result.returncode == 0, (
             f"{case}: positive control must exit 0; got {result.returncode}\n"
             f"stdout={result.stdout!r}\nstderr={result.stderr!r}"

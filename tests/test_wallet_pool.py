@@ -126,7 +126,11 @@ def test_bound_owner_survives_unavailable_console_deployment_read(monkeypatch):
         return ["borduas-runner-run-7-end"]
 
     client = select_client_for_bound_owner(
-        "123", owner, client_factory=lambda key: clients[key], group_reader=groups
+        "123",
+        owner,
+        "borduas-runner-run-7-end",
+        client_factory=lambda key: clients[key],
+        group_reader=groups,
     )
 
     assert client is clients["owner"]
@@ -161,6 +165,57 @@ def test_bound_owner_without_complete_exact_chain_identity_is_held(monkeypatch):
         select_client_for_bound_owner(
             "123", owner, client_factory=lambda _key: client, group_reader=lambda *_args: []
         )
+
+
+@pytest.mark.parametrize(
+    "actual_groups",
+    [
+        ["another-run-run-8-end"],
+        ["borduas-runner-run-7-end", "another-group"],
+        ["another-group", "borduas-runner-run-7-end"],
+    ],
+)
+def test_bound_owner_requires_the_complete_population_to_equal_the_expected_singleton(
+    monkeypatch, actual_groups
+):
+    """Same owner and DSEQ are insufficient when the create-time group disagrees.
+
+    The expected name being merely present is also insufficient: a second group means
+    the chain population is not the single-group deployment the pool submitted.
+    """
+    owner = "akash1" + "a" * 38
+    monkeypatch.setenv("AKASH_API_KEY", "owner")
+    monkeypatch.delenv("AKASH_API_KEYS", raising=False)
+    client = MagicMock(api_key="owner")
+    client.account_address.return_value = owner
+
+    with pytest.raises(RuntimeError, match="does not equal the expected singleton"):
+        select_client_for_bound_owner(
+            "123",
+            owner,
+            "borduas-runner-run-7-end",
+            client_factory=lambda _key: client,
+            group_reader=lambda *_args: actual_groups,
+        )
+
+    client.close_deployment.assert_not_called()
+
+
+def test_bound_owner_without_an_expected_group_preserves_the_legacy_population_check(monkeypatch):
+    owner = "akash1" + "a" * 38
+    monkeypatch.setenv("AKASH_API_KEY", "owner")
+    monkeypatch.delenv("AKASH_API_KEYS", raising=False)
+    client = MagicMock(api_key="owner")
+    client.account_address.return_value = owner
+
+    selected = select_client_for_bound_owner(
+        "123",
+        owner,
+        client_factory=lambda _key: client,
+        group_reader=lambda *_args: ["legacy-a", "legacy-b"],
+    )
+
+    assert selected is client
 
 
 def test_dseq_owner_requires_positive_matching_identity(monkeypatch):

@@ -118,7 +118,7 @@ def _resolve_deployment(client, dseq_arg):
     return dseq
 
 
-def _resolve_deployment_client(dseq_arg, expected_owner=None):
+def _resolve_deployment_client(dseq_arg, expected_owner=None, expected_group=None):
     """Resolve a DSEQ and the configured Console wallet that positively owns it."""
 
     from .api import AkashConsoleAPI, _extract_dseq, _interactive_pick, _resolve_dseq
@@ -129,12 +129,17 @@ def _resolve_deployment_client(dseq_arg, expected_owner=None):
     )
 
     dseq = _resolve_dseq(dseq_arg)
+    if expected_group is not None and not expected_owner:
+        raise RuntimeError("--expected-group requires --expected-owner")
     if expected_owner and not dseq:
         raise RuntimeError("--expected-owner requires an explicit --dseq")
     if dseq:
         if expected_owner:
             client = select_client_for_bound_owner(
-                dseq, expected_owner, client_factory=AkashConsoleAPI
+                dseq,
+                expected_owner,
+                expected_group,
+                client_factory=AkashConsoleAPI,
             )
             return client, dseq
         return select_client_for_dseq(dseq, client_factory=AkashConsoleAPI), dseq
@@ -608,6 +613,14 @@ def main():
             "owner/DSEQ chain identity to match before closing."
         ),
     )
+    destroy_p.add_argument(
+        "--expected-group",
+        default=None,
+        help=(
+            "Create-time group_spec.name. Valid only with --expected-owner; the complete "
+            "chain group population must equal this singleton before closing."
+        ),
+    )
     destroy_p.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompts")
 
     # ── verify-closed ──────────────────────────────────
@@ -689,6 +702,14 @@ def main():
         help=(
             "Create-time owner candidate. It is accepted only when a configured Console "
             "credential reports it and an exact owner/DSEQ chain read confirms it."
+        ),
+    )
+    resolve_owner_p.add_argument(
+        "--expected-group",
+        default=None,
+        help=(
+            "Create-time group_spec.name. Valid only with --expected-owner; the complete "
+            "chain group population must equal this singleton."
         ),
     )
     resolve_owner_p.add_argument(
@@ -1849,7 +1870,11 @@ def main():
         )
 
         try:
-            client, dseq = _resolve_deployment_client(args.dseq, args.expected_owner or None)
+            client, dseq = _resolve_deployment_client(
+                args.dseq,
+                args.expected_owner or None,
+                args.expected_group,
+            )
             tag = _get_tag(dseq)
             label = f"{dseq} ({tag})" if tag else dseq
             if _confirm(f"Destroy deployment {label}? (y/N) ", yes=args.yes):
@@ -1929,9 +1954,16 @@ def main():
 
         try:
             if args.expected_owner:
-                client, dseq = _resolve_deployment_client(args.dseq, args.expected_owner)
+                client, dseq = _resolve_deployment_client(
+                    args.dseq,
+                    args.expected_owner,
+                    args.expected_group,
+                )
             else:
-                client, dseq = _resolve_deployment_client(args.dseq)
+                client, dseq = _resolve_deployment_client(
+                    args.dseq,
+                    expected_group=args.expected_group,
+                )
             owner = client.account_address()
         except RuntimeError as e:
             print(f"Error: {e}", file=sys.stderr)
