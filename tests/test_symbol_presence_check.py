@@ -692,7 +692,7 @@ def test_renamed_python_file_still_flags_dropped_symbols(sandbox: Path) -> None:
 # --- Scenario N: prose must not masquerade as an intentional-delete trailer ---
 
 
-def test_intentional_delete_mention_must_share_clause_with_symbol(sandbox: Path) -> None:
+def test_prose_does_not_masquerade_as_intentional_delete(sandbox: Path) -> None:
     """The auto-downgrade to INTENTIONAL_DELETE requires an explicit
     `Intentional-Delete: <name>` declaration in the commit message.
     Prose that puts a deletion keyword near a name WITHOUT the
@@ -975,8 +975,8 @@ def test_intentional_delete_trailer_prefix_is_case_insensitive(sandbox: Path) ->
     commit_mentions_symbol pins this as a contract; this test pins the
     contract in executable form.
 
-    Construction: same as P, but the declaration line uses lowercase
-    `intentional-delete: foo`."""
+    Construction: same as P, but the declaration line uses mixed case
+    `InTeNtIoNaL-DeLeTe: FOO`."""
     _write(
         sandbox,
         "main",
@@ -995,12 +995,12 @@ def test_intentional_delete_trailer_prefix_is_case_insensitive(sandbox: Path) ->
         "commit",
         "-q",
         "-m",
-        "U: drop obsolete_parser\n\nintentional-delete: foo",
+        "U: drop obsolete_parser\n\nInTeNtIoNaL-DeLeTe: FOO",
     )
 
     result = _run_check(sandbox, "main", "branch-U")
     assert result.returncode == 0, (
-        f"lowercase `intentional-delete: foo` MUST downgrade the same "
+        f"mixed-case declaration MUST downgrade the same "
         f"way canonical case does; got {result.returncode}\n"
         f"{result.stdout}"
     )
