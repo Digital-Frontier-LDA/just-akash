@@ -971,6 +971,10 @@ jobs:
             echo "dseq=$DSEQ" >> "$GITHUB_OUTPUT"
             PROVIDER=$(awk -F': +' '/^[[:space:]]*Provider:/{print $2; exit}' /tmp/ja.log || true)
             WALLET=$(awk -F': +' '/^[[:space:]]*Wallet:/{print $2; exit}' /tmp/ja.log || true)
+            # Publish the create-time owner as soon as it is available. Internal
+            # rollback runs only on a failed handoff, so a success-only publication
+            # leaves precisely that teardown without the bound-owner fallback.
+            echo "wallet_address=$WALLET" >> "$GITHUB_OUTPUT"
             WALLET_UACT=$(awk '/^[[:space:]]*Wallet available:/{print $(NF-1); exit}' /tmp/ja.log || true)
 
             # A DSEQ with no PROVIDER is a REAL deployment we would otherwise walk away
@@ -1463,6 +1467,7 @@ jobs:
     uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@9fbb0a7d72d0007d0f91fc9d0bb38be42a0142b3
     with:
       dseq: ${{ needs.pool.outputs.dseq }}
+      wallet-address: ${{ needs.pool.outputs.wallet_address }}
       tag-prefix: ${{ inputs.tag-prefix }}
       runner-label: ${{ inputs.runner-label }}
       # ⭐ inputs.github-org, NOT github.organization — that context property DOES NOT

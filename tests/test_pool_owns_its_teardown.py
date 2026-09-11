@@ -160,6 +160,19 @@ def test_teardown_passes_the_pools_own_dseq():
     )
 
 
+def test_teardown_passes_the_pools_create_time_owner():
+    td = JOBS.get("teardown", {})
+    withs = td.get("with", {}) or {}
+    assert withs.get("wallet-address") == "${{ needs.pool.outputs.wallet_address }}"
+
+
+def test_wallet_address_is_published_before_failure_prone_validation():
+    parse = SRC.find("WALLET=$(awk")
+    publish = SRC.find('echo "wallet_address=$WALLET" >> "$GITHUB_OUTPUT"')
+    first_validation = SRC.find('if [ -n "$DSEQ" ] && [ -z "$PROVIDER" ]', parse)
+    assert parse != -1 and parse < publish < first_validation
+
+
 def test_teardown_forwards_the_secrets_the_close_needs():
     """The close authenticates through the Console wallet pool; de-registration
     needs GH_RUNNER_PAT. Missing secrets make the close a silent no-op."""

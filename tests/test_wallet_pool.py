@@ -142,7 +142,7 @@ def test_bound_owner_without_a_matching_configured_signer_is_held(monkeypatch):
     other.account_address.return_value = "akash1" + "b" * 38
     group_reader = MagicMock(return_value=["borduas-runner-run-7-end"])
 
-    with pytest.raises(RuntimeError, match="not controlled"):
+    with pytest.raises(RuntimeError, match="not reported"):
         select_client_for_bound_owner(
             "123", owner, client_factory=lambda _key: other, group_reader=group_reader
         )

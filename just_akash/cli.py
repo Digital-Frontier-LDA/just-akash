@@ -129,6 +129,8 @@ def _resolve_deployment_client(dseq_arg, expected_owner=None):
     )
 
     dseq = _resolve_dseq(dseq_arg)
+    if expected_owner and not dseq:
+        raise RuntimeError("--expected-owner requires an explicit --dseq")
     if dseq:
         if expected_owner:
             client = select_client_for_bound_owner(
@@ -598,6 +600,14 @@ def main():
     # ── destroy ────────────────────────────────────────
     destroy_p = subparsers.add_parser("destroy", help="Destroy a deployment")
     destroy_p.add_argument("--dseq", default="")
+    destroy_p.add_argument(
+        "--expected-owner",
+        default="",
+        help=(
+            "Create-time owner candidate. Requires the configured credential and exact "
+            "owner/DSEQ chain identity to match before closing."
+        ),
+    )
     destroy_p.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompts")
 
     # ── verify-closed ──────────────────────────────────
@@ -677,8 +687,8 @@ def main():
         "--expected-owner",
         default="",
         help=(
-            "Create-time owner candidate. It is accepted only when a configured signer "
-            "and an exact owner/DSEQ chain read both confirm it."
+            "Create-time owner candidate. It is accepted only when a configured Console "
+            "credential reports it and an exact owner/DSEQ chain read confirms it."
         ),
     )
     resolve_owner_p.add_argument(
@@ -1839,7 +1849,7 @@ def main():
         )
 
         try:
-            client, dseq = _resolve_deployment_client(args.dseq)
+            client, dseq = _resolve_deployment_client(args.dseq, args.expected_owner or None)
             tag = _get_tag(dseq)
             label = f"{dseq} ({tag})" if tag else dseq
             if _confirm(f"Destroy deployment {label}? (y/N) ", yes=args.yes):

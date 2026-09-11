@@ -266,12 +266,21 @@ def deployment_group_names(owner: str, dseq: str) -> list[str]:
     """
     if not owner or not dseq:
         return []
-    path = f"{_DEPLOYMENT_API}/deployments/info?id.owner={owner}&id.dseq={dseq}"
+    path = (
+        f"{_DEPLOYMENT_API}/deployments/info"
+        f"?id.owner={urllib.parse.quote(owner)}&id.dseq={urllib.parse.quote(dseq)}"
+    )
     for base in rest_urls():
         try:
             data = _lcd_get(path, base=base)
         except RuntimeError:
             continue  # one dead or lagging endpoint must not answer for the whole chain
+        deployment = data.get("deployment")
+        deployment_id = deployment.get("id") if isinstance(deployment, dict) else None
+        if not isinstance(deployment_id, dict):
+            continue
+        if deployment_id.get("owner") != owner or str(deployment_id.get("dseq")) != dseq:
+            continue
         groups = data.get("groups")
         if not isinstance(groups, list) or not groups:
             continue
@@ -282,8 +291,15 @@ def deployment_group_names(owner: str, dseq: str) -> list[str]:
         # unreadable and we try the next endpoint, which may simply be healthier.
         names: list[str] = []
         for g in groups:
+            group_id = g.get("id") if isinstance(g, dict) else None
             name = (g.get("group_spec") or {}).get("name") if isinstance(g, dict) else None
-            if not isinstance(name, str) or not name:
+            if (
+                not isinstance(group_id, dict)
+                or group_id.get("owner") != owner
+                or str(group_id.get("dseq")) != dseq
+                or not isinstance(name, str)
+                or not name
+            ):
                 names = []
                 break
             names.append(name)

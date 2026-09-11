@@ -322,9 +322,10 @@ def select_client_for_bound_owner(
     ``get_deployment`` strands the lease despite already having its create-time owner.
 
     The persisted value is a candidate, not authority by itself.  This path accepts it
-    only when a configured Console key resolves to that exact owner and an owner/DSEQ
-    chain read returns a complete non-empty group population.  Either missing proof is
-    a refusal; it never falls back to another owner.
+    only when a configured Console key's JWT reports that exact owner and an owner/DSEQ
+    chain read returns a complete non-empty group population. Either missing check is a
+    refusal; it never falls back to another owner. The JWT issuer is an assertion by
+    Console, not local cryptographic proof that the caller possesses an Akash private key.
     """
 
     if not re.fullmatch(r"akash1[a-z0-9]{38,58}", expected_owner):
@@ -344,7 +345,7 @@ def select_client_for_bound_owner(
             matching.append(client)
     if not matching:
         raise RuntimeError(
-            f"expected owner is not controlled by any of {len(keys)} configured Console wallets"
+            f"expected owner was not reported by any of {len(keys)} configured Console credentials"
         )
 
     try:

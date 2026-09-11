@@ -21,6 +21,35 @@ def _run_cli(monkeypatch, args):
         return main()
 
 
+class TestCliDestroyOwnerBinding:
+    @patch("just_akash.api._save_tags")
+    @patch("just_akash.api._load_tags", return_value={})
+    @patch("just_akash.api._get_tag", return_value="")
+    @patch("just_akash.cli._resolve_deployment_client")
+    def test_expected_owner_selects_the_mutating_client(
+        self, resolve, _get_tag, _load_tags, _save_tags, monkeypatch
+    ):
+        owner = "akash1" + "a" * 38
+        client = MagicMock()
+        resolve.return_value = (client, "12345")
+
+        _run_cli(
+            monkeypatch,
+            [
+                "just-akash",
+                "destroy",
+                "--dseq",
+                "12345",
+                "--expected-owner",
+                owner,
+                "-y",
+            ],
+        )
+
+        resolve.assert_called_once_with("12345", owner)
+        client.close_deployment.assert_called_once_with("12345")
+
+
 # ── update ───────────────────────────────────────────────────────────
 
 

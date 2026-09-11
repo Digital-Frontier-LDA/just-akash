@@ -22,7 +22,16 @@ DSEQ = "1786555091232"
 
 
 def _info(*names: str) -> dict:
-    return {"groups": [{"group_spec": {"name": n}} for n in names]}
+    return {
+        "deployment": {"id": {"owner": OWNER, "dseq": DSEQ}},
+        "groups": [
+            {
+                "id": {"owner": OWNER, "dseq": DSEQ, "gseq": index},
+                "group_spec": {"name": name},
+            }
+            for index, name in enumerate(names, 1)
+        ],
+    }
 
 
 def test_the_query_targets_the_version_the_chain_actually_serves(monkeypatch):
@@ -62,6 +71,15 @@ def test_it_asks_for_the_specific_deployment():
 def test_every_group_name_is_returned(monkeypatch):
     monkeypatch.setattr(chain, "_lcd_get", lambda *a, **k: _info("just-akash-a", "just-akash-b"))
     assert chain.deployment_group_names(OWNER, DSEQ) == ["just-akash-a", "just-akash-b"]
+
+
+@pytest.mark.parametrize("where", ["deployment", "group"])
+def test_response_identity_must_echo_the_exact_query(monkeypatch, where):
+    payload = _info("just-akash-runner")
+    target = payload["deployment"]["id"] if where == "deployment" else payload["groups"][0]["id"]
+    target["dseq"] = "999"
+    monkeypatch.setattr(chain, "_lcd_get", lambda *a, **k: payload)
+    assert chain.deployment_group_names(OWNER, DSEQ) == []
 
 
 def test_one_dead_endpoint_does_not_answer_for_the_chain(monkeypatch):
@@ -117,12 +135,8 @@ def test_a_partially_readable_response_is_unknown_not_partial_ownership(monkeypa
     """Three groups, two readable, is not a weaker proof — it is a different deployment's
     proof. The caller decides whether to DESTROY on this, so an unnamed group makes the
     whole response unreadable rather than yielding the names that did parse."""
-    payload = {
-        "groups": [
-            {"group_spec": {"name": "just-akash-runner"}},
-            {"group_spec": {}},
-        ]
-    }
+    payload = _info("just-akash-runner", "broken")
+    payload["groups"][1]["group_spec"] = {}
     monkeypatch.setattr(chain, "_lcd_get", lambda *a, **k: payload)
     assert chain.deployment_group_names(OWNER, DSEQ) == []
 
@@ -131,10 +145,9 @@ def test_a_partial_response_falls_through_to_a_healthier_endpoint(monkeypatch):
     """Rejecting the partial answer must not end the search — the next endpoint may
     simply be less lagged, and giving up would turn a readable deployment into an
     unverifiable one."""
-    answers = [
-        {"groups": [{"group_spec": {"name": "just-akash-runner"}}, {"group_spec": {}}]},
-        {"groups": [{"group_spec": {"name": "just-akash-runner"}}]},
-    ]
+    partial = _info("just-akash-runner", "broken")
+    partial["groups"][1]["group_spec"] = {}
+    answers = [partial, _info("just-akash-runner")]
     calls = {"n": 0}
 
     def staged(path, timeout=15, base=None):

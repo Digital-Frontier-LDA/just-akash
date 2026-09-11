@@ -80,9 +80,9 @@ on:
       wallet-address:
         description: >-
           Create-time owner candidate emitted by runner-pool. When present, teardown
-          requires both a configured signer for this exact owner and a complete exact
-          owner/DSEQ chain read before destroying. Empty preserves the legacy Console
-          deployment-read path for older callers.
+          requires both a configured Console credential that reports this exact owner
+          and a complete exact owner/DSEQ chain read before destroying. Empty preserves
+          the legacy Console deployment-read path for older callers.
         required: false
         type: string
         default: ''
@@ -225,6 +225,11 @@ jobs:
           fi
           echo "captured owner=$OWNER"
 
+          DESTROY_ARGS=(--dseq "$DSEQ" -y)
+          if [ -n "${WALLET_ADDRESS:-}" ]; then
+            DESTROY_ARGS+=(--expected-owner "$OWNER")
+          fi
+
           # ⛔ THE RETRY BUDGET WAS ON THE WRONG OPERATION. This loop retries the
           # DESTROY three times; the verification below used to get exactly one
           # immediate read. On blazing#920 (run 34138613280) destroy SUCCEEDED on
@@ -237,7 +242,7 @@ jobs:
           DESTROY_TRIES=0
           for _try in 1 2 3; do
             DESTROY_TRIES=$_try
-            "${JA[@]}" destroy --dseq "$DSEQ" -y 2>&1 | tee /tmp/destroy.log && break
+            "${JA[@]}" destroy "${DESTROY_ARGS[@]}" 2>&1 | tee /tmp/destroy.log && break
             # A non-zero exit whose output says the deployment is already closed IS a
             # success. Treating it as a failure sends the next reader looking for an
             # outage that never happened.

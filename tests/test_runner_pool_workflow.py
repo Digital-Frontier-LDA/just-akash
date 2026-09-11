@@ -1398,10 +1398,11 @@ def test_wallet_address_is_optional_but_has_a_bound_owner_safety_path():
     td_call = (TD.get("on") or TD.get(True))["workflow_call"]
     assert td_call["inputs"]["wallet-address"]["required"] is False
     description = td_call["inputs"]["wallet-address"]["description"]
-    assert "configured signer" in description
+    assert "configured Console credential" in description
     assert "exact owner/DSEQ chain read" in description
     body = TD_CLOSE["run"]
     assert body.count('RESOLVE_ARGS+=(--expected-owner "$WALLET_ADDRESS")') == 1
+    assert body.count('DESTROY_ARGS+=(--expected-owner "$OWNER")') == 1
 
 
 def test_teardown_does_not_claim_an_ownership_check_it_cannot_perform():
