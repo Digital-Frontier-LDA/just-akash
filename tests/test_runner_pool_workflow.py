@@ -128,13 +128,17 @@ def test_the_lease_is_tagged_before_the_wait_not_after():
 # --------------------------------------------------------------------------
 
 
-def test_teardown_targets_one_locally_parsed_dseq():
+def test_teardown_targets_one_locally_parsed_dseq_and_its_create_time_owner():
     """A sweep destroyed 14 third-party deployments once. Every destroy here must name
-    a single DSEQ parsed from this job's own deploy output — never a tag glob, never
-    an --all."""
-    for m in re.finditer(r'"\$\{JA\[@\]\}" destroy[^\n]*', PROVISION["run"]):
-        line = m.group(0)
+    a single DSEQ parsed from this job's own deploy output and carry the owner emitted by
+    that same create attempt. The count pins every immediate rollback call site."""
+    destroys = re.findall(r'"\$\{JA\[@\]\}" destroy[^\n]*', PROVISION["run"])
+    assert len(destroys) == 5
+    for line in destroys:
         assert '--dseq "$DSEQ"' in line, f"destroy must name this run's dseq: {line}"
+        assert '--expected-owner "$WALLET"' in line, (
+            f"destroy must retain this create attempt's owner: {line}"
+        )
         assert not re.search(r"--all\b|--tag\b|\*", line), f"blast radius too wide: {line}"
 
 
@@ -1008,8 +1012,11 @@ MUTATIONS = [
         ),
     ),
     (
-        "destroy stays narrow",
-        lambda s: s.replace('"${JA[@]}" destroy --dseq "$DSEQ" -y', '"${JA[@]}" destroy --all -y'),
+        "destroy stays owner-bound and narrow",
+        lambda s: s.replace(
+            '"${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" -y',
+            '"${JA[@]}" destroy --all -y',
+        ),
     ),
     ("discard uses MIN_POOL", lambda s: s.replace('-lt "${MIN_POOL}"', '-lt "${POOL_SIZE}"')),
     ("min-pool clamp", lambda s: s.replace('[ "$MIN_POOL" -ge 1 ]', '[ "$MIN_POOL" -ge 0 ]')),

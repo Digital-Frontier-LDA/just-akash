@@ -984,7 +984,7 @@ jobs:
               echo "::warning::attempt $attempt: dseq=$DSEQ exists but no Provider line was parsed — closing it so it cannot leak escrow"
               "${JA[@]}" tag --dseq "$DSEQ" --name "${TAG_PREFIX}-${RUN_ID}" || true
               for _try in 1 2 3; do
-                "${JA[@]}" destroy --dseq "$DSEQ" -y 2>&1 | tee /tmp/ja-orphan.log && break
+                "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" -y 2>&1 | tee /tmp/ja-orphan.log && break
                 grep -qi "Deployment closed" /tmp/ja-orphan.log && break
                 sleep 5
               done
@@ -1211,7 +1211,7 @@ jobs:
             # the most likely cause.
             if [ "$API_OK" = "0" ]; then
               for _try in 1 2 3; do
-                "${JA[@]}" destroy --dseq "$DSEQ" -y 2>&1 | tee /tmp/ja-destroy.log && break
+                "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" -y 2>&1 | tee /tmp/ja-destroy.log && break
                 grep -qi "Deployment closed" /tmp/ja-destroy.log && break
                 sleep 5
               done
@@ -1225,7 +1225,7 @@ jobs:
               # Escrow-critical, and deliberately a literal locally-parsed --dseq so a
               # destroy-safety lint can prove this only tears down what this loop made.
               for _try in 1 2 3; do
-                "${JA[@]}" destroy --dseq "$DSEQ" -y 2>&1 | tee /tmp/ja-destroy.log && break
+                "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" -y 2>&1 | tee /tmp/ja-destroy.log && break
                 grep -qi "Deployment closed" /tmp/ja-destroy.log && break
                 sleep 5
               done
@@ -1262,7 +1262,7 @@ jobs:
             if [ -z "${RUNNER_VERSIONS:-}" ]; then
               echo "::warning title=Landing gate: version projection empty for a pool reporting ${ONLINE} online::attempt $attempt: the runner listing yielded ${ONLINE} online id(s) and 0 versions on $PROVIDER — the read disagrees with itself, so this lease is discarded rather than trusted."
               for _try in 1 2 3; do
-                "${JA[@]}" destroy --dseq "$DSEQ" -y 2>&1 | tee /tmp/ja-destroy.log && break
+                "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" -y 2>&1 | tee /tmp/ja-destroy.log && break
                 grep -qi "Deployment closed" /tmp/ja-destroy.log && break
                 sleep 5
               done
@@ -1285,7 +1285,7 @@ jobs:
                 echo "::warning title=Landing gate: registered runners are not running::attempt $attempt: ${GATE_DEAD} online runner(s) report NO version and ${GATE_WRONG} report an unexpected one on $PROVIDER — discarding this lease rather than handing the caller a pool of corpses."
                 printf '%s\n' "$RUNNER_VERSIONS" | sort | uniq -c | sed 's/^/    version /'
                 for _try in 1 2 3; do
-                  "${JA[@]}" destroy --dseq "$DSEQ" -y 2>&1 | tee /tmp/ja-destroy.log && break
+                  "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" -y 2>&1 | tee /tmp/ja-destroy.log && break
                   grep -qi "Deployment closed" /tmp/ja-destroy.log && break
                   sleep 5
                 done
