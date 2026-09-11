@@ -136,7 +136,7 @@ class TestRobustDestroy:
     def test_first_try_success(self):
         with patch("just_akash._e2e.subprocess.run") as mock_run:
             mock_run.side_effect = [
-                _completed(0, stdout="Deployment 12345 closed"),  # destroy
+                _completed(0, stdout="Deployment 12345 destroyed"),  # destroy
                 _completed(0, stdout='{"state": "closed"}'),  # authoritative audit: settled
             ]
             assert robust_destroy("12345") is True
@@ -149,7 +149,7 @@ class TestRobustDestroy:
         ):
             mock_run.side_effect = [
                 _completed(1, stderr="API down"),  # 1st destroy fails
-                _completed(0, stdout="Deployment 12345 closed"),  # 2nd destroy ok
+                _completed(0, stdout="Deployment 12345 destroyed"),  # 2nd destroy ok
                 _completed(0, stdout='{"state": "closed"}'),  # authoritative audit: settled
             ]
             assert robust_destroy("12345", retries=2) is True
@@ -273,7 +273,7 @@ class TestDestroySuccessMatchesTheRealCLI:
     So every successful destroy was scored a failure, two redundant destroys fired
     against an already-closed deployment, and each E2E run printed three red FAILs
     while the audit quietly passed. The unit tests missed it because their fixtures
-    asserted against a hand-written "Deployment 12345 closed" that the CLI has never
+    asserted against a hand-written "Deployment 12345 destroyed" that the CLI has never
     printed -- self-consistent, and wrong about reality.
 
     So don't hand-write the output here. Run the real CLI, capture what it really
@@ -1208,7 +1208,7 @@ class TestRobustDestroySuccessLogContent:
             patch("just_akash._e2e.time.sleep"),
         ):
             mock_run.side_effect = [
-                _completed(0, stdout="Deployment 12345 closed"),
+                _completed(0, stdout="Deployment 12345 destroyed"),
                 _completed(0, stdout='{"state": "closed"}'),
             ]
             assert robust_destroy("12345") is True
@@ -1230,7 +1230,7 @@ class TestRobustDestroySuccessLogContent:
         ):
             mock_run.side_effect = [
                 _completed(1, stderr="API down"),  # attempt 1 fails
-                _completed(0, stdout="Deployment 12345 closed"),  # attempt 2 ok
+                _completed(0, stdout="Deployment 12345 destroyed"),  # attempt 2 ok
                 _completed(0, stdout='{"state": "closed"}'),  # authoritative audit
             ]
             assert robust_destroy("12345", retries=2) is True
@@ -1646,9 +1646,9 @@ class TestAuditOverClaimsWhenReaderLagsChainTruth:
       on the same evidence chain — public REST via polkachu, no
       key, block height → wall clock.)
 
-    The audit's docstring (``_e2e.py:175-220``) currently claims it
-    cannot over-claim. On the #275 run it did. The wording PR
-    (#303) only labels the destroy-CLI log line; the audit itself
+    The audit helper ``just_akash._e2e._confirm_settled`` currently allows this
+    over-claim. On the #275 run it did. This PR only labels the destroy-CLI log
+    line; the audit itself
     remains the load-bearing defect and is the subject of issue
     **#304** ("harden ``_confirm_settled`` against REST indexer-lag
     false-positive"). #299 is owned by DEV3-tron (this repo,
@@ -1673,15 +1673,13 @@ class TestAuditOverClaimsWhenReaderLagsChainTruth:
        changing the assertion to require corroboration with chain
        truth (gRPC state-proof, multi-reader, or a height-aware
        read);
-    3. anyone editing ``_e2e._confirm_settled`` without updating this
-       test breaks a CI green they didn't intend to.
+    3. anyone editing ``just_akash._e2e._confirm_settled`` without updating
+       this test breaks a CI green they didn't intend to.
 
-    Tested in isolation here because the test cases below are the *only*
-    unit tests that exercise "STILL ACTIVE on unanimous open reads" with
-    mocked subprocess output and zero real chain interaction. The
-    existing audit tests (lines 1337-1571) all use scenarios where the
-    output is mixed or settled, which is why the over-claim shape has
-    not been pinned before.
+    The focused cases below use mocked subprocess output and zero real chain
+    interaction. Other audit tests exercise related mixed, transient, and
+    settled scenarios; these cases specifically preserve the unanimous-open
+    persistence shape that produces the stronger ``STILL ACTIVE`` message.
     """
 
     def test_eight_active_reads_fire_still_active_under_current_audit(self):
@@ -1740,7 +1738,7 @@ class TestAuditOverClaimsWhenReaderLagsChainTruth:
             # (STILL ACTIVE FAIL line). The destroy succeeded on chain;
             # the audit over-claims because the reader is laggy.
             mock_run.side_effect = [
-                _completed(0, stdout="Deployment 12345 closed"),
+                _completed(0, stdout="Deployment 12345 destroyed"),
                 *(_completed(0, stdout='{"state": "active"}') for _ in range(8)),
             ]
             ok = robust_destroy("12345")
