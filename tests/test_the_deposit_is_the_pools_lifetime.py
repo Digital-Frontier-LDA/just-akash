@@ -59,8 +59,10 @@ def test_the_deposit_is_used_ONLY_as_the_escrow_deposit() -> None:
         rf"\$\{{?REQUIRED_DEPOSIT_USD\}}?|\$\{{\{{\s*inputs\.{re.escape(INPUT)}", code
     )
     assert uses, f"{INPUT} is never used; the description describes nothing"
-    # every use of the shell variable must be the --deposit flag
-    for m in re.finditer(r"^.*\$\{?REQUIRED_DEPOSIT_USD\}?.*$", code, re.M):
+    # Every reference, whether through the env binding or directly through
+    # the workflow input, must feed only the --deposit flag.
+    ref = r"(?:\$\{?REQUIRED_DEPOSIT_USD\}?|\$\{\{\s*inputs\." + re.escape(INPUT) + r"\s*\}\})"
+    for m in re.finditer(rf"^.*{ref}.*$", code, re.M):
         line = m.group(0)
         if "REQUIRED_DEPOSIT_USD:" in line:
             continue  # the env binding itself
