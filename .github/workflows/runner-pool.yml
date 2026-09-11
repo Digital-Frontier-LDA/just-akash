@@ -1464,7 +1464,7 @@ jobs:
     # The resolution that satisfies both is to pin the POST-MERGE main SHA: byte-identical
     # to the branch commit, and an ancestor of main. Never re-pin to a branch commit after
     # its PR has merged.
-    uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@2bb75194b3782ef94844ba0cf017999368d942a4
+    uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@db35f5fa8217d49479026ed47df94e65529376a5
     with:
       dseq: ${{ needs.pool.outputs.dseq }}
       wallet-address: ${{ needs.pool.outputs.wallet_address }}
