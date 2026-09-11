@@ -94,6 +94,11 @@ def _token() -> str | None:
 
 
 def _api(path: str) -> dict:
+    # Paths are assembled from checked-in workflow pins, never accepted as full URLs.
+    # Enforce that boundary before handing the value to urllib so a future caller
+    # cannot introduce a file:// or other non-HTTPS scheme.
+    if not path.startswith("/") or "://" in path or any(c in path for c in "\r\n"):
+        raise ValueError("GitHub API path must be a relative HTTPS path")
     request = urllib.request.Request(
         f"https://api.github.com{path}",
         headers={
@@ -141,6 +146,10 @@ def _cross_repo_pins() -> list[tuple[str, str, str, str]]:
     for workflow in _workflow_files():
         for line in workflow.read_text(encoding="utf-8").splitlines():
             if line.strip().startswith("#"):
+                continue
+            # Only executable workflow-call entries are pins. A matching SHA in
+            # run:, name:, or another scalar is documentation/data, not a call.
+            if not re.match(r"^\s*(?:-\s*)?uses\s*:", line):
                 continue
             for match in _PIN.finditer(line):
                 key = (match["owner"], match["repo"], match["path"], match["sha"])
