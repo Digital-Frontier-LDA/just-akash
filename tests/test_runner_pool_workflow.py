@@ -1377,7 +1377,9 @@ def test_pool_and_teardown_pass_the_complete_wallet_pool_to_just_akash():
     assert PROVISION["env"]["AKASH_API_KEYS"]
     assert TD_CLOSE["env"]["AKASH_API_KEYS"]
     assert '"${JA[@]}" deploy' in _code(PROVISION["run"])
-    assert '"${JA[@]}" destroy --dseq "$DSEQ"' in _code(TD_CLOSE["run"])
+    teardown_code = _code(TD_CLOSE["run"])
+    assert 'DESTROY_ARGS=(--dseq "$DSEQ" -y)' in teardown_code
+    assert '"${JA[@]}" destroy "${DESTROY_ARGS[@]}"' in teardown_code
 
 
 def test_required_deposit_drives_native_wallet_funding_floor():
@@ -1393,11 +1395,12 @@ def test_a_single_key_behaves_exactly_as_before():
     assert CALL["secrets"]["AKASH_API_KEY"]["required"] is False
 
 
-def test_teardown_routes_by_dseq_instead_of_wallet_position():
-    """The CLI must receive the DSEQ and full pool; it resolves the owner internally."""
-    body = TD_CLOSE["run"]
-    assert "positively reads" in body
-    assert '"${JA[@]}" destroy --dseq "$DSEQ"' in body
+def test_teardown_routes_by_bound_owner_and_dseq_instead_of_wallet_position():
+    """The resolver and mutating process must receive the same DSEQ and bound owner."""
+    body = _code(TD_CLOSE["run"])
+    assert 'DESTROY_ARGS=(--dseq "$DSEQ" -y)' in body
+    assert 'DESTROY_ARGS+=(--expected-owner "$OWNER")' in body
+    assert '"${JA[@]}" destroy "${DESTROY_ARGS[@]}"' in body
     assert "WANT_ADDR" not in body
 
 
