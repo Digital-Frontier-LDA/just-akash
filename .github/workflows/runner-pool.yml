@@ -971,6 +971,10 @@ jobs:
             echo "dseq=$DSEQ" >> "$GITHUB_OUTPUT"
             PROVIDER=$(awk -F': +' '/^[[:space:]]*Provider:/{print $2; exit}' /tmp/ja.log || true)
             WALLET=$(awk -F': +' '/^[[:space:]]*Wallet:/{print $2; exit}' /tmp/ja.log || true)
+            # Publish the create-time owner as soon as it is available. Internal
+            # rollback runs only on a failed handoff, so a success-only publication
+            # leaves precisely that teardown without the bound-owner fallback.
+            echo "wallet_address=$WALLET" >> "$GITHUB_OUTPUT"
             WALLET_UACT=$(awk '/^[[:space:]]*Wallet available:/{print $(NF-1); exit}' /tmp/ja.log || true)
 
             # A DSEQ with no PROVIDER is a REAL deployment we would otherwise walk away
@@ -980,7 +984,7 @@ jobs:
               echo "::warning::attempt $attempt: dseq=$DSEQ exists but no Provider line was parsed — closing it so it cannot leak escrow"
               "${JA[@]}" tag --dseq "$DSEQ" --name "${TAG_PREFIX}-${RUN_ID}" || true
               for _try in 1 2 3; do
-                "${JA[@]}" destroy --dseq "$DSEQ" -y 2>&1 | tee /tmp/ja-orphan.log && break
+                "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" -y 2>&1 | tee /tmp/ja-orphan.log && break
                 grep -qi "Deployment closed" /tmp/ja-orphan.log && break
                 sleep 5
               done
@@ -1207,7 +1211,7 @@ jobs:
             # the most likely cause.
             if [ "$API_OK" = "0" ]; then
               for _try in 1 2 3; do
-                "${JA[@]}" destroy --dseq "$DSEQ" -y 2>&1 | tee /tmp/ja-destroy.log && break
+                "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" -y 2>&1 | tee /tmp/ja-destroy.log && break
                 grep -qi "Deployment closed" /tmp/ja-destroy.log && break
                 sleep 5
               done
@@ -1221,7 +1225,7 @@ jobs:
               # Escrow-critical, and deliberately a literal locally-parsed --dseq so a
               # destroy-safety lint can prove this only tears down what this loop made.
               for _try in 1 2 3; do
-                "${JA[@]}" destroy --dseq "$DSEQ" -y 2>&1 | tee /tmp/ja-destroy.log && break
+                "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" -y 2>&1 | tee /tmp/ja-destroy.log && break
                 grep -qi "Deployment closed" /tmp/ja-destroy.log && break
                 sleep 5
               done
@@ -1258,7 +1262,7 @@ jobs:
             if [ -z "${RUNNER_VERSIONS:-}" ]; then
               echo "::warning title=Landing gate: version projection empty for a pool reporting ${ONLINE} online::attempt $attempt: the runner listing yielded ${ONLINE} online id(s) and 0 versions on $PROVIDER — the read disagrees with itself, so this lease is discarded rather than trusted."
               for _try in 1 2 3; do
-                "${JA[@]}" destroy --dseq "$DSEQ" -y 2>&1 | tee /tmp/ja-destroy.log && break
+                "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" -y 2>&1 | tee /tmp/ja-destroy.log && break
                 grep -qi "Deployment closed" /tmp/ja-destroy.log && break
                 sleep 5
               done
@@ -1281,7 +1285,7 @@ jobs:
                 echo "::warning title=Landing gate: registered runners are not running::attempt $attempt: ${GATE_DEAD} online runner(s) report NO version and ${GATE_WRONG} report an unexpected one on $PROVIDER — discarding this lease rather than handing the caller a pool of corpses."
                 printf '%s\n' "$RUNNER_VERSIONS" | sort | uniq -c | sed 's/^/    version /'
                 for _try in 1 2 3; do
-                  "${JA[@]}" destroy --dseq "$DSEQ" -y 2>&1 | tee /tmp/ja-destroy.log && break
+                  "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" -y 2>&1 | tee /tmp/ja-destroy.log && break
                   grep -qi "Deployment closed" /tmp/ja-destroy.log && break
                   sleep 5
                 done
@@ -1460,9 +1464,10 @@ jobs:
     # The resolution that satisfies both is to pin the POST-MERGE main SHA: byte-identical
     # to the branch commit, and an ancestor of main. Never re-pin to a branch commit after
     # its PR has merged.
-    uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@e13ead3bf42bd7e0740b5bbeba20f03f2a77c6d1
+    uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@db35f5fa8217d49479026ed47df94e65529376a5
     with:
       dseq: ${{ needs.pool.outputs.dseq }}
+      wallet-address: ${{ needs.pool.outputs.wallet_address }}
       tag-prefix: ${{ inputs.tag-prefix }}
       runner-label: ${{ inputs.runner-label }}
       # ⭐ inputs.github-org, NOT github.organization — that context property DOES NOT

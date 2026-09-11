@@ -10,6 +10,7 @@ from just_akash.wallet_pool import (
     _quorum_uact,
     _redact_keys,
     configured_api_keys,
+    select_client_for_bound_owner,
     select_client_for_create,
     select_client_for_dseq,
 )
@@ -107,6 +108,59 @@ def test_dseq_operations_use_the_owner_not_the_richest_wallet(monkeypatch):
     client = select_client_for_dseq("123", client_factory=lambda key: clients[key])
 
     assert client is clients["owner"]
+
+
+def test_bound_owner_survives_unavailable_console_deployment_read(monkeypatch):
+    """Create-time owner survives a broken Console deployment read only with two checks."""
+    owner = "akash1" + "a" * 38
+    monkeypatch.setenv("AKASH_API_KEYS", "other,owner")
+    monkeypatch.delenv("AKASH_API_KEY", raising=False)
+    clients = {key: MagicMock(api_key=key) for key in ("other", "owner")}
+    clients["other"].account_address.return_value = "akash1" + "b" * 38
+    clients["owner"].account_address.return_value = owner
+    clients["owner"].get_deployment.side_effect = RuntimeError("Console GET unavailable")
+    reads = []
+
+    def groups(bound_owner, dseq):
+        reads.append((bound_owner, dseq))
+        return ["borduas-runner-run-7-end"]
+
+    client = select_client_for_bound_owner(
+        "123", owner, client_factory=lambda key: clients[key], group_reader=groups
+    )
+
+    assert client is clients["owner"]
+    assert reads == [(owner, "123")]
+    clients["owner"].get_deployment.assert_not_called()
+
+
+def test_bound_owner_without_a_matching_configured_signer_is_held(monkeypatch):
+    owner = "akash1" + "a" * 38
+    monkeypatch.setenv("AKASH_API_KEY", "other")
+    monkeypatch.delenv("AKASH_API_KEYS", raising=False)
+    other = MagicMock(api_key="other")
+    other.account_address.return_value = "akash1" + "b" * 38
+    group_reader = MagicMock(return_value=["borduas-runner-run-7-end"])
+
+    with pytest.raises(RuntimeError, match="not reported"):
+        select_client_for_bound_owner(
+            "123", owner, client_factory=lambda _key: other, group_reader=group_reader
+        )
+
+    group_reader.assert_not_called()
+
+
+def test_bound_owner_without_complete_exact_chain_identity_is_held(monkeypatch):
+    owner = "akash1" + "a" * 38
+    monkeypatch.setenv("AKASH_API_KEY", "owner")
+    monkeypatch.delenv("AKASH_API_KEYS", raising=False)
+    client = MagicMock(api_key="owner")
+    client.account_address.return_value = owner
+
+    with pytest.raises(RuntimeError, match="no complete group population"):
+        select_client_for_bound_owner(
+            "123", owner, client_factory=lambda _key: client, group_reader=lambda *_args: []
+        )
 
 
 def test_dseq_owner_requires_positive_matching_identity(monkeypatch):

@@ -130,11 +130,15 @@ def test_the_lease_is_tagged_before_the_wait_not_after():
 
 def test_teardown_targets_one_locally_parsed_dseq():
     """A sweep destroyed 14 third-party deployments once. Every destroy here must name
-    a single DSEQ parsed from this job's own deploy output — never a tag glob, never
-    an --all."""
-    for m in re.finditer(r'"\$\{JA\[@\]\}" destroy[^\n]*', PROVISION["run"]):
-        line = m.group(0)
+    a single DSEQ parsed from this job's own deploy output and carry the owner emitted by
+    that same create attempt. The count pins every immediate rollback call site."""
+    destroys = re.findall(r'"\$\{JA\[@\]\}" destroy[^\n]*', PROVISION["run"])
+    assert len(destroys) == 5
+    for line in destroys:
         assert '--dseq "$DSEQ"' in line, f"destroy must name this run's dseq: {line}"
+        assert '--expected-owner "$WALLET"' in line, (
+            f"destroy must retain this create attempt's owner: {line}"
+        )
         assert not re.search(r"--all\b|--tag\b|\*", line), f"blast radius too wide: {line}"
 
 
@@ -1008,8 +1012,11 @@ MUTATIONS = [
         ),
     ),
     (
-        "destroy stays narrow",
-        lambda s: s.replace('"${JA[@]}" destroy --dseq "$DSEQ" -y', '"${JA[@]}" destroy --all -y'),
+        "destroy stays owner-bound and narrow",
+        lambda s: s.replace(
+            '"${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" -y',
+            '"${JA[@]}" destroy --all -y',
+        ),
     ),
     ("discard uses MIN_POOL", lambda s: s.replace('-lt "${MIN_POOL}"', '-lt "${POOL_SIZE}"')),
     ("min-pool clamp", lambda s: s.replace('[ "$MIN_POOL" -ge 1 ]', '[ "$MIN_POOL" -ge 0 ]')),
@@ -1370,7 +1377,9 @@ def test_pool_and_teardown_pass_the_complete_wallet_pool_to_just_akash():
     assert PROVISION["env"]["AKASH_API_KEYS"]
     assert TD_CLOSE["env"]["AKASH_API_KEYS"]
     assert '"${JA[@]}" deploy' in _code(PROVISION["run"])
-    assert '"${JA[@]}" destroy --dseq "$DSEQ"' in _code(TD_CLOSE["run"])
+    teardown_code = _code(TD_CLOSE["run"])
+    assert 'DESTROY_ARGS=(--dseq "$DSEQ" -y)' in teardown_code
+    assert '"${JA[@]}" destroy "${DESTROY_ARGS[@]}"' in teardown_code
 
 
 def test_required_deposit_drives_native_wallet_funding_floor():
@@ -1387,17 +1396,23 @@ def test_a_single_key_behaves_exactly_as_before():
 
 
 def test_teardown_routes_by_dseq_instead_of_wallet_position():
-    """The CLI must receive the DSEQ and full pool; it resolves the owner internally."""
-    body = TD_CLOSE["run"]
-    assert "positively reads" in body
-    assert '"${JA[@]}" destroy --dseq "$DSEQ"' in body
+    """The resolver and mutating process must receive the same DSEQ and bound owner."""
+    body = _code(TD_CLOSE["run"])
+    assert 'DESTROY_ARGS=(--dseq "$DSEQ" -y)' in body
+    assert 'DESTROY_ARGS+=(--expected-owner "$OWNER")' in body
+    assert '"${JA[@]}" destroy "${DESTROY_ARGS[@]}"' in body
     assert "WANT_ADDR" not in body
 
 
-def test_wallet_address_is_optional_compatibility_data_not_a_safety_dependency():
+def test_wallet_address_is_optional_but_has_a_bound_owner_safety_path():
     td_call = (TD.get("on") or TD.get(True))["workflow_call"]
     assert td_call["inputs"]["wallet-address"]["required"] is False
-    assert "Deprecated compatibility" in td_call["inputs"]["wallet-address"]["description"]
+    description = td_call["inputs"]["wallet-address"]["description"]
+    assert "configured Console credential" in description
+    assert "exact owner/DSEQ chain read" in description
+    body = TD_CLOSE["run"]
+    assert body.count('RESOLVE_ARGS+=(--expected-owner "$WALLET_ADDRESS")') == 1
+    assert body.count('DESTROY_ARGS+=(--expected-owner "$OWNER")') == 1
 
 
 def test_teardown_does_not_claim_an_ownership_check_it_cannot_perform():

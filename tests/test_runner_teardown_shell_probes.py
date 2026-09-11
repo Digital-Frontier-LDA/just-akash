@@ -264,6 +264,13 @@ def test_real_close_step(tmp_path, case):
     assert "--dseq" in resolve_call, (
         f"{case}: resolve-owner was invoked without --dseq; argv={resolve_call}"
     )
+    assert resolve_call.count("--expected-owner") == 1, (
+        f"{case}: the create-time owner was not wired once into resolve-owner; "
+        f"without this call-site binding teardown returns to the failing Console "
+        f"rediscovery path. argv={resolve_call}"
+    )
+    expected_owner_idx = resolve_call.index("--expected-owner")
+    assert resolve_call[expected_owner_idx + 1] == "akash1" + "a" * 38
     if case == "resolve_owner_unavailable":
         # ⇒ bash `-e` guard: when resolve-owner exits non-zero, the script
         # must abort AT THAT POINT. destroy and verify-closed must NOT
@@ -332,6 +339,12 @@ def test_real_close_step(tmp_path, case):
     assert subcommands.index("destroy") < subcommands.index("verify-closed"), (
         f"{case}: destroy must run BEFORE verify-closed; ordering was {subcommands}"
     )
+    destroy_call = next(call for call in invoked if call[0] == "destroy")
+    assert destroy_call.count("--expected-owner") == 1, (
+        f"{case}: the mutation did not retain the owner binding; argv={destroy_call}"
+    )
+    destroy_owner_idx = destroy_call.index("--expected-owner")
+    assert destroy_call[destroy_owner_idx + 1] == "akash1" + "a" * 38
     # ⇒ The verify-closed call must carry the owner captured by resolve-owner.
     # A regression that drops the --owner handoff would force the verifier to
     # re-resolve through a wallet pool that may now Console 404 (the exact
