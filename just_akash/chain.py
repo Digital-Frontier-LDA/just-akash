@@ -14,9 +14,14 @@ backs the default ``AKASH_NODE`` RPC.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import concurrent.futures
+import hashlib
 import json
 import os
+import re
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -52,6 +57,61 @@ DEFAULT_REST_FALLBACKS = (
     "https://akash-api.polkachu.com",
 )
 
+# Destructive identity reads use trust paths, not the availability/credit endpoints above.
+# Source labels and URLs: cosmos/chain-registry, akash/chain.json; observed and DNS
+# ancestry checked 2026-09-12. Bump the registry version when any entry changes.
+OWNER_CORROBORATION_SOURCES_V1 = (
+    {
+        "source_id": "quad",
+        "url": "https://akash.rpc.uquad.org:443",
+        "chain_id": "akashnet-2",
+        "operator": "quad",
+        "gateway_ancestry": "direct-88.198.50.175",
+        "cache_ancestry": "none-direct-88.198.50.175",
+        "proof_mode": "height-pinned-block-id-and-paginated-group-list",
+        "finality_rule": "committed-tip-minus-2",
+        "max_age_seconds": 180,
+        "max_height_skew": 5,
+    },
+    {
+        "source_id": "c29r3",
+        "url": "https://akash.c29r3.xyz:443/api",
+        "chain_id": "akashnet-2",
+        "operator": "c29r3",
+        "gateway_ancestry": "direct-65.21.234.82",
+        "cache_ancestry": "none-direct-65.21.234.82",
+        "proof_mode": "height-pinned-block-id-and-paginated-group-list",
+        "finality_rule": "committed-tip-minus-2",
+        "max_age_seconds": 180,
+        "max_height_skew": 5,
+    },
+)
+# Pocket is deliberately absent. It returned deployment data during the 2026-09-12
+# capability probe but did not echo ``x-cosmos-block-height``. That makes the response
+# useful for availability reads and ineligible for height-pinned destructive authority.
+
+
+def _source_registry_digest(sources) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            sources,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode()
+    ).hexdigest()
+
+
+OWNER_CORROBORATION_REGISTRY_VERSION = 1
+OWNER_CORROBORATION_REGISTRY_PROVENANCE = (
+    "https://github.com/cosmos/chain-registry/blob/"
+    "c67c94a5f5c41ad1b116b1b847ef8b5f196b6405/akash/chain.json"
+)
+OWNER_CORROBORATION_REGISTRY_PROVENANCE_SHA256 = (
+    "071d561eccb4a26ac4e3404b58ce1d1fb2b881c230e4468f78b44d92b8c5cd51"
+)
+OWNER_CORROBORATION_REGISTRY_SHA256 = _source_registry_digest(OWNER_CORROBORATION_SOURCES_V1)
+
 # Akash's own escrow authorization type (custom, not a generic cosmos SendAuthorization).
 _DEPOSIT_AUTH_TYPE = "/akash.escrow.v1.DepositAuthorization"
 
@@ -61,6 +121,10 @@ _DENOM_META = {
     "uact": {"label": "ACT", "decimals": 6, "usd_pegged": True},
     "uakt": {"label": "AKT", "decimals": 6, "usd_pegged": False},
 }
+
+
+class ChainResponseError(RuntimeError):
+    """A chain endpoint answered, but its response cannot support the requested read."""
 
 
 def rest_url() -> str:
@@ -110,22 +174,28 @@ def _lcd_get(
     req = urllib.request.Request(url, headers=headers)  # noqa: S310 — fixed base
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
-            body = resp.read().decode("utf-8")
+            raw_body = resp.read()
             echoed = getattr(resp, "headers", {}).get("x-cosmos-block-height")
+    except urllib.error.HTTPError as e:
+        raise ChainResponseError(f"chain query returned HTTP {e.code} ({url})") from e
     except Exception as e:  # noqa: BLE001 — normalize every failure to one error type
         raise RuntimeError(f"chain query failed ({url}): {type(e).__name__}: {e}") from e
     try:
+        body = raw_body.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise ChainResponseError(f"chain query returned non-UTF-8 ({url})") from e
+    try:
         parsed = json.loads(body)
     except json.JSONDecodeError as e:
-        raise RuntimeError(f"chain query returned non-JSON ({url}): {body[:200]}") from e
+        raise ChainResponseError(f"chain query returned non-JSON ({url}): {body[:200]}") from e
     if not isinstance(parsed, dict):
-        raise RuntimeError(f"chain query returned unexpected shape ({url}): {type(parsed)}")
+        raise ChainResponseError(f"chain query returned unexpected shape ({url}): {type(parsed)}")
     if height is not None:
         try:
             if echoed is None or int(echoed) != height:
-                raise RuntimeError(f"chain query did not echo pinned height ({url})")
+                raise ChainResponseError(f"chain query did not echo pinned height ({url})")
         except (TypeError, ValueError) as e:
-            raise RuntimeError(f"chain query returned invalid pinned height ({url})") from e
+            raise ChainResponseError(f"chain query returned invalid pinned height ({url})") from e
     return parsed
 
 
@@ -306,6 +376,416 @@ def deployment_group_names(owner: str, dseq: str) -> list[str]:
         if names:
             return names
     return []
+
+
+def _deployment_group_snapshot(
+    data: dict[str, Any], owner: str, dseq: str
+) -> tuple[tuple[str, str], ...] | None:
+    """Parse one complete deployment-group population, including every group id."""
+
+    # ``deployments/info`` is an atomic, non-paginated endpoint. It has no total-count
+    # contract to reconcile. If a server starts returning pagination metadata, refuse it
+    # instead of silently treating the first page as the complete group population.
+    if "pagination" in data:
+        return None
+    deployment = data.get("deployment")
+    deployment_id = deployment.get("id") if isinstance(deployment, dict) else None
+    if not isinstance(deployment_id, dict):
+        return None
+    if deployment_id.get("owner") != owner or str(deployment_id.get("dseq")) != dseq:
+        return None
+
+    return _group_rows_snapshot(data.get("groups"), owner, dseq)
+
+
+def _group_rows_snapshot(
+    groups: object, owner: str, dseq: str
+) -> tuple[tuple[str, str], ...] | None:
+    """Parse a complete set of group rows without inferring that the set is complete."""
+    if not isinstance(groups, list) or not groups:
+        return None
+    snapshot: dict[str, str] = {}
+    for group in groups:
+        group_id = group.get("id") if isinstance(group, dict) else None
+        spec = group.get("group_spec") if isinstance(group, dict) else None
+        if not isinstance(group_id, dict) or not isinstance(spec, dict):
+            return None
+        gseq = group_id.get("gseq")
+        if isinstance(gseq, bool) or not isinstance(gseq, (str, int)):
+            return None
+        gseq_text = str(gseq)
+        name = spec.get("name")
+        if (
+            group_id.get("owner") != owner
+            or str(group_id.get("dseq")) != dseq
+            or not re.fullmatch(r"[1-9][0-9]{0,31}", gseq_text)
+            or str(int(gseq_text)) in snapshot
+            or not isinstance(name, str)
+            or not name
+        ):
+            return None
+        snapshot[str(int(gseq_text))] = name
+    return tuple(sorted(snapshot.items(), key=lambda item: int(item[0])))
+
+
+def _corroborated_deployment_group_names(
+    owner: str,
+    dseq: str,
+    *,
+    sources,
+    reader,
+    expected_group: str | None = None,
+) -> list[str]:
+    """Return all group names only when two independent chain sources agree.
+
+    This is the destructive-path companion to :func:`deployment_group_names`.
+    The latter deliberately accepts the first complete response because its other
+    callers use an unreadable source only to hold or report a candidate. Selecting
+    a mutating Console client needs a stronger statement: two HTTPS endpoints with
+    distinct registered operators and gateway ancestries must return the same complete
+    owner/DSEQ/group-id/name map.
+
+    A malformed, truncated, missing, single-source, or disagreeing population is
+    unknown and returns ``[]``. Console is not a vote in this consensus.
+    """
+
+    if not owner or not dseq:
+        return []
+    path = (
+        f"{_DEPLOYMENT_API}/deployments/info"
+        f"?id.owner={urllib.parse.quote(owner)}&id.dseq={urllib.parse.quote(dseq)}"
+    )
+    get = reader
+    candidates = sources
+    snapshots: list[tuple[tuple[str, str], ...]] = []
+    source_ids: set[str] = set()
+    hostnames: set[str] = set()
+    operators: set[str] = set()
+    ancestries: set[str] = set()
+    cache_ancestries: set[str] = set()
+    for source in candidates:
+        if not isinstance(source, dict):
+            return []
+        base = source.get("url")
+        source_id = source.get("source_id")
+        operator = source.get("operator")
+        ancestry = source.get("gateway_ancestry")
+        cache_ancestry = source.get("cache_ancestry")
+        identifiers = (source_id, operator, ancestry, cache_ancestry)
+        if not all(
+            isinstance(value, str) and re.fullmatch(r"[a-z0-9][a-z0-9.-]*", value)
+            for value in identifiers
+        ):
+            return []
+        if (
+            source.get("chain_id") != "akashnet-2"
+            or source.get("proof_mode") != "height-pinned-block-id-and-paginated-group-list"
+            or source.get("finality_rule") != "committed-tip-minus-2"
+            or source.get("max_age_seconds") != 180
+            or source.get("max_height_skew") != 5
+            or not isinstance(base, str)
+        ):
+            return []
+        parsed = urllib.parse.urlsplit(base)
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+        try:
+            port = parsed.port
+        except ValueError:
+            return []
+        if (
+            not base.isascii()
+            or parsed.scheme.lower() != "https"
+            or not hostname
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or hostname != (parsed.hostname or "")
+            or port not in (None, 443)
+        ):
+            return []
+        if (
+            source_id in source_ids
+            or hostname in hostnames
+            or operator in operators
+            or ancestry in ancestries
+            or cache_ancestry in cache_ancestries
+        ):
+            return []
+        source_ids.add(source_id)
+        hostnames.add(hostname)
+        operators.add(operator)
+        ancestries.add(ancestry)
+        cache_ancestries.add(cache_ancestry)
+        try:
+            data = get(path, base=base)
+        except ChainResponseError:
+            return []
+        except Exception:  # noqa: BLE001,S112 — failed source contributes no authority
+            continue
+        if not isinstance(data, dict):
+            return []
+        snapshot = _deployment_group_snapshot(data, owner, dseq)
+        if snapshot is None:
+            return []
+        snapshots.append(snapshot)
+    if len(snapshots) < 2:
+        return []
+    if any(snapshot != snapshots[0] for snapshot in snapshots[1:]):
+        return []
+    if expected_group is not None and snapshots[0] != (("1", expected_group),):
+        return []
+    return [name for _gseq, name in snapshots[0]]
+
+
+def corroborated_deployment_group_names(owner: str, dseq: str, expected_group: str) -> list[str]:
+    """Closed-registry containment evidence; it is not fresh/finalized authority."""
+    if not re.fullmatch(r"[1-9][0-9]{0,19}", dseq) or int(dseq) > 2**64 - 1:
+        return []
+    if os.environ.get("AKASH_REST_URL") is not None:
+        return []
+    if (
+        _source_registry_digest(OWNER_CORROBORATION_SOURCES_V1)
+        != OWNER_CORROBORATION_REGISTRY_SHA256
+    ):
+        return []
+    return _corroborated_deployment_group_names(
+        owner,
+        dseq,
+        sources=OWNER_CORROBORATION_SOURCES_V1,
+        reader=_lcd_get,
+        expected_group=expected_group,
+    )
+
+
+def _rfc3339(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone(timezone.utc) if parsed.tzinfo else None
+
+
+def _block_hash(value: object) -> str | None:
+    """Cosmos REST emits Tendermint block hashes as canonical base64, not hex."""
+    if not isinstance(value, str):
+        return None
+    try:
+        raw = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if len(raw) != 32 or base64.b64encode(raw).decode() != value:
+        return None
+    return raw.hex()
+
+
+def _owner_close_evidence(
+    owner: str,
+    dseq: str,
+    expected_group: str,
+    *,
+    sources,
+    reader,
+    now: datetime,
+) -> dict[str, Any] | None:
+    """Fresh same-height authority evidence, or None. Tests inject transport/time here."""
+    # Validate the closed registry and exact singleton before doing the authority reads.
+    # This unpinned observation is containment only and is never reused as authority.
+    if _corroborated_deployment_group_names(
+        owner,
+        dseq,
+        sources=sources,
+        reader=reader,
+        expected_group=expected_group,
+    ) != [expected_group]:
+        return None
+    bases = [source.get("url") for source in sources if isinstance(source, dict)]
+    if len(bases) != len(sources) or len(bases) < 2:
+        return None
+
+    malformed = object()
+
+    def fetch(source, path, height=None):
+        try:
+            return reader(path, base=source["url"], height=height)
+        except ChainResponseError:
+            return malformed
+        except Exception:  # noqa: BLE001 — transport failure abstains
+            return None
+
+    latest_path = "/cosmos/base/tendermint/v1beta1/blocks/latest"
+    tips = []
+    for source in sources:
+        doc = fetch(source, latest_path)
+        if doc is malformed:
+            return None
+        if doc is None:
+            continue
+        header = (doc.get("block") or {}).get("header") if isinstance(doc, dict) else None
+        raw_height = header.get("height") if isinstance(header, dict) else None
+        if not isinstance(raw_height, str) or not re.fullmatch(r"[1-9][0-9]*", raw_height):
+            return None
+        height = int(raw_height)
+        if header.get("chain_id") != source.get("chain_id") or height <= 2:
+            return None
+        tips.append((source, height))
+    if len(tips) < 2:
+        return None
+    if max(height for _source, height in tips) - min(height for _source, height in tips) > 5:
+        return None
+    height = min(value for _source, value in tips) - 2
+
+    block_path = f"/cosmos/base/tendermint/v1beta1/blocks/{height}"
+    blocks = []
+    for source, _tip in tips:
+        doc = fetch(source, block_path)
+        if doc is malformed:
+            return None
+        if doc is None:
+            continue
+        header = (doc.get("block") or {}).get("header") if isinstance(doc, dict) else None
+        block_id = doc.get("block_id") if isinstance(doc, dict) else None
+        if not isinstance(header, dict) or not isinstance(block_id, dict):
+            return None
+        block_hash = _block_hash(block_id.get("hash"))
+        block_time = _rfc3339(header.get("time"))
+        if (
+            header.get("chain_id") != source.get("chain_id")
+            or str(header.get("height")) != str(height)
+            or block_hash is None
+            or block_time is None
+        ):
+            return None
+        blocks.append((source, block_hash, block_time))
+    if len(blocks) < 2:
+        return None
+    if any((item[1], item[2]) != (blocks[0][1], blocks[0][2]) for item in blocks[1:]):
+        return None
+    block_time = blocks[0][2]
+    if now.tzinfo is None or now < block_time or (now - block_time).total_seconds() > 180:
+        return None
+
+    snapshot = None
+    used = []
+    for source, _observed_hash, _observed_time in blocks:
+        # ``deployments/info`` carries a bare repeated field and cannot prove that a
+        # sibling was omitted. Authority therefore requires a separate list contract
+        # whose exhausted cursor and total positively reconcile with collected rows.
+        # A source that does not implement this route/shape simply cannot authorize.
+        base_path = (
+            f"{_DEPLOYMENT_API}/groups/list"
+            f"?filters.owner={urllib.parse.quote(owner)}"
+            f"&filters.dseq={urllib.parse.quote(dseq)}"
+            "&pagination.limit=100&pagination.count_total=true"
+        )
+        rows = []
+        cursor = None
+        total = None
+        seen_cursors = set()
+        transport_failed = False
+        for _page in range(100):
+            page_path = base_path
+            if cursor is not None:
+                page_path += f"&pagination.key={urllib.parse.quote(cursor)}"
+            doc = fetch(source, page_path, height=height)
+            if doc is malformed:
+                return None
+            if doc is None:
+                transport_failed = True
+                break
+            if not isinstance(doc, dict) or not isinstance(doc.get("groups"), list):
+                return None
+            pagination = doc.get("pagination")
+            if not isinstance(pagination, dict):
+                return None
+            raw_total = pagination.get("total")
+            if not isinstance(raw_total, str) or not re.fullmatch(r"[0-9]+", raw_total):
+                return None
+            page_total = int(raw_total)
+            if page_total > 10_000 or (total is not None and page_total != total):
+                return None
+            total = page_total
+            rows.extend(doc["groups"])
+            if len(rows) > total:
+                return None
+            next_key = pagination.get("next_key")
+            if next_key in (None, ""):
+                if len(rows) != total:
+                    return None
+                break
+            if not isinstance(next_key, str) or next_key in seen_cursors or len(rows) >= total:
+                return None
+            seen_cursors.add(next_key)
+            cursor = next_key
+        else:
+            return None
+        if transport_failed:
+            continue
+        current = _group_rows_snapshot(rows, owner, dseq)
+        if current is None:
+            return None
+        if snapshot is None:
+            snapshot = current
+        elif current != snapshot:
+            return None
+        used.append(source["source_id"])
+    if len(used) < 2 or snapshot != (("1", expected_group),):
+        return None
+    population = json.dumps(snapshot, separators=(",", ":"), ensure_ascii=True)
+    expires = min(now.timestamp() + 30, block_time.timestamp() + 180)
+    if expires <= now.timestamp():
+        return None
+    return {
+        "evidence_version": 1,
+        "registry_version": OWNER_CORROBORATION_REGISTRY_VERSION,
+        "registry_digest": OWNER_CORROBORATION_REGISTRY_SHA256,
+        "registry_provenance": OWNER_CORROBORATION_REGISTRY_PROVENANCE,
+        "registry_provenance_digest": OWNER_CORROBORATION_REGISTRY_PROVENANCE_SHA256,
+        "chain_id": "akashnet-2",
+        "source_ids": used,
+        "height": height,
+        "block_hash": blocks[0][1],
+        "block_time": block_time.isoformat(),
+        "owner": owner,
+        "dseq": dseq,
+        "gseq": "1",
+        "group": expected_group,
+        "population_digest": hashlib.sha256(population.encode()).hexdigest(),
+        "observed_at": now.isoformat(),
+        "evaluated_at": now.isoformat(),
+        "expires_at": datetime.fromtimestamp(expires, timezone.utc).isoformat(),
+    }
+
+
+def owner_close_evidence(owner: str, dseq: str, expected_group: str) -> dict[str, Any] | None:
+    """Closed-registry fresh authority evidence for one exact owner/DSEQ/group."""
+    if (
+        not isinstance(dseq, str)
+        or not re.fullmatch(r"[1-9][0-9]{0,19}", dseq)
+        or int(dseq) > 2**64 - 1
+    ):
+        return None
+    if not isinstance(expected_group, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", expected_group):
+        return None
+    if not isinstance(owner, str) or not re.fullmatch(r"akash1[a-z0-9]{38,58}", owner):
+        return None
+    if os.environ.get("AKASH_REST_URL") is not None:
+        return None
+    if (
+        _source_registry_digest(OWNER_CORROBORATION_SOURCES_V1)
+        != OWNER_CORROBORATION_REGISTRY_SHA256
+    ):
+        return None
+    return _owner_close_evidence(
+        owner,
+        dseq,
+        expected_group,
+        sources=OWNER_CORROBORATION_SOURCES_V1,
+        reader=_lcd_get,
+        now=datetime.now(timezone.utc),
+    )
 
 
 def _coins_map(coins: list[dict[str, Any]]) -> dict[str, int]:

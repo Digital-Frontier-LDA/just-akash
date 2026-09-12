@@ -119,7 +119,7 @@ def _resolve_deployment(client, dseq_arg):
 
 
 def _resolve_deployment_client(dseq_arg, expected_owner=None, expected_group=None):
-    """Resolve a DSEQ and the configured Console wallet that positively owns it."""
+    """Resolve legacy Console ownership or collect owner-bound containment evidence."""
 
     from .api import AkashConsoleAPI, _extract_dseq, _interactive_pick, _resolve_dseq
     from .wallet_pool import (
@@ -133,6 +133,8 @@ def _resolve_deployment_client(dseq_arg, expected_owner=None, expected_group=Non
         raise RuntimeError("--expected-group requires --expected-owner")
     if expected_owner and not dseq:
         raise RuntimeError("--expected-owner requires an explicit --dseq")
+    if expected_owner and not expected_group:
+        raise RuntimeError("--expected-owner requires --expected-group")
     if dseq:
         if expected_owner:
             client = select_client_for_bound_owner(
@@ -610,7 +612,7 @@ def main():
         default="",
         help=(
             "Create-time owner candidate. Requires the configured credential and exact "
-            "owner/DSEQ chain identity to match before closing."
+            "owner-bound containment evidence; it does not authorize closing."
         ),
     )
     destroy_p.add_argument(
@@ -701,7 +703,8 @@ def main():
         default="",
         help=(
             "Create-time owner candidate. It is accepted only when a configured Console "
-            "credential reports it and an exact owner/DSEQ chain read confirms it."
+            "credential reports it and registered chain sources produce owner-bound "
+            "containment evidence. It is not fresh/finalized close authority."
         ),
     )
     resolve_owner_p.add_argument(
@@ -1878,7 +1881,25 @@ def main():
             tag = _get_tag(dseq)
             label = f"{dseq} ({tag})" if tag else dseq
             if _confirm(f"Destroy deployment {label}? (y/N) ", yes=args.yes):
-                client.close_deployment(dseq)
+                if args.expected_owner:
+                    import json as _json
+
+                    from .wallet_pool import (
+                        authorize_client_for_bound_owner,
+                    )
+
+                    closer, evidence = authorize_client_for_bound_owner(
+                        dseq,
+                        args.expected_owner,
+                        args.expected_group,
+                    )
+                    print(
+                        "owner-close-evidence=" + _json.dumps(evidence, sort_keys=True),
+                        file=sys.stderr,
+                    )
+                    closer.close_deployment(dseq)
+                else:
+                    client.close_deployment(dseq)
                 tags = _load_tags()
                 tags.pop(dseq, None)
                 _save_tags(tags)
@@ -1968,7 +1989,7 @@ def main():
         except RuntimeError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
-        source = "bound_owner_chain" if args.expected_owner else "wallet_pool"
+        source = "owner_bound_containment" if args.expected_owner else "wallet_pool"
         print(_json.dumps({"owner": owner, "dseq": dseq, "source": source}))
 
     # ── destroy-all ────────────────────────────────────
