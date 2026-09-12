@@ -502,8 +502,33 @@ def test_create_response_without_dseq_retains_the_prepared_receipt(
 
 
 def test_all_receipt_arguments_are_required_together() -> None:
-    with pytest.raises(ValueError, match="all-or-none"):
+    with pytest.raises(RuntimeError, match="all-or-none"):
         deploy_module.deploy("unused.yaml", receipt_path="/private/unused")
+
+
+@patch("just_akash.deploy.AkashConsoleAPI")
+def test_receipt_refuses_a_digest_of_bytes_changed_during_preparation(
+    mock_api, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AKASH_API_KEY", "test-key")
+    monkeypatch.delenv("AKASH_PROVIDERS", raising=False)
+    monkeypatch.setattr(deploy_module, "_RUN_ID", RUN_ID)
+    unstamped = SDL.replace("receipt-primary", "just-akash-receipt-primary").replace(
+        "receipt-secondary", "just-akash-receipt-secondary"
+    )
+    sdl_path = tmp_path / "sdl.yaml"
+    sdl_path.write_text(unstamped)
+    receipt = _private_dir(tmp_path / "private") / "receipt.json"
+    client = mock_api.return_value
+
+    with pytest.raises(RuntimeError, match="exact submitted bytes"):
+        deploy_module.deploy(
+            sdl_path=str(sdl_path),
+            **_receipt_arguments(unstamped, receipt),
+        )
+
+    client.create_deployment.assert_not_called()
+    assert not receipt.exists()
 
 
 def test_write_location_effect_mutation_loses_the_dseq_on_early_failure(

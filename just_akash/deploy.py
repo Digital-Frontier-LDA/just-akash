@@ -957,7 +957,7 @@ def deploy(
     if any(value is not None for value in receipt_arguments) and not all(
         value is not None for value in receipt_arguments
     ):
-        raise ValueError(
+        raise RuntimeError(
             "deployment receipt arguments are all-or-none: receipt_path, expected_owner, "
             "expected_groups, expected_artifact_digest, and receipt_operation_id"
         )
@@ -1014,6 +1014,15 @@ def deploy(
     sdl_path = _resolve_sdl_path(sdl_path, gpu)
     _log(logging.INFO, "STEP 1: Preparing SDL")
     sdl_content = _prepare_sdl_content(sdl_path, image=image, env_vars=env_vars)
+    if receipt_path is not None:
+        source_bytes = Path(sdl_path).read_bytes()
+        if sdl_content.encode() != source_bytes:
+            raise RuntimeError(
+                "receipt mode requires --sdl to contain the exact submitted bytes, "
+                "including an already run-scoped placement key and all image/env "
+                "overrides; preparation changed the file, so its caller-supplied "
+                "artifact digest cannot identify the submitted artifact"
+            )
     _check_wallet_credit(client, deposit)
 
     prepared_receipt = None

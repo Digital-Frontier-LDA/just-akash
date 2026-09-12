@@ -182,7 +182,10 @@ Automation can opt into a local recovery receipt while migrating toward the flee
 identity standard. Existing callers remain unjournaled until they explicitly adopt every
 receipt flag; this optional path is not writer integration or standard conformance.
 Create a unique path inside a caller-owned `0700` directory and provide the complete
-identity expected from the exact rendered SDL:
+identity expected from the exact rendered SDL. The file must already contain its
+run-scoped placement key and every image/environment override. Receipt mode refuses the
+create if preparation would change even one byte, so the digest below always identifies
+the bytes actually sent:
 
 ```bash
 install -d -m 700 "$RUNNER_TEMP/akash-receipts"
@@ -190,7 +193,7 @@ uv run just-akash deploy --sdl rendered.yaml \
   --receipt-path "$RUNNER_TEMP/akash-receipts/${GITHUB_RUN_ID}.json" \
   --receipt-operation-id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
   --receipt-expected-owner "$AKASH_OWNER" \
-  --receipt-expected-group "$PLACEMENT_GROUP" \
+  --receipt-expected-group "$RUN_SCOPED_PLACEMENT_GROUP" \
   --receipt-artifact-sha256 "$(shasum -a 256 rendered.yaml | cut -d' ' -f1)"
 ```
 
