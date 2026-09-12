@@ -176,6 +176,57 @@ uv run just-akash destroy --dseq 12345
 uv run just-akash tag --dseq 12345 --name my-job
 ```
 
+### Local deployment recovery receipt
+
+Automation can opt into a local recovery receipt while migrating toward the fleet artifact
+identity standard. Existing callers remain unjournaled until they explicitly adopt every
+receipt flag; this optional path is not writer integration or standard conformance.
+Create a unique path inside a caller-owned `0700` directory and provide the complete
+identity expected from the exact rendered SDL:
+
+```bash
+install -d -m 700 "$RUNNER_TEMP/akash-receipts"
+uv run just-akash deploy --sdl rendered.yaml \
+  --receipt-path "$RUNNER_TEMP/akash-receipts/${GITHUB_RUN_ID}.json" \
+  --receipt-operation-id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+  --receipt-expected-owner "$AKASH_OWNER" \
+  --receipt-expected-group "$PLACEMENT_GROUP" \
+  --receipt-artifact-sha256 "$(shasum -a 256 rendered.yaml | cut -d' ' -f1)"
+```
+
+The command writes `prepared`, then atomically fsyncs a `submitting` transition immediately
+before the first create byte can be sent. As soon as the Console response supplies a
+canonical DSEQ, it atomically replaces that state with `create_response_received` and
+fsyncs both file data and the parent directory before bid collection begins. The response candidate
+subject contains a `signer_owner_candidate` reported by Console, its evidence source,
+`dseq`, the complete ordered `{gseq,name}` population, its
+digest, and the exact SDL digest. Console transaction identifiers are recorded when the
+response includes them; the Console response contract does not guarantee one, so the
+receipt also binds the complete response digest and does not claim to be chain close
+authority. In particular, it never exposes the Console candidate as authoritative
+`owner`; only later exact chain or transaction binding may populate that field and a
+`created` state.
+
+The `0700` directory, atomic replacement, and fsync calls make the record durable against a
+process crash on the same filesystem. A path under an ephemeral runner, including
+`$RUNNER_TEMP`, does not survive host loss. Callers that need host-loss durability must
+provide a separately proven persistent store. The record does not bind an authoritative
+backend endpoint, producer repository/class, protected workflow, or globally unique
+operation registry, so Guardian must keep create and close authority held on this artifact
+alone.
+
+All receipt flags are required together. Existing leaves, symlinks, malformed state,
+non-private paths, signer/group/digest disagreement, and non-canonical DSEQs are refused.
+The file remains after success or failure and is never reused; cleanup must still verify
+fresh owner-bound chain evidence before closing it. The digest covers bytes after
+`just-akash` transformations. Receipt mode therefore requires an already-rendered SDL
+whose submitted bytes remain predictable; `--image`, `--env`, or automatic
+`just-akash-*` run stamping is refused when it changes the caller-supplied digest.
+Only an explicit Console `already exists` response enters the legacy stale-cleanup-and-one-
+retry path. Timeouts and all other unknown create outcomes are never retried. Once a
+receipt exists, re-invocation with the same path is refused, including when the
+Console returned a DSEQ but the response-state fsync failed.
+
 ## Run a personal Akash LCD/RPC node
 
 `just up-akash-node` deploys a cosmos-omnibus node (chain `akashnet-2`) that

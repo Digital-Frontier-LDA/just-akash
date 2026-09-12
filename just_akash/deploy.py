@@ -38,6 +38,7 @@ from .api import (
     _extract_gseq,
     _extract_provider,
 )
+from .deployment_receipt import mark_create_response_received, mark_submitting, prepare_receipt
 from .provenance import PLACEMENT_PREFIX, SIBLING_REAPED_PREFIX, run_id_of, stamp_run
 from .provider_capacity import capacity_by_provider
 from .sdl_validate import SDLValidationError, validate_sdl
@@ -930,6 +931,11 @@ def deploy(
     deposit: float = 5.0,
     select: str = "cheapest",
     already_selected: list[str] | None = None,
+    receipt_path: str | None = None,
+    expected_owner: str | None = None,
+    expected_groups: list[str] | None = None,
+    expected_artifact_digest: str | None = None,
+    receipt_operation_id: str | None = None,
 ) -> dict:
     # deposit is user-controlled (--deposit); reject non-finite/non-positive
     # values before they reach json.dumps (which would emit invalid NaN/Infinity).
@@ -940,6 +946,20 @@ def deploy(
         raise ValueError(
             "bid_wait_retry is the total auction deadline and must be greater than "
             "or equal to bid_wait"
+        )
+    receipt_arguments = (
+        receipt_path,
+        expected_owner,
+        expected_groups,
+        expected_artifact_digest,
+        receipt_operation_id,
+    )
+    if any(value is not None for value in receipt_arguments) and not all(
+        value is not None for value in receipt_arguments
+    ):
+        raise ValueError(
+            "deployment receipt arguments are all-or-none: receipt_path, expected_owner, "
+            "expected_groups, expected_artifact_digest, and receipt_operation_id"
         )
     fallback_wait = bid_wait_retry - bid_wait
     # ⛔ VALIDATE BEFORE YOU SPEND. This raises on a bad --select, and it must raise HERE:
@@ -996,6 +1016,23 @@ def deploy(
     sdl_content = _prepare_sdl_content(sdl_path, image=image, env_vars=env_vars)
     _check_wallet_credit(client, deposit)
 
+    prepared_receipt = None
+    if receipt_path is not None:
+        actual_owner = client.account_address()
+        if actual_owner != expected_owner:
+            raise RuntimeError(
+                f"receipt expected owner {expected_owner!r} does not match selected signer "
+                f"{actual_owner!r}"
+            )
+        prepared_receipt = prepare_receipt(
+            receipt_path,
+            operation_id=str(receipt_operation_id),
+            expected_owner=actual_owner,
+            expected_groups=list(expected_groups or []),
+            expected_artifact_digest=str(expected_artifact_digest),
+            sdl_content=sdl_content,
+        )
+
     # Step 2: Create deployment (with stale-deployment recovery)
     _log(
         logging.INFO,
@@ -1004,6 +1041,8 @@ def deploy(
     # Stamped BEFORE the request so a deployment created by THIS call can be told from
     # one that already existed. See _report_suspected_orphans.
     _create_started = time.time()
+    if prepared_receipt is not None:
+        prepared_receipt = mark_submitting(*prepared_receipt)
     try:
         deployment_response = client.create_deployment(sdl_content, deposit=deposit)
     except RuntimeError as e:
@@ -1082,8 +1121,6 @@ def deploy(
             raise RuntimeError(f"Failed to create deployment: {e}") from e
 
     dseq = deployment_response.get("dseq")
-    _manifest_raw = deployment_response.get("manifest", "")
-    manifest = _manifest_raw if isinstance(_manifest_raw, str) else ""
     if dseq is None:
         _log(
             logging.ERROR,
@@ -1100,6 +1137,24 @@ def deploy(
         raise RuntimeError(
             f"No DSEQ returned from API. Response: {json.dumps(deployment_response)}"
         )
+    if prepared_receipt is not None:
+        try:
+            mark_create_response_received(
+                *prepared_receipt,
+                dseq=dseq,
+                deployment_response=deployment_response,
+            )
+        except Exception as receipt_error:
+            raise RuntimeError(
+                f"NON-RETRYABLE CREATE OUTCOME AMBIGUOUS: Console returned dseq={dseq}, "
+                "but its local recovery receipt could not be durably transitioned. The "
+                "existing receipt path remains a create-submitted recovery seed; reconcile "
+                "its owner and complete group identity against the chain before any retry. "
+                f"Receipt error: {receipt_error}"
+            ) from receipt_error
+
+    _manifest_raw = deployment_response.get("manifest", "")
+    manifest = _manifest_raw if isinstance(_manifest_raw, str) else ""
 
     _log(logging.INFO, f"Deployment created  DSEQ={dseq}  manifest_len={len(manifest)}")
     _log(
@@ -1876,6 +1931,12 @@ def deploy(
         re-created order. Raises RuntimeError with an accurate cause if the round
         fails; any newly-created order is cleaned up before raising.
         """
+        if prepared_receipt is not None:
+            raise RuntimeError(
+                "receipt mode refuses internal re-deploy: the durable receipt binds the "
+                f"original DSEQ {dseq}, so closing it and creating another order would "
+                "make the recovery identity false"
+            )
         _log(
             logging.WARNING,
             f"Re-creating the order for fresh bids — {reason} (1 re-deploy round); "
@@ -2243,6 +2304,13 @@ def deploy_main():
         default=None,
         help="Backup provider address (repeatable; overrides AKASH_PROVIDERS_BACKUP)",
     )
+    parser.add_argument("--receipt-path")
+    parser.add_argument("--receipt-expected-owner")
+    parser.add_argument(
+        "--receipt-expected-group", action="append", dest="receipt_expected_groups"
+    )
+    parser.add_argument("--receipt-artifact-sha256")
+    parser.add_argument("--receipt-operation-id")
     # Mirrors the flag on `just-akash deploy` (cli.py). Both entry points reach the same
     # deploy(), so a flag on only one of them is a trap for whoever uses the other.
     parser.add_argument(
@@ -2293,6 +2361,11 @@ def deploy_main():
             # [] means "no backups, ignore the environment"; None means "read
             # AKASH_PROVIDERS_BACKUP". See _resolve_tier.
             backup_providers=[] if args.no_backup_fallback else args.backup_providers,
+            receipt_path=args.receipt_path,
+            expected_owner=args.receipt_expected_owner,
+            expected_groups=args.receipt_expected_groups,
+            expected_artifact_digest=args.receipt_artifact_sha256,
+            receipt_operation_id=args.receipt_operation_id,
         )
         sys.exit(0)
     except RuntimeError as e:

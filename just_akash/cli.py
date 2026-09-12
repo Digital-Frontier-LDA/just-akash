@@ -387,6 +387,28 @@ def main():
         help="Escrow deposit in USD (default: 5.0). Unused escrow is refunded "
         "when the deployment closes; size it to outlast the workload.",
     )
+    deploy_p.add_argument(
+        "--receipt-path",
+        help="Absolute path in a private (0700) directory for the crash-durable create receipt",
+    )
+    deploy_p.add_argument(
+        "--receipt-expected-owner",
+        help="Expected signer account; required with --receipt-path and verified before create",
+    )
+    deploy_p.add_argument(
+        "--receipt-expected-group",
+        action="append",
+        dest="receipt_expected_groups",
+        help="Expected placement group name in gseq order (repeat for the complete population)",
+    )
+    deploy_p.add_argument(
+        "--receipt-artifact-sha256",
+        help="SHA-256 of the exact rendered SDL bytes submitted to the create endpoint",
+    )
+    deploy_p.add_argument(
+        "--receipt-operation-id",
+        help="Caller lifecycle/run identifier stored in every local receipt state",
+    )
 
     # ── update ─────────────────────────────────────────
     update_p = subparsers.add_parser(
@@ -920,6 +942,11 @@ def main():
                 deposit=args.deposit,
                 select=args.select,
                 already_selected=args.already_selected,
+                receipt_path=args.receipt_path,
+                expected_owner=args.receipt_expected_owner,
+                expected_groups=args.receipt_expected_groups,
+                expected_artifact_digest=args.receipt_artifact_sha256,
+                receipt_operation_id=args.receipt_operation_id,
             )
             sys.exit(0)
         except RuntimeError as e:
