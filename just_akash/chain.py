@@ -25,7 +25,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 
 # Companion to the default AKASH_NODE (akash-rpc.publicnode.com): the same provider's
 # REST/LCD host. A public default matches how AKASH_NODE already defaults.
@@ -514,11 +514,11 @@ def _corroborated_deployment_group_names(
             or cache_ancestry in cache_ancestries
         ):
             return []
-        source_ids.add(source_id)
+        source_ids.add(cast(str, source_id))
         hostnames.add(hostname)
-        operators.add(operator)
-        ancestries.add(ancestry)
-        cache_ancestries.add(cache_ancestry)
+        operators.add(cast(str, operator))
+        ancestries.add(cast(str, ancestry))
+        cache_ancestries.add(cast(str, cache_ancestry))
         try:
             data = get(path, base=base)
         except ChainResponseError:
@@ -729,7 +729,8 @@ def _creation_block_population(reader, source, created_at: int) -> dict | None:
         raw_bytes = [_canonical_base64_bytes(raw) for raw in raw_txs]
         if any(raw is None for raw in raw_bytes):
             raise ChainResponseError("creation block contained a malformed raw transaction")
-        raw_hashes = tuple(hashlib.sha256(raw).hexdigest().upper() for raw in raw_bytes)
+        complete_raw_bytes = cast(list[bytes], raw_bytes)
+        raw_hashes = tuple(hashlib.sha256(raw).hexdigest().upper() for raw in complete_raw_bytes)
         if len(set(raw_hashes)) != page_total:
             raise ChainResponseError("creation block contained duplicate raw transactions")
         page_block = (block_hash, block_time, raw_hashes)
@@ -759,10 +760,12 @@ def _creation_block_population(reader, source, created_at: int) -> dict | None:
         or len(set(fingerprints)) != total
     ):
         raise ChainResponseError("creation block population did not reconcile")
+    complete_block = cast(tuple[str, datetime, tuple[str, ...]], expected_block)
+    complete_raw_hashes = cast(tuple[str, ...], expected_raw_hashes)
     return {
-        "block_hash": expected_block[0],
-        "block_time": expected_block[1],
-        "raw_hashes": expected_raw_hashes,
+        "block_hash": complete_block[0],
+        "block_time": complete_block[1],
+        "raw_hashes": complete_raw_hashes,
         "fingerprints": tuple(fingerprints),
         "txs": decoded,
     }
@@ -933,7 +936,9 @@ def _owner_close_evidence(
         if doc is None:
             continue
         header = (doc.get("block") or {}).get("header") if isinstance(doc, dict) else None
-        raw_height = header.get("height") if isinstance(header, dict) else None
+        if not isinstance(header, dict):
+            return None
+        raw_height = header.get("height")
         if not isinstance(raw_height, str) or not re.fullmatch(r"[1-9][0-9]*", raw_height):
             return None
         height = int(raw_height)
@@ -1036,9 +1041,15 @@ def _owner_close_evidence(
         elif current_snapshot != snapshot or current_proof != creation_proof:
             return None
         used.append(source["source_id"])
-    if len(used) < 2 or snapshot != (("1", expected_group),):
+    if (
+        len(used) < 2
+        or snapshot != (("1", expected_group),)
+        or created_at is None
+        or creation_proof is None
+    ):
         return None
-    population = json.dumps(snapshot, separators=(",", ":"), ensure_ascii=True)
+    complete_snapshot = cast(tuple[tuple[str, str], ...], snapshot)
+    population = json.dumps(complete_snapshot, separators=(",", ":"), ensure_ascii=True)
     expires = min(now.timestamp() + 30, block_time.timestamp() + 180)
     if expires <= now.timestamp():
         return None
@@ -1062,7 +1073,7 @@ def _owner_close_evidence(
         "dseq": dseq,
         "gseq": "1",
         "group": expected_group,
-        "population_count": len(snapshot),
+        "population_count": len(complete_snapshot),
         "population_digest": hashlib.sha256(population.encode()).hexdigest(),
         "observed_at": now.isoformat(),
         "evaluated_at": now.isoformat(),

@@ -32,6 +32,7 @@ import os
 import shlex
 import subprocess
 import sys
+from typing import Any, cast
 
 NO_SSH_MSG = (
     "No SSH port found on this deployment.\n"
@@ -118,7 +119,11 @@ def _resolve_deployment(client, dseq_arg):
     return dseq
 
 
-def _resolve_deployment_client(dseq_arg, expected_owner=None, expected_group=None):
+def _resolve_deployment_client(
+    dseq_arg: Any,
+    expected_owner: str | None = None,
+    expected_group: str | None = None,
+) -> tuple[Any, str]:
     """Resolve legacy Console ownership or collect owner-bound containment evidence."""
 
     from .api import AkashConsoleAPI, _extract_dseq, _interactive_pick, _resolve_dseq
@@ -140,7 +145,7 @@ def _resolve_deployment_client(dseq_arg, expected_owner=None, expected_group=Non
             client = select_client_for_bound_owner(
                 dseq,
                 expected_owner,
-                expected_group,
+                cast(str, expected_group),
                 client_factory=AkashConsoleAPI,
             )
             return client, dseq

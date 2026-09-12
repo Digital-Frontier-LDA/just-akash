@@ -318,6 +318,7 @@ def test_malformed_sibling_invalidates_the_whole_population(mutate):
 
 def _mutated_consensus(source: str):
     namespace = {
+        "cast": chain.cast,
         "_DEPLOYMENT_API": "/akash/deployment/v1beta4",
         "_deployment_group_snapshot": chain._deployment_group_snapshot,
         "_lcd_get": chain._lcd_get,

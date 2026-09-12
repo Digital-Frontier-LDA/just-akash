@@ -208,7 +208,9 @@ def test_bound_owner_without_an_expected_group_fails_closed(monkeypatch):
     client.account_address.return_value = owner
 
     with pytest.raises(TypeError):
-        select_client_for_bound_owner("123", owner, client_factory=lambda _key: client)
+        select_client_for_bound_owner(  # pyright: ignore[reportCallIssue]
+            "123", owner, client_factory=lambda _key: client
+        )
 
 
 def test_dseq_owner_requires_positive_matching_identity(monkeypatch):

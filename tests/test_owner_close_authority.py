@@ -7,6 +7,8 @@ import inspect
 import textwrap
 import urllib.parse
 from datetime import datetime, timedelta, timezone
+from email.message import Message
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -246,7 +248,7 @@ def test_measured_tendermint_nanoseconds_are_accepted_but_not_weakened():
 
 def test_identical_truncated_current_populations_are_caught_by_signed_create_population():
     reader, _ = _reader(current_groups=(("1", GROUP),), create_groups=(GROUP, "sidecar"))
-    arguments = dict(sources=SOURCES, reader=reader, now=NOW)
+    arguments: dict[str, Any] = dict(sources=SOURCES, reader=reader, now=NOW)
     assert chain._owner_close_evidence(OWNER, DSEQ, GROUP, **arguments) is None
 
     mutant = _mutated_function(
@@ -478,7 +480,7 @@ def test_returned_protocol_failure_vetoes_but_transport_failure_abstains():
         return doc
 
     reader, _ = _reader(sources=sources, mutate=malformed)
-    arguments = dict(sources=sources, reader=reader, now=NOW)
+    arguments: dict[str, Any] = dict(sources=sources, reader=reader, now=NOW)
     assert chain._owner_close_evidence(OWNER, DSEQ, GROUP, **arguments) is None
 
     mutant = _mutated_function(
@@ -524,7 +526,9 @@ def test_missing_pinned_height_echo_is_a_protocol_failure():
 
 
 def test_http_response_is_a_protocol_failure_not_a_transport_abstention():
-    error = chain.urllib.error.HTTPError("https://lcd.example/test", 400, "bad request", {}, None)
+    error = chain.urllib.error.HTTPError(
+        "https://lcd.example/test", 400, "bad request", Message(), None
+    )
     with (
         patch.object(chain.urllib.request, "urlopen", side_effect=error),
         pytest.raises(chain.ChainResponseError, match="returned HTTP 400"),
@@ -535,7 +539,7 @@ def test_http_response_is_a_protocol_failure_not_a_transport_abstention():
 def test_current_block_hash_disagreement_is_not_authority():
     other = base64.b64encode(b"o" * 32).decode()
     reader, _ = _reader(current_hashes={SOURCES[0]["url"]: HASH, SOURCES[1]["url"]: other})
-    arguments = dict(sources=SOURCES, reader=reader, now=NOW)
+    arguments: dict[str, Any] = dict(sources=SOURCES, reader=reader, now=NOW)
     assert chain._owner_close_evidence(OWNER, DSEQ, GROUP, **arguments) is None
 
     condition = (
@@ -551,7 +555,7 @@ def test_current_block_hash_disagreement_is_not_authority():
 def test_creation_block_hash_disagreement_is_not_authority():
     other = base64.b64encode(b"o" * 32).decode()
     reader, _ = _reader(create_hashes={SOURCES[0]["url"]: CREATE_HASH, SOURCES[1]["url"]: other})
-    arguments = dict(sources=SOURCES, reader=reader, now=NOW)
+    arguments: dict[str, Any] = dict(sources=SOURCES, reader=reader, now=NOW)
     assert chain._owner_close_evidence(OWNER, DSEQ, GROUP, **arguments) is None
     mutant = _mutated_function(
         chain._owner_close_evidence,
@@ -565,7 +569,7 @@ def test_creation_block_hash_disagreement_is_not_authority():
 
 def test_creation_height_cannot_follow_the_pinned_action_height():
     reader, _ = _reader(created_at=101)
-    arguments = dict(sources=SOURCES, reader=reader, now=NOW)
+    arguments: dict[str, Any] = dict(sources=SOURCES, reader=reader, now=NOW)
     assert chain._owner_close_evidence(OWNER, DSEQ, GROUP, **arguments) is None
     mutant = _mutated_function(
         chain._owner_close_evidence,
@@ -577,7 +581,7 @@ def test_creation_height_cannot_follow_the_pinned_action_height():
 def test_creation_block_time_cannot_follow_the_pinned_action_block_time():
     future = NOW - timedelta(seconds=5)
     reader, _ = _reader(create_block_times={source["url"]: future for source in SOURCES})
-    arguments = dict(sources=SOURCES, reader=reader, now=NOW)
+    arguments: dict[str, Any] = dict(sources=SOURCES, reader=reader, now=NOW)
     assert chain._owner_close_evidence(OWNER, DSEQ, GROUP, **arguments) is None
     mutant = _mutated_function(
         chain._owner_close_evidence,
@@ -604,7 +608,7 @@ def test_block_time_disagreement_and_tip_skew_are_not_authority():
 @pytest.mark.parametrize("fractional", [102.9, "102.9"])
 def test_fractional_tip_height_is_malformed_and_not_coerced(fractional):
     reader, _ = _reader(tips={SOURCES[1]["url"]: fractional})
-    arguments = dict(sources=SOURCES, reader=reader, now=NOW)
+    arguments: dict[str, Any] = dict(sources=SOURCES, reader=reader, now=NOW)
     assert chain._owner_close_evidence(OWNER, DSEQ, GROUP, **arguments) is None
 
     mutant = _mutated_function(
@@ -639,7 +643,7 @@ def test_stale_common_block_is_not_authority():
     reader, _ = _reader(
         current_block_times={source["url"]: NOW - timedelta(seconds=181) for source in SOURCES}
     )
-    arguments = dict(sources=SOURCES, reader=reader, now=NOW)
+    arguments: dict[str, Any] = dict(sources=SOURCES, reader=reader, now=NOW)
     assert chain._owner_close_evidence(OWNER, DSEQ, GROUP, **arguments) is None
 
     mutant = _mutated_function(
@@ -663,7 +667,7 @@ def test_removing_current_height_pin_changes_population_and_false_allows():
             return _info((("1", "other-group"),))
         return base_reader(path, base=base, height=height)
 
-    arguments = dict(sources=SOURCES, reader=reader, now=NOW)
+    arguments: dict[str, Any] = dict(sources=SOURCES, reader=reader, now=NOW)
     assert chain._owner_close_evidence(OWNER, DSEQ, GROUP, **arguments) is None
 
     mutant = _mutated_function(
