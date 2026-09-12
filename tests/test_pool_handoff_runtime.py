@@ -119,8 +119,16 @@ def should_run(expression, results):
 
 
 def lifetime(pool, caller, output, outcome, consumer_result="success"):
+    render_output = {
+        "runner_targets": ('{"unit-1":["self-hosted","linux","akash","offline-pool-unit-1"]}'),
+        "slot_labels": '{"unit-1":"offline-pool-unit-1"}',
+        "deployment_group": (
+            "just-akash-e2epool-idv2-class-ci-runner-g1-op-7-attempt-1-run-99-end"
+        ),
+        "operation_label": "offline-pool-idv2-g1-op-7-attempt-1-run-99",
+    }
     job_output = {
-        k: resolve(v, {"steps": {"provision": output}})
+        k: resolve(v, {"steps": {"provision": output, "render": render_output}})
         for k, v in pool["jobs"]["pool"]["outputs"].items()
     }
     exported = {
@@ -152,9 +160,11 @@ def lifetime(pool, caller, output, outcome, consumer_result="success"):
         close(cleanup, caller_context, "caller")
     if outcome == "success":
         assert alive, events
-        assert exported.get("runner-targets") == output["runner_targets"], "missing-runner-targets"
+        assert exported.get("runner-targets") == render_output["runner_targets"], (
+            "missing-runner-targets"
+        )
         assert output["provision_healthy"] == "true"
-        assert "offline-pool" in output["runner_targets"]
+        assert "offline-pool" in render_output["runner_targets"]
         assert caller["jobs"]["work"]["needs"] == ["pool"]
         assert "needs.pool.outputs.runner-targets" in caller["jobs"]["work"]["runs-on"]
         events.extend(["consumer-started", "consumer-" + consumer_result])
@@ -224,9 +234,9 @@ def test_exact_target_mutations_break_observed_handoff(tmp_path, mutation, outco
         before["jobs"]["teardown"]["uses"] = pool["jobs"]["teardown"]["uses"]
     elif mutation == "missing-early-emit":
         step = provision_step(pool)
-        emit = 'echo "dseq=$DSEQ" >> "$GITHUB_OUTPUT"'
+        emit = 'echo "dseq=$DSEQ" >> "$GITHUB_OUTPUT"\n  PROVIDER=$(awk'
         assert step["run"].count(emit) == 1
-        step["run"] = step["run"].replace(emit, ":")
+        step["run"] = step["run"].replace(emit, ":\n  PROVIDER=$(awk")
         provision_step(before)["run"] = step["run"]
     else:
         assert caller["jobs"]["teardown"]["needs"].count("work") == 1

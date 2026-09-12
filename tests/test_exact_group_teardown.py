@@ -14,7 +14,7 @@ POOL_PATH = ROOT / ".github/workflows/runner-pool.yml"
 TEARDOWN_PATH = ROOT / ".github/workflows/runner-teardown.yml"
 POOL_SRC = POOL_PATH.read_text()
 TEARDOWN_SRC = TEARDOWN_PATH.read_text()
-EXPECTED_GROUP = "borduas-runner-run-42-end"
+EXPECTED_GROUP = "borduas-runner-idv2-class-ci-runner-g1-op-7-attempt-2-run-42-end"
 
 
 def _on(document: dict) -> dict:
@@ -40,12 +40,11 @@ def _assert_group_handoffs(pool_source: str, teardown_source: str) -> None:
 
     assert render.get("id") == "render"
     render_code = _code(render["run"])
-    publication = 'echo "deployment_group=${PLACEMENT_KEY}" >> "$GITHUB_OUTPUT"'
+    publication = '--create-operation "$CREATE_OPERATION" --run-id "$GH_RUN_ID"'
     assert render_code.count(publication) == 1
-    assert render_code.index('PLACEMENT_KEY="${PLACEMENT_KEY}-run-${GH_RUN_ID:-}-end"') < (
-        render_code.index(publication)
-    )
-    assert render_code.index(publication) < render_code.index("cat > /tmp/runner-sdl.yaml")
+    assert "python -m just_akash.jit_pool identity" in render_code
+    assert '--run-attempt "$GH_RUN_ATTEMPT"' in render_code
+    assert render_code.index(publication) < render_code.index("jit_pool topology")
 
     assert pool_job["outputs"].get("deployment_group") == (
         "${{ steps.render.outputs.deployment_group }}"
@@ -63,8 +62,8 @@ def _assert_group_handoffs(pool_source: str, teardown_source: str) -> None:
         for line in provision_code.splitlines()
         if '"${JA[@]}" destroy' in line and '--expected-owner "$WALLET"' in line
     ]
-    assert len(rollback_lines) == 5, (
-        "mutation target count changed: expected exactly five owner-bound immediate rollback calls"
+    assert len(rollback_lines) == 4, (
+        "mutation target count changed: expected exactly four owner-bound immediate rollback calls"
     )
     for line in rollback_lines:
         assert line.count('--expected-group "$DEPLOYMENT_GROUP"') == 1
@@ -93,6 +92,8 @@ def test_render_publishes_the_name_used_by_both_sdl_group_maps(tmp_path):
             "GH_RUNNER_PAT": "secret",
             "ORG": "Digital-Frontier-LDA",
             "RUNNER_LABEL": "exact-group-test",
+            "RUNNER_SLOTS": '["one"]',
+            "RUNNER_GROUP_ID": "17",
             "POOL_SIZE": "1",
             "CPU": "1",
             "MEMORY": "1Gi",
@@ -100,6 +101,8 @@ def test_render_publishes_the_name_used_by_both_sdl_group_maps(tmp_path):
             "EPHEMERAL": "true",
             "PLACEMENT_KEY": "borduas-runner",
             "GH_RUN_ID": "42",
+            "GH_RUN_ATTEMPT": "2",
+            "CREATE_OPERATION": "7",
             "GITHUB_OUTPUT": str(output),
         },
         text=True,
@@ -108,10 +111,9 @@ def test_render_publishes_the_name_used_by_both_sdl_group_maps(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert output.read_text().splitlines() == [f"deployment_group={EXPECTED_GROUP}"]
-    rendered = yaml.safe_load(Path("/tmp/runner-sdl.yaml").read_text())
-    assert list(rendered["profiles"]["placement"]) == [EXPECTED_GROUP]
-    assert list(rendered["deployment"]["runner"]) == [EXPECTED_GROUP]
+    outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert outputs["deployment_group"] == EXPECTED_GROUP
+    assert "attempt-2-run-42" in outputs["operation_label"]
 
 
 def _replace_once(source: str, old: str, new: str) -> str:
@@ -129,8 +131,8 @@ def _sever_rollback(source: str, index: int) -> str:
         for line_index, line in enumerate(lines)
         if '"${JA[@]}" destroy' in line and '--expected-owner "$WALLET"' in line
     ]
-    assert len(targets) == 5, (
-        f"rollback mutation target count changed: expected 5, found {len(targets)}"
+    assert len(targets) == 4, (
+        f"rollback mutation target count changed: expected 4, found {len(targets)}"
     )
     target = targets[index]
     assert lines[target].count(needle) == 1
@@ -148,8 +150,8 @@ MUTATIONS = [
         lambda p, t: (
             _replace_once(
                 p,
-                'echo "deployment_group=${PLACEMENT_KEY}" >> "$GITHUB_OUTPUT"',
-                'echo "deployment_group=" >> "$GITHUB_OUTPUT"',
+                '--create-operation "$CREATE_OPERATION" --run-id "$GH_RUN_ID"',
+                '--create-operation "" --run-id "$GH_RUN_ID"',
             ),
             t,
         ),
@@ -192,7 +194,7 @@ MUTATIONS = [
             f"immediate-rollback-{index + 1}",
             lambda p, t, index=index: (_sever_rollback(p, index), t),
         )
-        for index in range(5)
+        for index in range(4)
     ],
     (
         "job-output-to-nested-teardown-input",

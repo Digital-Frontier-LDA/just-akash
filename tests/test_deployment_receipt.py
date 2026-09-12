@@ -700,3 +700,49 @@ def test_receipt_mode_refuses_internal_second_create(
     assert client.create_deployment.call_count == 1
     client.close_deployment.assert_not_called()
     assert json.loads(receipt.read_text())["dseq"] == "111"
+
+
+@patch("just_akash.deploy.AkashConsoleAPI")
+def test_receipt_mode_refuses_the_create_time_already_exists_retry(
+    mock_api, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AKASH_API_KEY", "test-key")
+    monkeypatch.delenv("AKASH_PROVIDERS", raising=False)
+    sdl_path = tmp_path / "sdl.yaml"
+    sdl_path.write_text(SDL)
+    rendered = deploy_module._prepare_sdl_content(str(sdl_path))
+    receipt = _private_dir(tmp_path / "private") / "receipt.json"
+    client = mock_api.return_value
+    client.account_address.return_value = OWNER
+    client.create_deployment.side_effect = RuntimeError("deployment already exists")
+    with pytest.raises(RuntimeError, match="refuses create-time retry"):
+        deploy_module.deploy(sdl_path=str(sdl_path), **_receipt_arguments(rendered, receipt))
+    assert client.create_deployment.call_count == 1
+
+
+@patch("just_akash.deploy.AkashConsoleAPI")
+def test_create_time_retry_guard_bypass_has_an_observable_second_post(
+    mock_api, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = inspect.getsource(deploy_module.deploy)
+    target = "            _refuse_create_retry_with_receipt(prepared_receipt, e)\n"
+    assert source.count(target) == 1
+    monkeypatch.setenv("AKASH_API_KEY", "test-key")
+    monkeypatch.delenv("AKASH_PROVIDERS", raising=False)
+    monkeypatch.setattr(deploy_module, "_close_stale_for_retry", lambda *_args, **_kwargs: None)
+    sdl_path = tmp_path / "sdl.yaml"
+    sdl_path.write_text(SDL)
+    rendered = deploy_module._prepare_sdl_content(str(sdl_path))
+    receipt = _private_dir(tmp_path / "private") / "receipt.json"
+    client = mock_api.return_value
+    client.account_address.return_value = OWNER
+    client.create_deployment.side_effect = [
+        RuntimeError("deployment already exists"),
+        RuntimeError("second create observed"),
+    ]
+    with (
+        patch.object(deploy_module, "_refuse_create_retry_with_receipt", lambda *_args: None),
+        pytest.raises(RuntimeError, match="after retry"),
+    ):
+        deploy_module.deploy(sdl_path=str(sdl_path), **_receipt_arguments(rendered, receipt))
+    assert client.create_deployment.call_count == 2

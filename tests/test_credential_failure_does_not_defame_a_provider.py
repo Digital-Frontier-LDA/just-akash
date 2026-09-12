@@ -90,6 +90,7 @@ def _run_verdict(http_status: str | None) -> dict[str, str]:
             "PATH": bin_ + os.pathsep + os.environ["PATH"],
             "GITHUB_OUTPUT": out_file,
             "ORG": "some-org",
+            "VERIFIED_RUNNER_GROUP_ID": "17",
             "MAX_ATTEMPTS": "3",
         },
         capture_output=True,
