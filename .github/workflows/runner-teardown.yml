@@ -74,6 +74,14 @@ on:
         required: false
         type: string
         default: ''
+      runner-ids:
+        description: >-
+          JSON array of exact runner IDs created by the pool. When present, teardown
+          removes these identities regardless of transient status; an empty array uses
+          the operation-label fallback and holds online or busy runners.
+        required: false
+        type: string
+        default: '[]'
       github-org:
         required: false
         type: string
@@ -359,6 +367,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_RUNNER_PAT }}
           ORG: ${{ inputs.github-org }}
           RUNNER_LABEL: ${{ inputs.runner-label }}
+          RUNNER_IDS_JSON: ${{ inputs.runner-ids }}
         run: |
           set -uo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
@@ -386,17 +395,46 @@ jobs:
           # the filter lets a `"` or `\` build an invalid jq program whose non-zero exit
           # this step now (correctly) reads as an unreadable listing — turning a bad
           # input into "the API is down". See the same note in runner-pool.yml.
-          IDS=$(gh api --paginate "orgs/${ORG}/actions/runners?per_page=100" 2>/tmp/gh-dereg.err \
-                | jq -r --arg L "$RUNNER_LABEL" \
-                  '.runners[] | select(.status=="offline") | select(any(.labels[].name; .==$L)) | .id')
-          GH_RC=$?
-          if [ "$GH_RC" -ne 0 ]; then
-            {
-              echo "deregistered=unmeasured"
-              echo "deregister_failed=unmeasured"
-            } >> "$GITHUB_OUTPUT"
-            echo "::warning title=Could not read the runner listing — de-registration did NOT run::gh rc=${GH_RC}: $(tail -1 /tmp/gh-dereg.err 2>/dev/null). Offline registrations for ${RUNNER_LABEL} are still in the org, and every pool's poll pages through them. Re-run this teardown once the API budget recovers."
-            exit 0
+          if [ -n "${RUNNER_IDS_JSON:-}" ] && [ "$RUNNER_IDS_JSON" != "[]" ]; then
+            IDS_RC=0
+            IDS=$(printf '%s' "$RUNNER_IDS_JSON" | jq -er \
+              'if type=="array" and length>0 and all(.[]; type=="number" and .>0 and floor==.) and (unique|length)==length then .[] else error("invalid exact runner ids") end') || IDS_RC=$?
+            VERIFIED_IDS=''
+            if [ "$IDS_RC" -eq 0 ]; then
+              for id in $IDS; do
+                RUNNER_RC=0
+                RUNNER=$(gh api "orgs/${ORG}/actions/runners/${id}" 2>/tmp/gh-dereg.err) || RUNNER_RC=$?
+                if [ "$RUNNER_RC" -ne 0 ] || ! printf '%s' "$RUNNER" | jq -e \
+                    --argjson ID "$id" --arg L "$RUNNER_LABEL" \
+                    '.id==$ID and (.name|type=="string" and startswith("just-akash-")) and any(.labels[].name; .==$L) and any(.labels[].name; .=="self-hosted") and any(.labels[].name; .=="akash")' >/dev/null; then
+                  IDS_RC=1
+                  break
+                fi
+                VERIFIED_IDS="${VERIFIED_IDS}${id}\n"
+              done
+            fi
+            if [ "$IDS_RC" -ne 0 ]; then
+              {
+                echo "deregistered=0"
+                echo "deregister_failed=unmeasured"
+              } >> "$GITHUB_OUTPUT"
+              echo "::warning title=Exact runner identity could not be bound — de-registration did NOT run::Every requested ID must read back with the exact operation label plus self-hosted and akash labels. No runner was deleted. $(tail -1 /tmp/gh-dereg.err 2>/dev/null)"
+              exit 0
+            fi
+            IDS=$(printf '%b' "$VERIFIED_IDS")
+          else
+            IDS=$(gh api --paginate "orgs/${ORG}/actions/runners?per_page=100" 2>/tmp/gh-dereg.err \
+                  | jq -r --arg L "$RUNNER_LABEL" \
+                    '.runners[] | select(.status=="offline") | select(.busy==false) | select(any(.labels[].name; .==$L)) | .id')
+            GH_RC=$?
+            if [ "$GH_RC" -ne 0 ]; then
+              {
+                echo "deregistered=unmeasured"
+                echo "deregister_failed=unmeasured"
+              } >> "$GITHUB_OUTPUT"
+              echo "::warning title=Could not read the runner listing — de-registration did NOT run::gh rc=${GH_RC}: $(tail -1 /tmp/gh-dereg.err 2>/dev/null). Offline registrations for ${RUNNER_LABEL} are still in the org, and every pool's poll pages through them. Re-run this teardown once the API budget recovers."
+              exit 0
+            fi
           fi
 
           # A DELETE costs 5 points against GitHub's 900-points-per-minute secondary
