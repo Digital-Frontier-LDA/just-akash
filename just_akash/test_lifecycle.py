@@ -24,7 +24,9 @@ from ._e2e import (
     assert_provider_in_tiers,
     install_signal_cleanup,
     resolve_tiers,
-    robust_destroy,
+)
+from ._e2e import (
+    destroy_owned_deployment as robust_destroy,
 )
 
 GREEN = "\033[92m"

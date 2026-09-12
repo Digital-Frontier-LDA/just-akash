@@ -29,8 +29,12 @@ from just_akash._e2e import (
 
 
 @pytest.fixture(autouse=True)
-def _reset_e2e_state():
+def _reset_e2e_state(monkeypatch):
     """Each test starts with a clean signal registry."""
+    monkeypatch.setattr(
+        "just_akash._e2e.resolve_deployment_owner",
+        lambda _dseq: "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee",
+    )
     _reset_signal_cleanup_for_tests()
     yield
     _reset_signal_cleanup_for_tests()
@@ -245,7 +249,12 @@ class TestInstallSignalCleanup:
         ):
             handlers[signal.SIGINT](signal.SIGINT, None)
         assert exc.value.code == 130
-        mock_destroy.assert_called_once_with("9999", retries=1, audit=True)
+        mock_destroy.assert_called_once_with(
+            "9999",
+            owner="akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee",
+            retries=1,
+            audit=True,
+        )
 
     def test_handler_skips_destroy_when_dseq_unset(self, monkeypatch, capsys):
         handlers: dict = {}
@@ -1403,7 +1412,7 @@ class TestAuditReadsTheAuthoritativeRecordNotTheList:
                 [_completed(0, stdout="closed")], repeat(_completed(1, stderr="API 503"))
             )
             assert robust_destroy("12345") is False
-            assert "could not confirm" in capsys.readouterr().out.lower()
+            assert "settlement not observed" in capsys.readouterr().out.lower()
 
     def test_a_transient_blip_does_not_cry_leak(self):
         """Fails-closed only AFTER retries — otherwise one API blip would report a
@@ -1470,7 +1479,10 @@ class TestAuditNeverRaisesFromCleanup:
         with (
             patch("just_akash._e2e.subprocess.run") as mock_run,
             patch("just_akash._e2e.time.sleep"),
-            patch("just_akash._e2e._confirm_settled", side_effect=RuntimeError("boom")),
+            patch(
+                "just_akash._e2e._confirm_settled_single_reader",
+                side_effect=RuntimeError("boom"),
+            ),
         ):
             mock_run.side_effect = [_completed(0, stdout="closed")]
             assert robust_destroy("12345") is False
@@ -1487,7 +1499,7 @@ class TestAuditNeverRaisesFromCleanup:
                 [_completed(0, stdout="closed")], repeat(_completed(1, stderr="503"))
             )
             robust_destroy("123; rm -rf /tmp/x")
-            assert "'123; rm -rf /tmp/x'" in capsys.readouterr().out
+            assert "settlement not observed" in capsys.readouterr().out.lower()
 
 
 class TestUnknownStateIsNotAClaimOfLife:
@@ -1515,13 +1527,14 @@ class TestUnknownStateIsNotAClaimOfLife:
     def test_unknown_state_says_could_not_confirm_not_still_active(self, capsys):
         result, out = self._run_audit('{"state": "some_new_state"}', capsys)
         assert result is False, "must still fail closed"
-        assert "could not confirm" in out.lower()
+        assert "settlement not observed" in out.lower()
         assert "STILL ACTIVE" not in out, "we cannot claim it is active — we don't know"
 
-    def test_active_still_positively_reports_still_active(self, capsys):
+    def test_active_reports_only_unobserved_settlement(self, capsys):
         result, out = self._run_audit('{"state": "active"}', capsys)
         assert result is False
-        assert "STILL ACTIVE" in out
+        assert "settlement not observed" in out
+        assert "STILL ACTIVE" not in out
 
     def test_insufficient_funds_is_settled(self, capsys):
         """The escrow is what ran out — there is nothing left to leak. Terminal in
@@ -1533,7 +1546,7 @@ class TestUnknownStateIsNotAClaimOfLife:
     def test_missing_state_field_is_unknown_not_settled(self, capsys):
         result, out = self._run_audit('{"dseq": "12345"}', capsys)
         assert result is False
-        assert "could not confirm" in out.lower()
+        assert "settlement not observed" in out.lower()
 
     def test_one_active_then_unreadable_is_not_claimed_still_active(self, capsys):
         """Caught in review (CodeRabbit, PR #63): a single `active` read followed by
@@ -1554,7 +1567,7 @@ class TestUnknownStateIsNotAClaimOfLife:
             result = robust_destroy("12345")
             out = capsys.readouterr().out
         assert result is False, "still fails closed — we could not confirm settlement"
-        assert "could not confirm" in out.lower()
+        assert "settlement not observed" in out.lower()
         assert "STILL ACTIVE" not in out, "one stale active read is not persistence"
 
 
@@ -1597,7 +1610,9 @@ class TestAuditPollsBecauseCloseIsNotInstant:
                 _completed(0, stdout='{"state": "active"}') for _ in range(8)
             ]
             assert robust_destroy("12345") is False
-            assert "STILL ACTIVE" in capsys.readouterr().out
+            out = capsys.readouterr().out
+            assert "settlement not observed" in out
+            assert "STILL ACTIVE" not in out
 
     def test_a_settled_read_returns_immediately_without_burning_the_window(self):
         """The common case (already settled) must not pay the full poll."""
@@ -1628,130 +1643,30 @@ class TestAuditPollsBecauseCloseIsNotInstant:
 
 
 class TestAuditOverClaimsWhenReaderLagsChainTruth:
-    """Witness pin for issue #275: the audit fires ``STILL ACTIVE`` even
-    when the chain has settled. The shape has now been **measured
-    twice in two subsystems**, not estimated once:
+    """Regression for #304: a lagging reader cannot justify ``STILL ACTIVE``."""
 
-    * **#275 (this audit path)** — main @``e0a41cc8``, run
-      34026449786, 2026-09-06T10:05Z. Deployment settled at block
-      28502500 (10:07:15.204Z, escrow ``closed``, ``funds=0``,
-      lifetime cost 123 uact). Audit read ``state=active`` for all
-      8 probes and printed ``STILL ACTIVE``.
-    * **#299 (a different file, ``runner-teardown.yml``)** — settle
-      at 10:18:08.02Z, guard read ``active`` at 10:18:16.91Z (+8.9 s
-      lag). A second instance on blazing#915 measured +9.6 s. The
-      two lags landing within 0.7 s of each other is the strongest
-      signal: the lag is a consistent ~9 s property of the indexer,
-      not flake. (Issue #299 was filed by the same author as this PR
-      on the same evidence chain — public REST via polkachu, no
-      key, block height → wall clock.)
-
-    The audit helper ``just_akash._e2e._confirm_settled`` currently allows this
-    over-claim. On the #275 run it did. This PR only labels the destroy-CLI log
-    line; the audit itself
-    remains the load-bearing defect and is the subject of issue
-    **#304** ("harden ``_confirm_settled`` against REST indexer-lag
-    false-positive"). #299 is owned by DEV3-tron (this repo,
-    different file, no overlap with this commit).
-
-    A fix that only lengthens the probe window is **insufficient**
-    against the evidence above: a 9 s lag is short relative to
-    current operator patience but long relative to a probe schedule
-    that starts polling immediately after destroy. The property
-    that needs to be asserted is settlement observed positively —
-    poll until escrow reads ``closed``, and on timeout report
-    "close issued, settlement not observed within N s" rather
-    than "STILL ACTIVE". An unconfirmed close and a failed close
-    are different facts and need different words.
-
-    These tests pin the over-claim shape as observable. They assert
-    **current** behaviour — 8/8 active reads → ``STILL ACTIVE`` — and
-    exist so that:
-
-    1. the bug is observable and reproducible in unit-test form;
-    2. the audit-hardening PR has a precise RED to turn GREEN by
-       changing the assertion to require corroboration with chain
-       truth (gRPC state-proof, multi-reader, or a height-aware
-       read);
-    3. anyone editing ``just_akash._e2e._confirm_settled`` without updating
-       this test breaks a CI green they didn't intend to.
-
-    The focused cases below use mocked subprocess output and zero real chain
-    interaction. Other audit tests exercise related mixed, transient, and
-    settled scenarios; these cases specifically preserve the unanimous-open
-    persistence shape that produces the stronger ``STILL ACTIVE`` message.
-    """
-
-    def test_eight_active_reads_fire_still_active_under_current_audit(self):
-        """Current behaviour: 8/8 active reads → ``STILL ACTIVE`` (False).
-
-        Mirrors the production chain-read lag that fired ``STILL ACTIVE``
-        on 2026-09-06T10:05Z run #34026449786 (issue #275) and on
-        2026-09-07T10:18:16Z (+8.9 s after settle, issue #299 — same
-        defect class, different file). The mock is the only difference
-        from production: the audit's reader (just-akash status via REST)
-        is presumed to be indexer-lagged, so the mocked subprocess
-        always returns ``state=active`` regardless of chain truth.
-        """
-        from just_akash._e2e import _confirm_settled
-
+    def test_eight_active_reads_are_not_a_claim_of_life(self, capsys):
         with (
             patch("just_akash._e2e.subprocess.run") as mock_run,
             patch("just_akash._e2e.time.sleep"),
         ):
-            mock_run.side_effect = [_completed(0, stdout='{"state": "active"}') for _ in range(8)]
-            result = _confirm_settled("12345")
-        # Pin current over-claim behaviour. **Issue #304** is the
-        # audit-hardening PR that flips this assertion to require
-        # corroboration (or equivalent shape — gRPC state-proof,
-        # multi-reader, or height-aware). Until that issue lands,
-        # this test stays RED-free because it pins current behaviour.
-        assert result is False, (
-            "audit currently fires STILL ACTIVE on 8/8 active reads "
-            "regardless of chain truth — the over-claim shape pinned by "
-            "issue #275 / tracked for hardening in #304. A future PR on "
-            "#304 changes this to a corroboration-required shape; update "
-            "this test in the same PR."
-        )
-
-    def test_over_claim_shape_is_observable_end_to_end(self, capsys):
-        """Same shape, observed at the ``robust_destroy`` log-line level.
-
-        The two overclaiming labels that ran twenty lines apart on
-        2026-09-06T10:05Z are both pinned here:
-
-          * PASS line — now ``destroy reported success for {dseq} … ``
-            (the wording fix in this PR)
-          * FAIL line — ``Audit: deployment {dseq} STILL ACTIVE … ``
-
-        The PASS pin is exercised by tests in ``TestRobustDestroySuccessLogContent``
-        above. This test pins the FAIL pin under the over-claim shape:
-        a ``robust_destroy`` call where the audit reader is laggy fires
-        ``STILL ACTIVE`` even though the destroy succeeded and the chain
-        has settled.
-        """
-        with (
-            patch("just_akash._e2e.subprocess.run") as mock_run,
-            patch("just_akash._e2e.time.sleep"),
-        ):
-            # One successful destroy (PASS line) + 8 laggy active reads
-            # (STILL ACTIVE FAIL line). The destroy succeeded on chain;
-            # the audit over-claims because the reader is laggy.
             mock_run.side_effect = [
                 _completed(0, stdout="Deployment 12345 destroyed"),
                 *(_completed(0, stdout='{"state": "active"}') for _ in range(8)),
             ]
             ok = robust_destroy("12345")
         out = capsys.readouterr().out
-        assert ok is False, (
-            "robust_destroy returned False — the over-claim shape is "
-            "still observable end-to-end on the current audit."
-        )
-        assert "STILL ACTIVE" in out, (
-            "audit fired STILL ACTIVE despite the destroy having "
-            "succeeded — pins the over-claim shape end-to-end."
-        )
-        assert "settlement not yet verified" in out, (
-            "PASS line must use the new wording that reserves settled "
-            "language for the audit's positive confirmation."
-        )
+        assert ok is False
+        assert "settlement not observed" in out
+        assert "STILL ACTIVE" not in out
+
+    def test_corroborated_settlement_overrides_the_laggy_reader(self):
+        owner = "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee"
+        with (
+            patch("just_akash._e2e.subprocess.run") as mock_run,
+            patch("just_akash._e2e._confirm_settled", return_value=True) as confirm,
+            patch("just_akash._e2e.time.sleep"),
+        ):
+            mock_run.return_value = _completed(0, stdout="Deployment 12345 destroyed")
+            assert robust_destroy("12345", owner=owner) is True
+        confirm.assert_called_once_with("12345", owner)
