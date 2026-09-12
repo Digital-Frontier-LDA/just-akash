@@ -70,7 +70,9 @@ from ._e2e import (
     _run,
     install_signal_cleanup,
     resolve_tiers,
-    robust_destroy,
+)
+from ._e2e import (
+    destroy_owned_deployment as robust_destroy,
 )
 from ._states import TERMINAL_DEPLOYMENT_STATES
 from .api import AkashConsoleAPI, _extract_dseq

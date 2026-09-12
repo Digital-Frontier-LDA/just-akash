@@ -18,7 +18,10 @@ import signal
 import subprocess
 import sys
 import time
+from urllib import request as urllib_request
 
+from ._lease_verification import DEFAULT_ENDPOINTS
+from ._lease_verification import verdict as closure_verdict
 from ._states import TERMINAL_DEPLOYMENT_STATES
 
 GREEN = "\033[92m"
@@ -168,15 +171,84 @@ _SETTLED_STATES = TERMINAL_DEPLOYMENT_STATES
 # fails closed just the same but tells the operator the truth.
 _OPEN_STATES = ("active", "open")
 
+_OWNER_RE = re.compile(r"akash1[a-z0-9]{38,58}\Z")
 
-def _confirm_settled(dseq: str, *, attempts: int = 8, interval_s: int = 3) -> bool | None:
-    """Authoritative per-deployment read: is ``dseq`` settled (holding no escrow)?
 
-    Returns True (confirmed settled), False (positively still open — a recognised
-    open state persisted through the whole window), or None (indeterminate: either
-    no probe was readable, or the readable state was one we don't recognise as open,
-    which is UNKNOWN, not proof of life). Both False and None fail the audit closed;
-    they differ only in the message — "STILL ACTIVE" vs "could not confirm".
+def resolve_deployment_owner(dseq: str) -> str:
+    """Capture the exact owner while the deployment is still readable.
+
+    ``resolve-owner`` walks the configured wallet pool and positively binds the
+    DSEQ to the owning account.  Cleanup calls this before destroy because the
+    Console deployment record may disappear immediately after close, while the
+    settlement verifier still needs the owner-scoped chain identity.
+    """
+    cmd = f"uv run just-akash resolve-owner --dseq {shlex.quote(str(dseq))} --json"
+    result = _run(cmd, timeout=60)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "owner resolution failed").strip())
+    try:
+        payload = json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("owner resolution returned invalid JSON") from exc
+    if not isinstance(payload, dict) or str(payload.get("dseq")) != str(dseq):
+        raise RuntimeError("owner resolution did not bind the requested DSEQ")
+    if payload.get("source") not in {"wallet_pool", "owner_bound_containment"}:
+        raise RuntimeError("owner resolution returned an unknown evidence source")
+    owner = payload.get("owner")
+    if not isinstance(owner, str) or _OWNER_RE.fullmatch(owner) is None:
+        raise RuntimeError("owner resolution returned an invalid Akash address")
+    return owner
+
+
+def _chain_get_json(url: str) -> dict | None:
+    req = urllib_request.Request(  # noqa: S310 — verifier admits HTTPS endpoints only
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "just-akash-e2e-settlement-audit/1.0",
+        },
+    )
+    with urllib_request.urlopen(req, timeout=15) as response:  # noqa: S310
+        payload = json.loads(response.read().decode("utf-8"))
+    return payload if isinstance(payload, dict) else None
+
+
+def _confirm_settled(
+    dseq: str,
+    owner: str,
+    *,
+    attempts: int = 8,
+    interval_s: int = 3,
+) -> bool:
+    """Require two owner-scoped chain readers to prove complete settlement.
+
+    The former E2E audit trusted one REST-backed ``status`` reader. In #275 and
+    #304 that reader returned ``active`` throughout its polling window after the
+    close had settled. Extending that window cannot turn one lagging reader into
+    independent evidence, so this path delegates to the repository's typed
+    complete-population verifier. On timeout False means only "settlement not
+    observed"; it never supports the stronger ``STILL ACTIVE`` claim.
+    """
+    result = closure_verdict(
+        str(dseq),
+        owner,
+        DEFAULT_ENDPOINTS,
+        _chain_get_json,
+        retries=attempts,
+        retry_sleep_s=interval_s,
+    )
+    return result.get("closed") is True
+
+
+def _confirm_settled_single_reader(
+    dseq: str, *, attempts: int = 8, interval_s: int = 3
+) -> bool | None:
+    """Legacy per-deployment observation: did one reader report settlement?
+
+    Legacy single-reader observation retained for callers that have not supplied
+    owner identity. Returns True only for a terminal reading; False and None both
+    mean settlement was not observed. Neither result supports a claim that the
+    deployment remains active because this REST reader can lag chain truth.
 
     Deliberately NOT `just list`: the collection endpoint serves STALE state — it
     reported a deployment as active minutes after that deployment's own record read
@@ -226,7 +298,13 @@ def _confirm_settled(dseq: str, *, attempts: int = 8, interval_s: int = 3) -> bo
     return None
 
 
-def robust_destroy(dseq: str, *, retries: int = 2, audit: bool = True) -> bool:
+def robust_destroy(
+    dseq: str,
+    *,
+    owner: str | None = None,
+    retries: int = 2,
+    audit: bool = True,
+) -> bool:
     """Destroy a deployment with retry-on-fail and post-destroy audit.
 
     Returns True if the deployment is confirmed gone, False otherwise. Safe to call
@@ -238,6 +316,9 @@ def robust_destroy(dseq: str, *, retries: int = 2, audit: bool = True) -> bool:
     """
     if not dseq:
         return True
+    if owner is not None and _OWNER_RE.fullmatch(owner) is None:
+        _fail(f"Cleanup held for {dseq}: invalid owner identity")
+        return False
     # Clamp negative retries so a caller mistake (or signal-handler default
     # of retries=1 minus a typo) never silently skips the destroy loop. Empty
     # range with retries<0 used to issue ZERO destroy commands but still
@@ -272,23 +353,41 @@ def robust_destroy(dseq: str, *, retries: int = 2, audit: bool = True) -> bool:
     # Exception, matching the destroy loop above: KeyboardInterrupt deliberately
     # still propagates, so a user hammering Ctrl-C can always escape. An unreadable
     # audit fails closed rather than claiming success.
+    audit_started = time.monotonic()
     try:
         time.sleep(2)
-        settled = _confirm_settled(dseq)
+        settled = (
+            _confirm_settled(dseq, owner)
+            if owner is not None
+            else _confirm_settled_single_reader(dseq)
+        )
     except Exception as e:  # noqa: BLE001 — cleanup must never raise
         _fail(f"Audit: probe raised ({type(e).__name__}) — treating as a possible leak")
         return False
     if settled is True:
         _pass(f"Audit: deployment {dseq} confirmed settled (no escrow held)")
         return True
-    if settled is False:
-        _fail(f"Audit: deployment {dseq} STILL ACTIVE after destroy — manual cleanup required")
-        return False
+    elapsed_s = time.monotonic() - audit_started
     _fail(
-        f"Audit: could not confirm {dseq} is settled — treating as a possible leak. "
-        f"Verify with: uv run just-akash status --dseq {shlex.quote(str(dseq))} --json"
+        f"Audit: deployment {dseq} close issued, settlement not observed after "
+        f"{elapsed_s:.1f} s "
+        "— manual cleanup required"
     )
     return False
+
+
+def destroy_owned_deployment(dseq: str, *, retries: int = 2, audit: bool = True) -> bool:
+    """Resolve owner before the first close byte, then run owner-scoped cleanup.
+
+    Owner resolution failure is a hold: a shared wallet DSEQ without its owner is
+    insufficient authority to select and verify a deployment.
+    """
+    try:
+        owner = resolve_deployment_owner(dseq)
+    except Exception as exc:  # noqa: BLE001 — cleanup reports and holds
+        _fail(f"Cleanup held for {dseq}: owner could not be resolved ({exc})")
+        return False
+    return robust_destroy(dseq, owner=owner, retries=retries, audit=audit)
 
 
 def _signal_handler(signum, _frame):
@@ -315,7 +414,15 @@ def _signal_handler(signum, _frame):
         for ref in list(_REGISTERED_DSEQ_REFS):
             dseq = (ref or {}).get("dseq") or ""
             if dseq:
-                robust_destroy(dseq, retries=1, audit=True)
+                owner = (ref or {}).get("owner") or None
+                if owner is None:
+                    try:
+                        owner = resolve_deployment_owner(dseq)
+                    except Exception as exc:  # noqa: BLE001 — signal cleanup holds safely
+                        _fail(f"Cleanup held for {dseq}: owner could not be resolved ({exc})")
+                        cleaned_any = True
+                        continue
+                robust_destroy(dseq, owner=owner, retries=1, audit=True)
                 cleaned_any = True
         if not cleaned_any:
             _info("No DSEQ recorded yet — nothing to clean up")
