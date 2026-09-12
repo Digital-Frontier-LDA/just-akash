@@ -919,6 +919,14 @@ def _check_wallet_credit(client: AkashConsoleAPI, deposit: float) -> None:
         )
 
 
+def _refuse_create_retry_with_receipt(receipt: object, cause: RuntimeError) -> None:
+    if receipt is not None:
+        raise RuntimeError(
+            "receipt mode refuses create-time retry: the submitting receipt cannot "
+            "prove that the first non-idempotent create did not commit"
+        ) from cause
+
+
 def deploy(
     sdl_path: str,
     gpu: bool = False,
@@ -981,19 +989,6 @@ def deploy(
         fallback_window_seconds=fallback_wait,
     )
 
-    from .wallet_pool import select_client_for_create
-
-    required_uact = math.ceil(deposit * 1_000_000)
-    wallet = select_client_for_create(required_uact, client_factory=AkashConsoleAPI)
-    client = wallet.client
-    if wallet.configured_keys > 1:
-        _log(
-            logging.INFO,
-            f"WALLET policy={wallet.policy_version} selected_account={wallet.account} "
-            f"available_uact={wallet.available_uact} distinct_accounts="
-            f"{wallet.distinct_accounts}/{wallet.configured_keys}",
-        )
-
     preferred = _resolve_tier(preferred_providers, "AKASH_PROVIDERS")
     backup = _resolve_tier(backup_providers, "AKASH_PROVIDERS_BACKUP")
     has_allowlist = bool(preferred or backup)
@@ -1010,6 +1005,21 @@ def deploy(
     if not has_allowlist:
         _log(logging.INFO, "ALLOWED_PROVIDERS: (any — no allowlist set)")
 
+    from .wallet_pool import select_client_for_create
+
+    required_uact = math.ceil(deposit * 1_000_000)
+    # Preserve the legacy no-receipt failure order: wallet selection is the
+    # actionable configuration check even when the SDL path is also bad. Receipt
+    # mode deliberately validates the exact artifact bytes first because those
+    # bytes are part of the create authority, then pins the already selected owner.
+    wallet = None
+    if receipt_path is None:
+        wallet = select_client_for_create(
+            required_uact,
+            required_owner=None,
+            client_factory=AkashConsoleAPI,
+        )
+
     # Step 1: Read + validate + transform SDL (resolve GPU variant first)
     sdl_path = _resolve_sdl_path(sdl_path, gpu)
     _log(logging.INFO, "STEP 1: Preparing SDL")
@@ -1023,6 +1033,21 @@ def deploy(
                 "overrides; preparation changed the file, so its caller-supplied "
                 "artifact digest cannot identify the submitted artifact"
             )
+    if wallet is None:
+        wallet = select_client_for_create(
+            required_uact,
+            required_owner=expected_owner,
+            client_factory=AkashConsoleAPI,
+        )
+    client = wallet.client
+    if wallet.configured_keys > 1:
+        _log(
+            logging.INFO,
+            f"WALLET policy={wallet.policy_version} selected_account={wallet.account} "
+            f"available_uact={wallet.available_uact} distinct_accounts="
+            f"{wallet.distinct_accounts}/{wallet.configured_keys}",
+        )
+
     _check_wallet_credit(client, deposit)
 
     prepared_receipt = None
@@ -1056,6 +1081,7 @@ def deploy(
         deployment_response = client.create_deployment(sdl_content, deposit=deposit)
     except RuntimeError as e:
         if "already exists" in str(e).lower():
+            _refuse_create_retry_with_receipt(prepared_receipt, e)
             _log(
                 logging.WARNING,
                 "Deployment already exists — closing stale deployments and retrying...",

@@ -68,6 +68,26 @@ def test_multi_key_create_chooses_the_highest_measured_allowance(monkeypatch):
     assert selection.available_uact == 90_000_000
 
 
+def test_required_create_owner_stays_bound_when_ranking_changes(monkeypatch):
+    monkeypatch.setenv("AKASH_API_KEYS", "first,second")
+    monkeypatch.delenv("AKASH_API_KEY", raising=False)
+    clients = {key: MagicMock(api_key=key) for key in ("first", "second")}
+    clients["first"].account_address.return_value = "account-first"
+    clients["second"].account_address.return_value = "account-second"
+    selection = select_client_for_create(
+        5_000_000,
+        required_owner="account-first",
+        client_factory=lambda key: clients[key],
+        credit_reader=lambda account: {
+            "account-first": 6_000_000,
+            "account-second": 90_000_000,
+        }[account],
+    )
+    assert selection.client is clients["first"]
+    assert selection.account == "account-first"
+    assert selection.policy_version == "required-owner-v1"
+
+
 def test_duplicate_keys_for_one_account_are_one_wallet(monkeypatch):
     monkeypatch.setenv("AKASH_API_KEYS", "alias-a,alias-b")
     monkeypatch.delenv("AKASH_API_KEY", raising=False)

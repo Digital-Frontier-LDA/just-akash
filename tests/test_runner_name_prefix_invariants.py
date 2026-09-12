@@ -42,8 +42,8 @@ FOREIGN_PREFIXES = (
 # `RUNNER_NAME_PREFIX=<literal>${VAR}` (SDL) or `"RUNNER_NAME_PREFIX": f"<literal>{var}"` (python).
 EMITTERS = (
     (
-        Path(".github/workflows/runner-pool.yml"),
-        re.compile(r"RUNNER_NAME_PREFIX=([A-Za-z0-9._-]*)"),
+        Path("just_akash/jit_pool.py"),
+        re.compile(r'name = f"(just-akash-)[^" ]+'),
     ),
     (
         Path("just_akash/runner_probe.py"),

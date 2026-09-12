@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from just_akash.jit_pool import render_sdl
 from just_akash.provenance import (
     PLACEMENT_PREFIX,
     SIBLING_REAPED_PREFIX,
@@ -55,16 +56,23 @@ def test_every_sdl_stamps_the_repo_prefix():
 # --------------------------------------------------------------------------
 
 
-def test_the_inline_workflow_sdls_are_actually_found():
-    """Same anti-vacuity rule as `test_there_are_sdls_to_check`, one directory over.
+def _rendered_pool_sdl() -> str:
+    return render_sdl(
+        image="example.invalid/runner@sha256:" + "a" * 64,
+        placement="just-akash-runner-idv2-class-ci-runner-g1-op-7-attempt-2-run-99-end",
+        slots=["unit-1", "unit-2"],
+        configs={"unit-1": "secret-one", "unit-2": "secret-two"},
+        cpu="1",
+        memory="1Gi",
+        storage="5Gi",
+    )
 
-    `runner-pool.yml` renders its SDL with a heredoc rather than shipping a file, because
-    the pool's shape depends on caller inputs. So a guard globbing `sdl/*.yaml` could not
-    see the SDL this repo deploys most often — and if the extractor ever stops matching,
-    every assertion below passes while checking nothing."""
-    found = inline_sdls()
-    assert found, "no inline SDL extracted — the heredoc scanner has stopped matching"
-    assert any("runner-pool" in label for label, _ in found), [lbl for lbl, _ in found]
+
+def test_the_generated_pool_sdl_is_actually_rendered():
+    """The phase-2 pool is rendered by the typed Python builder, not a shell heredoc."""
+    text = _rendered_pool_sdl()
+    assert "services:" in text and "profiles:" in text
+    assert len(placement_keys(text)) == 1
 
 
 # A placement key rendered from a caller input rather than written literally. The pool's
@@ -91,7 +99,7 @@ def _pool_input_default(name: str) -> str:
     return str(call["inputs"][name]["default"])
 
 
-def test_every_inline_sdl_stamps_the_repo_prefix():
+def test_the_generated_pool_sdl_stamps_the_repo_prefix():
     """An unstamped runner pool is precisely what the sibling sweeper closes: non-GPU,
     and with `ephemeral: false` legitimately older than 12h. The symptom is runners
     vanishing mid-job, read back as RUNNER_NEVER_REGISTERED against a provider that did
@@ -111,37 +119,20 @@ def test_every_inline_sdl_stamps_the_repo_prefix():
     one — and a template that is not backed by both halves is a hole, which is why the
     default is re-checked below rather than taken on trust.
     """
-    for label, text in inline_sdls():
-        keys = placement_keys(text)
-        assert keys, f"{label}: no placement key found in the rendered SDL"
-        for key in keys:
-            if is_templated(key):
-                default = _pool_input_default("placement-key")
-                assert default.startswith(PLACEMENT_PREFIX), (
-                    f"{label}: placement key {key!r} is rendered from an input whose "
-                    f"default is {default!r}, which does not start with {PLACEMENT_PREFIX!r}. "
-                    f"A caller that sets nothing would deploy unstamped."
-                )
-                continue
-            assert key.startswith(PLACEMENT_PREFIX), (
-                f"{label}: placement key {key!r} does not start with {PLACEMENT_PREFIX!r}. "
-                f"Unstamped deployments are indistinguishable from a CI leak on the "
-                f"shared wallet and are closed after 12h."
-            )
+    keys = placement_keys(_rendered_pool_sdl())
+    assert keys
+    assert all(key.startswith(PLACEMENT_PREFIX) for key in keys)
 
 
-def test_no_inline_sdl_wears_the_siblings_reaped_prefix():
+def test_generated_pool_sdl_does_not_wear_the_siblings_reaped_prefix():
     """⚠ A TEMPLATED KEY PASSES THIS TRIVIALLY — `${PLACEMENT_KEY}` never starts with
     `dfci-infra-` — so for the templated case the real claim is that the workflow REFUSES
     the sibling's prefix at run time. That is asserted where it can be executed:
     test_the_guard_refuses_the_sibling_prefix_the_module_names, and behaviourally in
     test_the_guard_actually_runs_and_decides. This function keeps the literal case."""
-    for label, text in inline_sdls():
-        for key in placement_keys(text):
-            assert not key.startswith(SIBLING_REAPED_PREFIX), (
-                f"{label}: placement key {key!r} carries the sibling repo's prefix, "
-                f"which its leak sweeper closes on a 3-hourly cron."
-            )
+    keys = placement_keys(_rendered_pool_sdl())
+    assert keys
+    assert all(not key.startswith(SIBLING_REAPED_PREFIX) for key in keys)
 
 
 def test_the_heredoc_extractor_only_returns_sdls():

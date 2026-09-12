@@ -53,36 +53,47 @@ jobs:
     with:
       runner-label:  fast-pool-${{ github.run_id }}
       tag-prefix:    ci-myrepo          # REQUIRED — must name YOUR repo
-      github-org:    my-org
-      pool-size:     '4'
-      min-pool-size: '2'                # 2 of 4 is still usable
+      github-org:      my-org
+      runner-group-id: '1234'           # restricted to this repo + workflow
+      create-operation: ${{ needs.admit.outputs.operation_ordinal }} # broker-issued
+      runner-slots:   '["unit-1","unit-2"]'
+      runner-image: >-
+        ghcr.io/digital-frontier-lda/df-akash-runner@sha256:5b43d797d92bb081d2e085046b48579ebf0448a48fcc32f562eafa0c811b4a32
     secrets:
       AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
       GH_RUNNER_PAT: ${{ secrets.GH_RUNNER_PAT }}
 
-  build:
+  build-unit-1:
     needs: pool
-    runs-on: ${{ fromJSON(needs.pool.outputs.runner-targets) }}
+    runs-on: ${{ fromJSON(needs.pool.outputs.runner-targets).unit-1 }}
     steps:
       - run: make test
 
   teardown:
-    needs: [pool, build]
+    needs: [pool, build-unit-1]
     if: always()
     uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@runner-v1
     with:
       dseq:         ${{ needs.pool.outputs.dseq }}
       tag-prefix:   ci-myrepo
-      runner-label: fast-pool-${{ github.run_id }}
+      runner-label: ${{ needs.pool.outputs.operation-label }}
+      runner-ids:   ${{ needs.pool.outputs.runner-ids }}
       github-org:   my-org
     secrets:
       AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
       GH_RUNNER_PAT: ${{ secrets.GH_RUNNER_PAT }}
 ```
 
-`runner-targets` is the ergonomic core: the pool's labels when healthy, `["ubuntu-latest"]`
-when not. `runs-on` cannot be conditional, so without this a bad pool means every
-downstream job fails to schedule.
+This phase-two example is **not promotable yet**. `create-operation` must come from the
+external lifecycle broker's owner-wide CAS; a caller-chosen number, `run_id`, local file,
+or workflow output does not allocate an operation. The broker must durably record the
+prepared create and receipt outside the hosted runner before submission. Until that
+broker endpoint and output are wired, do not run this workflow against Akash.
+
+`runner-targets` maps every declared slot to an exact label array. Route each job to
+one slot as shown above. The output is published only after every count:1 service is
+online in the verified runner group with the exact ID, name, and labels returned when
+its one-use JIT configuration was created.
 
 ---
 
@@ -104,58 +115,28 @@ Every failure here names which world it came from, via the `failure_reason` outp
 | `NO_ELIGIBLE_BIDDER` | The provider spec was malformed or filtered to nothing | Fix the `providers` input |
 | `PROVIDER_CAPACITY` | Nobody bid within the window | Market condition — retry later or widen the pool |
 | `RUNNER_NEVER_REGISTERED` | A provider won the lease, the runner never came online | Qualify that provider; it is a `runner_deny` candidate |
-| `GITHUB_API_UNAVAILABLE` | The runner listing was never readable, so the pool was never observable | **Your GitHub API budget** — see below. Never a verdict about a provider. |
+| `GITHUB_API_UNAVAILABLE` | The verified group population was never readable or did not preserve exact IDs, names, and labels | Fix GitHub API access or group integrity. Never a verdict about a provider. |
 | `WALLET_TX_CONTENTION` | Concurrent provisioners on one Cosmos account rejected each other | See below. **Detection is inferred, not yet observed** — if a deploy fails unclassified, its raw output is printed so the matcher can be fixed from a real string. |
 | `INDETERMINATE` | The tooling itself failed | Never a verdict about Akash |
 
 ---
 
-## The GitHub API budget is the real ceiling on pool size
+## Runner landing is verified through the restricted group
 
-**GitHub cannot filter runners by label.** `GET /orgs/{org}/actions/runners` takes only
-`name`, and `name` is **exact-match** — verified live: a 12-character prefix of a real
-runner's name returns `0`. The runner image randomises each replica's name from
-`RUNNER_NAME_PREFIX`, so the names aren't known in advance and the filter is useless here.
+Every landing poll reads `GET /orgs/{org}/actions/runner-groups/{group_id}/runners`
+with complete pagination. The expected population comes from the durable attempt journal,
+which contains the exact IDs, names, and labels returned during JIT creation. A runner
+counts as online only when all three agree inside the same group that was read back before
+creation.
 
-Every poll therefore pages the **entire org listing**:
+A failed page, malformed response, duplicate ID, changed name, or missing expected label
+makes the population unverifiable. The workflow closes the lease and reports
+`GITHUB_API_UNAVAILABLE`; it does not exclude the Akash provider. This keeps GitHub API
+or routing-policy failures from becoming fabricated provider verdicts.
 
-```
-requests per poll     = ceil(total_org_runners / 100)     ← all runners, not just yours
-requests per attempt  = that × RUNNER_WAIT_TRIES (90)
-```
-
-A 300-runner org polled for the full window is **~270 requests for one provision**, ×3
-attempts. Against:
-
-| Credential | Primary limit |
-|---|---|
-| PAT | **5,000 req/hour, shared across every token of that user and every repo using them** |
-| GitHub App (org) | 5,000/hr, scaling to 12,500 |
-| GitHub App (Enterprise Cloud) | 15,000/hr |
-
-plus a secondary limit of **900 points/minute** (GET = 1 point, DELETE = 5) and **100
-concurrent requests**. A handful of concurrent pools on one PAT reaches the ceiling in
-minutes.
-
-This is why `GITHUB_API_UNAVAILABLE` is its own failure world. A throttled read used to
-be counted as *zero runners online*, which destroyed the lease, excluded the provider,
-and reported `RUNNER_NEVER_REGISTERED` — naming a provider a `runner_deny` candidate for
-our own rate limit. The same conflation in `runner_probe` produced `POD_NO_REGISTER`,
-which is a **permanent** disqualification.
-
-**The listing shrinks or grows on its own.** Offline registrations accumulate, every one
-adds to the page count of every future poll, and once they overflow a page they are also
-harder to clean. Teardown de-registration isn't hygiene at this scale — it is what keeps
-the polling cost bounded. Skipping it is a compounding leak.
-
-Practical levers, in order of effect:
-
-1. **Give this workflow its own credential.** The PAT bucket is per-user, not per-repo.
-2. **Always run the teardown** (`if: always()`), so the listing stays small.
-3. **Fewer, larger pools** beat many small ones — the poll cost is per-provision and
-   scales with the whole org, not with your pool.
-4. **Raise `RUNNER_WAIT_TRIES`/`min-pool-size` deliberately**: waiting longer is more
-   requests, and 90 tries × 5s = 7.5 min is tuned for a handful of replicas.
+Polling a group still consumes the shared credential's request budget. Keep the declared
+slot list no larger than the actual job graph, always run teardown, and give independent
+high-volume callers separate credentials.
 
 ---
 
@@ -361,14 +342,33 @@ while you are under three.
 
 ---
 
-## A partial pool is usable
+## The declared slot population is atomic
 
-`min-pool-size` exists because all-or-nothing is not the conservative choice, it is the
-destructive one. A provider once delivered 6 of 12 runners and was rejected **and had its
-lease closed** — removing the only provider actually serving us, in favour of nothing.
+Each slot is a separate count:1 Akash service with its own one-use JIT configuration and
+exact routing label. The workflow publishes routing targets only when every declared slot
+is online. A partial non-ephemeral pool is destroyed and its exact GitHub runner IDs are
+removed before another provider attempt receives fresh configurations.
 
-Set `min-pool-size` to the smallest count your matrix can make progress on. The run warns
-when it accepts a partial pool, so degraded capacity doesn't masquerade as slow CI.
+The runner group must use selected-repository visibility, refuse public repositories,
+restrict selected workflows, and name exactly the calling repository and workflow. The
+workflow reads this policy back before creating any JIT identity and passes that verified
+numeric group ID unchanged to every `generate-jitconfig` request.
+
+The submitted placement is idv2 and binds the actual group number, broker operation,
+GitHub run ID, and GitHub run attempt. The workflow also derives an operation-scoped
+registration label containing the same fields; consumers must use the published slot
+targets and teardown must use the published operation label. A run-only placement key or
+caller label is not conformant because reruns reuse `run_id`.
+
+Adoption is atomic. The reusable workflow pin, broker ordinal output, dedicated singleton
+runner group, explicit slot list, every consumer's exact slot target, teardown inputs, and
+scheduled observer must move together. Blazing fast tests need four named batch slots;
+the E2E graph needs three named slots and must stop using its current run-only label and
+placement. If no singleton group exists whose policy selects the exact caller
+`workflow_ref`, stop. Provision a new dedicated nonproduction canary group separately;
+never widen or mutate an existing group automatically. The first canary must supply that
+numeric group ID explicitly and pin both this workflow commit and the candidate runner
+image digest shown above.
 
 ---
 

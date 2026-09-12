@@ -16,7 +16,6 @@ import ast
 import os
 import pathlib
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -118,7 +117,7 @@ def test_the_lease_is_tagged_before_the_wait_not_after():
     """The wait is the long part and the likeliest place to be cancelled. A lease
     tagged only afterwards is invisible to every sweeper and leaks escrow forever."""
     body = PROVISION["run"]
-    assert body.index('"${JA[@]}" tag') < body.index("online (usable at"), (
+    assert body.index('"${JA[@]}" tag') < body.index("exact JIT runners online"), (
         "tag must precede the runner wait, or a cancellation leaks an untagged lease"
     )
 
@@ -133,7 +132,7 @@ def test_teardown_targets_one_locally_parsed_dseq():
     a single DSEQ parsed from this job's own deploy output and carry the owner emitted by
     that same create attempt. The count pins every immediate rollback call site."""
     destroys = re.findall(r'"\$\{JA\[@\]\}" destroy[^\n]*', PROVISION["run"])
-    assert len(destroys) == 5
+    assert len(destroys) == 4
     for line in destroys:
         assert '--dseq "$DSEQ"' in line, f"destroy must name this run's dseq: {line}"
         assert '--expected-owner "$WALLET"' in line, (
@@ -154,80 +153,30 @@ def test_a_discarded_lease_is_actually_destroyed():
 
 
 # --------------------------------------------------------------------------
-# A partial pool is usable — rejecting it destroys the only working runners
+# JIT pools are one-job identities — partial handoff is not a usable topology
 # --------------------------------------------------------------------------
 
 
-def test_the_usable_threshold_is_min_pool_not_pool_size():
-    """A provider delivered 6 of 12 and was rejected AND torn down, removing the only
-    provider actually serving us. The discard branch must compare against MIN_POOL."""
+def test_the_usable_threshold_is_the_complete_slot_population():
     body = PROVISION["run"]
-    discard = body[body.index('if [ "${ONLINE:-0}"') : body.index('EXCLUDED="$EXCLUDED')]
-    assert '-lt "${MIN_POOL}"' in discard, (
-        "comparing the discard against POOL_SIZE restores all-or-nothing, which "
-        "destroyed the only provider actually serving us"
-    )
-    assert '-lt "${POOL_SIZE}"' not in discard
+    start = body.index('if [ "${ONLINE:-0}"')
+    discard = body[start : body.index('if [ -z "${RUNNER_VERSIONS:-}"', start)]
+    assert '-lt "${POOL_SIZE}"' in discard
+    assert "cleanup_jit_attempt || exit 1" in discard
 
 
-def test_min_pool_is_clamped_against_junk_and_out_of_range():
-    """min-pool-size is a free-text workflow input. Empty, 'two', 0 or 99 must all
-    degrade to pool-size rather than making the discard test meaningless."""
-    body = PROVISION["run"]
-    assert "*[!0-9]*" in body, "non-numeric input must be rejected"
-    # Named, not bare "-ge 1": a second clamp elsewhere in the step (runner-wait-tries)
-    # satisfied the loose form and made this guard vacuous — caught by the anti-vacuity
-    # pass below, which is exactly the failure it exists to surface.
-    assert '[ "$MIN_POOL" -ge 1 ]' in body, "0 would accept an empty pool as healthy"
-    assert '-le "$POOL_SIZE"' in body, "above pool-size the loop can never satisfy it"
+def test_pool_size_is_derived_from_validated_slots():
+    assert PROVISION["env"]["POOL_SIZE"] == "${{ steps.render.outputs.slot_count }}"
+    assert "pool-size" not in INPUTS and "min-pool-size" not in INPUTS
 
 
-def test_accepting_a_partial_pool_is_announced():
-    """Silently running at half capacity looks like a slow CI, not a degraded one."""
-    assert "Partial pool accepted" in PROVISION["run"]
+def test_a_partial_pool_is_never_announced_as_accepted():
+    assert "Partial pool accepted" not in PROVISION["run"]
 
 
 # --------------------------------------------------------------------------
 # GitHub paginates — and an aggregating --jq silently inverts this job's verdict
 # --------------------------------------------------------------------------
-
-
-def test_the_online_count_survives_a_paginated_org():
-    """`gh api --paginate --jq` runs the filter against EACH PAGE and concatenates the
-    results, so an aggregating filter emits one value PER PAGE: an org with >100 runners
-    returned "2\\n1" instead of "3".
-
-    That is not a miscount, it inverts the verdict. `[ "$ONLINE" -ge N ]` on a
-    multi-line value exits NON-ZERO with "integer expression expected", so the
-    `-lt "${MIN_POOL}"` discard branch is never taken and a pool with ZERO online
-    runners is published as healthy — `runs-on` then targets a label nothing answers
-    to, which is worse than the hosted fallback this workflow exists to provide.
-
-    >100 runners is the normal case, not an exotic one: offline registrations
-    accumulate and once overflowed an org's runner listing outright.
-    """
-    code = _code(PROVISION["run"])
-    poll = code[code.index("gh api --paginate") : code.index("online (usable at")]
-    assert "| length" not in poll, (
-        "an aggregating jq filter emits one value per page under --paginate, and a "
-        "multi-line ONLINE makes every integer test below error-out into 'healthy'"
-    )
-    assert "grep -c" in poll or "--slurp" in poll, (
-        "the count must survive page concatenation — count matched LINES, or --slurp"
-    )
-
-
-def test_the_online_count_is_a_single_integer_on_every_path():
-    """ONLINE feeds three integer comparisons and $GITHUB_OUTPUT. Anything that can
-    return empty or multi-line corrupts all four — a multi-line value written to
-    $GITHUB_OUTPUT without a heredoc delimiter also breaks every LATER output in the
-    file, not just this one."""
-    code = _code(PROVISION["run"])
-    poll = code[code.index("gh api --paginate") : code.index("online (usable at")]
-    assert "grep -c ." in poll, "grep -c prints exactly one integer, 0 included"
-    assert "|| true" in poll or "|| echo 0" in poll, (
-        "grep -c exits 1 on zero matches; the assignment must not carry that outward"
-    )
 
 
 def test_a_failed_listing_query_is_not_counted_as_zero_runners():
@@ -242,7 +191,7 @@ def test_a_failed_listing_query_is_not_counted_as_zero_runners():
     server-side, so each poll costs ceil(org_runners/100) requests against a PAT's
     5,000/hour, shared across every token and repo of that user."""
     code = _code(PROVISION["run"])
-    poll = code[code.index("gh api --paginate") : code.index('if [ "$API_OK"')]
+    poll = code[code.index("OBSERVATION=") : code.index('if [ "$API_OK"')]
     # Positive assertions: `2>/dev/null not in poll` would also forbid the legitimate
     # suppression on the `tail` that reports the error, and a guard that forbids the
     # remedy gets weakened rather than obeyed.
@@ -288,7 +237,7 @@ def test_a_throttled_poll_backs_off_further_than_the_healthy_cadence():
     """The secondary limit is a per-MINUTE budget, so retrying a throttled read at the
     healthy 5s cadence spends the window it is waiting for."""
     body = PROVISION["run"]
-    poll = body[body.index("gh api --paginate") : body.index('if [ "$API_OK"')]
+    poll = body[body.index("OBSERVATION=") : body.index('if [ "$API_OK"')]
     fail_branch = poll[poll.index("GH_RC") : poll.index("API_OK=1")]
     assert re.search(r"sleep (1[0-9]|[2-9][0-9])", fail_branch), (
         "the failure path must back off further than the 5s healthy poll"
@@ -315,7 +264,7 @@ def test_the_runner_query_is_still_paginated_at_all():
     registrations land on page 2 reads as never having come online — RUNNER_NEVER_
     REGISTERED against providers that did their job."""
     poll = PROVISION["run"]
-    assert "--paginate" in poll and "per_page=100" in poll
+    assert 'observe --journal "$JIT_JOURNAL"' in poll
 
 
 # --------------------------------------------------------------------------
@@ -405,7 +354,7 @@ def test_every_uv_invocation_runs_from_the_just_akash_checkout():
         )
 
 
-def test_the_pool_runs_the_image_providers_were_qualified_against():
+def test_the_pool_requires_a_digest_pinned_jit_capable_image():
     """A provider earns runner_host by scheduling the PROBE image three consecutive
     times. Running a different image in the pool means the pool is trusting a
     measurement taken of something else — and `:latest` made that gap permanent and
@@ -413,23 +362,9 @@ def test_the_pool_runs_the_image_providers_were_qualified_against():
 
     The probe SDL already explains why it pins a digest; this asserts the pool did not
     quietly opt out of that reasoning."""
-    probe_sdl = (Path(__file__).resolve().parents[1] / "sdl/github-runner-probe.yaml").read_text(
-        encoding="utf-8"
-    )
-
-    def _image(text: str, what: str) -> str:
-        m = re.search(r"image:\s*(\S+)", text)
-        assert m, f"no image found in {what}"
-        return m.group(1)
-
-    probe_img = _image(probe_sdl, "the probe SDL")
-    pool_img = _image(_code(_step("Render runner SDL")["run"]), "the rendered pool SDL")
-
-    assert "@sha256:" in pool_img, f"the pool image must be digest-pinned, got {pool_img}"
-    assert pool_img == probe_img, (
-        f"pool runs {pool_img} but providers are qualified against {probe_img} — "
-        "the qualification measures a different artifact than the pool runs"
-    )
+    spec = INPUTS["runner-image"]
+    assert spec["required"] is True and "default" not in spec
+    assert '--image "$RUNNER_IMAGE"' in PROVISION["run"]
 
 
 def test_wallet_contention_is_not_reported_as_a_market_outage():
@@ -568,24 +503,20 @@ def test_proven_and_unproven_candidates_reach_distinct_auction_tiers():
 # --------------------------------------------------------------------------
 
 
-def test_runner_targets_falls_back_to_a_hosted_runner():
-    """runs-on cannot be conditional, so an unhealthy pool must still yield a runnable
-    label or every downstream job fails to schedule."""
+def test_runner_targets_are_a_slot_keyed_exact_routing_map():
     job_out = DOC["jobs"]["pool"]["outputs"]["runner-targets"]
-    assert '["ubuntu-latest"]' in job_out, "no hosted fallback: downstream jobs cannot schedule"
+    assert job_out == "${{ steps.render.outputs.runner_targets }}"
     assert "runner-targets" in OUTPUTS, "the fallback never reaches the caller"
 
 
-def test_runner_targets_is_only_set_on_a_healthy_pool():
-    """Emitting the pool's labels after a failed provision would route jobs at runners
-    that do not exist, and they would queue until the job timeout."""
-    body = PROVISION["run"]
-    assert body.index("provision_healthy=true") - 200 < body.index("runner_targets=[")
+def test_runner_targets_are_derived_before_credentials_or_deploy():
+    render = _step("Render runner SDL")["run"]
+    assert "jit_pool topology" in render and '--runner-label "$RUNNER_LABEL"' in render
 
 
 def test_the_pool_label_carries_run_identity():
     """A shared static label lets one run's jobs land on another run's runners."""
-    assert "${RUNNER_LABEL}" in _step("Render runner SDL")["run"]
+    assert "RUNNER_LABEL: ${{ inputs.runner-label }}" in SRC
 
 
 # --------------------------------------------------------------------------
@@ -593,12 +524,10 @@ def test_the_pool_label_carries_run_identity():
 # --------------------------------------------------------------------------
 
 
-def test_the_rendered_sdl_is_echoed_without_the_token():
-    """The SDL embeds a PAT with org runner-registration rights. Actions masks known
-    secrets, but a rendered file printed wholesale is exactly how one escaped before."""
-    render = _step("Render runner SDL")["run"]
-    assert "grep -vE 'ACCESS_TOKEN'" in render
-    assert "cat /tmp/runner-sdl.yaml" not in render
+def test_the_secret_bearing_sdl_is_never_echoed():
+    body = PROVISION["run"]
+    assert "cat $JIT_SDL" not in body and 'cat "$JIT_SDL"' not in body
+    assert 'deploy --sdl "$JIT_SDL"' in body
 
 
 def test_checkout_does_not_persist_credentials():
@@ -705,22 +634,15 @@ def test_the_placement_key_is_optional_and_defaults_to_the_module_s_marker():
     )
 
 
-def test_both_sdl_sites_take_the_key_from_the_input():
+def test_generated_sdl_takes_the_attributed_key_from_the_input():
     """`placement.<KEY>` and `deployment.<svc>.<KEY>` must be the SAME key.
 
     Substituting one and leaving the other a literal renders an SDL whose deployment
     references a placement that does not exist — rejected at MsgCreateDeployment, with a
     message about the SDL rather than about this input.
     """
-    render = _step("Render runner SDL")["run"]
-    assert render.count("${PLACEMENT_KEY}:") == 2, (
-        "expected the key under both `placement:` and `deployment.runner:`; found "
-        f"{render.count('${PLACEMENT_KEY}:')}"
-    )
-    assert "just-akash-runner:" not in render, (
-        "the SDL still hardcodes a placement key. The default belongs on the INPUT, where "
-        "a caller can override it; hardcoded, every consumer shares one marker again."
-    )
+    body = PROVISION["run"]
+    assert '--placement "$DEPLOYMENT_GROUP"' in body
     assert "PLACEMENT_KEY: ${{ inputs.placement-key }}" in SRC, (
         "the render step does not receive the input"
     )
@@ -781,15 +703,14 @@ def test_the_guard_actually_runs_and_decides(key, accepted, tmp_path):
         "GH_RUNNER_PAT": "x",
         "ORG": "o",
         "RUNNER_LABEL": "l",
-        "POOL_SIZE": "1",
-        "CPU": "1",
-        "MEMORY": "1Gi",
-        "STORAGE": "1Gi",
-        "EPHEMERAL": "true",
+        "RUNNER_SLOTS": '["one"]',
+        "RUNNER_GROUP_ID": "17",
         "PLACEMENT_KEY": key,
         # The step sets this from `github.run_id` for the attribution stamp (#311). The
         # harness must supply what the real step supplies, or it tests a different script.
         "GH_RUN_ID": "34228480597",
+        "GH_RUN_ATTEMPT": "2",
+        "CREATE_OPERATION": "7",
         "GITHUB_OUTPUT": str(tmp_path / "output"),
     }
     proc = subprocess.run(["bash", "-e", str(script)], env=env, capture_output=True, text=True)
@@ -798,119 +719,6 @@ def test_the_guard_actually_runs_and_decides(key, accepted, tmp_path):
     else:
         assert proc.returncode == 2, f"{key!r} was ACCEPTED (rc={proc.returncode})"
         assert "::error" in (proc.stdout + proc.stderr), "refused without saying why"
-
-
-@pytest.mark.parametrize("n", [3999, 4000, 4001])
-def test_resume_token_survives_an_exact_4000_byte_body(n, tmp_path):
-    """⛔ The ONE body length at which the CWE-117 guard never turns itself back off.
-
-    `head -c` cuts by BYTES and `<<<` appends exactly one newline, so at a body of
-    EXACTLY 4000 the cut keeps the payload and discards that newline, leaving the
-    cursor mid-line. `::<token>::` is honoured only at the start of a line, so the
-    resume never registers and `::stop-commands::` stays active for the REST OF THE JOB
-    — `pool` runs to ~line 1246 and contains the `::add-mask::` on the minted verdict
-    token. So this fails OPEN on secret masking, not closed on injection.
-
-    3999 and 4001 both work. Only 4000 does not, which is why this is pinned to the
-    exact bound: a test at "a large body" cannot express it, and neither can one at
-    3999 or 4001.
-
-    The fragment is read FROM the workflow rather than restated here, so an edit to the
-    emit sequence is tested rather than diverged from.
-    """
-    m = re.search(
-        r"head -c 4000 <<< \"\$RESP\".*?echo \"::\$\{RESP_TOKEN\}::\"",
-        SRC,
-        re.S,
-    )
-    assert m, "the bounded-echo fragment moved — re-anchor this test rather than deleting it"
-    body = "\n".join(
-        line.strip() for line in m.group(0).splitlines() if not line.strip().startswith("#")
-    )
-
-    script = tmp_path / "emit.sh"
-    script.write_text(body, encoding="utf-8")
-    proc = subprocess.run(
-        ["bash", "-e", str(script)],
-        env={**os.environ, "RESP": "A" * n, "RESP_TOKEN": "TESTTOKEN"},
-        capture_output=True,
-        text=True,
-    )
-    assert proc.returncode == 0, proc.stderr
-    assert any(line == "::TESTTOKEN::" for line in proc.stdout.splitlines()), (
-        f"at {n} bytes the resume token is not at the start of a line, so "
-        "::stop-commands:: is never lifted and stays active for the rest of the job"
-    )
-
-
-def test_a_huge_unexpected_body_does_not_kill_the_step(tmp_path):
-    """⛔ The bounded echo must not SIGPIPE the step it is protecting.
-
-    `printf ... | head -c 4000` sends printf SIGPIPE once the body exceeds the PIPE
-    BUFFER. This step opens `set -uo pipefail`, and Actions runs `run:` under
-    `bash -e`, so the pipeline's 141 killed the step outright — before the resume
-    token, before ::endgroup::, and before `failure_reason` was written, which is
-    the entire purpose of #253. Workflow commands then stay disabled for the rest
-    of `jobs.pool`, including the ::add-mask:: ~700 lines later.
-
-    ⚠ NOT a >4000 problem, which is why this test uses 512 KiB. Measured on macOS:
-    130000 bytes survives, 150000 dies; a Linux runner's 64 KiB buffer trips
-    earlier. A test at 8000 bytes PASSES against the broken code and proves
-    nothing — the same "near the bound is not the bound" trap as the 4000 case,
-    one level up.
-
-    Drives the real step under errexit + pipefail, which is the configuration the
-    fragment-level test could not express.
-    """
-    run = _step("Preflight")["run"]
-    bindir = tmp_path / "bin"
-    bindir.mkdir()
-    # 418 falls to the `*)` arm. NOT 5xx or "" — those have their own arms and never
-    # reach the echo block, which is what this test is about.
-    (bindir / "gh").write_text(
-        "#!/usr/bin/env bash\n"
-        "printf 'HTTP/2 418\\n\\n'\n"
-        "python3 -c \"print('A'*524288, end='')\"\n"
-        # non-zero: the unexpected-status arm is gated on `RC -ne 0`
-        "exit 1\n",
-        encoding="utf-8",
-    )
-    (bindir / "gh").chmod(0o755)
-
-    script = tmp_path / "preflight.sh"
-    script.write_text(run, encoding="utf-8")
-    out_file = tmp_path / "gh_output"
-    out_file.touch()
-    proc = subprocess.run(
-        ["bash", "-e", str(script)],
-        env={
-            **os.environ,
-            "PATH": f"{bindir}:{os.environ['PATH']}",
-            "GH_TOKEN": "x",
-            "ORG": "o",
-            "GITHUB_OUTPUT": str(out_file),
-            "GITHUB_STEP_SUMMARY": str(tmp_path / "summary"),
-        },
-        capture_output=True,
-        text=True,
-    )
-
-    assert proc.returncode != 141, (
-        "the step died on SIGPIPE — pipefail promoted head's early close to 141 and "
-        "bash -e aborted before anything below the echo ran"
-    )
-    token = re.search(r"::stop-commands::([0-9a-f]{32})", proc.stdout)
-    assert token, "stop-commands was never emitted"
-    assert any(line == f"::{token.group(1)}::" for line in proc.stdout.splitlines()), (
-        "the resume token is missing or not at the start of a line, so workflow "
-        "commands stay disabled for the rest of the job"
-    )
-    assert "[truncated at 4000 bytes]" in proc.stdout, "the truncation notice never ran"
-    assert "::endgroup::" in proc.stdout, "the group was never closed"
-    assert "failure_reason=GITHUB_API_UNAVAILABLE" in out_file.read_text(encoding="utf-8"), (
-        "failure_reason was never written — the step reported nothing, which is the "
-        "defect #253 exists to fix"
-    )
 
 
 def test_no_guard_is_satisfied_by_prose(tmp_path):
@@ -966,25 +774,6 @@ def test_no_guard_is_satisfied_by_prose(tmp_path):
 
 MUTATIONS = [
     (
-        "the bounded echo does not go through a pipe",
-        # Restores the SIGPIPE-able pipeline; the >4000 test must go red.
-        lambda s: s.replace(
-            'head -c 4000 <<< "$RESP"',
-            "printf '%s\\n' \"$RESP\" | head -c 4000",
-        ),
-    ),
-    (
-        "the resume token is unconditionally at line start",
-        # Removes the unconditional newline, restoring the exact-4000-byte hole.
-        lambda s: s.replace(
-            "                printf '\\n'\n"
-            '                if [ "$(printf \'%s\' "$RESP" | wc -c)" -gt 4000 ]; then\n'
-            "                  printf '[truncated at 4000 bytes]\\n'",
-            '                if [ "$(printf \'%s\' "$RESP" | wc -c)" -gt 4000 ]; then\n'
-            "                  printf '\\n[truncated at 4000 bytes]\\n'",
-        ),
-    ),
-    (
         "placement-key keeps its default",
         lambda s: s.replace(
             "        required: false\n        default: just-akash-runner",
@@ -993,7 +782,7 @@ MUTATIONS = [
     ),
     (
         "SDL takes the key from the input",
-        lambda s: s.replace("${PLACEMENT_KEY}:", "just-akash-runner:"),
+        lambda s: s.replace('--placement "$DEPLOYMENT_GROUP"', '--placement "just-akash-runner"'),
     ),
     (
         "the guard still refuses the network default",
@@ -1020,29 +809,34 @@ MUTATIONS = [
             '"${JA[@]}" destroy --all -y',
         ),
     ),
-    ("discard uses MIN_POOL", lambda s: s.replace('-lt "${MIN_POOL}"', '-lt "${POOL_SIZE}"')),
-    ("min-pool clamp", lambda s: s.replace('[ "$MIN_POOL" -ge 1 ]', '[ "$MIN_POOL" -ge 0 ]')),
+    ("discard requires every slot", lambda s: s.replace('-lt "${POOL_SIZE}"', '-lt "0"')),
+    (
+        "pool size comes from slots",
+        lambda s: s.replace(
+            "POOL_SIZE: ${{ steps.render.outputs.slot_count }}",
+            "POOL_SIZE: ${{ inputs.pool-size }}",
+        ),
+    ),
     (
         "402 is distinct",
         lambda s: s.replace("failure_reason=WALLET_UNDERFUNDED", "failure_reason=INFRA"),
     ),
-    ("sdl token redacted", lambda s: s.replace("grep -vE 'ACCESS_TOKEN'", "cat")),
+    (
+        "secret SDL is not dumped",
+        lambda s: s.replace(
+            'deploy --sdl "$JIT_SDL"',
+            'deploy --sdl "$JIT_SDL"; cat "$JIT_SDL"',
+        ),
+    ),
     (
         "pool image matches the probe",
         lambda s: s.replace(
-            "df-akash-runner@sha256:aaf3799b5e138abef0831bb8467ded7325164316f0cfde5c183fe6e129eae79e",
-            # ⚠ SAME repository, de-pinned. Replacing with "github-runner:latest" left the
-            # `ghcr.io/digital-frontier-lda/` prefix intact and produced a DIFFERENT repo,
-            # so the mutation tested "wrong image" rather than the "`:latest` can move
-            # between qualification and use" hazard the guard is actually about.
-            "df-akash-runner:latest",
+            "      runner-image:\n        description:",
+            "      runner-image:\n"
+            "        default: ghcr.io/example/runner:latest\n"
+            "        description:",
         ),
     ),
-    # The count must survive a multi-page org. Both shapes below are what a reader
-    # "tidying up" the jq would plausibly write, and each restores the bug.
-    ("online count is line-based", lambda s: s.replace("grep -c .", "head -1")),
-    ("no aggregating jq under paginate", lambda s: s.replace("| .id'", "] | length'")),
-    ("runner poll stays paginated", lambda s: s.replace("--paginate ", "")),
     # A throttled read must never be absorbed into "the provider delivered nothing".
     (
         "failed listing is not zero",
@@ -1317,6 +1111,16 @@ def test_deregistration_is_scoped_to_this_runs_label():
     body = TD_DEREG["run"]
     assert "${RUNNER_LABEL}" in body
     assert 'select(.status=="offline")' in body.replace('\\"', '"')
+    assert "select(.busy==false)" in body.replace('\\"', '"')
+
+
+def test_deregistration_prefers_exact_ids_when_the_pool_published_them():
+    pool_teardown = DOC["jobs"]["teardown"]
+    assert pool_teardown["with"]["runner-ids"] == "${{ needs.pool.outputs.runner-ids }}"
+    body = TD_DEREG["run"]
+    assert "RUNNER_IDS_JSON: ${{ inputs.runner-ids }}" in TD_SRC
+    assert "printf '%s' \"$RUNNER_IDS_JSON\"" in body
+    assert 'gh api -X DELETE "orgs/${ORG}/actions/runners/${id}"' in body
 
 
 def test_deregistration_sees_every_page_of_the_org():
@@ -1445,14 +1249,16 @@ def test_teardown_does_not_claim_an_ownership_check_it_cannot_perform():
 # --------------------------------------------------------------------------
 
 
-def test_a_dseq_without_a_provider_is_still_closed():
+def test_a_dseq_without_a_provider_stops_before_another_create():
     """`deploy` can emit a DSEQ with no `Provider:` line. Treating that identically to
     "no deployment" walks away from a REAL lease: untagged, undestroyed, holding escrow
     against the grant the next attempt spends from."""
     body = PROVISION["run"]
     assert '[ -n "$DSEQ" ] && [ -z "$PROVIDER" ]' in body, "the orphan branch is missing"
     orphan = body[body.index('[ -n "$DSEQ" ] && [ -z "$PROVIDER" ]') :]
-    assert '"${JA[@]}" destroy --dseq "$DSEQ"' in orphan[:900], "an orphan dseq must be destroyed"
+    assert "failure_reason=CREATE_WITHOUT_PROVIDER" in orphan[:900]
+    assert "exit 1" in orphan[:900]
+    assert "continue" not in orphan[:900]
 
 
 def test_an_unreadable_state_is_not_reported_as_closed(tmp_path):
@@ -1462,154 +1268,15 @@ def test_an_unreadable_state_is_not_reported_as_closed(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# A credential failure must never masquerade as a provider failure
-# --------------------------------------------------------------------------
+# A missing credential is refused before any runner or lease exists.
 
 
-def test_the_pat_is_validated_before_provisioning():
-    """A PAT expiry is otherwise SILENT: the runner never registers, the pool times out
-    after ~15 minutes, and the run reports RUNNER_NEVER_REGISTERED — indistinguishable
-    from a provider that leases and never schedules. That reading sends the investigation
-    at Akash and ends in "switch back to hosted runners", which is the bill this workflow
-    exists to remove. One API call turns 15 silent minutes into a named failure."""
-    names = [s.get("name", "") for s in STEPS]
-    pat_i = next(i for i, n in enumerate(names) if "PAT must still be valid" in n)
-    prov_i = next(i for i, n in enumerate(names) if "Provision" in n)
-    assert pat_i < prov_i, "the PAT check must run before any lease is taken"
-
-
-def test_an_expired_pat_is_not_reported_as_a_provider_failure():
-    body = _step("PAT must still be valid")["run"]
-    assert "REASON=RUNNER_PAT_INVALID" in body
-    assert "RUNNER_NEVER_REGISTERED" in body, (
-        "the message must name the symptom it prevents, or the next reader will not "
-        "connect a 15-minute timeout to a credential"
-    )
-    assert "not a provider" in body.lower() and "rotate" in body.lower()
-
-
-# ⛔ TEXT ASSERTIONS COULD NOT SEE THE DEFECT ABOVE.
-# The original test asserted that the string "failure_reason=RUNNER_PAT_INVALID"
-# appeared in the step. It does — and it appeared for 401, 403, 404, 429, 5xx AND a
-# transport failure with no HTTP response at all, because every nonzero exit took the
-# same branch. "A 401 maps to PAT_INVALID" and "EVERYTHING maps to PAT_INVALID" are
-# indistinguishable to a substring check, so the collapse the preflight exists to
-# prevent shipped inside the preflight, past a green test.
-#
-# These run the actual shell against a stubbed `gh`, because the only assertion that
-# can tell those two apart is one that varies the input.
-
-_CASES = [
-    ("HTTP/2.0 401 Unauthorized", "RUNNER_PAT_INVALID", "an expired or revoked PAT"),
-    ("HTTP/2.0 403 Forbidden", "RUNNER_PAT_INVALID", "403 without rate-limit evidence"),
-    (
-        "HTTP/2.0 403 Forbidden\nx-ratelimit-remaining: 0",
-        "GITHUB_API_UNAVAILABLE",
-        "403 that IS a rate limit",
-    ),
-    ("HTTP/2.0 404 Not Found", "RUNNER_PAT_INVALID", "an org the token cannot see"),
-    ("HTTP/2.0 429 Too Many Requests", "GITHUB_API_UNAVAILABLE", "rate limiting"),
-    ("HTTP/2.0 503 Service Unavailable", "GITHUB_API_UNAVAILABLE", "a GitHub outage"),
-    ("dial tcp: lookup api.github.com: i/o timeout", "GITHUB_API_UNAVAILABLE", "no response"),
-]
-
-
-def _run_preflight(tmp_path, response: str, rc: int, org: str = "testorg") -> tuple[str, str]:
-    """Execute the preflight's classification half with `gh` stubbed out."""
-
-    body = _step("PAT must still be valid")["run"]
-    script = tmp_path / "preflight.sh"
-    out, summary = tmp_path / "out.txt", tmp_path / "sum.txt"
-    script.write_text(
-        f"set -uo pipefail\nORG={shlex.quote(org)}\n"
-        f'GITHUB_OUTPUT="{out}"\nGITHUB_STEP_SUMMARY="{summary}"\n' + body[body.index("RC=0") :],
-        encoding="utf-8",
-    )
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    (fake_bin / "gh").write_text(
-        '#!/usr/bin/env bash\nprintf "%s\\n" "$FAKE_RESP"\nexit "$FAKE_RC"\n',
-        encoding="utf-8",
-    )
-    (fake_bin / "gh").chmod(0o755)
-    env = {
-        **os.environ,
-        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
-        "FAKE_RESP": response,
-        "FAKE_RC": str(rc),
-    }
-    # ⛔ `-e` IS THE POINT, NOT A DETAIL. Actions runs this step as `bash -e {0}`,
-    # and the regression being guarded — a bare `RESP=$(gh ...)` followed by
-    # `RC=$?` — only misbehaves under `-e`, where the failing assignment kills the
-    # shell before RC is ever read. A harness without `-e` cannot reproduce it, so
-    # it would pass forever INCLUDING on the exact regression it exists to stop.
-    proc = subprocess.run(["bash", "-e", str(script)], env=env, capture_output=True, check=False)
-    # Captured so the fallback arm's emitted response can be asserted; without it
-    # a test can only check that the guidance MENTIONS output, never that it exists.
-    (tmp_path / "stdout.txt").write_bytes(proc.stdout + proc.stderr)
-    # ⛔ A block that is not valid bash produces NO output — which every
-    # absence-assertion in this file is trivially satisfied by. Fail here instead.
-    assert b"unexpected EOF" not in proc.stderr, (
-        f"the extracted preflight is not valid bash:\n{proc.stderr.decode()}"
-    )
-    return (
-        out.read_text(encoding="utf-8") if out.exists() else "",
-        summary.read_text(encoding="utf-8") if summary.exists() else "",
-    )
-
-
-@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
-@pytest.mark.parametrize(("response", "expected", "label"), _CASES)
-def test_each_failure_cause_is_classified_not_collapsed(tmp_path, response, expected, label):
-    out, _ = _run_preflight(tmp_path, response, rc=1)
-    assert f"failure_reason={expected}" in out, (
-        f"{label} must classify as {expected}; a preflight whose purpose is saying "
-        "WHY it failed cannot report five causes as one"
-    )
-
-
-@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
-def test_a_transport_failure_does_not_invent_an_http_status(tmp_path):
-    """⛔ `${CODE:-401}` ASSERTED a 401 that was never received. Reporting a status
-    the server never sent is worse than reporting none: it is a fabricated fact that
-    sends the reader to rotate a credential which may be perfectly valid."""
-
-    out, summary = _run_preflight(tmp_path, "dial tcp: i/o timeout", rc=1)
-    assert "401" not in summary, "a status was invented for a response that never arrived"
-    assert "none received" in summary
-    assert "failure_reason=GITHUB_API_UNAVAILABLE" in out
-
-
-@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
-def test_a_valid_pat_emits_no_failure_reason(tmp_path):
-    """The success path must stay silent — a reason emitted on success would make
-    every run look like a fallback.
-
-    ⛔ AN ABSENCE ASSERTION NEEDS A VALIDITY PRECONDITION. "no failure_reason" is
-    also what an EMPTY output file says, so this passed if the step exited before
-    reaching the success path at all — a moved slice anchor, or the missing-PAT
-    branch firing. An absence is evidence only once the code that would produce a
-    presence is shown to have run.
-    """
-
-    out, _ = _run_preflight(tmp_path, "HTTP/2.0 200 OK", rc=0)
-    log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
-    assert "runner PAT valid for" in log, (
-        "the success path never ran, so 'no failure_reason' proves nothing"
-    )
-    assert "failure_reason=" not in out
-
-
-def test_a_missing_pat_is_distinct_from_an_invalid_one():
-    """Never set and expired need different remedies — one is configuration, the other
-    is rotation."""
-    body = _step("PAT must still be valid")["run"]
+def test_a_missing_pat_is_distinct_from_group_binding_failure():
+    body = _step("runner administration credential")["run"]
     assert "failure_reason=RUNNER_PAT_MISSING" in body
-
-
-def test_the_pat_failure_reason_reaches_the_caller():
-    assert "steps.pat.outputs.failure_reason" in DOC["jobs"]["pool"]["outputs"]["failure_reason"]
-    assert "RUNNER_PAT_INVALID" in OUTPUTS["failure_reason"]["description"]
+    failure = DOC["jobs"]["pool"]["outputs"]["failure_reason"]
+    assert "steps.pat.outputs.failure_reason" in failure
+    assert "steps.group-binding.outputs.failure_reason" in failure
 
 
 # ── cross-repo callability ───────────────────────────────────────────────────
@@ -1920,200 +1587,6 @@ def test_the_inner_run_does_not_inherit_addopts():
     )
 
 
-class TestTheFallbackArmPrintsWhatItPromises:
-    """⛔ THE DEFAULT ARM IS WHERE A FIX'S OWN DEFECT HIDES.
-
-    The `*)` branch fires when the status is UNRECOGNISED — precisely when the
-    operator has least to go on. Its fix text said "read the response below",
-    and `RESP` was captured, parsed twice, and never emitted. So the one arm
-    that exists for the unexplained case sent the reader to output that did not
-    exist, in a PR whose entire subject is a preflight that could not report why
-    it failed.
-
-    It is the branch least likely to have been exercised, which is exactly why
-    it was the one still broken. Check the default arm first, not last.
-    """
-
-    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
-    def test_an_unexpected_status_emits_the_response(self, tmp_path):
-        out, summary = _run_preflight(tmp_path, "HTTP/2.0 418 I'm a teapot\nx-trace: abc123", rc=1)
-        log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
-        assert "::group::Unexpected preflight response" in log
-        assert "x-trace: abc123" in log, "the guidance names a response that must be printed"
-        assert "log" in summary, "the summary must say WHERE the response is"
-
-    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
-    def test_the_echoed_response_cannot_forge_a_workflow_command(self, tmp_path):
-        """⛔ CWE-117 again. A response body echoed raw into an Actions log can
-        forge commands — `::error::` at line start is a COMMAND, not text. Same
-        shape as just-akash#252, reached by a different route: there the payload
-        arrived in an exception message, here in an HTTP body.
-
-        Asserted as the property that matters — the payload IS printed (the
-        operator needs it) but is wrapped in `::stop-commands::`, which is
-        GitHub's documented neutraliser. Deleting the payload would trade one
-        blind spot for another.
-        """
-        forged = "HTTP/2.0 418 Teapot\n::error title=forged::a provider is down"
-        _out, _summary = _run_preflight(tmp_path, forged, rc=1)
-        log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
-
-        assert "::error title=forged::" in log, "the evidence must still reach the operator"
-        stop = re.search(r"::stop-commands::([0-9a-f]{32})", log)
-        assert stop, "untrusted output was echoed without ::stop-commands::"
-        token = stop.group(1)
-        body_start = log.index(f"::stop-commands::{token}")
-        body_end = log.index(f"::{token}::")
-        assert body_start < log.index("::error title=forged::") < body_end, (
-            "the forged command fell outside the neutralised block"
-        )
-        assert log.index(f"::{token}::") < log.index("::endgroup::"), (
-            "commands must be resumed BEFORE ::endgroup::, or the group never closes"
-        )
-
-    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
-    def test_a_recognised_status_does_not_dump_the_response(self, tmp_path):
-        """401 has specific guidance and does not promise the raw body — dumping
-        it for every failure would bury the named diagnosis this PR added."""
-        _run_preflight(tmp_path, "HTTP/2.0 401 Unauthorized\nx-trace: nope", rc=1)
-        log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
-        assert "::group::Unexpected preflight response" not in log
-
-
-class TestTheAnnotationCannotBeSplitByCallerInput:
-    """⛔ `${ORG}` IS A CALLER-SUPPLIED `workflow_call` INPUT.
-
-    It flows into TITLE, which is interpolated into `::error title=...::`. A CR
-    or LF in it ends that line, and whatever follows starts a NEW workflow
-    command — forging annotations, or `::stop-commands::` to switch command
-    processing off entirely.
-
-    Third entry point for this class in one day: an exception message
-    (just-akash#252), an HTTP response body (this PR's fallback arm), and now a
-    workflow input. Same defect, three doors.
-    """
-
-    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
-    def test_a_newline_in_the_org_cannot_start_a_second_command(self, tmp_path):
-        _run_preflight(
-            tmp_path,
-            # ⛔ 404, NOT 401. Only the 404 arm interpolates ${ORG} into TITLE
-            # ("org ${ORG} is not visible..."); 401's TITLE is a fixed string. With
-            # 401 this test passed with the flattening REMOVED — the fixture could
-            # not carry the tainted value into the sink, so it proved nothing.
-            "HTTP/2.0 404 Not Found",
-            rc=1,
-            org="evil\n::error title=forged::a provider is down",
-        )
-        log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
-        annotations = [ln for ln in log.splitlines() if ln.startswith("::error")]
-        assert annotations, "the step emitted no annotation at all"
-        assert len(annotations) == 1, (
-            f"one failure must produce ONE annotation, got {len(annotations)}"
-        )
-        line = annotations[0]
-        # ⛔ ASSERT THE PROPERTY, NOT THE OLD PROXY. This used to read
-        # `"forged" not in ln.split("::")[1]`, which worked only because a RAW '::'
-        # split the line into pieces. Now that ':' is escaped, the forged text sits
-        # inert inside the title and that proxy fires on CORRECT behaviour. What
-        # actually matters is that no second command is emitted and that the caller's
-        # '::' cannot escape the property it was placed in.
-        assert "::error title=forged" not in line, "caller input started its own workflow command"
-        assert "%3A%3A" in line, (
-            "the caller's '::' was left raw inside a command property, so it truncates "
-            "the property list instead of being carried as text"
-        )
-
-    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
-    def test_a_percent_escape_cannot_smuggle_a_newline_past_the_flattener(self, tmp_path):
-        """⛔ `tr -d` SEES LITERAL CONTROL CHARACTERS; THE RUNNER DECODES ESCAPES.
-
-        A caller who sends the four ordinary text characters `%0A` walks through the
-        flattener untouched — there is no control character there to delete — and an
-        unescaped `%` then leaves the runner free to decode them back into a newline
-        when it reads the property. Same for `::`, which truncates the property list,
-        and `,`, which appends a property (`file=...` re-points the annotation at a
-        file of the caller's choosing). (Reported by Copilot on #253.)
-
-        ⚠ The stdout-line assertions in the sibling test above cannot express this:
-        `%0A` produces ONE line either way, so `len(annotations) == 1` stays true with
-        the escaping removed. This asserts on the EMITTED ENCODING instead.
-        """
-        _run_preflight(
-            tmp_path,
-            "HTTP/2.0 404 Not Found",
-            rc=1,
-            org="evil%0A::error title=forged::x,file=/etc/passwd",
-        )
-        log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
-        annotations = [ln for ln in log.splitlines() if ln.startswith("::error")]
-        assert len(annotations) == 1, f"expected ONE annotation, got {len(annotations)}"
-        line = annotations[0]
-
-        assert "%250A" in line, (
-            "the '%' was left raw, so the runner decodes '%0A' into a newline inside "
-            "the annotation property"
-        )
-        assert ",file=" not in line, (
-            "an unescaped ',' injected a further command property — the annotation can "
-            "be re-pointed at an arbitrary file"
-        )
-        title = line.split("::", 2)[1]
-        assert "%3A%3A" in title, (
-            "an embedded '::' was left raw and truncates the property list early"
-        )
-        # ⛔ ORDERING PIN. Escaping ':' before '%' re-escapes the '%' in the '%3A' just
-        # written, so every value double-encodes and the annotation renders '%3A'
-        # instead of ':'. This fixture carries no literal '%3A', so the sequence can
-        # only appear if the sed expressions were reordered.
-        assert "%253A" not in line, (
-            "':' was escaped before '%': the '%' in '%3A' got escaped again, so every "
-            "value is double-encoded"
-        )
-
-    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
-    def test_a_carriage_return_from_the_response_cannot_reach_the_annotation(self, tmp_path):
-        """⛔ CODE_TEXT's `tr -d` was the only guard on it, and nothing tested it.
-
-        Found by mutating `tr -d` off each variable in turn: TITLE is caught by the
-        test above, CLASS is two string literals and cannot be tainted at all, and
-        this one survived the ENTIRE file. Two guards over one value hid it — once ':'
-        is escaped, an injected '::' is neutralised whether or not the CR survived, so
-        only the variable where `tr -d` stands ALONE can fail for its own reason.
-
-        `CODE` is `awk 'NR==1 && $1 ~ /^HTTP/ {print $2}'` over the response. An awk
-        FIELD cannot span a newline — records are newline-delimited — so LF genuinely
-        cannot arrive here and no test could show it. `\r` is NOT a field separator,
-        so it can: a first line of `HTTP/2.0 403\rforged Forbidden` yields
-        CODE=`403\rforged`.
-
-        A lone CR does not end a line, so this is not command injection. It is log
-        SPOOFING — the CR returns the cursor to column 0 and what follows overwrites
-        the rendered line. That is the other half of CWE-117 and the half that
-        survives once the newline path is closed.
-        """
-        _run_preflight(tmp_path, "HTTP/2.0 403\rforged Forbidden", rc=1)
-        # ⛔ newline="" AND split("\n"). TWO separate ways this fixture destroys the very
-        # character it exists to detect, and the first one is invisible:
-        #   - `read_text()` applies UNIVERSAL NEWLINE TRANSLATION, silently rewriting the
-        #     \r to \n before any assertion sees it. Measured: with the guard mutated
-        #     off, the CR still never reached the test — the fixture, not the workflow,
-        #     was cleaning the input.
-        #   - `splitlines()` then breaks on \r as well, consuming whatever survived.
-        # A test for a control character has to read bytes the way the runner would.
-        with open(tmp_path / "stdout.txt", encoding="utf-8", newline="") as fh:
-            log = fh.read()
-        annotations = [ln for ln in log.split("\n") if ln.startswith("::error")]
-        assert annotations, "the step emitted no annotation at all"
-        assert not any("\r" in ln for ln in annotations), (
-            "a CR from the HTTP response reached the annotation: it returns the cursor "
-            "to column 0, so following text overwrites what was rendered"
-        )
-
-
-# ── #260: the probes must exercise the verb the containers use ──────────
-
-
 def _verdict_script(tmp_path, response: str) -> tuple[str, str]:
     """Run the verdict step's credential re-check with `gh` stubbed.
 
@@ -2136,7 +1609,11 @@ def _verdict_script(tmp_path, response: str) -> tuple[str, str]:
     out = tmp_path / "out.txt"
     script = tmp_path / "verdict.sh"
     script.write_text(
-        f'set -uo pipefail\nORG=testorg\nGITHUB_OUTPUT="{out}"\n: > "{out}"\n' + block + tail,
+        "set -uo pipefail\n"
+        "ORG=testorg\n"
+        "VERIFIED_RUNNER_GROUP_ID=17\n"
+        f'GITHUB_OUTPUT="{out}"\n'
+        f': > "{out}"\n' + block + tail,
         encoding="utf-8",
     )
     fake = tmp_path / "bin"
@@ -2184,25 +1661,23 @@ def _verdict_script(tmp_path, response: str) -> tuple[str, str]:
 
 
 class TestBothProbesUseTheWriteVerb:
-    """⛔ THE PREFLIGHT TESTED A READ; EVERY CONTAINER DOES A WRITE.
+    """⛔ A BARE LIST READ CANNOT PROVE THAT THE CREDENTIAL CAN CREATE JIT RUNNERS.
 
-    `gh api orgs/{org}/actions/runners` is a GET — it proves the PAT can LIST
-    runners. Each container gets `ACCESS_TOKEN=${GH_RUNNER_PAT}` and the image
-    exchanges it via POST .../actions/runners/registration-token, once per
-    replica because of `count: ${POOL_SIZE}`. So a PAT with read but not write
-    passed the gate and 403'd in all N replicas — the exact failure the gate
-    exists to prevent (#260).
+    The preflight now checks only that the credential exists. The first API read
+    verifies the exact group policy, and the first write creates the distinct JIT
+    registrations that are journaled before any Akash deployment is created.
     """
 
-    def test_both_sites_post_a_registration_token(self):
-        preflight = _step("PAT must still be valid")["run"]
+    def test_jit_creation_is_the_only_write_and_is_journaled(self):
+        preflight = _step("runner administration credential")["run"]
         provision = _step("Provision")["run"]
-        for label, body in (("preflight", preflight), ("verdict", provision)):
-            assert "actions/runners/registration-token" in body, f"{label} still reads"
-            assert "--method POST" in body, f"{label} is not using the write verb"
+        assert "gh api" not in preflight
+        assert "--method POST" not in preflight
+        assert '"${JIT[@]}" prepare' in provision
+        assert 'cat "$JIT_OUTPUT" >> "$GITHUB_OUTPUT"' in provision
 
     def test_the_preflight_no_longer_probes_with_a_bare_list_read(self):
-        body = _step("PAT must still be valid")["run"]
+        body = _step("runner administration credential")["run"]
         assert "actions/runners?per_page=1" not in body, (
             "a GET proves only that the PAT can LIST runners; the workload mints"
         )
@@ -2239,15 +1714,8 @@ class TestTheVerdictDoesNotBlameAProviderForOurCredential:
         assert "failure_reason=RUNNER_NEVER_REGISTERED" not in out
 
     @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
-    def test_201_is_success_so_a_healthy_credential_is_not_INDETERMINATE(self, tmp_path):
-        """⛔ 201, NOT 200. A successful mint is `201 Created`. Leaving the case
-        arm at 200 would send every HEALTHY credential to the `*)` arm and
-        report INDETERMINATE — 'the credential could not be re-checked' — on a
-        run where it was re-checked and was fine. That is not a safe default:
-        it converts a real provider fault into 'no evidence either way' and the
-        provider is never qualified."""
-
-        out, _log = _verdict_script(tmp_path, "HTTP/2.0 201 Created")
+    def test_200_group_read_is_success_not_indeterminate(self, tmp_path):
+        out, _log = _verdict_script(tmp_path, "HTTP/2.0 200 OK")
         assert "failure_reason=INDETERMINATE" not in out
         assert "failure_reason=RUNNER_NEVER_REGISTERED" in out, (
             "with the credential proven healthy, the provider verdict must stand"

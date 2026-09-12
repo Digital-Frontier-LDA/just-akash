@@ -201,6 +201,7 @@ def _quorum_uact(readings: list[int | None], quorum: int = 2) -> int:
 def select_client_for_create(
     required_uact: int,
     *,
+    required_owner: str | None = None,
     client_factory: Callable[[str], AkashConsoleAPI] = AkashConsoleAPI,
     credit_reader: Callable[[str], int] = _default_credit_reader,
 ) -> WalletClientSelection:
@@ -210,7 +211,10 @@ def select_client_for_create(
     if not keys:
         raise RuntimeError("AKASH_API_KEY or AKASH_API_KEYS must be set")
     if len(keys) == 1:
-        return WalletClientSelection(client_factory(keys[0]), None, None, 1, 1, "single-wallet")
+        client = client_factory(keys[0])
+        if required_owner is not None and client.account_address() != required_owner:
+            raise RuntimeError("required create owner does not match the configured wallet")
+        return WalletClientSelection(client, required_owner, None, 1, 1, "single-wallet")
 
     clients: dict[str, AkashConsoleAPI] = {}
     candidates: list[WalletCandidate] = []
@@ -243,6 +247,22 @@ def select_client_for_create(
             failures.append(
                 f"{candidate_id}: {_one_line(_redact_keys(f'{type(exc).__name__}: {exc}', keys))}"
             )
+
+    if required_owner is not None:
+        matches = [item for item in candidates if item.account == required_owner]
+        if len(matches) != 1:
+            raise RuntimeError("required create owner did not resolve to one configured wallet")
+        selected_owner = matches[0]
+        if int(selected_owner.available_credit) < required_uact:
+            raise RuntimeError("required create owner no longer has enough available credit")
+        return WalletClientSelection(
+            client=clients[selected_owner.candidate_id],
+            account=selected_owner.account,
+            available_uact=int(selected_owner.available_credit),
+            configured_keys=len(keys),
+            distinct_accounts=len({item.account for item in candidates}),
+            policy_version="required-owner-v1",
+        )
 
     result = rank_wallets(
         candidates,

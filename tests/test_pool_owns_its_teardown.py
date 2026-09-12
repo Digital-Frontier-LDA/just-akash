@@ -206,6 +206,12 @@ def test_teardown_receives_usable_inputs_not_empty_context_lookups():
         expr = str(expr)
         if expr.startswith("${{"):
             inner = expr[3:-3].strip()
+            if inner.startswith("format("):
+                assert "inputs.runner-label" in inner
+                assert "inputs.create-operation" in inner
+                assert "github.run_attempt" in inner
+                assert "github.run_id" in inner
+                continue
             known = (
                 "inputs.",
                 "needs.",
@@ -227,9 +233,12 @@ def test_teardown_label_wiring_uses_the_pools_own_label():
     input, not a consumer's."""
     td = JOBS.get("teardown", {})
     withs = td.get("with", {}) or {}
-    assert withs.get("runner-label") == "${{ inputs.runner-label }}", (
+    label = str(withs.get("runner-label", ""))
+    assert "inputs.runner-label" in label and "inputs.create-operation" in label, (
         f"de-registration label is not the pool's own: {withs!r}"
     )
+    assert "github.run_attempt" in label and "github.run_id" in label
+    assert "needs.pool.outputs" not in label
 
 
 # ── Part B: early dseq publication ─────────────────────────────────────────────
