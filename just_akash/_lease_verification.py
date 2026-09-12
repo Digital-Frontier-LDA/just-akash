@@ -2,7 +2,9 @@
 
 Closure proof requires two distinct chain endpoints to agree on the complete
 owner/dseq/gseq/oseq/bseq/provider lease map, with all leases terminal. Both sources
-must also positively identify the deployment and its escrow as closed. Closed
+must also positively identify the deployment and its escrow as closed. Complete
+agreed empty histories are allowed only with the same deployment/escrow proof,
+covering deployments that never obtained a lease. Closed
 leases alone can coexist with an active deployment and retained escrow.
 A single Console API read is not proof — the Console API and
 the chain RPC are different channels that can disagree (the failure that
@@ -39,12 +41,13 @@ def lease_snapshot(
 
     Returns the COMPLETE identity-state mapping for the (owner, dseq)
     intersection, or None if any page was unreadable / structurally invalid.
-    A partial read is treated as a failed read — it is the same defect as
-    an empty read, just hidden inside a population that LOOKED populated.
+    A complete empty history is {}, distinct from an unreadable collection.
+    Empty maps still need independent deployment/escrow closure proof in verdict().
     """
     leases: dict[tuple[str, ...], str] = {}
     cursor = ""
     visited: set[str] = set()
+    empty_complete = True
     for _ in range(50):
         query = {"filters.owner": owner, "filters.dseq": dseq, "pagination.limit": "200"}
         if cursor:
@@ -88,11 +91,27 @@ def lease_snapshot(
                 return None
             leases[key] = lease["state"]
         pagination = doc.get("pagination")
+        reported_total_zero = False
         if pagination is not None and not isinstance(pagination, dict):
             return None
+        # Empty history needs explicit end-of-collection evidence. Missing pagination
+        # or a positive/invalid reported total cannot establish that no lease existed.
+        if not isinstance(pagination, dict) or "next_key" not in pagination:
+            empty_complete = False
+        elif "total" in pagination:
+            total = pagination["total"]
+            if isinstance(total, bool) or not isinstance(total, (str, int)) or str(total) != "0":
+                empty_complete = False
+            else:
+                reported_total_zero = True
         cursor = pagination.get("next_key") if pagination is not None else None
+        if empty_complete and cursor not in (None, "") and reported_total_zero:
+            # A server cannot simultaneously prove an empty collection and advertise
+            # another page. Treat the response as contradictory rather than following
+            # the cursor and potentially blessing a fabricated empty history.
+            return None
         if cursor in (None, ""):
-            return leases or None
+            return leases if leases or empty_complete else None
         if not isinstance(cursor, str) or cursor in visited:
             return None
         visited.add(cursor)
@@ -216,15 +235,17 @@ def verdict(
         leases, sources = consensus(dseq, owner, endpoints, get)
         if leases is not None:
             states = set(leases.values())
-            if (
-                states
-                and states.issubset(TERMINAL_STATES)
-                and all(deployment_closed(base, dseq, owner, get) for base in sources)
+            if states.issubset(TERMINAL_STATES) and all(
+                deployment_closed(base, dseq, owner, get) for base in sources
             ):
                 return {
                     "closed": True,
                     "sources": list(sources),
-                    "reason": "agreeing terminal states",
+                    "reason": (
+                        "agreeing terminal states"
+                        if leases
+                        else "agreeing empty lease history and closed deployment/escrow"
+                    ),
                 }
             # ⇒ Active observation. NOT terminal yet — but the
             # destroy-then-propagate lag can mean this is stale.
