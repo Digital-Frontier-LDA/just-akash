@@ -353,6 +353,7 @@ def robust_destroy(
     # Exception, matching the destroy loop above: KeyboardInterrupt deliberately
     # still propagates, so a user hammering Ctrl-C can always escape. An unreadable
     # audit fails closed rather than claiming success.
+    audit_started = time.monotonic()
     try:
         time.sleep(2)
         settled = (
@@ -366,8 +367,10 @@ def robust_destroy(
     if settled is True:
         _pass(f"Audit: deployment {dseq} confirmed settled (no escrow held)")
         return True
+    elapsed_s = time.monotonic() - audit_started
     _fail(
-        f"Audit: deployment {dseq} close issued, settlement not observed within 24 s "
+        f"Audit: deployment {dseq} close issued, settlement not observed after "
+        f"{elapsed_s:.1f} s "
         "— manual cleanup required"
     )
     return False

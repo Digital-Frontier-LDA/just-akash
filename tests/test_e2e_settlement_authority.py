@@ -109,6 +109,19 @@ def test_laggy_single_reader_cannot_emit_still_active(capsys):
     assert "STILL ACTIVE" not in output
 
 
+def test_timeout_reports_measured_elapsed_time_not_a_stale_constant(capsys):
+    with (
+        patch.object(_e2e, "_run", return_value=_completed(0, "Deployment destroyed")),
+        patch.object(_e2e, "_confirm_settled", return_value=False),
+        patch.object(_e2e.time, "sleep"),
+        patch.object(_e2e.time, "monotonic", side_effect=[100.0, 137.25]),
+    ):
+        assert _e2e.robust_destroy(DSEQ, owner=OWNER) is False
+    output = capsys.readouterr().out
+    assert "settlement not observed after 37.2 s" in output
+    assert "within 24 s" not in output
+
+
 def test_audit_receives_the_captured_owner():
     with (
         patch.object(_e2e, "_run", return_value=_completed(0, "Deployment destroyed")) as run,
@@ -132,7 +145,7 @@ def _compiled_destroy(source: str):
             returncode=0, stdout="Deployment destroyed", stderr=""
         ),
         "shlex": __import__("shlex"),
-        "time": SimpleNamespace(sleep=lambda _seconds: None),
+        "time": SimpleNamespace(sleep=lambda _seconds: None, monotonic=lambda: 0.0),
     }
     exec(source, namespace)
     return namespace["robust_destroy"]
