@@ -24,7 +24,7 @@ def _source(url: str, index: int) -> dict:
         "operator": f"operator-{index}",
         "gateway_ancestry": f"direct-{index}",
         "cache_ancestry": f"cache-{index}",
-        "proof_mode": "height-pinned-block-id-and-paginated-group-list",
+        "proof_mode": "fresh-common-height-and-complete-creation-block",
         "finality_rule": "committed-tip-minus-2",
         "max_age_seconds": 180,
         "max_height_skew": 5,
@@ -203,7 +203,7 @@ def test_effect_mutation_skipping_a_malformed_third_response_false_allows():
 
 def test_default_runtime_sources_are_exactly_two_eligible_destructive_voters(monkeypatch):
     monkeypatch.delenv("AKASH_REST_URL", raising=False)
-    sources = chain.OWNER_CORROBORATION_SOURCES_V1
+    sources = chain.OWNER_CORROBORATION_SOURCES_V2
     hosts = {urllib.parse.urlsplit(source["url"]).hostname for source in sources}
 
     assert len(sources) == len(hosts) == 2
@@ -213,7 +213,7 @@ def test_default_runtime_sources_are_exactly_two_eligible_destructive_voters(mon
     assert len({s["gateway_ancestry"] for s in sources}) == 2
     assert len({s["cache_ancestry"] for s in sources}) == 2
     assert {s["chain_id"] for s in sources} == {"akashnet-2"}
-    assert chain.OWNER_CORROBORATION_REGISTRY_VERSION == 1
+    assert chain.OWNER_CORROBORATION_REGISTRY_VERSION == 2
     assert "akash/chain.json" in chain.OWNER_CORROBORATION_REGISTRY_PROVENANCE
     assert "c67c94a5f5c41ad1b116b1b847ef8b5f196b6405" in (
         chain.OWNER_CORROBORATION_REGISTRY_PROVENANCE
@@ -225,8 +225,8 @@ def test_default_runtime_sources_are_exactly_two_eligible_destructive_voters(mon
 def test_registry_population_cannot_silently_become_empty_or_one(monkeypatch):
     monkeypatch.delenv("AKASH_REST_URL", raising=False)
     monkeypatch.setattr(chain, "_lcd_get", lambda _path, *, base: _info((1, "runner")))
-    for sources in ((), chain.OWNER_CORROBORATION_SOURCES_V1[:1]):
-        monkeypatch.setattr(chain, "OWNER_CORROBORATION_SOURCES_V1", sources)
+    for sources in ((), chain.OWNER_CORROBORATION_SOURCES_V2[:1]):
+        monkeypatch.setattr(chain, "OWNER_CORROBORATION_SOURCES_V2", sources)
         monkeypatch.setattr(
             chain, "OWNER_CORROBORATION_REGISTRY_SHA256", chain._source_registry_digest(sources)
         )
@@ -238,7 +238,7 @@ def test_registry_population_cannot_silently_become_empty_or_one(monkeypatch):
 def test_public_containment_requires_the_exact_gseq_one_singleton(monkeypatch, gseq):
     reader = _reader_for({url: _info((gseq, "runner")) for url in ENDPOINTS})
     monkeypatch.delenv("AKASH_REST_URL", raising=False)
-    monkeypatch.setattr(chain, "OWNER_CORROBORATION_SOURCES_V1", SOURCES)
+    monkeypatch.setattr(chain, "OWNER_CORROBORATION_SOURCES_V2", SOURCES)
     monkeypatch.setattr(
         chain, "OWNER_CORROBORATION_REGISTRY_SHA256", chain._source_registry_digest(SOURCES)
     )
@@ -249,7 +249,7 @@ def test_public_containment_requires_the_exact_gseq_one_singleton(monkeypatch, g
 def test_public_containment_accepts_only_exact_expected_singleton(monkeypatch):
     reader = _reader_for({url: _info((1, "runner")) for url in ENDPOINTS})
     monkeypatch.delenv("AKASH_REST_URL", raising=False)
-    monkeypatch.setattr(chain, "OWNER_CORROBORATION_SOURCES_V1", SOURCES)
+    monkeypatch.setattr(chain, "OWNER_CORROBORATION_SOURCES_V2", SOURCES)
     monkeypatch.setattr(
         chain, "OWNER_CORROBORATION_REGISTRY_SHA256", chain._source_registry_digest(SOURCES)
     )
