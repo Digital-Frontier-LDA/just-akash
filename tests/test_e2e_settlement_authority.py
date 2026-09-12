@@ -85,6 +85,14 @@ def test_resolver_accepts_only_typed_owner_binding():
             raise AssertionError("an untyped owner source must be rejected")
 
 
+def test_checksum_invalid_owner_is_held_before_destroy():
+    invalid_owner = OWNER[:-1] + ("q" if OWNER[-1] != "q" else "p")
+    assert invalid_owner.startswith("akash1") and len(invalid_owner) == len(OWNER)
+    with patch.object(_e2e, "_run") as run:
+        assert _e2e.robust_destroy(DSEQ, owner=invalid_owner) is False
+    run.assert_not_called()
+
+
 def test_typed_multireader_verdict_is_the_settlement_effect():
     verdict = Mock(return_value={"closed": True, "sources": ["a", "b"]})
     with patch.object(_e2e, "closure_verdict", verdict):
@@ -135,7 +143,7 @@ def test_audit_receives_the_captured_owner():
 
 def _compiled_destroy(source: str):
     namespace = {
-        "_OWNER_RE": _e2e._OWNER_RE,
+        "is_canonical_akash_address": _e2e.is_canonical_akash_address,
         "_confirm_settled": lambda _dseq, _owner: True,
         "_confirm_settled_single_reader": lambda _dseq: False,
         "_destroy_succeeded": lambda _result: True,

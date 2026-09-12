@@ -23,6 +23,7 @@ from urllib import request as urllib_request
 from ._lease_verification import DEFAULT_ENDPOINTS
 from ._lease_verification import verdict as closure_verdict
 from ._states import TERMINAL_DEPLOYMENT_STATES
+from .address import is_canonical_akash_address
 
 GREEN = "\033[92m"
 RED = "\033[91m"
@@ -171,8 +172,6 @@ _SETTLED_STATES = TERMINAL_DEPLOYMENT_STATES
 # fails closed just the same but tells the operator the truth.
 _OPEN_STATES = ("active", "open")
 
-_OWNER_RE = re.compile(r"akash1[a-z0-9]{38,58}\Z")
-
 
 def resolve_deployment_owner(dseq: str) -> str:
     """Capture the exact owner while the deployment is still readable.
@@ -195,7 +194,7 @@ def resolve_deployment_owner(dseq: str) -> str:
     if payload.get("source") not in {"wallet_pool", "owner_bound_containment"}:
         raise RuntimeError("owner resolution returned an unknown evidence source")
     owner = payload.get("owner")
-    if not isinstance(owner, str) or _OWNER_RE.fullmatch(owner) is None:
+    if not isinstance(owner, str) or not is_canonical_akash_address(owner):
         raise RuntimeError("owner resolution returned an invalid Akash address")
     return owner
 
@@ -316,7 +315,7 @@ def robust_destroy(
     """
     if not dseq:
         return True
-    if owner is not None and _OWNER_RE.fullmatch(owner) is None:
+    if owner is not None and not is_canonical_akash_address(owner):
         _fail(f"Cleanup held for {dseq}: invalid owner identity")
         return False
     # Clamp negative retries so a caller mistake (or signal-handler default

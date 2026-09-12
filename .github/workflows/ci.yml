@@ -8,7 +8,10 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Both E2E jobs create paid Akash deployments. Cancelling the workflow can
+  # interrupt their in-process finally cleanup after a DSEQ exists. Queue a
+  # replacement behind the owner workflow so that cleanup can finish.
+  cancel-in-progress: false
 
 # Top-level permissions: required by CKV2_GHA_1 (Sentinel on #283), which
 # has cited this finding nine times on this PR. Sentinel bills the
