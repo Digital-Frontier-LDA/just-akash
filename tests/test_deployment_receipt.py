@@ -8,6 +8,7 @@ import multiprocessing
 import os
 import stat
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -373,7 +374,7 @@ def test_process_kill_after_emit_cannot_lose_the_response_receipt(tmp_path: Path
     assert json.loads(path.read_text())["dseq"] == "99"
 
 
-def _receipt_arguments(sdl: str, receipt: Path) -> dict[str, object]:
+def _receipt_arguments(sdl: str, receipt: Path) -> dict[str, Any]:
     population, _, digest = artifact_identity(sdl)
     return {
         "receipt_path": str(receipt),

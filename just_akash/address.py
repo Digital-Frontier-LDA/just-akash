@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-_BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+_BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"  # pragma: allowlist secret
 _BECH32_VALUES = {character: index for index, character in enumerate(_BECH32_CHARSET)}
 
 
