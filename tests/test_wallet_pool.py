@@ -121,15 +121,17 @@ def test_bound_owner_survives_unavailable_console_deployment_read(monkeypatch):
     clients["owner"].get_deployment.side_effect = RuntimeError("Console GET unavailable")
     reads = []
 
-    def groups(bound_owner, dseq):
+    def groups(bound_owner, dseq, expected_group):
         reads.append((bound_owner, dseq))
+        assert expected_group == "borduas-runner-run-7-end"
         return ["borduas-runner-run-7-end"]
 
-    client = select_client_for_bound_owner(
-        "123", owner, client_factory=lambda key: clients[key], group_reader=groups
+    monkeypatch.setattr("just_akash.chain.corroborated_deployment_group_names", groups)
+    selected = select_client_for_bound_owner(
+        "123", owner, "borduas-runner-run-7-end", client_factory=lambda key: clients[key]
     )
-
-    assert client is clients["owner"]
+    assert selected.account_address() == owner
+    assert not hasattr(selected, "close_deployment")
     assert reads == [(owner, "123")]
     clients["owner"].get_deployment.assert_not_called()
 
@@ -143,9 +145,7 @@ def test_bound_owner_without_a_matching_configured_signer_is_held(monkeypatch):
     group_reader = MagicMock(return_value=["borduas-runner-run-7-end"])
 
     with pytest.raises(RuntimeError, match="not reported"):
-        select_client_for_bound_owner(
-            "123", owner, client_factory=lambda _key: other, group_reader=group_reader
-        )
+        select_client_for_bound_owner("123", owner, "runner", client_factory=lambda _key: other)
 
     group_reader.assert_not_called()
 
@@ -157,9 +157,59 @@ def test_bound_owner_without_complete_exact_chain_identity_is_held(monkeypatch):
     client = MagicMock(api_key="owner")
     client.account_address.return_value = owner
 
-    with pytest.raises(RuntimeError, match="no complete group population"):
+    monkeypatch.setattr("just_akash.chain.corroborated_deployment_group_names", lambda *_: [])
+    with pytest.raises(RuntimeError, match="did not prove"):
         select_client_for_bound_owner(
-            "123", owner, client_factory=lambda _key: client, group_reader=lambda *_args: []
+            "123", owner, "borduas-runner-run-7-end", client_factory=lambda _key: client
+        )
+
+
+@pytest.mark.parametrize(
+    "actual_groups",
+    [
+        ["another-run-run-8-end"],
+        ["borduas-runner-run-7-end", "another-group"],
+        ["another-group", "borduas-runner-run-7-end"],
+    ],
+)
+def test_bound_owner_requires_the_complete_population_to_equal_the_expected_singleton(
+    monkeypatch, actual_groups
+):
+    """Same owner and DSEQ are insufficient when the create-time group disagrees.
+
+    The expected name being merely present is also insufficient: a second group means
+    the chain population is not the single-group deployment the pool submitted.
+    """
+    owner = "akash1" + "a" * 38
+    monkeypatch.setenv("AKASH_API_KEY", "owner")
+    monkeypatch.delenv("AKASH_API_KEYS", raising=False)
+    client = MagicMock(api_key="owner")
+    client.account_address.return_value = owner
+
+    monkeypatch.setattr(
+        "just_akash.chain.corroborated_deployment_group_names", lambda *_: actual_groups
+    )
+    with pytest.raises(RuntimeError, match="did not prove"):
+        select_client_for_bound_owner(
+            "123",
+            owner,
+            "borduas-runner-run-7-end",
+            client_factory=lambda _key: client,
+        )
+
+    client.close_deployment.assert_not_called()
+
+
+def test_bound_owner_without_an_expected_group_fails_closed(monkeypatch):
+    owner = "akash1" + "a" * 38
+    monkeypatch.setenv("AKASH_API_KEY", "owner")
+    monkeypatch.delenv("AKASH_API_KEYS", raising=False)
+    client = MagicMock(api_key="owner")
+    client.account_address.return_value = owner
+
+    with pytest.raises(TypeError):
+        select_client_for_bound_owner(  # pyright: ignore[reportCallIssue]
+            "123", owner, client_factory=lambda _key: client
         )
 
 

@@ -11,6 +11,7 @@
 #         runner-label:   fast-pool-${{ github.run_id }}
 #         github-org:     my-org
 #         wallet-address: ${{ needs.pool.outputs.wallet_address }}   # create-time owner candidate
+#         deployment-group: ${{ needs.pool.outputs.deployment_group }} # final group_spec.name
 #       secrets:
 #         AKASH_API_KEY:  ${{ secrets.AKASH_API_KEY }}
 #         AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}              # only with a pool
@@ -86,6 +87,15 @@ on:
         required: false
         type: string
         default: ''
+      deployment-group:
+        description: >-
+          Final submitted group_spec.name emitted by runner-pool. When present, teardown
+          accepts the owner/DSEQ chain identity only when its complete group population is
+          exactly this singleton. Valid only with wallet-address. Empty preserves the legacy
+          owner-bound check for older callers.
+        required: false
+        type: string
+        default: ''
     secrets:
       AKASH_API_KEY:
         required: false
@@ -150,6 +160,7 @@ jobs:
           AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}
           DSEQ: ${{ inputs.dseq }}
           WALLET_ADDRESS: ${{ inputs.wallet-address }}
+          DEPLOYMENT_GROUP: ${{ inputs.deployment-group }}
           TAG_PREFIX: ${{ inputs.tag-prefix }}
         run: |
           set -uo pipefail
@@ -218,6 +229,9 @@ jobs:
           if [ -n "${WALLET_ADDRESS:-}" ]; then
             RESOLVE_ARGS+=(--expected-owner "$WALLET_ADDRESS")
           fi
+          if [ -n "${DEPLOYMENT_GROUP:-}" ]; then
+            RESOLVE_ARGS+=(--expected-group "$DEPLOYMENT_GROUP")
+          fi
           "${JA[@]}" resolve-owner "${RESOLVE_ARGS[@]}" >/tmp/owner.json 2>/tmp/owner.err || OWNER_RC=$?
           OWNER_RC=${OWNER_RC:-0}
           # ⛔ THE STDERR IS THE WHOLE DIAGNOSIS, AND IT USED TO BE THROWN AWAY.
@@ -266,6 +280,9 @@ jobs:
           DESTROY_ARGS=(--dseq "$DSEQ" -y)
           if [ -n "${WALLET_ADDRESS:-}" ]; then
             DESTROY_ARGS+=(--expected-owner "$OWNER")
+          fi
+          if [ -n "${DEPLOYMENT_GROUP:-}" ]; then
+            DESTROY_ARGS+=(--expected-group "$DEPLOYMENT_GROUP")
           fi
 
           # ⛔ THE RETRY BUDGET WAS ON THE WRONG OPERATION. This loop retries the

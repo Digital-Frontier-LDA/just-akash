@@ -338,6 +338,11 @@ on:
           The Akash account that actually provisioned this pool. Teardown locates the
           DSEQ owner across the supplied pool instead of re-deriving a positional choice.
         value: ${{ jobs.pool.outputs.wallet_address }}
+      deployment_group:
+        description: >-
+          The final submitted group_spec.name after runner-pool applies its run stamp.
+          Published independently of provisioning success for bound rollback and teardown.
+        value: ${{ jobs.pool.outputs.deployment_group }}
       runner_hosts_proven:
         description: >-
           Supplied providers marked runner_host and not runner_deny. Below 3, one silent
@@ -360,6 +365,7 @@ jobs:
       runner_hosts_proven: ${{ steps.candidates.outputs.proven_hosts }}
       wallet_index: 'deprecated'
       wallet_address: ${{ steps.provision.outputs.wallet_address }}
+      deployment_group: ${{ steps.render.outputs.deployment_group }}
       runner-targets: ${{ steps.provision.outputs.runner_targets || '["ubuntu-latest"]' }}
     # Every `run` below needs just-akash's OWN source, never the caller's checkout.
     defaults:
@@ -626,6 +632,7 @@ jobs:
           fi
 
       - name: Render runner SDL
+        id: render
         env:
           GH_RUNNER_PAT: ${{ secrets.GH_RUNNER_PAT }}
           ORG: ${{ inputs.github-org }}
@@ -754,6 +761,7 @@ jobs:
               exit 2 ;;
           esac
           echo "placement key (on-chain group_spec.name): ${PLACEMENT_KEY}"
+          echo "deployment_group=${PLACEMENT_KEY}" >> "$GITHUB_OUTPUT"
           # All N replicas share ONE label carrying run identity; the runner image
           # randomises each replica's NAME from the prefix, so the wait loop counts
           # DISTINCT online runners by label rather than by name.
@@ -886,6 +894,7 @@ jobs:
           EXPECTED_RUNNER_VERSION: ${{ inputs.expected-runner-version }}
           REQUIRED_DEPOSIT_USD: ${{ inputs.required-deposit-usd }}
           PROVIDER_SELECT: ${{ inputs.provider-select }}
+          DEPLOYMENT_GROUP: ${{ steps.render.outputs.deployment_group }}
         run: |
           set -uo pipefail
 
@@ -984,7 +993,7 @@ jobs:
               echo "::warning::attempt $attempt: dseq=$DSEQ exists but no Provider line was parsed — closing it so it cannot leak escrow"
               "${JA[@]}" tag --dseq "$DSEQ" --name "${TAG_PREFIX}-${RUN_ID}" || true
               for _try in 1 2 3; do
-                "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" -y 2>&1 | tee /tmp/ja-orphan.log && break
+                "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-orphan.log && break
                 grep -qi "Deployment closed" /tmp/ja-orphan.log && break
                 sleep 5
               done
@@ -1211,7 +1220,7 @@ jobs:
             # the most likely cause.
             if [ "$API_OK" = "0" ]; then
               for _try in 1 2 3; do
-                "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" -y 2>&1 | tee /tmp/ja-destroy.log && break
+                "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-destroy.log && break
                 grep -qi "Deployment closed" /tmp/ja-destroy.log && break
                 sleep 5
               done
@@ -1225,7 +1234,7 @@ jobs:
               # Escrow-critical, and deliberately a literal locally-parsed --dseq so a
               # destroy-safety lint can prove this only tears down what this loop made.
               for _try in 1 2 3; do
-                "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" -y 2>&1 | tee /tmp/ja-destroy.log && break
+                "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-destroy.log && break
                 grep -qi "Deployment closed" /tmp/ja-destroy.log && break
                 sleep 5
               done
@@ -1262,7 +1271,7 @@ jobs:
             if [ -z "${RUNNER_VERSIONS:-}" ]; then
               echo "::warning title=Landing gate: version projection empty for a pool reporting ${ONLINE} online::attempt $attempt: the runner listing yielded ${ONLINE} online id(s) and 0 versions on $PROVIDER — the read disagrees with itself, so this lease is discarded rather than trusted."
               for _try in 1 2 3; do
-                "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" -y 2>&1 | tee /tmp/ja-destroy.log && break
+                "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-destroy.log && break
                 grep -qi "Deployment closed" /tmp/ja-destroy.log && break
                 sleep 5
               done
@@ -1285,7 +1294,7 @@ jobs:
                 echo "::warning title=Landing gate: registered runners are not running::attempt $attempt: ${GATE_DEAD} online runner(s) report NO version and ${GATE_WRONG} report an unexpected one on $PROVIDER — discarding this lease rather than handing the caller a pool of corpses."
                 printf '%s\n' "$RUNNER_VERSIONS" | sort | uniq -c | sed 's/^/    version /'
                 for _try in 1 2 3; do
-                  "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" -y 2>&1 | tee /tmp/ja-destroy.log && break
+                  "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-destroy.log && break
                   grep -qi "Deployment closed" /tmp/ja-destroy.log && break
                   sleep 5
                 done
@@ -1464,10 +1473,11 @@ jobs:
     # The resolution that satisfies both is to pin the POST-MERGE main SHA: byte-identical
     # to the branch commit, and an ancestor of main. Never re-pin to a branch commit after
     # its PR has merged.
-    uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@7d515f0e77d4ec6e164821b96c2c0e3fac3c3eda
+    uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@459573ae29875677a8a60515c78986c6a2a43998
     with:
       dseq: ${{ needs.pool.outputs.dseq }}
       wallet-address: ${{ needs.pool.outputs.wallet_address }}
+      deployment-group: ${{ needs.pool.outputs.deployment_group }}
       tag-prefix: ${{ inputs.tag-prefix }}
       runner-label: ${{ inputs.runner-label }}
       # ⭐ inputs.github-org, NOT github.organization — that context property DOES NOT

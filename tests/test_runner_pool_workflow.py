@@ -790,6 +790,7 @@ def test_the_guard_actually_runs_and_decides(key, accepted, tmp_path):
         # The step sets this from `github.run_id` for the attribution stamp (#311). The
         # harness must supply what the real step supplies, or it tests a different script.
         "GH_RUN_ID": "34228480597",
+        "GITHUB_OUTPUT": str(tmp_path / "output"),
     }
     proc = subprocess.run(["bash", "-e", str(script)], env=env, capture_output=True, text=True)
     if accepted:
@@ -1014,7 +1015,8 @@ MUTATIONS = [
     (
         "destroy stays owner-bound and narrow",
         lambda s: s.replace(
-            '"${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" -y',
+            '"${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" '
+            '--expected-group "$DEPLOYMENT_GROUP" -y',
             '"${JA[@]}" destroy --all -y',
         ),
     ),

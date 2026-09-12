@@ -26,12 +26,15 @@ class TestCliDestroyOwnerBinding:
     @patch("just_akash.api._load_tags", return_value={})
     @patch("just_akash.api._get_tag", return_value="")
     @patch("just_akash.cli._resolve_deployment_client")
-    def test_expected_owner_selects_the_mutating_client(
-        self, resolve, _get_tag, _load_tags, _save_tags, monkeypatch
+    @patch("just_akash.wallet_pool.authorize_client_for_bound_owner")
+    def test_expected_owner_and_group_select_the_mutating_client(
+        self, authorize, resolve, _get_tag, _load_tags, _save_tags, monkeypatch
     ):
         owner = "akash1" + "a" * 38
         client = MagicMock()
+        closer = MagicMock()
         resolve.return_value = (client, "12345")
+        authorize.return_value = (closer, {"expires_at": "2026-09-12T12:00:30+00:00"})
 
         _run_cli(
             monkeypatch,
@@ -42,12 +45,62 @@ class TestCliDestroyOwnerBinding:
                 "12345",
                 "--expected-owner",
                 owner,
+                "--expected-group",
+                "borduas-runner-run-7-end",
                 "-y",
             ],
         )
 
-        resolve.assert_called_once_with("12345", owner)
-        client.close_deployment.assert_called_once_with("12345")
+        resolve.assert_called_once_with("12345", owner, "borduas-runner-run-7-end")
+        authorize.assert_called_once_with("12345", owner, "borduas-runner-run-7-end")
+        closer.close_deployment.assert_called_once_with("12345")
+        client.close_deployment.assert_not_called()
+
+    @patch("just_akash.cli._resolve_deployment_client")
+    def test_resolve_owner_forwards_the_expected_group_to_the_same_api_boundary(
+        self, resolve, monkeypatch
+    ):
+        owner = "akash1" + "a" * 38
+        client = MagicMock()
+        client.account_address.return_value = owner
+        resolve.return_value = (client, "12345")
+
+        _run_cli(
+            monkeypatch,
+            [
+                "just-akash",
+                "resolve-owner",
+                "--dseq",
+                "12345",
+                "--expected-owner",
+                owner,
+                "--expected-group",
+                "borduas-runner-run-7-end",
+            ],
+        )
+
+        resolve.assert_called_once_with("12345", owner, "borduas-runner-run-7-end")
+
+    @pytest.mark.parametrize("command", ["destroy", "resolve-owner"])
+    def test_expected_group_without_expected_owner_is_rejected_before_client_selection(
+        self, command, monkeypatch, capsys
+    ):
+        with pytest.raises(SystemExit) as exc:
+            _run_cli(
+                monkeypatch,
+                [
+                    "just-akash",
+                    command,
+                    "--dseq",
+                    "12345",
+                    "--expected-group",
+                    "borduas-runner-run-7-end",
+                    *(["-y"] if command == "destroy" else []),
+                ],
+            )
+
+        assert exc.value.code == 1
+        assert "--expected-group requires --expected-owner" in capsys.readouterr().err
 
 
 # ── update ───────────────────────────────────────────────────────────

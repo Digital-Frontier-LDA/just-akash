@@ -745,7 +745,7 @@ def test_cli_subprocess_resolve_owner_exits_nonzero_when_wallet_pool_returns_non
         "ssl._create_default_https_context = ssl._create_unverified_context\n"
         "from unittest.mock import patch\n"
         "from just_akash import cli\n"
-        "def _raise(_dseq):\n"
+        "def _raise(_dseq, *, expected_group=None):\n"
         "    raise RuntimeError('no wallet in pool claims that DSEQ')\n"
         "with patch.object(cli, '_resolve_deployment_client', side_effect=_raise):\n"
         "    cli.main()\n"

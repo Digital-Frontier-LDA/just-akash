@@ -10,6 +10,7 @@ import urllib.request
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from akash_lease_core import WalletCandidate, WalletPolicy, rank_wallets
@@ -307,34 +308,30 @@ def select_client_for_dseq(
     )
 
 
-def select_client_for_bound_owner(
+def _raw_client_for_bound_owner(
     dseq: str,
     expected_owner: str,
+    expected_group: str,
     *,
     client_factory: Callable[[str], AkashConsoleAPI] = AkashConsoleAPI,
-    group_reader: Callable[[str, str], list[str]] = chain.deployment_group_names,
 ) -> AkashConsoleAPI:
-    """Resolve a persisted owner to a configured signer and exact chain deployment.
+    """Select the private signer behind exact owner-bound containment.
 
-    The runner provisioner learns the selected wallet before handing a DSEQ to a
-    separate teardown job.  A later Console deployment read can be unavailable even
-    while the deployment remains active.  In that case rediscovering the owner through
-    ``get_deployment`` strands the lease despite already having its create-time owner.
-
-    The persisted value is a candidate, not authority by itself.  This path accepts it
-    only when a configured Console key's JWT reports that exact owner and an owner/DSEQ
-    chain read returns a complete non-empty group population. Either missing check is a
-    refusal; it never falls back to another owner. The JWT issuer is an assertion by
-    Console, not local cryptographic proof that the caller possesses an Akash private key.
+    Console maps a credential to the create-time owner but is not a chain vote. Two
+    registered trust paths must agree on the exact singleton ``gseq=1`` group. State is
+    intentionally absent before destroy; it belongs to post-destroy closure verification.
+    Callers receive either a read-only view or an evidence-gated closer, never this client.
     """
-
+    if not re.fullmatch(r"[1-9][0-9]{0,19}", dseq) or int(dseq) > 2**64 - 1:
+        raise RuntimeError("dseq must be canonical positive uint64 ASCII decimal")
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", expected_group):
+        raise RuntimeError("expected group must be a non-empty canonical group name")
     if not re.fullmatch(r"akash1[a-z0-9]{38,58}", expected_owner):
         raise RuntimeError("expected owner is not a canonical Akash account shape")
     keys = configured_api_keys()
     if not keys:
         raise RuntimeError("AKASH_API_KEY or AKASH_API_KEYS must be set")
-
-    matching: list[AkashConsoleAPI] = []
+    matching = []
     for key in keys:
         client = client_factory(key)
         try:
@@ -344,14 +341,75 @@ def select_client_for_bound_owner(
         if owner == expected_owner:
             matching.append(client)
     if not matching:
-        raise RuntimeError(
-            f"expected owner was not reported by any of {len(keys)} configured Console credentials"
-        )
-
-    try:
-        names = group_reader(expected_owner, str(dseq))
-    except RuntimeError as exc:
-        raise RuntimeError("exact owner/DSEQ chain identity could not be read") from exc
-    if not names:
-        raise RuntimeError("exact owner/DSEQ chain identity has no complete group population")
+        raise RuntimeError("expected owner was not reported by any configured Console credential")
+    names = chain.corroborated_deployment_group_names(expected_owner, dseq, expected_group)
+    if names != [expected_group]:
+        raise RuntimeError("owner-bound containment did not prove exact gseq=1 singleton")
     return matching[0]
+
+
+@dataclass(frozen=True)
+class BoundOwnerContainment:
+    """Read-only owner result; it deliberately carries no Console client or close method."""
+
+    owner: str
+
+    def account_address(self) -> str:
+        return self.owner
+
+
+def select_client_for_bound_owner(
+    dseq: str,
+    expected_owner: str,
+    expected_group: str,
+    *,
+    client_factory: Callable[[str], AkashConsoleAPI] = AkashConsoleAPI,
+) -> BoundOwnerContainment:
+    """Return read-only containment evidence without exposing a mutating client."""
+    _raw_client_for_bound_owner(
+        dseq, expected_owner, expected_group, client_factory=client_factory
+    )
+    return BoundOwnerContainment(expected_owner)
+
+
+def authorize_client_for_bound_owner(
+    dseq: str,
+    expected_owner: str,
+    expected_group: str,
+    *,
+    client_factory: Callable[[str], AkashConsoleAPI] = AkashConsoleAPI,
+) -> tuple[_AuthorizedBoundOwnerCloser, dict]:
+    """Return an evidence-gated closer, never the raw mutating client."""
+    client = _raw_client_for_bound_owner(
+        dseq, expected_owner, expected_group, client_factory=client_factory
+    )
+    evidence = chain.owner_close_evidence(expected_owner, dseq, expected_group)
+    if evidence is None:
+        raise RuntimeError("owner-bound containment is not fresh/finalized destructive authority")
+    return _AuthorizedBoundOwnerCloser(client, evidence), evidence
+
+
+def owner_evidence_is_unexpired(evidence: dict, *, now: datetime | None = None) -> bool:
+    """The final local gate immediately before the mutating send."""
+    try:
+        expiry = datetime.fromisoformat(evidence["expires_at"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    current = now or datetime.now(timezone.utc)
+    return expiry.tzinfo is not None and current.tzinfo is not None and expiry > current
+
+
+@dataclass
+class _AuthorizedBoundOwnerCloser:
+    """The only owner-bound close handle; expiry is checked at its network boundary."""
+
+    _client: AkashConsoleAPI
+    evidence: dict
+    _clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
+
+    def close_deployment(self, dseq: str) -> dict:
+        if str(self.evidence.get("dseq")) != str(dseq):
+            raise RuntimeError("owner authority evidence is bound to a different dseq")
+        if not owner_evidence_is_unexpired(self.evidence, now=self._clock()):
+            raise RuntimeError("owner authority evidence expired at close send boundary")
+        return self._client.close_deployment(dseq)
