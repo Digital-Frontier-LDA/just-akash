@@ -299,6 +299,12 @@ on:
           Typed create outcome: created only with a parsed DSEQ, no-deployment only on
           an authoritative pre-create/no-broadcast branch, unknown otherwise.
         value: ${{ jobs.pool.outputs.deployment_outcome }}
+      create_ambiguous:
+        description: >-
+          'true' when a later create request may have committed without returning an
+          identity. The published dseq is then only the last KNOWN lease: teardown must
+          close it and still fail HELD, because a second deployment may exist.
+        value: ${{ jobs.pool.outputs.create_ambiguous }}
       held_reason:
         description: 'Why rollback was HELD without closure authority.'
         value: ${{ jobs.teardown.outputs.held_reason }}
@@ -325,7 +331,8 @@ on:
           RUNNER_PAT_INVALID, WALLET_UNDERFUNDED, WALLET_TX_CONTENTION,
           NO_ELIGIBLE_BIDDER, PROVIDER_CAPACITY, RUNNER_NEVER_REGISTERED,
           GITHUB_API_UNAVAILABLE, INDETERMINATE, LEASE_CLOSE_UNVERIFIED,
-          LEASE_OWNER_UNREADABLE, CREATE_OUTCOME_AMBIGUOUS — or empty on success.
+          LEASE_OWNER_UNREADABLE, CREATE_OUTCOME_AMBIGUOUS, DIAGNOSTICS_DISABLED — or
+          empty on success.
           Each implies a different remedy, which is why they are not collapsed into "infra".
 
           Three of them are explicitly NOT statements about a provider, and each was
@@ -374,6 +381,7 @@ jobs:
     outputs:
       dseq: ${{ steps.provision.outputs.dseq }}
       deployment_outcome: ${{ steps.provision.outputs.deployment_outcome }}
+      create_ambiguous: ${{ steps.provision.outputs.create_ambiguous }}
       provision_healthy: ${{ steps.provision.outputs.provision_healthy }}
       runners_online: ${{ steps.provision.outputs.runners_online }}
       failure_reason: ${{ steps.pat.outputs.failure_reason || steps.provision.outputs.failure_reason || steps.candidates.outputs.failure_reason }}
@@ -918,6 +926,19 @@ jobs:
           # only the enumerated no-broadcast sites below may narrow it to no-deployment.
           echo "deployment_outcome=unknown" >> "$GITHUB_OUTPUT"
 
+          # ⛔ THE CLASSIFICATION BELOW READS just-akash's STRUCTURED DIAGNOSTICS (#348).
+          # AKASH_DIAGNOSTICS=off silences them, so an ambiguous create or a failed lease
+          # that still holds a DSEQ would fall through to "unclassified" and RETRY. Refuse
+          # before any create instead: nothing has been submitted, so no-deployment is
+          # authoritative here.
+          case "$(printf '%s' "${AKASH_DIAGNOSTICS:-}" | tr '[:upper:]' '[:lower:]')" in
+            off|0|false)
+              echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+              echo "failure_reason=DIAGNOSTICS_DISABLED" >> "$GITHUB_OUTPUT"
+              echo "::error title=AKASH_DIAGNOSTICS is disabled::The provision step classifies create and lease failures from just-akash's structured diagnostics. With them off, an ambiguous create would be retried. Unset AKASH_DIAGNOSTICS or set it to 1."
+              exit 1 ;;
+          esac
+
           # Wallet selection belongs to just-akash. It receives the complete pool,
           # measures authoritative free credit, and chooses the richest funded account.
           # No key or positional index crosses a step boundary.
@@ -1012,7 +1033,19 @@ jobs:
             rm -f /tmp/ja.log
             "${JA[@]}" deploy --sdl /tmp/runner-sdl.yaml --deposit "$REQUIRED_DEPOSIT_USD" --bid-wait 60 \
               --bid-wait-retry 120 "${SELECT_ARGS[@]}" "${PROV_ARGS[@]}" 2>&1 | tee /tmp/ja.log || true
-            DSEQ=$(awk -F': +' '/^[[:space:]]*DSEQ:/{print $2; exit}' /tmp/ja.log || true)
+            # ⛔ A FAILED LEASE STILL HOLDS A DEPLOYMENT (#348). just-akash prints the
+            # "DSEQ:" summary only after a lease succeeds. When lease creation fails it
+            # closes best-effort and emits LEASE_CREATE_FAILED (or REDEPLOY_FAILED) with the
+            # dseq, then raises. That deployment is real until proven closed, so the same
+            # single read also recovers its identity from that diagnostic line; the paths
+            # below then refuse to create again until it is proven closed.
+            DSEQ=$(awk -F': +' '
+              /^[[:space:]]*DSEQ:/ { print $2; found = 1; exit }
+              /"code": "(LEASE_CREATE_FAILED|REDEPLOY_FAILED)"/ && match($0, /"dseq": "[1-9][0-9]*"/) {
+                recovered = substr($0, RSTART + 9, RLENGTH - 10)
+              }
+              END { if (!found && recovered != "") print recovered }
+            ' /tmp/ja.log || true)
             # ⭐ PUBLISH THE DSEQ THE MOMENT IT EXISTS — before tagging, before the
             # registration wait, before anything can fail or be cancelled. The
             # success block below also writes it, but a run that dies mid-wait
@@ -1112,6 +1145,7 @@ jobs:
                 # an earlier round. The stale DSEQ may remain published for diagnosis,
                 # but teardown must see unknown and hold rather than close/no-op it.
                 echo "deployment_outcome=unknown" >> "$GITHUB_OUTPUT"
+                echo "create_ambiguous=true" >> "$GITHUB_OUTPUT"
                 echo "failure_reason=CREATE_OUTCOME_AMBIGUOUS" >> "$GITHUB_OUTPUT"
                 echo "::error title=Create outcome is AMBIGUOUS::The non-idempotent create may have committed without returning a usable DSEQ. Stopping before another create; teardown will hold this run for receipt or owner-scoped chain reconciliation."
                 echo "::endgroup::"; exit 1
@@ -1561,11 +1595,12 @@ jobs:
     # its PR has merged.
     uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@06f3d2f9d9df72a6310dbfe61723236d3ca3daba
     with:
-      # An ambiguous later create dominates an earlier closed DSEQ. Suppress that
-      # stale identity at the teardown boundary so the pinned callee takes its
-      # CREATE_OUTCOME_AMBIGUOUS hold path and cannot close/no-op the old round.
-      dseq: ${{ needs.pool.outputs.deployment_outcome == 'created' && needs.pool.outputs.dseq || '' }}
+      # The last KNOWN lease always reaches teardown so it is closed and proven. An
+      # ambiguous later create travels beside it as create-ambiguous: teardown closes
+      # the known dseq and still fails HELD with CREATE_OUTCOME_AMBIGUOUS.
+      dseq: ${{ needs.pool.outputs.dseq }}
       deployment-outcome: ${{ needs.pool.outputs.deployment_outcome }}
+      create-ambiguous: ${{ needs.pool.outputs.create_ambiguous }}
       wallet-address: ${{ needs.pool.outputs.wallet_address }}
       deployment-group: ${{ needs.pool.outputs.deployment_group }}
       tag-prefix: ${{ inputs.tag-prefix }}

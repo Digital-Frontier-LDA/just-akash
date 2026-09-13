@@ -72,6 +72,14 @@ on:
         required: false
         type: string
         default: 'no-deployment'
+      create-ambiguous:
+        description: >-
+          'true' when a later create may have committed without returning an identity.
+          The known dseq is still closed and proven, then the job fails HELD with
+          CREATE_OUTCOME_AMBIGUOUS, because a second deployment may exist.
+        required: false
+        type: string
+        default: ''
       tag-prefix:
         description: >-
           REQUIRED. Asserted against the deployment's own tag before anything is
@@ -196,6 +204,7 @@ jobs:
           WALLET_ADDRESS: ${{ inputs.wallet-address }}
           DEPLOYMENT_GROUP: ${{ inputs.deployment-group }}
           DEPLOYMENT_OUTCOME: ${{ inputs.deployment-outcome }}
+          CREATE_AMBIGUOUS: ${{ inputs.create-ambiguous }}
           TAG_PREFIX: ${{ inputs.tag-prefix }}
         run: |
           set -uo pipefail
@@ -204,7 +213,7 @@ jobs:
           # unquoted one is SC2086.
           JA=(uv run --with . just-akash)
 
-          if [ -z "${DSEQ}" ] && [ "${DEPLOYMENT_OUTCOME:-unknown}" != "no-deployment" ]; then
+          if [ -z "${DSEQ}" ] && { [ "${DEPLOYMENT_OUTCOME:-unknown}" != "no-deployment" ] || [ "${CREATE_AMBIGUOUS:-}" = "true" ]; }; then
             HELD_GROUP=""
             [[ "${DEPLOYMENT_GROUP:-}" =~ ^[A-Za-z0-9._-]+$ ]] && HELD_GROUP="$DEPLOYMENT_GROUP"
             {
@@ -415,6 +424,20 @@ jobs:
           if [ "$VERIFY_RC" -eq 0 ] && [ "$VERDICT" = "True" ]; then
             echo "closed=true" >> "$GITHUB_OUTPUT"
             echo "lease $DSEQ closed; verifier returned terminal states across two endpoints"
+            # ⛔ THE KNOWN LEASE IS CLOSED, BUT A LATER CREATE MAY HAVE LANDED (#348).
+            # Closing the last known dseq cannot prove there is no second deployment, so
+            # an ambiguous create still fails HELD rather than reporting a clean close.
+            if [ "${CREATE_AMBIGUOUS:-}" = "true" ]; then
+              HELD_GROUP=""
+              [[ "${DEPLOYMENT_GROUP:-}" =~ ^[A-Za-z0-9._-]+$ ]] && HELD_GROUP="$DEPLOYMENT_GROUP"
+              {
+                echo "held_reason=CREATE_OUTCOME_AMBIGUOUS"
+                echo "held_dseq="
+                echo "held_deployment_group=$HELD_GROUP"
+              } >> "$GITHUB_OUTPUT"
+              echo "::error title=HELD: a later create outcome is ambiguous::Known lease $DSEQ is closed and proven, but a later create may have committed without returning a DSEQ. Reconcile the create receipt or the owner-scoped chain population before another create. group=${HELD_GROUP:-<unknown>}"
+              exit 1
+            fi
             exit 0
           fi
           echo "closed=unknown" >> "$GITHUB_OUTPUT"

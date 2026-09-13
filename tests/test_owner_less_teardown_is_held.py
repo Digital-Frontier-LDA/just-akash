@@ -58,6 +58,7 @@ def run_close(
     script: str | None = None,
     deployment_outcome: str = "no-deployment",
     dseq: str = "1002",
+    create_ambiguous: str = "",
 ) -> tuple[int, list, dict, str]:
     source = script if script is not None else close_step()["run"]
     assert source.count(JA_LINE) == 1, "just-akash invocation moved; re-derive the harness"
@@ -81,8 +82,9 @@ def run_close(
             "WALLET_ADDRESS": wallet,
             "DEPLOYMENT_GROUP": group,
             "DEPLOYMENT_OUTCOME": deployment_outcome,
+            "CREATE_AMBIGUOUS": create_ambiguous,
             "TAG_PREFIX": "pool",
-            "FAKE_OWNER": OWNER,
+            "FAKE_OWNER": wallet or OWNER,
             "GITHUB_OUTPUT": str(output),
             "TASK_CALLS": str(calls),
         },

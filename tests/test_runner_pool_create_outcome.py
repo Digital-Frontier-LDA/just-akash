@@ -27,9 +27,12 @@ def test_typed_outcome_is_published_through_both_workflow_boundaries() -> None:
     )
     teardown_with = DOC["jobs"]["teardown"]["with"]
     assert teardown_with["deployment-outcome"] == ("${{ needs.pool.outputs.deployment_outcome }}")
-    assert teardown_with["dseq"] == (
-        "${{ needs.pool.outputs.deployment_outcome == 'created' "
-        "&& needs.pool.outputs.dseq || '' }}"
+    # The last KNOWN lease always reaches teardown; a later ambiguous create travels
+    # beside it and makes teardown hold after closing it (#348).
+    assert teardown_with["dseq"] == "${{ needs.pool.outputs.dseq }}"
+    assert teardown_with["create-ambiguous"] == "${{ needs.pool.outputs.create_ambiguous }}"
+    assert DOC["jobs"]["pool"]["outputs"]["create_ambiguous"] == (
+        "${{ steps.provision.outputs.create_ambiguous }}"
     )
     for key in ("held_reason", "held_dseq", "held_deployment_group"):
         assert CALL["outputs"][key]["value"] == f"${{{{ jobs.teardown.outputs.{key} }}}}"

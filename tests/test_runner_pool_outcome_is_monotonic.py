@@ -663,6 +663,55 @@ def test_ambiguous_create_stops_before_a_second_non_idempotent_request(
     assert last(r, "dseq") is None
 
 
+@pytest.mark.parametrize("code", ["LEASE_CREATE_FAILED", "REDEPLOY_FAILED"])
+def test_a_failed_lease_keeps_its_dseq_and_is_never_followed_by_another_create(
+    tmp_path: Path, code: str
+) -> None:
+    """just-akash prints "DSEQ:" only after a lease succeeds. A failed lease emits its dseq
+    only in the diagnostic, after a best-effort close that may itself fail. Without
+    recovery the round looks unclassified and the loop creates again."""
+    diagnostic = json.dumps(
+        {
+            "type": "akash-diag",
+            "level": "error",
+            "code": code,
+            "dseq": "1001",
+            "context": {"provider": PROVIDER_A},
+        }
+    )
+    r = run_step(
+        tmp_path,
+        {
+            "owner": OWNER,
+            "destroy": {"1001": "fail"},
+            "verify": {"1001": "open"},
+            "rounds": [{"text": diagnostic}, {"dseq": "1002", "provider": PROVIDER_A}],
+        },
+    )
+    assert r["rc"] != 0
+    assert deploys(r) == 1, f"a create followed a failed lease that still holds 1001: {r['calls']}"
+    assert last(r, "dseq") == "1001", r["writes"]
+    assert last(r, "deployment_outcome") == "created", r["writes"]
+    # The lease-failure path prints no Wallet, so the owner is unreadable: stop, publish
+    # the pair (1001, ''), and let teardown hold it rather than close by guesswork.
+    assert identity_pairs(r) == [("1001", "")], r["writes"]
+    assert last(r, "failure_reason") == "LEASE_OWNER_UNREADABLE", r["writes"]
+    assert_monotonic(r)
+
+
+@pytest.mark.parametrize("value", ["off", "0", "FALSE"])
+def test_disabled_diagnostics_refuse_before_any_create(tmp_path: Path, value: str) -> None:
+    r = run_step(
+        tmp_path,
+        {"owner": OWNER, "rounds": [{"dseq": "1001"}]},
+        env_extra={"AKASH_DIAGNOSTICS": value},
+    )
+    assert r["rc"] != 0
+    assert deploys(r) == 0, r["calls"]
+    assert last(r, "failure_reason") == "DIAGNOSTICS_DISABLED", r["writes"]
+    assert last(r, "deployment_outcome") == "no-deployment", r["writes"]
+
+
 # ── the call site: every retry edge goes through the one proof ───────────────────
 
 
