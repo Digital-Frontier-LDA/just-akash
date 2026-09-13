@@ -297,3 +297,125 @@ def test_anti_affinity_through_deploy_needs_the_profile(run_deploy) -> None:
         already_selected=[CHEAP],
     )
     assert chosen == DEAR, "anti-affinity: CHEAP was already selected this round"
+
+
+# ── gseq-less bids (goal keeper ruling on just-akash#346) ────────────────────────────────
+
+
+def _bid_without_gseq(provider: str, amount: str) -> dict:
+    return {
+        "bid": {
+            "id": {"provider": provider},
+            "price": {"denom": "uakt", "amount": amount},
+            "state": "open",
+        }
+    }
+
+
+@pytest.fixture
+def observations(monkeypatch):
+    """Every BidObservation `_select_auction_bid` builds — the auction's view of each bid."""
+    seen: list = []
+    real = deploy_mod.BidObservation
+
+    def record(*args, **kwargs):
+        obs = real(*args, **kwargs)
+        seen.append(obs)
+        return obs
+
+    monkeypatch.setattr(deploy_mod, "BidObservation", record)
+    return seen
+
+
+def _submitted_profiles(sdl: str):
+    from just_akash.provenance import stamp_run
+    from just_akash.request_profile import derive_resource_profiles
+
+    return derive_resource_profiles(stamp_run(sdl, "abc123def456")[0])
+
+
+def _auction(bids, derived):
+    from akash_lease_core.auction import PreferredSelection
+
+    return deploy_mod._select_auction_bid(
+        bids,
+        preferred=[CHEAP, DEAR],
+        backup=[],
+        collection_window_seconds=10,
+        capacity_by_provider=FIT_SPLIT,
+        preferred_selection=PreferredSelection.EMPTIEST,
+        resource_profiles=derived.profiles,
+        placement_group_count=derived.placement_group_count,
+    )
+
+
+def test_reproduction_a_gseqless_bid_no_longer_bypasses_the_fit_check() -> None:
+    """The measured reproduction, committed. Before the ruling the second row selected
+    akash1cheap with `emptiest_request_profile_unavailable_fell_back_to_cheapest`."""
+    derived = _submitted_profiles(ONE_GROUP)
+    for label, cheap in (
+        ("CHEAP names gseq=1", _bid(CHEAP, "1")),
+        ("CHEAP has NO gseq", _bid_without_gseq(CHEAP, "1")),
+    ):
+        _raw, result = _auction([cheap, _bid(DEAR, "9")], derived)
+        assert result.selected is not None, label
+        assert result.selected.provider == DEAR, label
+        assert result.selection_reason == "emptiest_preferred", label
+
+
+def test_a_one_group_gseqless_bid_is_observed_as_group_1_and_fit_checked(observations) -> None:
+    """(a) One placement group, profile derived: the gseq-less CHEAP bid is observed as
+    gseq 1 WITH the group's profile, rejected for insufficient capacity, and DEAR wins."""
+    derived = _submitted_profiles(ONE_GROUP)
+    assert derived.placement_group_count == 1 and derived.profiles
+    _raw, result = _auction([_bid_without_gseq(CHEAP, "1"), _bid(DEAR, "9")], derived)
+    cheap_obs = [o for o in observations if o.provider == CHEAP]
+    assert len(cheap_obs) == 1
+    assert cheap_obs[0].gseq == 1
+    assert cheap_obs[0].resource_profile == derived.profiles[1]
+    assert [(r.provider, r.reason.value) for r in result.rejected] == [
+        (CHEAP, "insufficient_capacity")
+    ]
+    assert result.selected is not None and result.selected.provider == DEAR
+    assert result.selection_reason == "emptiest_preferred"
+
+
+def test_a_one_group_gseqless_bid_is_NOT_normalized_when_no_profile_was_derived(
+    observations,
+) -> None:
+    """(a, no-profile variant) One group, but the request is unreadable: nothing to fit,
+    so there is no reason to assign a group. gseq stays None and the fallback applies."""
+    templated = ONE_GROUP.replace("cpu: {units: 1}", "cpu: {units: '{{CPU}}'}")
+    assert templated != ONE_GROUP
+    derived = _submitted_profiles(templated)
+    assert derived.placement_group_count == 1 and not derived.profiles
+    _raw, result = _auction([_bid_without_gseq(CHEAP, "1"), _bid(DEAR, "9")], derived)
+    cheap_obs = [o for o in observations if o.provider == CHEAP]
+    assert len(cheap_obs) == 1
+    assert cheap_obs[0].gseq is None
+    assert cheap_obs[0].resource_profile is None
+    assert result.selection_reason == "emptiest_request_profile_unavailable_fell_back_to_cheapest"
+
+
+def test_a_multi_group_gseqless_bid_is_never_silently_assigned_group_1(
+    observations, run_deploy, caplog
+) -> None:
+    """(b) ⛔ Two groups: which group a gseq-less bid is for is unknowable. It must stay
+    gseq None with NO profile, the whole auction takes the core's explicit fallback, and the
+    call site logs how many bids did not say."""
+    derived = _submitted_profiles(TWO_GROUPS)
+    assert derived.placement_group_count == 2 and len(derived.profiles) == 2
+    _raw, result = _auction([_bid_without_gseq(CHEAP, "1"), _bid(DEAR, "9")], derived)
+    cheap_obs = [o for o in observations if o.provider == CHEAP]
+    assert len(cheap_obs) == 1
+    assert cheap_obs[0].gseq is None, "a multi-group gseq-less bid was assigned a group"
+    assert cheap_obs[0].resource_profile is None
+    assert result.selection_reason == "emptiest_request_profile_unavailable_fell_back_to_cheapest"
+
+    caplog.set_level(logging.INFO)
+    run_deploy(
+        sdl=TWO_GROUPS,
+        capacity=FIT_SPLIT,
+        bids=[_bid_without_gseq(CHEAP, "1"), _bid(DEAR, "9")],
+    )
+    assert "gseqless_bids=1" in caplog.text

@@ -68,10 +68,17 @@ class DerivedProfiles:
     profiles: dict[int, ResourceProfile] = field(default_factory=dict)
     unavailable_reason: str | None = None
     sdl_sha256: str = ""
+    # Declared `profiles.placement` groups, recorded as soon as that section parses —
+    # even when derivation then fails — so "one group" and "a profile was derived" stay
+    # two separate facts. None = the placement section itself was unreadable.
+    placement_group_count: int | None = None
 
-    def describe(self) -> str:
-        """One log line naming the artefact the profile was derived from."""
+    def describe(self, gseqless_bids: int | None = None) -> str:
+        """One log line naming the artefact the profile was derived from, and how many
+        bids in this round did not say which group they are for."""
         source = f"sdl_sha256={self.sdl_sha256[:12]}"
+        if gseqless_bids is not None:
+            source += f" gseqless_bids={gseqless_bids}"
         if self.unavailable_reason is not None:
             return f"REQUEST_PROFILE unavailable reason={self.unavailable_reason} {source}"
         groups = " ".join(
@@ -152,11 +159,13 @@ def _replica_request(compute: dict, profile_name: object) -> tuple[int, int, int
 def derive_resource_profiles(sdl_text: str) -> DerivedProfiles:
     """Derive one aggregate `ResourceProfile` per gseq from the exact SDL text submitted."""
     digest = hashlib.sha256(sdl_text.encode("utf-8")).hexdigest()
+    placement_group_count: int | None = None
     try:
         document = _mapping(yaml.safe_load(sdl_text), "SDL")
         profiles_section = _mapping(document.get("profiles"), "profiles")
         compute = _mapping(profiles_section.get("compute"), "profiles.compute")
         placement_names = list(_mapping(profiles_section.get("placement"), "profiles.placement"))
+        placement_group_count = len(placement_names)
         deployment = _mapping(document.get("deployment"), "deployment")
 
         totals: dict[str, list[int]] = {}
@@ -188,8 +197,14 @@ def derive_resource_profiles(sdl_text: str) -> DerivedProfiles:
         }
     except (_Unreadable, ValueError, yaml.YAMLError, TypeError) as exc:
         reason = re.sub(r"\s+", "_", str(exc).strip())[:120] or type(exc).__name__
-        return DerivedProfiles(unavailable_reason=reason, sdl_sha256=digest)
-    return DerivedProfiles(profiles=derived, sdl_sha256=digest)
+        return DerivedProfiles(
+            unavailable_reason=reason,
+            sdl_sha256=digest,
+            placement_group_count=placement_group_count,
+        )
+    return DerivedProfiles(
+        profiles=derived, sdl_sha256=digest, placement_group_count=placement_group_count
+    )
 
 
 def attach_profile(profiles: dict[int, ResourceProfile] | None, gseq: int | None) -> Any:
@@ -198,3 +213,31 @@ def attach_profile(profiles: dict[int, ResourceProfile] | None, gseq: int | None
     if not profiles or gseq is None:
         return None
     return profiles.get(gseq)
+
+
+def observed_gseq(
+    extracted: int | None,
+    profiles: dict[int, ResourceProfile] | None,
+    placement_group_count: int | None,
+) -> int | None:
+    """The group a bid is OBSERVED for in the auction.
+
+    A bid that names its gseq keeps it. A bid that does not is observed as gseq 1 ONLY when
+    the submitted SDL declares exactly one placement group AND a profile was derived for
+    it. With one group there is no other group it can be for, and the lease path already
+    uses 1 for that bid (`_extract_gseq(...) or 1`), so auction and lease agree.
+
+    ⛔ Measured without this: in a one-group deployment a gseq-less bid carried no profile,
+    skipped the fit check, and won — while also downgrading the WHOLE auction to cheapest
+    (`profiles_complete` false in akash-lease-core `auction.py:844`).
+
+    ⛔ Two or more groups: still None. Which group a gseq-less bid is for is not knowable,
+    so it gets no profile and the core's explicit fallback applies. This is not
+    `_extract_gseq` guessing 1 (api.py:760): extraction still returns None, and the
+    caller applies its default only where the SDL proves there is a single group.
+    """
+    if extracted is not None:
+        return extracted
+    if placement_group_count == 1 and profiles:
+        return 1
+    return None

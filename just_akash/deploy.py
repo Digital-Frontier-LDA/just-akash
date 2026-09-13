@@ -41,7 +41,7 @@ from .api import (
 from .deployment_receipt import mark_create_response_received, mark_submitting, prepare_receipt
 from .provenance import PLACEMENT_PREFIX, SIBLING_REAPED_PREFIX, run_id_of, stamp_run
 from .provider_capacity import capacity_by_provider
-from .request_profile import attach_profile, derive_resource_profiles
+from .request_profile import attach_profile, derive_resource_profiles, observed_gseq
 from .sdl_validate import SDLValidationError, validate_sdl
 from .smoke_providers import _probe_age_seconds
 
@@ -567,6 +567,11 @@ def _resolve_selection(select: str) -> "PreferredSelection":
     return table[key]
 
 
+def _count_gseqless(bids: list) -> int:
+    """Bids in this round that do not say which group they are for (see observed_gseq)."""
+    return sum(1 for bid in bids if isinstance(bid, dict) and _extract_gseq(bid) is None)
+
+
 def _select_auction_bid(
     bids: list,
     *,
@@ -580,6 +585,7 @@ def _select_auction_bid(
     preferred_selection: "PreferredSelection | None" = None,
     already_selected: frozenset[str] | None = None,
     resource_profiles: "dict[int, ResourceProfile] | None" = None,
+    placement_group_count: int | None = None,
 ):
     """Normalize Console bids and delegate the decision to the shared core.
 
@@ -620,7 +626,7 @@ def _select_auction_bid(
             continue
         amount, denom = _extract_bid_price(raw_bid)
         bid_key = f"{provider}:{index}"
-        gseq = _extract_gseq(raw_bid)
+        gseq = observed_gseq(_extract_gseq(raw_bid), resource_profiles, placement_group_count)
         try:
             observation = BidObservation(
                 bid_key=bid_key,
@@ -1380,7 +1386,10 @@ def deploy(
     # REQUEST PROFILE (just-akash#346): derived ONCE, from `sdl_content` — the exact text
     # `create_deployment` submitted — so the fit check sees what was actually ordered.
     _request_profiles = derive_resource_profiles(sdl_content)
-    _log(logging.INFO, f"auction[collection] {_request_profiles.describe()}")
+    _log(
+        logging.INFO,
+        f"auction[collection] {_request_profiles.describe(_count_gseqless(bids))}",
+    )
     selected_bid, auction_result = _select_auction_bid(
         bids,
         preferred=preferred,
@@ -1393,6 +1402,7 @@ def deploy(
         preferred_selection=_selection,
         already_selected=_already_selected,
         resource_profiles=_request_profiles.profiles,
+        placement_group_count=_request_profiles.placement_group_count,
     )
     if auction_result.status is AuctionStatus.COLLECTING:
         fallback_deadline = start_time + bid_wait_retry
@@ -1468,7 +1478,10 @@ def deploy(
                             p for p, c in _capacity.items() if c.available_fraction() is None
                         ),
                     )
-        _log(logging.INFO, f"auction[fallback] {_request_profiles.describe()}")
+        _log(
+            logging.INFO,
+            f"auction[fallback] {_request_profiles.describe(_count_gseqless(bids))}",
+        )
         selected_bid, auction_result = _select_auction_bid(
             bids,
             preferred=preferred,
@@ -1481,6 +1494,7 @@ def deploy(
             preferred_selection=_selection,
             already_selected=_already_selected,
             resource_profiles=_request_profiles.profiles,
+            placement_group_count=_request_profiles.placement_group_count,
         )
     selection_phase = (
         1 if auction_result.selection_reason == "cheapest_preferred" or not has_allowlist else 2
