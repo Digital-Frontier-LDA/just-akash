@@ -86,10 +86,20 @@ sys.exit(0)
 """
 
 GH_STUB = r"""#!/usr/bin/env python3
-import json, os
-online = int(json.load(open(os.environ["STUB_SCENARIO"])).get("online", 0))
-runners = [{"id": i + 1, "status": "online", "version": "2.330.0",
-            "labels": [{"name": os.environ["RUNNER_LABEL"]}]} for i in range(online)]
+import json, os, sys
+sc = json.load(open(os.environ["STUB_SCENARIO"]))
+if "registration-token" in " ".join(sys.argv[1:]):
+    code = int(sc.get("token_status", 201))
+    print(f"HTTP/2.0 {code} stub\n\n" + ('{"token": "stub-token"}' if code == 201 else "{}"))
+    sys.exit(0 if code == 201 else 1)
+if sc.get("gh_fail"):
+    sys.stderr.write("HTTP 503\n"); sys.exit(1)
+runners = []
+for i in range(int(sc.get("online", 0))):
+    row = {"id": i + 1, "status": "online", "labels": [{"name": os.environ["RUNNER_LABEL"]}]}
+    if sc.get("version", "2.330.0") is not None:
+        row["version"] = sc.get("version", "2.330.0")
+    runners.append(row)
 print(json.dumps({"runners": runners}))
 """
 
@@ -225,6 +235,10 @@ def assert_monotonic(result: dict) -> None:
     first_real = next((i for i, v in enumerate(dseqs) if v), None)
     if first_real is not None:
         assert all(dseqs[first_real:]), f"an empty dseq followed a real one: {dseqs}"
+    owners = [v for k, v in result["writes"] if k == "wallet_address"]
+    first_owner = next((i for i, v in enumerate(owners) if v), None)
+    if first_owner is not None:
+        assert all(owners[first_owner:]), f"an empty owner followed a real one: {owners}"
 
 
 def deploys(result: dict) -> int:
@@ -340,6 +354,66 @@ def test_s2_unproven_post_provider_close_stops_before_another_deploy(tmp_path: P
     assert_monotonic(r)
 
 
+def _empty_version_projection(tmp_path: Path) -> dict:
+    """jq that drops only the version projection, so ids and versions disagree."""
+    wrap = tmp_path / "jq-wrap"
+    wrap.mkdir()
+    real = shutil.which("jq")
+    assert real, "jq is required to reach the empty-projection edge"
+    jq = wrap / "jq"
+    jq.write_text(
+        "#!/bin/bash\n"
+        'case "$*" in *".version"*) cat >/dev/null; exit 0 ;; esac\n'
+        f'exec {real} "$@"\n',
+        encoding="utf-8",
+    )
+    jq.chmod(0o755)
+    return {"PATH": f"{wrap}:{tmp_path / 'bin'}:{os.environ['PATH']}"}
+
+
+VERSION_EDGES = {
+    "empty-version-projection": ({}, "version projection empty"),
+    "dead-runner-version": ({"version": None}, "Landing gate: registered runners are not running"),
+}
+
+
+@pytest.mark.parametrize("edge", sorted(VERSION_EDGES))
+@pytest.mark.parametrize("verdict", ["open", "closed"])
+def test_s2_version_gate_retry_edges_go_through_the_proof(
+    tmp_path: Path, edge: str, verdict: str
+) -> None:
+    """The two landing-gate discards, reached through the real poll: an unproven close
+    stops at one deploy; a proven close continues to the next attempt."""
+    extra, warning = VERSION_EDGES[edge]
+    env = _empty_version_projection(tmp_path) if edge == "empty-version-projection" else None
+    r = run_step(
+        tmp_path,
+        {
+            "owner": OWNER,
+            "online": 1,
+            **extra,
+            "destroy": {"1001": "ok"},
+            "verify": {"1001": verdict},
+            "rounds": [
+                {"dseq": "1001", "provider": PROVIDER_A},
+                {"dseq": "1002", "provider": PROVIDER_B},
+            ],
+        },
+        env_extra=env,
+    )
+    assert warning in r["log"], r["log"][-2000:]
+    assert "verify-closed dseq=1001" in r["calls"], r["calls"]
+    if verdict == "open":
+        assert deploys(r) == 1, f"a second deploy followed an unproven close: {r['calls']}"
+        assert last(r, "failure_reason") == "LEASE_CLOSE_UNVERIFIED"
+        assert last(r, "dseq") == "1001"
+    else:
+        assert deploys(r) == 2, r["calls"]
+        assert last(r, "dseq") == "1002"
+    assert last(r, "deployment_outcome") == "created"
+    assert_monotonic(r)
+
+
 # ── S3 (must stay green): a proven close does allow the next attempt ─────────────
 
 
@@ -380,6 +454,72 @@ def test_s4_a_later_empty_round_never_blanks_the_published_dseq(tmp_path: Path) 
     assert deploys(r) == 3, r["calls"]
     assert last(r, "dseq") == "1001", r["writes"]
     assert last(r, "deployment_outcome") == "created"
+    assert_monotonic(r)
+
+
+def test_s5_a_later_empty_round_never_blanks_the_owner_of_the_published_dseq(
+    tmp_path: Path,
+) -> None:
+    """#348: teardown passes --expected-owner only for a non-empty wallet_address."""
+    r = run_step(
+        tmp_path,
+        {
+            "owner": OWNER,
+            "verify": {"1001": "closed"},
+            "destroy": {"1001": "ok"},
+            "rounds": [{"dseq": "1001"}, {"text": "unclassified"}],
+        },
+    )
+    assert deploys(r) == 3, r["calls"]
+    assert last(r, "dseq") == "1001", r["writes"]
+    owners = [v for k, v in r["writes"] if k == "wallet_address"]
+    assert owners == [OWNER], owners
+
+
+# ── S6: every exit reached after a lease was created keeps created ───────────────
+
+
+@pytest.mark.parametrize(
+    ("scenario_extra", "reason"),
+    [
+        ({"gh_fail": True, "online": 1}, "GITHUB_API_UNAVAILABLE"),
+        ({"token_status": 401}, "RUNNER_PAT_INVALID"),
+        ({"token_status": 429}, "GITHUB_API_UNAVAILABLE"),
+        ({"token_status": 500}, "INDETERMINATE"),
+        ({"token_status": 201}, "RUNNER_NEVER_REGISTERED"),
+    ],
+    ids=[
+        "listing-unreadable",
+        "verdict-401",
+        "verdict-429",
+        "verdict-unknown",
+        "never-registered",
+    ],
+)
+def test_s6_a_post_create_exit_never_publishes_no_deployment(
+    tmp_path: Path, scenario_extra: dict, reason: str
+) -> None:
+    """The removed #345 ratchet pinned "no post-submit no-deployment write" as text.
+    This runs each post-create failure exit instead, so a write inserted on any of
+    these paths is observed, whatever its wording or position."""
+    r = run_step(
+        tmp_path,
+        {
+            "owner": OWNER,
+            "destroy": {"1001": "ok"},
+            "verify": {"1001": "closed"},
+            "rounds": [{"dseq": "1001", "provider": PROVIDER_A}],
+            **scenario_extra,
+        },
+        env_extra={"MAX_ATTEMPTS": "1"},
+    )
+    assert r["rc"] != 0
+    assert deploys(r) == 1, r["calls"]
+    assert last(r, "failure_reason") == reason, r["writes"]
+    outcomes = [v for k, v in r["writes"] if k == "deployment_outcome"]
+    assert "no-deployment" not in outcomes and outcomes[-1] == "created", outcomes
+    assert last(r, "dseq") == "1001"
+    assert last(r, "wallet_address") == OWNER
     assert_monotonic(r)
 
 

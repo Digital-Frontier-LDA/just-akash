@@ -1022,7 +1022,9 @@ jobs:
             # Publish the create-time owner as soon as it is available. Internal
             # rollback runs only on a failed handoff, so a success-only publication
             # leaves precisely that teardown without the bound-owner fallback.
-            echo "wallet_address=$WALLET" >> "$GITHUB_OUTPUT"
+            # Monotonic beside dseq (#348): a round with no DSEQ, or no parsed
+            # owner, never overwrites the owner already published for the lease.
+            [ -n "$DSEQ" ] && [ -n "$WALLET" ] && echo "wallet_address=$WALLET" >> "$GITHUB_OUTPUT"
             WALLET_UACT=$(awk '/^[[:space:]]*Wallet available:/{print $(NF-1); exit}' /tmp/ja.log || true)
 
             # A DSEQ with no PROVIDER is a REAL deployment we would otherwise walk away
