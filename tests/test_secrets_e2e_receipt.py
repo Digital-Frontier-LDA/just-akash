@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from just_akash import deploy as deploy_module
 from just_akash import test_secrets_e2e as target
 from just_akash.deployment_receipt import (
     mark_create_response_received,
@@ -19,6 +20,9 @@ from just_akash.deployment_receipt import (
 )
 
 OWNER = "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee"
+OPERATION_ID = "e2e-secrets-test"
+RUN_ID = "abc123def456"
+GROUP = f"just-akash-secrets.{RUN_ID}"
 SDL = """---
 version: "2.0"
 services:
@@ -33,25 +37,25 @@ profiles:
         memory: {size: 1Gi}
         storage: {size: 1Gi}
   placement:
-    group-one:
+    just-akash-secrets.abc123def456:
       pricing:
         app: {denom: uakt, amount: 1}
 deployment:
   app:
-    group-one:
+    just-akash-secrets.abc123def456:
       profile: app
       count: 1
 """
 
 
-def _prepared(tmp_path: Path):
+def _prepared(tmp_path: Path, *, sdl: str = SDL, operation_id: str = OPERATION_ID):
     tmp_path.chmod(0o700)
     path = tmp_path / "receipt.json"
     return prepare_receipt(
         str(path),
-        operation_id="e2e-secrets-test",
+        operation_id=operation_id,
         owner=OWNER,
-        sdl_content=SDL,
+        sdl_content=sdl,
     )
 
 
@@ -67,8 +71,8 @@ def test_a_submitting_receipt_runs_reconciliation_once(monkeypatch, tmp_path: Pa
         lambda got_client, started, operation: calls.append((got_client, started, operation)),
     )
 
-    assert target._reconcile_receipt(prepared[0], "operation-7", 123.0, "test-key") is None
-    assert calls == [(client, 123.0, "operation-7")]
+    assert target._reconcile_receipt(prepared[0], OPERATION_ID, 123.0, "test-key") is None
+    assert calls == [(client, 123.0, RUN_ID)]
 
 
 def test_a_response_receipt_recovers_exact_dseq_without_population_probe(
@@ -82,7 +86,122 @@ def test_a_response_receipt_recovers_exact_dseq_without_population_probe(
         lambda *_: (_ for _ in ()).throw(AssertionError("response receipt must not probe")),
     )
 
-    assert target._reconcile_receipt(submitting[0], "operation-7", 123.0, "test-key") == "1002"
+    assert target._reconcile_receipt(submitting[0], OPERATION_ID, 123.0, "test-key") == "1002"
+
+
+def test_submitting_receipt_uses_its_stamped_run_for_real_orphan_close_and_mutation(
+    monkeypatch, tmp_path: Path
+) -> None:
+    submitting = mark_submitting(*_prepared(tmp_path))
+    dseq = "123000"
+    network_closes = []
+    bound_closes = []
+
+    class Client:
+        def list_deployments(self, *, active_only: bool):
+            assert active_only is True
+            return [{"dseq": dseq, "leases": []}]
+
+        def account_address(self) -> str:
+            return OWNER
+
+        def close_deployment(self, got_dseq: str) -> None:
+            network_closes.append((self, got_dseq))
+
+    client = Client()
+    monkeypatch.setattr(target, "AkashConsoleAPI", lambda _api_key: client)
+    monkeypatch.setattr(
+        deploy_module.chain,
+        "deployment_group_names",
+        lambda owner, got_dseq: (
+            [GROUP]
+            if (owner, got_dseq) == (OWNER, dseq)
+            else (_ for _ in ()).throw(AssertionError((owner, got_dseq)))
+        ),
+    )
+    real_close = deploy_module._close_proven_orphan
+
+    def observed_close(got_client, got_dseq: str, group: str) -> bool:
+        bound_closes.append((got_client, got_dseq, group))
+        return real_close(got_client, got_dseq, group)
+
+    monkeypatch.setattr(deploy_module, "_close_proven_orphan", observed_close)
+    assert target._reconcile_receipt(submitting[0], OPERATION_ID, 123.0, "test-key") is None
+    assert bound_closes == [(client, dseq, GROUP)]
+    assert network_closes == [(client, dseq)]
+
+    source = textwrap.dedent(inspect.getsource(target._reconcile_receipt))
+    call = "_report_suspected_orphans(AkashConsoleAPI(api_key), started_at, provenance_run_id)"
+    assert source.count(call) == 1, f"reconciliation target count changed: {source.count(call)}"
+    mutated = source.replace(
+        call,
+        "_report_suspected_orphans(AkashConsoleAPI(api_key), started_at, operation_id)",
+    )
+    assert mutated != source and mutated.count(call) == 0
+    namespace = {
+        "Path": Path,
+        "AkashConsoleAPI": target.AkashConsoleAPI,
+        "decode_receipt": target.decode_receipt,
+        "log_fail": target.log_fail,
+        "log_info": target.log_info,
+        "_receipt_provenance_run_id": target._receipt_provenance_run_id,
+        "_report_suspected_orphans": target._report_suspected_orphans,
+    }
+    exec(mutated, namespace)  # noqa: S102 - executable effect mutation
+    bound_closes.clear()
+    network_closes.clear()
+    assert namespace["_reconcile_receipt"](submitting[0], OPERATION_ID, 123.0, "test-key") is None
+    assert bound_closes == [] and network_closes == [], (
+        "operation_id mutant unexpectedly retained the exact-run close effect"
+    )
+
+
+def _sdl_for_groups(groups: list[str]) -> str:
+    placements = "\n".join(
+        f"    {group}:\n      pricing:\n        app: {{denom: uakt, amount: 1}}"
+        for group in groups
+    )
+    deployment = "\n".join(f"    {group}:\n      profile: app\n      count: 1" for group in groups)
+    return SDL.replace(
+        "    just-akash-secrets.abc123def456:\n"
+        "      pricing:\n"
+        "        app: {denom: uakt, amount: 1}",
+        placements,
+    ).replace(
+        "    just-akash-secrets.abc123def456:\n      profile: app\n      count: 1",
+        deployment,
+    )
+
+
+@pytest.mark.parametrize(
+    "groups",
+    [
+        ["foreign-workload"],
+        ["just-akash-one.abc123", "just-akash-two.def456"],
+        ["just-akash-one.abc123", "foreign-workload"],
+    ],
+    ids=["foreign", "mismatched-run-ids", "partially-stamped"],
+)
+def test_unbound_or_disagreeing_receipt_groups_remain_held_before_population_read(
+    monkeypatch, tmp_path: Path, groups: list[str], capsys
+) -> None:
+    submitting = mark_submitting(*_prepared(tmp_path, sdl=_sdl_for_groups(groups)))
+    calls = []
+    monkeypatch.setattr(target, "_report_suspected_orphans", lambda *args: calls.append(args))
+
+    assert target._reconcile_receipt(submitting[0], OPERATION_ID, 123.0, "test-key") is None
+    assert calls == []
+    assert "HELD: reconciliation could not complete" in capsys.readouterr().out
+
+
+def test_receipt_operation_id_disagreement_is_held_independently_of_provenance(
+    monkeypatch, tmp_path: Path
+) -> None:
+    submitting = mark_submitting(*_prepared(tmp_path))
+    calls = []
+    monkeypatch.setattr(target, "_report_suspected_orphans", lambda *args: calls.append(args))
+    assert target._reconcile_receipt(submitting[0], "another-operation", 123.0, "test-key") is None
+    assert calls == []
 
 
 def test_timeout_terminates_the_complete_just_up_process_group(monkeypatch) -> None:

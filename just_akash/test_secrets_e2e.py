@@ -38,7 +38,8 @@ from ._e2e import (
 )
 from .api import AkashConsoleAPI
 from .deploy import _report_suspected_orphans
-from .deployment_receipt import decode_receipt
+from .deployment_receipt import DeploymentReceipt, decode_receipt
+from .provenance import run_id_of
 
 GREEN = "\033[92m"
 RED = "\033[91m"
@@ -168,6 +169,30 @@ def _verified_cleanup(dseq_ref: dict) -> bool:
     return True
 
 
+def _receipt_provenance_run_id(receipt: DeploymentReceipt) -> str:
+    """Return one run stamp shared by the receipt's complete group population.
+
+    ``operation_id`` identifies the caller's lifecycle operation. It is deliberately
+    independent of the private hexadecimal run id that ``deploy`` stamps into every
+    owned placement group. Orphan reconciliation needs the latter: substituting the
+    former makes the exact-this-run close branch unreachable.
+    """
+    population = receipt.get("group_population")
+    if not isinstance(population, list) or not population:
+        raise RuntimeError("receipt has no complete group population")
+    run_ids = []
+    for entry in population:
+        name = entry.get("name") if isinstance(entry, dict) else None
+        run_id = run_id_of(name) if isinstance(name, str) else ""
+        if not run_id:
+            raise RuntimeError("receipt group population has an unstamped or foreign group")
+        run_ids.append(run_id)
+    unique = set(run_ids)
+    if len(unique) != 1:
+        raise RuntimeError("receipt group population disagrees on its provenance run id")
+    return run_ids[0]
+
+
 def _reconcile_receipt(
     receipt_path: Path, operation_id: str, started_at: float, api_key: str
 ) -> str | None:
@@ -176,6 +201,9 @@ def _reconcile_receipt(
         receipt = decode_receipt(receipt_path.read_bytes())
     except Exception as exc:  # noqa: BLE001 - report ambiguity without replacing it
         log_fail(f"HELD: create receipt unreadable ({exc}); manual reconciliation required")
+        return None
+    if receipt["operation_id"] != operation_id:
+        log_fail("HELD: create receipt operation ID disagrees with this lifecycle operation")
         return None
     if receipt["state"] == "create_response_received":
         dseq = str(receipt["dseq"])
@@ -187,7 +215,8 @@ def _reconcile_receipt(
             "owner-scoped/provenance reconciliation before exit"
         )
         try:
-            _report_suspected_orphans(AkashConsoleAPI(api_key), started_at, operation_id)
+            provenance_run_id = _receipt_provenance_run_id(receipt)
+            _report_suspected_orphans(AkashConsoleAPI(api_key), started_at, provenance_run_id)
         except Exception as exc:  # noqa: BLE001 - reconciliation failure remains HELD
             log_fail(f"HELD: reconciliation could not complete ({exc})")
     return None

@@ -214,13 +214,13 @@ backend endpoint, producer repository/class, protected workflow, or globally uni
 operation registry, so Guardian must keep create and close authority held on this artifact
 alone.
 
-All receipt flags are required together. Existing leaves, symlinks, malformed state,
-non-private paths, signer/group/digest disagreement, and non-canonical DSEQs are refused.
-The file remains after success or failure and is never reused; cleanup must still verify
-fresh owner-bound chain evidence before closing it. The digest covers bytes after
-`just-akash` transformations. Receipt mode therefore requires an already-rendered SDL
-whose submitted bytes remain predictable; `--image`, `--env`, or automatic
-`just-akash-*` run stamping is refused when it changes the caller-supplied digest.
+Both receipt flags are required together. Existing leaves, symlinks, malformed state,
+non-private paths, derived signer/group/digest disagreement, and non-canonical DSEQs are
+refused. The file remains after `deploy` returns and is never reused; a lifecycle wrapper
+may remove it only after an exact owner-bound close is positively verified. The artifact
+digest covers the bytes after `just-akash` applies `--image`, `--env`, and automatic
+`just-akash-*` run stamping, so those transforms remain supported in receipt mode and are
+part of the recorded identity.
 Only an explicit Console `already exists` response enters the legacy stale-cleanup-and-one-
 retry path. Timeouts and all other unknown create outcomes are never retried. Once a
 receipt exists, re-invocation with the same path is refused, including when the
