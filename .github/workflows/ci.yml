@@ -498,6 +498,15 @@ jobs:
       - name: Run E2E secrets test
         run: uv run python -m just_akash.test_secrets_e2e
 
+      - name: Preserve unresolved deployment receipt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-secrets-deployment-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/just-akash-secrets-receipt/create.json
+          if-no-files-found: ignore
+          retention-days: 30
+
   # The predicate is the PR AUTHOR, not github.actor. github.actor is whoever triggered
   # THIS RUN, so a human clicking "Re-run all jobs" on a red dependabot PR would flip the
   # guard: the E2E jobs would run again, still without secrets, fail again -- and the

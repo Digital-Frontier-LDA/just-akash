@@ -296,6 +296,26 @@ def test_s1_created_then_a_later_402_still_publishes_created(tmp_path: Path) -> 
     assert_monotonic(r)
 
 
+def test_later_ambiguous_create_dominates_an_earlier_closed_dseq(tmp_path: Path) -> None:
+    r = run_step(
+        tmp_path,
+        {
+            "owner": OWNER,
+            "verify": {"1001": "closed"},
+            "destroy": {"1001": "ok"},
+            "rounds": [
+                {"dseq": "1001"},
+                {"text": '{"code":"NO_DSEQ_RETURNED"}'},
+            ],
+        },
+    )
+    assert deploys(r) == 2, r["calls"]
+    assert r["rc"] != 0
+    assert last(r, "failure_reason") == "CREATE_OUTCOME_AMBIGUOUS"
+    assert last(r, "deployment_outcome") == "unknown"
+    assert last(r, "dseq") == "1001", "the stale identity is diagnostic only"
+
+
 def test_s1b_created_then_no_eligible_provider_still_publishes_created(tmp_path: Path) -> None:
     """Both candidates get excluded by post-provider discards; the next round has no bidder."""
     r = run_step(

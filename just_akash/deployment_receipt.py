@@ -267,41 +267,23 @@ def prepare_receipt(
     path: str,
     *,
     operation_id: str,
-    expected_owner: str,
-    expected_groups: list[str],
-    expected_artifact_digest: str,
+    owner: str,
     sdl_content: str,
 ) -> tuple[Path, PreparedDeploymentReceipt, bytes]:
-    """Validate caller expectations and durably create the pre-send receipt."""
+    """Derive and durably bind the selected signer and exact submitted SDL."""
 
     population, population_digest, artifact_digest = artifact_identity(sdl_content)
-    derived_groups = [str(group["name"]) for group in population]
-    if derived_groups != expected_groups:
-        raise RuntimeError(
-            "receipt expected group population does not equal the complete submitted "
-            "SDL population"
-        )
-    if not is_canonical_akash_address(expected_owner):
-        raise RuntimeError("receipt expected owner must be a canonical akash1 address")
+    if not is_canonical_akash_address(owner):
+        raise RuntimeError("receipt owner must be a canonical akash1 address")
     if not isinstance(operation_id, str) or not re.fullmatch(
         r"[A-Za-z0-9._:-]{1,128}", operation_id
     ):
         raise RuntimeError("receipt operation ID has an invalid or empty shape")
-    if not isinstance(expected_artifact_digest, str) or not re.fullmatch(
-        r"[0-9A-Fa-f]{64}", expected_artifact_digest
-    ):
-        raise RuntimeError("receipt artifact digest must be exactly 64 hexadecimal characters")
-    normalized_digest = expected_artifact_digest.lower()
-    if normalized_digest != artifact_digest:
-        raise RuntimeError(
-            f"receipt artifact digest mismatch: expected {normalized_digest}, "
-            f"derived {artifact_digest}"
-        )
     receipt: PreparedDeploymentReceipt = {
         "receipt_type": RECEIPT_TYPE,
         "state": "prepared",
         "operation_id": operation_id,
-        "expected_owner": expected_owner,
+        "expected_owner": owner,
         "group_population": population,
         "group_population_digest": population_digest,
         "artifact_digest": artifact_digest,

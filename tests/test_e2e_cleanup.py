@@ -27,6 +27,8 @@ from just_akash._e2e import (
     robust_destroy,
 )
 
+OWNER = "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee"
+
 
 @pytest.fixture(autouse=True)
 def _reset_e2e_state(monkeypatch):
@@ -145,6 +147,24 @@ class TestRobustDestroy:
             ]
             assert robust_destroy("12345") is True
             assert mock_run.call_count == 2
+
+    def test_receipt_bound_destroy_passes_exact_owner_and_group(self):
+        with (
+            patch("just_akash._e2e.subprocess.run") as mock_run,
+            patch("just_akash._e2e._confirm_settled", return_value=True) as settled,
+        ):
+            mock_run.return_value = _completed(0, stdout="Deployment 12345 destroyed")
+            assert robust_destroy("12345", owner=OWNER, group="group-one") is True
+        command = mock_run.call_args.args[0]
+        assert command.count("--expected-owner") == 1
+        assert command.count("--expected-group") == 1
+        assert OWNER in command and "group-one" in command
+        settled.assert_called_once_with("12345", OWNER)
+
+    def test_group_without_owner_is_held_before_any_destroy(self):
+        with patch("just_akash._e2e.subprocess.run") as mock_run:
+            assert robust_destroy("12345", group="group-one") is False
+        mock_run.assert_not_called()
 
     def test_retry_after_first_failure(self):
         with (

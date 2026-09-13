@@ -301,6 +301,7 @@ def robust_destroy(
     dseq: str,
     *,
     owner: str | None = None,
+    group: str | None = None,
     retries: int = 2,
     audit: bool = True,
 ) -> bool:
@@ -318,6 +319,9 @@ def robust_destroy(
     if owner is not None and not is_canonical_akash_address(owner):
         _fail(f"Cleanup held for {dseq}: invalid owner identity")
         return False
+    if group is not None and (owner is None or not re.fullmatch(r"[A-Za-z0-9._-]+", group)):
+        _fail(f"Cleanup held for {dseq}: invalid or owner-less group identity")
+        return False
     # Clamp negative retries so a caller mistake (or signal-handler default
     # of retries=1 minus a typo) never silently skips the destroy loop. Empty
     # range with retries<0 used to issue ZERO destroy commands but still
@@ -326,7 +330,15 @@ def robust_destroy(
     last_err = ""
     for attempt in range(1, retries + 2):
         try:
-            r = _run(f"just destroy {shlex.quote(str(dseq))}", input_text="y\n", timeout=60)
+            if owner is None or group is None:
+                command = f"just destroy {shlex.quote(str(dseq))}"
+            else:
+                command = (
+                    f"uv run just-akash destroy --dseq {shlex.quote(str(dseq))} "
+                    f"--expected-owner {shlex.quote(owner)} -y"
+                )
+                command += f" --expected-group {shlex.quote(group)}"
+            r = _run(command, input_text="y\n", timeout=60)
             if _destroy_succeeded(r):
                 _pass(
                     f"destroy reported success for {dseq} (attempt {attempt}) "
@@ -375,18 +387,28 @@ def robust_destroy(
     return False
 
 
-def destroy_owned_deployment(dseq: str, *, retries: int = 2, audit: bool = True) -> bool:
+def destroy_owned_deployment(
+    dseq: str,
+    *,
+    owner: str | None = None,
+    group: str | None = None,
+    retries: int = 2,
+    audit: bool = True,
+) -> bool:
     """Resolve owner before the first close byte, then run owner-scoped cleanup.
 
     Owner resolution failure is a hold: a shared wallet DSEQ without its owner is
     insufficient authority to select and verify a deployment.
     """
-    try:
-        owner = resolve_deployment_owner(dseq)
-    except Exception as exc:  # noqa: BLE001 — cleanup reports and holds
-        _fail(f"Cleanup held for {dseq}: owner could not be resolved ({exc})")
-        return False
-    return robust_destroy(dseq, owner=owner, retries=retries, audit=audit)
+    if owner is None:
+        try:
+            owner = resolve_deployment_owner(dseq)
+        except Exception as exc:  # noqa: BLE001 — cleanup reports and holds
+            _fail(f"Cleanup held for {dseq}: owner could not be resolved ({exc})")
+            return False
+    if group is None:
+        return robust_destroy(dseq, owner=owner, retries=retries, audit=audit)
+    return robust_destroy(dseq, owner=owner, group=group, retries=retries, audit=audit)
 
 
 def _signal_handler(signum, _frame):
@@ -421,7 +443,11 @@ def _signal_handler(signum, _frame):
                         _fail(f"Cleanup held for {dseq}: owner could not be resolved ({exc})")
                         cleaned_any = True
                         continue
-                robust_destroy(dseq, owner=owner, retries=1, audit=True)
+                group = (ref or {}).get("group") or None
+                if group is None:
+                    robust_destroy(dseq, owner=owner, retries=1, audit=True)
+                else:
+                    robust_destroy(dseq, owner=owner, group=group, retries=1, audit=True)
                 cleaned_any = True
         if not cleaned_any:
             _info("No DSEQ recorded yet — nothing to clean up")

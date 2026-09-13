@@ -20,12 +20,12 @@ import json as _json
 import os
 import re
 import secrets
-import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import time
+from contextlib import suppress
 from pathlib import Path
 
 from ._e2e import (
@@ -38,7 +38,7 @@ from ._e2e import (
 )
 from .api import AkashConsoleAPI
 from .deploy import _report_suspected_orphans
-from .deployment_receipt import artifact_identity, decode_receipt
+from .deployment_receipt import decode_receipt
 
 GREEN = "\033[92m"
 RED = "\033[91m"
@@ -89,30 +89,39 @@ def _run_just_up(
         env=env,
         start_new_session=True,
     )
+
+    def terminate_group() -> tuple[str, str]:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            return process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            return process.communicate()
+
     try:
         stdout, stderr = process.communicate(timeout=timeout)
         result = subprocess.CompletedProcess(["just", "up"], process.returncode, stdout, stderr)
         return result, False
     except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGTERM)
-        try:
-            stdout, stderr = process.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            stdout, stderr = process.communicate()
+        stdout, stderr = terminate_group()
         result = subprocess.CompletedProcess(["just", "up"], process.returncode, stdout, stderr)
         return result, True
+    except BaseException:
+        # SIGINT/SIGTERM handlers raise SystemExit, and KeyboardInterrupt plus any
+        # other BaseException must still contain the paid create subprocess tree.
+        terminate_group()
+        raise
 
 
-def _receipt_environment(api_key: str) -> tuple[Path, str, dict[str, str]]:
-    """Bind owner, complete group population and submitted bytes before create starts."""
-    sdl = Path("sdl/cpu-backtest-ssh.yaml")
-    population, _, artifact_digest = artifact_identity(sdl.read_text(encoding="utf-8"))
-    groups = [str(row["name"]) for row in population]
-    if len(groups) != 1:
-        raise RuntimeError(f"secrets E2E expects exactly one deployment group, got {groups}")
-    owner = AkashConsoleAPI(api_key).account_address()
-    receipt_dir = Path(tempfile.mkdtemp(prefix="just-akash-secrets-receipt-"))
+def _receipt_environment() -> tuple[Path, str, dict[str, str]]:
+    """Choose the durable path; deploy derives signer and final artifact identity."""
+    runner_temp = os.environ.get("RUNNER_TEMP")
+    if runner_temp:
+        receipt_dir = Path(runner_temp) / "just-akash-secrets-receipt"
+        receipt_dir.mkdir(mode=0o700, parents=False, exist_ok=True)
+        receipt_dir.chmod(0o700)
+    else:
+        receipt_dir = Path(tempfile.mkdtemp(prefix="just-akash-secrets-receipt-"))
     receipt_path = receipt_dir / "create.json"
     operation_id = f"e2e-secrets-{secrets.token_hex(8)}"
     return (
@@ -120,12 +129,43 @@ def _receipt_environment(api_key: str) -> tuple[Path, str, dict[str, str]]:
         operation_id,
         {
             "JUST_AKASH_RECEIPT_PATH": str(receipt_path),
-            "JUST_AKASH_RECEIPT_OWNER": owner,
-            "JUST_AKASH_RECEIPT_GROUP": groups[0],
-            "JUST_AKASH_RECEIPT_ARTIFACT_SHA256": artifact_digest,
             "JUST_AKASH_RECEIPT_OPERATION_ID": operation_id,
         },
     )
+
+
+def _receipt_identity(receipt_path: Path) -> tuple[str, str | None, str, str]:
+    receipt = decode_receipt(receipt_path.read_bytes())
+    population = receipt["group_population"]
+    if len(population) != 1 or population[0].get("gseq") != 1:
+        raise RuntimeError(
+            "secrets E2E cleanup requires the receipt's complete population to be one gseq=1 group"
+        )
+    group = population[0].get("name")
+    if not isinstance(group, str) or not group:
+        raise RuntimeError("receipt group identity is invalid")
+    dseq = str(receipt["dseq"]) if receipt["state"] == "create_response_received" else None
+    return receipt["state"], dseq, receipt["expected_owner"], group
+
+
+def _delete_receipt(receipt_path: Path) -> None:
+    receipt_path.unlink(missing_ok=True)
+    with suppress(OSError):
+        receipt_path.parent.rmdir()
+
+
+def _verified_cleanup(dseq_ref: dict) -> bool:
+    """Clear receipt identity only after exact destruction and positive closure audit."""
+    dseq = dseq_ref.get("dseq")
+    if not dseq or not robust_destroy(
+        dseq, owner=dseq_ref.get("owner"), group=dseq_ref.get("group")
+    ):
+        return False
+    dseq_ref["dseq"] = None
+    receipt_path = dseq_ref.get("receipt_path")
+    if isinstance(receipt_path, Path):
+        _delete_receipt(receipt_path)
+    return True
 
 
 def _reconcile_receipt(
@@ -226,41 +266,61 @@ def main():
 
     install_signal_cleanup(dseq_ref)
 
-    # Create-time identity is fixed before the paid command starts. The deploy writes
-    # this private receipt to `submitting` before POST and to
-    # `create_response_received` before auction work, so timeout and empty stdout do
-    # not erase the only rollback handle.
+    # Deploy binds its selected signer and final transformed SDL into this private
+    # receipt before POST, then records the response DSEQ before auction work.
     api_key = os.environ["AKASH_API_KEY"]
-    receipt_path, receipt_operation_id, receipt_env = _receipt_environment(api_key)
+    receipt_path, receipt_operation_id, receipt_env = _receipt_environment()
+    dseq_ref["receipt_path"] = receipt_path
 
     # ── Step 2: Deploy SSH instance ────────────────────
     log_step(2, "Deploy SSH instance")
 
     deploy_started_at = time.time()
-    r, timed_out = _run_just_up({**os.environ, **receipt_env}, timeout=300)
+    try:
+        r, timed_out = _run_just_up({**os.environ, **receipt_env}, timeout=300)
+    except BaseException:
+        # The child group is dead before this read. Preserve an unresolved receipt;
+        # remove it only after authoritative pre-submit state or verified closure.
+        try:
+            state, dseq, owner, group = _receipt_identity(receipt_path)
+            dseq_ref.update(dseq=dseq, owner=owner, group=group)
+            if state == "prepared":
+                _delete_receipt(receipt_path)
+            else:
+                _verified_cleanup(dseq_ref)
+        except Exception as exc:  # noqa: BLE001 - interruption remains HELD
+            log_fail(f"HELD: interrupted create receipt could not be reconciled ({exc})")
+        raise
     output = r.stdout + r.stderr
     print(output)
 
-    m = re.search(r"DSEQ[:\s]+(\d+)", output)
-    if m:
-        dseq_ref["dseq"] = m.group(1)
+    try:
+        state, receipt_dseq, owner, group = _receipt_identity(receipt_path)
+        dseq_ref.update(owner=owner, group=group)
+    except Exception as exc:  # noqa: BLE001 - no bound identity means cleanup is held
+        state, receipt_dseq = "unreadable", None
+        log_fail(f"HELD: create receipt unreadable ({exc})")
+    output_match = re.search(r"DSEQ[:\s]+(\d+)", output)
+    output_dseq = output_match.group(1) if output_match else None
+    if output_dseq and receipt_dseq and output_dseq != receipt_dseq:
+        log_fail(f"HELD: output DSEQ {output_dseq} disagrees with receipt DSEQ {receipt_dseq}")
+        dseq_ref["dseq"] = None
     else:
-        dseq_ref["dseq"] = _reconcile_receipt(
+        dseq_ref["dseq"] = receipt_dseq or _reconcile_receipt(
             receipt_path, receipt_operation_id, deploy_started_at, api_key
         )
 
     if timed_out or r.returncode != 0:
         log_fail("just up timed out" if timed_out else "just up failed")
         if dseq_ref["dseq"]:
-            robust_destroy(dseq_ref["dseq"])
-            dseq_ref["dseq"] = None
-        shutil.rmtree(receipt_path.parent, ignore_errors=True)
+            _verified_cleanup(dseq_ref)
+        elif state == "prepared":
+            _delete_receipt(receipt_path)
         _summary(["deploy: failed"])
         sys.exit(1)
 
     if not dseq_ref["dseq"]:
         log_fail("Could not recover DSEQ from output or durable receipt; create is HELD")
-        shutil.rmtree(receipt_path.parent, ignore_errors=True)
         _summary(["deploy: no dseq"])
         sys.exit(1)
 
@@ -475,10 +535,8 @@ def main():
         # is None — skip to avoid double-destroy.
         if dseq_ref.get("dseq"):
             log_step(TOTAL_STEPS, f"Cleanup DSEQ {dseq}")
-            if not robust_destroy(dseq):
+            if not _verified_cleanup(dseq_ref):
                 failures.append("cleanup: destroy or audit failed")
-            dseq_ref["dseq"] = None
-        shutil.rmtree(receipt_path.parent, ignore_errors=True)
 
     _summary(failures)
     sys.exit(1 if failures else 0)
@@ -486,9 +544,7 @@ def main():
 
 def _finish(failures: list, dseq_ref: dict):
     """Early-exit helper that runs cleanup before summarizing."""
-    if dseq_ref.get("dseq"):
-        robust_destroy(dseq_ref["dseq"])
-        dseq_ref["dseq"] = None
+    _verified_cleanup(dseq_ref)
     _summary(failures)
     sys.exit(1 if failures else 0)
 

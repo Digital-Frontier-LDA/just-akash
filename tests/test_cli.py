@@ -322,9 +322,6 @@ class TestCliDeployPassesArgs:
             # every group on the single cheapest one.
             already_selected=[],
             receipt_path=None,
-            expected_owner=None,
-            expected_groups=None,
-            expected_artifact_digest=None,
             receipt_operation_id=None,
         )
 
@@ -352,8 +349,7 @@ class TestCliDeployPassesArgs:
         assert kwargs["backup_providers"] == ["akash1back1"]
 
     @patch("just_akash.deploy.deploy")
-    def test_deploy_passes_complete_receipt_identity(self, mock_deploy, monkeypatch):
-        owner = "akash1" + "q" * 38
+    def test_deploy_passes_receipt_location_and_operation(self, mock_deploy, monkeypatch):
         with pytest.raises(SystemExit) as exc_info:
             _run_cli(
                 monkeypatch,
@@ -362,14 +358,6 @@ class TestCliDeployPassesArgs:
                     "deploy",
                     "--receipt-path",
                     "/private/receipts/run.json",
-                    "--receipt-expected-owner",
-                    owner,
-                    "--receipt-expected-group",
-                    "primary",
-                    "--receipt-expected-group",
-                    "secondary",
-                    "--receipt-artifact-sha256",
-                    "a" * 64,
                     "--receipt-operation-id",
                     "github-run-123-attempt-2",
                 ],
@@ -377,9 +365,6 @@ class TestCliDeployPassesArgs:
         assert exc_info.value.code == 0
         kwargs = mock_deploy.call_args.kwargs
         assert kwargs["receipt_path"] == "/private/receipts/run.json"
-        assert kwargs["expected_owner"] == owner
-        assert kwargs["expected_groups"] == ["primary", "secondary"]
-        assert kwargs["expected_artifact_digest"] == "a" * 64
         assert kwargs["receipt_operation_id"] == "github-run-123-attempt-2"
 
 

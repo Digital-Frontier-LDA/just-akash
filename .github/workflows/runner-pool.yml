@@ -927,11 +927,10 @@ jobs:
           # Arrays are the only form that is both correct and lint-clean.
           JA=(uv run --with . just-akash)
 
-          # ⛔ CREATION IS MONOTONIC FOR THE RUN (#347). Once any round parses a DSEQ, a
-          # later round cannot publish no-deployment, and cannot overwrite that DSEQ
-          # with an empty one. Every write below carries the monotonic state, so no
-          # later write downgrades an earlier one — whichever way GitHub resolves a
-          # key written more than once.
+          # ⛔ KNOWN EFFECTS ARE MONOTONIC FOR THE RUN (#347). Once a round parses a
+          # DSEQ, a later authoritative pre-broadcast failure cannot publish
+          # no-deployment or erase that identity. A later ambiguous POST is different:
+          # it must publish unknown because it may have created a second deployment.
           CREATED_DSEQ=""
 
           # ⛔ A LEASE IS TERMINAL ONLY ON TWO-ENDPOINT CHAIN AGREEMENT (#347). A
@@ -1109,6 +1108,10 @@ jobs:
               # Never issue another create in that state: external teardown receives the
               # typed unknown outcome and must report HELD rather than a clean empty no-op.
               if grep -qE '"code"[[:space:]]*:[[:space:]]*"(NO_DSEQ_RETURNED|DEPLOY_CREATE_FAILED|DEPLOY_CREATE_ORPHAN_SUSPECTED)"|NON-RETRYABLE CREATE OUTCOME AMBIGUOUS|No DSEQ returned from API' /tmp/ja.log 2>/dev/null; then
+                # Ambiguity from THIS later create dominates any closed identity from
+                # an earlier round. The stale DSEQ may remain published for diagnosis,
+                # but teardown must see unknown and hold rather than close/no-op it.
+                echo "deployment_outcome=unknown" >> "$GITHUB_OUTPUT"
                 echo "failure_reason=CREATE_OUTCOME_AMBIGUOUS" >> "$GITHUB_OUTPUT"
                 echo "::error title=Create outcome is AMBIGUOUS::The non-idempotent create may have committed without returning a usable DSEQ. Stopping before another create; teardown will hold this run for receipt or owner-scoped chain reconciliation."
                 echo "::endgroup::"; exit 1
@@ -1558,7 +1561,10 @@ jobs:
     # its PR has merged.
     uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@06f3d2f9d9df72a6310dbfe61723236d3ca3daba
     with:
-      dseq: ${{ needs.pool.outputs.dseq }}
+      # An ambiguous later create dominates an earlier closed DSEQ. Suppress that
+      # stale identity at the teardown boundary so the pinned callee takes its
+      # CREATE_OUTCOME_AMBIGUOUS hold path and cannot close/no-op the old round.
+      dseq: ${{ needs.pool.outputs.deployment_outcome == 'created' && needs.pool.outputs.dseq || '' }}
       deployment-outcome: ${{ needs.pool.outputs.deployment_outcome }}
       wallet-address: ${{ needs.pool.outputs.wallet_address }}
       deployment-group: ${{ needs.pool.outputs.deployment_group }}

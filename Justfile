@@ -16,15 +16,9 @@ up tag="":
     set -x
     args=(uv run just-akash deploy --sdl sdl/cpu-backtest-ssh.yaml --bid-wait 60 --bid-wait-retry 120)
     if [ -n "${JUST_AKASH_RECEIPT_PATH:-}" ]; then
-        : "${JUST_AKASH_RECEIPT_OWNER:?receipt owner required}"
-        : "${JUST_AKASH_RECEIPT_GROUP:?receipt group required}"
-        : "${JUST_AKASH_RECEIPT_ARTIFACT_SHA256:?receipt artifact digest required}"
         : "${JUST_AKASH_RECEIPT_OPERATION_ID:?receipt operation id required}"
         args+=(
             --receipt-path "$JUST_AKASH_RECEIPT_PATH"
-            --receipt-expected-owner "$JUST_AKASH_RECEIPT_OWNER"
-            --receipt-expected-group "$JUST_AKASH_RECEIPT_GROUP"
-            --receipt-artifact-sha256 "$JUST_AKASH_RECEIPT_ARTIFACT_SHA256"
             --receipt-operation-id "$JUST_AKASH_RECEIPT_OPERATION_ID"
         )
     fi
