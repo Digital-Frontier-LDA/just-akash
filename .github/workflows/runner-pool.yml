@@ -1040,11 +1040,11 @@ jobs:
             # single read also recovers its identity from that diagnostic line; the paths
             # below then refuse to create again until it is proven closed.
             DSEQ=$(awk -F': +' '
-              /^[[:space:]]*DSEQ:/ { print $2; found = 1; exit }
+              /^[[:space:]]*DSEQ:/ && !found { summary = $2; found = 1 }
               /"code": "(LEASE_CREATE_FAILED|REDEPLOY_FAILED)"/ && match($0, /"dseq": "[1-9][0-9]*"/) {
                 recovered = substr($0, RSTART + 9, RLENGTH - 10)
               }
-              END { if (!found && recovered != "") print recovered }
+              END { if (found) print summary; else if (recovered != "") print recovered }
             ' /tmp/ja.log || true)
             # ⭐ PUBLISH THE DSEQ THE MOMENT IT EXISTS — before tagging, before the
             # registration wait, before anything can fail or be cancelled. The
