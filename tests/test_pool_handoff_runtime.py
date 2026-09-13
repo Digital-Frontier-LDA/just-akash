@@ -182,7 +182,10 @@ def test_actual_early_output_survives_shell_failure_and_reaches_internal_rollbac
 ):
     pool, caller = documents()
     output = publish_from_real_shell(pool, tmp_path, outcome)
-    assert output == {"dseq": "1789000000001"}
+    assert output == {
+        "deployment_outcome": "created",
+        "dseq": "1789000000001",
+    }
     events = lifetime(pool, caller, output, outcome)
     assert events.index("rollback-close") < events.index("callee-finished")
 
