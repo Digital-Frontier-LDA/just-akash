@@ -43,7 +43,9 @@ elif sub == "verify-closed":
 
 
 def close_step(doc: dict | None = None) -> dict:
-    doc = doc or yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    if doc is None:
+        doc = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    assert isinstance(doc, dict), "runner-teardown.yml did not parse to a mapping"
     steps = [s for s in doc["jobs"]["teardown"]["steps"] if s.get("id") == "close"]
     assert len(steps) == 1, f"expected one close step, found {len(steps)}"
     return steps[0]
