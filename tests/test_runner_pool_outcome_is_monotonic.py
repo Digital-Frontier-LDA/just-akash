@@ -166,7 +166,7 @@ def run_step(
         "STUB_STATE": str(state),
         "STUB_SCENARIO": str(tmp_path / "scenario.json"),
         "GITHUB_OUTPUT": str(output),
-        "AKASH_API_KEY": "stub",
+        "AKASH_API_KEY": "stub",  # pragma: allowlist secret
         "AKASH_API_KEYS": "",
         "GH_TOKEN": "stub",
         "PREFERRED_CANDIDATES_CSV": f"{PROVIDER_A},{PROVIDER_B}",
