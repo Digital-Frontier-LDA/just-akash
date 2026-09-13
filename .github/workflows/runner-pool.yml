@@ -917,6 +917,29 @@ jobs:
           # Arrays are the only form that is both correct and lint-clean.
           JA=(uv run --with . just-akash)
 
+          # ⛔ CREATION IS MONOTONIC FOR THE RUN (#347). Once any round parses a DSEQ, a
+          # later round cannot publish no-deployment, and cannot overwrite that DSEQ
+          # with an empty one. Every write below carries the monotonic state, so no
+          # later write downgrades an earlier one — whichever way GitHub resolves a
+          # key written more than once.
+          CREATED_DSEQ=""
+
+          # ⛔ A LEASE IS TERMINAL ONLY ON TWO-ENDPOINT CHAIN AGREEMENT (#347). A
+          # destroy that exits 0 has only had its close ACCEPTED (cli.py destroy), and
+          # destroy-side text such as "Deployment closed" is not proof
+          # (_lease_verification.py). This is the rule runner-teardown.yml already
+          # enforces: verify-closed exits 0 AND reports a typed closed=True. An empty
+          # DSEQ or owner, or an unreadable verdict, is NOT proven.
+          lease_is_terminal() {
+            local dseq="$1" owner="$2" rc=0 verdict=False
+            [ -n "$dseq" ] && [ -n "$owner" ] || return 1
+            "${JA[@]}" verify-closed --dseq "$dseq" --owner "$owner" --json \
+              >/tmp/ja-verify.json 2>/tmp/ja-verify.err || rc=$?
+            verdict=$(python3 -c "import json,sys;print(json.load(sys.stdin).get('closed') is True)" \
+              </tmp/ja-verify.json 2>/dev/null || echo False)
+            [ "$rc" -eq 0 ] && [ "$verdict" = "True" ]
+          }
+
           # A free-text input feeding `seq`: junk would make the wait loop a no-op and
           # every pool instantly "never registered". Clamp like MIN_POOL below.
           case "${RUNNER_WAIT_TRIES}" in ''|*[!0-9]*) RUNNER_WAIT_TRIES=90 ;; esac
@@ -956,7 +979,7 @@ jobs:
             # Never degrade an exhausted/denied allowlist into unrestricted
             # marketplace selection; that would re-admit every standing trap.
             if [ "${#PROV_ARGS[@]}" -eq 0 ]; then
-              echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+              [ -n "$CREATED_DSEQ" ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
               echo "failure_reason=NO_ELIGIBLE_BIDDER" >> "$GITHUB_OUTPUT"
               echo "::error title=No eligible provider remains::All configured preferred and fallback providers are standing-denied or failed during this run."
               echo "::endgroup::"; exit 1
@@ -972,7 +995,7 @@ jobs:
               "") ;;
               cheapest|emptiest) SELECT_ARGS=(--select "$PROVIDER_SELECT") ;;
               *)
-                echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+                [ -n "$CREATED_DSEQ" ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
                 echo "::error title=provider-select::must be 'cheapest' or 'emptiest', got '${PROVIDER_SELECT}'"
                 exit 1 ;;
             esac
@@ -991,8 +1014,9 @@ jobs:
             # round overwrites this, so the surviving value names the CURRENT lease;
             # an already-closed round's dseq is a harmless no-op for the teardown
             # ("already closed|not found" → verified-closed). (#1439 pattern.)
-            echo "dseq=$DSEQ" >> "$GITHUB_OUTPUT"
+            [ -n "$DSEQ" ] && echo "dseq=$DSEQ" >> "$GITHUB_OUTPUT"
             [ -n "$DSEQ" ] && echo "deployment_outcome=created" >> "$GITHUB_OUTPUT"
+            [ -n "$DSEQ" ] && CREATED_DSEQ="$DSEQ"
             PROVIDER=$(awk -F': +' '/^[[:space:]]*Provider:/{print $2; exit}' /tmp/ja.log || true)
             WALLET=$(awk -F': +' '/^[[:space:]]*Wallet:/{print $2; exit}' /tmp/ja.log || true)
             # Publish the create-time owner as soon as it is available. Internal
@@ -1012,6 +1036,7 @@ jobs:
                 grep -qi "Deployment closed" /tmp/ja-orphan.log && break
                 sleep 5
               done
+              lease_is_terminal "$DSEQ" "$WALLET" || { echo "failure_reason=LEASE_CLOSE_UNVERIFIED" >> "$GITHUB_OUTPUT"; echo "::error title=Internal lease close is UNVERIFIED::dseq=$DSEQ did not reach a terminal state across two chain endpoints. Stopping before another deploy so this lease stays the published identity for the external teardown."; echo "::endgroup::"; exit 1; }
             fi
 
             if [ -z "$DSEQ" ] || [ -z "$PROVIDER" ]; then
@@ -1022,7 +1047,7 @@ jobs:
                 # Only the exact Console 402/PaymentRequired rejection is proven
                 # pre-broadcast. Generic insufficient wording remains UNKNOWN.
                 if grep -qiE 'PaymentRequiredError|HTTP 402' /tmp/ja.log 2>/dev/null; then
-                  echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+                  [ -n "$CREATED_DSEQ" ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
                 fi
                 echo "failure_reason=WALLET_UNDERFUNDED" >> "$GITHUB_OUTPUT"
                 echo "::error title=Akash rejected the deploy: INSUFFICIENT BALANCE::No order was created and no provider was asked to bid, so retrying cannot help. Top up the wallet."
@@ -1258,6 +1283,7 @@ jobs:
                 grep -qi "Deployment closed" /tmp/ja-destroy.log && break
                 sleep 5
               done
+              lease_is_terminal "$DSEQ" "$WALLET" || { echo "failure_reason=LEASE_CLOSE_UNVERIFIED" >> "$GITHUB_OUTPUT"; echo "::error title=Internal lease close is UNVERIFIED::dseq=$DSEQ did not reach a terminal state across two chain endpoints. Stopping before another deploy so this lease stays the published identity for the external teardown."; echo "::endgroup::"; exit 1; }
               EXCLUDED="$EXCLUDED $PROVIDER"
               echo "::endgroup::"; continue
             fi
@@ -1295,6 +1321,7 @@ jobs:
                 grep -qi "Deployment closed" /tmp/ja-destroy.log && break
                 sleep 5
               done
+              lease_is_terminal "$DSEQ" "$WALLET" || { echo "failure_reason=LEASE_CLOSE_UNVERIFIED" >> "$GITHUB_OUTPUT"; echo "::error title=Internal lease close is UNVERIFIED::dseq=$DSEQ did not reach a terminal state across two chain endpoints. Stopping before another deploy so this lease stays the published identity for the external teardown."; echo "::endgroup::"; exit 1; }
               EXCLUDED="$EXCLUDED $PROVIDER"
               echo "::endgroup::"; continue
             fi
@@ -1318,6 +1345,7 @@ jobs:
                   grep -qi "Deployment closed" /tmp/ja-destroy.log && break
                   sleep 5
                 done
+                lease_is_terminal "$DSEQ" "$WALLET" || { echo "failure_reason=LEASE_CLOSE_UNVERIFIED" >> "$GITHUB_OUTPUT"; echo "::error title=Internal lease close is UNVERIFIED::dseq=$DSEQ did not reach a terminal state across two chain endpoints. Stopping before another deploy so this lease stays the published identity for the external teardown."; echo "::endgroup::"; exit 1; }
                 EXCLUDED="$EXCLUDED $PROVIDER"
                 echo "::endgroup::"; continue
               fi
