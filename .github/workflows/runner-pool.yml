@@ -1593,7 +1593,7 @@ jobs:
     # The resolution that satisfies both is to pin the POST-MERGE main SHA: byte-identical
     # to the branch commit, and an ancestor of main. Never re-pin to a branch commit after
     # its PR has merged.
-    uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@06f3d2f9d9df72a6310dbfe61723236d3ca3daba
+    uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@1ad3913ba6634bacaf55c024797731b903620247
     with:
       # The last KNOWN lease always reaches teardown so it is closed and proven. An
       # ambiguous later create travels beside it as create-ambiguous: teardown closes
