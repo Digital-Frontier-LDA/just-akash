@@ -20,10 +20,13 @@ import json as _json
 import os
 import re
 import secrets
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
 
 from ._e2e import (
     assert_provider_in_tiers,
@@ -33,6 +36,9 @@ from ._e2e import (
 from ._e2e import (
     destroy_owned_deployment as robust_destroy,
 )
+from .api import AkashConsoleAPI
+from .deploy import _report_suspected_orphans
+from .deployment_receipt import artifact_identity, decode_receipt
 
 GREEN = "\033[92m"
 RED = "\033[91m"
@@ -68,6 +74,81 @@ def run(cmd: str, timeout: int = 60, input_text: str | None = None) -> subproces
         timeout=timeout,
         input=input_text,
     )
+
+
+def _run_just_up(
+    env: dict[str, str], timeout: int = 300
+) -> tuple[subprocess.CompletedProcess, bool]:
+    """Run the paid create in its own process group so timeout contains every child."""
+    process = subprocess.Popen(
+        ["just", "up"],
+        shell=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+        result = subprocess.CompletedProcess(["just", "up"], process.returncode, stdout, stderr)
+        return result, False
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            stdout, stderr = process.communicate()
+        result = subprocess.CompletedProcess(["just", "up"], process.returncode, stdout, stderr)
+        return result, True
+
+
+def _receipt_environment() -> tuple[Path, str, dict[str, str]]:
+    """Bind owner, complete group population and submitted bytes before create starts."""
+    sdl = Path("sdl/cpu-backtest-ssh.yaml")
+    population, _, artifact_digest = artifact_identity(sdl.read_text(encoding="utf-8"))
+    groups = [str(row["name"]) for row in population]
+    if len(groups) != 1:
+        raise RuntimeError(f"secrets E2E expects exactly one deployment group, got {groups}")
+    owner = AkashConsoleAPI().account_address()
+    receipt_dir = Path(tempfile.mkdtemp(prefix="just-akash-secrets-receipt-"))
+    receipt_path = receipt_dir / "create.json"
+    operation_id = f"e2e-secrets-{secrets.token_hex(8)}"
+    return (
+        receipt_path,
+        operation_id,
+        {
+            "JUST_AKASH_RECEIPT_PATH": str(receipt_path),
+            "JUST_AKASH_RECEIPT_OWNER": owner,
+            "JUST_AKASH_RECEIPT_GROUP": groups[0],
+            "JUST_AKASH_RECEIPT_ARTIFACT_SHA256": artifact_digest,
+            "JUST_AKASH_RECEIPT_OPERATION_ID": operation_id,
+        },
+    )
+
+
+def _reconcile_receipt(receipt_path: Path, operation_id: str, started_at: float) -> str | None:
+    """Recover a returned DSEQ or reconcile a submitted create before reporting HELD."""
+    try:
+        receipt = decode_receipt(receipt_path.read_bytes())
+    except Exception as exc:  # noqa: BLE001 - report ambiguity without replacing it
+        log_fail(f"HELD: create receipt unreadable ({exc}); manual reconciliation required")
+        return None
+    if receipt["state"] == "create_response_received":
+        dseq = str(receipt["dseq"])
+        log_info(f"Recovered DSEQ={dseq} from the durable create receipt")
+        return dseq
+    if receipt["state"] == "submitting":
+        log_fail(
+            "HELD: create request was submitted without a response identity; running "
+            "owner-scoped/provenance reconciliation before exit"
+        )
+        try:
+            _report_suspected_orphans(AkashConsoleAPI(), started_at, operation_id)
+        except Exception as exc:  # noqa: BLE001 - reconciliation failure remains HELD
+            log_fail(f"HELD: reconciliation could not complete ({exc})")
+    return None
 
 
 def _wait_for_ssh(ssh_key, ssh_host, ssh_port, max_attempts=18):
@@ -143,26 +224,40 @@ def main():
 
     install_signal_cleanup(dseq_ref)
 
+    # Create-time identity is fixed before the paid command starts. The deploy writes
+    # this private receipt to `submitting` before POST and to
+    # `create_response_received` before auction work, so timeout and empty stdout do
+    # not erase the only rollback handle.
+    receipt_path, receipt_operation_id, receipt_env = _receipt_environment()
+
     # ── Step 2: Deploy SSH instance ────────────────────
     log_step(2, "Deploy SSH instance")
 
-    r = run("just up", timeout=300)
+    deploy_started_at = time.time()
+    r, timed_out = _run_just_up({**os.environ, **receipt_env}, timeout=300)
     output = r.stdout + r.stderr
     print(output)
 
     m = re.search(r"DSEQ[:\s]+(\d+)", output)
     if m:
         dseq_ref["dseq"] = m.group(1)
+    else:
+        dseq_ref["dseq"] = _reconcile_receipt(
+            receipt_path, receipt_operation_id, deploy_started_at
+        )
 
-    if r.returncode != 0:
-        log_fail("just up failed")
+    if timed_out or r.returncode != 0:
+        log_fail("just up timed out" if timed_out else "just up failed")
         if dseq_ref["dseq"]:
             robust_destroy(dseq_ref["dseq"])
+            dseq_ref["dseq"] = None
+        shutil.rmtree(receipt_path.parent, ignore_errors=True)
         _summary(["deploy: failed"])
         sys.exit(1)
 
     if not dseq_ref["dseq"]:
-        log_fail("Could not parse DSEQ from output")
+        log_fail("Could not recover DSEQ from output or durable receipt; create is HELD")
+        shutil.rmtree(receipt_path.parent, ignore_errors=True)
         _summary(["deploy: no dseq"])
         sys.exit(1)
 
@@ -380,6 +475,7 @@ def main():
             if not robust_destroy(dseq):
                 failures.append("cleanup: destroy or audit failed")
             dseq_ref["dseq"] = None
+        shutil.rmtree(receipt_path.parent, ignore_errors=True)
 
     _summary(failures)
     sys.exit(1 if failures else 0)

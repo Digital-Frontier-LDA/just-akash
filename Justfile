@@ -14,7 +14,21 @@ up tag="":
     trap 'status=$?; echo "[INFO] recipe=up finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
     echo "[INFO] recipe=up started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file tag={{tag}}"
     set -x
-    uv run just-akash deploy --sdl sdl/cpu-backtest-ssh.yaml --bid-wait 60 --bid-wait-retry 120 | tee /tmp/.akash-last-deploy.log
+    args=(uv run just-akash deploy --sdl sdl/cpu-backtest-ssh.yaml --bid-wait 60 --bid-wait-retry 120)
+    if [ -n "${JUST_AKASH_RECEIPT_PATH:-}" ]; then
+        : "${JUST_AKASH_RECEIPT_OWNER:?receipt owner required}"
+        : "${JUST_AKASH_RECEIPT_GROUP:?receipt group required}"
+        : "${JUST_AKASH_RECEIPT_ARTIFACT_SHA256:?receipt artifact digest required}"
+        : "${JUST_AKASH_RECEIPT_OPERATION_ID:?receipt operation id required}"
+        args+=(
+            --receipt-path "$JUST_AKASH_RECEIPT_PATH"
+            --receipt-expected-owner "$JUST_AKASH_RECEIPT_OWNER"
+            --receipt-expected-group "$JUST_AKASH_RECEIPT_GROUP"
+            --receipt-artifact-sha256 "$JUST_AKASH_RECEIPT_ARTIFACT_SHA256"
+            --receipt-operation-id "$JUST_AKASH_RECEIPT_OPERATION_ID"
+        )
+    fi
+    "${args[@]}" | tee /tmp/.akash-last-deploy.log
     dseq=$(sed -n 's/.*DSEQ: \([0-9]*\).*/\1/p' /tmp/.akash-last-deploy.log | head -1)
     if [ -n "{{tag}}" ] && [ -n "$dseq" ]; then
         uv run just-akash tag --dseq "$dseq" --name "{{tag}}"

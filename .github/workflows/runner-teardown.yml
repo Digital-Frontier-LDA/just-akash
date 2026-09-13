@@ -58,10 +58,20 @@ on:
         default: 'Digital-Frontier-LDA/just-akash'
         type: string
       dseq:
-        description: 'Deployment to close. Empty is a no-op, not an error.'
+        description: >-
+          Deployment to close. Empty is a no-op only with an authoritative
+          no-deployment outcome; an unknown create outcome is HELD.
         required: false
         type: string
         default: ''
+      deployment-outcome:
+        description: >-
+          Create-side effect classification. Pass unknown when a create request may have
+          committed without returning an identity; teardown then fails HELD instead of
+          reporting a clean no-op. Defaults to no-deployment for legacy explicit no-op calls.
+        required: false
+        type: string
+        default: 'no-deployment'
       tag-prefix:
         description: >-
           REQUIRED. Asserted against the deployment's own tag before anything is
@@ -185,6 +195,7 @@ jobs:
           DSEQ: ${{ inputs.dseq }}
           WALLET_ADDRESS: ${{ inputs.wallet-address }}
           DEPLOYMENT_GROUP: ${{ inputs.deployment-group }}
+          DEPLOYMENT_OUTCOME: ${{ inputs.deployment-outcome }}
           TAG_PREFIX: ${{ inputs.tag-prefix }}
         run: |
           set -uo pipefail
@@ -192,6 +203,19 @@ jobs:
           # An ARRAY: the command is multiple words, so a quoted string breaks it and an
           # unquoted one is SC2086.
           JA=(uv run --with . just-akash)
+
+          if [ -z "${DSEQ}" ] && [ "${DEPLOYMENT_OUTCOME:-unknown}" != "no-deployment" ]; then
+            HELD_GROUP=""
+            [[ "${DEPLOYMENT_GROUP:-}" =~ ^[A-Za-z0-9._-]+$ ]] && HELD_GROUP="$DEPLOYMENT_GROUP"
+            {
+              echo "closed=unknown"
+              echo "held_reason=CREATE_OUTCOME_AMBIGUOUS"
+              echo "held_dseq="
+              echo "held_deployment_group=$HELD_GROUP"
+            } >> "$GITHUB_OUTPUT"
+            echo "::error title=HELD: create outcome ambiguous, no teardown identity::The create request may have committed but returned no DSEQ. Nothing can be closed automatically; reconcile the create receipt or owner-scoped chain population before another create. group=${HELD_GROUP:-<unknown>}"
+            exit 1
+          fi
 
           if [ -z "${DSEQ}" ]; then
             echo "closed=noop" >> "$GITHUB_OUTPUT"
@@ -245,7 +269,7 @@ jobs:
           # the DSEQ is forbidden: it can select a foreign owner. resolve-owner also
           # refuses --expected-group without --expected-owner. So: no resolve, no
           # destroy, a FAILED job, and outputs that locate the still-live lease.
-          if [ -z "${WALLET_ADDRESS:-}" ] && [ -n "${DEPLOYMENT_GROUP:-}" ]; then
+          if [ -z "${WALLET_ADDRESS:-}" ]; then
             # The group is echoed into GITHUB_OUTPUT and an annotation, so only the
             # canonical group-name shape is published (DSEQ is digits-only above).
             HELD_GROUP=""

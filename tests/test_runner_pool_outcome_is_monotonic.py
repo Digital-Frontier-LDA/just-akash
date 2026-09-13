@@ -621,6 +621,28 @@ def test_unknown_evidence_never_becomes_no_deployment(tmp_path: Path, rounds: li
     assert last(r, "deployment_outcome") == "unknown", r["writes"]
 
 
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        '{"type":"akash-diag","level":"error","code":"NO_DSEQ_RETURNED"}',
+        '{"type":"akash-diag","level":"error","code":"DEPLOY_CREATE_FAILED"}',
+        "No DSEQ returned from API",
+    ],
+)
+def test_ambiguous_create_stops_before_a_second_non_idempotent_request(
+    tmp_path: Path, evidence: str
+) -> None:
+    r = run_step(
+        tmp_path,
+        {"owner": OWNER, "rounds": [{"text": evidence}, {"dseq": "1002"}]},
+    )
+    assert r["rc"] != 0
+    assert deploys(r) == 1, r["calls"]
+    assert last(r, "deployment_outcome") == "unknown", r["writes"]
+    assert last(r, "failure_reason") == "CREATE_OUTCOME_AMBIGUOUS", r["writes"]
+    assert last(r, "dseq") is None
+
+
 # ── the call site: every retry edge goes through the one proof ───────────────────
 
 

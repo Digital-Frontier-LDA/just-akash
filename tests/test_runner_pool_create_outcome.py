@@ -25,3 +25,8 @@ def test_typed_outcome_is_published_through_both_workflow_boundaries() -> None:
     assert DOC["jobs"]["pool"]["outputs"]["deployment_outcome"] == (
         "${{ steps.provision.outputs.deployment_outcome }}"
     )
+    assert DOC["jobs"]["teardown"]["with"]["deployment-outcome"] == (
+        "${{ needs.pool.outputs.deployment_outcome }}"
+    )
+    for key in ("held_reason", "held_dseq", "held_deployment_group"):
+        assert CALL["outputs"][key]["value"] == f"${{{{ jobs.teardown.outputs.{key} }}}}"

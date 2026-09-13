@@ -52,7 +52,12 @@ def close_step(doc: dict | None = None) -> dict:
 
 
 def run_close(
-    tmp_path: Path, wallet: str, group: str, script: str | None = None
+    tmp_path: Path,
+    wallet: str,
+    group: str,
+    script: str | None = None,
+    deployment_outcome: str = "no-deployment",
+    dseq: str = "1002",
 ) -> tuple[int, list, dict, str]:
     source = script if script is not None else close_step()["run"]
     assert source.count(JA_LINE) == 1, "just-akash invocation moved; re-derive the harness"
@@ -72,9 +77,10 @@ def run_close(
         ["bash", "-e", "-c", source],
         env={
             **os.environ,
-            "DSEQ": "1002",
+            "DSEQ": dseq,
             "WALLET_ADDRESS": wallet,
             "DEPLOYMENT_GROUP": group,
+            "DEPLOYMENT_OUTCOME": deployment_outcome,
             "TAG_PREFIX": "pool",
             "FAKE_OWNER": OWNER,
             "GITHUB_OUTPUT": str(output),
@@ -129,11 +135,32 @@ def test_opposite_leg_a_bound_owner_closes_the_exact_owner_dseq_pair(tmp_path: P
 
 
 @pytest.mark.parametrize("group", [GROUP, ""])
-def test_no_call_ever_passes_a_group_without_an_owner(tmp_path: Path, group: str) -> None:
-    """The exact shape resolve-owner refuses (--expected-group requires --expected-owner)."""
-    _, calls, _, _ = run_close(tmp_path, wallet="", group=group)
-    for call in calls:
-        assert not ("--expected-group" in call and "--expected-owner" not in call), call
+def test_every_owner_less_receipt_is_held_before_any_call(tmp_path: Path, group: str) -> None:
+    rc, calls, out, _ = run_close(tmp_path, wallet="", group=group)
+    assert rc != 0 and calls == []
+    assert out.get("held_reason") == ["OWNER_UNKNOWN"], out
+    assert out.get("closed") == ["unknown"], out
+
+
+@pytest.mark.parametrize("outcome", ["unknown", "created", ""])
+def test_an_ambiguous_empty_receipt_is_held_instead_of_a_clean_noop(
+    tmp_path: Path, outcome: str
+) -> None:
+    rc, calls, out, _ = run_close(
+        tmp_path, wallet="", group=GROUP, deployment_outcome=outcome, dseq=""
+    )
+    assert rc != 0 and calls == []
+    assert out.get("held_reason") == ["CREATE_OUTCOME_AMBIGUOUS"], out
+    assert out.get("held_dseq") == [""], out
+    assert out.get("closed") == ["unknown"], out
+
+
+def test_an_authoritative_no_deployment_remains_a_clean_noop(tmp_path: Path) -> None:
+    rc, calls, out, _ = run_close(
+        tmp_path, wallet="", group=GROUP, deployment_outcome="no-deployment", dseq=""
+    )
+    assert rc == 0 and calls == []
+    assert out.get("closed") == ["noop"] and "held_reason" not in out, out
 
 
 def test_held_is_published_through_the_job_and_workflow_and_cannot_be_skipped() -> None:
@@ -168,10 +195,20 @@ def test_no_caller_job_gate_can_skip_the_teardown() -> None:
     """Derived from every workflow and fixture that calls runner-teardown.yml. A new
     caller, a changed gate, or continue-on-error on a caller is a failure, not a pass."""
     root = WORKFLOW.parents[2]
+    roots = (root / ".github/workflows", root / "tests/fixtures")
+    assert all(path.is_dir() for path in roots), "caller discovery root moved or disappeared"
+    excluded: set[Path] = set()
+    assert not excluded, "caller exclusions require an explicit lifecycle justification"
+    candidates = sorted(
+        path
+        for directory in roots
+        for path in directory.rglob("*")
+        if path.is_file() and path.suffix in {".yml", ".yaml"} and path not in excluded
+    )
+    assert len(candidates) >= 16, "caller file population unexpectedly shrank; re-derive scan"
+    assert len(candidates) == len(set(candidates)), "caller scan contains duplicate entries"
     callers = {}
-    patterns = ("*.yml", "*.yaml")
-    dirs = (root / ".github/workflows", root / "tests/fixtures")
-    for path in sorted(p for d in dirs for pattern in patterns for p in d.glob(pattern)):
+    for path in candidates:
         doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         for name, job in (doc.get("jobs") or {}).items():
             if "runner-teardown.yml@" in str(job.get("uses", "")):
@@ -197,12 +234,14 @@ def test_the_pool_job_fails_when_an_owner_less_provision_fails() -> None:
     doc = yaml.safe_load((root / ".github/workflows/runner-pool.yml").read_text(encoding="utf-8"))
     job = doc["jobs"]["pool"]
     assert "continue-on-error" not in job, "the pool job would report success over a HELD lease"
+    assert "if" not in job, "the pool job itself must not be conditionally skipped"
     steps = job["steps"]
     provision = [i for i, step in enumerate(steps) if step.get("id") == "provision"]
     assert len(provision) == 1, f"expected one provision step, found {len(provision)}"
     assert "continue-on-error" not in steps[provision[0]], (
         "a continue-on-error provision step makes the pool job succeed and skips teardown"
     )
+    assert "if" not in steps[provision[0]], "the provision step itself must not be skipped"
     for step in steps[provision[0] + 1 :]:
         runs_after_failure = "always()" in str(step.get("if", ""))
         assert not (runs_after_failure and "continue-on-error" in step), (

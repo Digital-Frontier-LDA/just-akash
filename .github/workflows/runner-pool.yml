@@ -299,6 +299,15 @@ on:
           Typed create outcome: created only with a parsed DSEQ, no-deployment only on
           an authoritative pre-create/no-broadcast branch, unknown otherwise.
         value: ${{ jobs.pool.outputs.deployment_outcome }}
+      held_reason:
+        description: 'Why rollback was HELD without closure authority.'
+        value: ${{ jobs.teardown.outputs.held_reason }}
+      held_dseq:
+        description: 'Exact DSEQ of a HELD rollback, when one was returned.'
+        value: ${{ jobs.teardown.outputs.held_dseq }}
+      held_deployment_group:
+        description: 'Expected group of a HELD rollback, when canonical.'
+        value: ${{ jobs.teardown.outputs.held_deployment_group }}
       provision_healthy:
         description: "'true' iff a usable pool came online. Key your fallback on this."
         value: ${{ jobs.pool.outputs.provision_healthy }}
@@ -316,8 +325,8 @@ on:
           RUNNER_PAT_INVALID, WALLET_UNDERFUNDED, WALLET_TX_CONTENTION,
           NO_ELIGIBLE_BIDDER, PROVIDER_CAPACITY, RUNNER_NEVER_REGISTERED,
           GITHUB_API_UNAVAILABLE, INDETERMINATE, LEASE_CLOSE_UNVERIFIED,
-          LEASE_OWNER_UNREADABLE — or empty on success. Each implies a different
-          remedy, which is why they are not collapsed into "infra".
+          LEASE_OWNER_UNREADABLE, CREATE_OUTCOME_AMBIGUOUS — or empty on success.
+          Each implies a different remedy, which is why they are not collapsed into "infra".
 
           Three of them are explicitly NOT statements about a provider, and each was
           measured misreporting as one:
@@ -1094,6 +1103,17 @@ jobs:
                 echo "::endgroup::"; continue
               fi
 
+              # A failed or malformed create response is not evidence that the POST had
+              # no effect. In particular NO_DSEQ_RETURNED means Console answered after
+              # accepting the non-idempotent request but supplied no usable identity.
+              # Never issue another create in that state: external teardown receives the
+              # typed unknown outcome and must report HELD rather than a clean empty no-op.
+              if grep -qE '"code"[[:space:]]*:[[:space:]]*"(NO_DSEQ_RETURNED|DEPLOY_CREATE_FAILED|DEPLOY_CREATE_ORPHAN_SUSPECTED)"|NON-RETRYABLE CREATE OUTCOME AMBIGUOUS|No DSEQ returned from API' /tmp/ja.log 2>/dev/null; then
+                echo "failure_reason=CREATE_OUTCOME_AMBIGUOUS" >> "$GITHUB_OUTPUT"
+                echo "::error title=Create outcome is AMBIGUOUS::The non-idempotent create may have committed without returning a usable DSEQ. Stopping before another create; teardown will hold this run for receipt or owner-scoped chain reconciliation."
+                echo "::endgroup::"; exit 1
+              fi
+
               # UNCLASSIFIED, and it must SAY so rather than defaulting to the market.
               #
               # The two matchers above are not equally evidenced. The 402 signature is
@@ -1539,6 +1559,7 @@ jobs:
     uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@6d260324f572ac1a77f433fbfaa8744f0ede9ec5
     with:
       dseq: ${{ needs.pool.outputs.dseq }}
+      deployment-outcome: ${{ needs.pool.outputs.deployment_outcome }}
       wallet-address: ${{ needs.pool.outputs.wallet_address }}
       deployment-group: ${{ needs.pool.outputs.deployment_group }}
       tag-prefix: ${{ inputs.tag-prefix }}
