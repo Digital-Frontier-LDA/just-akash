@@ -699,6 +699,25 @@ def test_a_failed_lease_keeps_its_dseq_and_is_never_followed_by_another_create(
     assert_monotonic(r)
 
 
+def test_a_success_summary_outranks_a_stale_failure_diagnostic(tmp_path: Path) -> None:
+    """The recovery is a fallback: when the round printed its own "DSEQ:" summary, that
+    identity is published, never a dseq named by an earlier diagnostic line."""
+    stale = json.dumps(
+        {"type": "akash-diag", "level": "error", "code": "LEASE_CREATE_FAILED", "dseq": "1001"}
+    )
+    r = run_step(
+        tmp_path,
+        {
+            "owner": OWNER,
+            "online": 1,
+            "rounds": [{"dseq": "2002", "provider": PROVIDER_A, "text": stale}],
+        },
+    )
+    assert r["rc"] == 0, r["log"][-2000:]
+    assert identity_pairs(r)[0] == ("2002", OWNER), r["writes"]
+    assert "1001" not in [v for k, v in r["writes"] if k == "dseq"], r["writes"]
+
+
 @pytest.mark.parametrize("value", ["off", "0", "FALSE"])
 def test_disabled_diagnostics_refuse_before_any_create(tmp_path: Path, value: str) -> None:
     r = run_step(
