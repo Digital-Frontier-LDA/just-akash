@@ -6,6 +6,7 @@ import inspect
 import signal
 import stat
 import subprocess
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -140,6 +141,33 @@ def test_base_exception_terminates_the_complete_just_up_process_group(monkeypatc
     assert signals == [(9876, signal.SIGTERM)]
 
 
+def test_stubborn_process_group_escalates_from_sigterm_to_sigkill(monkeypatch) -> None:
+    class Process:
+        pid = 2468
+        returncode = -signal.SIGKILL
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def communicate(self, timeout: float | None = None):
+            self.calls += 1
+            if self.calls <= 2:
+                assert timeout is not None, "both pre-kill waits must be bounded"
+                raise subprocess.TimeoutExpired(["just", "up"], timeout)
+            assert timeout is None, "SIGKILL must be followed by complete reaping"
+            return "out", "err"
+
+    process = Process()
+    signals = []
+    monkeypatch.setattr(target.subprocess, "Popen", lambda *_, **__: process)
+    monkeypatch.setattr(target.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+
+    result, timed_out = target._run_just_up({"PATH": "/bin"}, timeout=1)
+    assert timed_out is True and result.returncode == -signal.SIGKILL
+    assert process.calls == 3
+    assert signals == [(2468, signal.SIGTERM), (2468, signal.SIGKILL)]
+
+
 def test_runner_receipt_path_is_deterministic_and_private(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
     path, _, env = target._receipt_environment()
@@ -182,7 +210,7 @@ def test_unverified_cleanup_preserves_receipt_and_bound_identity(
     assert calls == [("1002", {"owner": OWNER, "group": "group-one"})]
 
 
-def test_verified_cleanup_removes_receipt_and_all_call_sites_use_it(
+def test_verified_cleanup_removes_receipt_and_finish_call_site_has_an_observable_effect(
     monkeypatch, tmp_path: Path
 ) -> None:
     receipt = tmp_path / "create.json"
@@ -197,9 +225,29 @@ def test_verified_cleanup_removes_receipt_and_all_call_sites_use_it(
     assert target._verified_cleanup(identity) is True
     assert identity["dseq"] is None and not receipt.exists()
 
-    source = inspect.getsource(target)
+    source = textwrap.dedent(inspect.getsource(target._finish))
     call = "_verified_cleanup(dseq_ref)"
-    assert source.count(call) == 4, f"cleanup call-site target count changed: {source.count(call)}"
+    assert source.count(call) == 1, f"cleanup call-site target count changed: {source.count(call)}"
+    mutated = source.replace(call, "None")
+    assert mutated != source and mutated.count(call) == 0
+
+    call_identity = {"dseq": "1002", "owner": OWNER, "group": "group-one"}
+    effects = []
+    namespace = {
+        "_verified_cleanup": lambda ref: effects.append(ref.copy()),
+        "_summary": lambda _: None,
+        "sys": target.sys,
+    }
+    exec(mutated, namespace)
+    with pytest.raises(SystemExit):
+        namespace["_finish"]([], call_identity)
+    assert effects == [], "the bypass mutation unexpectedly retained the cleanup effect"
+
+    monkeypatch.setattr(target, "_verified_cleanup", lambda ref: effects.append(ref.copy()))
+    monkeypatch.setattr(target, "_summary", lambda _: None)
+    with pytest.raises(SystemExit):
+        target._finish([], call_identity)
+    assert effects == [call_identity]
 
 
 def test_receipt_and_reconciliation_surround_every_just_up_exit() -> None:
