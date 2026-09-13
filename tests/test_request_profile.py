@@ -9,12 +9,26 @@ coincidence.
 from __future__ import annotations
 
 import pytest
-from akash_lease_core import ResourceProfile
+from akash_lease_core import (
+    CapacityFit,
+    NodeCapacity,
+    ProviderCapacity,
+    ReplicaProfile,
+    ResourceProfile,
+)
 
 from just_akash.request_profile import attach_profile, derive_resource_profiles
 
 GI = 1024**3
 MI = 1024**2
+
+SMALL = ReplicaProfile(cpu_millicores=500, memory_bytes=512 * MI, storage_bytes=GI)
+BIG = ReplicaProfile(
+    cpu_millicores=2000,
+    memory_bytes=4 * GI,
+    storage_bytes=15 * GI,
+    gpu_count=1,
+)
 
 TWO_GROUPS = """\
 version: "2.0"
@@ -51,9 +65,18 @@ def test_each_group_is_count_times_its_replica_shape() -> None:
     derived = derive_resource_profiles(TWO_GROUPS)
     assert derived.unavailable_reason is None
     assert derived.profiles == {
-        1: ResourceProfile(cpu_millicores=1500, memory_bytes=3 * 512 * MI, storage_bytes=3 * GI),
+        1: ResourceProfile(
+            cpu_millicores=1500,
+            memory_bytes=3 * 512 * MI,
+            storage_bytes=3 * GI,
+            replicas=(SMALL,) * 3,
+        ),
         2: ResourceProfile(
-            cpu_millicores=4000, memory_bytes=8 * GI, storage_bytes=2 * 15 * GI, gpu_count=2
+            cpu_millicores=4000,
+            memory_bytes=8 * GI,
+            storage_bytes=2 * 15 * GI,
+            gpu_count=2,
+            replicas=(BIG,) * 2,
         ),
     }
 
@@ -73,8 +96,51 @@ def test_two_services_in_one_group_sum_into_that_group() -> None:
     derived = derive_resource_profiles(sdl)
     assert derived.unavailable_reason is None
     assert derived.profiles == {
-        1: ResourceProfile(cpu_millicores=2000, memory_bytes=4 * 512 * MI, storage_bytes=4 * GI)
+        1: ResourceProfile(
+            cpu_millicores=2000,
+            memory_bytes=4 * 512 * MI,
+            storage_bytes=4 * GI,
+            replicas=(SMALL,) * 4,
+        )
     }
+
+
+def test_replica_shapes_allow_a_group_to_fit_across_two_nodes() -> None:
+    """The aggregate is 4 CPU, but it is two 2-CPU replicas rather than one 4-CPU pod."""
+    profile = derive_resource_profiles(TWO_GROUPS).profiles[2]
+    provider = ProviderCapacity.from_totals(
+        cpu=(4000, 8000),
+        memory=(8 * GI, 16 * GI),
+        storage=(30 * GI, 60 * GI),
+        gpu=(2, 4),
+        node_capacities=(
+            NodeCapacity(
+                cpu_millicores_available=2000,
+                memory_bytes_available=4 * GI,
+                storage_bytes_available=15 * GI,
+                gpu_count_available=1,
+            ),
+            NodeCapacity(
+                cpu_millicores_available=2000,
+                memory_bytes_available=4 * GI,
+                storage_bytes_available=15 * GI,
+                gpu_count_available=1,
+            ),
+        ),
+    )
+
+    assert profile.replicas == (BIG, BIG)
+    assert provider.fit(profile) is CapacityFit.FIT
+
+
+def test_unbounded_replica_population_is_refused_before_allocation() -> None:
+    target = "{profile: small, count: 3}"
+    assert TWO_GROUPS.count(target) == 1
+    derived = derive_resource_profiles(
+        TWO_GROUPS.replace(target, "{profile: small, count: 100001}")
+    )
+    assert derived.profiles == {}
+    assert "replica_derivation_limit" in (derived.unavailable_reason or "")
 
 
 @pytest.mark.parametrize(

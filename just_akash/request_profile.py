@@ -1,8 +1,8 @@
 """Aggregate resource request per Akash group, derived from the SUBMITTED SDL.
 
-akash-lease-core#47 made `PreferredSelection.EMPTIEST` request-aware: a bid is ranked
-on whether the provider can fit the exact aggregate its group asks for, and a provider
-that cannot is rejected. The core only knows that aggregate if the consumer supplies it
+akash-lease-core#47 made `PreferredSelection.EMPTIEST` request-aware and #49 made its
+per-node fit proof exact: a bid is ranked on whether the provider can place every
+replica in the group. The core only knows that population if the consumer supplies it
 as `BidObservation.resource_profile`. Without one, EMPTIEST degrades to cheapest and
 says so (`emptiest_request_profile_unavailable_fell_back_to_cheapest`).
 
@@ -11,9 +11,10 @@ profile turned every `--select emptiest` deploy into cheapest, and collapsed the
 anti-affinity spread onto one provider — three sequential placements chose
 `['akash1lisbon', 'akash1lisbon', 'akash1lisbon']`.
 
-⛔ SUM `count × resources` PER GROUP. The core's own contract (`ResourceProfile`):
-"Passing a per-replica shape here would make a provider appear to fit a population it
-cannot actually host." A group of four 2-CPU replicas asks for 8 CPUs, not 2.
+⛔ RETAIN BOTH `count × resources` TOTALS AND EVERY REPLICA SHAPE PER GROUP. Totals
+prove aggregate capacity while the population proves per-node placement. A group of
+four 2-CPU replicas asks for 8 CPUs, but it may fit across four nodes even when no one
+node has 8 CPUs.
 
 ⛔ PER GROUP, NOT PER DEPLOYMENT. Akash auctions each group separately and a bid names
 its `gseq`. Summing across groups would reject a provider that can host the group it
@@ -38,7 +39,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import yaml
-from akash_lease_core import ResourceProfile
+from akash_lease_core import ReplicaProfile, ResourceProfile
 
 _SIZE_RE = re.compile(r"^(?P<num>\d+(?:\.\d+)?)\s*(?P<unit>[A-Za-z]*)$")
 _SIZE_UNITS = {
@@ -55,6 +56,12 @@ _SIZE_UNITS = {
     "Ti": 1024**4,
     "Ei": 1024**6,
 }
+
+# Building one exact shape per replica is required by the core's bin-packing proof.
+# Refuse an adversarial SDL before allocating an unbounded tuple; the shared solver
+# itself explores at most 100,000 canonical states, so a larger input cannot earn a
+# positive placement verdict through this synchronous adapter.
+MAX_REPLICA_POPULATION = 100_000
 
 
 class _Unreadable(ValueError):
@@ -169,6 +176,7 @@ def derive_resource_profiles(sdl_text: str) -> DerivedProfiles:
         deployment = _mapping(document.get("deployment"), "deployment")
 
         totals: dict[str, list[int]] = {}
+        replicas: dict[str, list[ReplicaProfile]] = {}
         for service, groups in deployment.items():
             for group_name, spec in _mapping(groups, f"deployment.{service}").items():
                 spec = _mapping(spec, f"deployment.{service}.{group_name}")
@@ -181,20 +189,35 @@ def derive_resource_profiles(sdl_text: str) -> DerivedProfiles:
                 running = totals.setdefault(group_name, [0, 0, 0, 0])
                 for index, amount in enumerate(replica):
                     running[index] += count * amount
+                population = replicas.setdefault(group_name, [])
+                if len(population) + count > MAX_REPLICA_POPULATION:
+                    raise _Unreadable(
+                        f"deployment group {group_name!r} exceeds the "
+                        f"{MAX_REPLICA_POPULATION} replica derivation limit"
+                    )
+                shape = ReplicaProfile(
+                    cpu_millicores=replica[0],
+                    memory_bytes=replica[1],
+                    storage_bytes=replica[2],
+                    gpu_count=replica[3],
+                )
+                population.extend([shape] * count)
 
         if list(totals) != placement_names:
             raise _Unreadable(
                 "deployment groups do not reference profiles.placement in the same order, "
                 "so gseq cannot be assigned"
             )
-        derived = {
-            gseq: ResourceProfile(
-                cpu_millicores=cpu, memory_bytes=memory, storage_bytes=storage, gpu_count=gpu
+        derived: dict[int, ResourceProfile] = {}
+        for gseq, name in enumerate(placement_names, start=1):
+            cpu, memory, storage, gpu = totals[name]
+            derived[gseq] = ResourceProfile(
+                cpu_millicores=cpu,
+                memory_bytes=memory,
+                storage_bytes=storage,
+                gpu_count=gpu,
+                replicas=tuple(replicas[name]),
             )
-            for gseq, (cpu, memory, storage, gpu) in (
-                (index, totals[name]) for index, name in enumerate(placement_names, start=1)
-            )
-        }
     except (_Unreadable, ValueError, yaml.YAMLError, TypeError) as exc:
         reason = re.sub(r"\s+", "_", str(exc).strip())[:120] or type(exc).__name__
         return DerivedProfiles(
