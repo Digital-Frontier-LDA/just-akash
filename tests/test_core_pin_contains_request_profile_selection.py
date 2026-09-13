@@ -8,6 +8,8 @@ goes red here, not in production placement.
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 from akash_lease_core import (
     Auction,
@@ -47,7 +49,7 @@ def _bid(provider: str, price: str, *, gseq, profile, free: int) -> BidObservati
     return BidObservation(
         bid_key=f"{provider}/{gseq}",
         provider=provider,
-        price=price,
+        price=Decimal(price),
         denom="uakt",
         observed_at=1,
         state="open",

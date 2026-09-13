@@ -331,7 +331,7 @@ def _submitted_profiles(sdl: str):
     from just_akash.provenance import stamp_run
     from just_akash.request_profile import derive_resource_profiles
 
-    return derive_resource_profiles(stamp_run(sdl, "abc123def456")[0])
+    return derive_resource_profiles(stamp_run(sdl, "test-run")[0])
 
 
 def _auction(bids, derived):
