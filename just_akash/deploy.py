@@ -567,6 +567,19 @@ def _resolve_selection(select: str) -> "PreferredSelection":
     return table[key]
 
 
+class _GroupKwarg(TypedDict):
+    """The bid's group and that group's request, spread into `BidObservation`.
+
+    ⛔ A TypedDict for the same reason as `_SelectionKwarg`: Pyright reads `**dict[str, V]`
+    as V for every parameter. It is spread rather than written as `gseq=<name>,` because
+    tests/test_lease_uses_winning_group.py mutates the FIRST such line in this file and
+    must reach create_lease's argument, not this observation.
+    """
+
+    gseq: int | None
+    resource_profile: "ResourceProfile | None"
+
+
 def _count_gseqless(bids: list) -> int:
     """Bids in this round that do not say which group they are for (see observed_gseq)."""
     return sum(1 for bid in bids if isinstance(bid, dict) and _extract_gseq(bid) is None)
@@ -626,7 +639,11 @@ def _select_auction_bid(
             continue
         amount, denom = _extract_bid_price(raw_bid)
         bid_key = f"{provider}:{index}"
-        gseq = observed_gseq(_extract_gseq(raw_bid), resource_profiles, placement_group_count)
+        bid_gseq = observed_gseq(_extract_gseq(raw_bid), resource_profiles, placement_group_count)
+        group: _GroupKwarg = {
+            "gseq": bid_gseq,
+            "resource_profile": attach_profile(resource_profiles, bid_gseq),
+        }
         try:
             observation = BidObservation(
                 bid_key=bid_key,
@@ -655,8 +672,7 @@ def _select_auction_bid(
                 # The GROUP this bid is for. An order split into groups lets a provider
                 # bid on the subset it can actually host, and the core needs the group to
                 # tell two bids from one provider apart. None = the shape did not say.
-                gseq=gseq,
-                resource_profile=attach_profile(resource_profiles, gseq),
+                **group,
             )
         except (TypeError, ValueError):
             continue
