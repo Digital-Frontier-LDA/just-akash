@@ -26,7 +26,7 @@ from typing import TypedDict
 
 from akash_lease_core import Auction, AuctionPolicy, AuctionStatus, BidObservation
 from akash_lease_core.auction import PreferredSelection
-from akash_lease_core.capacity import ProviderCapacity
+from akash_lease_core.capacity import ProviderCapacity, ResourceProfile
 
 from . import chain
 from ._diagnostics import Code, emit, enabled
@@ -41,6 +41,7 @@ from .api import (
 from .deployment_receipt import mark_create_response_received, mark_submitting, prepare_receipt
 from .provenance import PLACEMENT_PREFIX, SIBLING_REAPED_PREFIX, run_id_of, stamp_run
 from .provider_capacity import capacity_by_provider
+from .request_profile import attach_profile, derive_resource_profiles, observed_gseq
 from .sdl_validate import SDLValidationError, validate_sdl
 from .smoke_providers import _probe_age_seconds
 
@@ -566,6 +567,24 @@ def _resolve_selection(select: str) -> "PreferredSelection":
     return table[key]
 
 
+class _GroupKwarg(TypedDict):
+    """The bid's group and that group's request, spread into `BidObservation`.
+
+    ⛔ A TypedDict for the same reason as `_SelectionKwarg`: Pyright reads `**dict[str, V]`
+    as V for every parameter. It is spread rather than written as `gseq=<name>,` because
+    tests/test_lease_uses_winning_group.py mutates the FIRST such line in this file and
+    must reach create_lease's argument, not this observation.
+    """
+
+    gseq: int | None
+    resource_profile: "ResourceProfile | None"
+
+
+def _count_gseqless(bids: list) -> int:
+    """Bids in this round that do not say which group they are for (see observed_gseq)."""
+    return sum(1 for bid in bids if isinstance(bid, dict) and _extract_gseq(bid) is None)
+
+
 def _select_auction_bid(
     bids: list,
     *,
@@ -578,8 +597,14 @@ def _select_auction_bid(
     capacity_by_provider: dict[str, "ProviderCapacity"] | None = None,
     preferred_selection: "PreferredSelection | None" = None,
     already_selected: frozenset[str] | None = None,
+    resource_profiles: "dict[int, ResourceProfile] | None" = None,
+    placement_group_count: int | None = None,
 ):
     """Normalize Console bids and delegate the decision to the shared core.
+
+    `resource_profiles` maps gseq → the aggregate request derived from the SUBMITTED SDL
+    (just_akash.request_profile). A bid receives its own group's profile only when it
+    names a gseq: the core rejects a profiled bid with no group as unbound.
 
     The caller owns polling and clocks.  This adapter owns only translation
     between Console's response shape and the transport-neutral auction schema.
@@ -614,6 +639,11 @@ def _select_auction_bid(
             continue
         amount, denom = _extract_bid_price(raw_bid)
         bid_key = f"{provider}:{index}"
+        bid_gseq = observed_gseq(_extract_gseq(raw_bid), resource_profiles, placement_group_count)
+        group: _GroupKwarg = {
+            "gseq": bid_gseq,
+            "resource_profile": attach_profile(resource_profiles, bid_gseq),
+        }
         try:
             observation = BidObservation(
                 bid_key=bid_key,
@@ -642,7 +672,7 @@ def _select_auction_bid(
                 # The GROUP this bid is for. An order split into groups lets a provider
                 # bid on the subset it can actually host, and the core needs the group to
                 # tell two bids from one provider apart. None = the shape did not say.
-                gseq=_extract_gseq(raw_bid),
+                **group,
             )
         except (TypeError, ValueError):
             continue
@@ -1343,6 +1373,13 @@ def deploy(
                 ),
             )
 
+    # REQUEST PROFILE (just-akash#346): derived ONCE, from `sdl_content` — the exact text
+    # `create_deployment` submitted — so the fit check sees what was actually ordered.
+    _request_profiles = derive_resource_profiles(sdl_content)
+    _log(
+        logging.INFO,
+        f"auction[collection] {_request_profiles.describe(_count_gseqless(bids))}",
+    )
     selected_bid, auction_result = _select_auction_bid(
         bids,
         preferred=preferred,
@@ -1354,6 +1391,8 @@ def deploy(
         capacity_by_provider=_capacity,
         preferred_selection=_selection,
         already_selected=_already_selected,
+        resource_profiles=_request_profiles.profiles,
+        placement_group_count=_request_profiles.placement_group_count,
     )
     if auction_result.status is AuctionStatus.COLLECTING:
         fallback_deadline = start_time + bid_wait_retry
@@ -1429,6 +1468,10 @@ def deploy(
                             p for p, c in _capacity.items() if c.available_fraction() is None
                         ),
                     )
+        _log(
+            logging.INFO,
+            f"auction[fallback] {_request_profiles.describe(_count_gseqless(bids))}",
+        )
         selected_bid, auction_result = _select_auction_bid(
             bids,
             preferred=preferred,
@@ -1440,6 +1483,8 @@ def deploy(
             capacity_by_provider=_capacity,
             preferred_selection=_selection,
             already_selected=_already_selected,
+            resource_profiles=_request_profiles.profiles,
+            placement_group_count=_request_profiles.placement_group_count,
         )
     selection_phase = (
         1 if auction_result.selection_reason == "cheapest_preferred" or not has_allowlist else 2

@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from akash_lease_core import from_provider_status
+from akash_lease_core import ResourceProfile, from_provider_status
 from akash_lease_core.auction import PreferredSelection
 
 from just_akash.deploy import _select_auction_bid
@@ -39,7 +39,7 @@ LIS, SOF, HEL = "akash1lisbon", "akash1sofia", "akash1helsinki"
 def _bid(provider: str, amount: str) -> dict:
     return {
         "bid": {
-            "id": {"provider": provider},
+            "id": {"provider": provider, "gseq": 1},
             "price": {"denom": "uakt", "amount": amount},
             "state": "open",
         }
@@ -77,8 +77,14 @@ def _run(**kw):
 
 def _run_emptiest(**kw):
     """Anti-affinity only engages under EMPTIEST with readable capacity — see the header."""
+    # Since akash-lease-core#47, EMPTIEST ranks only bids that carry their group's request.
+    # Without `resource_profiles` the core falls back to cheapest and the spread term never
+    # runs: measured, all three placements chose akash1lisbon.
     return _run(
-        capacity_by_provider=CAPACITY, preferred_selection=PreferredSelection.EMPTIEST, **kw
+        capacity_by_provider=CAPACITY,
+        preferred_selection=PreferredSelection.EMPTIEST,
+        resource_profiles={1: ResourceProfile(cpu_millicores=1)},
+        **kw,
     )
 
 

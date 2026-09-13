@@ -10,7 +10,7 @@ until a caller explicitly asks for EMPTIEST.
 
 from __future__ import annotations
 
-from akash_lease_core import from_provider_status
+from akash_lease_core import ResourceProfile, from_provider_status
 from akash_lease_core.auction import PreferredSelection
 
 from just_akash.deploy import _select_auction_bid
@@ -21,7 +21,7 @@ BIG, MID, SMALL = "akash1big", "akash1mid", "akash1small"
 def _bid(provider: str, amount: str) -> dict:
     return {
         "bid": {
-            "id": {"provider": provider},
+            "id": {"provider": provider, "gseq": 1},
             "price": {"denom": "uakt", "amount": amount},
             "state": "open",
         }
@@ -64,6 +64,10 @@ CAPACITY = {
     SMALL: from_provider_status(_status(5, 100)),  # 5% free, cheapest
 }
 PREFERRED = [BIG, MID, SMALL]
+# akash-lease-core#47 ranks EMPTIEST on whether a provider fits the group's aggregate request.
+# One millicore fits every fixture provider, so these tests still exercise RANKING; the fit
+# rejection itself is covered in tests/test_deploy_request_profile_call_sites.py.
+PROFILES = {1: ResourceProfile(cpu_millicores=1)}
 
 
 def _run(**kw):
@@ -91,11 +95,27 @@ def test_emptiest_selects_the_roomiest_provider_not_the_cheapest() -> None:
     """⛔ THE LINK. Before this wiring, capacity was never passed and this returned
     the cheapest while reporting a degraded reason."""
     raw, result = _run(
-        capacity_by_provider=CAPACITY, preferred_selection=PreferredSelection.EMPTIEST
+        capacity_by_provider=CAPACITY,
+        preferred_selection=PreferredSelection.EMPTIEST,
+        resource_profiles=PROFILES,
     )
     assert result.selected is not None
     assert result.selected.provider == BIG
-    assert "emptiest" in result.selection_reason
+    assert result.selection_reason == "emptiest_preferred"
+
+
+def test_emptiest_with_capacity_but_NO_PROFILE_falls_back_to_cheapest_AND_SAYS_SO() -> None:
+    """⛔ The semantics akash-lease-core#47 changed, pinned as a contract rather than erased
+    when the fixtures gained profiles. Before #47 this exact call ranked on capacity and
+    chose BIG; now EMPTIEST needs the group's request, and without it the core chooses the
+    cheapest AND names the degradation. Measured consequence of pinning #47 without #346:
+    every `--select emptiest` deploy became cheapest."""
+    raw, result = _run(
+        capacity_by_provider=CAPACITY, preferred_selection=PreferredSelection.EMPTIEST
+    )
+    assert result.selected is not None
+    assert result.selected.provider == SMALL
+    assert result.selection_reason == "emptiest_request_profile_unavailable_fell_back_to_cheapest"
 
 
 def test_emptiest_without_capacity_degrades_to_cheapest_AND_SAYS_SO() -> None:
@@ -114,7 +134,9 @@ def test_an_unreadable_provider_is_unranked_not_ranked_last() -> None:
     partial = dict(CAPACITY)
     partial[BIG] = from_provider_status({})  # unreadable
     raw, result = _run(
-        capacity_by_provider=partial, preferred_selection=PreferredSelection.EMPTIEST
+        capacity_by_provider=partial,
+        preferred_selection=PreferredSelection.EMPTIEST,
+        resource_profiles=PROFILES,
     )
     # BIG is unrankable, so the roomiest MEASURED provider wins — not BIG, and not
     # "BIG last" either; it is simply out of the ranking.
@@ -127,6 +149,7 @@ def test_a_provider_with_no_capacity_entry_is_treated_as_unmeasured() -> None:
     raw, result = _run(
         capacity_by_provider={BIG: CAPACITY[BIG]},
         preferred_selection=PreferredSelection.EMPTIEST,
+        resource_profiles=PROFILES,
     )
     assert result.selected is not None
     assert result.selected.provider == BIG
