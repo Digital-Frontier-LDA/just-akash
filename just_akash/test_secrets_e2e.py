@@ -104,14 +104,14 @@ def _run_just_up(
         return result, True
 
 
-def _receipt_environment() -> tuple[Path, str, dict[str, str]]:
+def _receipt_environment(api_key: str) -> tuple[Path, str, dict[str, str]]:
     """Bind owner, complete group population and submitted bytes before create starts."""
     sdl = Path("sdl/cpu-backtest-ssh.yaml")
     population, _, artifact_digest = artifact_identity(sdl.read_text(encoding="utf-8"))
     groups = [str(row["name"]) for row in population]
     if len(groups) != 1:
         raise RuntimeError(f"secrets E2E expects exactly one deployment group, got {groups}")
-    owner = AkashConsoleAPI().account_address()
+    owner = AkashConsoleAPI(api_key).account_address()
     receipt_dir = Path(tempfile.mkdtemp(prefix="just-akash-secrets-receipt-"))
     receipt_path = receipt_dir / "create.json"
     operation_id = f"e2e-secrets-{secrets.token_hex(8)}"
@@ -128,7 +128,9 @@ def _receipt_environment() -> tuple[Path, str, dict[str, str]]:
     )
 
 
-def _reconcile_receipt(receipt_path: Path, operation_id: str, started_at: float) -> str | None:
+def _reconcile_receipt(
+    receipt_path: Path, operation_id: str, started_at: float, api_key: str
+) -> str | None:
     """Recover a returned DSEQ or reconcile a submitted create before reporting HELD."""
     try:
         receipt = decode_receipt(receipt_path.read_bytes())
@@ -145,7 +147,7 @@ def _reconcile_receipt(receipt_path: Path, operation_id: str, started_at: float)
             "owner-scoped/provenance reconciliation before exit"
         )
         try:
-            _report_suspected_orphans(AkashConsoleAPI(), started_at, operation_id)
+            _report_suspected_orphans(AkashConsoleAPI(api_key), started_at, operation_id)
         except Exception as exc:  # noqa: BLE001 - reconciliation failure remains HELD
             log_fail(f"HELD: reconciliation could not complete ({exc})")
     return None
@@ -228,7 +230,8 @@ def main():
     # this private receipt to `submitting` before POST and to
     # `create_response_received` before auction work, so timeout and empty stdout do
     # not erase the only rollback handle.
-    receipt_path, receipt_operation_id, receipt_env = _receipt_environment()
+    api_key = os.environ["AKASH_API_KEY"]
+    receipt_path, receipt_operation_id, receipt_env = _receipt_environment(api_key)
 
     # ── Step 2: Deploy SSH instance ────────────────────
     log_step(2, "Deploy SSH instance")
@@ -243,7 +246,7 @@ def main():
         dseq_ref["dseq"] = m.group(1)
     else:
         dseq_ref["dseq"] = _reconcile_receipt(
-            receipt_path, receipt_operation_id, deploy_started_at
+            receipt_path, receipt_operation_id, deploy_started_at, api_key
         )
 
     if timed_out or r.returncode != 0:

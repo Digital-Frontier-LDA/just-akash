@@ -59,14 +59,14 @@ def test_a_submitting_receipt_runs_reconciliation_once(monkeypatch, tmp_path: Pa
     mark_submitting(*prepared)
     calls = []
     client = object()
-    monkeypatch.setattr(target, "AkashConsoleAPI", lambda: client)
+    monkeypatch.setattr(target, "AkashConsoleAPI", lambda _api_key: client)
     monkeypatch.setattr(
         target,
         "_report_suspected_orphans",
         lambda got_client, started, operation: calls.append((got_client, started, operation)),
     )
 
-    assert target._reconcile_receipt(prepared[0], "operation-7", 123.0) is None
+    assert target._reconcile_receipt(prepared[0], "operation-7", 123.0, "test-key") is None
     assert calls == [(client, 123.0, "operation-7")]
 
 
@@ -81,7 +81,7 @@ def test_a_response_receipt_recovers_exact_dseq_without_population_probe(
         lambda *_: (_ for _ in ()).throw(AssertionError("response receipt must not probe")),
     )
 
-    assert target._reconcile_receipt(submitting[0], "operation-7", 123.0) == "1002"
+    assert target._reconcile_receipt(submitting[0], "operation-7", 123.0, "test-key") == "1002"
 
 
 def test_timeout_terminates_the_complete_just_up_process_group(monkeypatch) -> None:
@@ -92,9 +92,11 @@ def test_timeout_terminates_the_complete_just_up_process_group(monkeypatch) -> N
         def __init__(self) -> None:
             self.calls = 0
 
-        def communicate(self, timeout=None):
+        def communicate(self, timeout: float | None = None):
             self.calls += 1
             if self.calls == 1:
+                if timeout is None:
+                    raise AssertionError("the first communicate call must be time-bounded")
                 raise subprocess.TimeoutExpired(["just", "up"], timeout)
             return "out", "err"
 
@@ -116,7 +118,7 @@ def test_timeout_terminates_the_complete_just_up_process_group(monkeypatch) -> N
 
 def test_receipt_and_reconciliation_surround_every_just_up_exit() -> None:
     source = inspect.getsource(target.main)
-    receipt = source.index("_receipt_environment()")
+    receipt = source.index("_receipt_environment(api_key)")
     create = source.index("_run_just_up(")
     reconcile = source.index("_reconcile_receipt(")
     first_exit = source.index("sys.exit", create)
