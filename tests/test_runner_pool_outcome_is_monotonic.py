@@ -59,8 +59,9 @@ if sub == "deploy":
         print(f"DSEQ: {r['dseq']}")
     if r.get("provider"):
         print(f"Provider: {r['provider']}")
-    if r.get("dseq"):
-        print(f"Wallet: {r.get('wallet', scenario.get('owner', ''))}")
+    # just-akash prints Wallet only when it has one; "wallet": null models that.
+    if r.get("dseq") and r.get("wallet", scenario.get("owner")) is not None:
+        print(f"Wallet: {r.get('wallet', scenario.get('owner'))}")
     if r.get("text"):
         print(r["text"])
     sys.exit(0)
@@ -235,10 +236,19 @@ def assert_monotonic(result: dict) -> None:
     first_real = next((i for i, v in enumerate(dseqs) if v), None)
     if first_real is not None:
         assert all(dseqs[first_real:]), f"an empty dseq followed a real one: {dseqs}"
-    owners = [v for k, v in result["writes"] if k == "wallet_address"]
-    first_owner = next((i for i, v in enumerate(owners) if v), None)
-    if first_owner is not None:
-        assert all(owners[first_owner:]), f"an empty owner followed a real one: {owners}"
+    identity_pairs(result)
+
+
+def identity_pairs(result: dict) -> list[tuple[str, str]]:
+    """dseq and wallet_address are one record: every dseq write is followed by the
+    owner of that same round before any other identity write, and no owner is
+    written without its dseq. Returns the published (dseq, owner) pairs in order."""
+    ident = [(k, v) for k, v in result["writes"] if k in ("dseq", "wallet_address")]
+    keys = [k for k, _ in ident]
+    assert keys == ["dseq", "wallet_address"] * (len(keys) // 2), (
+        f"dseq and owner were not published as pairs: {ident}"
+    )
+    return [(ident[i][1], ident[i + 1][1]) for i in range(0, len(ident), 2)]
 
 
 def deploys(result: dict) -> int:
@@ -457,7 +467,7 @@ def test_s4_a_later_empty_round_never_blanks_the_published_dseq(tmp_path: Path) 
     assert_monotonic(r)
 
 
-def test_s5_a_later_empty_round_never_blanks_the_owner_of_the_published_dseq(
+def test_s5a_an_empty_round_preserves_the_published_dseq_owner_pair(
     tmp_path: Path,
 ) -> None:
     """#348: teardown passes --expected-owner only for a non-empty wallet_address."""
@@ -471,9 +481,37 @@ def test_s5_a_later_empty_round_never_blanks_the_owner_of_the_published_dseq(
         },
     )
     assert deploys(r) == 3, r["calls"]
-    assert last(r, "dseq") == "1001", r["writes"]
-    owners = [v for k, v in r["writes"] if k == "wallet_address"]
-    assert owners == [OWNER], owners
+    assert identity_pairs(r) == [("1001", OWNER)], r["writes"]
+    assert_monotonic(r)
+
+
+def test_s5b_a_new_dseq_without_a_wallet_never_keeps_the_old_owner_and_stops(
+    tmp_path: Path,
+) -> None:
+    """A later round that prints DSEQ but no Wallet must not inherit the previous
+    round's owner, and must stop before any close or another deploy."""
+    r = run_step(
+        tmp_path,
+        {
+            "owner": OWNER,
+            "verify": {"1001": "closed"},
+            "destroy": {"1001": "ok"},
+            "rounds": [
+                {"dseq": "1001"},
+                {"dseq": "1002", "provider": PROVIDER_A, "wallet": None},
+                {"dseq": "1003", "provider": PROVIDER_B},
+            ],
+        },
+    )
+    assert r["rc"] != 0
+    assert deploys(r) == 2, f"a deploy followed an unreadable owner: {r['calls']}"
+    assert identity_pairs(r) == [("1001", OWNER), ("1002", "")], r["writes"]
+    assert last(r, "failure_reason") == "LEASE_OWNER_UNREADABLE", r["writes"]
+    assert last(r, "deployment_outcome") == "created"
+    assert not [c for c in r["calls"] if c.endswith("dseq=1002") and not c.startswith("deploy")], (
+        f"an owner-less lease was acted on: {r['calls']}"
+    )
+    assert_monotonic(r)
 
 
 # ── S6: every exit reached after a lease was created keeps created ───────────────

@@ -1022,9 +1022,21 @@ jobs:
             # Publish the create-time owner as soon as it is available. Internal
             # rollback runs only on a failed handoff, so a success-only publication
             # leaves precisely that teardown without the bound-owner fallback.
-            # Monotonic beside dseq (#348): a round with no DSEQ, or no parsed
-            # owner, never overwrites the owner already published for the lease.
-            [ -n "$DSEQ" ] && [ -n "$WALLET" ] && echo "wallet_address=$WALLET" >> "$GITHUB_OUTPUT"
+            # ⛔ THE OWNER IS PART OF THE SAME RECORD AS THE DSEQ (#348). A round with no
+            # DSEQ writes neither, so the previous pair stands. A round WITH a DSEQ always
+            # writes this round's owner, even an empty one: just-akash prints DSEQ
+            # unconditionally but Wallet only conditionally, so skipping an empty owner
+            # would pair the NEW dseq with the OLD owner. An unreadable owner cannot be
+            # closed under --expected-owner, so stop here, before any destroy or retry,
+            # and leave this DSEQ as the published identity.
+            if [ -n "$DSEQ" ]; then
+              echo "wallet_address=$WALLET" >> "$GITHUB_OUTPUT"
+              if [ -z "$WALLET" ]; then
+                echo "failure_reason=LEASE_OWNER_UNREADABLE" >> "$GITHUB_OUTPUT"
+                echo "::error title=Lease owner is UNREADABLE::dseq=$DSEQ was created but the deploy output named no Wallet. Stopping before any close or another deploy; the external teardown must resolve this DSEQ's owner."
+                echo "::endgroup::"; exit 1
+              fi
+            fi
             WALLET_UACT=$(awk '/^[[:space:]]*Wallet available:/{print $(NF-1); exit}' /tmp/ja.log || true)
 
             # A DSEQ with no PROVIDER is a REAL deployment we would otherwise walk away
