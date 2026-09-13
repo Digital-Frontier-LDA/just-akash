@@ -186,32 +186,34 @@ def _receipt_provenance_run_id(receipt: DeploymentReceipt) -> str:
 
 
 def _reconcile_receipt(
-    receipt_path: Path, operation_id: str, started_at: float, _api_key: str
-) -> str | None:
+    receipt_path: Path,
+    operation_id: str,
+    started_at: float,
+    _api_key: str,
+    dseq_ref: dict,
+) -> None:
     """Recover a returned DSEQ or reconcile a submitted create before reporting HELD."""
     try:
         receipt = decode_receipt(receipt_path.read_bytes())
     except Exception as exc:  # noqa: BLE001 - report ambiguity without replacing it
         log_fail(f"HELD: create receipt unreadable ({exc}); manual reconciliation required")
-        return None
+        return
     if receipt["operation_id"] != operation_id:
         log_fail("HELD: create receipt operation ID disagrees with this lifecycle operation")
-        return None
+        return
     if receipt["state"] == "submitting":
         log_fail(
             "HELD: create request was submitted without a response identity; running "
             "owner-scoped/provenance reconciliation before exit"
         )
     try:
-        recovered = reconcile_paid_receipt(
-            receipt_path, operation_id, started_at, {"dseq": None, "receipt_path": receipt_path}
-        )
+        recovered = reconcile_paid_receipt(receipt_path, operation_id, started_at, dseq_ref)
     except Exception as exc:  # noqa: BLE001 - reconciliation failure remains HELD
         log_fail(f"HELD: reconciliation could not complete ({exc})")
-        return None
+        return
     if recovered:
+        dseq_ref["dseq"] = recovered
         log_info(f"Recovered DSEQ={recovered} from the durable create receipt")
-    return recovered
 
 
 def _wait_for_ssh(ssh_key, ssh_host, ssh_port, max_attempts=18):
@@ -308,7 +310,13 @@ def main():
             if dseq:
                 _verified_cleanup(dseq_ref)
             elif state == "submitting":
-                _reconcile_receipt(receipt_path, receipt_operation_id, deploy_started_at, api_key)
+                _reconcile_receipt(
+                    receipt_path,
+                    receipt_operation_id,
+                    deploy_started_at,
+                    api_key,
+                    dseq_ref,
+                )
         except Exception as exc:  # noqa: BLE001 - interruption remains HELD
             log_fail(f"HELD: interrupted create receipt could not be reconciled ({exc})")
         raise
@@ -327,9 +335,15 @@ def main():
         log_info(
             f"Ignoring stale output DSEQ {output_dseq}; response receipt proves {receipt_dseq}"
         )
-    dseq_ref["dseq"] = receipt_dseq or _reconcile_receipt(
-        receipt_path, receipt_operation_id, deploy_started_at, api_key
-    )
+    dseq_ref["dseq"] = receipt_dseq
+    if receipt_dseq is None:
+        _reconcile_receipt(
+            receipt_path,
+            receipt_operation_id,
+            deploy_started_at,
+            api_key,
+            dseq_ref,
+        )
 
     if timed_out or r.returncode != 0:
         log_fail("just up timed out" if timed_out else "just up failed")
@@ -338,12 +352,14 @@ def main():
         _summary(["deploy: failed"])
         sys.exit(1)
 
-    if not dseq_ref["dseq"]:
+    if not receipt_dseq:
+        if dseq_ref["dseq"]:
+            _verified_cleanup(dseq_ref)
         log_fail("Could not recover DSEQ from output or durable receipt; create is HELD")
         _summary(["deploy: no dseq"])
         sys.exit(1)
 
-    dseq = dseq_ref["dseq"]
+    dseq = receipt_dseq
     log_pass(f"Deployed: DSEQ={dseq}")
 
     try:

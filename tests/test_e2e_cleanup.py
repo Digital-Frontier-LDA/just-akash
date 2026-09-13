@@ -1688,5 +1688,5 @@ class TestAuditOverClaimsWhenReaderLagsChainTruth:
             patch("just_akash._e2e.time.sleep"),
         ):
             mock_run.return_value = _completed(0, stdout="Deployment 12345 destroyed")
-            assert robust_destroy("12345", owner=owner) is True
+            assert robust_destroy("12345", owner=owner, group="group-one") is True
         confirm.assert_called_once_with("12345", owner)

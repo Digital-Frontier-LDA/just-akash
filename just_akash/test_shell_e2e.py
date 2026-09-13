@@ -593,9 +593,9 @@ def main():
             owner=receipt["expected_owner"],
             groups=receipt["group_population"],
         )
-        dseq_ref["dseq"] = receipt_dseq or reconcile_receipt(
-            receipt_path, receipt_operation_id, deploy_started_at, dseq_ref
-        )
+        dseq_ref["dseq"] = receipt_dseq
+        if receipt_dseq is None:
+            reconcile_receipt(receipt_path, receipt_operation_id, deploy_started_at, dseq_ref)
     except Exception as exc:  # noqa: BLE001 - unverified output has no close authority
         receipt, receipt_dseq = None, None
         log_fail(f"HELD: create receipt unreadable ({exc})")
@@ -661,9 +661,12 @@ def main():
             report_unnamed_deployment(deploy_started_at, deploy_ended_at, recovered_dseq)
         sys.exit(1)
 
-    if not dseq_ref["dseq"]:
+    if not receipt_dseq:
+        if dseq_ref["dseq"]:
+            verified_cleanup(dseq_ref)
         log_fail("Could not parse DSEQ from `just up` output")
-        report_unnamed_deployment(deploy_started_at, deploy_ended_at, recovered_dseq)
+        if not dseq_ref["dseq"]:
+            report_unnamed_deployment(deploy_started_at, deploy_ended_at, recovered_dseq)
         sys.exit(1)
 
     # ⛔ `dseq` REACHES SUBPROCESS BELOW, but no longer through a shell: `run` takes an
@@ -675,7 +678,7 @@ def main():
     # the escrow rule — an unverified value must not reach a privileged sink — and it
     # closed the injection path as a side effect, before this conversion removed the
     # path itself. If you assign to `dseq_ref` from a new source, you are editing this.
-    dseq = dseq_ref["dseq"]
+    dseq = receipt_dseq
     log_pass(f"Deployed DSEQ={dseq}")
 
     # ── Steps 3-5 with cleanup guarantee ─────────────────────

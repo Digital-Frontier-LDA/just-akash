@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from just_akash import _e2e
+from just_akash import _e2e, chain
 
 OWNER = "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee"
 DSEQ = "1789233446929"
@@ -39,14 +39,42 @@ def test_owner_is_resolved_and_validated_before_destroy():
 
     with (
         patch.object(_e2e, "resolve_deployment_owner", side_effect=resolve),
+        patch.object(chain, "deployment_group_names", return_value=["group-one"]),
         patch.object(_e2e, "robust_destroy", side_effect=destroy),
     ):
         assert _e2e.destroy_owned_deployment(DSEQ) is True
 
     assert events == [
         ("resolve", DSEQ),
-        ("destroy", (DSEQ, {"owner": OWNER, "retries": 2, "audit": True})),
+        (
+            "destroy",
+            (DSEQ, {"owner": OWNER, "group": "group-one", "retries": 2, "audit": True}),
+        ),
     ]
+
+
+def test_known_owner_without_group_holds_before_bare_destroy():
+    with patch.object(_e2e, "_run") as run:
+        assert _e2e.robust_destroy(DSEQ, owner=OWNER) is False
+    run.assert_not_called()
+
+
+def test_owned_destroy_holds_when_singleton_group_cannot_be_resolved():
+    with (
+        patch.object(chain, "deployment_group_names", return_value=[]),
+        patch.object(_e2e, "robust_destroy") as destroy,
+    ):
+        assert _e2e.destroy_owned_deployment(DSEQ, owner=OWNER) is False
+    destroy.assert_not_called()
+
+
+def test_owned_destroy_holds_when_group_lookup_raises():
+    with (
+        patch.object(chain, "deployment_group_names", side_effect=RuntimeError("offline")),
+        patch.object(_e2e, "robust_destroy") as destroy,
+    ):
+        assert _e2e.destroy_owned_deployment(DSEQ, owner=OWNER) is False
+    destroy.assert_not_called()
 
 
 def test_owner_resolution_failure_holds_before_destroy():
@@ -111,7 +139,7 @@ def test_laggy_single_reader_cannot_emit_still_active(capsys):
         patch.object(_e2e, "_confirm_settled", return_value=False),
         patch.object(_e2e.time, "sleep"),
     ):
-        assert _e2e.robust_destroy(DSEQ, owner=OWNER) is False
+        assert _e2e.robust_destroy(DSEQ, owner=OWNER, group="group-one") is False
     output = capsys.readouterr().out
     assert "settlement not observed" in output
     assert "STILL ACTIVE" not in output
@@ -124,7 +152,7 @@ def test_timeout_reports_measured_elapsed_time_not_a_stale_constant(capsys):
         patch.object(_e2e.time, "sleep"),
         patch.object(_e2e.time, "monotonic", side_effect=[100.0, 137.25]),
     ):
-        assert _e2e.robust_destroy(DSEQ, owner=OWNER) is False
+        assert _e2e.robust_destroy(DSEQ, owner=OWNER, group="group-one") is False
     output = capsys.readouterr().out
     assert "settlement not observed after 37.2 s" in output
     assert "within 24 s" not in output
@@ -136,8 +164,8 @@ def test_audit_receives_the_captured_owner():
         patch.object(_e2e, "_confirm_settled", return_value=True) as confirm,
         patch.object(_e2e.time, "sleep"),
     ):
-        assert _e2e.robust_destroy(DSEQ, owner=OWNER) is True
-    assert run.call_args.args[0] == f"just destroy {DSEQ}"
+        assert _e2e.robust_destroy(DSEQ, owner=OWNER, group="group-one") is True
+    assert "--expected-owner" in run.call_args.args[0]
     confirm.assert_called_once_with(DSEQ, OWNER)
 
 
@@ -153,6 +181,7 @@ def _compiled_destroy(source: str):
             returncode=0, stdout="Deployment destroyed", stderr=""
         ),
         "shlex": __import__("shlex"),
+        "re": __import__("re"),
         "time": SimpleNamespace(sleep=lambda _seconds: None, monotonic=lambda: 0.0),
     }
     exec(source, namespace)
@@ -167,8 +196,8 @@ def test_removing_owner_scoped_audit_call_is_a_red_effect_mutation():
     mutant = source.replace(target, replacement, 1)
     assert mutant != source
 
-    assert _compiled_destroy(source)(DSEQ, owner=OWNER) is True
-    assert _compiled_destroy(mutant)(DSEQ, owner=OWNER) is False
+    assert _compiled_destroy(source)(DSEQ, owner=OWNER, group="group-one") is True
+    assert _compiled_destroy(mutant)(DSEQ, owner=OWNER, group="group-one") is False
 
 
 _RECEIPT_BOUND_CLEANUP_MARKERS = {

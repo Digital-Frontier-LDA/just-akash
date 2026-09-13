@@ -108,15 +108,6 @@ jobs:
           SMOKE_BENCHMARK_FILE: ${{ github.workspace }}/smoke-benchmark.jsonl
         run: uv run python -m just_akash.smoke_providers ${{ inputs.all && '--all' || '' }}
 
-      - name: Preserve unresolved provider-smoke deployment receipts
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: provider-smoke-deployment-receipts-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/just-akash-deployment-receipts/provider-smoke-*.json
-          if-no-files-found: ignore
-          retention-days: 30
-
       # Snapshot the remaining deploy credit HERE, in the one job that holds the
       # API key — the accrue job (which renders the Prometheus metrics) deliberately
       # has no AKASH_API_KEY, so it reads this snapshot instead of the chain.
@@ -167,6 +158,15 @@ jobs:
         timeout-minutes: 10
         # AKASH_API_KEY is already in $GITHUB_ENV from the SOPS load step.
         run: uv run python -m just_akash.smoke_providers --sweep-only --min-age 0
+
+      - name: Preserve unresolved provider-smoke deployment receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: provider-smoke-deployment-receipts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/just-akash-deployment-receipts/provider-smoke-*.json
+          if-no-files-found: ignore
+          retention-days: 30
 
   # Accrue this run's telemetry onto the long-lived `telemetry` branch so the data
   # accumulates across runs (main is branch-protected; the telemetry branch is

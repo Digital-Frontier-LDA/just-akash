@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 import signal
 import stat
 import subprocess
@@ -282,6 +283,22 @@ def test_runner_receipt_path_is_deterministic_and_private(monkeypatch, tmp_path:
     assert set(env) == {"JUST_AKASH_RECEIPT_PATH", "JUST_AKASH_RECEIPT_OPERATION_ID"}
 
 
+def test_secrets_reconciliation_retains_dseq_in_the_persistent_carrier(
+    monkeypatch, tmp_path: Path
+) -> None:
+    submitting = mark_submitting(*_prepared(tmp_path))
+    carrier = {"dseq": None, "receipt_path": submitting[0]}
+
+    def failed_cleanup(_path, _operation_id, _started_at, ref):
+        assert ref is carrier
+        ref["dseq"] = "123000"
+        return None
+
+    monkeypatch.setattr(target, "reconcile_paid_receipt", failed_cleanup)
+    target._reconcile_receipt(submitting[0], OPERATION_ID, 123.0, "unused", carrier)
+    assert carrier["dseq"] == "123000"
+
+
 def test_ci_always_uploads_an_unresolved_receipt_for_thirty_days() -> None:
     workflow = (Path(__file__).parents[1] / ".github/workflows/ci.yml").read_text()
     assert workflow.count("name: Preserve unresolved deployment receipt") == 1
@@ -382,3 +399,61 @@ def test_just_up_passes_the_complete_receipt_identity() -> None:
         "--receipt-artifact-sha256",
     ):
         assert predicted_identity not in recipe
+
+
+def test_just_up_rejects_each_half_configured_receipt_before_paid_deploy(tmp_path: Path) -> None:
+    root = Path(__file__).parents[1]
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "deploy-called"
+    fake_uv = fake_bin / "uv"
+    fake_uv.write_text(f"#!/bin/sh\nprintf called > {marker}\n", encoding="utf-8")
+    fake_uv.chmod(0o755)
+    base_env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "JUST_AKASH_RECEIPT_PATH": "",
+        "JUST_AKASH_RECEIPT_OPERATION_ID": "",
+    }
+
+    for configured in (
+        {"JUST_AKASH_RECEIPT_PATH": str(tmp_path / "receipt.json")},
+        {"JUST_AKASH_RECEIPT_OPERATION_ID": "operation-only"},
+    ):
+        result = subprocess.run(
+            [
+                "just",
+                "--justfile",
+                str(root / "Justfile"),
+                "--working-directory",
+                str(tmp_path),
+                "up",
+            ],
+            env={**base_env, **configured},
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        assert result.returncode != 0
+        assert not marker.exists(), "half-configured receipt mode reached the paid deploy"
+
+    complete = subprocess.run(
+        [
+            "just",
+            "--justfile",
+            str(root / "Justfile"),
+            "--working-directory",
+            str(tmp_path),
+            "up",
+        ],
+        env={
+            **base_env,
+            "JUST_AKASH_RECEIPT_PATH": str(tmp_path / "receipt.json"),
+            "JUST_AKASH_RECEIPT_OPERATION_ID": "complete-operation",
+        },
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    assert complete.returncode == 0 and marker.exists()

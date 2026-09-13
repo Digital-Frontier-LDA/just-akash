@@ -7,14 +7,28 @@ classified, and how each feature check reads a subprocess result.
 
 from __future__ import annotations
 
+import inspect
 import os
 import re
 import subprocess
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from just_akash import smoke_providers as sp
+
+OWNER = "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee"
+
+
+def test_provider_receipts_are_uploaded_only_after_the_final_sweep() -> None:
+    workflow = (Path(__file__).parents[1] / ".github/workflows/provider-smoke.yml").read_text(
+        encoding="utf-8"
+    )
+    reap = "- name: Reap any leaked probe"
+    upload = "- name: Preserve unresolved provider-smoke deployment receipts"
+    assert workflow.count(reap) == workflow.count(upload) == 1
+    assert workflow.index(reap) < workflow.index(upload)
 
 
 def _completed(stdout: str = "", stderr: str = "", returncode: int = 0):
@@ -1197,6 +1211,7 @@ class TestOrphanProbeSweep:
     # ── the sweep itself ─────────────────────────────────────────────
     def _fake_api(self, deployments, details):
         api = MagicMock()
+        api.account_address.return_value = OWNER
         api.list_deployments.return_value = deployments
         api.get_deployment.side_effect = lambda dseq, owner=None: details[dseq]
         return api
@@ -1220,7 +1235,51 @@ class TestOrphanProbeSweep:
         ):
             swept = sp.sweep_orphan_probes()
         assert swept == [old_probe]
-        rd.assert_called_once_with(old_probe)
+        rd.assert_called_once_with(old_probe, owner=OWNER, group=sp.PROBE_GROUP)
+
+    def test_successful_sweep_deletes_only_its_resolved_receipt(self, monkeypatch, tmp_path):
+        old_probe = self._dseq_aged(7200)
+        receipt_dir = tmp_path / "just-akash-deployment-receipts"
+        receipt_dir.mkdir()
+        matching = receipt_dir / "provider-smoke-matching.json"
+        other = receipt_dir / "provider-smoke-other.json"
+        unreadable = receipt_dir / "provider-smoke-unreadable.json"
+        for path in (matching, other, unreadable):
+            path.write_text("receipt")
+
+        def identity(path):
+            if path == unreadable:
+                raise ValueError("malformed")
+            return {"expected_owner": OWNER}, old_probe if path == matching else "999"
+
+        api = self._fake_api([{"dseq": old_probe}], {old_probe: self._detail(["probe"])})
+        monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+        with (
+            patch.object(sp, "_api", return_value=api),
+            patch.object(sp, "receipt_identity", side_effect=identity),
+            patch.object(sp, "robust_destroy", return_value=True),
+            patch.object(sp.time, "time", return_value=self.NOW),
+        ):
+            assert sp.sweep_orphan_probes() == [old_probe]
+        assert not matching.exists()
+        assert other.exists() and unreadable.exists()
+
+        source = inspect.getsource(sp.sweep_orphan_probes)
+        call = "_delete_resolved_provider_smoke_receipts(dseq, owner)"
+        assert source.count(call) == 1, "receipt deletion call-site target must apply once"
+
+    def test_failed_or_dry_run_sweep_keeps_receipts(self):
+        old_probe = self._dseq_aged(7200)
+        api = self._fake_api([{"dseq": old_probe}], {old_probe: self._detail(["probe"])})
+        for dry_run, destroy_result in ((False, False), (True, True)):
+            with (
+                patch.object(sp, "_api", return_value=api),
+                patch.object(sp, "robust_destroy", return_value=destroy_result),
+                patch.object(sp, "_delete_resolved_provider_smoke_receipts") as delete,
+                patch.object(sp.time, "time", return_value=self.NOW),
+            ):
+                sp.sweep_orphan_probes(dry_run=dry_run)
+            delete.assert_not_called()
 
     def test_sweep_dry_run_destroys_nothing(self, capsys):
         old_probe = self._dseq_aged(7200)

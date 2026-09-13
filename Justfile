@@ -15,8 +15,12 @@ up tag="":
     echo "[INFO] recipe=up started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file tag={{tag}}"
     set -x
     args=(uv run just-akash deploy --sdl sdl/cpu-backtest-ssh.yaml --bid-wait 60 --bid-wait-retry 120)
+    if { [ -n "${JUST_AKASH_RECEIPT_PATH:-}" ] && [ -z "${JUST_AKASH_RECEIPT_OPERATION_ID:-}" ]; } || \
+       { [ -z "${JUST_AKASH_RECEIPT_PATH:-}" ] && [ -n "${JUST_AKASH_RECEIPT_OPERATION_ID:-}" ]; }; then
+        echo "receipt path and operation id must be set together" >&2
+        exit 1
+    fi
     if [ -n "${JUST_AKASH_RECEIPT_PATH:-}" ]; then
-        : "${JUST_AKASH_RECEIPT_OPERATION_ID:?receipt operation id required}"
         args+=(
             --receipt-path "$JUST_AKASH_RECEIPT_PATH"
             --receipt-operation-id "$JUST_AKASH_RECEIPT_OPERATION_ID"

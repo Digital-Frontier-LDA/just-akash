@@ -150,9 +150,9 @@ def main():
     try:
         receipt, receipt_dseq = receipt_identity(receipt_path)
         dseq_ref.update(owner=receipt["expected_owner"], groups=receipt["group_population"])
-        dseq_ref["dseq"] = receipt_dseq or reconcile_receipt(
-            receipt_path, operation_id, started_at, dseq_ref
-        )
+        dseq_ref["dseq"] = receipt_dseq
+        if receipt_dseq is None:
+            reconcile_receipt(receipt_path, operation_id, started_at, dseq_ref)
     except Exception as exc:  # noqa: BLE001 - output alone has no close authority
         receipt = None
         log_fail(f"HELD: create receipt unreadable ({exc})")
@@ -165,13 +165,15 @@ def main():
         _summary(failures)
         sys.exit(1)
 
-    if not dseq_ref["dseq"]:
+    if not receipt_dseq:
+        if dseq_ref["dseq"]:
+            verified_cleanup(dseq_ref)
         log_fail("Could not parse DSEQ from 'just up' output")
         failures.append("up: no dseq in output")
         _summary(failures)
         sys.exit(1)
 
-    dseq = dseq_ref["dseq"]
+    dseq = receipt_dseq
     log_pass(f"Deployed: DSEQ={dseq}")
 
     # Wrap all post-deploy work in try/finally so the deployment is destroyed

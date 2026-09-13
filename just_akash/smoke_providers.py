@@ -59,6 +59,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+from pathlib import Path
 from shlex import quote as q
 
 from ._diagnostics import Code, emit
@@ -77,6 +78,7 @@ from ._e2e import (
 from ._states import TERMINAL_DEPLOYMENT_STATES
 from .api import AkashConsoleAPI, _extract_dseq
 from .paid_create import (
+    delete_receipt,
     receipt_environment,
     receipt_identity,
     reconcile_receipt,
@@ -469,11 +471,38 @@ def _hdr(msg: str) -> None:
 # The probe SDL's sole service name. A deployment whose service set is exactly
 # {PROBE_SERVICE} is unambiguously a leaked smoke probe, never a user workload.
 PROBE_SERVICE = "probe"
+PROBE_GROUP = "akash"
 
 # Don't reap a probe younger than this: a concurrent smoke run could still be
 # using it (a run holds one probe for up to the whole matrix, ~tens of minutes).
 # A genuine orphan is seen by the next daily run (~24h later), far past this.
 MIN_ORPHAN_AGE_SECONDS = 3600  # 1 hour
+
+
+def _delete_resolved_provider_smoke_receipts(dseq: str, owner: str) -> list[Path]:
+    """Delete only durable provider-smoke receipts bound to a settled DSEQ."""
+    runner_temp = os.environ.get("RUNNER_TEMP")
+    if not runner_temp:
+        return []
+    receipt_dir = Path(runner_temp) / "just-akash-deployment-receipts"
+    deleted: list[Path] = []
+    try:
+        paths = list(receipt_dir.glob("provider-smoke-*.json"))
+    except OSError:
+        return []
+    for path in paths:
+        try:
+            receipt, receipt_dseq = receipt_identity(path)
+        except Exception:  # noqa: BLE001 - unreadable receipts must remain for upload
+            continue
+        if receipt_dseq == str(dseq) and receipt["expected_owner"] == owner:
+            try:
+                delete_receipt(path)
+            except OSError:
+                continue
+            else:
+                deleted.append(path)
+    return deleted
 
 
 def _deployment_service_names(detail: dict) -> set[str]:
@@ -556,7 +585,9 @@ def sweep_orphan_probes(
     """
     now = time.time()
     try:
-        deployments = _api().list_deployments(active_only=True)
+        api = _api()
+        owner = api.account_address()
+        deployments = api.list_deployments(active_only=True)
     except Exception as e:  # noqa: BLE001 -- sweep must never abort the run
         print(f"  {YELLOW}orphan sweep skipped: list_deployments failed: {e}{RESET}")
         return []
@@ -568,7 +599,7 @@ def sweep_orphan_probes(
         if not dseq:
             continue
         try:
-            detail = _api().get_deployment(dseq)
+            detail = api.get_deployment(dseq)
         except Exception as e:  # noqa: BLE001 -- must not abort the sweep
             # A 404 means the deployment is already gone -> not an active leak,
             # safe to skip. Any OTHER error means we could not inspect it, so the
@@ -590,8 +621,10 @@ def sweep_orphan_probes(
             f"  {YELLOW}orphaned probe {dseq} ({age_note}) — leaked by an earlier "
             f"run; {action}{RESET}"
         )
-        if dry_run or robust_destroy(dseq):
+        if dry_run or robust_destroy(dseq, owner=owner, group=PROBE_GROUP):
             swept.append(dseq)
+            if not dry_run:
+                _delete_resolved_provider_smoke_receipts(dseq, owner)
     # An incomplete sweep must never masquerade as a clean all-clear: flag any
     # deployment we could not inspect so the log reflects that a leak may have
     # gone unseen.
@@ -1016,9 +1049,9 @@ def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, s
     try:
         receipt, receipt_dseq = receipt_identity(receipt_path)
         dseq_ref.update(owner=receipt["expected_owner"], groups=receipt["group_population"])
-        dseq_ref["dseq"] = receipt_dseq or reconcile_receipt(
-            receipt_path, operation_id, started_at, dseq_ref
-        )
+        dseq_ref["dseq"] = receipt_dseq
+        if receipt_dseq is None:
+            reconcile_receipt(receipt_path, operation_id, started_at, dseq_ref)
     except Exception:
         receipt, receipt_dseq = None, None
     # findall + [-1], never search: on the stale-bid path (issue #19) deploy closes

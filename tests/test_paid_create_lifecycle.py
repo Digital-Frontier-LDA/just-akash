@@ -26,6 +26,12 @@ TARGETS = {
     "lifecycle": "run_process_group",
     "provider": "_run",
 }
+RECONCILE_NAMES = {
+    "secrets": "_reconcile_receipt",  # pragma: allowlist secret
+    "shell": "reconcile_receipt",
+    "lifecycle": "reconcile_receipt",
+    "provider": "reconcile_receipt",
+}
 
 
 def _paid_calls(source: str, target: str) -> list[ast.Call]:
@@ -41,6 +47,66 @@ def _paid_calls(source: str, target: str) -> list[ast.Call]:
         ):
             calls.append(node)
     return calls
+
+
+def _reconcile_calls(source: str, name: str) -> list[ast.Call]:
+    return [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == name
+    ]
+
+
+def _assigned_reconciliation_calls(source: str, name: str) -> list[ast.Assign]:
+    return [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == name
+            for call in ast.walk(node.value)
+        )
+    ]
+
+
+@pytest.mark.parametrize("path_name", PATHS)
+def test_reconciliation_never_overwrites_the_dseq_carrier_and_mutation_is_red(
+    path_name: str,
+) -> None:
+    source = PATHS[path_name].read_text(encoding="utf-8")
+    name = RECONCILE_NAMES[path_name]
+    calls = _reconcile_calls(source, name)
+    assert len(calls) == 2, f"{path_name} must reconcile normal and interruption paths"
+    assert _assigned_reconciliation_calls(source, name) == []
+
+    call = calls[0]
+    lines = source.splitlines(keepends=True)
+    absolute_start = sum(len(line) for line in lines[: call.lineno - 1]) + call.col_offset
+    mutant = source[:absolute_start] + 'dseq_ref["dseq"] = ' + source[absolute_start:]
+    assigned = _assigned_reconciliation_calls(mutant, name)
+    assert len(assigned) == 1, "assigning the None cleanup result must trip the carrier guard"
+
+
+def test_secrets_normal_and_interruption_reconciliation_share_the_live_carrier() -> None:
+    source = PATHS["secrets"].read_text(encoding="utf-8")
+    calls = _reconcile_calls(source, "_reconcile_receipt")
+    assert len(calls) == 2
+    assert all(
+        call.args and isinstance(call.args[-1], ast.Name) and call.args[-1].id == "dseq_ref"
+        for call in calls
+    )
+
+    target = "                    dseq_ref,\n"
+    assert source.count(target) == 1, "interruption call mutation target must apply exactly once"
+    mutant = source.replace(target, "                    {},\n", 1)
+    mutant_calls = _reconcile_calls(mutant, "_reconcile_receipt")
+    assert (
+        sum(
+            isinstance(call.args[-1], ast.Name) and call.args[-1].id == "dseq_ref"
+            for call in mutant_calls
+        )
+        == 1
+    )
 
 
 @pytest.mark.parametrize("path_name", PATHS)

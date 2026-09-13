@@ -242,8 +242,22 @@ def test_the_deploy_call_cannot_escape_uncaught():
     assert call is not None, "the `just up` deploy call moved — re-anchor, do not delete"
     tries = [a for a in _ancestors(call) if isinstance(a, ast.Try)]
     assert tries, "the deploy call is not inside a try — a timeout escapes the whole run"
-    handler_src = " ".join(ast.get_source_segment(_SRC, h) or "" for h in tries[0].handlers)
-    assert "BaseException" in handler_src and "reconcile_receipt" in handler_src
+    base_handlers = [
+        handler
+        for handler in tries[0].handlers
+        if isinstance(handler.type, ast.Name) and handler.type.id == "BaseException"
+    ]
+    assert len(base_handlers) == 1, "the deploy try must have exactly one BaseException handler"
+    reconcile_calls = [
+        node
+        for node in ast.walk(base_handlers[0])
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "reconcile_receipt"
+    ]
+    assert len(reconcile_calls) == 1, (
+        "the actual BaseException handler must reconcile the durable receipt before reraising"
+    )
 
 
 def test_every_dseq_less_exit_reports_the_unnamed_deployment():

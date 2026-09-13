@@ -365,6 +365,9 @@ def robust_destroy(
     if group is not None and (owner is None or not re.fullmatch(r"[A-Za-z0-9._-]+", group)):
         _fail(f"Cleanup held for {dseq}: invalid or owner-less group identity")
         return False
+    if owner is not None and group is None and groups is None:
+        _fail(f"Cleanup held for {dseq}: owner identity has no group identity")
+        return False
     direct_client = None
     if groups is not None:
         if owner is None:
@@ -493,7 +496,20 @@ def destroy_owned_deployment(
             _fail(f"Cleanup held for {dseq}: owner could not be resolved ({exc})")
             return False
     if group is None:
-        return robust_destroy(dseq, owner=owner, retries=retries, audit=audit)
+        # The legacy CLI cannot bind an owner without a group. Read a candidate
+        # singleton group, then let the destroy command independently corroborate
+        # that exact owner/group pair before it selects a wallet or closes anything.
+        from . import chain
+
+        try:
+            names = chain.deployment_group_names(owner, str(dseq))
+        except Exception as exc:  # noqa: BLE001 - discovery failure is a hold
+            _fail(f"Cleanup held for {dseq}: singleton group lookup failed ({exc})")
+            return False
+        if len(names) != 1:
+            _fail(f"Cleanup held for {dseq}: exact singleton group could not be resolved")
+            return False
+        group = names[0]
     return robust_destroy(dseq, owner=owner, group=group, retries=retries, audit=audit)
 
 
