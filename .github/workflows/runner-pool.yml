@@ -294,6 +294,11 @@ on:
       dseq:
         description: 'Deployment sequence number; empty when no lease survived.'
         value: ${{ jobs.pool.outputs.dseq }}
+      deployment_outcome:
+        description: >-
+          Typed create outcome: created only with a parsed DSEQ, no-deployment only on
+          an authoritative pre-create/no-broadcast branch, unknown otherwise.
+        value: ${{ jobs.pool.outputs.deployment_outcome }}
       provision_healthy:
         description: "'true' iff a usable pool came online. Key your fallback on this."
         value: ${{ jobs.pool.outputs.provision_healthy }}
@@ -358,6 +363,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       dseq: ${{ steps.provision.outputs.dseq }}
+      deployment_outcome: ${{ steps.provision.outputs.deployment_outcome }}
       provision_healthy: ${{ steps.provision.outputs.provision_healthy }}
       runners_online: ${{ steps.provision.outputs.runners_online }}
       failure_reason: ${{ steps.pat.outputs.failure_reason || steps.provision.outputs.failure_reason || steps.candidates.outputs.failure_reason }}
@@ -898,6 +904,10 @@ jobs:
         run: |
           set -uo pipefail
 
+          # Fail closed before the first possible submit. Every branch inherits UNKNOWN;
+          # only the enumerated no-broadcast sites below may narrow it to no-deployment.
+          echo "deployment_outcome=unknown" >> "$GITHUB_OUTPUT"
+
           # Wallet selection belongs to just-akash. It receives the complete pool,
           # measures authoritative free credit, and chooses the richest funded account.
           # No key or positional index crosses a step boundary.
@@ -946,6 +956,7 @@ jobs:
             # Never degrade an exhausted/denied allowlist into unrestricted
             # marketplace selection; that would re-admit every standing trap.
             if [ "${#PROV_ARGS[@]}" -eq 0 ]; then
+              echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
               echo "failure_reason=NO_ELIGIBLE_BIDDER" >> "$GITHUB_OUTPUT"
               echo "::error title=No eligible provider remains::All configured preferred and fallback providers are standing-denied or failed during this run."
               echo "::endgroup::"; exit 1
@@ -960,7 +971,10 @@ jobs:
             case "${PROVIDER_SELECT:-}" in
               "") ;;
               cheapest|emptiest) SELECT_ARGS=(--select "$PROVIDER_SELECT") ;;
-              *) echo "::error title=provider-select::must be 'cheapest' or 'emptiest', got '${PROVIDER_SELECT}'"; exit 1 ;;
+              *)
+                echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+                echo "::error title=provider-select::must be 'cheapest' or 'emptiest', got '${PROVIDER_SELECT}'"
+                exit 1 ;;
             esac
 
             rm -f /tmp/ja.log
@@ -978,6 +992,7 @@ jobs:
             # an already-closed round's dseq is a harmless no-op for the teardown
             # ("already closed|not found" → verified-closed). (#1439 pattern.)
             echo "dseq=$DSEQ" >> "$GITHUB_OUTPUT"
+            [ -n "$DSEQ" ] && echo "deployment_outcome=created" >> "$GITHUB_OUTPUT"
             PROVIDER=$(awk -F': +' '/^[[:space:]]*Provider:/{print $2; exit}' /tmp/ja.log || true)
             WALLET=$(awk -F': +' '/^[[:space:]]*Wallet:/{print $2; exit}' /tmp/ja.log || true)
             # Publish the create-time owner as soon as it is available. Internal
@@ -1004,6 +1019,11 @@ jobs:
               # order exists, so no provider ever saw it — calling that "no bid" sends
               # the investigation at providers instead of at the balance.
               if grep -qiE 'PaymentRequiredError|Insufficient balance|HTTP 402' /tmp/ja.log 2>/dev/null; then
+                # Only the exact Console 402/PaymentRequired rejection is proven
+                # pre-broadcast. Generic insufficient wording remains UNKNOWN.
+                if grep -qiE 'PaymentRequiredError|HTTP 402' /tmp/ja.log 2>/dev/null; then
+                  echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+                fi
                 echo "failure_reason=WALLET_UNDERFUNDED" >> "$GITHUB_OUTPUT"
                 echo "::error title=Akash rejected the deploy: INSUFFICIENT BALANCE::No order was created and no provider was asked to bid, so retrying cannot help. Top up the wallet."
                 echo "::endgroup::"; exit 1
@@ -1473,7 +1493,7 @@ jobs:
     # The resolution that satisfies both is to pin the POST-MERGE main SHA: byte-identical
     # to the branch commit, and an ancestor of main. Never re-pin to a branch commit after
     # its PR has merged.
-    uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@864a9640680f0f8018c31f585b9355e81160421a
+    uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@f50cc83698871a0e284bed1447589002dda5fd19
     with:
       dseq: ${{ needs.pool.outputs.dseq }}
       wallet-address: ${{ needs.pool.outputs.wallet_address }}

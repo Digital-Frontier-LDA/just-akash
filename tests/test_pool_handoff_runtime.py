@@ -104,18 +104,38 @@ def should_run(expression, results):
     text = re.sub(r"needs\.([\w-]+)\.result", lambda m: repr(results[m[1]]), text)
     text = text.replace("always()", "True").replace("&&", " and ").replace("||", " or ")
     tree = ast.parse(text, mode="eval")
-    allowed = (
-        ast.Expression,
-        ast.BoolOp,
-        ast.And,
-        ast.Or,
-        ast.Compare,
-        ast.Eq,
-        ast.NotEq,
-        ast.Constant,
-    )
-    assert all(isinstance(node, allowed) for node in ast.walk(tree))
-    return eval(compile(tree, "<workflow predicate>", "eval"), {"__builtins__": {}})
+
+    def evaluate(node):
+        if isinstance(node, ast.Expression):
+            return evaluate(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (bool, str)):
+            return node.value
+        if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.And):
+            return all(bool(evaluate(value)) for value in node.values)
+        if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
+            return any(bool(evaluate(value)) for value in node.values)
+        if isinstance(node, ast.Compare):
+            left = evaluate(node.left)
+            for operator, comparator in zip(node.ops, node.comparators, strict=True):
+                right = evaluate(comparator)
+                if isinstance(operator, ast.Eq):
+                    matches = left == right
+                elif isinstance(operator, ast.NotEq):
+                    matches = left != right
+                else:
+                    raise AssertionError(f"unsupported comparison: {ast.dump(operator)}")
+                if not matches:
+                    return False
+                left = right
+            return True
+        raise AssertionError(f"unsupported workflow predicate: {ast.dump(node)}")
+
+    return bool(evaluate(tree))
+
+
+def test_workflow_predicate_interpreter_rejects_executable_syntax():
+    with pytest.raises(AssertionError, match="unsupported workflow predicate"):
+        should_run("${{ always() && __import__('os') }}", {})
 
 
 def lifetime(pool, caller, output, outcome, consumer_result="success"):
@@ -182,7 +202,10 @@ def test_actual_early_output_survives_shell_failure_and_reaches_internal_rollbac
 ):
     pool, caller = documents()
     output = publish_from_real_shell(pool, tmp_path, outcome)
-    assert output == {"dseq": "1789000000001"}
+    assert output == {
+        "deployment_outcome": "created",
+        "dseq": "1789000000001",
+    }
     events = lifetime(pool, caller, output, outcome)
     assert events.index("rollback-close") < events.index("callee-finished")
 
