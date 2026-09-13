@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from just_akash import _e2e, api, chain, paid_create, wallet_pool
+from just_akash import _e2e, api, chain, paid_create, test_lifecycle, wallet_pool
 
 OWNER = "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee"
 
@@ -107,6 +107,40 @@ def test_secrets_normal_and_interruption_reconciliation_share_the_live_carrier()
         )
         == 1
     )
+
+
+def test_lifecycle_unreadable_receipt_exits_held_without_losing_the_no_dseq_state(
+    monkeypatch, tmp_path: Path
+) -> None:
+    for name in ("AKASH_API_KEY", "AKASH_PROVIDERS", "SSH_PUBKEY"):
+        monkeypatch.setenv(name, "configured")
+    monkeypatch.setattr(test_lifecycle.os.path, "exists", lambda _path: True)
+    monkeypatch.setattr(test_lifecycle, "install_signal_cleanup", lambda _ref: None)
+    monkeypatch.setattr(
+        test_lifecycle,
+        "receipt_environment",
+        lambda _label: (tmp_path / "receipt.json", "operation", {}),
+    )
+    monkeypatch.setattr(
+        test_lifecycle,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "", ""),
+    )
+    monkeypatch.setattr(
+        test_lifecycle,
+        "run_process_group",
+        lambda *_args, **_kwargs: (subprocess.CompletedProcess([], 0, "", ""), False),
+    )
+    monkeypatch.setattr(
+        test_lifecycle,
+        "receipt_identity",
+        lambda _path: (_ for _ in ()).throw(ValueError("unreadable")),
+    )
+    monkeypatch.setattr(test_lifecycle, "_summary", lambda _failures: None)
+
+    with pytest.raises(SystemExit) as exc:
+        test_lifecycle.main()
+    assert exc.value.code == 1
 
 
 @pytest.mark.parametrize("path_name", PATHS)

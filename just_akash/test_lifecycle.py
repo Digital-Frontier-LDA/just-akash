@@ -154,7 +154,7 @@ def main():
         if receipt_dseq is None:
             reconcile_receipt(receipt_path, operation_id, started_at, dseq_ref)
     except Exception as exc:  # noqa: BLE001 - output alone has no close authority
-        receipt = None
+        receipt, receipt_dseq = None, None
         log_fail(f"HELD: create receipt unreadable ({exc})")
 
     if timed_out or r.returncode != 0:
