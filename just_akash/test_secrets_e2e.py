@@ -32,13 +32,10 @@ from ._e2e import (
     assert_provider_in_tiers,
     install_signal_cleanup,
     resolve_tiers,
+    robust_destroy,
 )
-from ._e2e import (
-    destroy_owned_deployment as robust_destroy,
-)
-from .api import AkashConsoleAPI
-from .deploy import _report_suspected_orphans
 from .deployment_receipt import DeploymentReceipt, decode_receipt
+from .paid_create import reconcile_receipt as reconcile_paid_receipt
 from .provenance import run_id_of
 
 GREEN = "\033[92m"
@@ -92,11 +89,13 @@ def _run_just_up(
     )
 
     def terminate_group() -> tuple[str, str]:
-        os.killpg(process.pid, signal.SIGTERM)
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
         try:
             return process.communicate(timeout=5)
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
             return process.communicate()
 
     try:
@@ -135,18 +134,11 @@ def _receipt_environment() -> tuple[Path, str, dict[str, str]]:
     )
 
 
-def _receipt_identity(receipt_path: Path) -> tuple[str, str | None, str, str]:
+def _receipt_identity(receipt_path: Path) -> tuple[str, str | None, str, list[dict[str, object]]]:
     receipt = decode_receipt(receipt_path.read_bytes())
     population = receipt["group_population"]
-    if len(population) != 1 or population[0].get("gseq") != 1:
-        raise RuntimeError(
-            "secrets E2E cleanup requires the receipt's complete population to be one gseq=1 group"
-        )
-    group = population[0].get("name")
-    if not isinstance(group, str) or not group:
-        raise RuntimeError("receipt group identity is invalid")
     dseq = str(receipt["dseq"]) if receipt["state"] == "create_response_received" else None
-    return receipt["state"], dseq, receipt["expected_owner"], group
+    return receipt["state"], dseq, receipt["expected_owner"], population
 
 
 def _delete_receipt(receipt_path: Path) -> None:
@@ -159,7 +151,7 @@ def _verified_cleanup(dseq_ref: dict) -> bool:
     """Clear receipt identity only after exact destruction and positive closure audit."""
     dseq = dseq_ref.get("dseq")
     if not dseq or not robust_destroy(
-        dseq, owner=dseq_ref.get("owner"), group=dseq_ref.get("group")
+        dseq, owner=dseq_ref.get("owner"), groups=dseq_ref.get("groups")
     ):
         return False
     dseq_ref["dseq"] = None
@@ -194,7 +186,7 @@ def _receipt_provenance_run_id(receipt: DeploymentReceipt) -> str:
 
 
 def _reconcile_receipt(
-    receipt_path: Path, operation_id: str, started_at: float, api_key: str
+    receipt_path: Path, operation_id: str, started_at: float, _api_key: str
 ) -> str | None:
     """Recover a returned DSEQ or reconcile a submitted create before reporting HELD."""
     try:
@@ -205,21 +197,21 @@ def _reconcile_receipt(
     if receipt["operation_id"] != operation_id:
         log_fail("HELD: create receipt operation ID disagrees with this lifecycle operation")
         return None
-    if receipt["state"] == "create_response_received":
-        dseq = str(receipt["dseq"])
-        log_info(f"Recovered DSEQ={dseq} from the durable create receipt")
-        return dseq
     if receipt["state"] == "submitting":
         log_fail(
             "HELD: create request was submitted without a response identity; running "
             "owner-scoped/provenance reconciliation before exit"
         )
-        try:
-            provenance_run_id = _receipt_provenance_run_id(receipt)
-            _report_suspected_orphans(AkashConsoleAPI(api_key), started_at, provenance_run_id)
-        except Exception as exc:  # noqa: BLE001 - reconciliation failure remains HELD
-            log_fail(f"HELD: reconciliation could not complete ({exc})")
-    return None
+    try:
+        recovered = reconcile_paid_receipt(
+            receipt_path, operation_id, started_at, {"dseq": None, "receipt_path": receipt_path}
+        )
+    except Exception as exc:  # noqa: BLE001 - reconciliation failure remains HELD
+        log_fail(f"HELD: reconciliation could not complete ({exc})")
+        return None
+    if recovered:
+        log_info(f"Recovered DSEQ={recovered} from the durable create receipt")
+    return recovered
 
 
 def _wait_for_ssh(ssh_key, ssh_host, ssh_port, max_attempts=18):
@@ -311,12 +303,12 @@ def main():
         # The child group is dead before this read. Preserve an unresolved receipt;
         # remove it only after authoritative pre-submit state or verified closure.
         try:
-            state, dseq, owner, group = _receipt_identity(receipt_path)
-            dseq_ref.update(dseq=dseq, owner=owner, group=group)
-            if state == "prepared":
-                _delete_receipt(receipt_path)
-            else:
+            state, dseq, owner, groups = _receipt_identity(receipt_path)
+            dseq_ref.update(dseq=dseq, owner=owner, groups=groups)
+            if dseq:
                 _verified_cleanup(dseq_ref)
+            elif state == "submitting":
+                _reconcile_receipt(receipt_path, receipt_operation_id, deploy_started_at, api_key)
         except Exception as exc:  # noqa: BLE001 - interruption remains HELD
             log_fail(f"HELD: interrupted create receipt could not be reconciled ({exc})")
         raise
@@ -324,27 +316,25 @@ def main():
     print(output)
 
     try:
-        state, receipt_dseq, owner, group = _receipt_identity(receipt_path)
-        dseq_ref.update(owner=owner, group=group)
+        state, receipt_dseq, owner, groups = _receipt_identity(receipt_path)
+        dseq_ref.update(owner=owner, groups=groups)
     except Exception as exc:  # noqa: BLE001 - no bound identity means cleanup is held
         state, receipt_dseq = "unreadable", None
         log_fail(f"HELD: create receipt unreadable ({exc})")
     output_match = re.search(r"DSEQ[:\s]+(\d+)", output)
     output_dseq = output_match.group(1) if output_match else None
     if output_dseq and receipt_dseq and output_dseq != receipt_dseq:
-        log_fail(f"HELD: output DSEQ {output_dseq} disagrees with receipt DSEQ {receipt_dseq}")
-        dseq_ref["dseq"] = None
-    else:
-        dseq_ref["dseq"] = receipt_dseq or _reconcile_receipt(
-            receipt_path, receipt_operation_id, deploy_started_at, api_key
+        log_info(
+            f"Ignoring stale output DSEQ {output_dseq}; response receipt proves {receipt_dseq}"
         )
+    dseq_ref["dseq"] = receipt_dseq or _reconcile_receipt(
+        receipt_path, receipt_operation_id, deploy_started_at, api_key
+    )
 
     if timed_out or r.returncode != 0:
         log_fail("just up timed out" if timed_out else "just up failed")
         if dseq_ref["dseq"]:
             _verified_cleanup(dseq_ref)
-        elif state == "prepared":
-            _delete_receipt(receipt_path)
         _summary(["deploy: failed"])
         sys.exit(1)
 

@@ -171,9 +171,20 @@ def test_removing_owner_scoped_audit_call_is_a_red_effect_mutation():
     assert _compiled_destroy(mutant)(DSEQ, owner=OWNER) is False
 
 
+_RECEIPT_BOUND_CLEANUP_MARKERS = {
+    "just_akash/test_lifecycle.py": "    verified_cleanup,",
+    "just_akash/test_secrets_e2e.py": 'groups=dseq_ref.get("groups")',
+    "just_akash/test_shell_e2e.py": "    verified_cleanup,",
+    "just_akash/smoke_providers.py": "    verified_cleanup,",
+}
+
+
 def _unowned_e2e_wiring(source_by_path: dict[str, str]) -> list[str]:
-    marker = "destroy_owned_deployment as robust_destroy"
-    return [path for path, source in source_by_path.items() if marker not in source]
+    return [
+        path
+        for path, source in source_by_path.items()
+        if _RECEIPT_BOUND_CLEANUP_MARKERS[path] not in source
+    ]
 
 
 def test_every_real_e2e_cleanup_is_wired_through_owner_capture():
@@ -185,7 +196,7 @@ def test_every_real_e2e_cleanup_is_wired_through_owner_capture():
 def test_removing_one_e2e_owner_capture_call_site_is_a_red_mutation():
     sources = {path: (ROOT / path).read_text() for path in E2E_CALLERS}
     path = E2E_CALLERS[0]
-    target = "destroy_owned_deployment as robust_destroy"
+    target = _RECEIPT_BOUND_CLEANUP_MARKERS[path]
     assert sources[path].count(target) == 1, "call-site mutation must apply exactly once"
-    sources[path] = sources[path].replace(target, "robust_destroy", 1)
+    sources[path] = sources[path].replace(target, "", 1)
     assert _unowned_e2e_wiring(sources) == [path]

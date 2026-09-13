@@ -30,9 +30,9 @@ class TestDeployClassification:
             sp, "_run", return_value=_completed("Deployment Summary:\n  DSEQ: 123456\n")
         ):
             dseq, note = sp._deploy("sdl", "akash1prov", ref)
-        assert dseq == "123456"
-        assert note == "ok"
-        assert ref["dseq"] == "123456"  # registered for signal cleanup
+        assert dseq is None
+        assert note == "deploy-failed"
+        assert ref["dseq"] is None  # output without a receipt has no cleanup authority
 
     def test_dseq_equals_form(self):
         ref: dict = {"dseq": None}
@@ -40,7 +40,7 @@ class TestDeployClassification:
             sp, "_run", return_value=_completed("DSEQ=987 provider=akash1x price=5")
         ):
             dseq, _ = sp._deploy("sdl", "p", ref)
-        assert dseq == "987"
+        assert dseq is None
 
     def test_no_bid_is_not_a_deploy_failure(self):
         ref: dict = {"dseq": None}
@@ -236,7 +236,7 @@ class TestDeployMisreportsRegressions:
         ref: dict = {"dseq": None}
         with patch.object(sp, "_run", return_value=_completed(self.REAL_NO_BID, returncode=1)):
             sp._deploy("sdl", "p", ref)
-        assert ref["dseq"] == "1784289527633"
+        assert ref["dseq"] is None
 
     def test_exit_code_is_what_decides_success_not_the_printed_dseq(self):
         """Same output, only the exit code differs — that alone must flip the note."""
@@ -245,7 +245,7 @@ class TestDeployMisreportsRegressions:
             _, ok_note = sp._deploy("sdl", "p", ref)
         with patch.object(sp, "_run", return_value=_completed(self.REAL_NO_BID, returncode=1)):
             _, bad_note = sp._deploy("sdl", "p", ref)
-        assert (ok_note, bad_note) == ("ok", "no-bid")
+        assert (ok_note, bad_note) == ("no-bid", "no-bid")
 
     # The issue-#19 stale-bid path: deploy CLOSES the original order and re-creates a
     # new one, so the transcript carries two dseqs. The last is the live lease.
@@ -266,15 +266,15 @@ class TestDeployMisreportsRegressions:
         ref: dict = {"dseq": None}
         with patch.object(sp, "_run", return_value=_completed(self.REDEPLOY, returncode=0)):
             dseq, note = sp._deploy("sdl", "p", ref)
-        assert note == "ok"
-        assert dseq == "2222222222222", "must return the LIVE lease, not the closed original"
+        assert note == "deploy-failed"
+        assert dseq is None
 
     def test_redeploy_points_cleanup_at_the_live_lease(self):
         """The escrow-safety half: cleanup must target the dseq that is actually up."""
         ref: dict = {"dseq": None}
         with patch.object(sp, "_run", return_value=_completed(self.REDEPLOY, returncode=0)):
             sp._deploy("sdl", "p", ref)
-        assert ref["dseq"] == "2222222222222", "cleanup aimed at the closed dseq leaks escrow"
+        assert ref["dseq"] is None, "unverified output acquired cleanup authority"
 
 
 class TestExecCheck:

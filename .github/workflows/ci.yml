@@ -447,6 +447,15 @@ jobs:
       - name: Run E2E lease-shell test
         run: uv run python -m just_akash.test_shell_e2e
 
+      - name: Preserve unresolved lease-shell deployment receipt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-shell-deployment-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/just-akash-deployment-receipts/e2e-shell.json
+          if-no-files-found: ignore
+          retention-days: 30
+
   e2e-secrets:
     name: E2E secrets injection
     runs-on: ubuntu-latest

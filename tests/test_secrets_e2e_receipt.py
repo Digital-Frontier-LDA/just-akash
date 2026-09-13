@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from just_akash import deploy as deploy_module
+from just_akash import paid_create as paid
 from just_akash import test_secrets_e2e as target
 from just_akash.deployment_receipt import (
     mark_create_response_received,
@@ -59,101 +59,41 @@ def _prepared(tmp_path: Path, *, sdl: str = SDL, operation_id: str = OPERATION_I
     )
 
 
-def test_a_submitting_receipt_runs_reconciliation_once(monkeypatch, tmp_path: Path) -> None:
-    prepared = _prepared(tmp_path)
-    mark_submitting(*prepared)
-    calls = []
-    client = object()
-    monkeypatch.setattr(target, "AkashConsoleAPI", lambda _api_key: client)
-    monkeypatch.setattr(
-        target,
-        "_report_suspected_orphans",
-        lambda got_client, started, operation: calls.append((got_client, started, operation)),
-    )
-
-    assert target._reconcile_receipt(prepared[0], OPERATION_ID, 123.0, "test-key") is None
-    assert calls == [(client, 123.0, RUN_ID)]
-
-
 def test_a_response_receipt_recovers_exact_dseq_without_population_probe(
     monkeypatch, tmp_path: Path
 ) -> None:
     submitting = mark_submitting(*_prepared(tmp_path))
     mark_create_response_received(*submitting, dseq="1002", deployment_response={"dseq": "1002"})
     monkeypatch.setattr(
-        target,
-        "_report_suspected_orphans",
+        paid.chain,
+        "list_active_deployments",
         lambda *_: (_ for _ in ()).throw(AssertionError("response receipt must not probe")),
     )
+    assert paid.reconcile_receipt(submitting[0], OPERATION_ID, 123.0, {}) == "1002"
 
-    assert target._reconcile_receipt(submitting[0], OPERATION_ID, 123.0, "test-key") == "1002"
 
-
-def test_submitting_receipt_uses_its_stamped_run_for_real_orphan_close_and_mutation(
+def test_submitting_receipt_requires_exact_two_source_population_and_verified_close(
     monkeypatch, tmp_path: Path
 ) -> None:
     submitting = mark_submitting(*_prepared(tmp_path))
     dseq = "123000"
-    network_closes = []
-    bound_closes = []
-
-    class Client:
-        def list_deployments(self, *, active_only: bool):
-            assert active_only is True
-            return [{"dseq": dseq, "leases": []}]
-
-        def account_address(self) -> str:
-            return OWNER
-
-        def close_deployment(self, got_dseq: str) -> None:
-            network_closes.append((self, got_dseq))
-
-    client = Client()
-    monkeypatch.setattr(target, "AkashConsoleAPI", lambda _api_key: client)
+    calls = []
+    monkeypatch.setattr(paid.chain, "list_active_deployments", lambda owner: [{"dseq": dseq}])
     monkeypatch.setattr(
-        deploy_module.chain,
-        "deployment_group_names",
-        lambda owner, got_dseq: (
-            [GROUP]
-            if (owner, got_dseq) == (OWNER, dseq)
-            else (_ for _ in ()).throw(AssertionError((owner, got_dseq)))
+        paid.chain,
+        "corroborated_deployment_group_population",
+        lambda owner, got_dseq, population: (
+            calls.append((owner, got_dseq, population)) or population
         ),
     )
-    real_close = deploy_module._close_proven_orphan
-
-    def observed_close(got_client, got_dseq: str, group: str) -> bool:
-        bound_closes.append((got_client, got_dseq, group))
-        return real_close(got_client, got_dseq, group)
-
-    monkeypatch.setattr(deploy_module, "_close_proven_orphan", observed_close)
-    assert target._reconcile_receipt(submitting[0], OPERATION_ID, 123.0, "test-key") is None
-    assert bound_closes == [(client, dseq, GROUP)]
-    assert network_closes == [(client, dseq)]
-
-    source = textwrap.dedent(inspect.getsource(target._reconcile_receipt))
-    call = "_report_suspected_orphans(AkashConsoleAPI(api_key), started_at, provenance_run_id)"
-    assert source.count(call) == 1, f"reconciliation target count changed: {source.count(call)}"
-    mutated = source.replace(
-        call,
-        "_report_suspected_orphans(AkashConsoleAPI(api_key), started_at, operation_id)",
+    monkeypatch.setattr(
+        paid, "robust_destroy", lambda dseq, **kw: calls.append((dseq, kw)) or True
     )
-    assert mutated != source and mutated.count(call) == 0
-    namespace = {
-        "Path": Path,
-        "AkashConsoleAPI": target.AkashConsoleAPI,
-        "decode_receipt": target.decode_receipt,
-        "log_fail": target.log_fail,
-        "log_info": target.log_info,
-        "_receipt_provenance_run_id": target._receipt_provenance_run_id,
-        "_report_suspected_orphans": target._report_suspected_orphans,
-    }
-    exec(mutated, namespace)  # noqa: S102 - executable effect mutation
-    bound_closes.clear()
-    network_closes.clear()
-    assert namespace["_reconcile_receipt"](submitting[0], OPERATION_ID, 123.0, "test-key") is None
-    assert bound_closes == [] and network_closes == [], (
-        "operation_id mutant unexpectedly retained the exact-run close effect"
-    )
+    ref = {}
+    assert paid.reconcile_receipt(submitting[0], OPERATION_ID, 123.0, ref) is None
+    assert calls[0] == (OWNER, dseq, [{"gseq": 1, "name": GROUP}])
+    assert calls[1] == (dseq, {"owner": OWNER, "groups": [{"gseq": 1, "name": GROUP}]})
+    assert not submitting[0].exists(), "verified cleanup must consume exactly its receipt"
 
 
 def _sdl_for_groups(groups: list[str]) -> str:
@@ -173,35 +113,82 @@ def _sdl_for_groups(groups: list[str]) -> str:
     )
 
 
-@pytest.mark.parametrize(
-    "groups",
-    [
-        ["foreign-workload"],
-        ["just-akash-one.abc123", "just-akash-two.def456"],
-        ["just-akash-one.abc123", "foreign-workload"],
-    ],
-    ids=["foreign", "mismatched-run-ids", "partially-stamped"],
-)
-def test_unbound_or_disagreeing_receipt_groups_remain_held_before_population_read(
-    monkeypatch, tmp_path: Path, groups: list[str], capsys
+@pytest.mark.parametrize("observed", [[], [{"gseq": 1, "name": "partial"}]])
+def test_disagreeing_or_partial_population_and_unverified_close_retain_receipt(
+    monkeypatch, tmp_path: Path, observed
 ) -> None:
-    submitting = mark_submitting(*_prepared(tmp_path, sdl=_sdl_for_groups(groups)))
-    calls = []
-    monkeypatch.setattr(target, "_report_suspected_orphans", lambda *args: calls.append(args))
+    submitting = mark_submitting(*_prepared(tmp_path))
+    monkeypatch.setattr(paid.chain, "list_active_deployments", lambda owner: [{"dseq": "123000"}])
+    monkeypatch.setattr(
+        paid.chain, "corroborated_deployment_group_population", lambda *args: observed
+    )
+    closes = []
+    monkeypatch.setattr(
+        paid, "robust_destroy", lambda *args, **kw: closes.append((args, kw)) or False
+    )
+    assert paid.reconcile_receipt(submitting[0], OPERATION_ID, 123.0, {}) is None
+    assert closes == [] and submitting[0].exists()
 
-    assert target._reconcile_receipt(submitting[0], OPERATION_ID, 123.0, "test-key") is None
-    assert calls == []
-    assert "HELD: reconciliation could not complete" in capsys.readouterr().out
+
+def test_returned_close_without_two_source_terminal_verdict_retains_receipt(
+    monkeypatch, tmp_path: Path
+) -> None:
+    submitting = mark_submitting(*_prepared(tmp_path))
+    population = [{"gseq": 1, "name": GROUP}]
+    monkeypatch.setattr(paid.chain, "list_active_deployments", lambda owner: [{"dseq": "123000"}])
+    monkeypatch.setattr(
+        paid.chain, "corroborated_deployment_group_population", lambda *args: population
+    )
+    monkeypatch.setattr(paid, "robust_destroy", lambda *args, **kwargs: False)
+    assert paid.reconcile_receipt(submitting[0], OPERATION_ID, 123.0, {}) is None
+    assert submitting[0].exists()
+
+
+def test_later_multiple_exact_candidates_are_ambiguous_and_remain_held(
+    monkeypatch, tmp_path: Path
+) -> None:
+    submitting = mark_submitting(*_prepared(tmp_path))
+    population = [{"gseq": 1, "name": GROUP}]
+    monkeypatch.setattr(
+        paid.chain,
+        "list_active_deployments",
+        lambda owner: [{"dseq": "123000"}, {"dseq": "123001"}],
+    )
+    monkeypatch.setattr(
+        paid.chain, "corroborated_deployment_group_population", lambda *args: population
+    )
+    closes = []
+    monkeypatch.setattr(
+        paid, "robust_destroy", lambda *args, **kwargs: closes.append((args, kwargs)) or True
+    )
+    assert paid.reconcile_receipt(submitting[0], OPERATION_ID, 123.0, {}) is None
+    assert closes == []
+    assert submitting[0].exists()
 
 
 def test_receipt_operation_id_disagreement_is_held_independently_of_provenance(
     monkeypatch, tmp_path: Path
 ) -> None:
     submitting = mark_submitting(*_prepared(tmp_path))
-    calls = []
-    monkeypatch.setattr(target, "_report_suspected_orphans", lambda *args: calls.append(args))
-    assert target._reconcile_receipt(submitting[0], "another-operation", 123.0, "test-key") is None
-    assert calls == []
+    monkeypatch.setattr(
+        paid.chain,
+        "list_active_deployments",
+        lambda *_: (_ for _ in ()).throw(AssertionError("operation mismatch must hold first")),
+    )
+    assert paid.reconcile_receipt(submitting[0], "another-operation", 123.0, {}) is None
+
+
+def test_operation_id_must_be_distinct_from_the_group_provenance_stamp(
+    monkeypatch, tmp_path: Path
+) -> None:
+    submitting = mark_submitting(*_prepared(tmp_path, operation_id=RUN_ID))
+    monkeypatch.setattr(
+        paid.chain,
+        "list_active_deployments",
+        lambda *_: (_ for _ in ()).throw(AssertionError("non-distinct identity must hold")),
+    )
+    assert paid.reconcile_receipt(submitting[0], RUN_ID, 123.0, {}) is None
+    assert submitting[0].exists()
 
 
 def test_timeout_terminates_the_complete_just_up_process_group(monkeypatch) -> None:
@@ -314,7 +301,7 @@ def test_unverified_cleanup_preserves_receipt_and_bound_identity(
     identity = {
         "dseq": "1002",
         "owner": OWNER,
-        "group": "group-one",
+        "groups": [{"gseq": 1, "name": "group-one"}],
         "receipt_path": receipt,
     }
     calls = []
@@ -326,7 +313,7 @@ def test_unverified_cleanup_preserves_receipt_and_bound_identity(
     assert target._verified_cleanup(identity) is False
     assert receipt.read_text() == "recovery seed"
     assert identity["dseq"] == "1002"
-    assert calls == [("1002", {"owner": OWNER, "group": "group-one"})]
+    assert calls == [("1002", {"owner": OWNER, "groups": [{"gseq": 1, "name": "group-one"}]})]
 
 
 def test_verified_cleanup_removes_receipt_and_finish_call_site_has_an_observable_effect(
@@ -337,7 +324,7 @@ def test_verified_cleanup_removes_receipt_and_finish_call_site_has_an_observable
     identity = {
         "dseq": "1002",
         "owner": OWNER,
-        "group": "group-one",
+        "groups": [{"gseq": 1, "name": "group-one"}],
         "receipt_path": receipt,
     }
     monkeypatch.setattr(target, "robust_destroy", lambda *_args, **_kwargs: True)
@@ -350,7 +337,11 @@ def test_verified_cleanup_removes_receipt_and_finish_call_site_has_an_observable
     mutated = source.replace(call, "None")
     assert mutated != source and mutated.count(call) == 0
 
-    call_identity = {"dseq": "1002", "owner": OWNER, "group": "group-one"}
+    call_identity = {
+        "dseq": "1002",
+        "owner": OWNER,
+        "groups": [{"gseq": 1, "name": "group-one"}],
+    }
     effects = []
     namespace = {
         "_verified_cleanup": lambda ref: effects.append(ref.copy()),

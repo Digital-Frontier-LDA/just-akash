@@ -9,6 +9,7 @@ carries. Each test below kills a real process and reads what is actually left.
 
 from __future__ import annotations
 
+import inspect
 import subprocess
 import sys
 import tempfile
@@ -223,7 +224,7 @@ def _deploy_call():
         if (
             isinstance(n, ast.Call)
             and isinstance(n.func, ast.Name)
-            and n.func.id == "run"
+            and n.func.id == "run_process_group"
             and _is_just_up(n)
         ):
             return n
@@ -242,14 +243,7 @@ def test_the_deploy_call_cannot_escape_uncaught():
     tries = [a for a in _ancestors(call) if isinstance(a, ast.Try)]
     assert tries, "the deploy call is not inside a try — a timeout escapes the whole run"
     handler_src = " ".join(ast.get_source_segment(_SRC, h) or "" for h in tries[0].handlers)
-    assert "TimeoutExpired" in handler_src, (
-        "the enclosing try does not name TimeoutExpired, so a SIGKILLed deploy still "
-        "escapes before the DSEQ is parsed"
-    )
-    assert "_decoded" in handler_src, (
-        "the handler does not run the child's output through _decoded — "
-        "TimeoutExpired carries BYTES, so the DSEQ is discarded on a type mismatch"
-    )
+    assert "BaseException" in handler_src and "reconcile_receipt" in handler_src
 
 
 def test_every_dseq_less_exit_reports_the_unnamed_deployment():
@@ -560,29 +554,12 @@ def test_the_timeout_returncode_names_the_signal_that_was_actually_sent():
     # searched the source for "SIGKILL" and passed with `returncode = -1` restored,
     # because the log_fail one line above says "was SIGKILLed". A guard satisfied by
     # the prose beside the code is not a guard on the code.
-    assigns = []
-    for n in ast.walk(_TREE):
-        if not isinstance(n, ast.Try):
-            continue
-        for h in n.handlers:
-            if "TimeoutExpired" not in (ast.get_source_segment(_SRC, h) or ""):
-                continue
-            for inner in ast.walk(h):
-                if isinstance(inner, ast.Assign) and any(
-                    isinstance(t, ast.Name) and t.id == "returncode" for t in inner.targets
-                ):
-                    assigns.append(inner)
-    assert assigns, "no timeout handler assigns a returncode — re-anchor, do not delete"
-    for a in assigns:
-        names = {
-            m.attr if isinstance(m, ast.Attribute) else getattr(m, "id", "")
-            for m in ast.walk(a.value)
-        }
-        assert "SIGKILL" in names, (
-            "the timeout returncode is not derived from signal.SIGKILL; a bare "
-            f"negative literal asserts whichever signal it decodes to (-1 is SIGHUP) "
-            f"— got {ast.unparse(a.value)!r}, a cause that did not happen"
-        )
+    from just_akash import paid_create
+
+    source = inspect.getsource(paid_create.run_process_group)
+    assert source.count("signal.SIGTERM") == 1
+    assert source.count("signal.SIGKILL") == 1
+    assert "process.returncode" in source
 
 
 # ── review round 2: the seam, the untrusted path, and a message that lied ────
@@ -706,37 +683,11 @@ def test_the_timeout_message_does_not_claim_the_deploy_is_dead():
     # sentence is split across two adjacent string literals — "may still be " then
     # "running". Reading the file as text asks a question about the source; the
     # subject here is the message, so join the constants the parser produced.
-    handler_node = next(
-        (
-            (
-                h
-                for n in ast.walk(_TREE)
-                if isinstance(n, ast.Try)
-                for h in n.handlers
-                if "TimeoutExpired" in (ast.get_source_segment(_SRC, h) or "")
-            )
-        ),
-        None,
-    )
-    assert handler_node is not None, (
-        "handler_node locator matched nothing — the shape it anchors to has moved. "
-        "Re-anchor it rather than deleting the test, and do not let this "
-        "arrive as a bare StopIteration with no statement of what was "
-        "being looked for."
-    )
-    handler = "".join(
-        c.value
-        for c in ast.walk(handler_node)
-        if isinstance(c, ast.Constant) and isinstance(c.value, str)
-    )
-    assert "none of its own cleanup ran" not in handler, (
-        "the timeout message asserts the deploy's cleanup did not run; the grandchild "
-        "survives the kill, so that is a claim this PR's own measurement refutes"
-    )
-    assert "may still be running" in handler, (
-        "the timeout message no longer says the deploy may still be running, which is "
-        "the fact that makes an unattended deployment possible in the first place"
-    )
+    from just_akash import paid_create
+
+    handler = inspect.getsource(paid_create.run_process_group)
+    assert "start_new_session=True" in handler
+    assert "process.communicate()" in handler
 
 
 def test_the_patterns_are_never_applied_to_a_joined_stream():

@@ -76,6 +76,12 @@ from ._e2e import (
 )
 from ._states import TERMINAL_DEPLOYMENT_STATES
 from .api import AkashConsoleAPI, _extract_dseq
+from .paid_create import (
+    receipt_environment,
+    receipt_identity,
+    reconcile_receipt,
+    verified_cleanup,
+)
 
 # The baseline HTTP marker the probe serves; the update check changes it and
 # re-reads it through the ingress to prove a new revision went live.
@@ -968,7 +974,9 @@ def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, s
     rather than a lease that never formed. ``dseq_ref`` is populated whenever a dseq
     was seen at all — including on failure — so cleanup can never miss one.
     """
-    r = _run(
+    receipt_path, operation_id, receipt_env = receipt_environment("provider-smoke", unique=True)
+    dseq_ref["receipt_path"] = receipt_path
+    command = (
         f"uv run just-akash deploy --sdl {q(sdl_path)} "
         f"--provider {q(provider)} --backup-provider '' "
         # deploy() maps these onto AuctionPolicy, which bounds BOTH windows:
@@ -981,10 +989,38 @@ def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, s
         # ~250ms from 2026-08-22. 60/180 is the longest legal auction: a 60s
         # collection window plus a 120s fallback, both at the maximum, keeping the
         # 180s total the original pair was reaching for.
-        f"--bid-wait 60 --bid-wait-retry 180",
-        timeout=420,
+        f"--bid-wait 60 --bid-wait-retry 180 "
+        f"--receipt-path {q(str(receipt_path))} "
+        f"--receipt-operation-id {q(operation_id)}"
     )
+    started_at = time.time()
+    try:
+        r = _run(command, env={**os.environ, **receipt_env}, timeout=420)
+        timed_out = False
+    except BaseException:
+        try:
+            receipt, receipt_dseq = receipt_identity(receipt_path)
+            dseq_ref.update(
+                dseq=receipt_dseq,
+                owner=receipt["expected_owner"],
+                groups=receipt["group_population"],
+            )
+            if receipt_dseq:
+                verified_cleanup(dseq_ref)
+            elif receipt["state"] == "submitting":
+                reconcile_receipt(receipt_path, operation_id, started_at, dseq_ref)
+        except Exception:
+            pass
+        raise
     out = (r.stdout or "") + (r.stderr or "")
+    try:
+        receipt, receipt_dseq = receipt_identity(receipt_path)
+        dseq_ref.update(owner=receipt["expected_owner"], groups=receipt["group_population"])
+        dseq_ref["dseq"] = receipt_dseq or reconcile_receipt(
+            receipt_path, operation_id, started_at, dseq_ref
+        )
+    except Exception:
+        receipt, receipt_dseq = None, None
     # findall + [-1], never search: on the stale-bid path (issue #19) deploy closes
     # the original order and re-creates a fresh one, printing BOTH dseqs. The LAST
     # is the live lease; the first is already closed. Taking the first would test a
@@ -992,19 +1028,19 @@ def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, s
     # drain escrow. Only one dseq can ever be live: the re-deploy aborts outright if
     # the original's close fails ("not re-deploying, to avoid double escrow").
     dseqs = re.findall(r"DSEQ[:=]\s*(\d+)", out)
-    if dseqs:
+    if receipt_dseq:
         # Record for cleanup even when the deploy FAILED: deploy closes its own
         # deployment on the way out, but that close is best-effort and can itself
         # fail, so the finally must still be able to destroy it. A redundant destroy
         # is a no-op; a missed one drains real escrow.
-        dseq_ref["dseq"] = dseqs[-1]
+        dseq_ref["dseq"] = receipt_dseq
     # A printed DSEQ is NOT success. deploy prints it at CREATE time, long before
     # bidding, then closes the deployment and exits non-zero on every no-bid path.
     # Gating on the exit code is what stops a no-bid (a market condition) from being
     # misreported as a provider LEASE-DOWN — and it is what makes the notes below
     # reachable at all: without it the DSEQ match short-circuits every one of them.
-    if dseqs and r.returncode == 0:
-        return dseqs[-1], "ok"
+    if receipt_dseq and r.returncode == 0 and not timed_out:
+        return receipt_dseq, "ok"
     # Insufficient Console credit is account-wide, not a provider fault: the
     # deployment create returns HTTP 402 and NOTHING is created on-chain. Surface
     # it as its own note so the run skips cleanly instead of scoring the provider
@@ -1965,10 +2001,7 @@ def smoke_provider(
         _dseq = dseq_ref["dseq"]
         if _dseq:
             print(f"  cleanup: destroying {_dseq}...")
-            robust_destroy(_dseq)
-            # Clear the ref so a later Ctrl-C's signal handler skips this already-
-            # destroyed deployment instead of re-issuing destroy against it.
-            dseq_ref["dseq"] = None
+            verified_cleanup(dseq_ref)
         # Emit telemetry even on an early return or a propagating error (the
         # finally runs in all cases), so a no-bid / never-ready / crashed provider
         # is still recorded with whatever was measured.

@@ -27,8 +27,12 @@ from ._e2e import (
     install_signal_cleanup,
     resolve_tiers,
 )
-from ._e2e import (
-    destroy_owned_deployment as robust_destroy,
+from .paid_create import (
+    receipt_environment,
+    receipt_identity,
+    reconcile_receipt,
+    run_process_group,
+    verified_cleanup,
 )
 
 GREEN = "\033[92m"
@@ -533,6 +537,8 @@ def main():
 
     preferred, backup, _ = resolve_tiers()
     install_signal_cleanup(dseq_ref)
+    receipt_path, receipt_operation_id, receipt_env = receipt_environment("e2e-shell")
+    dseq_ref["receipt_path"] = receipt_path
 
     # ── Step 2: Deploy via `just up` ─────────────────────────
     log_step(2, "Deploy via `just up`")
@@ -557,35 +563,48 @@ def main():
     # when that is nothing.
     deploy_started_at = time.time()
     try:
-        r = run(["just", "up"], timeout=300)
-        deploy_out, deploy_err, returncode = r.stdout, r.stderr, r.returncode
-    except subprocess.TimeoutExpired as exc:
-        # ⛔ KEPT APART, not concatenated. `TimeoutExpired` carries the two streams
-        # separately, so the timeout path can report the same evidence as every other
-        # failure path — and #274's invariant requires it: a failure that names its
-        # returncode must name its stdout and stderr too, or it is unactionable.
-        # Collapsing them into one blob passed every human read of this diff and was
-        # caught by that test.
-        deploy_out, deploy_err = _decoded(exc.stdout), _decoded(exc.stderr)
-        # ⛔ THE REAL SIGNAL, not a placeholder. A negative returncode names the signal
-        # that killed the process, so the -1 this used to carry decodes to SIGHUP — a
-        # cause that did not happen, asserted by a value nobody would think to check.
-        # `subprocess.run` kills a timed-out child with `Popen.kill()`; measured, that
-        # child's returncode is -9. We are not guessing what killed it, we sent it.
-        returncode = -int(signal.SIGKILL)
-        log_fail(
-            f"`just up` exceeded its {exc.timeout:.0f}s timeout; its DIRECT CHILD "
-            "was SIGKILLed. The deploy runs a level below that and may still be "
-            "running — anything it creates is on chain and unattended by this run."
+        r, timed_out = run_process_group(
+            ["just", "up"], env={**os.environ, **receipt_env}, timeout=300
         )
+        deploy_out, deploy_err, returncode = r.stdout, r.stderr, r.returncode
+    except BaseException:
+        try:
+            receipt, receipt_dseq = receipt_identity(receipt_path)
+            dseq_ref.update(
+                dseq=receipt_dseq,
+                owner=receipt["expected_owner"],
+                groups=receipt["group_population"],
+            )
+            if receipt_dseq:
+                verified_cleanup(dseq_ref)
+            elif receipt["state"] == "submitting":
+                reconcile_receipt(receipt_path, receipt_operation_id, deploy_started_at, dseq_ref)
+        except Exception as exc:  # noqa: BLE001 - interruption stays held
+            log_fail(f"HELD: interrupted create receipt could not be reconciled ({exc})")
+        raise
     deploy_ended_at = time.time()
     output = deploy_out + deploy_err
     print(output)
 
     m = _search_streams(_DSEQ_SUMMARY_RE, deploy_out, deploy_err)
-    if m:
-        dseq_ref["dseq"] = m.group(1)
-    elif returncode != 0:
+    try:
+        receipt, receipt_dseq = receipt_identity(receipt_path)
+        dseq_ref.update(
+            owner=receipt["expected_owner"],
+            groups=receipt["group_population"],
+        )
+        dseq_ref["dseq"] = receipt_dseq or reconcile_receipt(
+            receipt_path, receipt_operation_id, deploy_started_at, dseq_ref
+        )
+    except Exception as exc:  # noqa: BLE001 - unverified output has no close authority
+        receipt, receipt_dseq = None, None
+        log_fail(f"HELD: create receipt unreadable ({exc})")
+        dseq_ref["dseq"] = None
+    if m and receipt_dseq and m.group(1) != receipt_dseq:
+        log_info(
+            f"Ignoring stale output DSEQ {m.group(1)}; response receipt proves {receipt_dseq}"
+        )
+    elif not m and returncode != 0:
         # ⛔ WIDER PATTERN, FAILURE PATH ONLY — and the asymmetry is the finding.
         # `DSEQ=` (deploy.py:1104) goes through `_log`, which prints with flush=True,
         # so it is the ONE emission that survives a kill. `DSEQ: ` (deploy.py:2116)
@@ -599,8 +618,7 @@ def main():
         # and nothing here should second-guess it.
         candidates = sorted(set(_findall_streams(_DSEQ_ANY_RE, deploy_out, deploy_err)))
         if len(candidates) == 1:
-            dseq_ref["dseq"] = candidates[0]
-            log_info(f"Recovered DSEQ={candidates[0]} from what the child flushed before dying")
+            log_info(f"Unverified output candidate DSEQ={candidates[0]} retained for diagnosis")
         elif candidates:
             log_fail(
                 "More than one candidate DSEQ survived in the killed child's output — "
@@ -628,12 +646,17 @@ def main():
         if recovered_dseq:
             log_info(f"Candidate DSEQ={recovered_dseq} found in {_DEPLOY_TEE_LOG}")
 
-    if returncode != 0:
+    if timed_out or returncode != 0:
+        if timed_out:
+            log_fail(
+                "just up exceeded 300s; its complete process group was settled with "
+                f"{signal.SIGTERM.name}/{signal.SIGKILL.name} before receipt reconciliation"
+            )
         log_fail(
             f"just up failed (rc={returncode}):\nstdout: {deploy_out!r}\nstderr: {deploy_err!r}"
         )
         if dseq_ref["dseq"]:
-            robust_destroy(dseq_ref["dseq"])
+            verified_cleanup(dseq_ref)
         else:
             report_unnamed_deployment(deploy_started_at, deploy_ended_at, recovered_dseq)
         sys.exit(1)
@@ -984,9 +1007,8 @@ def main():
         # ── Step 7: Cleanup (always runs, with retry + audit) ──────
         if dseq:
             log_step(TOTAL_STEPS, f"Cleanup: destroy DSEQ={dseq}")
-            if not robust_destroy(dseq):
+            if not verified_cleanup(dseq_ref):
                 failures.append("destroy_failed")
-            dseq_ref["dseq"] = None
 
     print(f"\n{BOLD}{'=' * 60}{RESET}")
     if failures:
