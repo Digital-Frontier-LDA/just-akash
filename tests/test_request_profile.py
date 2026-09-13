@@ -143,6 +143,20 @@ def test_unbounded_replica_population_is_refused_before_allocation() -> None:
     assert "replica_derivation_limit" in (derived.unavailable_reason or "")
 
 
+def test_replica_population_limit_is_cumulative_across_groups() -> None:
+    first = "{profile: small, count: 3}"
+    second = "{profile: big, count: 2}"
+    assert TWO_GROUPS.count(first) == TWO_GROUPS.count(second) == 1
+    sdl = TWO_GROUPS.replace(first, "{profile: small, count: 60000}").replace(
+        second, "{profile: big, count: 60000}"
+    )
+
+    derived = derive_resource_profiles(sdl)
+
+    assert derived.profiles == {}
+    assert "total_replica_derivation_limit" in (derived.unavailable_reason or "")
+
+
 @pytest.mark.parametrize(
     ("units", "millicores"),
     [(1, 1000), ("0.1", 100), ("250m", 250), (2.5, 2500)],

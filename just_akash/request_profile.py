@@ -177,6 +177,7 @@ def derive_resource_profiles(sdl_text: str) -> DerivedProfiles:
 
         totals: dict[str, list[int]] = {}
         replicas: dict[str, list[ReplicaProfile]] = {}
+        total_population = 0
         for service, groups in deployment.items():
             for group_name, spec in _mapping(groups, f"deployment.{service}").items():
                 spec = _mapping(spec, f"deployment.{service}.{group_name}")
@@ -189,12 +190,13 @@ def derive_resource_profiles(sdl_text: str) -> DerivedProfiles:
                 running = totals.setdefault(group_name, [0, 0, 0, 0])
                 for index, amount in enumerate(replica):
                     running[index] += count * amount
-                population = replicas.setdefault(group_name, [])
-                if len(population) + count > MAX_REPLICA_POPULATION:
+                if total_population + count > MAX_REPLICA_POPULATION:
                     raise _Unreadable(
-                        f"deployment group {group_name!r} exceeds the "
-                        f"{MAX_REPLICA_POPULATION} replica derivation limit"
+                        f"deployment exceeds the {MAX_REPLICA_POPULATION} total replica "
+                        "derivation limit"
                     )
+                total_population += count
+                population = replicas.setdefault(group_name, [])
                 shape = ReplicaProfile(
                     cpu_millicores=replica[0],
                     memory_bytes=replica[1],
