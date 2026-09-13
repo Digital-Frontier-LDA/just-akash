@@ -403,16 +403,25 @@ def test_just_up_passes_the_complete_receipt_identity() -> None:
 
 def test_just_up_rejects_each_half_configured_receipt_before_paid_deploy(tmp_path: Path) -> None:
     root = Path(__file__).parents[1]
+    justfile = (root / "Justfile").read_text(encoding="utf-8")
+    start = justfile.index('up tag="":')
+    end = justfile.index("\n# Connect to a running instance", start)
+    recipe = "\n".join(
+        line[4:] if line.startswith("    ") else line
+        for line in justfile[start:end].splitlines()[1:]
+    )
+    recipe = recipe.replace("{{log_dir}}", ".logs/just").replace("{{tag}}", "")
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     marker = tmp_path / "deploy-called"
     fake_uv = fake_bin / "uv"
-    fake_uv.write_text(f"#!/bin/sh\nprintf called > {marker}\n", encoding="utf-8")
+    fake_uv.write_text('#!/bin/sh\nprintf called > "$TMP_DEPLOY_MARKER"\n', encoding="utf-8")
     fake_uv.chmod(0o755)
     base_env = {
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "JUST_AKASH_RECEIPT_PATH": "",
         "JUST_AKASH_RECEIPT_OPERATION_ID": "",
+        "TMP_DEPLOY_MARKER": str(marker),
     }
 
     for configured in (
@@ -420,14 +429,9 @@ def test_just_up_rejects_each_half_configured_receipt_before_paid_deploy(tmp_pat
         {"JUST_AKASH_RECEIPT_OPERATION_ID": "operation-only"},
     ):
         result = subprocess.run(
-            [
-                "just",
-                "--justfile",
-                str(root / "Justfile"),
-                "--working-directory",
-                str(tmp_path),
-                "up",
-            ],
+            ["bash"],
+            input=recipe,
+            cwd=tmp_path,
             env={**base_env, **configured},
             text=True,
             capture_output=True,
@@ -438,14 +442,9 @@ def test_just_up_rejects_each_half_configured_receipt_before_paid_deploy(tmp_pat
         assert not marker.exists(), "half-configured receipt mode reached the paid deploy"
 
     complete = subprocess.run(
-        [
-            "just",
-            "--justfile",
-            str(root / "Justfile"),
-            "--working-directory",
-            str(tmp_path),
-            "up",
-        ],
+        ["bash"],
+        input=recipe,
+        cwd=tmp_path,
         env={
             **base_env,
             "JUST_AKASH_RECEIPT_PATH": str(tmp_path / "receipt.json"),
