@@ -142,7 +142,46 @@ def test_held_is_published_through_the_job_and_workflow_and_cannot_be_skipped() 
     step = close_step(doc)
     assert "continue-on-error" not in step and "continue-on-error" not in job
     assert "if" not in step, "a conditional close step could be skipped instead of failing"
+    assert "if" not in job, "a conditional teardown JOB turns HELD into a silent skip"
     outputs = (doc.get("on") or doc.get(True))["workflow_call"]["outputs"]
     for key in ("held_reason", "held_dseq", "held_deployment_group"):
         assert job["outputs"][key] == f"${{{{ steps.close.outputs.{key} }}}}"
         assert outputs[key]["value"] == f"${{{{ jobs.teardown.outputs.{key} }}}}"
+
+
+# Every caller's job-level gate, exactly. A gate is allowed only if it cannot evaluate
+# false for an owner-less receipt:
+# - runner-pool.yml runs teardown when the pool job did not succeed. An owner-less
+#   receipt always fails that job (LEASE_OWNER_UNREADABLE exits 1, measured by
+#   test_runner_pool_outcome_is_monotonic.py::test_s5b_...), so the gate is true there.
+# - The handoff fixture gates on always().
+ALLOWED_CALLER_GATES = {
+    (
+        ".github/workflows/runner-pool.yml",
+        "teardown",
+    ): "always() && needs.pool.result != 'success'",
+    ("tests/fixtures/runner_handoff_consumer.yml", "teardown"): "${{ always() }}",
+}
+
+
+def test_no_caller_job_gate_can_skip_the_teardown() -> None:
+    """Derived from every workflow and fixture that calls runner-teardown.yml. A new
+    caller, a changed gate, or continue-on-error on a caller is a failure, not a pass."""
+    root = WORKFLOW.parents[2]
+    callers = {}
+    for path in sorted(
+        [*root.glob(".github/workflows/*.yml"), *root.glob("tests/fixtures/*.yml")]
+    ):
+        doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        for name, job in (doc.get("jobs") or {}).items():
+            if "runner-teardown.yml@" in str(job.get("uses", "")):
+                callers[(str(path.relative_to(root)), name)] = job
+    assert (".github/workflows/runner-pool.yml", "teardown") in callers, sorted(callers)
+    assert set(callers) == set(ALLOWED_CALLER_GATES), (
+        f"teardown callers changed; justify each gate before allowing it: {sorted(callers)}"
+    )
+    for key, job in callers.items():
+        assert "continue-on-error" not in job, f"{key} can hide a HELD teardown"
+        assert job.get("if") == ALLOWED_CALLER_GATES[key], (
+            f"{key} gates teardown on {job.get('if')!r}, which may skip an owner-less receipt"
+        )
