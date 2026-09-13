@@ -315,8 +315,9 @@ on:
           WHY a fallback happened, when it did. One of RUNNER_PAT_MISSING,
           RUNNER_PAT_INVALID, WALLET_UNDERFUNDED, WALLET_TX_CONTENTION,
           NO_ELIGIBLE_BIDDER, PROVIDER_CAPACITY, RUNNER_NEVER_REGISTERED,
-          GITHUB_API_UNAVAILABLE, INDETERMINATE — or empty on success. Each implies a
-          different remedy, which is why they are not collapsed into "infra".
+          GITHUB_API_UNAVAILABLE, INDETERMINATE, LEASE_CLOSE_UNVERIFIED,
+          LEASE_OWNER_UNREADABLE — or empty on success. Each implies a different
+          remedy, which is why they are not collapsed into "infra".
 
           Three of them are explicitly NOT statements about a provider, and each was
           measured misreporting as one:

@@ -561,6 +561,30 @@ def test_s6_a_post_create_exit_never_publishes_no_deployment(
     assert_monotonic(r)
 
 
+def test_s6_created_then_wallet_tx_contention_never_publishes_no_deployment(
+    tmp_path: Path,
+) -> None:
+    """The one post-create exit S6's single-round shape cannot reach: contention is
+    classified before SAW_BID, so it needs an earlier created (and proven-closed) lease."""
+    r = run_step(
+        tmp_path,
+        {
+            "owner": OWNER,
+            "destroy": {"1001": "ok"},
+            "verify": {"1001": "closed"},
+            "rounds": [{"dseq": "1001"}, {"text": "account sequence mismatch"}],
+        },
+        env_extra={"MAX_ATTEMPTS": "2"},
+    )
+    assert r["rc"] != 0
+    assert deploys(r) == 2, r["calls"]
+    assert last(r, "failure_reason") == "WALLET_TX_CONTENTION", r["writes"]
+    outcomes = [v for k, v in r["writes"] if k == "deployment_outcome"]
+    assert "no-deployment" not in outcomes and outcomes[-1] == "created", outcomes
+    assert identity_pairs(r) == [("1001", OWNER)], r["writes"]
+    assert_monotonic(r)
+
+
 # ── #347 acceptance: no-deployment still means something, unknown stays unknown ──
 
 
