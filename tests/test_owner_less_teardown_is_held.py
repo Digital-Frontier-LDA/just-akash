@@ -169,9 +169,9 @@ def test_no_caller_job_gate_can_skip_the_teardown() -> None:
     caller, a changed gate, or continue-on-error on a caller is a failure, not a pass."""
     root = WORKFLOW.parents[2]
     callers = {}
-    for path in sorted(
-        [*root.glob(".github/workflows/*.yml"), *root.glob("tests/fixtures/*.yml")]
-    ):
+    patterns = ("*.yml", "*.yaml")
+    dirs = (root / ".github/workflows", root / "tests/fixtures")
+    for path in sorted(p for d in dirs for pattern in patterns for p in d.glob(pattern)):
         doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         for name, job in (doc.get("jobs") or {}).items():
             if "runner-teardown.yml@" in str(job.get("uses", "")):
@@ -184,4 +184,28 @@ def test_no_caller_job_gate_can_skip_the_teardown() -> None:
         assert "continue-on-error" not in job, f"{key} can hide a HELD teardown"
         assert job.get("if") == ALLOWED_CALLER_GATES[key], (
             f"{key} gates teardown on {job.get('if')!r}, which may skip an owner-less receipt"
+        )
+
+
+def test_the_pool_job_fails_when_an_owner_less_provision_fails() -> None:
+    """The caller gate is `needs.pool.result != 'success'`, so it is only true for an
+    owner-less receipt if a failed provision step fails the pool JOB. S5b measures the
+    script's exit code; this pins the job wiring that turns that exit into the result.
+    continue-on-error on the job or on the provision step would report success and
+    silently skip teardown."""
+    root = WORKFLOW.parents[2]
+    doc = yaml.safe_load((root / ".github/workflows/runner-pool.yml").read_text(encoding="utf-8"))
+    job = doc["jobs"]["pool"]
+    assert "continue-on-error" not in job, "the pool job would report success over a HELD lease"
+    steps = job["steps"]
+    provision = [i for i, step in enumerate(steps) if step.get("id") == "provision"]
+    assert len(provision) == 1, f"expected one provision step, found {len(provision)}"
+    assert "continue-on-error" not in steps[provision[0]], (
+        "a continue-on-error provision step makes the pool job succeed and skips teardown"
+    )
+    for step in steps[provision[0] + 1 :]:
+        runs_after_failure = "always()" in str(step.get("if", ""))
+        assert not (runs_after_failure and "continue-on-error" in step), (
+            f"step {step.get('name') or step.get('id')!r} runs after a failed provision "
+            "with continue-on-error"
         )
