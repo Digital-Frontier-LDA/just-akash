@@ -288,9 +288,14 @@ class AkashConsoleAPI:
             # ⛔ TRANSPORT, UNKNOWN OUTCOME (#368). The endpoint connected and then
             # went silent past CONSOLE_HTTP_TIMEOUT: whether the request was applied
             # is as unknown as with a dropped connection, and raising AkashAPIError
-            # here would claim an HTTP verdict the server never sent. Re-raised AS
-            # TimeoutError so callers classify it with the connection-class failures
-            # — never a hang, never a verdict.
+            # here would claim an HTTP verdict the server never sent.
+            # ⚠ THIS BLOCK LOGS; THE CLASSIFICATION COMES FROM PROPAGATION. The
+            # re-raised type is TimeoutError only because it arrived as one —
+            # TimeoutError is a SIBLING of URLError, not a subclass, so the
+            # handler below never catches it and the raw type reaches the caller
+            # whether or not this block exists. Its whole effect is the loud
+            # elapsed-time log; deleting it would silence the timeout, not
+            # re-classify it.
             elapsed_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
             logger.error(f"[{_ts()}] API {method} {endpoint} -> TIMEOUT after {elapsed_ms}ms: {e}")
             raise
