@@ -98,10 +98,15 @@ def urlopen_rule_errors(source: str, where: str) -> list[str]:
     }
     errors: list[str] = []
     for node in ast.walk(tree):
-        is_reference = (isinstance(node, ast.Attribute) and node.attr == "urlopen") or (
-            isinstance(node, ast.Name) and node.id in imported
-        )
-        if not is_reference:
+        # isinstance branches, not an `is_reference` boolean: the branches NARROW
+        # node to Attribute | Name (both carry .lineno) for the error paths below.
+        if isinstance(node, ast.Attribute):
+            if node.attr != "urlopen":
+                continue
+        elif isinstance(node, ast.Name):
+            if node.id not in imported:
+                continue
+        else:
             continue
         call = called.get(id(node))
         if call is None:
@@ -112,7 +117,8 @@ def urlopen_rule_errors(source: str, where: str) -> list[str]:
             errors.append(f"{where}:{call.lineno}: urlopen without timeout=")
             continue
         # ⚠ `-1` parses as UnaryOp(USub, Constant(1)), NOT Constant(-1): the
-        # signed literal must be flattened before it can be judged.
+        # signed literal must be flattened before it can be judged. The operand
+        # is narrowed to a real number BEFORE negating, so no type: ignore.
         literal: object = _NOT_A_LITERAL
         value = keyword.value
         if isinstance(value, ast.Constant):
@@ -121,12 +127,10 @@ def urlopen_rule_errors(source: str, where: str) -> list[str]:
             isinstance(value, ast.UnaryOp)
             and isinstance(value.op, (ast.UAdd, ast.USub))
             and isinstance(value.operand, ast.Constant)
-            and isinstance(value.operand.value, (int, float))
-            and not isinstance(value.operand.value, bool)
         ):
-            literal = value.operand.value
-            if isinstance(value.op, ast.USub):
-                literal = -literal  # type: ignore[operator]
+            operand = value.operand.value
+            if isinstance(operand, (int, float)) and not isinstance(operand, bool):
+                literal = -operand if isinstance(value.op, ast.USub) else operand
         if (
             literal is None
             or isinstance(literal, bool)
