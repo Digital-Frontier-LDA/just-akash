@@ -80,6 +80,10 @@ _OWNER_LOOKUP_JOB_MARKERS = (
     "resolve-owner",
     "just_akash.test_shell_e2e",
     "just_akash.test_secrets_e2e",
+    # smoke_providers reaches owner lookup through robust_destroy →
+    # _select_owner_credential (#378 repair): the smoke and its reap-sweep are
+    # lookup windows too.
+    "just_akash.smoke_providers",
 )
 
 
@@ -108,7 +112,7 @@ STALL = "stall"
 @pytest.fixture
 def console(monkeypatch):
     """Per-key mint scripts at urlopen: JWT bodies, resets, or a no-byte stall."""
-    state: dict = {"mint": {}}
+    state: dict = {"mint": {}, "read": {}}
     for module in (owner_lookup, wallet_pool):
         monkeypatch.setattr(module, "OWNER_LOOKUP_DEADLINE_SECONDS", _TEST_DEADLINE)
     monkeypatch.setattr(wallet_pool, "configured_api_keys", lambda: list(KEYS))
@@ -122,12 +126,17 @@ def console(monkeypatch):
         ),
     )
 
-    def urlopen(request, *args, **kwargs):
+    def _resolve(request):
         key = request.headers.get("X-api-key") or request.get_header("X-api-key")
-        script = state["mint"].get(key) or _jwt(OTHER)
+        kind = "mint" if request.full_url.endswith("/v1/create-jwt-token") else "read"
+        script = state[kind].get(key) or (_jwt(OTHER) if kind == "mint" else {"dseq": DSEQ})
         result = script[0] if isinstance(script, list) else script
         if isinstance(script, list):
             script.pop(0)
+        return result
+
+    def urlopen(request, *args, **kwargs):
+        result = _resolve(request)
         if result == STALL:
             # ⚠ Block on an Event, NOT time.sleep: this runs inside an abandoned
             # daemon worker that outlives the test, and a LATER test that
@@ -365,6 +374,26 @@ def test_a_dripping_first_key_cannot_starve_a_later_key_that_answers(console) ->
     assert client is not None
 
 
+def test_the_share_keeps_a_dseq_read_from_starvation(console) -> None:
+    """(S1b.) A stalling FIRST wallet must not starve a later wallet that can read
+    the deployment — the per-wallet share bounds the first to its own slice."""
+    console["read"][KEYS[0]] = STALL
+    console["read"][KEYS[1]] = {"dseq": DSEQ}
+    client = wallet_pool.select_client_for_dseq(DSEQ)
+    assert client is not None
+
+
+def test_the_share_keeps_the_e2e_scan_from_starvation(console) -> None:
+    """(S1c.) A stalling FIRST credential must not starve a later one that answers
+    the owner — the per-credential share bounds the first to its own slice."""
+    from just_akash import _e2e
+
+    console["mint"][KEYS[0]] = STALL
+    console["mint"][KEYS[1]] = _jwt(OWNER)
+    candidate, verdict = _e2e._select_owner_credential(DSEQ, OWNER, list(KEYS), None)
+    assert candidate is not None and verdict is None
+
+
 def test_the_step_wide_env_ceiling_binds_across_the_budget(console, monkeypatch) -> None:
     """OWNER_LOOKUP_DEADLINE_AT is the per-STEP ceiling: even with the process budget
     at its 600s default, a step that exported a 1s ceiling ends in ~1s."""
@@ -412,6 +441,8 @@ def test_no_key_material_or_suffix_reaches_any_unreachable_path(
 
     console["mint"][KEYS[0]] = STALL
     console["mint"][KEYS[1]] = STALL
+    console["read"][KEYS[0]] = STALL
+    console["read"][KEYS[1]] = STALL
     messages: list[str] = []
     with pytest.raises(OwnerLookupUnresolved) as excinfo:
         wallet_pool._raw_client_for_bound_owner(DSEQ, OWNER, "g")
@@ -472,6 +503,16 @@ def _code(line: str) -> str:
     return "" if line.lstrip().startswith("#") else line
 
 
+def _has_lookup_marker(code_line: str) -> bool:
+    """A lookup invocation in CODE: the explicit markers, plus the destroy subcommand
+    in any of its invocation forms — including the args-array form
+    `"${JA[@]}" destroy "${DESTROY_ARGS[@]}"`, which no literal `destroy --dseq`
+    string can see (#378 review, W1)."""
+    if any(marker in code_line for marker in _OWNER_LOOKUP_JOB_MARKERS):
+        return True
+    return bool(re.search(r"(\$JA|\$\{JA\[@\]\}|just-akash)[^|;&]*\bdestroy\b", code_line))
+
+
 def _lookup_steps_and_jobs(workflows_dir: Path = WORKFLOWS):
     """(workflow, job, timeout-minutes, [(step name, budget seconds or None)]) for every
     job with a lookup-invoking step."""
@@ -482,12 +523,12 @@ def _lookup_steps_and_jobs(workflows_dir: Path = WORKFLOWS):
             steps = []
             for st in job.get("steps", []):
                 run = st.get("run") or ""
-                if not any(marker in run for marker in _OWNER_LOOKUP_JOB_MARKERS):
+                if not any(_has_lookup_marker(_code(ln)) for ln in run.splitlines()):
                     continue
                 budget = None
                 for line in run.splitlines():
                     m = re.search(r"OWNER_LOOKUP_DEADLINE_AT=.*\+\s*(\d+)", line)
-                    if m:
+                    if m and _code(line):
                         budget = float(m.group(1))
                         break
                 steps.append((st.get("name") or job_name, budget, run))
@@ -496,14 +537,21 @@ def _lookup_steps_and_jobs(workflows_dir: Path = WORKFLOWS):
     return found
 
 
-def test_every_lookup_step_shares_one_budget_and_every_retry_loop_stops_on_unreachable():
-    """(Review blocker a+b+c.) Per JOB: every lookup-invoking step exports the shared
-    budget BEFORE its first lookup; every retry loop containing a lookup breaks on the
-    UNREACHABLE exit code instead of re-spending a dead budget; and timeout-minutes
-    clears steps x budget + margin. Set TEST_OWNER_LOOKUP_WORKFLOWS_DIR to run the same
-    derivation against a historical tree (used to show this RED on b0d6727, whose
-    per-process deadline let one teardown retry loop alone budget ~40.2 lookup-minutes
-    inside a 30-minute job)."""
+def test_every_lookup_window_has_a_fresh_ceiling_and_every_retry_loop_stops_on_unreachable():
+    """(DEV1 interim + parts 1-2.) Per JOB: every retry WINDOW containing a lookup
+    carries its OWN fresh OWNER_LOOKUP_DEADLINE_AT export in its preamble (a step-start
+    ceiling goes stale while the step's deploys and runner waits spend the clock); every
+    lookup marker outside a window is preceded by a step-level export; every retry loop
+    over a lookup breaks on the UNREACHABLE exit code; timeout-minutes clears
+    exports x budget + margin. TEST_OWNER_LOOKUP_WORKFLOWS_DIR re-runs the derivation
+    against a historical tree.
+
+    ⚠ WHICH LEG FIRES WHERE: on b0d6727/5009c4f's trees this goes red through the
+    MISSING-EXPORT legs (no ceiling at all, budget None → the window check is never
+    reached); the timeout ARITHMETIC leg needs exports present but a timeout too
+    small, which no historical tree has — the companion fixture test below fires it
+    instead. Verified red on 5009c4f (pool windows + both smoke steps) via the env
+    override."""
     import os
 
     workflows_dir = Path(os.environ.get("TEST_OWNER_LOOKUP_WORKFLOWS_DIR") or WORKFLOWS)
@@ -511,53 +559,107 @@ def test_every_lookup_step_shares_one_budget_and_every_retry_loop_stops_on_unrea
     # ⛔ POPULATION FIRST: a finder that locates zero invoking jobs is broken, not
     # satisfied — the deadline would then be protected by nothing.
     assert len(jobs) >= 4, f"owner-lookup job finder located only {jobs}; widen it"
+    # ⛔ AND THE SMOKE POPULATION IS NAMED: removing the smoke_providers marker
+    # would blind the finder to provider-smoke.yml silently (the floor of 4 would
+    # still hold). This assertion is what makes marker removal red.
+    assert any(workflow == "provider-smoke.yml" for workflow, *_ in jobs), (
+        "provider-smoke.yml vanished from the lookup population — a marker was "
+        "dropped, not the smoke made safe"
+    )
     violations = []
     for workflow, job, timeout_minutes, steps in jobs:
-        for step_name, budget, run in steps:
-            if budget is None:
-                violations.append(
-                    f"{workflow}:{job}/{step_name}: no OWNER_LOOKUP_DEADLINE_AT export "
-                    "before the first lookup — the budget is per process again"
-                )
-                continue
+        exports_in_job = 0
+        for step_name, _budget, run in steps:
             lines = run.splitlines()
-            first_marker = next(
-                i
-                for i, ln in enumerate(lines)
-                if any(m in ln for m in _OWNER_LOOKUP_JOB_MARKERS) and _code(ln)
-            )
-            export_at = next(
-                (i for i, ln in enumerate(lines) if "OWNER_LOOKUP_DEADLINE_AT=" in ln), None
-            )
-            if export_at is None or export_at > first_marker:
-                violations.append(
-                    f"{workflow}:{job}/{step_name}: export must precede the first lookup"
-                )
-            # every retry window (a `for` line .. its `done`) containing a lookup must
-            # break on the UNREACHABLE exit code
+            code = [_code(ln) for ln in lines]
             in_window = False
-            window_has_lookup = window_stops = False
-            for ln in lines:
-                if re.search(r"\bfor\b.*;\s*do\b", ln):
+            window_has_lookup = window_stops = window_has_export = False
+            for i, (_ln, cl) in enumerate(zip(lines, code, strict=True)):
+                if re.search(r"\bfor\b.*;\s*do\b", cl):
+                    # The window's PREAMBLE counts: the fresh ceiling may sit in the
+                    # lines immediately ABOVE the `for` (that is how the workflows
+                    # are written) or inside the window body.
+                    preamble = code[max(0, i - 6) : i]
                     in_window, window_has_lookup, window_stops = True, False, False
-                elif in_window and re.match(r"\s*done\b", ln):
+                    window_has_export = any("OWNER_LOOKUP_DEADLINE_AT=" in c for c in preamble)
+                elif in_window and re.match(r"\s*done\b", cl):
                     if window_has_lookup and not window_stops:
                         violations.append(
                             f"{workflow}:{job}/{step_name}: a retry loop over a lookup "
                             f"does not break on exit {OWNER_LOOKUP_UNREACHABLE_EXIT_CODE}"
                         )
+                    if window_has_lookup and not window_has_export:
+                        violations.append(
+                            f"{workflow}:{job}/{step_name}: a lookup retry window with "
+                            "no fresh OWNER_LOOKUP_DEADLINE_AT export in its preamble — "
+                            "it inherits whatever ceiling is left, stale or none"
+                        )
                     in_window = False
                 elif in_window:
-                    if any(m in ln for m in _OWNER_LOOKUP_JOB_MARKERS) and _code(ln):
+                    if "OWNER_LOOKUP_DEADLINE_AT=" in cl:
+                        window_has_export = True
+                    if _has_lookup_marker(cl):
                         window_has_lookup = True
-                    if f"-eq {OWNER_LOOKUP_UNREACHABLE_EXIT_CODE}" in ln:
+                    if f"-eq {OWNER_LOOKUP_UNREACHABLE_EXIT_CODE}" in cl:
                         window_stops = True
-        budgets = sum(b or 0 for _, b, _ in steps)
-        required = (budgets + OWNER_LOOKUP_JOB_MARGIN_SECONDS) / 60
+                else:
+                    if _has_lookup_marker(cl):
+                        before = [
+                            c
+                            for j, c in enumerate(code[:i])
+                            if "OWNER_LOOKUP_DEADLINE_AT=" in c and _code(lines[j])
+                        ]
+                        if not before:
+                            violations.append(
+                                f"{workflow}:{job}/{step_name}: a lookup outside any "
+                                "retry window with no preceding step-level export"
+                            )
+                if "OWNER_LOOKUP_DEADLINE_AT=" in cl:
+                    exports_in_job += 1
+        required = (exports_in_job * 600 + OWNER_LOOKUP_JOB_MARGIN_SECONDS) / 60
         if timeout_minutes is None or timeout_minutes < required:
             violations.append(
                 f"{workflow}:{job}: timeout-minutes={timeout_minutes} does not clear "
-                f"{len(steps)} budgeted lookup step(s) ({budgets:.0f}s) + margin "
+                f"{exports_in_job} fresh ceiling(s) x 600s + margin "
                 f"({OWNER_LOOKUP_JOB_MARGIN_SECONDS:.0f}s) = {required:.1f} min"
             )
     assert not violations, "\n".join(violations)
+
+
+def test_the_timeout_arithmetic_leg_fires_on_a_too_small_timeout(tmp_path) -> None:
+    """The arithmetic leg of the structural rule, fired on a FIXTURE: exports present,
+    breaks present, but timeout-minutes below exports x 600 + margin. No historical
+    tree exercises this leg (missing-export fires first), so it is proven here."""
+    workflow = tmp_path / "fixture.yml"
+    workflow.write_text(
+        "on: [push]\n"
+        "jobs:\n"
+        "  closer:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    timeout-minutes: 5\n"
+        "    steps:\n"
+        "      - name: close\n"
+        "        run: |\n"
+        "          export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))\n"
+        "          for _try in 1 2 3; do\n"
+        '            "$JA" destroy "${DESTROY_ARGS[@]}" 2>&1 | tee /tmp/d.log \
+'
+        "              || RC=${PIPESTATUS[0]}\n"
+        '            [ "$RC" -eq 75 ] && break\n'
+        "          done\n",
+        encoding="utf-8",
+    )
+    jobs = _lookup_steps_and_jobs(tmp_path)
+    assert len(jobs) == 1, "fixture did not register as a lookup job — finder broken"
+    ((workflow_name, job, timeout_minutes, steps),) = jobs
+    assert timeout_minutes == 5
+    exports = sum(
+        1
+        for _, _, run in steps
+        for ln in run.splitlines()
+        if "OWNER_LOOKUP_DEADLINE_AT=" in ln and _code(ln)
+    )
+    required = (exports * 600 + OWNER_LOOKUP_JOB_MARGIN_SECONDS) / 60
+    assert exports == 1 and required > timeout_minutes, (
+        "fixture must sit strictly inside the arithmetic violation region"
+    )

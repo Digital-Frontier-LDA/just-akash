@@ -386,6 +386,10 @@ jobs:
           # not among them. The close was accepted and had not yet propagated. It is
           # the OBSERVATION that needed patience, not the action.
           DESTROY_TRIES=0
+          # ⛔ FRESH ceiling for THIS close window (#378 repair): resolve-owner above
+          # spent wall time against the step-start ceiling; the destroy retries get
+          # their own, so the window never inherits a stale one.
+          export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
           for _try in 1 2 3; do
             DESTROY_TRIES=$_try
             DESTROY_RC=0

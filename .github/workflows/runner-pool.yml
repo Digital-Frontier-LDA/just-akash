@@ -928,10 +928,6 @@ jobs:
           DEPLOYMENT_GROUP: ${{ steps.render.outputs.deployment_group }}
         run: |
           set -uo pipefail
-          # ⛔ ONE lookup budget for the WHOLE STEP (#378): every resolve-owner/destroy in
-          # this step — including each retry — shares this absolute ceiling (epoch
-          # seconds); just-akash honours it as min(own budget, ceiling).
-          export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
 
 
           # Fail closed before the first possible submit. Every branch inherits UNKNOWN;
@@ -1099,6 +1095,11 @@ jobs:
             if [ -n "$DSEQ" ] && [ -z "$PROVIDER" ]; then
               echo "::warning::attempt $attempt: dseq=$DSEQ exists but no Provider line was parsed — closing it so it cannot leak escrow"
               "${JA[@]}" tag --dseq "$DSEQ" --name "${TAG_PREFIX}-${RUN_ID}" || true
+              # ⛔ FRESH ceiling for THIS close window only (#378 repair): the step's own work
+              # (deploys, the runner wait) spends wall time the step-start export could not
+              # spare — a later window inherited an expired ceiling and exited 75 with
+              # "0 of 1 credential(s) tried" while the lease stayed open (DEV1's witness).
+              export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
               for _try in 1 2 3; do
                 DESTROY_RC=0
                 "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-orphan.log || DESTROY_RC=${PIPESTATUS[0]}
@@ -1353,6 +1354,11 @@ jobs:
             # GitHub's API, and a second attempt just doubles the request load that is
             # the most likely cause.
             if [ "$API_OK" = "0" ]; then
+              # ⛔ FRESH ceiling for THIS close window only (#378 repair): the step's own work
+              # (deploys, the runner wait) spends wall time the step-start export could not
+              # spare — a later window inherited an expired ceiling and exited 75 with
+              # "0 of 1 credential(s) tried" while the lease stayed open (DEV1's witness).
+              export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
               for _try in 1 2 3; do
                 DESTROY_RC=0
                 "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-destroy.log || DESTROY_RC=${PIPESTATUS[0]}
@@ -1372,6 +1378,11 @@ jobs:
               echo "::warning::attempt $attempt: ${ONLINE:-0}/${POOL_SIZE} online on $PROVIDER (need >= ${MIN_POOL}) — discarding this lease"
               # Escrow-critical, and deliberately a literal locally-parsed --dseq so a
               # destroy-safety lint can prove this only tears down what this loop made.
+              # ⛔ FRESH ceiling for THIS close window only (#378 repair): the step's own work
+              # (deploys, the runner wait) spends wall time the step-start export could not
+              # spare — a later window inherited an expired ceiling and exited 75 with
+              # "0 of 1 credential(s) tried" while the lease stayed open (DEV1's witness).
+              export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
               for _try in 1 2 3; do
                 DESTROY_RC=0
                 "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-destroy.log || DESTROY_RC=${PIPESTATUS[0]}
@@ -1415,6 +1426,11 @@ jobs:
             # whole standard exists to refuse.
             if [ -z "${RUNNER_VERSIONS:-}" ]; then
               echo "::warning title=Landing gate: version projection empty for a pool reporting ${ONLINE} online::attempt $attempt: the runner listing yielded ${ONLINE} online id(s) and 0 versions on $PROVIDER — the read disagrees with itself, so this lease is discarded rather than trusted."
+              # ⛔ FRESH ceiling for THIS close window only (#378 repair): the step's own work
+              # (deploys, the runner wait) spends wall time the step-start export could not
+              # spare — a later window inherited an expired ceiling and exited 75 with
+              # "0 of 1 credential(s) tried" while the lease stayed open (DEV1's witness).
+              export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
               for _try in 1 2 3; do
                 DESTROY_RC=0
                 "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-destroy.log || DESTROY_RC=${PIPESTATUS[0]}
@@ -1444,6 +1460,11 @@ jobs:
               if [ "${GATE_DEAD:-0}" -gt 0 ] || [ "${GATE_WRONG:-0}" -gt 0 ]; then
                 echo "::warning title=Landing gate: registered runners are not running::attempt $attempt: ${GATE_DEAD} online runner(s) report NO version and ${GATE_WRONG} report an unexpected one on $PROVIDER — discarding this lease rather than handing the caller a pool of corpses."
                 printf '%s\n' "$RUNNER_VERSIONS" | sort | uniq -c | sed 's/^/    version /'
+                # ⛔ FRESH ceiling for THIS close window only (#378 repair): the step's own work
+                # (deploys, the runner wait) spends wall time the step-start export could not
+                # spare — a later window inherited an expired ceiling and exited 75 with
+                # "0 of 1 credential(s) tried" while the lease stayed open (DEV1's witness).
+                export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
                 for _try in 1 2 3; do
                   DESTROY_RC=0
                   "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-destroy.log || DESTROY_RC=${PIPESTATUS[0]}
