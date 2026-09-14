@@ -177,6 +177,15 @@ def _run_level_mocks(client, group_names, dseq):
         patch.object(cs.chain, "rest_urls", return_value=["https://one.test", "https://two.test"]),
         patch.object(
             cs.chain,
+            "owner_close_population_evidence",
+            side_effect=lambda owner, exact_dseq, population: {
+                "owner": owner,
+                "dseq": exact_dseq,
+                "groups": population,
+            },
+        ),
+        patch.object(
+            cs.chain,
             "_lcd_get",
             return_value={
                 "deployment": records[0]["deployment"],

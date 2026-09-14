@@ -273,6 +273,54 @@ def test_complete_creation_population_with_second_group_cannot_authorize_singlet
     )
 
 
+def test_complete_signed_multi_group_population_can_be_bound_exactly():
+    population = (("1", GROUP), ("2", "sidecar"))
+    reader, _ = _reader(
+        current_groups=population,
+        create_groups=(GROUP, "sidecar"),
+    )
+    evidence = chain._owner_close_evidence(
+        OWNER,
+        DSEQ,
+        GROUP,
+        sources=SOURCES,
+        reader=reader,
+        now=NOW,
+        expected_population=population,
+    )
+    assert evidence is not None
+    assert evidence["groups"] == [
+        {"gseq": 1, "name": GROUP},
+        {"gseq": 2, "name": "sidecar"},
+    ]
+    assert evidence["population_count"] == 2
+
+
+def test_public_population_authority_preserves_the_exact_order(monkeypatch):
+    calls = []
+    expected = [{"gseq": 1, "name": GROUP}, {"gseq": 2, "name": "sidecar"}]
+
+    def authority(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"groups": expected}
+
+    monkeypatch.delenv("AKASH_REST_URL", raising=False)
+    monkeypatch.setattr(chain, "_owner_close_evidence", authority)
+    assert chain.owner_close_population_evidence(OWNER, DSEQ, expected) == {"groups": expected}
+    assert calls[0][0] == (OWNER, DSEQ, GROUP)
+    assert calls[0][1]["expected_population"] == (("1", GROUP), ("2", "sidecar"))
+
+    calls.clear()
+    for invalid in (
+        [],
+        [{"gseq": 2, "name": GROUP}],
+        [{"gseq": 1, "name": GROUP}, {"gseq": 3, "name": "sidecar"}],
+        [{"gseq": 1, "name": "contains spaces"}],
+    ):
+        assert chain.owner_close_population_evidence(OWNER, DSEQ, invalid) is None
+    assert calls == []
+
+
 def test_block_raw_population_truncation_effect_mutation():
     def truncate(_path, _base, _height, doc):
         if "/txs/block/" in _path:
