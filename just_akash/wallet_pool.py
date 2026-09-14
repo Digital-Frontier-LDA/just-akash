@@ -311,7 +311,7 @@ def select_client_for_dseq(
     unknown = False
     deadline = Deadline()
     attempts: list[int] = []
-    for key in keys:
+    for position, key in enumerate(keys):
         if deadline.expired:
             raise OwnerLookupUnresolved(
                 "OWNER_LOOKUP_UNREACHABLE",
@@ -328,7 +328,10 @@ def select_client_for_dseq(
             made += 1
             return client.get_deployment(str(dseq))
 
-        kind, deployment = ask(_read, deadline=deadline)
+        # ⭐ PER-WALLET SHARE of the remaining budget (remaining / untried): a
+        # dripping first wallet must not starve a later wallet that can read it.
+        share = Deadline(deadline.remaining() / (len(keys) - position))
+        kind, deployment = ask(_read, deadline=share)
         attempts.append(made)
         if kind == "unknown":
             unknown = True
@@ -381,7 +384,7 @@ def _raw_client_for_bound_owner(
     kinds: set[str] = set()
     deadline = Deadline()
     attempts: list[int] = []
-    for key in keys:
+    for position, key in enumerate(keys):
         if deadline.expired:
             raise OwnerLookupUnresolved(
                 "OWNER_LOOKUP_UNREACHABLE",
@@ -398,8 +401,13 @@ def _raw_client_for_bound_owner(
             made += 1
             return client.account_address()
 
+        # ⭐ PER-CREDENTIAL SHARE of the remaining budget (remaining / untried, this
+        # key included): one dripping FIRST key must not starve a later key that
+        # would answer. The share is itself a Deadline, so the step-wide ceiling
+        # (OWNER_LOOKUP_DEADLINE_AT) still binds through min().
+        share = Deadline(deadline.remaining() / (len(keys) - position))
         # ask() + the kind mapping lookup_owner() applies, with the attempt counted.
-        kind, owner = ask(_mint, deadline=deadline)
+        kind, owner = ask(_mint, deadline=share)
         attempts.append(made)
         if kind == "answered":
             kind = "address"
@@ -415,7 +423,8 @@ def _raw_client_for_bound_owner(
             if verdict == "NO_CREDENTIAL_MATCHES_OWNER"
             else "no configured Console credential was proven to be the expected owner "
             + (
-                "(a credential lookup did not answer within its retry budget)"
+                "(a credential lookup did not answer within its retry budget; ownership is "
+                "unproven, not disproven)"
                 if verdict == "OWNER_LOOKUP_UNREACHABLE"
                 else "(every credential lookup failed for a non-transport reason)"
             ),

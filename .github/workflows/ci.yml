@@ -451,7 +451,12 @@ jobs:
           age-key: ${{ secrets.SOPS_AGE_KEY }}
 
       - name: Run E2E lease-shell test
-        run: uv run python -m just_akash.test_shell_e2e
+        run: |
+          # ⛔ ONE lookup budget for the WHOLE STEP (#378): every lookup this e2e
+          # script performs — including cleanup retries — shares this absolute
+          # ceiling (epoch seconds); just-akash honours it as min(own, ceiling).
+          export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
+          uv run python -m just_akash.test_shell_e2e
 
       - name: Preserve unresolved lease-shell deployment receipt
         if: always()
@@ -517,7 +522,12 @@ jobs:
           echo "SSH_PUBKEY=$(cat ~/.ssh/id_ed25519.pub)" >> "$GITHUB_ENV"
 
       - name: Run E2E secrets test
-        run: uv run python -m just_akash.test_secrets_e2e
+        run: |
+          # ⛔ ONE lookup budget for the WHOLE STEP (#378): every lookup this e2e
+          # script performs — including cleanup retries — shares this absolute
+          # ceiling (epoch seconds); just-akash honours it as min(own, ceiling).
+          export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
+          uv run python -m just_akash.test_secrets_e2e
 
       - name: Preserve unresolved deployment receipt
         if: always()

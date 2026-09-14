@@ -369,6 +369,7 @@ from .owner_lookup import (  # noqa: E402, F401 - re-exported under their origin
     unresolved_verdict,
 )
 from .owner_lookup import is_transport_error as _is_transport_error  # noqa: E402, F401
+from .owner_lookup import lookup_owner as _lookup_owner  # noqa: E402, F401 - original name (#366)
 
 
 def _select_owner_credential(dseq: str, owner: str, keys: list[str], credential: object):
@@ -393,7 +394,7 @@ def _select_owner_credential(dseq: str, owner: str, keys: list[str], credential:
     # key material never enters a log line.
     deadline = Deadline()
     attempts: list[int] = []
-    for index in order:
+    for scan_position, index in enumerate(order):
         if deadline.expired:
             _info(
                 f"Cleanup for {dseq}: owner-lookup wall-clock deadline "
@@ -410,7 +411,11 @@ def _select_owner_credential(dseq: str, owner: str, keys: list[str], credential:
             return candidate.account_address()
 
         # ask() + the kind mapping lookup_owner() applies, with the attempt counted.
-        kind, address = ask(_mint, bound=index == bound, deadline=deadline)
+        # ⭐ PER-CREDENTIAL SHARE of the remaining budget (remaining / untried in
+        # scan order, the bound key first): a dripping bound key must not starve a
+        # later credential that would answer.
+        share = Deadline(deadline.remaining() / (len(order) - scan_position))
+        kind, address = ask(_mint, bound=index == bound, deadline=share)
         attempts.append(made)
         if kind == "answered":
             kind = "address"

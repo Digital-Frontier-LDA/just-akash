@@ -22,6 +22,7 @@ MISMATCH → NO_CREDENTIAL_MATCHES_OWNER; else OWNER_LOOKUP_UNREADABLE (no addre
 from __future__ import annotations
 
 import http.client
+import os
 import threading
 import time
 from typing import TYPE_CHECKING, Any
@@ -57,6 +58,21 @@ OWNER_LOOKUP_DEADLINE_SECONDS = 600.0
 # deadline must not consume the job budget the cleanup itself needs.
 OWNER_LOOKUP_JOB_MARGIN_SECONDS = 240.0
 
+# ⛔ THE BUDGET IS PER JOB STEP, NOT PER PROCESS (#378 review). A step that runs
+# resolve-owner and then a retry loop of destroys starts a NEW process per command, and a
+# per-process Deadline let each of them spend the full 600s again — 40+ minutes of lookup
+# inside a 30-minute job. A step therefore exports OWNER_LOOKUP_DEADLINE_AT (epoch seconds,
+# wall clock) once, before its first lookup; every process in the step honours it as an
+# ABSOLUTE ceiling (min with its own budget), so retries share one budget instead of
+# minting new ones.
+OWNER_LOOKUP_DEADLINE_AT_ENV = "OWNER_LOOKUP_DEADLINE_AT"
+
+# The exit code for "the shared lookup budget is exhausted, UNREACHABLE": EX_TEMPFAIL.
+# Distinct from every other failure so a retry loop can tell "retrying is waste — the
+# step's budget is gone" from "the destroy failed, try again". A LATER run (next job,
+# next sweep) gets a fresh budget; this step must not burn more of it.
+OWNER_LOOKUP_UNREACHABLE_EXIT_CODE = 75
+
 
 class Deadline:
     """A monotonic wall-clock budget shared by every credential and every attempt.
@@ -70,9 +86,28 @@ class Deadline:
         if budget is None:
             budget = OWNER_LOOKUP_DEADLINE_SECONDS
         self._expires_at = time.monotonic() + budget
+        env_at = os.environ.get(OWNER_LOOKUP_DEADLINE_AT_ENV)
+        if not env_at:
+            self._wall_expires_at: float | None = None
+        else:
+            try:
+                self._wall_expires_at = float(env_at)
+            except ValueError as exc:
+                # A malformed ceiling silently ignored IS the unbounded step again —
+                # fail loudly at the first lookup instead.
+                raise ValueError(
+                    f"{OWNER_LOOKUP_DEADLINE_AT_ENV} must be epoch seconds, got {env_at!r}"
+                ) from exc
 
     def remaining(self) -> float:
-        return max(0.0, self._expires_at - time.monotonic())
+        # TWO CLOCKS, ON PURPOSE: the process's own budget on time.monotonic (a
+        # backwards clock jump must not re-inflate it), the step-wide ceiling on epoch
+        # time (the exporting shell speaks `date +%s`, and the ceiling must hold across
+        # processes). The binding deadline is the MINIMUM of the two.
+        remaining = self._expires_at - time.monotonic()
+        if self._wall_expires_at is not None:
+            remaining = min(remaining, self._wall_expires_at - time.time())
+        return max(0.0, remaining)
 
     @property
     def expired(self) -> bool:
@@ -154,6 +189,11 @@ def ask(
     """
     attempts = BOUND_OWNER_LOOKUP_ATTEMPTS if bound else OWNER_LOOKUP_ATTEMPTS
     for attempt in range(1, attempts + 1):
+        # ⛔ CHECK BEFORE EVERY ATTEMPT, not only after a failure (#378 review, Y3): a
+        # Console call that STARTS after the deadline is budget the deadline did not
+        # grant — measured at +0.51s and +1.0s past it under the old ordering.
+        if deadline is not None and deadline.expired:
+            return "unknown", None
         try:
             if deadline is None:
                 return "answered", call()
@@ -164,14 +204,18 @@ def ask(
         except Exception as exc:  # noqa: BLE001 - classified below, never read as a mismatch
             if not is_transport_error(exc):
                 return "unreadable", None
-            if deadline is not None and deadline.expired:
-                return "unknown", None
             if attempt < attempts:
-                time.sleep(
+                backoff = (
                     BOUND_OWNER_LOOKUP_BACKOFF_SECONDS * 2 ** (attempt - 1)
                     if bound
                     else OWNER_LOOKUP_BACKOFF_SECONDS * attempt
                 )
+                if deadline is not None:
+                    if deadline.expired:
+                        return "unknown", None
+                    # Never sleep PAST the deadline: the sleep itself is budget too.
+                    backoff = min(backoff, deadline.remaining())
+                time.sleep(backoff)
     return "unknown", None
 
 

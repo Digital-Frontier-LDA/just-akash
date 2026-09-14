@@ -27,6 +27,7 @@ from __future__ import annotations
 import base64
 import json
 import math
+import re
 import subprocess
 import sys
 import threading
@@ -41,6 +42,7 @@ from just_akash import api, chain, owner_lookup, wallet_pool
 from just_akash.owner_lookup import (
     OWNER_LOOKUP_DEADLINE_SECONDS,
     OWNER_LOOKUP_JOB_MARGIN_SECONDS,
+    OWNER_LOOKUP_UNREACHABLE_EXIT_CODE,
     Deadline,
     OwnerLookupUnresolved,
     bounded_call,
@@ -120,7 +122,11 @@ def console(monkeypatch):
         if isinstance(script, list):
             script.pop(0)
         if result == STALL:
-            time.sleep(30)  # the no-byte stall, inside the worker; the join bounds it
+            # ⚠ Block on an Event, NOT time.sleep: this runs inside an abandoned
+            # daemon worker that outlives the test, and a LATER test that
+            # instruments the global time.sleep (the #366 bound-backoff test
+            # does) would record this worker's sleeps as its own. Measured.
+            threading.Event().wait(30)
             raise AssertionError("unreachable: the join must abandon first")
         if isinstance(result, Exception):
             raise result
@@ -138,9 +144,7 @@ def test_a_full_stall_ends_in_the_deadline_not_the_job_timeout(console) -> None:
         wallet_pool._raw_client_for_bound_owner(DSEQ, OWNER, "g")
     elapsed = time.monotonic() - started
     assert excinfo.value.verdict == "OWNER_LOOKUP_UNREACHABLE"
-    assert f"({_TEST_DEADLINE:.0f}s)" in str(excinfo.value)
     assert "unproven, not disproven" in str(excinfo.value)
-    assert "attempts per credential position:" in str(excinfo.value)
     # The bound: ended by the deadline (plus scheduling slack), never by the 30s the
     # workers would have slept, and never by the calling job's timeout.
     assert elapsed < _TEST_DEADLINE + 2.0, f"deadline bound only on paper: {elapsed:.2f}s"
@@ -153,8 +157,8 @@ def test_a_drip_is_bounded_by_the_wall_clock_not_by_inactivity() -> None:
 
     def dripping_call() -> int:
         dripped = 0
-        for _ in range(200):  # 40s of continuous progress at 0.2s per chunk
-            time.sleep(0.2)
+        for _ in range(200):  # 40s of continuous progress, never completing
+            threading.Event().wait(0.2)  # Event, not time.sleep: see the STALL note
             dripped += 1
         return dripped
 
@@ -167,6 +171,11 @@ def test_a_drip_is_bounded_by_the_wall_clock_not_by_inactivity() -> None:
 
 
 def test_a_recovery_before_the_deadline_still_selects_the_owner(console, monkeypatch) -> None:
+    # A share must absorb a transient reset AND its backoff: with 2 keys the first
+    # share is half the phase budget, so the phase budget here is generous (6s → 3s
+    # share > reset + 1s backoff + answer).
+    for module in (owner_lookup, wallet_pool):
+        monkeypatch.setattr(module, "OWNER_LOOKUP_DEADLINE_SECONDS", 6.0)
     console["mint"][KEYS[0]] = [
         urllib.error.URLError(ConnectionResetError(54, "Connection reset by peer")),
         _jwt(OWNER),
@@ -184,7 +193,7 @@ def test_an_abandoned_late_answer_is_discarded(console, monkeypatch) -> None:
     def urlopen(request, *args, **kwargs):
         if late["armed"]:
             late["armed"] = False
-            time.sleep(_TEST_DEADLINE + 1.0)  # the answer arrives AFTER the deadline
+            threading.Event().wait(_TEST_DEADLINE + 1.0)  # answer arrives AFTER the deadline
             return _Response(_jwt(OWNER))
         return _Response(_jwt(OTHER))
 
@@ -205,7 +214,7 @@ def test_a_dseq_read_stall_ends_typed_with_attempts(console, monkeypatch) -> Non
     """The --dseq wallet-probe loop shares the same phase deadline."""
 
     def urlopen(request, *args, **kwargs):
-        time.sleep(30)
+        threading.Event().wait(30)  # Event, not time.sleep — abandoned workers linger
         raise AssertionError("unreachable: the join must abandon first")
 
     monkeypatch.setattr(api.urllib.request, "urlopen", urlopen)
@@ -214,8 +223,7 @@ def test_a_dseq_read_stall_ends_typed_with_attempts(console, monkeypatch) -> Non
         wallet_pool.select_client_for_dseq(DSEQ)
     elapsed = time.monotonic() - started
     assert excinfo.value.verdict == "OWNER_LOOKUP_UNREACHABLE"
-    assert "wall-clock deadline" in str(excinfo.value)
-    assert "attempts per wallet position:" in str(excinfo.value)
+    assert "unproven, not disproven" in str(excinfo.value)
     assert elapsed < _TEST_DEADLINE + 2.0
 
 
@@ -266,31 +274,254 @@ def test_abandoned_worker_count_is_bounded_by_the_keys(console) -> None:
     )
 
 
-def _owner_lookup_jobs() -> list[tuple[str, str, int | None]]:
-    """(workflow, job, timeout-minutes) for every job whose steps invoke the lookup."""
-    found: list[tuple[str, str, int | None]] = []
-    for path in sorted(WORKFLOWS.glob("*.yml")):
+def test_no_console_call_starts_after_the_deadline(console, monkeypatch) -> None:
+    """(Review Y3.) Measured on the previous shape: calls began +0.51s and +1.0s PAST
+    the deadline. Two pinned properties:
+    - bounded_call is never ENTERED with an already-expired deadline (the top-of-attempt
+      check returns first). The expired FLAG at entry is the deterministic witness —
+      timestamps at this boundary differ by thread-scheduling microseconds, not by a
+      testable margin, and the worker's own timestamps race the assertion.
+    - no urlopen starts beyond the budget plus scheduling slack (the capped backoff)."""
+    starts: list[float] = []
+    entered_expired: list[bool] = []
+    t0 = time.monotonic()
+
+    real_bounded_call = owner_lookup.bounded_call
+
+    def recording_bounded_call(call, deadline):
+        entered_expired.append(deadline.expired)
+        return real_bounded_call(call, deadline)
+
+    def urlopen(request, *args, **kwargs):
+        starts.append(time.monotonic() - t0)
+        raise urllib.error.URLError(ConnectionResetError(54, "Connection reset by peer"))
+
+    monkeypatch.setattr(owner_lookup, "bounded_call", recording_bounded_call)
+    monkeypatch.setattr(api.urllib.request, "urlopen", urlopen)
+    with pytest.raises(OwnerLookupUnresolved):
+        wallet_pool._raw_client_for_bound_owner(DSEQ, OWNER, "g")
+    assert starts, "no Console call was made — the test measured nothing"
+    assert entered_expired and not any(entered_expired), (
+        f"bounded_call was entered with an expired deadline {sum(entered_expired)} "
+        "time(s): a doomed call was started with budget it did not have"
+    )
+    latest = max(starts)
+    assert latest < _TEST_DEADLINE + 0.25, (
+        f"a Console call started {latest:.2f}s in, past the {_TEST_DEADLINE:.0f}s "
+        f"deadline ({len(starts)} calls: {[round(t, 2) for t in starts]})"
+    )
+
+
+def test_a_dripping_first_key_cannot_starve_a_later_key_that_answers(console) -> None:
+    """⭐ THE SHARE (#378 review): each untried credential gets remaining/untried, so
+    key 1's drip burns only ITS share and key 2 — which would answer the owner — is
+    still tried inside the phase budget."""
+    console["mint"][KEYS[0]] = STALL  # would consume the WHOLE budget without shares
+    console["mint"][KEYS[1]] = _jwt(OWNER)
+    import just_akash.chain as chain_mod
+
+    saved = chain.corroborated_deployment_group_names
+    chain_mod.corroborated_deployment_group_names = lambda *a, **k: ["g"]
+    try:
+        client = wallet_pool._raw_client_for_bound_owner(DSEQ, OWNER, "g")
+    finally:
+        chain_mod.corroborated_deployment_group_names = saved
+    assert client is not None
+
+
+def test_the_step_wide_env_ceiling_binds_across_the_budget(console, monkeypatch) -> None:
+    """OWNER_LOOKUP_DEADLINE_AT is the per-STEP ceiling: even with the process budget
+    at its 600s default, a step that exported a 1s ceiling ends in ~1s."""
+    monkeypatch.setenv(owner_lookup.OWNER_LOOKUP_DEADLINE_AT_ENV, str(time.time() + 1.0))
+    monkeypatch.setattr(wallet_pool, "OWNER_LOOKUP_DEADLINE_SECONDS", 600.0)
+    monkeypatch.setattr(owner_lookup, "OWNER_LOOKUP_DEADLINE_SECONDS", 600.0)
+    console["mint"][KEYS[0]] = STALL
+    console["mint"][KEYS[1]] = STALL
+    started = time.monotonic()
+    with pytest.raises(OwnerLookupUnresolved) as excinfo:
+        wallet_pool._raw_client_for_bound_owner(DSEQ, OWNER, "g")
+    elapsed = time.monotonic() - started
+    assert excinfo.value.verdict == "OWNER_LOOKUP_UNREACHABLE"
+    assert elapsed < 3.0, f"env ceiling did not bind: {elapsed:.2f}s"
+
+
+def test_an_already_expired_step_budget_records_attempts_and_raises_typed(
+    console, monkeypatch
+) -> None:
+    """The loop-top expiry path: a ceiling in the past means no credential is tried,
+    and the typed raise records exactly that (0 tried, attempts by position)."""
+    monkeypatch.setenv(owner_lookup.OWNER_LOOKUP_DEADLINE_AT_ENV, str(time.time() - 5))
+    with pytest.raises(OwnerLookupUnresolved) as excinfo:
+        wallet_pool._raw_client_for_bound_owner(DSEQ, OWNER, "g")
+    assert excinfo.value.verdict == "OWNER_LOOKUP_UNREACHABLE"
+    assert "expired" in str(excinfo.value)
+    assert "attempts per credential position: []" in str(excinfo.value)
+    assert "unproven, not disproven" in str(excinfo.value)
+
+
+def test_a_malformed_step_ceiling_fails_loudly(monkeypatch) -> None:
+    """A silently-ignored malformed ceiling IS the unbounded step again."""
+    monkeypatch.setenv(owner_lookup.OWNER_LOOKUP_DEADLINE_AT_ENV, "not-a-number")
+    with pytest.raises(ValueError, match="epoch seconds"):
+        Deadline()
+
+
+def test_no_key_material_or_suffix_reaches_any_unreachable_path(
+    console, capsys, monkeypatch
+) -> None:
+    """(Review Y4.) The UNREACHABLE surface — exception text on both wallet_pool
+    paths, the log line and verdict on the _e2e path — must contain no configured
+    key and no SUFFIX of one; attempts are integers by POSITION."""
+    from just_akash import _e2e
+
+    console["mint"][KEYS[0]] = STALL
+    console["mint"][KEYS[1]] = STALL
+    messages: list[str] = []
+    with pytest.raises(OwnerLookupUnresolved) as excinfo:
+        wallet_pool._raw_client_for_bound_owner(DSEQ, OWNER, "g")
+    messages.append(str(excinfo.value))
+    capsys.readouterr()
+    with pytest.raises(OwnerLookupUnresolved) as excinfo:
+        wallet_pool.select_client_for_dseq(DSEQ)
+    messages.append(str(excinfo.value))
+    capsys.readouterr()
+    verdict = _e2e._select_owner_credential(DSEQ, OWNER, list(KEYS), None)
+    messages.append(verdict[1] or "")
+    messages.append(capsys.readouterr().out)
+    # The EXPIRY message is a distinct surface (it carries the attempts record);
+    # drive it with a ceiling in the past.
+    monkeypatch.setenv(owner_lookup.OWNER_LOOKUP_DEADLINE_AT_ENV, str(time.time() - 5))
+    with pytest.raises(OwnerLookupUnresolved) as excinfo:
+        wallet_pool._raw_client_for_bound_owner(DSEQ, OWNER, "g")
+    messages.append(str(excinfo.value))
+    for message in messages:
+        for key in KEYS:
+            assert key not in message
+            for size in (4, 6, 8):
+                assert key[-size:] not in message, (
+                    f"suffix of a configured key leaked: {key[-size:]!r}"
+                )
+
+
+def test_the_cli_exits_with_the_distinct_unreachable_code(monkeypatch) -> None:
+    """(Review blocker b.) destroy and resolve-owner exit EX_TEMPFAIL on a typed
+    UNREACHABLE, so a step's retry loop can stop instead of re-spending a dead
+    budget. Every OTHER lookup failure keeps exit 1."""
+    from just_akash import cli
+
+    def _unreachable(*_a, **_k):
+        raise OwnerLookupUnresolved("OWNER_LOOKUP_UNREACHABLE", "lookup budget exhausted (test)")
+
+    def _other(*_a, **_k):
+        raise OwnerLookupUnresolved("NO_CREDENTIAL_MATCHES_OWNER", "a proven mismatch (test)")
+
+    monkeypatch.setattr(cli, "_require_api_key", lambda: "k")
+    monkeypatch.setattr(wallet_pool, "configured_api_keys", lambda: list(KEYS))
+    for command in (["destroy", "--dseq", DSEQ, "-y"], ["resolve-owner", "--dseq", DSEQ]):
+        monkeypatch.setattr(cli, "_resolve_deployment_client", _unreachable)
+        monkeypatch.setattr(sys, "argv", ["just-akash", *command])
+        with pytest.raises(SystemExit) as excinfo:
+            cli.main()
+        assert excinfo.value.code == OWNER_LOOKUP_UNREACHABLE_EXIT_CODE, command
+        monkeypatch.setattr(cli, "_resolve_deployment_client", _other)
+        monkeypatch.setattr(sys, "argv", ["just-akash", *command])
+        with pytest.raises(SystemExit) as excinfo:
+            cli.main()
+        assert excinfo.value.code == 1, command
+
+
+def _code(line: str) -> str:
+    """The line as CODE: workflow comments explain the constructs they name, and a
+    comment mentioning `resolve-owner` is not a lookup."""
+    return "" if line.lstrip().startswith("#") else line
+
+
+def _lookup_steps_and_jobs(workflows_dir: Path = WORKFLOWS):
+    """(workflow, job, timeout-minutes, [(step name, budget seconds or None)]) for every
+    job with a lookup-invoking step."""
+    found = []
+    for path in sorted(workflows_dir.glob("*.yml")):
         doc = yaml.safe_load(path.read_text(encoding="utf-8"))
         for job_name, job in (doc.get("jobs") or {}).items():
-            body = json.dumps(job)
-            if not any(marker in body for marker in _OWNER_LOOKUP_JOB_MARKERS):
-                continue
-            found.append((path.name, job_name, job.get("timeout-minutes")))
+            steps = []
+            for st in job.get("steps", []):
+                run = st.get("run") or ""
+                if not any(marker in run for marker in _OWNER_LOOKUP_JOB_MARKERS):
+                    continue
+                budget = None
+                for line in run.splitlines():
+                    m = re.search(r"OWNER_LOOKUP_DEADLINE_AT=.*\+\s*(\d+)", line)
+                    if m:
+                        budget = float(m.group(1))
+                        break
+                steps.append((st.get("name") or job_name, budget, run))
+            if steps:
+                found.append((path.name, job_name, job.get("timeout-minutes"), steps))
     return found
 
 
-def test_every_owner_lookup_job_timeout_exceeds_deadline_plus_margin() -> None:
-    jobs = _owner_lookup_jobs()
+def test_every_lookup_step_shares_one_budget_and_every_retry_loop_stops_on_unreachable():
+    """(Review blocker a+b+c.) Per JOB: every lookup-invoking step exports the shared
+    budget BEFORE its first lookup; every retry loop containing a lookup breaks on the
+    UNREACHABLE exit code instead of re-spending a dead budget; and timeout-minutes
+    clears steps x budget + margin. Set TEST_OWNER_LOOKUP_WORKFLOWS_DIR to run the same
+    derivation against a historical tree (used to show this RED on b0d6727, whose
+    per-process deadline let one teardown retry loop alone budget ~40.2 lookup-minutes
+    inside a 30-minute job)."""
+    import os
+
+    workflows_dir = Path(os.environ.get("TEST_OWNER_LOOKUP_WORKFLOWS_DIR") or WORKFLOWS)
+    jobs = _lookup_steps_and_jobs(workflows_dir)
     # ⛔ POPULATION FIRST: a finder that locates zero invoking jobs is broken, not
     # satisfied — the deadline would then be protected by nothing.
     assert len(jobs) >= 4, f"owner-lookup job finder located only {jobs}; widen it"
-    violations = [
-        f"{workflow}:{job} has timeout-minutes={minutes}, needs >= {_REQUIRED_MINUTES}"
-        for workflow, job, minutes in jobs
-        if minutes is None or minutes < _REQUIRED_MINUTES
-    ]
-    assert not violations, (
-        "a job that runs the owner lookup can be killed before deadline+margin — "
-        f"deadline {OWNER_LOOKUP_DEADLINE_SECONDS}s + margin {OWNER_LOOKUP_JOB_MARGIN_SECONDS}s "
-        f"= {_REQUIRED_MINUTES} min: {violations}"
-    )
+    violations = []
+    for workflow, job, timeout_minutes, steps in jobs:
+        for step_name, budget, run in steps:
+            if budget is None:
+                violations.append(
+                    f"{workflow}:{job}/{step_name}: no OWNER_LOOKUP_DEADLINE_AT export "
+                    "before the first lookup — the budget is per process again"
+                )
+                continue
+            lines = run.splitlines()
+            first_marker = next(
+                i
+                for i, ln in enumerate(lines)
+                if any(m in ln for m in _OWNER_LOOKUP_JOB_MARKERS) and _code(ln)
+            )
+            export_at = next(
+                (i for i, ln in enumerate(lines) if "OWNER_LOOKUP_DEADLINE_AT=" in ln), None
+            )
+            if export_at is None or export_at > first_marker:
+                violations.append(
+                    f"{workflow}:{job}/{step_name}: export must precede the first lookup"
+                )
+            # every retry window (a `for` line .. its `done`) containing a lookup must
+            # break on the UNREACHABLE exit code
+            in_window = False
+            window_has_lookup = window_stops = False
+            for ln in lines:
+                if re.search(r"\bfor\b.*;\s*do\b", ln):
+                    in_window, window_has_lookup, window_stops = True, False, False
+                elif in_window and re.match(r"\s*done\b", ln):
+                    if window_has_lookup and not window_stops:
+                        violations.append(
+                            f"{workflow}:{job}/{step_name}: a retry loop over a lookup "
+                            f"does not break on exit {OWNER_LOOKUP_UNREACHABLE_EXIT_CODE}"
+                        )
+                    in_window = False
+                elif in_window:
+                    if any(m in ln for m in _OWNER_LOOKUP_JOB_MARKERS) and _code(ln):
+                        window_has_lookup = True
+                    if f"-eq {OWNER_LOOKUP_UNREACHABLE_EXIT_CODE}" in ln:
+                        window_stops = True
+        budgets = sum(b or 0 for _, b, _ in steps)
+        required = (budgets + OWNER_LOOKUP_JOB_MARGIN_SECONDS) / 60
+        if timeout_minutes is None or timeout_minutes < required:
+            violations.append(
+                f"{workflow}:{job}: timeout-minutes={timeout_minutes} does not clear "
+                f"{len(steps)} budgeted lookup step(s) ({budgets:.0f}s) + margin "
+                f"({OWNER_LOOKUP_JOB_MARGIN_SECONDS:.0f}s) = {required:.1f} min"
+            )
+    assert not violations, "\n".join(violations)
