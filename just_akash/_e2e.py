@@ -422,6 +422,10 @@ def _select_owner_credential(dseq: str, owner: str, keys: list[str], credential:
         if kind == "address" and address == owner:
             return candidate, None
         kinds.add(kind)
+    _info(
+        f"Cleanup for {dseq}: no MATCH — attempts per credential position: {attempts} "
+        f"(kinds: {sorted(kinds)})"
+    )
     return None, unresolved_verdict(kinds)
 
 

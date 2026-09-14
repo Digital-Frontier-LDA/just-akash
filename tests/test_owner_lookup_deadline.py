@@ -7,6 +7,12 @@ the phase gets ONE monotonic deadline: on expiry the caller raises (or returns) 
 OWNER_LOOKUP_UNREACHABLE, recording the attempts each credential made, by POSITION (key
 material never enters a message).
 
+⚠ THE INFORMATIVE ATTEMPTS RECORD LIVES ON THE POST-LOOP UNREACHABLE message and
+the _e2e log line. Under per-credential shares the expiry raise is effectively always
+"tried 0" (a share spends itself before the next key is reached), so a test asserting
+attempts against the expiry text measures nothing — the post-loop surface is where a
+key[-6:] leak or a missing record is actually observable (#378 review, Y4 decision).
+
 The per-request bound is enforced OUTSIDE the socket: a drip server — bytes trickling in,
 never stopping — resets the socket timeout with every chunk and defeats it (measured on
 #369's review: 12.3s against a 0.5s socket timeout). So each attempt runs in a daemon
@@ -45,6 +51,7 @@ from just_akash.owner_lookup import (
     OWNER_LOOKUP_UNREACHABLE_EXIT_CODE,
     Deadline,
     OwnerLookupUnresolved,
+    ask,
     bounded_call,
 )
 
@@ -211,7 +218,10 @@ def test_an_abandoned_late_answer_is_discarded(console, monkeypatch) -> None:
 
 
 def test_a_dseq_read_stall_ends_typed_with_attempts(console, monkeypatch) -> None:
-    """The --dseq wallet-probe loop shares the same phase deadline."""
+    """The --dseq wallet-probe loop shares the phase deadline on BOTH legs: a stall
+    ends in the post-loop UNREACHABLE with the attempts record (the informative
+    surface under shares), and a pre-expired ceiling raises the expiry text with
+    its (empty) record — the loop-top check the Y2b mutation removed."""
 
     def urlopen(request, *args, **kwargs):
         threading.Event().wait(30)  # Event, not time.sleep — abandoned workers linger
@@ -224,7 +234,15 @@ def test_a_dseq_read_stall_ends_typed_with_attempts(console, monkeypatch) -> Non
     elapsed = time.monotonic() - started
     assert excinfo.value.verdict == "OWNER_LOOKUP_UNREACHABLE"
     assert "unproven, not disproven" in str(excinfo.value)
+    assert "attempts per wallet position:" in str(excinfo.value)
     assert elapsed < _TEST_DEADLINE + 2.0
+    # The expiry leg: a ceiling in the past records what the loop actually tried.
+    monkeypatch.setenv(owner_lookup.OWNER_LOOKUP_DEADLINE_AT_ENV, str(time.time() - 5))
+    with pytest.raises(OwnerLookupUnresolved) as expired:
+        wallet_pool.select_client_for_dseq(DSEQ)
+    assert expired.value.verdict == "OWNER_LOOKUP_UNREACHABLE"
+    assert "expired" in str(expired.value)
+    assert "attempts per wallet position: []" in str(expired.value)
 
 
 def test_every_lingering_worker_is_a_daemon_and_cannot_block_exit(console) -> None:
@@ -310,6 +328,24 @@ def test_no_console_call_starts_after_the_deadline(console, monkeypatch) -> None
         f"a Console call started {latest:.2f}s in, past the {_TEST_DEADLINE:.0f}s "
         f"deadline ({len(starts)} calls: {[round(t, 2) for t in starts]})"
     )
+
+
+def test_a_bound_backoff_never_outruns_the_ceiling(monkeypatch) -> None:
+    """(DEV1 Y3c.) A bound credential's exponential backoff (2+4+8+16 = 30s
+    uncapped) must be capped by the remaining budget: with a 2s deadline the phase
+    ends at ~2s, not ~6s past its ceiling. Real sleeps, real clock."""
+
+    def resetting() -> str:
+        raise urllib.error.URLError(ConnectionResetError(54, "reset by peer"))
+
+    # Budget 5.0 makes the cap load-bearing: the SECOND bound backoff (4s) exceeds
+    # the ~3s remaining, so uncapped the phase ends ~6s; capped it ends ~5s.
+    deadline = Deadline(5.0)
+    started = time.monotonic()
+    kind, _ = ask(resetting, bound=True, deadline=deadline)
+    elapsed = time.monotonic() - started
+    assert kind == "unknown"
+    assert elapsed < 5.5, f"the bound backoff overran the ceiling: {elapsed:.1f}s"
 
 
 def test_a_dripping_first_key_cannot_starve_a_later_key_that_answers(console) -> None:

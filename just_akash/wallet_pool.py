@@ -346,7 +346,8 @@ def select_client_for_dseq(
         raise OwnerLookupUnresolved(
             "OWNER_LOOKUP_UNREACHABLE",
             f"deployment {dseq} could not be read: at least one configured Console wallet did "
-            "not answer within its retry budget, so ownership is unproven, not disproven",
+            f"not answer within its retry budget (attempts per wallet position: {attempts}), "
+            "so ownership is unproven, not disproven",
         )
     raise RuntimeError(
         f"deployment {dseq} was not readable under any of {len(keys)} configured Console wallets"
@@ -424,8 +425,8 @@ def _raw_client_for_bound_owner(
             if verdict == "NO_CREDENTIAL_MATCHES_OWNER"
             else "no configured Console credential was proven to be the expected owner "
             + (
-                "(a credential lookup did not answer within its retry budget; ownership is "
-                "unproven, not disproven)"
+                "(a credential lookup did not answer within its retry budget; attempts "
+                f"per credential position: {attempts}; ownership is unproven, not disproven)"
                 if verdict == "OWNER_LOOKUP_UNREACHABLE"
                 else "(every credential lookup failed for a non-transport reason)"
             ),
