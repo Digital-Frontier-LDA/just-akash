@@ -401,45 +401,35 @@ def test_missing_signed_creation_population_is_held(setup, monkeypatch):
     client.close_deployment.assert_not_called()
 
 
-def test_all_group_check_effect_mutation_reopens_the_mixed_population():
-    """Replacing ALL with ANY recreates the reproduced mixed-group false close."""
+def test_all_group_check_effect_mutation_reopens_the_mixed_population(monkeypatch):
+    """Replacing ALL with ANY recreates the reproduced mixed-group false close.
 
-    source = textwrap.dedent(inspect.getsource(cs._all_groups_owned))
-    target = "return bool(group_names) and all("
-    replacement = "return bool(group_names) and any("
-    assert source.count(target) == 1, "all-group mutation target must apply exactly once"
-    mutated = source.replace(target, replacement, 1)
-    assert mutated != source
-    namespace = {"__builtins__": __builtins__}
-    exec(mutated, namespace)  # noqa: S102 -- executable effect mutation
+    The mutant is installed with monkeypatch, not compiled from edited source text:
+    `classify` looks `_all_groups_owned` up in the module at call time, so swapping the
+    helper is enough to observe the effect on the real classifier.
+    """
+
     groups = [PREFIX + "runner-run-99-end", "foreign-prod-release"]
+    detail = {"leases": [{"status": {"services": {"runner": {}}}}]}
+
+    def verdict() -> str:
+        return cs.classify(
+            detail, DSEQ, NOW, reap_runners=True, group_names=groups, placement_prefix=PREFIX
+        )[0]
+
+    # The real helper and the real classifier refuse the mixed population, by behaviour.
     assert not cs._all_groups_owned(groups, PREFIX)
-    assert namespace["_all_groups_owned"](groups, PREFIX), (
-        "mutation applied but did not reopen the mixed-group population"
-    )
-    real_verdict = cs.classify(
-        {"leases": [{"status": {"services": {"runner": {}}}}]},
-        DSEQ,
-        NOW,
-        reap_runners=True,
-        group_names=groups,
-        placement_prefix=PREFIX,
-    )[0]
-    mutant_globals = vars(cs).copy()
-    mutant_globals["_all_groups_owned"] = namespace["_all_groups_owned"]
-    exec(  # noqa: S102 -- executable effect mutation
-        textwrap.dedent(inspect.getsource(cs.classify)), mutant_globals
-    )
-    mutant_verdict = mutant_globals["classify"](
-        {"leases": [{"status": {"services": {"runner": {}}}}]},
-        DSEQ,
-        NOW,
-        reap_runners=True,
-        group_names=groups,
-        placement_prefix=PREFIX,
-    )[0]
-    assert real_verdict == "LEAVE-not-ours"
-    assert mutant_verdict == "STALE-runner", (
+    assert verdict() == "LEAVE-not-ours"
+
+    def any_group_owned(group_names, placement_prefix):
+        return bool(group_names) and any(
+            isinstance(name, str) and bool(name) and name.startswith(placement_prefix)
+            for name in group_names or []
+        )
+
+    monkeypatch.setattr(cs, "_all_groups_owned", any_group_owned)
+    assert cs._all_groups_owned(groups, PREFIX), "mutation did not reopen the mixed population"
+    assert verdict() == "STALE-runner", (
         "mutation applied but did not change the close candidate population"
     )
 
@@ -530,3 +520,49 @@ def test_removing_the_send_boundary_policy_call_reaches_close_transport(setup, m
     )
     assert calls == 1, "mutation must remove exactly the immediate pre-close recheck"
     client.close_deployment.assert_called_once_with(DSEQ)
+
+
+# ── intent must agree with the workload class; a complete multi-group CI population closes ──
+
+
+@pytest.mark.parametrize(
+    ("services", "workload_class"),
+    [(["runner"], "ci-payload"), (["probe"], "ci-runner"), (["backtest"], "ci-runner")],
+    ids=["runner-intent-on-payload", "probe-intent-on-runner", "backtest-intent-on-runner"],
+)
+def test_an_intent_that_disagrees_with_the_workload_class_is_held(
+    setup, capsys, services, workload_class
+):
+    """A stale-runner verdict on a CI payload, or a probe/backtest verdict on a CI runner."""
+
+    client, doc, _ = setup
+    client.get_deployment.return_value = {
+        "leases": [{"status": {"services": {s: {} for s in services}}}]
+    }
+    doc.update(_document([format_identity(_identity(workload_class), REGISTER)]))
+    assert _run() == 2
+    client.close_deployment.assert_not_called()
+    assert "disagrees with cleanup intent" in capsys.readouterr().out
+
+
+def test_a_complete_multi_group_ci_population_is_bound_whole_and_closed(setup, monkeypatch):
+    """Availability, and the population the signed-creation proof is asked about."""
+
+    client, doc, _ = setup
+    names = [
+        format_identity(_identity("ci-payload", 1), REGISTER),
+        format_identity(_identity("ci-payload", 2), REGISTER),
+    ]
+    doc.update(_document(names))
+    asked = []
+
+    def evidence(owner, dseq, population):
+        asked.append(population)
+        return {"owner": owner, "dseq": dseq, "groups": population}
+
+    monkeypatch.setattr(guard.chain, "owner_close_population_evidence", evidence)
+    assert _run() == 0
+    client.close_deployment.assert_called_once_with(DSEQ)
+    expected = [{"gseq": 1, "name": names[0]}, {"gseq": 2, "name": names[1]}]
+    assert len(asked) == 2, "selection and the pre-send recheck each prove the population"
+    assert asked == [expected, expected]
