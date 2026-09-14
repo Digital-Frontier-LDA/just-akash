@@ -17,8 +17,11 @@ from tests.nested_self_pins import (
     ShallowHistory,
     base_branch,
     discover_self_pins,
+    identity_scope,
     identity_target,
     identity_violations,
+    pin_format_violations,
+    pr_touches_pin,
     prepare_history,
     pull_request_base,
     reachability_violations,
@@ -188,3 +191,225 @@ def test_discovery_parses_job_and_step_uses_and_ignores_everything_else():
         SelfPin("a.yml", "call", ".github/workflows/runner-teardown.yml", "a" * 40),
         SelfPin("a.yml", "steps", ".github/workflows/probe.yml", "runner-teardown-v2"),
     ]
+
+
+# ── review repairs (DEV2 on #365) ───────────────────────────────────────────
+
+
+def test_a_missing_base_raises_and_is_never_judged_against_head(history):
+    """MR1: a HEAD fallback in reference_ref would reopen #364. It must raise instead."""
+    root, _base, _pr = history
+
+    with pytest.raises(LookupError, match="no-such-base-364"):
+        reference_ref(root, "no-such-base-364")
+    with pytest.raises(LookupError, match="no-such-base-364"):
+        prepare_history(root, "no-such-base-364", [])
+
+
+def test_an_undecidable_base_fails_under_ci_instead_of_skipping(history, monkeypatch):
+    """MR2: the real guard's preparation must FAIL under CI, never skip."""
+    from tests.test_runner_pool_workflow import _prepared_reference
+
+    root, _base, pr_only = history
+    monkeypatch.setenv("CI", "true")
+    monkeypatch.setenv("GITHUB_BASE_REF", "no-such-base-364")
+
+    try:
+        with pytest.raises(AssertionError, match="cannot decide nested-pin ancestry under CI"):
+            _prepared_reference(root, [_pin(pr_only)])
+    except pytest.skip.Exception:
+        pytest.fail(
+            "the nested-pin guard SKIPPED under CI: the surface it protects went unchecked"
+        )
+
+
+@pytest.mark.parametrize("ref", ["main", "runner-teardown-v9", "a" * 39, "A" * 40])
+def test_every_self_pin_must_be_a_40_hex_sha(ref):
+    violations = pin_format_violations([SelfPin("any-workflow.yml", "job", CALLED, ref)])
+
+    assert len(violations) == 1
+    assert "not a 40-hex commit SHA" in violations[0]
+
+
+def test_a_full_sha_passes_the_format_rule():
+    assert pin_format_violations([SelfPin("w.yml", "j", CALLED, "0" * 40)]) == []
+
+
+def _drifted_base(root: Path) -> str:
+    """main after a squash that edited the called file while the pool still pins the old copy."""
+    _git(root, "checkout", "-q", "main")
+    pool = root / ".github/workflows/runner-pool.yml"
+    pool.write_text(
+        f"jobs:\n  teardown:\n    uses: {SELF_REPO}/{CALLED}@{_git(root, 'rev-parse', 'HEAD')}\n"
+    )
+    _git(root, "add", str(pool))
+    _git(root, "commit", "-q", "-m", "pool pins A")
+    pinned = _git(root, "rev-parse", "HEAD")
+    _commit(root, "teardown: v2\n", "S: teardown edit squashed, pin not yet moved")
+    return pinned
+
+
+def _pool_pin(root: Path) -> SelfPin:
+    import yaml
+
+    doc = yaml.safe_load((root / ".github/workflows/runner-pool.yml").read_text())
+    return discover_self_pins({"runner-pool.yml": doc})[0]
+
+
+def test_an_unrelated_pr_on_a_drifted_base_skips_identity_with_a_note(history, monkeypatch):
+    root, _base, _pr = history
+    _drifted_base(root)
+    _git(root, "checkout", "-q", "-b", "unrelated")
+    (root / "README.md").write_text("docs\n")
+    _git(root, "add", "README.md")
+    _git(root, "commit", "-q", "-m", "unrelated change")
+    monkeypatch.setenv("GITHUB_BASE_REF", "main")
+    reference = reference_ref(root, "main")
+    pin = _pool_pin(root)
+
+    checked, notes = identity_scope(root, [pin], reference)
+
+    assert checked == []
+    assert len(notes) == 1
+    assert "PENDING REPIN" in notes[0]
+    assert identity_violations(root, checked, identity_target(reference)) == []
+    assert reachability_violations(root, [pin], reference) == []  # reachability still applies
+
+
+def test_a_pr_touching_the_called_file_on_a_drifted_base_is_identity_checked(history, monkeypatch):
+    root, _base, _pr = history
+    _drifted_base(root)
+    _git(root, "checkout", "-q", "-b", "edits-teardown")
+    _commit(root, "teardown: v3\n", "another teardown edit")
+    monkeypatch.setenv("GITHUB_BASE_REF", "main")
+    reference = reference_ref(root, "main")
+    pin = _pool_pin(root)
+
+    checked, notes = identity_scope(root, [pin], reference)
+
+    assert checked == [pin]
+    assert notes == []
+    assert len(identity_violations(root, checked, identity_target(reference))) == 1
+
+
+def test_a_pr_moving_the_pin_line_is_identity_checked(history, monkeypatch):
+    root, base, _pr = history
+    _git(root, "checkout", "-q", "main")
+    pool = root / ".github/workflows/runner-pool.yml"
+    pool.write_text(f"jobs:\n  teardown:\n    uses: {SELF_REPO}/{CALLED}@{base}\n")
+    _git(root, "add", str(pool))
+    _git(root, "commit", "-q", "-m", "pool pins A")
+    _git(root, "checkout", "-q", "-b", "moves-pin")
+    moved = _git(root, "rev-parse", "HEAD")
+    pool.write_text(f"jobs:\n  teardown:\n    uses: {SELF_REPO}/{CALLED}@{moved}\n")
+    _git(root, "add", str(pool))
+    _git(root, "commit", "-q", "-m", "move pin")
+    monkeypatch.setenv("GITHUB_BASE_REF", "main")
+
+    checked, _notes = identity_scope(root, [_pool_pin(root)], reference_ref(root, "main"))
+
+    assert checked == [_pool_pin(root)]
+
+
+def test_off_a_pull_request_every_pin_is_identity_checked(history, monkeypatch):
+    root, base, _pr = history
+    monkeypatch.delenv("GITHUB_BASE_REF", raising=False)
+
+    checked, notes = identity_scope(root, [_pin(base)], reference_ref(root, "main"))
+
+    assert checked == [_pin(base)]
+    assert notes == []
+
+
+@pytest.mark.parametrize(
+    "guard",
+    [
+        "test_the_nested_teardown_pin_matches_the_file_it_calls",
+        "test_the_nested_teardown_pin_is_reachable_from_main",
+    ],
+)
+@pytest.mark.parametrize("ref", ["main", "runner-teardown-v9"])
+def test_both_real_guards_refuse_a_non_sha_self_pin_in_any_workflow(
+    guard, ref, history, monkeypatch
+):
+    """The format rule must be WIRED into each guard, not only exist in the helper."""
+    import tests.test_runner_pool_workflow as module
+
+    root, base, _pr = history
+    pins = [SelfPin("some-other-workflow.yml", "call", CALLED, ref)]
+    monkeypatch.setattr(module, "_self_pins_and_root", lambda: (root, pins))
+    monkeypatch.setattr(module, "_prepared_reference", lambda _root, _pins: "refs/heads/main")
+
+    with pytest.raises(AssertionError, match="not a 40-hex commit SHA"):
+        getattr(module, guard)()
+
+
+# ── DEV2 delta review of f0694e3: S1, P2, P3 ────────────────────────────────
+
+
+def test_off_a_pull_request_an_untouched_pin_on_a_drifted_main_is_still_identity_checked(
+    history, monkeypatch
+):
+    """S1. A push to main after a teardown-editing squash: HEAD == main, so the diff against main
+    is EMPTY and the pin is "untouched". Scoping must not apply off a pull request, or a stale
+    post-merge teardown would never go red anywhere."""
+    root, _base, _pr = history
+    _drifted_base(root)  # leaves main checked out, drifted, pin not moved
+    monkeypatch.delenv("GITHUB_BASE_REF", raising=False)
+    reference = reference_ref(root, "main")
+    pin = _pool_pin(root)
+    assert not pr_touches_pin(root, pin, reference), "fixture must not touch the pin"
+
+    checked, notes = identity_scope(root, [pin], reference)
+
+    assert checked == [pin]
+    assert notes == []
+    stale = identity_violations(root, checked, identity_target(reference))
+    assert len(stale) == 1
+    assert "STALE copy" in stale[0]
+
+
+def test_an_undecidable_merge_base_is_identity_checked_not_skipped(history, monkeypatch):
+    """P2. A base with no common history cannot say what the PR touched, so it is checked."""
+    root, base, _pr = history
+    _git(root, "checkout", "-q", "--orphan", "unrelated-base")
+    _git(root, "rm", "-rq", "--cached", ".")
+    (root / "UNRELATED").write_text("x\n")
+    _git(root, "add", "UNRELATED")
+    _git(root, "commit", "-q", "-m", "unrelated root")
+    _git(root, "checkout", "-q", "-f", "pr")
+    monkeypatch.setenv("GITHUB_BASE_REF", "unrelated-base")
+    reference = reference_ref(root, "unrelated-base")
+    unrelated = subprocess.run(
+        ["git", "-C", str(root), "merge-base", reference, "HEAD"], capture_output=True, check=False
+    )
+    assert unrelated.returncode != 0, "fixture must make merge-base undecidable"
+    pin = SelfPin("runner-pool.yml", "teardown", CALLED, base)
+
+    checked, notes = identity_scope(root, [pin], reference)
+
+    assert checked == [pin]
+    assert notes == []
+
+
+def test_a_pin_in_a_workflow_new_to_the_pr_is_identity_checked(history, monkeypatch):
+    """P3. The workflow does not exist on base, so the pin was added by this PR."""
+    root, base, _pr = history
+    _git(root, "checkout", "-q", "main")
+    _git(root, "checkout", "-q", "-b", "adds-workflow")
+    new = root / ".github/workflows/new-caller.yml"
+    new.write_text(f"jobs:\n  call:\n    uses: {SELF_REPO}/{CALLED}@{base}\n")
+    _git(root, "add", str(new))
+    _git(root, "commit", "-q", "-m", "new workflow pinning the teardown")
+    monkeypatch.setenv("GITHUB_BASE_REF", "main")
+    reference = reference_ref(root, "main")
+    pin = SelfPin("new-caller.yml", "call", CALLED, base)
+    changed = _git(root, "diff", "--name-only", "main", "HEAD").split()
+    assert CALLED not in changed, (
+        "fixture must reach the new-workflow leg, not the changed-file leg"
+    )
+
+    checked, notes = identity_scope(root, [pin], reference)
+
+    assert checked == [pin]
+    assert notes == []

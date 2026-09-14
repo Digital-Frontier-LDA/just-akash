@@ -1724,13 +1724,28 @@ def test_the_nested_teardown_pin_matches_the_file_it_calls():
     repin. Forcing the bump into the same PR is impossible under a squash merge — the only commit
     holding the new bytes mid-PR is a branch commit, which the merge destroys (#308, #348).
 
+    ⚠ ON A PULL REQUEST IDENTITY IS SCOPED TO PINS THE PR TOUCHES (the called file or the pin
+    line). Otherwise one teardown-editing merge would turn every open PR red until main's repin
+    lands; those PRs skip identity with a warning naming the pending repin. Main stays red.
+
     ⚠ NOT "lags by exactly one commit": commit distance is not enforceable; identity is.
     """
-    from tests.nested_self_pins import identity_target, identity_violations
+    import warnings
+
+    from tests.nested_self_pins import (
+        identity_scope,
+        identity_target,
+        identity_violations,
+        pin_format_violations,
+    )
 
     root, pins = _self_pins_and_root()
+    assert pin_format_violations(pins) == []
     reference = _prepared_reference(root, pins)
-    assert identity_violations(root, pins, identity_target(reference)) == []
+    checked, notes = identity_scope(root, pins, reference)
+    for note in notes:
+        warnings.warn(note, stacklevel=1)  # surfaces in the CI log's warnings summary
+    assert identity_violations(root, checked, identity_target(reference)) == []
 
 
 def test_the_nested_teardown_pin_is_reachable_from_main():
@@ -1751,9 +1766,10 @@ def test_the_nested_teardown_pin_is_reachable_from_main():
     ⚠ A shallow walk reports a genuine ancestor as orphaned, so history is fetched explicitly and
     proven not shallow before any verdict.
     """
-    from tests.nested_self_pins import reachability_violations
+    from tests.nested_self_pins import pin_format_violations, reachability_violations
 
     root, pins = _self_pins_and_root()
+    assert pin_format_violations(pins) == []
     reference = _prepared_reference(root, pins)
     assert reachability_violations(root, pins, reference) == []
 

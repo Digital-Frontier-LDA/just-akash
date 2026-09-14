@@ -10,9 +10,10 @@ A pin into a PR's own branch looks fine for the whole life of the PR and is orph
 merge: #348 → 16be7deb left `runner-pool.yml` pinning 1ad3913b, and the old guard only went red on
 main afterwards, because it let any ancestor of HEAD through — and a PR-only commit always is one.
 
-    pull_request   every pin must be an ancestor of the BASE branch (no HEAD escape), and the
-                   pinned file must be byte-identical to the BASE's copy: the pool keeps calling
-                   the merged, reviewed file, and a PR cannot silently change what it runs.
+    pull_request   every pin must be an ancestor of the BASE branch (no HEAD escape). Identity
+                   against the BASE's copy applies only when the PR itself changes the called
+                   file or the pin line; an unrelated PR skips it with a note naming main's
+                   pending repin, so one teardown-editing merge does not turn every open PR red.
     anything else  every pin must be an ancestor of main, and the pinned file must be
                    byte-identical to the working copy. When a merged change edits the called
                    file this goes red on main by design and names the one-line repin.
@@ -33,6 +34,8 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+import yaml
 
 SELF_REPO = "Digital-Frontier-LDA/just-akash"
 _SELF_USES = re.compile(
@@ -67,6 +70,16 @@ def discover_self_pins(workflows: dict[str, object]) -> list[SelfPin]:
                 if match:
                     pins.append(SelfPin(name, str(job_name), match["path"], match["ref"]))
     return pins
+
+
+def pin_format_violations(pins: list[SelfPin]) -> list[str]:
+    """Every self-pin names an immutable 40-hex commit: never a branch, never a movable tag."""
+    return [
+        f"{pin.workflow}:{pin.job} pins {pin.path}@{pin.ref}, not a 40-hex commit SHA. A branch "
+        "or tag can move under every caller; pin the exact commit."
+        for pin in pins
+        if not re.fullmatch(r"[0-9a-f]{40}", pin.ref)
+    ]
 
 
 def git(root: Path, *args: str, check: bool = False) -> subprocess.CompletedProcess:
@@ -147,7 +160,8 @@ def identity_violations(root: Path, pins: list[SelfPin], against: str | None) ->
         else:
             violations.append(
                 f"{where} calls {pin.path} as it was at {pin.ref[:12]}, which differs from "
-                f"{against}. On a pull request the pin stays at the base copy; repin after merge."
+                f"{against}. This PR changes {pin.path} or its pin: keep the pin at the base copy "
+                "and repin in a follow-up after merge."
             )
     return violations
 
@@ -172,11 +186,54 @@ def prepare_history(root: Path, branch: str, pins: list[SelfPin]) -> str:
     if _is_shallow(root):
         raise ShallowHistory("still shallow after --unshallow; ancestry is undecidable")
     for pin in pins:
-        if resolve_commit(root, pin.ref) is None:
-            # ⚠ NO --depth HERE: a depth-limited fetch re-shallows the repository just proven full.
-            if re.fullmatch(r"[0-9a-f]{40}", pin.ref):
-                git(root, "fetch", "--quiet", "origin", pin.ref)
-            else:
-                tag = f"refs/tags/{pin.ref}"
-                git(root, "fetch", "--quiet", "origin", f"+{tag}:{tag}")
+        # ⚠ NO --depth HERE: a depth-limited fetch re-shallows the repository just proven full.
+        if resolve_commit(root, pin.ref) is None and re.fullmatch(r"[0-9a-f]{40}", pin.ref):
+            git(root, "fetch", "--quiet", "origin", pin.ref)
     return reference_ref(root, branch)
+
+
+def pr_touches_pin(root: Path, pin: SelfPin, base: str) -> bool:
+    """Whether this PR changes the called file, or adds or moves this pin, relative to `base`."""
+    fork = git(root, "merge-base", base, "HEAD")
+    if fork.returncode != 0:
+        return True  # undecidable: check identity rather than skip it
+    start = fork.stdout.decode().strip()
+    changed = git(root, "diff", "--name-only", start, "HEAD").stdout.decode().split()
+    if pin.path in changed:
+        return True
+    shown = git(root, "show", f"{start}:.github/workflows/{pin.workflow}")
+    if shown.returncode != 0:
+        return True  # the workflow is new in this PR
+    return pin not in discover_self_pins({pin.workflow: yaml.safe_load(shown.stdout)})
+
+
+def identity_scope(root: Path, pins: list[SelfPin], base: str) -> tuple[list[SelfPin], list[str]]:
+    """(pins whose identity is checked, notes for the ones skipped).
+
+    Off a pull request every pin is checked. On one, only pins this PR touches: after a squash
+    merge that edited the called file, main is red until its repin lands, and an unrelated PR
+    must not inherit that red. Reachability is NOT scoped this way; it applies to every PR.
+    """
+    if not pull_request_base():
+        return list(pins), []
+    checked, notes = [], []
+    for pin in pins:
+        if pr_touches_pin(root, pin, base):
+            checked.append(pin)
+            continue
+        pinned = git(root, "show", f"{pin.ref}:{pin.path}")
+        current = git(root, "show", f"{base}:{pin.path}")
+        drift = (
+            pinned.returncode != 0 or current.returncode != 0 or pinned.stdout != current.stdout
+        )
+        notes.append(
+            f"identity not checked for {pin.workflow}:{pin.job}: this PR does not change "
+            f"{pin.path} or its pin."
+            + (
+                f" {base} has a PENDING REPIN: its pin {pin.ref[:12]} differs from its own "
+                f"{pin.path}; merge that repin to turn main green."
+                if drift
+                else ""
+            )
+        )
+    return checked, notes
