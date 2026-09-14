@@ -810,8 +810,11 @@ def test_one_pinned_view_that_abstains_leaves_a_single_view_which_is_not_authori
 
 
 def test_pinned_population_that_disagrees_with_the_unpinned_one_is_not_authority():
-    """Unpinned reads agree on [g1, g2]; both height-pinned views and the signed create say
-    [g1, g3]. The group-1 names match, so only a whole-population comparison refuses."""
+    """Unpinned reads agree on [runner-run-7, sidecar]; both height-pinned views and the signed
+    create say [runner-run-7, other]. Group 1 matches, so only a whole-population comparison
+    refuses. Not an honest-chain state (groups are fixed at creation): this needs the two
+    registered sources to serve inconsistent data, and it is the one fixture that reaches the
+    pinned comparison."""
 
     expected = (("1", GROUP), ("2", "sidecar"))
     pinned = (("1", GROUP), ("2", "other"))
@@ -838,6 +841,48 @@ def test_pinned_population_that_disagrees_with_the_unpinned_one_is_not_authority
     )
     unpinned = [c for c in calls if "/deployments/info" in c[1] and c[2] is None]
     assert len(unpinned) == 2, "the unpinned containment read must have agreed first"
+
+
+def test_a_caller_expectation_the_registry_does_not_hold_is_refused_before_any_pinned_read():
+    """The reachable mismatch: the caller expects [runner-run-7, sidecar] (from its own
+    rest_urls read), while every registered source and the signed create say
+    [runner-run-7, other]. The unpinned containment check refuses it, so no height-pinned
+    deployment read is ever made."""
+
+    expected = (("1", GROUP), ("2", "sidecar"))
+    registry = (("1", GROUP), ("2", "other"))
+    reader, calls = _reader(current_groups=registry, create_groups=(GROUP, "other"))
+    assert (
+        chain._owner_close_evidence(
+            OWNER,
+            DSEQ,
+            GROUP,
+            sources=SOURCES,
+            reader=reader,
+            now=NOW,
+            expected_population=expected,
+        )
+        is None
+    )
+    unpinned = [c for c in calls if "/deployments/info" in c[1] and c[2] is None]
+    pinned = [c for c in calls if "/deployments/info" in c[1] and c[2] is not None]
+    # The verdict alone cannot tell which check refused: with containment removed, the pinned
+    # comparison refuses this honest state too. What containment adds is refusing it first.
+    assert pinned == [], "containment must refuse before any height-pinned read"
+    assert len(unpinned) == 2, "both registered sources must have been asked"
+
+
+def test_singleton_evidence_refuses_a_pinned_lcd_without_reading(monkeypatch):
+    """The singleton path used by bound-owner client selection and destroy has the same rail."""
+
+    calls = []
+    monkeypatch.setattr(chain, "_owner_close_evidence", lambda *a, **k: calls.append(a) or {})
+    monkeypatch.setenv("AKASH_REST_URL", "https://pinned-lcd.example")
+    assert chain.owner_close_evidence(OWNER, DSEQ, GROUP) is None
+    assert calls == []
+    monkeypatch.delenv("AKASH_REST_URL")
+    assert chain.owner_close_evidence(OWNER, DSEQ, GROUP) == {}
+    assert len(calls) == 1, "control: without the pin the same call reaches the evidence path"
 
 
 def test_population_evidence_refuses_a_pinned_lcd_without_reading(monkeypatch):
