@@ -732,19 +732,72 @@ def invocation_spellings(root: Path, lifecycle_paths: set[str]) -> set[str]:
 # ── content keys ───────────────────────────────────────────────────────────────────────
 
 
-def _normalise(line: str, python: bool) -> str:
-    """The offending line without layout: whitespace collapsed, and Python comments dropped."""
+_LAYOUT_TOKENS = {
+    tokenize.COMMENT,
+    tokenize.NL,
+    tokenize.NEWLINE,
+    tokenize.INDENT,
+    tokenize.DEDENT,
+    tokenize.ENDMARKER,
+}
+
+
+def _source_tokens(source: str) -> str | None:
+    """Python source as its token strings joined by single spaces, or None if it won't tokenise.
+
+    ⛔ NOT `ast.unparse`. Its output is the interpreter's choice, not the file's: Python 3.10
+    prints `(receipt, receipt_dseq) = (None, None)` where 3.13 prints the same source without
+    the parentheses, so one unchanged tree had a different key per Python version. Tokens of
+    identical source are the same on every version, with one exception handled here: from 3.12
+    an f-string (and from 3.14 a t-string) is split into START / MIDDLE / END tokens. The
+    outermost such string is re-joined from its SOURCE span, which is exactly the single
+    STRING token an older tokenizer emits.
+    """
+    text = textwrap.dedent(source)
+    if not text.endswith("\n"):
+        text += "\n"
+    lines = text.splitlines(keepends=True)
+
+    def span(start: tuple[int, int], end: tuple[int, int]) -> str:
+        (row, col), (end_row, end_col) = start, end
+        if row == end_row:
+            return lines[row - 1][col:end_col]
+        return (
+            lines[row - 1][col:] + "".join(lines[row : end_row - 1]) + lines[end_row - 1][:end_col]
+        )
+
+    out: list[str] = []
+    depth, opened = 0, (0, 0)
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(text).readline):
+            name = tokenize.tok_name.get(token.type, "")
+            if name.endswith("STRING_START"):
+                if depth == 0:
+                    opened = token.start
+                depth += 1
+                continue
+            if depth:
+                if name.endswith("STRING_END"):
+                    depth -= 1
+                    if depth == 0:
+                        out.append(span(opened, token.end))
+                continue
+            if token.type not in _LAYOUT_TOKENS and token.string:
+                out.append(token.string)
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return None
+    return " ".join(out)
+
+
+def _normalise(source: str, python: bool) -> str:
+    """The offending text without layout. Python: tokens, comments dropped. Otherwise: whitespace
+    collapsed. Python that does not tokenise on its own (one line of a longer statement) falls
+    back to the whitespace form."""
     if python:
-        try:
-            tokens = [
-                token.string
-                for token in tokenize.generate_tokens(io.StringIO(line.strip() + "\n").readline)
-                if token.type not in (tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE)
-            ]
-            return " ".join(t for t in tokens if t)
-        except (tokenize.TokenError, IndentationError, SyntaxError):
-            pass  # a line that does not tokenise alone is kept as text
-    return " ".join(line.split())
+        tokens = _source_tokens(source)
+        if tokens is not None:
+            return tokens
+    return " ".join(source.split())
 
 
 def _python_scopes(text: str) -> list[tuple[int, int, str]]:
@@ -802,7 +855,8 @@ def keyed(hits: list[Hit], text: str, rel: str) -> list[Hit]:
     """The same hits, each given the scope and normalised text its baseline key is built from.
 
     For a Python R1 hit the offending "line" is the whole handler, `except …:` plus its body,
-    unparsed (so comments and layout drop out). Keying on the `except Exception:` line alone
+    as source lines through the tokenizer (so comments and layout drop out). Keying on the
+    `except Exception:` line alone
     would make every such handler in one function the same entry, and an edit to what one of
     them swallows would change no key.
     """
@@ -825,7 +879,8 @@ def keyed(hits: list[Hit], text: str, rel: str) -> list[Hit]:
         line = int(hit.where.rsplit(":", 1)[1])
         handler = handlers.get(line) if hit.rule == "R1" else None
         if handler is not None:
-            normalised = " ".join(ast.unparse(handler).split())
+            source = "\n".join(lines[handler.lineno - 1 : handler.end_lineno or handler.lineno])
+            normalised = _normalise(source, python=True)
         else:
             offending = lines[line - 1] if 0 < line <= len(lines) else ""
             normalised = _normalise(offending, python)
@@ -882,386 +937,386 @@ def unexplained(hits: list[Hit], baseline: Mapping[tuple[str, str, str, str], tu
 # not a way to make this test pass.
 BASELINE: dict[tuple[str, str, str, str], tuple[int, str]] = {
     # R1 — broad except that swallows
-    # except Exception: return (UNKNOWN, lived)
+    # except Exception : return UNKNOWN , None
     (
         "R1",
         "canary/closure.py",
         "attribute_detailed",
-        "4d49026ddf73",  # pragma: allowlist secret
-    ): (
-        1,
-        "an unexpected shape is attributed UNKNOWN, never a false blame",
-    ),
-    # except Exception: return (UNKNOWN, None)
-    (
-        "R1",
-        "canary/closure.py",
-        "attribute_detailed",
-        "54c0f40f79d8",  # pragma: allowlist secret
+        "67f2f8574a93",  # pragma: allowlist secret
     ): (
         1,
         "an unreadable chain is attributed UNKNOWN, never a cause",
     ),
-    # except Exception: block = None
+    # except Exception : block = None
     (
         "R1",
         "canary/closure.py",
         "attribute_detailed",
-        "e22e90f0a54b",  # pragma: allowlist secret
+        "7682e694d3f2",  # pragma: allowlist secret
     ): (
         1,
         "a missing settlement block falls back to the escrow-only verdict",
     ),
-    # except Exception: result = UNKNOWN
-    ("R1", "canary/collect.py", "merge", "bb8daa36833e"): (  # pragma: allowlist secret
+    # except Exception : return UNKNOWN , lived
+    (
+        "R1",
+        "canary/closure.py",
+        "attribute_detailed",
+        "c3115c20852b",  # pragma: allowlist secret
+    ): (
+        1,
+        "an unexpected shape is attributed UNKNOWN, never a false blame",
+    ),
+    # except Exception : result = UNKNOWN
+    ("R1", "canary/collect.py", "merge", "8d231d3d7186"): (  # pragma: allowlist secret
         1,
         "a broken attributor records cause UNKNOWN for that lease",
     ),
-    # except Exception: pass
-    ("R1", "just_akash/_diagnostics.py", "emit", "a2ad58d9f50d"): (  # pragma: allowlist secret
+    # except Exception : pass
+    ("R1", "just_akash/_diagnostics.py", "emit", "0a41f9034f28"): (  # pragma: allowlist secret
         1,
         "the diagnostics emitter itself; writing to stderr is what failed",
     ),
-    # except Exception: pass
+    # except Exception : pass
     (
         "R1",
         "just_akash/_e2e.py",
         "_confirm_settled_single_reader",
-        "a2ad58d9f50d",  # pragma: allowlist secret
+        "0a41f9034f28",  # pragma: allowlist secret
     ): (
         1,
         "a failed probe leaves got_open False, so the audit returns None and fails closed",
     ),
-    # except Exception: snapshot = None
+    # except Exception : snapshot = None
     (
         "R1",
         "just_akash/_lease_verification.py",
         "consensus",
-        "f9a071386b9c",  # pragma: allowlist secret
+        "95de5107dd00",  # pragma: allowlist secret
     ): (
         1,
         "an endpoint that errors abstains; consensus refuses without two agreeing snapshots",
     ),
-    # except Exception: return False
+    # except Exception : return False
     (
         "R1",
         "just_akash/_lease_verification.py",
         "deployment_closed",
-        "7bea3bdfca89",  # pragma: allowlist secret
+        "4a7dfa6a9521",  # pragma: allowlist secret
     ): (
         1,
         "an unreadable deployment reads as not closed (False), the safe direction",
     ),
-    # except Exception: _FEATURE_CAP_MS = {}
+    # except Exception : _FEATURE_CAP_MS = { }
     (
         "R1",
         "just_akash/analyze_telemetry.py",
         "<file>",
-        "d911204aafec",  # pragma: allowlist secret
+        "58dd0e85ab95",  # pragma: allowlist secret
     ): (
         1,
         "module-import fallback for standalone telemetry analysis; no lease verdict",
     ),
-    # except Exception: continue
+    # except Exception : continue
     (
         "R1",
         "just_akash/chain.py",
         "_corroborated_deployment_group_names",
-        "af10980773d7",  # pragma: allowlist secret
+        "ee5053bf339b",  # pragma: allowlist secret
     ): (
         1,
         "a failed source contributes no authority to the corroborated group names",
     ),
-    # except Exception: return None
+    # except Exception : return None
     (
         "R1",
         "just_akash/chain.py",
         "_owner_close_evidence.fetch",
-        "eaf9362805e8",  # pragma: allowlist secret
+        "011145e9570c",  # pragma: allowlist secret
     ): (
         1,
         "a transport failure abstains from the height-pinned read",
     ),
-    # except Exception: return None
+    # except Exception : return None
     (
         "R1",
         "just_akash/chain.py",
         "_read_source_document",
-        "eaf9362805e8",  # pragma: allowlist secret
+        "011145e9570c",  # pragma: allowlist secret
     ): (
         1,
         "an unavailable trust path contributes no vote",
     ),
-    # except Exception: unresolved.append(position) continue
+    # except Exception : unresolved . append ( position ) continue
     (
         "R1",
         "just_akash/cleanup_stale.py",
         "_resolve_distinct_accounts",
-        "242e4308cd07",  # pragma: allowlist secret
+        "4b40f99e254e",  # pragma: allowlist secret
     ): (
         1,
         "an unidentifiable key is appended to `unresolved` and reported",
     ),
-    # except Exception: address = ''
+    # except Exception : address = ""
     (
         "R1",
         "just_akash/cli.py",
         "_warn_if_listing_degraded",
-        "e2953895fa08",  # pragma: allowlist secret
+        "0f8d9d2605b2",  # pragma: allowlist secret
     ): (
         1,
         "no address means no corroboration; corroborate_listing classifies the unreadable source",
     ),
-    # except Exception: owner = ''
+    # except Exception : names = [ ]
     (
         "R1",
         "just_akash/deploy.py",
         "_report_suspected_orphans",
-        "548e8c096c38",  # pragma: allowlist secret
-    ): (
-        1,
-        "orphan diagnosis on an already-failing create; owner degrades to empty",
-    ),
-    # except Exception: names = []
-    (
-        "R1",
-        "just_akash/deploy.py",
-        "_report_suspected_orphans",
-        "ee5c87462490",  # pragma: allowlist secret
+        "18ed7041decf",  # pragma: allowlist secret
     ): (
         1,
         "orphan diagnosis weakens its claim; the create failure is still raised",
     ),
-    # except Exception: return None
+    # except Exception : owner = ""
+    (
+        "R1",
+        "just_akash/deploy.py",
+        "_report_suspected_orphans",
+        "f2a2de1bcdc2",  # pragma: allowlist secret
+    ): (
+        1,
+        "orphan diagnosis on an already-failing create; owner degrades to empty",
+    ),
+    # except Exception : return None
     (
         "R1",
         "just_akash/orphan_detect.py",
         "active_leases_for",
-        "eaf9362805e8",  # pragma: allowlist secret
+        "011145e9570c",  # pragma: allowlist secret
     ): (
         1,
         "a read failure returns None (UNKNOWN), never 'no leases'",
     ),
-    # except Exception: return None
+    # except Exception : return None
     (
         "R1",
         "just_akash/orphan_detect.py",
         "live_orders_for",
-        "eaf9362805e8",  # pragma: allowlist secret
+        "011145e9570c",  # pragma: allowlist secret
     ): (
         1,
         "a read failure returns None (UNKNOWN), never 'no orders'",
     ),
-    # except Exception: return None
+    # except Exception : return None
     (
         "R1",
         "just_akash/runner_probe.py",
         "_pod_started",
-        "eaf9362805e8",  # pragma: allowlist secret
+        "011145e9570c",  # pragma: allowlist secret
     ): (
         1,
         "a read error returns None (unknown), never 'no pod'",
     ),
-    # except Exception: runs = []
+    # except Exception : runs = [ ]
     (
         "R1",
         "just_akash/runner_probe.py",
         "_run_noop_job",
-        "4851c1bbcf1b",  # pragma: allowlist secret
+        "c365f9240449",  # pragma: allowlist secret
     ): (
         1,
         "an unparseable run listing keeps the probe waiting until its deadline",
     ),
-    # except Exception: return False
+    # except Exception : return False
     (
         "R1",
         "just_akash/smoke_providers.py",
         "_availability_ready",
-        "7bea3bdfca89",  # pragma: allowlist secret
+        "4a7dfa6a9521",  # pragma: allowlist secret
     ): (
         1,
         "readiness unreadable counts as not ready, the safe direction",
     ),
-    # except Exception: return None
+    # except Exception : return None
     (
         "R1",
         "just_akash/smoke_providers.py",
         "_dead_state",
-        "eaf9362805e8",  # pragma: allowlist secret
+        "011145e9570c",  # pragma: allowlist secret
     ): (
         1,
         "state unreadable returns None; a transient read error is not treated as dead",
     ),
-    # except Exception: continue
+    # except Exception : continue
     (
         "R1",
         "just_akash/smoke_providers.py",
         "_delete_resolved_provider_smoke_receipts",
-        "af10980773d7",  # pragma: allowlist secret
+        "ee5053bf339b",  # pragma: allowlist secret
     ): (1, "an unreadable receipt is kept on disk for the upload step"),
-    # except Exception: receipt, receipt_dseq = (None, None)
+    # except Exception : receipt , receipt_dseq = None , None
     (
         "R1",
         "just_akash/smoke_providers.py",
         "_deploy",
-        "255c018c294b",  # pragma: allowlist secret
+        "048c23769e34",  # pragma: allowlist secret
     ): (
         1,
         "DEFECT (#376): a failed receipt read or reconciliation is swallowed unlogged",
     ),
-    # except Exception: pass
+    # except Exception : pass
     (
         "R1",
         "just_akash/smoke_providers.py",
         "_deploy",
-        "a2ad58d9f50d",  # pragma: allowlist secret
+        "0a41f9034f28",  # pragma: allowlist secret
     ): (
         1,
         "DEFECT (#376): interrupt-path cleanup errors are swallowed unlogged",
     ),
-    # except Exception: return False
+    # except Exception : return False
     (
         "R1",
         "just_akash/smoke_providers.py",
         "_exec_works",
-        "7bea3bdfca89",  # pragma: allowlist secret
+        "4a7dfa6a9521",  # pragma: allowlist secret
     ): (
         1,
         "exec probe failure reports 'unreachable' in the diagnostic",
     ),
-    # except Exception: pass
+    # except Exception : pass
     (
         "R1",
         "just_akash/smoke_providers.py",
         "_explain_deploy_failed",
-        "a2ad58d9f50d",  # pragma: allowlist secret
+        "0a41f9034f28",  # pragma: allowlist secret
     ): (
         1,
         "best-effort evidence printing on an already-failed deploy",
     ),
-    # except Exception: return None
+    # except Exception : return None
     (
         "R1",
         "just_akash/smoke_providers.py",
         "_ingress_uri",
-        "eaf9362805e8",  # pragma: allowlist secret
+        "011145e9570c",  # pragma: allowlist secret
     ): (
         1,
         "no ingress URI yet returns None, which keeps waiting",
     ),
-    # except Exception: pass
+    # except Exception : pass
     (
         "R1",
         "just_akash/smoke_providers.py",
         "_observe_after_cap",
-        "a2ad58d9f50d",  # pragma: allowlist secret
+        "0a41f9034f28",  # pragma: allowlist secret
     ): (
         1,
         "post-cap diagnostic probe; the timeout verdict is already recorded",
     ),
-    # except Exception: return 'unknown'
+    # except Exception : return "unknown"
     (
         "R1",
         "just_akash/smoke_providers.py",
         "_pkg_version",
-        "c96db9388dd9",  # pragma: allowlist secret
+        "110b3c6eb086",  # pragma: allowlist secret
     ): (
         1,
         "telemetry version label degrades to 'unknown'",
     ),
-    # except Exception: return 'unreachable'
+    # except Exception : return "unreachable"
     (
         "R1",
         "just_akash/smoke_providers.py",
         "_probe_in_pod_marker",
-        "fcca9498f9d9",  # pragma: allowlist secret
+        "fccefb7584f1",  # pragma: allowlist secret
     ): (
         1,
         "in-pod marker probe reports 'unreachable' as its own diagnostic value",
     ),
-    # except Exception: avail = None
+    # except Exception : avail = None
     (
         "R1",
         "just_akash/smoke_providers.py",
         "_record_ingress_timeout",
-        "b465c434c100",  # pragma: allowlist secret
+        "f17c98407913",  # pragma: allowlist secret
     ): (
         1,
         "diagnostic evidence for an ingress timeout; the verdict never changes",
     ),
-    # except Exception: info = {}
+    # except Exception : info = { }
     (
         "R1",
         "just_akash/smoke_providers.py",
         "_record_no_bid_evidence",
-        "3e1b56a528ff",  # pragma: allowlist secret
+        "8ad71bafd053",  # pragma: allowlist secret
     ): (
         1,
         "best-effort no-bid evidence; provider info degrades to empty",
     ),
-    # except Exception: dead = False
+    # except Exception : dead = False
     (
         "R1",
         "just_akash/smoke_providers.py",
         "_record_ready_timeout",
-        "45caeacc1ef1",  # pragma: allowlist secret
+        "1ad887b53ca0",  # pragma: allowlist secret
     ): (
         1,
         "diagnostic evidence for a ready timeout; the verdict never changes",
     ),
-    # except Exception: avail = None
+    # except Exception : avail = None
     (
         "R1",
         "just_akash/smoke_providers.py",
         "_record_ready_timeout",
-        "b465c434c100",  # pragma: allowlist secret
+        "f17c98407913",  # pragma: allowlist secret
     ): (
         1,
         "diagnostic evidence for a ready timeout; the verdict never changes",
     ),
-    # except Exception: avail = None
+    # except Exception : avail = None
     (
         "R1",
         "just_akash/smoke_providers.py",
         "_record_update_timeout",
-        "b465c434c100",  # pragma: allowlist secret
+        "f17c98407913",  # pragma: allowlist secret
     ): (
         1,
         "diagnostic evidence for an update timeout; the timeout verdict stands",
     ),
-    # except Exception: return None
+    # except Exception : return None
     (
         "R1",
         "just_akash/smoke_providers.py",
         "_service_availability",
-        "eaf9362805e8",  # pragma: allowlist secret
+        "011145e9570c",  # pragma: allowlist secret
     ): (
         1,
         "availability unreadable returns None, which keeps waiting",
     ),
-    # except Exception: return False
+    # except Exception : return False
     (
         "R1",
         "just_akash/transport/lease_shell.py",
         "LeaseShellTransport._send_resize",
-        "7bea3bdfca89",  # pragma: allowlist secret
+        "4a7dfa6a9521",  # pragma: allowlist secret
     ): (1, "terminal resize is best-effort and returns False; not a lease verdict"),
-    # except Exception: continue
+    # except Exception : continue
     (
         "R1",
         "just_akash/wallet_pool.py",
         "_chain_height",
-        "af10980773d7",  # pragma: allowlist secret
+        "ee5053bf339b",  # pragma: allowlist secret
     ): (
         1,
         "LCD failover; every endpoint failing raises RuntimeError",
     ),
-    # except Exception: return None
+    # except Exception : return None
     (
         "R1",
         "just_akash/wallet_pool.py",
         "_credit_at",
-        "eaf9362805e8",  # pragma: allowlist secret
+        "011145e9570c",  # pragma: allowlist secret
     ): (
         1,
         "an unprovable endpoint abstains; _quorum_uact requires two agreeing readings",
@@ -1916,3 +1971,60 @@ def test_changing_what_a_handler_swallows_is_a_new_hit_and_a_stale_entry(tmp_pat
     new, stale = unexplained(after, baseline)
     assert [h.rule for h in new] == ["R1"], new
     assert len(stale) == 1 and stale[0][0][0] == "R1", stale
+
+
+# ── golden keys: the same source hashes the same on every interpreter ────────────────────
+
+_GOLDEN_MODULE = """\
+import functools
+
+
+def deploy(path, operation_id):
+    try:
+        receipt, receipt_dseq = receipt_identity(path, operation_id)
+    except Exception:
+        receipt, receipt_dseq = None, None  # a tuple target: 3.10 unparse adds parentheses
+    return receipt
+
+
+def settle(dseq):
+    try:
+        confirm(dseq)
+    except Exception:
+        retry_later(
+            dseq,
+            attempts=3,  # a multi-line call as the swallowing body
+        )
+
+
+@functools.lru_cache(maxsize=None)
+def cached(dseq):
+    try:
+        return lookup(dseq)
+    except Exception:
+        return None
+
+
+def labelled(dseq):
+    try:
+        return lookup(dseq)
+    except Exception:
+        return f"unknown {dseq!r} {'nested'}"
+"""
+
+# Measured identical on CPython 3.10.9, 3.12.12 and 3.13.9. `labelled` is the f-string case
+# 3.12's tokenizer splits. A changed value here means the key a
+# baseline entry was written against has moved: the normaliser changed, or an interpreter
+# tokenizes the same source differently. Either way every baseline entry is suspect.
+_GOLDEN_KEYS = {
+    "deploy": "048c23769e34",  # pragma: allowlist secret
+    "settle": "7af833a8a215",  # pragma: allowlist secret
+    "cached": "011145e9570c",  # pragma: allowlist secret
+    "labelled": "93a02c384a19",  # pragma: allowlist secret
+}
+
+
+def test_r1_keys_are_pinned_to_source_tokens_not_to_an_interpreter() -> None:
+    hits = keyed(python_swallows(_GOLDEN_MODULE, "golden.py"), _GOLDEN_MODULE, "golden.py")
+    assert len(hits) == len(_GOLDEN_KEYS), hits
+    assert {h.scope: h.key[3] for h in hits} == _GOLDEN_KEYS, [(h.scope, h.text) for h in hits]
