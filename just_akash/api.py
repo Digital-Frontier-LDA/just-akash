@@ -23,6 +23,15 @@ from typing import Any
 
 logger = logging.getLogger("akash.api")
 
+# ⛔ THE ONE SOCKET TIMEOUT FOR EVERY CONSOLE HTTP CALL (#368). Without it, a socket
+# that connects and then never sends a byte raised nothing at all — a lookup or close
+# could hang until the GitHub job timeout, and no retry budget bounds that in wall time.
+# 180s rather than something tight because the origin is MEASURED to answer slowly and
+# still usefully: a committed-then-500 arrived 103s into the request, Cloudflare's own
+# 524 at 125s (deploy.py `_report_suspected_orphans` records the shape). Cutting inside
+# that envelope would turn answers we currently get — and can classify — into unknowns.
+CONSOLE_HTTP_TIMEOUT = 180.0
+
 
 def _ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -207,7 +216,7 @@ class AkashConsoleAPI:
 
         try:
             t0 = datetime.now(timezone.utc)
-            with urllib.request.urlopen(req) as response:  # noqa: S310
+            with urllib.request.urlopen(req, timeout=CONSOLE_HTTP_TIMEOUT) as response:  # noqa: S310
                 response_data = response.read().decode("utf-8")
                 elapsed_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
                 if response_data:
@@ -275,6 +284,16 @@ class AkashConsoleAPI:
                 retry_after=retry_after,
                 error_name=error_name,
             ) from e
+        except TimeoutError as e:
+            # ⛔ TRANSPORT, UNKNOWN OUTCOME (#368). The endpoint connected and then
+            # went silent past CONSOLE_HTTP_TIMEOUT: whether the request was applied
+            # is as unknown as with a dropped connection, and raising AkashAPIError
+            # here would claim an HTTP verdict the server never sent. Re-raised AS
+            # TimeoutError so callers classify it with the connection-class failures
+            # — never a hang, never a verdict.
+            elapsed_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
+            logger.error(f"[{_ts()}] API {method} {endpoint} -> TIMEOUT after {elapsed_ms}ms: {e}")
+            raise
         except urllib.error.URLError as e:
             logger.error(f"[{_ts()}] API {method} {endpoint} -> URLError: {e}")
             raise RuntimeError(f"Connection error: {e}") from e
