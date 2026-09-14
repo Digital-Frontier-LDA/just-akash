@@ -6,7 +6,8 @@ does so well: it materialises the object, DEEPENS `main` first — a depth-1 `ma
 answer NO for a genuine ancestor, a false ORPHAN report — and fails under CI rather than skipping.
 ⇒ That guard stays authoritative for the internal pin. This file does not touch it.
 
-⛔ BUT IT READS ONE HARD-CODED PIN, and this repository has three::
+⛔ BUT IT CAN ONLY SEE PINS INTO THIS REPOSITORY (it discovers every nested self-pin by parsing
+the workflows, just-akash#364), and this repository has three pins in total::
 
     runner-pool.yml:1430        just-akash/runner-teardown.yml@…          guarded there
     reap-stale-runners.yml      akash-github-runner/…-reaper.yml@…        guarded HERE

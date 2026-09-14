@@ -1676,77 +1676,102 @@ def test_the_real_reference_is_accepted():
     assert re.fullmatch(REUSABLE_WORKFLOW_REF, str(DOC["jobs"]["teardown"]["uses"]))
 
 
-def test_the_nested_teardown_pin_matches_the_file_it_calls():
-    """The pinned teardown must be byte-identical to the working copy.
+def _self_pins_and_root():
+    """Every nested self-pin, discovered by parsing every workflow (just-akash#364).
 
-    Referencing by pin means the pool calls the teardown as it was at that SHA. Harmless
-    while they agree, and silent drift the moment they do not — which is the failure a pin
-    is supposed to prevent. Asserting identity forces the bump into the SAME change that
-    edits the teardown.
-
-    ⚠ NOT "lags by exactly one commit" — an earlier version of this docstring claimed that
-    and the repo cannot guarantee it: multi-commit PRs and squash merges both break the
-    distance. What is enforced is IDENTITY, which is the property that matters; commit
-    distance is not.
-
-    ⛔ AND THIS GUARD MUST NOT SKIP IN CI. `actions/checkout` fetches shallow, so the
-    pinned commit is usually absent and `git show` fails — turning the whole check into a
-    silent skip on the one surface it exists to protect. That is the "a check that cannot
-    fail" class this repo keeps finding. So: fetch the object on demand, and if it still
-    cannot be read, FAIL under CI and skip only on a developer machine.
+    ⚠ runner-pool.yml comes from DOC, not disk: the anti-vacuity harness re-runs this module
+    against a mutated copy through RUNNER_POOL_WF, and the guard must see that copy.
     """
-    import os
-    import subprocess
+    from tests.nested_self_pins import discover_self_pins
 
-    uses = str(DOC["jobs"]["teardown"]["uses"])
-    pin = uses.rsplit("@", 1)[-1]
-    assert re.fullmatch(r"[0-9a-f]{40}", pin), f"teardown pinned to {pin!r}, not a 40-hex SHA"
-
-    # ⚠ From __file__, never from WF_PATH: the mutation harness overrides RUNNER_POOL_WF to
-    # a temp copy, and deriving the repo root from it would point git at /tmp.
+    # ⚠ From __file__, never from WF_PATH: the mutation harness points WF_PATH at /tmp.
     root = pathlib.Path(__file__).resolve().parents[1]
+    workflows = {
+        path.name: yaml.safe_load(path.read_text(encoding="utf-8"))
+        for path in sorted((root / ".github/workflows").glob("*.y*ml"))
+    }
+    workflows["runner-pool.yml"] = DOC
+    pins = discover_self_pins(workflows)
+    # Measured 2026-09-14: one nested self-pin (runner-pool.yml -> runner-teardown.yml). A floor on
+    # the DISCOVERED population, so a parser that finds nothing cannot report a clean audit.
+    assert len(workflows) >= 10, f"workflow population collapsed: {sorted(workflows)}"
+    assert len(pins) >= 1, "no nested self-pin discovered; the parser is blind"
+    return root, pins
 
-    def _show() -> subprocess.CompletedProcess:
-        return subprocess.run(
-            [
-                "git",
-                "-C",
-                str(root),
-                "show",
-                f"{pin}:.github/workflows/runner-teardown.yml",
-            ],
-            capture_output=True,
-            timeout=60,
-        )  # ⚠ no text=True: decoding hides a CRLF/LF difference, and this asserts BYTES
 
-    shown = _show()
-    if shown.returncode != 0:
-        # Shallow clone: ask for just this object, then retry once.
-        subprocess.run(
-            ["git", "-C", str(root), "fetch", "--depth=1", "origin", pin],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        shown = _show()
+def _prepared_reference(root, pins):
+    """The ref to judge against, with history proven complete; skips only off CI."""
+    from tests.nested_self_pins import ShallowHistory, base_branch, prepare_history
 
-    if shown.returncode != 0:
-        detail = shown.stderr.decode("utf-8", "replace").strip()[:120]
-        assert not os.environ.get("CI"), (
-            f"cannot read runner-teardown.yml at the pinned {pin[:8]} even after fetching "
-            f"({detail}). Under CI this is a FAILURE, not a skip: a drift guard that skips "
-            "on the surface it protects is a check that cannot fail."
-        )
-        pytest.skip(f"pinned commit {pin[:8]} unavailable locally: {detail}")
+    try:
+        return prepare_history(root, base_branch(), pins)
+    except (ShallowHistory, LookupError) as exc:
+        # ⛔ MUST NOT SKIP IN CI — that is the surface this protects.
+        assert not os.environ.get("CI"), f"cannot decide nested-pin ancestry under CI: {exc}"
+        pytest.skip(f"nested-pin ancestry undecidable locally: {exc}")
 
-    # ⚠ read_bytes, not read_text. The docstring claims byte-identity; comparing decoded
-    # text would make a line-ending difference invisible and the claim false — an overclaim
-    # of the same kind this file already corrected once.
-    current = (root / ".github/workflows/runner-teardown.yml").read_bytes()
-    assert shown.stdout == current, (
-        f"runner-teardown.yml has changed since the pinned {pin[:8]}, so the pool calls a "
-        "STALE copy of its own teardown. Bump the pin in this change."
+
+def test_the_nested_teardown_pin_matches_the_file_it_calls():
+    """Every nested self-pin calls a file byte-identical to the one it should.
+
+    Referencing by pin means callers run the called workflow as it was at that ref: harmless while
+    the copies agree, silent drift the moment they do not.
+
+    ⛔ THE COMPARISON TARGET DEPENDS ON THE EVENT (just-akash#364). On a pull request the pin must
+    sit on the BASE branch (see the reachability guard), so it is compared with the BASE's copy:
+    a PR that edits the called file keeps the pin at base and repins after merge. Everywhere else
+    it is compared with the working copy, so a merged edit goes red on main naming the one-line
+    repin. Forcing the bump into the same PR is impossible under a squash merge — the only commit
+    holding the new bytes mid-PR is a branch commit, which the merge destroys (#308, #348).
+
+    ⚠ ON A PULL REQUEST IDENTITY IS SCOPED TO PINS THE PR TOUCHES (the called file or the pin
+    line). Otherwise one teardown-editing merge would turn every open PR red until main's repin
+    lands; those PRs skip identity with a warning naming the pending repin. Main stays red.
+
+    ⚠ NOT "lags by exactly one commit": commit distance is not enforceable; identity is.
+    """
+    import warnings
+
+    from tests.nested_self_pins import (
+        identity_scope,
+        identity_target,
+        identity_violations,
+        pin_format_violations,
     )
+
+    root, pins = _self_pins_and_root()
+    assert pin_format_violations(pins) == []
+    reference = _prepared_reference(root, pins)
+    checked, notes = identity_scope(root, pins, reference)
+    for note in notes:
+        warnings.warn(note, stacklevel=1)  # surfaces in the CI log's warnings summary
+    assert identity_violations(root, checked, identity_target(reference)) == []
+
+
+def test_the_nested_teardown_pin_is_reachable_from_main():
+    """Every nested self-pin is an ancestor of the BASE branch — main, or the PR's base.
+
+    ⛔ THE FAILURE THIS EXISTS TO PREVENT, MEASURED TWICE. #308 was squash-merged leaving
+    the pin at d5e64da8 (`compare d5e64da8...main` -> "diverged"); #348 → 16be7deb left it
+    at 1ad3913b. Once orphaned, Actions cannot resolve the nested `uses:` while building the
+    job graph and every caller dies as a STARTUP FAILURE: zero jobs, no logs, nothing naming
+    the missing ref.
+
+    ⛔ THERE IS NO ESCAPE FOR ANCESTORS OF HEAD (just-akash#364). This guard used to return early
+    when the pin was on the current branch, reasoning that a PR's own commit is legitimately not
+    yet on main. That early return IS the hole: a PR-only commit is always an ancestor of HEAD, so
+    the guard went green for the whole PR and red on main only after the squash destroyed it. The
+    pin must already be on the base before merge.
+
+    ⚠ A shallow walk reports a genuine ancestor as orphaned, so history is fetched explicitly and
+    proven not shallow before any verdict.
+    """
+    from tests.nested_self_pins import pin_format_violations, reachability_violations
+
+    root, pins = _self_pins_and_root()
+    assert pin_format_violations(pins) == []
+    reference = _prepared_reference(root, pins)
+    assert reachability_violations(root, pins, reference) == []
 
 
 # ==========================================================================
@@ -2343,119 +2368,3 @@ def test_the_read_loops_observation_survives_to_the_classifier(tmp_path):
     from tests.test_runner_teardown_shell_probes import test_real_close_step
 
     test_real_close_step(tmp_path, "verifier_true_nonzero")
-
-
-def test_the_nested_teardown_pin_is_reachable_from_main():
-    """Byte-identity is not enough — the pinned commit must still be REACHABLE.
-
-    ⛔ THE FAILURE THIS EXISTS TO PREVENT, MEASURED. #308 was squash-merged. The
-    identity guard above requires the pin to name a commit whose runner-teardown.yml
-    matches this one byte for byte, which during the PR is the BRANCH commit
-    (d5e64da8). A squash merge does not keep that commit in main's history:
-
-        compare d5e64da8...main -> "diverged"      (orphaned)
-        compare c2cad20a...main -> "ahead"         (the previous pin, an ancestor)
-
-    The previous pin survived only because its PR was not squashed. Once orphaned,
-    GitHub Actions cannot resolve the nested `uses:` while building the job graph, and
-    every downstream caller dies as a STARTUP FAILURE — a run with ZERO jobs and no
-    logs, which renders as a grey X indistinguishable from a generic CI blip.
-
-    ⇒ blazing#927 hit exactly this: three commits, `jobs=0` on every one, no logs, no
-    annotation, and nothing anywhere naming the unresolvable ref. Cost far more to
-    diagnose than to prevent.
-
-    ★ Identity and reachability are independent properties and the identity guard
-    silently traded one for the other: it FORCES the pin onto a branch commit (that is
-    the only place the bytes match mid-PR), which is precisely the commit a squash
-    merge destroys. The two guards must therefore both hold, and the resolution is to
-    pin the post-merge main SHA — byte-identical AND an ancestor.
-    """
-    import os
-    import subprocess
-
-    uses = str(DOC["jobs"]["teardown"]["uses"])
-    pin = uses.rsplit("@", 1)[-1]
-    assert re.fullmatch(r"[0-9a-f]{40}", pin), f"teardown pinned to {pin!r}, not a 40-hex SHA"
-
-    root = pathlib.Path(__file__).resolve().parents[1]
-
-    def _git(*args) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            ["git", "-C", str(root), *args], capture_output=True, text=True, timeout=60
-        )
-
-    # A PR's own head is legitimately not yet on main; what must never happen is a pin
-    # that is orphaned. Fetch on demand — CI checks out shallow.
-    if _git("cat-file", "-e", f"{pin}^{{commit}}").returncode != 0:
-        # ⚠ DEPTH 1 IS ENOUGH HERE, and depth 200 was cargo. This fetch only has to
-        # MATERIALISE the pinned object; the ancestry walk below runs over MAIN's
-        # history, which the unshallow deepens separately. Matches the identity guard
-        # above, which has always used depth 1.
-        _git("fetch", "--quiet", "--depth", "1", "origin", pin)
-
-    if _git("cat-file", "-e", f"{pin}^{{commit}}").returncode != 0:
-        # ⛔ MUST NOT SKIP IN CI — that is the surface this protects.
-        assert not os.environ.get("CI"), (
-            f"the pinned teardown commit {pin[:8]} cannot be read even after a fetch. "
-            f"Under CI that is the orphaned-pin condition itself, not a local gap."
-        )
-        pytest.skip("pinned commit unavailable locally; this guard is enforced in CI")
-
-    # ⛔ THE MAIN REF MUST BE MADE TO EXIST, NOT ASSUMED. The first version of this
-    # guard ended in `pytest.skip("no main ref available")`, and `actions/checkout`
-    # is shallow by default with no guarantee of `origin/main` — so under CI, the one
-    # surface this protects, it would have SKIPPED rather than enforced. That is the
-    # same "a check that cannot fail" defect this file keeps finding, committed inside
-    # the guard written to prevent it. Copilot and CodeRabbit both caught it.
-    #
-    # ⚠ AND DEPTH MATTERS INDEPENDENTLY OF PRESENCE. A depth-1 `main` makes
-    # `merge-base --is-ancestor` answer NO for a genuinely older ancestor, because the
-    # parent history it needs is simply absent — a false ORPHAN report, which would
-    # fail honest PRs and teach the next person to delete this test. So deepen before
-    # concluding anything.
-    def _main_ref() -> str | None:
-        for ref in ("origin/main", "main"):
-            if _git("rev-parse", "--verify", "--quiet", ref).returncode == 0:
-                return ref
-        _git("fetch", "--quiet", "origin", "+refs/heads/main:refs/remotes/origin/main")
-        for ref in ("origin/main", "main"):
-            if _git("rev-parse", "--verify", "--quiet", ref).returncode == 0:
-                return ref
-        return None
-
-    ref = _main_ref()
-    if ref is None:
-        assert not os.environ.get("CI"), (
-            "no main ref is available even after an explicit fetch. Under CI this is a "
-            "broken checkout, not an excuse to skip: the reachability property would go "
-            "unchecked on the exact surface this guard exists to protect."
-        )
-        pytest.skip("no main ref available locally; this guard is enforced in CI")
-
-    # Deepen so merge-base has the history it needs. --unshallow is the reliable form;
-    # fall back to a bounded deepen if the remote refuses it. ⚠ The `and` short-circuits,
-    # so --unshallow is attempted ONLY on a shallow repo — same semantics as the nested
-    # ifs this replaced (ruff SIM102), not a widening.
-    if (
-        _git("rev-parse", "--is-shallow-repository").stdout.strip() == "true"
-        and _git("fetch", "--quiet", "--unshallow", "origin").returncode != 0
-    ):
-        _git("fetch", "--quiet", "--deepen=1000", "origin")
-
-    head = _git("rev-parse", ref).stdout.strip()
-    if pin == head or _git("merge-base", "--is-ancestor", pin, ref).returncode == 0:
-        return  # reachable from main
-
-    # Not on main. Legitimate ONLY while this is the PR that will put it there — the
-    # pin is an ancestor of HEAD but not yet of main.
-    if _git("merge-base", "--is-ancestor", pin, "HEAD").returncode == 0:
-        return
-
-    raise AssertionError(
-        f"the pinned teardown commit {pin[:8]} is not reachable from {ref} and is not "
-        f"on this branch either — it has been orphaned, most likely by a squash merge. "
-        f"Every downstream caller of runner-pool.yml will die as a STARTUP FAILURE: "
-        f"zero jobs, no logs, and nothing naming the unresolvable ref. Re-pin to the "
-        f"post-merge main SHA, which is both byte-identical and an ancestor."
-    )

@@ -1570,8 +1570,8 @@ jobs:
     #
     # ⇒ The pin is not trusted, it is CHECKED:
     # test_the_nested_teardown_pin_matches_the_file_it_calls asserts the teardown at this
-    # SHA is byte-identical to the working copy, so editing the teardown forces the bump
-    # in the SAME change and the two cannot drift.
+    # SHA is byte-identical — to the BASE branch's copy on a pull request, and to the
+    # working copy everywhere else — so the two cannot drift silently.
     # ⚠ NOT "lags by exactly one commit" — this comment said that, and the guard does not
     # check it. Commit DISTANCE is not enforceable here: a multi-commit PR or a squash
     # merge breaks it while the pin stays correct. IDENTITY is the property that matters,
@@ -1590,9 +1590,15 @@ jobs:
     # ⇒ So TWO independent properties are asserted, and both are required:
     #   identity     — test_the_nested_teardown_pin_matches_the_file_it_calls
     #   REACHABILITY — test_the_nested_teardown_pin_is_reachable_from_main
-    # The resolution that satisfies both is to pin the POST-MERGE main SHA: byte-identical
-    # to the branch commit, and an ancestor of main. Never re-pin to a branch commit after
-    # its PR has merged.
+    # ⛔ ON A PULL REQUEST THIS PIN MUST ALREADY BE ON THE BASE BRANCH (just-akash#364).
+    # The reachability guard used to accept any ancestor of HEAD, and a PR-only commit
+    # always is one — #348 → 16be7deb orphaned 1ad3913b that way. A PR that edits
+    # runner-teardown.yml therefore leaves this pin at base (identity is judged against the
+    # base copy there), and a follow-up change repins to the post-merge main SHA, which the
+    # identity guard names on main. Until that repin lands only main is red: a PR that does
+    # not touch runner-teardown.yml or this line skips identity with a note naming the
+    # pending repin. Every self-pin must be a 40-hex SHA, never a branch or tag, and never a
+    # commit that exists only on a PR branch.
     uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@16be7debd43128248d87960ccee68f187f1174b1
     with:
       # The last KNOWN lease always reaches teardown so it is closed and proven. An
