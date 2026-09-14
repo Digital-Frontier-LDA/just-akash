@@ -1,9 +1,15 @@
-"""The pinned akash-lease-core actually contains what just-akash#346 relies on.
+"""The pinned akash-lease-core actually contains what just-akash relies on.
 
 A version string or an ancestry claim is not evidence: release histories in this org have
 diverged from main before. These assert the BEHAVIOUR of akash-lease-core#47 — including
 the two defects its final review found — so a pin that resolves to a core without them
 goes red here, not in production placement.
+
+v0.15.1 (akash-lease-core#51, closing #50) adds the contract asserted at the bottom of this
+file: provider-scoped EMPTIEST degradation (L1), anti-affinity in the degraded fallback (L2),
+an aggregate contradicting its node list is unreadable (L3), and an aggregate below the
+request proves insufficiency without a node list (L4). The same L1/L2 are proven through
+deploy() in tests/test_deploy_request_profile_call_sites.py.
 """
 
 from __future__ import annotations
@@ -16,6 +22,9 @@ from akash_lease_core import (
     AuctionPolicy,
     BidObservation,
     BidRejectionReason,
+    CapacityFit,
+    NodeCapacity,
+    ProviderCapacity,
     ResourceProfile,
     SelectionReason,
     from_provider_status,
@@ -93,3 +102,87 @@ def test_emptiest_rejects_a_provider_that_cannot_fit_the_aggregate() -> None:
     fits = _bid("akash1fits", "9", gseq=1, profile=profile, free=4000)
     result = _decide(PreferredSelection.EMPTIEST, [too_small_but_cheap, fits])
     assert result.selected is not None and result.selected.provider == "akash1fits"
+
+
+# ── v0.15.1 contract (akash-lease-core#51) ─────────────────────────────────────────────
+
+
+def _complete(free: int) -> ProviderCapacity:
+    return ProviderCapacity.from_totals(
+        cpu=(free, 1000), node_capacities=(NodeCapacity(cpu_millicores_available=free),)
+    )
+
+
+def _partial(free: int) -> ProviderCapacity:
+    """Fit is provable from the readable node; the provider-wide fraction is not."""
+    return ProviderCapacity.from_totals(
+        cpu=(free, 1000),
+        node_capacities=(NodeCapacity(cpu_millicores_available=free), NodeCapacity()),
+    )
+
+
+def _emptiest(rows, *, already_selected=None):
+    profile = ResourceProfile(cpu_millicores=100)
+    auction = Auction(
+        AuctionPolicy(
+            collection_window_seconds=10,
+            preferred_providers=frozenset(p for p, _, _ in rows),
+            preferred_selection=PreferredSelection.EMPTIEST,
+        ),
+        started_at=0,
+    )
+    for index, (provider, price, capacity) in enumerate(rows, 1):
+        auction.observe(
+            BidObservation(
+                bid_key=f"bid-{index}",
+                provider=provider,
+                price=Decimal(price),
+                denom="uakt",
+                observed_at=float(index),
+                capacity=capacity,
+                resource_profile=profile,
+                gseq=1,
+            )
+        )
+    return auction.evaluate(now=11, already_selected=already_selected)
+
+
+def test_v0_15_1_L1_degradation_is_provider_scoped() -> None:
+    result = _emptiest(
+        [("q", "9", _complete(600)), ("r", "1", _complete(300)), ("p", "5", _partial(900))]
+    )
+    assert result.selected is not None and result.selected.provider == "q"
+    assert result.selection_reason is SelectionReason.EMPTIEST_PREFERRED
+
+
+def test_v0_15_1_L2_the_degraded_auction_keeps_anti_affinity() -> None:
+    rows = [("q", "1", _complete(600)), ("r", "5", _complete(300)), ("p", "3", _partial(900))]
+    result = _emptiest(rows, already_selected=frozenset({"q"}))
+    assert result.selected is not None and result.selected.provider == "r"
+
+
+def test_v0_15_1_L3_an_aggregate_contradicting_its_nodes_is_unreadable() -> None:
+    capacity = ProviderCapacity.from_totals(
+        cpu=(5_000, 32_000), node_capacities=(NodeCapacity(cpu_millicores_available=16_000),)
+    )
+    fit = capacity.fit(ResourceProfile(cpu_millicores=8_000))
+    assert fit is CapacityFit.REQUIRED_DIMENSION_UNREADABLE
+
+
+def test_v0_15_1_L4_an_aggregate_below_the_request_proves_insufficiency() -> None:
+    capacity = ProviderCapacity.from_totals(cpu=(4_000, 32_000))
+    fit = capacity.fit(ResourceProfile(cpu_millicores=8_000))
+    assert fit is CapacityFit.INSUFFICIENT_CAPACITY
+
+
+def test_v0_15_2_an_integer_above_float_range_is_unreadable_not_an_overflow() -> None:
+    """akash-lease-core#53. just_akash.provider_capacity.capacity_for does not catch
+    OverflowError, so the adapter itself must not raise on a 401-digit /status value."""
+    huge = 10**400
+    node = {
+        "allocatable": {"cpu": huge, "memory": 10_000, "storage_ephemeral": 10_000, "gpu": 0},
+        "available": {"cpu": huge, "memory": 10_000, "storage_ephemeral": 10_000, "gpu": 0},
+    }
+    capacity = from_provider_status({"cluster": {"inventory": {"available": {"nodes": [node]}}}})
+    fit = capacity.fit(ResourceProfile(cpu_millicores=1000))
+    assert fit is CapacityFit.REQUIRED_DIMENSION_UNREADABLE
