@@ -360,15 +360,26 @@ BOUND_OWNER_LOOKUP_ATTEMPTS = 5
 BOUND_OWNER_LOOKUP_BACKOFF_SECONDS = 2.0
 OWNER_LOOKUP_UNREACHABLE = "OWNER_LOOKUP_UNREACHABLE"
 NO_CREDENTIAL_MATCHES_OWNER = "NO_CREDENTIAL_MATCHES_OWNER"
+# Every key failed for a non-transport reason (401, 403, malformed JWT): no address was read
+# at all, so "no credential matches" would claim a comparison that never happened.
+OWNER_LOOKUP_UNREADABLE = "OWNER_LOOKUP_UNREADABLE"
 
 
 def _is_transport_error(exc: BaseException) -> bool:
-    """A failure that says nothing about which account the key belongs to."""
+    """A failure that says nothing about which account the key belongs to.
+
+    Measured through the real AkashConsoleAPI with only urlopen patched (DEV7 on #366):
+    connect-phase resets, timeouts and DNS failures arrive as "Connection error: …"; a reset or
+    timeout while reading the body arrives raw; a truncated body arrives as
+    http.client.IncompleteRead, which is NOT an OSError; 5xx, 524, 429 and 408 arrive as
+    AkashAPIError."""
+    import http.client
+
     from .api import AkashAPIError
 
     if isinstance(exc, AkashAPIError):
-        return exc.status is not None and (exc.status >= 500 or exc.status == 429)
-    if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+        return exc.status is not None and (exc.status >= 500 or exc.status in (408, 429))
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError, http.client.IncompleteRead)):
         return True
     return isinstance(exc, RuntimeError) and str(exc).startswith("Connection error:")
 
@@ -407,14 +418,18 @@ def _select_owner_credential(dseq: str, owner: str, keys: list[str], credential:
         order.insert(0, bound)  # a hint: ordering only
     elif binding is not None:
         _info(f"Cleanup for {dseq}: credential binding does not fit the configured list")
-    unknown = False
+    kinds: set[str] = set()
     for index in order:
         candidate = AkashConsoleAPI(keys[index])
         kind, address = _lookup_owner(candidate, bound=index == bound)
         if kind == "address" and address == owner:
             return candidate, None
-        unknown = unknown or kind == "unknown"
-    return None, OWNER_LOOKUP_UNREACHABLE if unknown else NO_CREDENTIAL_MATCHES_OWNER
+        kinds.add(kind)
+    if "unknown" in kinds:
+        return None, OWNER_LOOKUP_UNREACHABLE
+    if "address" in kinds:
+        return None, NO_CREDENTIAL_MATCHES_OWNER
+    return None, OWNER_LOOKUP_UNREADABLE
 
 
 def robust_destroy(

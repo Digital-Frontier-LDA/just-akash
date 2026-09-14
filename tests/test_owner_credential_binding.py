@@ -215,13 +215,27 @@ def test_when_every_key_reads_a_different_address_the_verdict_is_no_match(consol
     assert _e2e.OWNER_LOOKUP_UNREACHABLE not in text
 
 
-def test_an_authorisation_failure_is_not_retried_and_is_not_an_outage(console, capsys) -> None:
+def test_all_keys_unreadable_is_its_own_verdict_not_an_outage(console, capsys) -> None:
+    """Every key 401s: no address was read, so neither "no match" nor "unreachable" is true."""
     console.scripts = {
         key: [AkashAPIError("API Error (401): bad key", status=401)] for key in KEYS
     }
 
     assert _destroy() is False
-    assert console.lookups == {key: 1 for key in KEYS}
+    assert console.lookups == {key: 1 for key in KEYS}, "a 401 is not retried"
+    text = _never_prints_keys(capsys)
+    assert _e2e.OWNER_LOOKUP_UNREADABLE in text
+    assert _e2e.NO_CREDENTIAL_MATCHES_OWNER not in text
+    assert _e2e.OWNER_LOOKUP_UNREACHABLE not in text
+
+
+def test_one_unreadable_key_beside_a_proven_mismatch_is_no_match(console, capsys) -> None:
+    console.scripts = {
+        KEYS[0]: [AkashAPIError("API Error (403): forbidden", status=403)],
+        KEYS[1]: [OTHER],
+    }
+
+    assert _destroy() is False
     assert _e2e.NO_CREDENTIAL_MATCHES_OWNER in _never_prints_keys(capsys)
 
 
@@ -353,3 +367,140 @@ def test_deploy_writes_the_creating_credential_into_the_receipt(
     durable = json.loads(receipt.read_text())
     assert durable["credential_binding"] == {"credential_index": 0, "credential_count": 1}
     assert KEYS[0] not in receipt.read_text()
+
+
+# ── R2: the REAL Console client's raise surface, with only urlopen patched ─────────────
+
+
+class _Response:
+    def __init__(self, body: bytes, *, truncated: bool = False) -> None:
+        self._body, self._truncated, self.status = body, truncated, 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        return None
+
+    def read(self) -> bytes:
+        if self._truncated:
+            import http.client
+
+            raise http.client.IncompleteRead(self._body[:5], len(self._body))
+        return self._body
+
+
+def _jwt_for(address: str) -> bytes:
+    import base64
+
+    claims = base64.urlsafe_b64encode(json.dumps({"iss": address}).encode()).decode().rstrip("=")
+    return json.dumps({"data": {"token": f"header.{claims}.signature"}}).encode()
+
+
+@pytest.fixture
+def real_console(monkeypatch):
+    """The real AkashConsoleAPI; urlopen answers JWT mints from a script, closes with {}."""
+    import io
+    import urllib.error
+    from email.message import Message
+
+    state: dict = {"mints": [], "closes": [], "sleeps": []}
+    monkeypatch.setattr(wallet_pool, "configured_api_keys", lambda: [KEYS[0]])
+    monkeypatch.setattr(
+        chain, "corroborated_deployment_group_population", lambda owner, dseq, groups: groups
+    )
+    monkeypatch.setattr(_e2e, "_confirm_settled", lambda dseq, owner: True)
+    monkeypatch.setattr(_e2e.time, "sleep", state["sleeps"].append)
+
+    def urlopen(request, *args, **kwargs):
+        url = request.full_url
+        if url.endswith("/v1/create-jwt-token"):
+            outcome = state["script"][min(len(state["mints"]), len(state["script"]) - 1)]
+            state["mints"].append(outcome)
+            if outcome == "truncated":
+                return _Response(_jwt_for(OWNER), truncated=True)
+            if outcome == "408":
+                raise urllib.error.HTTPError(
+                    url, 408, "Request Timeout", Message(), io.BytesIO(b'{"message":"timeout"}')
+                )
+            return _Response(_jwt_for(outcome))
+        state["closes"].append((request.get_method(), url.rsplit("/", 1)[-1]))
+        return _Response(b"{}")
+
+    monkeypatch.setattr(api.urllib.request, "urlopen", urlopen)
+    return state
+
+
+@pytest.mark.parametrize("failure", ["truncated", "408"], ids=["incomplete-read", "http-408"])
+def test_a_real_client_transport_failure_is_retried_then_matches(real_console, failure) -> None:
+    real_console["script"] = [failure, OWNER]
+
+    assert _destroy() is True
+    assert real_console["mints"] == [failure, OWNER], "the first failure must be retried"
+    assert real_console["closes"] == [("DELETE", "1001")]
+
+
+@pytest.mark.parametrize("failure", ["truncated", "408"], ids=["incomplete-read", "http-408"])
+def test_a_real_client_transport_failure_that_persists_is_unreachable(
+    real_console, capsys, failure
+) -> None:
+    real_console["script"] = [failure]
+
+    assert _destroy() is False
+    assert len(real_console["mints"]) == _e2e.OWNER_LOOKUP_ATTEMPTS
+    assert real_console["closes"] == []
+    assert _e2e.OWNER_LOOKUP_UNREACHABLE in _never_prints_keys(capsys)
+
+
+# ── R1: every receipt-identity consumer forwards the binding (derived, not listed) ─────
+
+
+def _receipt_identity_sites():
+    """Every place in just_akash that copies a receipt's group population into cleanup
+    identity, and every robust_destroy call that passes a complete group population."""
+    import ast
+
+    package = Path(__file__).resolve().parents[1] / "just_akash"
+    updates, destroys = [], []
+    for path in sorted(package.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            keywords = {kw.arg: kw.value for kw in node.keywords if kw.arg}
+            where = f"{path.name}:{node.lineno}"
+            groups = keywords.get("groups")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "update"
+                and groups is not None
+                and ast.unparse(groups) == "receipt['group_population']"
+            ):
+                updates.append((where, keywords.get("credential")))
+            name = node.func.id if isinstance(node.func, ast.Name) else None
+            if name == "robust_destroy" and groups is not None:
+                destroys.append((where, keywords.get("credential")))
+    return updates, destroys
+
+
+def test_every_receipt_identity_site_forwards_the_credential_binding() -> None:
+    import ast
+
+    updates, destroys = _receipt_identity_sites()
+    # Measured 2026-09-14: 9 identity copies (paid_create 1, smoke_providers 2, test_lifecycle 2,
+    # test_secrets_e2e 2, test_shell_e2e 2) and 3 group-population destroys (paid_create,
+    # test_secrets_e2e, the _e2e signal handler). A floor, so a blind walk cannot pass.
+    assert len(updates) >= 9, updates
+    assert len(destroys) >= 3, destroys
+    missing_updates = [
+        where
+        for where, value in updates
+        if value is None or ast.unparse(value) != "receipt.get('credential_binding')"
+    ]
+    assert not missing_updates, (
+        f"receipt identity copied without its credential binding: {missing_updates}"
+    )
+    missing_destroys = [where for where, value in destroys if value is None]
+    assert not missing_destroys, (
+        f"robust_destroy called without the credential: {missing_destroys}"
+    )
