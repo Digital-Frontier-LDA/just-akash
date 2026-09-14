@@ -106,7 +106,12 @@ jobs:
           # is non-gating: a benchmark failure never reddens the smoke. Accrued to the
           # telemetry branch as smoke-benchmark.jsonl for the quality analyzer.
           SMOKE_BENCHMARK_FILE: ${{ github.workspace }}/smoke-benchmark.jsonl
-        run: uv run python -m just_akash.smoke_providers ${{ inputs.all && '--all' || '' }}
+        run: |
+          # ⛔ ONE lookup budget for the smoke's lookups (#378): probe destroys and
+          # the sweep's closes share this absolute ceiling (epoch seconds);
+          # just-akash honours it as min(own budget, ceiling).
+          export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
+          uv run python -m just_akash.smoke_providers ${{ inputs.all && '--all' || '' }}
 
       # Snapshot the remaining deploy credit HERE, in the one job that holds the
       # API key — the accrue job (which renders the Prometheus metrics) deliberately
@@ -155,9 +160,15 @@ jobs:
       # Only a runner-infra death (rare) still falls through to the daily sweep.
       - name: Reap any leaked probe
         if: always()
-        timeout-minutes: 10
+        # ⛔ MUST EXCEED the lookup budget (600s) + close/audit margin (240s) = 14 min
+        # (tests/test_owner_lookup_deadline.py). 20 keeps reaping headroom; the old
+        # 10 could not clear budget+margin at all.
+        timeout-minutes: 20
         # AKASH_API_KEY is already in $GITHUB_ENV from the SOPS load step.
-        run: uv run python -m just_akash.smoke_providers --sweep-only --min-age 0
+        run: |
+          # ⛔ ONE lookup budget for this sweep's closes (#378).
+          export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
+          uv run python -m just_akash.smoke_providers --sweep-only --min-age 0
 
       - name: Preserve unresolved provider-smoke deployment receipts
         if: always()
