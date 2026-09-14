@@ -333,12 +333,97 @@ def _confirm_settled_single_reader(
     return None
 
 
+# ── owner credential selection (#363) ──────────────────────────────────────────────────
+#
+# ⛔ AN API OUTAGE IS NOT OWNERSHIP EVIDENCE. The old selection called account_address()
+# once per configured key and read every exception as "this key is not the owner". During
+# a Console API connection-reset window every key failed, none "matched", and a lease the
+# run itself created was HELD open (just-akash#362 run 34818093597, dseq 1789370984331).
+#
+# Three outcomes per key, never two:
+#   MATCH    a lookup returned the receipt owner: the ONLY thing that authorises a destroy
+#   MISMATCH a lookup returned a different address: the only thing that excludes a key
+#   UNKNOWN  every attempt in the bounded budget failed in transport: not evidence either way
+# A key whose lookup fails for a non-transport reason (401, malformed JWT) cannot close the
+# lease and is skipped, but it never counts as a transport outage.
+#
+# ⛔ THE CREATE-TIME BINDING IS A HINT, NEVER AUTHORITY. It only orders the lookups: the
+# bound key goes first, with a longer budget. A position and a count are weak identity (key
+# order can change across runs, and a HELD receipt may be cleaned by a later run or a reaper),
+# and the ownership standard forbids selecting a signer without a positive owner match. So
+# an UNKNOWN bound key does not close anything: the scan continues, and "no MATCH, some
+# UNKNOWN" is the typed OWNER_LOOKUP_UNREACHABLE hold.
+OWNER_LOOKUP_ATTEMPTS = 3
+OWNER_LOOKUP_BACKOFF_SECONDS = 1.0
+# The bound key waits longer: 5 attempts, exponential 2+4+8+16 = 30s of backoff in total.
+BOUND_OWNER_LOOKUP_ATTEMPTS = 5
+BOUND_OWNER_LOOKUP_BACKOFF_SECONDS = 2.0
+OWNER_LOOKUP_UNREACHABLE = "OWNER_LOOKUP_UNREACHABLE"
+NO_CREDENTIAL_MATCHES_OWNER = "NO_CREDENTIAL_MATCHES_OWNER"
+
+
+def _is_transport_error(exc: BaseException) -> bool:
+    """A failure that says nothing about which account the key belongs to."""
+    from .api import AkashAPIError
+
+    if isinstance(exc, AkashAPIError):
+        return exc.status is not None and (exc.status >= 500 or exc.status == 429)
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+        return True
+    return isinstance(exc, RuntimeError) and str(exc).startswith("Connection error:")
+
+
+def _lookup_owner(candidate, *, bound: bool = False) -> tuple[str, str | None]:
+    """("address"|"unknown"|"unreadable", address) within the key's retry budget."""
+    attempts = BOUND_OWNER_LOOKUP_ATTEMPTS if bound else OWNER_LOOKUP_ATTEMPTS
+    for attempt in range(1, attempts + 1):
+        try:
+            return "address", candidate.account_address()
+        except Exception as exc:  # noqa: BLE001 - classified below, never read as a mismatch
+            if not _is_transport_error(exc):
+                return "unreadable", None
+            if attempt < attempts:
+                time.sleep(
+                    BOUND_OWNER_LOOKUP_BACKOFF_SECONDS * 2 ** (attempt - 1)
+                    if bound
+                    else OWNER_LOOKUP_BACKOFF_SECONDS * attempt
+                )
+    return "unknown", None
+
+
+def _select_owner_credential(dseq: str, owner: str, keys: list[str], credential: object):
+    """The Console client proven to be ``owner``, or (None, typed verdict).
+
+    Only an address MATCH selects a client. Never logs key material."""
+    from .api import AkashConsoleAPI
+    from .deployment_receipt import valid_credential_binding
+
+    binding = valid_credential_binding(credential)
+    order = list(range(len(keys)))
+    bound: int | None = None
+    if binding is not None and binding["credential_count"] == len(keys):
+        bound = binding["credential_index"]
+        order.remove(bound)
+        order.insert(0, bound)  # a hint: ordering only
+    elif binding is not None:
+        _info(f"Cleanup for {dseq}: credential binding does not fit the configured list")
+    unknown = False
+    for index in order:
+        candidate = AkashConsoleAPI(keys[index])
+        kind, address = _lookup_owner(candidate, bound=index == bound)
+        if kind == "address" and address == owner:
+            return candidate, None
+        unknown = unknown or kind == "unknown"
+    return None, OWNER_LOOKUP_UNREACHABLE if unknown else NO_CREDENTIAL_MATCHES_OWNER
+
+
 def robust_destroy(
     dseq: str,
     *,
     owner: str | None = None,
     group: str | None = None,
     groups: list[dict[str, object]] | None = None,
+    credential: object = None,
     retries: int = 2,
     audit: bool = True,
 ) -> bool:
@@ -371,7 +456,6 @@ def robust_destroy(
             _fail(f"Cleanup held for {dseq}: complete group population has no owner")
             return False
         from . import chain
-        from .api import AkashConsoleAPI
         from .wallet_pool import configured_api_keys
 
         expected = [
@@ -393,16 +477,12 @@ def robust_destroy(
         except Exception as e:  # noqa: BLE001 - identity discovery must fail closed
             _fail(f"Cleanup held for {dseq}: could not enumerate owner credentials ({e})")
             return False
-        for key in keys:
-            try:
-                candidate = AkashConsoleAPI(key)
-                if candidate.account_address() == owner:
-                    direct_client = candidate
-                    break
-            except Exception:  # noqa: BLE001 - one unreadable key is not owner evidence
-                continue
+        direct_client, verdict = _select_owner_credential(str(dseq), owner, keys, credential)
         if direct_client is None:
-            _fail(f"Cleanup held for {dseq}: no configured credential selected the receipt owner")
+            _fail(
+                f"Cleanup held for {dseq}: {verdict} — no configured credential was proven "
+                "to be the receipt owner"
+            )
             return False
     # Clamp negative retries so a caller mistake (or signal-handler default
     # of retries=1 minus a typo) never silently skips the destroy loop. Empty
@@ -553,7 +633,14 @@ def _signal_handler(signum, _frame):
                 group = (ref or {}).get("group") or None
                 groups = (ref or {}).get("groups")
                 if isinstance(groups, list):
-                    robust_destroy(dseq, owner=owner, groups=groups, retries=1, audit=True)
+                    robust_destroy(
+                        dseq,
+                        owner=owner,
+                        groups=groups,
+                        credential=(ref or {}).get("credential"),
+                        retries=1,
+                        audit=True,
+                    )
                 elif group is None:
                     robust_destroy(dseq, owner=owner, retries=1, audit=True)
                 else:

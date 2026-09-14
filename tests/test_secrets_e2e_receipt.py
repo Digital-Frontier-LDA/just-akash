@@ -93,7 +93,11 @@ def test_submitting_receipt_requires_exact_two_source_population_and_verified_cl
     ref = {}
     assert paid.reconcile_receipt(submitting[0], OPERATION_ID, 123.0, ref) is None
     assert calls[0] == (OWNER, dseq, [{"gseq": 1, "name": GROUP}])
-    assert calls[1] == (dseq, {"owner": OWNER, "groups": [{"gseq": 1, "name": GROUP}]})
+    # No credential binding in this receipt (written without one), so none is forwarded.
+    assert calls[1] == (
+        dseq,
+        {"owner": OWNER, "groups": [{"gseq": 1, "name": GROUP}], "credential": None},
+    )
     assert not submitting[0].exists(), "verified cleanup must consume exactly its receipt"
 
 
@@ -330,7 +334,12 @@ def test_unverified_cleanup_preserves_receipt_and_bound_identity(
     assert target._verified_cleanup(identity) is False
     assert receipt.read_text() == "recovery seed"
     assert identity["dseq"] == "1002"
-    assert calls == [("1002", {"owner": OWNER, "groups": [{"gseq": 1, "name": "group-one"}]})]
+    assert calls == [
+        (
+            "1002",
+            {"owner": OWNER, "groups": [{"gseq": 1, "name": "group-one"}], "credential": None},
+        )
+    ]
 
 
 def test_verified_cleanup_removes_receipt_and_finish_call_site_has_an_observable_effect(

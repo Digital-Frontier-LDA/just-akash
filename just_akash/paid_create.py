@@ -99,7 +99,7 @@ def verified_cleanup(ref: dict) -> bool:
     groups = ref.get("groups")
     if not dseq or not isinstance(owner, str) or not isinstance(groups, list):
         return False
-    if not robust_destroy(str(dseq), owner=owner, groups=groups):
+    if not robust_destroy(str(dseq), owner=owner, groups=groups, credential=ref.get("credential")):
         return False
     ref["dseq"] = None
     path = ref.get("receipt_path")
@@ -130,6 +130,7 @@ def reconcile_receipt(path: Path, operation_id: str, started_at: float, ref: dic
     ref.update(
         owner=receipt["expected_owner"],
         groups=receipt["group_population"],
+        credential=receipt.get("credential_binding"),
         receipt_path=path,
     )
     if dseq is not None:

@@ -145,7 +145,10 @@ def _verified_cleanup(dseq_ref: dict) -> bool:
     """Clear receipt identity only after exact destruction and positive closure audit."""
     dseq = dseq_ref.get("dseq")
     if not dseq or not robust_destroy(
-        dseq, owner=dseq_ref.get("owner"), groups=dseq_ref.get("groups")
+        dseq,
+        owner=dseq_ref.get("owner"),
+        groups=dseq_ref.get("groups"),
+        credential=dseq_ref.get("credential"),
     ):
         return False
     dseq_ref["dseq"] = None
@@ -304,6 +307,7 @@ def main():
                 dseq=dseq,
                 owner=receipt["expected_owner"],
                 groups=receipt["group_population"],
+                credential=receipt.get("credential_binding"),
             )
             if dseq:
                 _verified_cleanup(dseq_ref)
@@ -323,7 +327,11 @@ def main():
 
     try:
         receipt, receipt_dseq = receipt_identity(receipt_path, receipt_operation_id)
-        dseq_ref.update(owner=receipt["expected_owner"], groups=receipt["group_population"])
+        dseq_ref.update(
+            owner=receipt["expected_owner"],
+            groups=receipt["group_population"],
+            credential=receipt.get("credential_binding"),
+        )
     except Exception as exc:  # noqa: BLE001 - no bound identity means cleanup is held
         receipt, receipt_dseq = None, None
         log_fail(f"HELD: create receipt unreadable ({exc})")

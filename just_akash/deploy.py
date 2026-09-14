@@ -38,7 +38,12 @@ from .api import (
     _extract_gseq,
     _extract_provider,
 )
-from .deployment_receipt import mark_create_response_received, mark_submitting, prepare_receipt
+from .deployment_receipt import (
+    credential_binding_for,
+    mark_create_response_received,
+    mark_submitting,
+    prepare_receipt,
+)
 from .provenance import PLACEMENT_PREFIX, SIBLING_REAPED_PREFIX, run_id_of, stamp_run
 from .provider_capacity import capacity_by_provider
 from .request_profile import attach_profile, derive_resource_profiles, observed_gseq
@@ -1038,12 +1043,19 @@ def deploy(
 
     prepared_receipt = None
     if receipt_path is not None:
+        from .wallet_pool import configured_api_keys
+
         actual_owner = client.account_address()
         prepared_receipt = prepare_receipt(
             receipt_path,
             operation_id=str(receipt_operation_id),
             owner=actual_owner,
             sdl_content=sdl_content,
+            # #363: record WHICH configured credential created this deployment, so
+            # cleanup can select it without re-deriving ownership over the network.
+            credential_binding=credential_binding_for(
+                configured_api_keys(), getattr(client, "api_key", None)
+            ),
         )
 
     # Step 2: Create deployment (with stale-deployment recovery)
