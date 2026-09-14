@@ -42,6 +42,15 @@ def lifecycle(monkeypatch):
     name = format_identity(Identity(PREFIX, REPO, "ci-payload", 1, run=99, attempt=2), REGISTER)
     monkeypatch.setattr(cs.chain, "deployment_group_names", lambda *args: [name])
     monkeypatch.setattr(
+        cs.chain,
+        "owner_close_population_evidence",
+        lambda owner, dseq, population: {
+            "owner": owner,
+            "dseq": dseq,
+            "groups": population,
+        },
+    )
+    monkeypatch.setattr(
         cs.cleanup_identity,
         "completed_run",
         lambda *args: {

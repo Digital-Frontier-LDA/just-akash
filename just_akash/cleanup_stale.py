@@ -64,6 +64,8 @@ from .smoke_providers import (
 )
 from .wallet_pool import configured_api_keys
 
+CleanupIntent = cleanup_identity.CleanupIntent
+
 # e2e (test_shell_e2e / test_secrets_e2e / smoke SSH checks) deploys the
 # cpu-backtest-ssh SDL, whose sole service is `backtest`, and destroys it
 # in-run — minutes, not days. 48h is far past any legitimate holder (a
@@ -172,6 +174,14 @@ STALE_VERDICTS = (
     "STALE-provider-closed",
 )
 
+_INTENT_BY_VERDICT = {
+    "STALE-probe": CleanupIntent.PROBE,
+    "STALE-e2e": CleanupIntent.BACKTEST,
+    "STALE-runner": CleanupIntent.RUNNER,
+    "STALE-owned": CleanupIntent.OWNED_CI,
+    "STALE-provider-closed": CleanupIntent.PROVIDER_CLOSED_CI,
+}
+
 
 # ⛔ DEPLOYMENTS THAT MUST NEVER BE CLOSED, WHATEVER THE CLASSIFIER SAYS.
 #
@@ -200,13 +210,21 @@ PROTECTED_DSEQS = frozenset(
 )
 
 
-def _wants_owned_provenance(detail: dict, dseq: str, now: float | None = None) -> bool:
-    """True when `classify`'s reap_owned branch would actually consult ``group_names``.
+def _all_groups_owned(group_names: list[str] | None, placement_prefix: str) -> bool:
+    """True only for a nonempty, wholly readable, wholly owned population."""
 
-    ⛔ MIRRORS classify's EARLY RETURNS and must be kept in step with them. {probe},
-    {backtest} and {runner} return before the reap_owned branch, so reading their
-    provenance spends a chain round-trip on a value nothing looks at.
-    `test_provenance_is_skipped_where_classify_ignores_it` pins the pairing.
+    return bool(group_names) and all(
+        isinstance(name, str) and bool(name) and name.startswith(placement_prefix)
+        for name in group_names or []
+    )
+
+
+def _wants_owned_provenance(detail: dict, dseq: str, now: float | None = None) -> bool:
+    """True when `classify`'s reap_owned branch would consult group identity.
+
+    Probe, backtest and runner are only candidate selectors here.  They still
+    require the independent typed cleanup policy before any close, but their
+    service/age classifier does not consume the names itself.
 
     The EMPTY set is judged by the reap_owned branch too (provider-closed), but at the
     PROBE floor rather than the owned floor — see classify for why the two floors differ.
@@ -273,7 +291,7 @@ def classify(
             # deployment may have closed under us. Destroying on a failed read is the
             # same class of error as destroying on a guess.
             return "LEAVE-unverified-runner", services, age
-        if not any(n.startswith(placement_prefix) for n in group_names):
+        if not _all_groups_owned(group_names, placement_prefix):
             return "LEAVE-not-ours", services, age
         if age is not None and age >= STALE_RUNNER_AGE_SECONDS:
             return "STALE-runner", services, age
@@ -300,7 +318,7 @@ def classify(
                 # UNREADABLE is not UNOWNED, and here it is not CLASSIFIABLE either: a
                 # failed chain read leaves this exactly where the safe default found it.
                 return "LEAVE-unverified-provider-closed", services, age
-            if not any(n.startswith(placement_prefix) for n in group_names):
+            if not _all_groups_owned(group_names, placement_prefix):
                 # Another project's naming scheme, or a bare unattributable group
                 # (dcloud / akash1...): not ours to close, however stranded it looks.
                 return "LEAVE-not-ours-provider-closed", services, age
@@ -317,7 +335,7 @@ def classify(
     if reap_owned:
         if not group_names:
             return "LEAVE-unverified-owned", services, age
-        if not any(n.startswith(placement_prefix) for n in group_names):
+        if not _all_groups_owned(group_names, placement_prefix):
             return "LEAVE-not-ours", services, age
         if age is not None and age >= STALE_OWNED_AGE_SECONDS:
             return "STALE-owned", services, age
@@ -598,6 +616,7 @@ def run(
     print(f"ownership prefix: {placement_prefix!r}\n")
 
     stale: list[str] = []
+    stale_intents: dict[str, CleanupIntent] = {}
     protected: list[str] = []
     # Rail inputs. `seen_verdicts` feeds the unrecognised-verdict refusal;
     # `stale_ages` lets a capped run close the OLDEST first, so a partial pass
@@ -632,21 +651,14 @@ def run(
             print(f"  {dseq}  ERROR reading detail: {exc} -> LEAVE")
             unreadable += 1
             continue
-        # Read provenance ONLY for the candidates it can decide, so a sweep does not
-        # spend a chain round-trip per deployment on an account of hundreds.
+        # This read only classifies a candidate.  The typed cleanup policy below
+        # performs its own complete two-source all-group read before the DSEQ can
+        # enter the close plan.
         names: list[str] | None = None
-        if reap_runners and _deployment_service_names(detail) == {RUNNER_SERVICE}:
+        services_for_read = _deployment_service_names(detail)
+        if reap_runners and services_for_read == {RUNNER_SERVICE}:  # noqa: SIM114
             names = chain.deployment_group_names(address, dseq)
         elif reap_owned and _wants_owned_provenance(detail, dseq, now):
-            # ⛔ reap_owned DECIDES ON PROVENANCE, so it must READ provenance — for the
-            # services `classify` will actually consult it for. Without the read the flag is
-            # inert in the worst way: `classify` returns LEAVE-unverified-owned for everything
-            # and the sweep reports a clean account it never judged.
-            #
-            # ⚠ NARROWED, because the naive form paid a chain round-trip for EVERY deployment
-            # — including {probe}, {backtest} and {runner}, whose branches return before
-            # `group_names` is ever read. On an account of hundreds that is hundreds of wasted
-            # reads for a value nothing consults.
             names = chain.deployment_group_names(address, dseq)
         verdict, services, age = classify(
             detail, dseq, now, reap_runners, names, placement_prefix, reap_owned=reap_owned
@@ -666,14 +678,16 @@ def run(
             protected.append(dseq)
             continue
         if verdict in STALE_VERDICTS and not filtered:
+            intent = _INTENT_BY_VERDICT[verdict]
             allowed, reason = cleanup_identity.eligible(
-                address, str(dseq), placement_prefix, ownership_register
+                address, str(dseq), placement_prefix, ownership_register, intent
             )
             if not allowed:
                 identity_held += 1
                 print(f"  {dseq} HELD: {reason}")
                 continue
             stale.append(dseq)
+            stale_intents[dseq] = intent
             # -1.0 sorts an unaged deployment LAST, never first: an unknown age
             # must not win a race to be closed under a cap.
             stale_ages[dseq] = age if age is not None else -1.0
@@ -742,8 +756,9 @@ def run(
 
     closed, failed, unverified = 0, 0, 0
     for dseq in stale:
+        intent = stale_intents[dseq]
         allowed, reason = cleanup_identity.eligible(
-            address, str(dseq), placement_prefix, ownership_register
+            address, str(dseq), placement_prefix, ownership_register, intent
         )
         if not allowed:
             identity_held += 1
