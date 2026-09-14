@@ -365,6 +365,7 @@ from .owner_lookup import (  # noqa: E402, F401 - re-exported under their origin
     OWNER_LOOKUP_UNREADABLE,
     unresolved_verdict,
 )
+from .owner_lookup import is_transport_error as _is_transport_error  # noqa: E402, F401
 from .owner_lookup import lookup_owner as _lookup_owner  # noqa: E402
 
 
