@@ -27,6 +27,9 @@ from __future__ import annotations
 import base64
 import json
 import math
+import subprocess
+import sys
+import threading
 import time
 import urllib.error
 from pathlib import Path
@@ -214,6 +217,57 @@ def test_a_dseq_read_stall_ends_typed_with_attempts(console, monkeypatch) -> Non
     assert "wall-clock deadline" in str(excinfo.value)
     assert "attempts per wallet position:" in str(excinfo.value)
     assert elapsed < _TEST_DEADLINE + 2.0
+
+
+def test_every_lingering_worker_is_a_daemon_and_cannot_block_exit(console) -> None:
+    """(Review condition on #370.) An abandoned worker must be a DAEMON: a drip-fed
+    worker can outlive the deadline by minutes, and neither the process exit nor the
+    job's completion may wait for it."""
+    console["mint"][KEYS[0]] = STALL
+    console["mint"][KEYS[1]] = STALL
+    with pytest.raises(OwnerLookupUnresolved):
+        wallet_pool._raw_client_for_bound_owner(DSEQ, OWNER, "g")
+    lingering = [
+        t
+        for t in threading.enumerate()
+        if t is not threading.main_thread() and t.is_alive()
+    ]
+    assert lingering, "expected at least one abandoned worker from the stall"
+    assert all(t.daemon for t in lingering), [t.name for t in lingering if not t.daemon]
+
+
+def test_the_process_exits_promptly_with_a_lingering_worker() -> None:
+    """The exit-half of the same condition: a fresh interpreter abandons a 30s call
+    at the deadline and EXITS while the worker is still sleeping."""
+    code = (
+        "from just_akash.owner_lookup import Deadline, bounded_call\n"
+        "import time\n"
+        f"answered, _ = bounded_call(lambda: time.sleep(30), Deadline({_TEST_DEADLINE}))\n"
+        "assert not answered\n"
+        "print('returned-before-worker')\n"
+    )
+    started = time.monotonic()
+    proc = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=30
+    )
+    elapsed = time.monotonic() - started
+    assert proc.returncode == 0, proc.stderr[-500:]
+    assert "returned-before-worker" in proc.stdout
+    assert elapsed < 15, f"process waited for the abandoned worker: {elapsed:.1f}s"
+
+
+def test_abandoned_worker_count_is_bounded_by_the_keys(console) -> None:
+    """(Review condition on #370.) Worst case ONE abandoned worker per credential:
+    thread growth is bounded by the attempt budgets, never by the stall's duration."""
+    console["mint"][KEYS[0]] = STALL
+    console["mint"][KEYS[1]] = STALL
+    baseline = threading.active_count()
+    with pytest.raises(OwnerLookupUnresolved):
+        wallet_pool._raw_client_for_bound_owner(DSEQ, OWNER, "g")
+    lingerers = threading.active_count() - baseline
+    assert 0 < lingerers <= len(KEYS), (
+        f"{lingerers} lingering worker(s); at most one abandoned per key is acceptable"
+    )
 
 
 def _owner_lookup_jobs() -> list[tuple[str, str, int | None]]:
