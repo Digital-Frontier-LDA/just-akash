@@ -876,117 +876,219 @@ def unexplained(hits: list[Hit], baseline: Mapping[tuple[str, str, str, str], tu
 # Measured on 2026-09-14 at 7d1ba709: 75 hits (R1 40, R2 29, R3 3, R4 3) under 74 keys. Each
 # entry says why the site is not a false green today, or names a defect tracked in an issue.
 # The comment above each entry is the start of its normalised offending text, for finding it.
+# Each key line carries `# pragma: allowlist secret`: its 12-hex digest is a content hash, and
+# detect-secrets reads any short hex run as a possible credential.
 # ⛔ SHRINK-ONLY: delete an entry when its site is fixed. Adding one is a reviewed decision,
 # not a way to make this test pass.
 BASELINE: dict[tuple[str, str, str, str], tuple[int, str]] = {
     # R1 — broad except that swallows
     # except Exception: return (UNKNOWN, lived)
-    ("R1", "canary/closure.py", "attribute_detailed", "4d49026ddf73"): (
+    (
+        "R1",
+        "canary/closure.py",
+        "attribute_detailed",
+        "4d49026ddf73",  # pragma: allowlist secret
+    ): (
         1,
         "an unexpected shape is attributed UNKNOWN, never a false blame",
     ),
     # except Exception: return (UNKNOWN, None)
-    ("R1", "canary/closure.py", "attribute_detailed", "54c0f40f79d8"): (
+    (
+        "R1",
+        "canary/closure.py",
+        "attribute_detailed",
+        "54c0f40f79d8",  # pragma: allowlist secret
+    ): (
         1,
         "an unreadable chain is attributed UNKNOWN, never a cause",
     ),
     # except Exception: block = None
-    ("R1", "canary/closure.py", "attribute_detailed", "e22e90f0a54b"): (
+    (
+        "R1",
+        "canary/closure.py",
+        "attribute_detailed",
+        "e22e90f0a54b",  # pragma: allowlist secret
+    ): (
         1,
         "a missing settlement block falls back to the escrow-only verdict",
     ),
     # except Exception: result = UNKNOWN
-    ("R1", "canary/collect.py", "merge", "bb8daa36833e"): (
+    ("R1", "canary/collect.py", "merge", "bb8daa36833e"): (  # pragma: allowlist secret
         1,
         "a broken attributor records cause UNKNOWN for that lease",
     ),
     # except Exception: pass
-    ("R1", "just_akash/_diagnostics.py", "emit", "a2ad58d9f50d"): (
+    ("R1", "just_akash/_diagnostics.py", "emit", "a2ad58d9f50d"): (  # pragma: allowlist secret
         1,
         "the diagnostics emitter itself; writing to stderr is what failed",
     ),
     # except Exception: pass
-    ("R1", "just_akash/_e2e.py", "_confirm_settled_single_reader", "a2ad58d9f50d"): (
+    (
+        "R1",
+        "just_akash/_e2e.py",
+        "_confirm_settled_single_reader",
+        "a2ad58d9f50d",  # pragma: allowlist secret
+    ): (
         1,
         "a failed probe leaves got_open False, so the audit returns None and fails closed",
     ),
     # except Exception: snapshot = None
-    ("R1", "just_akash/_lease_verification.py", "consensus", "f9a071386b9c"): (
+    (
+        "R1",
+        "just_akash/_lease_verification.py",
+        "consensus",
+        "f9a071386b9c",  # pragma: allowlist secret
+    ): (
         1,
         "an endpoint that errors abstains; consensus refuses without two agreeing snapshots",
     ),
     # except Exception: return False
-    ("R1", "just_akash/_lease_verification.py", "deployment_closed", "7bea3bdfca89"): (
+    (
+        "R1",
+        "just_akash/_lease_verification.py",
+        "deployment_closed",
+        "7bea3bdfca89",  # pragma: allowlist secret
+    ): (
         1,
         "an unreadable deployment reads as not closed (False), the safe direction",
     ),
     # except Exception: _FEATURE_CAP_MS = {}
-    ("R1", "just_akash/analyze_telemetry.py", "<file>", "d911204aafec"): (
+    (
+        "R1",
+        "just_akash/analyze_telemetry.py",
+        "<file>",
+        "d911204aafec",  # pragma: allowlist secret
+    ): (
         1,
         "module-import fallback for standalone telemetry analysis; no lease verdict",
     ),
     # except Exception: continue
-    ("R1", "just_akash/chain.py", "_corroborated_deployment_group_names", "af10980773d7"): (
+    (
+        "R1",
+        "just_akash/chain.py",
+        "_corroborated_deployment_group_names",
+        "af10980773d7",  # pragma: allowlist secret
+    ): (
         1,
         "a failed source contributes no authority to the corroborated group names",
     ),
     # except Exception: return None
-    ("R1", "just_akash/chain.py", "_owner_close_evidence.fetch", "eaf9362805e8"): (
+    (
+        "R1",
+        "just_akash/chain.py",
+        "_owner_close_evidence.fetch",
+        "eaf9362805e8",  # pragma: allowlist secret
+    ): (
         1,
         "a transport failure abstains from the height-pinned read",
     ),
     # except Exception: return None
-    ("R1", "just_akash/chain.py", "_read_source_document", "eaf9362805e8"): (
+    (
+        "R1",
+        "just_akash/chain.py",
+        "_read_source_document",
+        "eaf9362805e8",  # pragma: allowlist secret
+    ): (
         1,
         "an unavailable trust path contributes no vote",
     ),
     # except Exception: unresolved.append(position) continue
-    ("R1", "just_akash/cleanup_stale.py", "_resolve_distinct_accounts", "242e4308cd07"): (
+    (
+        "R1",
+        "just_akash/cleanup_stale.py",
+        "_resolve_distinct_accounts",
+        "242e4308cd07",  # pragma: allowlist secret
+    ): (
         1,
         "an unidentifiable key is appended to `unresolved` and reported",
     ),
     # except Exception: address = ''
-    ("R1", "just_akash/cli.py", "_warn_if_listing_degraded", "e2953895fa08"): (
+    (
+        "R1",
+        "just_akash/cli.py",
+        "_warn_if_listing_degraded",
+        "e2953895fa08",  # pragma: allowlist secret
+    ): (
         1,
         "no address means no corroboration; corroborate_listing classifies the unreadable source",
     ),
     # except Exception: owner = ''
-    ("R1", "just_akash/deploy.py", "_report_suspected_orphans", "548e8c096c38"): (
+    (
+        "R1",
+        "just_akash/deploy.py",
+        "_report_suspected_orphans",
+        "548e8c096c38",  # pragma: allowlist secret
+    ): (
         1,
         "orphan diagnosis on an already-failing create; owner degrades to empty",
     ),
     # except Exception: names = []
-    ("R1", "just_akash/deploy.py", "_report_suspected_orphans", "ee5c87462490"): (
+    (
+        "R1",
+        "just_akash/deploy.py",
+        "_report_suspected_orphans",
+        "ee5c87462490",  # pragma: allowlist secret
+    ): (
         1,
         "orphan diagnosis weakens its claim; the create failure is still raised",
     ),
     # except Exception: return None
-    ("R1", "just_akash/orphan_detect.py", "active_leases_for", "eaf9362805e8"): (
+    (
+        "R1",
+        "just_akash/orphan_detect.py",
+        "active_leases_for",
+        "eaf9362805e8",  # pragma: allowlist secret
+    ): (
         1,
         "a read failure returns None (UNKNOWN), never 'no leases'",
     ),
     # except Exception: return None
-    ("R1", "just_akash/orphan_detect.py", "live_orders_for", "eaf9362805e8"): (
+    (
+        "R1",
+        "just_akash/orphan_detect.py",
+        "live_orders_for",
+        "eaf9362805e8",  # pragma: allowlist secret
+    ): (
         1,
         "a read failure returns None (UNKNOWN), never 'no orders'",
     ),
     # except Exception: return None
-    ("R1", "just_akash/runner_probe.py", "_pod_started", "eaf9362805e8"): (
+    (
+        "R1",
+        "just_akash/runner_probe.py",
+        "_pod_started",
+        "eaf9362805e8",  # pragma: allowlist secret
+    ): (
         1,
         "a read error returns None (unknown), never 'no pod'",
     ),
     # except Exception: runs = []
-    ("R1", "just_akash/runner_probe.py", "_run_noop_job", "4851c1bbcf1b"): (
+    (
+        "R1",
+        "just_akash/runner_probe.py",
+        "_run_noop_job",
+        "4851c1bbcf1b",  # pragma: allowlist secret
+    ): (
         1,
         "an unparseable run listing keeps the probe waiting until its deadline",
     ),
     # except Exception: return False
-    ("R1", "just_akash/smoke_providers.py", "_availability_ready", "7bea3bdfca89"): (
+    (
+        "R1",
+        "just_akash/smoke_providers.py",
+        "_availability_ready",
+        "7bea3bdfca89",  # pragma: allowlist secret
+    ): (
         1,
         "readiness unreadable counts as not ready, the safe direction",
     ),
     # except Exception: return None
-    ("R1", "just_akash/smoke_providers.py", "_dead_state", "eaf9362805e8"): (
+    (
+        "R1",
+        "just_akash/smoke_providers.py",
+        "_dead_state",
+        "eaf9362805e8",  # pragma: allowlist secret
+    ): (
         1,
         "state unreadable returns None; a transient read error is not treated as dead",
     ),
@@ -995,75 +1097,145 @@ BASELINE: dict[tuple[str, str, str, str], tuple[int, str]] = {
         "R1",
         "just_akash/smoke_providers.py",
         "_delete_resolved_provider_smoke_receipts",
-        "af10980773d7",
+        "af10980773d7",  # pragma: allowlist secret
     ): (1, "an unreadable receipt is kept on disk for the upload step"),
     # except Exception: receipt, receipt_dseq = (None, None)
-    ("R1", "just_akash/smoke_providers.py", "_deploy", "255c018c294b"): (
+    (
+        "R1",
+        "just_akash/smoke_providers.py",
+        "_deploy",
+        "255c018c294b",  # pragma: allowlist secret
+    ): (
         1,
         "DEFECT (#376): a failed receipt read or reconciliation is swallowed unlogged",
     ),
     # except Exception: pass
-    ("R1", "just_akash/smoke_providers.py", "_deploy", "a2ad58d9f50d"): (
+    (
+        "R1",
+        "just_akash/smoke_providers.py",
+        "_deploy",
+        "a2ad58d9f50d",  # pragma: allowlist secret
+    ): (
         1,
         "DEFECT (#376): interrupt-path cleanup errors are swallowed unlogged",
     ),
     # except Exception: return False
-    ("R1", "just_akash/smoke_providers.py", "_exec_works", "7bea3bdfca89"): (
+    (
+        "R1",
+        "just_akash/smoke_providers.py",
+        "_exec_works",
+        "7bea3bdfca89",  # pragma: allowlist secret
+    ): (
         1,
         "exec probe failure reports 'unreachable' in the diagnostic",
     ),
     # except Exception: pass
-    ("R1", "just_akash/smoke_providers.py", "_explain_deploy_failed", "a2ad58d9f50d"): (
+    (
+        "R1",
+        "just_akash/smoke_providers.py",
+        "_explain_deploy_failed",
+        "a2ad58d9f50d",  # pragma: allowlist secret
+    ): (
         1,
         "best-effort evidence printing on an already-failed deploy",
     ),
     # except Exception: return None
-    ("R1", "just_akash/smoke_providers.py", "_ingress_uri", "eaf9362805e8"): (
+    (
+        "R1",
+        "just_akash/smoke_providers.py",
+        "_ingress_uri",
+        "eaf9362805e8",  # pragma: allowlist secret
+    ): (
         1,
         "no ingress URI yet returns None, which keeps waiting",
     ),
     # except Exception: pass
-    ("R1", "just_akash/smoke_providers.py", "_observe_after_cap", "a2ad58d9f50d"): (
+    (
+        "R1",
+        "just_akash/smoke_providers.py",
+        "_observe_after_cap",
+        "a2ad58d9f50d",  # pragma: allowlist secret
+    ): (
         1,
         "post-cap diagnostic probe; the timeout verdict is already recorded",
     ),
     # except Exception: return 'unknown'
-    ("R1", "just_akash/smoke_providers.py", "_pkg_version", "c96db9388dd9"): (
+    (
+        "R1",
+        "just_akash/smoke_providers.py",
+        "_pkg_version",
+        "c96db9388dd9",  # pragma: allowlist secret
+    ): (
         1,
         "telemetry version label degrades to 'unknown'",
     ),
     # except Exception: return 'unreachable'
-    ("R1", "just_akash/smoke_providers.py", "_probe_in_pod_marker", "fcca9498f9d9"): (
+    (
+        "R1",
+        "just_akash/smoke_providers.py",
+        "_probe_in_pod_marker",
+        "fcca9498f9d9",  # pragma: allowlist secret
+    ): (
         1,
         "in-pod marker probe reports 'unreachable' as its own diagnostic value",
     ),
     # except Exception: avail = None
-    ("R1", "just_akash/smoke_providers.py", "_record_ingress_timeout", "b465c434c100"): (
+    (
+        "R1",
+        "just_akash/smoke_providers.py",
+        "_record_ingress_timeout",
+        "b465c434c100",  # pragma: allowlist secret
+    ): (
         1,
         "diagnostic evidence for an ingress timeout; the verdict never changes",
     ),
     # except Exception: info = {}
-    ("R1", "just_akash/smoke_providers.py", "_record_no_bid_evidence", "3e1b56a528ff"): (
+    (
+        "R1",
+        "just_akash/smoke_providers.py",
+        "_record_no_bid_evidence",
+        "3e1b56a528ff",  # pragma: allowlist secret
+    ): (
         1,
         "best-effort no-bid evidence; provider info degrades to empty",
     ),
     # except Exception: dead = False
-    ("R1", "just_akash/smoke_providers.py", "_record_ready_timeout", "45caeacc1ef1"): (
+    (
+        "R1",
+        "just_akash/smoke_providers.py",
+        "_record_ready_timeout",
+        "45caeacc1ef1",  # pragma: allowlist secret
+    ): (
         1,
         "diagnostic evidence for a ready timeout; the verdict never changes",
     ),
     # except Exception: avail = None
-    ("R1", "just_akash/smoke_providers.py", "_record_ready_timeout", "b465c434c100"): (
+    (
+        "R1",
+        "just_akash/smoke_providers.py",
+        "_record_ready_timeout",
+        "b465c434c100",  # pragma: allowlist secret
+    ): (
         1,
         "diagnostic evidence for a ready timeout; the verdict never changes",
     ),
     # except Exception: avail = None
-    ("R1", "just_akash/smoke_providers.py", "_record_update_timeout", "b465c434c100"): (
+    (
+        "R1",
+        "just_akash/smoke_providers.py",
+        "_record_update_timeout",
+        "b465c434c100",  # pragma: allowlist secret
+    ): (
         1,
         "diagnostic evidence for an update timeout; the timeout verdict stands",
     ),
     # except Exception: return None
-    ("R1", "just_akash/smoke_providers.py", "_service_availability", "eaf9362805e8"): (
+    (
+        "R1",
+        "just_akash/smoke_providers.py",
+        "_service_availability",
+        "eaf9362805e8",  # pragma: allowlist secret
+    ): (
         1,
         "availability unreadable returns None, which keeps waiting",
     ),
@@ -1072,15 +1244,25 @@ BASELINE: dict[tuple[str, str, str, str], tuple[int, str]] = {
         "R1",
         "just_akash/transport/lease_shell.py",
         "LeaseShellTransport._send_resize",
-        "7bea3bdfca89",
+        "7bea3bdfca89",  # pragma: allowlist secret
     ): (1, "terminal resize is best-effort and returns False; not a lease verdict"),
     # except Exception: continue
-    ("R1", "just_akash/wallet_pool.py", "_chain_height", "af10980773d7"): (
+    (
+        "R1",
+        "just_akash/wallet_pool.py",
+        "_chain_height",
+        "af10980773d7",  # pragma: allowlist secret
+    ): (
         1,
         "LCD failover; every endpoint failing raises RuntimeError",
     ),
     # except Exception: return None
-    ("R1", "just_akash/wallet_pool.py", "_credit_at", "eaf9362805e8"): (
+    (
+        "R1",
+        "just_akash/wallet_pool.py",
+        "_credit_at",
+        "eaf9362805e8",  # pragma: allowlist secret
+    ): (
         1,
         "an unprovable endpoint abstains; _quorum_uact requires two agreeing readings",
     ),
@@ -1090,69 +1272,84 @@ BASELINE: dict[tuple[str, str, str, str], tuple[int, str]] = {
         "R2",
         ".github/workflows/ci.yml",
         "e2e-secrets/Preserve unresolved deployment receipt",
-        "d4f17979db7f",
+        "d4f17979db7f",  # pragma: allowlist secret
     ): (1, "a verified closure deletes the receipt, so absence is the success case"),
     # if-no-files-found: ignore
     (
         "R2",
         ".github/workflows/ci.yml",
         "e2e-shell/Preserve unresolved lease-shell deployment receipt",
-        "d4f17979db7f",
+        "d4f17979db7f",  # pragma: allowlist secret
     ): (1, "a verified closure deletes the receipt, so absence is the success case"),
     # owner="$(python3 -c 'import json;print(json.load(open("credit.json")).…
     (
         "R2",
         ".github/workflows/provider-canary.yml",
         "canary/Collect from inside every deployment",
-        "294057ef03aa",
+        "294057ef03aa",  # pragma: allowlist secret
     ): (1, "empty owner degrades attribution to cause=unknown, handled by the next `if`"),
     # sed 's/^/ /' orphan-scan.err | tail -5 || true
     (
         "R2",
         ".github/workflows/provider-canary.yml",
         "canary/Collect from inside every deployment",
-        "fcc98e63aadc",
+        "fcc98e63aadc",  # pragma: allowlist secret
     ): (1, "prints the orphan-scan stderr tail inside a ::warning branch"),
     # uv run just-akash tag --dseq "$dseq" --name "canary-${provider}" || tr…
     (
         "R2",
         ".github/workflows/provider-canary.yml",
         "canary/Deploy canaries for providers missing one",
-        "3c79a14f4e9b",
+        "3c79a14f4e9b",  # pragma: allowlist secret
     ): (1, "the tag is a local convenience; canary identity is read off the deployment"),
     # status=$(python -c "import json,sys;print(json.load(open('credit.json'…
     (
         "R2",
         ".github/workflows/provider-canary.yml",
         "canary/Deploy canaries for providers missing one",
-        "6568cd459338",
+        "6568cd459338",  # pragma: allowlist secret
     ): (1, "empty status from an unreadable credit.json fails != OK, which skips creation"),
     # dseq=$(grep -oE 'dseq[ =:]+[0-9]+' "deploy-${provider}.log" | grep -oE…
     (
         "R2",
         ".github/workflows/provider-canary.yml",
         "canary/Deploy canaries for providers missing one",
-        "f89c8c101706",
+        "f89c8c101706",  # pragma: allowlist secret
     ): (1, "empty dseq from the deploy log is handled by the next `if`"),
     # continue-on-error: true
     (
         "R2",
         ".github/workflows/provider-canary.yml",
         "canary/Re-resolve targets after any deploy",
-        "9ff6534d73ee",
+        "9ff6534d73ee",  # pragma: allowlist secret
     ): (1, "re-resolve after deploy; a failure leaves the first resolve's targets.json"),
     # cat credit.json 2>/dev/null || true
-    ("R2", ".github/workflows/provider-canary.yml", "canary/Read deploy credit", "0ef5ef2a6909"): (
+    (
+        "R2",
+        ".github/workflows/provider-canary.yml",
+        "canary/Read deploy credit",
+        "0ef5ef2a6909",  # pragma: allowlist secret
+    ): (
         1,
         "prints credit.json into the log; the gate reads the file below",
     ),
     # timeout 120 uv run just-akash balance --json || true
-    ("R2", ".github/workflows/provider-canary.yml", "canary/Read deploy credit", "7fdc3c5699ef"): (
+    (
+        "R2",
+        ".github/workflows/provider-canary.yml",
+        "canary/Read deploy credit",
+        "7fdc3c5699ef",  # pragma: allowlist secret
+    ): (
         1,
         "full balance printed for the log only",
     ),
     # [ -s credit.err ] && cat credit.err || true
-    ("R2", ".github/workflows/provider-canary.yml", "canary/Read deploy credit", "ce92d9193896"): (
+    (
+        "R2",
+        ".github/workflows/provider-canary.yml",
+        "canary/Read deploy credit",
+        "ce92d9193896",  # pragma: allowlist secret
+    ): (
         1,
         "prints credit.err into the log only",
     ),
@@ -1161,115 +1358,120 @@ BASELINE: dict[tuple[str, str, str, str], tuple[int, str]] = {
         "R2",
         ".github/workflows/provider-canary.yml",
         "canary/Resolve which providers still have a live canary",
-        "e7a2d2405555",
+        "e7a2d2405555",  # pragma: allowlist secret
     ): (1, "echo of the missing-provider list for the log only"),
     # python3 -m just_akash.analyze_telemetry accrued.jsonl --shim-survey ||…
     (
         "R2",
         ".github/workflows/provider-smoke.yml",
         "report/Aggregate + latency gate",
-        "a4ce1a73097f",
+        "a4ce1a73097f",  # pragma: allowlist secret
     ): (1, "advisory shim survey; the SLO gate below still runs"),
     # if-no-files-found: ignore
     (
         "R2",
         ".github/workflows/provider-smoke.yml",
         "smoke/Preserve unresolved provider-smoke deployment receipts",
-        "d4f17979db7f",
+        "d4f17979db7f",  # pragma: allowlist secret
     ): (1, "a verified closure deletes the receipts, so absence is the success case"),
     # continue-on-error: true
     (
         "R2",
         ".github/workflows/provider-smoke.yml",
         "smoke/Snapshot deploy credit",
-        "9ff6534d73ee",
+        "9ff6534d73ee",  # pragma: allowlist secret
     ): (1, "credit snapshot is observational; the accrue render uses the last snapshot"),
     # WALLET=$(awk -F': +' '/^[[:space:]]*Wallet:/{print $2; exit}' /tmp/ja.…
     (
         "R2",
         ".github/workflows/runner-pool.yml",
         "pool/Provision (retry down candidates, tag before waiting)",
-        "0f2a0cb14a3d",
+        "0f2a0cb14a3d",  # pragma: allowlist secret
     ): (1, "awk on a missing log; wallet is published only for a DSEQ round (#348)"),
     # "${JA[@]}" tag --dseq "$DSEQ" --name "${TAG_PREFIX}-${RUN_ID}" || true
     (
         "R2",
         ".github/workflows/runner-pool.yml",
         "pool/Provision (retry down candidates, tag before waiting)",
-        "20d2c8273401",
+        "20d2c8273401",  # pragma: allowlist secret
     ): (1, "tag before the destroy retry loop; the destroy is what is checked"),
     # VERDICT_MINTED=$(printf '%s' "$VERDICT_RESP" | sed -n 's/.*"token" *: …
     (
         "R2",
         ".github/workflows/runner-pool.yml",
         "pool/Provision (retry down candidates, tag before waiting)",
-        "2cd988bbbefb",
+        "2cd988bbbefb",  # pragma: allowlist secret
     ): (1, "token extraction for masking; an empty token is refused by the guard below"),
     # WALLET_UACT=$(awk '/^[[:space:]]*Wallet available:/{print $(NF-1); exi…
     (
         "R2",
         ".github/workflows/runner-pool.yml",
         "pool/Provision (retry down candidates, tag before waiting)",
-        "45e6a922369c",
+        "45e6a922369c",  # pragma: allowlist secret
     ): (1, "wallet-available figure for the log; not a gate"),
     # PROVIDER=$(awk -F': +' '/^[[:space:]]*Provider:/{print $2; exit}' /tmp…
     (
         "R2",
         ".github/workflows/runner-pool.yml",
         "pool/Provision (retry down candidates, tag before waiting)",
-        "49ddce72bb8f",
+        "49ddce72bb8f",  # pragma: allowlist secret
     ): (1, "awk on a missing log; empty PROVIDER closes the DSEQ below"),
     # GATE_DEAD=$(printf '%s\n' "$RUNNER_VERSIONS" | grep -cxF -- "null" || …
     (
         "R2",
         ".github/workflows/runner-pool.yml",
         "pool/Provision (retry down candidates, tag before waiting)",
-        "58f543325b69",
+        "58f543325b69",  # pragma: allowlist secret
     ): (1, "`grep -c` exits 1 on zero matches while printing 0; the count is gated"),
     # --bid-wait-retry 120 "${SELECT_ARGS[@]}" "${PROV_ARGS[@]}" 2>&1 | tee …
     (
         "R2",
         ".github/workflows/runner-pool.yml",
         "pool/Provision (retry down candidates, tag before waiting)",
-        "76a6828d2ce6",
+        "76a6828d2ce6",  # pragma: allowlist secret
     ): (1, "deploy outcome is read from the log; DSEQ and LEASE_CREATE_FAILED recovery below"),
     # ONLINE=$(printf '%s\n' "$RUNNER_IDS" | grep -c . || true)
     (
         "R2",
         ".github/workflows/runner-pool.yml",
         "pool/Provision (retry down candidates, tag before waiting)",
-        "7e97ecd1cba8",
+        "7e97ecd1cba8",  # pragma: allowlist secret
     ): (1, "`grep -c` exits 1 on zero matches while printing 0; the count is gated"),
     # VERDICT_RESP=$(gh api --method POST "orgs/${ORG}/actions/runners/regis…
     (
         "R2",
         ".github/workflows/runner-pool.yml",
         "pool/Provision (retry down candidates, tag before waiting)",
-        "83245f3e0d2e",
+        "83245f3e0d2e",  # pragma: allowlist secret
     ): (1, "captures the token-mint response; the guard below classifies it"),
     # GATE_WRONG=$(printf '%s\n' "$RUNNER_VERSIONS" | grep -vxF -- "null" | …
     (
         "R2",
         ".github/workflows/runner-pool.yml",
         "pool/Provision (retry down candidates, tag before waiting)",
-        "cbec588f7541",
+        "cbec588f7541",  # pragma: allowlist secret
     ): (1, "`grep -c` exits 1 on zero matches while printing 0; the count is gated"),
     # BAD_PAGES=$(printf '%s' "$RUNNER_PAGES" | jq -r 'select(has("runners")…
     (
         "R2",
         ".github/workflows/runner-pool.yml",
         "pool/Provision (retry down candidates, tag before waiting)",
-        "f11f90afd4b3",
+        "f11f90afd4b3",  # pragma: allowlist secret
     ): (1, "`grep -c` exits 1 on zero matches while printing 0; the count is gated"),
     # ' /tmp/ja.log || true)
     (
         "R2",
         ".github/workflows/runner-pool.yml",
         "pool/Provision (retry down candidates, tag before waiting)",
-        "febe634fb7db",
+        "febe634fb7db",  # pragma: allowlist secret
     ): (1, "awk on a missing log yields empty DSEQ, the no-deployment branch"),
     # sed -e 's/^/ /' /tmp/owner.err >&2 || true
-    ("R2", ".github/workflows/runner-teardown.yml", "teardown/Close the lease", "071b2a82f956"): (
+    (
+        "R2",
+        ".github/workflows/runner-teardown.yml",
+        "teardown/Close the lease",
+        "071b2a82f956",  # pragma: allowlist secret
+    ): (
         2,
         "indents resolve-owner stderr inside a branch that exits 1",
     ),
@@ -1279,14 +1481,14 @@ BASELINE: dict[tuple[str, str, str, str], tuple[int, str]] = {
         "R3",
         ".github/workflows/provider-canary.yml",
         "canary/Say so if canaries are missing and we did not deploy",
-        "7e3fc57c5f73",
+        "7e3fc57c5f73",  # pragma: allowlist secret
     ): (1, "missing.txt absent is a named ::error; the step continues so collect still publishes"),
     # if [ "$GH_RC" -ne 0 ]; then
     (
         "R3",
         ".github/workflows/runner-teardown.yml",
         "teardown/De-register offline runners for this label",
-        "5137207716fb",
+        "5137207716fb",  # pragma: allowlist secret
     ): (
         1,
         "registrations only: published as outputs deregistered and deregister_failed=unmeasured",
@@ -1296,24 +1498,39 @@ BASELINE: dict[tuple[str, str, str, str], tuple[int, str]] = {
         "R3",
         ".github/workflows/runner-teardown.yml",
         "teardown/De-register offline runners for this label",
-        "664d14642554",
+        "664d14642554",  # pragma: allowlist secret
     ): (
         1,
         "registrations only: published as output deregister_failed=unmeasured, plus a ::warning",
     ),
     # R4 — observer counts
     # if len ( seen ) == 1 :
-    ("R4", "just_akash/test_shell_e2e.py", "_dseq_from_deploy_log", "48f6bd5cecac"): (
+    (
+        "R4",
+        "just_akash/test_shell_e2e.py",
+        "_dseq_from_deploy_log",
+        "48f6bd5cecac",  # pragma: allowlist secret
+    ): (
         1,
         "`seen` is a set of DSEQs found in a log, not chain observers",
     ),
     # observations = build_observations ( owner , state , height )
-    ("R4", "just_akash/unleased_orders.py", "audit_owner", "0ef278995075"): (
+    (
+        "R4",
+        "just_akash/unleased_orders.py",
+        "audit_owner",
+        "0ef278995075",  # pragma: allowlist secret
+    ): (
         1,
         "order observations from one chain read, not independent observers",
     ),
     # if len ( endpoints ) == 1 :
-    ("R4", "just_akash/wallet_pool.py", "_default_credit_reader", "fe211630d77e"): (
+    (
+        "R4",
+        "just_akash/wallet_pool.py",
+        "_default_credit_reader",
+        "fe211630d77e",  # pragma: allowlist secret
+    ): (
         1,
         "an explicit AKASH_REST_URL is honoured alone by design (chain.rest_urls)",
     ),
