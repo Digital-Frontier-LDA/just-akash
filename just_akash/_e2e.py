@@ -13,7 +13,6 @@ here, not by patching three call sites.
 import json
 import os
 import re
-import shlex
 import signal
 import subprocess
 import sys
@@ -106,24 +105,22 @@ def assert_provider_in_tiers(
 
 
 def _run(
-    cmd: str,
+    cmd: list[str],
     *,
     timeout: int = 60,
     input_text: str | None = None,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     if env is None:
-        return subprocess.run(  # noqa: S602 - existing callers pass fixed, quoted shapes
+        return subprocess.run(  # noqa: S603 - argv is constructed by this package
             cmd,
-            shell=True,
             capture_output=True,
             text=True,
             timeout=timeout,
             input=input_text,
         )
-    process = subprocess.Popen(  # noqa: S602 - callers pass fixed, quoted command shapes
+    process = subprocess.Popen(  # noqa: S603 - argv is constructed by this package
         cmd,
-        shell=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         stdin=subprocess.PIPE if input_text is not None else None,
@@ -220,7 +217,7 @@ def resolve_deployment_owner(dseq: str) -> str:
     Console deployment record may disappear immediately after close, while the
     settlement verifier still needs the owner-scoped chain identity.
     """
-    cmd = f"uv run just-akash resolve-owner --dseq {shlex.quote(str(dseq))} --json"
+    cmd = ["uv", "run", "just-akash", "resolve-owner", "--dseq", str(dseq), "--json"]
     result = _run(cmd, timeout=60)
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout or "owner resolution failed").strip())
@@ -311,7 +308,7 @@ def _confirm_settled_single_reader(
     for attempt in range(1, attempts + 1):
         got_open = False
         try:
-            cmd = f"uv run just-akash status --dseq {shlex.quote(str(dseq))} --json"
+            cmd = ["uv", "run", "just-akash", "status", "--dseq", str(dseq), "--json"]
             r = _run(cmd, timeout=30)
             if r.returncode == 0 and r.stdout:
                 state = str(json.loads(r.stdout).get("state", "")).strip().lower()
@@ -419,14 +416,22 @@ def robust_destroy(
                 direct_client.close_deployment(str(dseq))
                 r = subprocess.CompletedProcess([], 0, "Deployment closed", "")
             elif owner is None or group is None:
-                command = f"just destroy {shlex.quote(str(dseq))}"
+                command = ["just", "destroy", str(dseq)]
                 r = _run(command, input_text="y\n", timeout=60)
             else:
-                command = (
-                    f"uv run just-akash destroy --dseq {shlex.quote(str(dseq))} "
-                    f"--expected-owner {shlex.quote(owner)} -y"
-                )
-                command += f" --expected-group {shlex.quote(group)}"
+                command = [
+                    "uv",
+                    "run",
+                    "just-akash",
+                    "destroy",
+                    "--dseq",
+                    str(dseq),
+                    "--expected-owner",
+                    owner,
+                    "-y",
+                    "--expected-group",
+                    group,
+                ]
                 r = _run(command, input_text="y\n", timeout=60)
             if _destroy_succeeded(r):
                 _pass(

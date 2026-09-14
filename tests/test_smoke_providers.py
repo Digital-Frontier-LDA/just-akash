@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import inspect
 import os
-import re
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -2366,11 +2365,11 @@ class TestBidWaitInvariant:
     exactly that command, so every deploy died in ~250ms before touching the
     network and all three providers scored FAIL for five days.
 
-    Nothing caught it: _deploy's own tests mock _run, so the command string was
+    Nothing caught it: _deploy's own tests mock _run, so the command argv was
     never checked against the callee's contract.
     """
 
-    def _built_command(self) -> str:
+    def _built_command(self) -> list[str]:
         captured: dict = {}
 
         def fake_run(cmd, **kw):
@@ -2382,10 +2381,11 @@ class TestBidWaitInvariant:
         return captured["cmd"]
 
     @staticmethod
-    def _flag(cmd: str, flag: str) -> int:
-        m = re.search(rf"{re.escape(flag)} (\d+)", cmd)
-        assert m is not None, f"{flag} missing or reformatted in the built command: {cmd}"
-        return int(m.group(1))
+    def _flag(cmd: list[str], flag: str) -> int:
+        assert cmd.count(flag) == 1, f"{flag} missing or duplicated in built argv: {cmd}"
+        index = cmd.index(flag)
+        assert index + 1 < len(cmd), f"{flag} has no value in built argv: {cmd}"
+        return int(cmd[index + 1])
 
     def test_retry_is_at_least_the_wait(self):
         cmd = self._built_command()

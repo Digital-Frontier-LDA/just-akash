@@ -39,8 +39,8 @@ HTTP 402 (insufficient Console credit — nothing is created on-chain) skips the
 whole run as NO-CREDIT. Along with NO-BID, these are "couldn't test", never
 "failed".
 
-Run from the repository root: cleanup goes through robust_destroy(), which shells
-out to `just destroy` / `just list`, so the Justfile and `just` must be available.
+Run from the repository root: cleanup goes through robust_destroy(), which invokes
+`just destroy`, so the Justfile and `just` must be available.
 """
 
 from __future__ import annotations
@@ -60,7 +60,6 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from shlex import quote as q
 
 from ._diagnostics import Code, emit
 from ._e2e import (
@@ -708,7 +707,8 @@ def _capture_diagnostics(dseq: str, reason: str) -> None:
     for kind, dur in (("events", 12), ("logs", 8)):
         try:
             r = _run(
-                f"uv run just-akash {kind} --dseq {q(dseq)} --duration {dur}", timeout=dur + 25
+                ["uv", "run", "just-akash", kind, "--dseq", dseq, "--duration", str(dur)],
+                timeout=dur + 25,
             )
             lines = [ln for ln in (r.stdout or "").splitlines() if ln.strip()]
             if kind == "logs":
@@ -1009,9 +1009,17 @@ def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, s
     """
     receipt_path, operation_id, receipt_env = receipt_environment("provider-smoke", unique=True)
     dseq_ref["receipt_path"] = receipt_path
-    command = (
-        f"uv run just-akash deploy --sdl {q(sdl_path)} "
-        f"--provider {q(provider)} --backup-provider '' "
+    command = [
+        "uv",
+        "run",
+        "just-akash",
+        "deploy",
+        "--sdl",
+        sdl_path,
+        "--provider",
+        provider,
+        "--backup-provider",
+        "",
         # deploy() maps these onto AuctionPolicy, which bounds BOTH windows:
         #   collection_window_seconds = bid_wait                 must be 0..60
         #   fallback_window_seconds   = bid_wait_retry - bid_wait must be 0..120
@@ -1022,10 +1030,15 @@ def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, s
         # ~250ms from 2026-08-22. 60/180 is the longest legal auction: a 60s
         # collection window plus a 120s fallback, both at the maximum, keeping the
         # 180s total the original pair was reaching for.
-        f"--bid-wait 60 --bid-wait-retry 180 "
-        f"--receipt-path {q(str(receipt_path))} "
-        f"--receipt-operation-id {q(operation_id)}"
-    )
+        "--bid-wait",
+        "60",
+        "--bid-wait-retry",
+        "180",
+        "--receipt-path",
+        str(receipt_path),
+        "--receipt-operation-id",
+        operation_id,
+    ]
     started_at = time.time()
     try:
         r = _run(command, env={**os.environ, **receipt_env}, timeout=420)
@@ -1121,7 +1134,7 @@ def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, s
 
 
 def _status_json(dseq: str) -> dict:
-    r = _run(f"uv run just-akash status --dseq {q(dseq)} --json", timeout=30)
+    r = _run(["uv", "run", "just-akash", "status", "--dseq", dseq, "--json"], timeout=30)
     try:
         data = json.loads(r.stdout)
     except (json.JSONDecodeError, TypeError):
@@ -1272,7 +1285,17 @@ def _wait_exec_ready(dseq: str, attempts: int = 12, interval: int = 8) -> bool:
     marker = "exec-ready-probe"
     for _ in range(attempts):
         r = _run(
-            f"uv run just-akash exec 'echo {marker}' --dseq {q(dseq)} --transport lease-shell",
+            [
+                "uv",
+                "run",
+                "just-akash",
+                "exec",
+                f"echo {marker}",
+                "--dseq",
+                dseq,
+                "--transport",
+                "lease-shell",
+            ],
             timeout=30,
         )
         if r.returncode == 0 and marker in (r.stdout or ""):
@@ -1331,8 +1354,19 @@ def _wait_ssh_ready(dseq: str, key: str, attempts: int = 15, interval: int = 8) 
     for _ in range(attempts):
         if _ssh_info(dseq) is not None:
             r = _run(
-                f"uv run just-akash exec 'echo ssh-ready' --dseq {q(dseq)} "
-                f"--transport ssh --key {q(key)}",
+                [
+                    "uv",
+                    "run",
+                    "just-akash",
+                    "exec",
+                    "echo ssh-ready",
+                    "--dseq",
+                    dseq,
+                    "--transport",
+                    "ssh",
+                    "--key",
+                    key,
+                ],
                 timeout=30,
             )
             if r.returncode == 0 and "ssh-ready" in (r.stdout or ""):
@@ -1434,14 +1468,24 @@ def _check_exec(dseq: str) -> bool:
     # field then unambiguously means the exec never ran (no-bid / never-ready).
     _EXEC_FRAME_SHAPES[dseq] = "unavailable"
     # JUST_AKASH_TRACE_FRAMES makes the transport emit a FRAME-TRACE line to stderr.
-    # Prefixing it into the shell command scopes it to THIS subprocess only -- an
-    # inherited env var would leak the trace into every other check that runs exec.
+    # Pass it in this subprocess's explicit environment so it cannot leak into every
+    # other check that runs exec.
     # On an empty-stdout FAIL the trace is the frame-level evidence for issue #3438
     # (a genuine DROP shows shape=[result] with no stdout frame).
     r = _run(
-        f"JUST_AKASH_TRACE_FRAMES=1 uv run just-akash exec 'echo {token}' "
-        f"--dseq {q(dseq)} --transport lease-shell",
+        [
+            "uv",
+            "run",
+            "just-akash",
+            "exec",
+            f"echo {token}",
+            "--dseq",
+            dseq,
+            "--transport",
+            "lease-shell",
+        ],
         timeout=45,
+        env={**os.environ, "JUST_AKASH_TRACE_FRAMES": "1"},
     )
     ok = r.returncode == 0 and token in (r.stdout or "")
     _note_exit_code_shapes(dseq, r.stderr or "")
@@ -1459,14 +1503,27 @@ def _check_exec(dseq: str) -> bool:
 def _inject_and_read(dseq: str, transport: str, key: str = "") -> bool:
     """Inject an env file over ``transport`` then read it back via exec."""
     remote = f"/tmp/smoke-inject-{transport}.env"  # path is inside the probe container
-    keyarg = f"--key {q(key)}" if key else ""
+    key_args = ["--key", key] if key else []
     with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as f:
         f.write("SMOKE_SECRET=injected_ok\nSECOND_VAR=hello_world\n")  # pragma: allowlist secret
         env_file = f.name
     try:
         inj = _run(
-            f"uv run just-akash inject --dseq {q(dseq)} --env-file {q(env_file)} "
-            f"--remote-path {q(remote)} --transport {transport} {keyarg}",
+            [
+                "uv",
+                "run",
+                "just-akash",
+                "inject",
+                "--dseq",
+                dseq,
+                "--env-file",
+                env_file,
+                "--remote-path",
+                remote,
+                "--transport",
+                transport,
+                *key_args,
+            ],
             timeout=60,
         )
         if inj.returncode != 0:
@@ -1478,8 +1535,18 @@ def _inject_and_read(dseq: str, transport: str, key: str = "") -> bool:
         # immediately, so a genuine inject regression is never masked.
         for attempt in range(_INJECT_READBACK_ATTEMPTS):
             back = _run(
-                f"uv run just-akash exec 'cat {q(remote)}' --dseq {q(dseq)} "
-                f"--transport {transport} {keyarg}",
+                [
+                    "uv",
+                    "run",
+                    "just-akash",
+                    "exec",
+                    f"cat {remote}",
+                    "--dseq",
+                    dseq,
+                    "--transport",
+                    transport,
+                    *key_args,
+                ],
                 timeout=45,
             )
             out = back.stdout or ""
@@ -1518,7 +1585,7 @@ def _check_stream(dseq: str, command: str) -> bool:
     an argparse error), so the command must not include it.
     """
     start = time.monotonic()
-    r = _run(f"uv run just-akash {command} --dseq {q(dseq)} --duration 8", timeout=40)
+    r = _run(["uv", "run", "just-akash", command, "--dseq", dseq, "--duration", "8"], timeout=40)
     elapsed = time.monotonic() - start
     got_output = any(line.strip() for line in (r.stdout or "").splitlines())
     return r.returncode == 0 and elapsed < 35 and got_output
@@ -1527,7 +1594,19 @@ def _check_stream(dseq: str, command: str) -> bool:
 def _check_ssh(dseq: str, key: str) -> bool:
     """exec + inject over the SSH transport (provider port-forwarding)."""
     r = _run(
-        f"uv run just-akash exec 'echo SSH_OK' --dseq {q(dseq)} --transport ssh --key {q(key)}",
+        [
+            "uv",
+            "run",
+            "just-akash",
+            "exec",
+            "echo SSH_OK",
+            "--dseq",
+            dseq,
+            "--transport",
+            "ssh",
+            "--key",
+            key,
+        ],
         timeout=45,
     )
     if not (r.returncode == 0 and "SSH_OK" in (r.stdout or "")):
@@ -1619,8 +1698,17 @@ def _probe_in_pod_marker(dseq: str, expected_token: str) -> str:
     failed (a flaky exec must never be mistaken for a real signal). Diagnostic-only."""
     try:
         r = _run(
-            f"uv run just-akash exec 'printenv SMOKE_MARKER' "
-            f"--dseq {q(dseq)} --transport lease-shell",
+            [
+                "uv",
+                "run",
+                "just-akash",
+                "exec",
+                "printenv SMOKE_MARKER",
+                "--dseq",
+                dseq,
+                "--transport",
+                "lease-shell",
+            ],
             timeout=45,
         )
     except Exception:  # noqa: BLE001 — a diagnostic probe must never raise
@@ -1713,7 +1801,17 @@ def _exec_works(dseq: str) -> bool:
     never mistaken for a live container."""
     try:
         r = _run(
-            f"uv run just-akash exec 'echo ready' --dseq {q(dseq)} --transport lease-shell",
+            [
+                "uv",
+                "run",
+                "just-akash",
+                "exec",
+                "echo ready",
+                "--dseq",
+                dseq,
+                "--transport",
+                "lease-shell",
+            ],
             timeout=25,
         )
     except Exception:  # noqa: BLE001 — a diagnostic probe must never raise
@@ -1801,8 +1899,18 @@ def _check_update(dseq: str, sdl_path: str, uri: str, diag: dict | None = None) 
     diagnostics never flip the verdict: a genuine provider defect must stay visible."""
     token = f"probe-updated-{dseq[-6:]}"
     r = _run(
-        f"uv run just-akash update --dseq {q(dseq)} --sdl {q(sdl_path)} "
-        f"--env SMOKE_MARKER={token}",
+        [
+            "uv",
+            "run",
+            "just-akash",
+            "update",
+            "--dseq",
+            dseq,
+            "--sdl",
+            sdl_path,
+            "--env",
+            f"SMOKE_MARKER={token}",
+        ],
         timeout=120,
     )
     if r.returncode != 0:
@@ -1850,7 +1958,7 @@ def _benchmark_provider(dseq: str, provider: str) -> dict | None:
         return None
     try:
         print("  benchmark: grading hardware (non-gating)...")
-        r = _run(f"uv run just-akash benchmark --dseq {q(dseq)} --json", timeout=150)
+        r = _run(["uv", "run", "just-akash", "benchmark", "--dseq", dseq, "--json"], timeout=150)
         line = next(
             (ln for ln in (r.stdout or "").splitlines() if ln.strip().startswith("{")), None
         )
