@@ -76,6 +76,7 @@ from ._e2e import (
 )
 from ._states import TERMINAL_DEPLOYMENT_STATES
 from .api import AkashConsoleAPI, _extract_dseq
+from .deployment_receipt import decode_receipt
 from .paid_create import (
     delete_receipt,
     receipt_environment,
@@ -479,7 +480,12 @@ MIN_ORPHAN_AGE_SECONDS = 3600  # 1 hour
 
 
 def _delete_resolved_provider_smoke_receipts(dseq: str, owner: str) -> list[Path]:
-    """Delete only durable provider-smoke receipts bound to a settled DSEQ."""
+    """Delete only durable provider-smoke receipts bound to a settled DSEQ.
+
+    This intentionally decodes without a caller operation ID: the sweep has
+    already verified closure and uses the receipt only as the deletion target,
+    never as authority to close. Both response DSEQ and owner must match.
+    """
     runner_temp = os.environ.get("RUNNER_TEMP")
     if not runner_temp:
         return []
@@ -491,7 +497,10 @@ def _delete_resolved_provider_smoke_receipts(dseq: str, owner: str) -> list[Path
         return []
     for path in paths:
         try:
-            receipt, receipt_dseq = receipt_identity(path)
+            receipt = decode_receipt(path.read_bytes())
+            receipt_dseq = (
+                str(receipt["dseq"]) if receipt["state"] == "create_response_received" else None
+            )
         except Exception:  # noqa: BLE001 - unreadable receipts must remain for upload
             continue
         if receipt_dseq == str(dseq) and receipt["expected_owner"] == owner:
@@ -1045,7 +1054,7 @@ def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, s
         timed_out = False
     except BaseException:
         try:
-            receipt, receipt_dseq = receipt_identity(receipt_path)
+            receipt, receipt_dseq = receipt_identity(receipt_path, operation_id)
             dseq_ref.update(
                 dseq=receipt_dseq,
                 owner=receipt["expected_owner"],
@@ -1060,7 +1069,7 @@ def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, s
         raise
     out = (r.stdout or "") + (r.stderr or "")
     try:
-        receipt, receipt_dseq = receipt_identity(receipt_path)
+        receipt, receipt_dseq = receipt_identity(receipt_path, operation_id)
         dseq_ref.update(owner=receipt["expected_owner"], groups=receipt["group_population"])
         dseq_ref["dseq"] = receipt_dseq
         if receipt_dseq is None:

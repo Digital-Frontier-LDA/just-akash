@@ -35,6 +35,7 @@ from ._e2e import (
     robust_destroy,
 )
 from .deployment_receipt import DeploymentReceipt, decode_receipt
+from .paid_create import receipt_identity
 from .paid_create import reconcile_receipt as reconcile_paid_receipt
 from .provenance import run_id_of
 
@@ -132,13 +133,6 @@ def _receipt_environment() -> tuple[Path, str, dict[str, str]]:
             "JUST_AKASH_RECEIPT_OPERATION_ID": operation_id,
         },
     )
-
-
-def _receipt_identity(receipt_path: Path) -> tuple[str, str | None, str, list[dict[str, object]]]:
-    receipt = decode_receipt(receipt_path.read_bytes())
-    population = receipt["group_population"]
-    dseq = str(receipt["dseq"]) if receipt["state"] == "create_response_received" else None
-    return receipt["state"], dseq, receipt["expected_owner"], population
 
 
 def _delete_receipt(receipt_path: Path) -> None:
@@ -305,11 +299,15 @@ def main():
         # The child group is dead before this read. Preserve an unresolved receipt;
         # remove it only after authoritative pre-submit state or verified closure.
         try:
-            state, dseq, owner, groups = _receipt_identity(receipt_path)
-            dseq_ref.update(dseq=dseq, owner=owner, groups=groups)
+            receipt, dseq = receipt_identity(receipt_path, receipt_operation_id)
+            dseq_ref.update(
+                dseq=dseq,
+                owner=receipt["expected_owner"],
+                groups=receipt["group_population"],
+            )
             if dseq:
                 _verified_cleanup(dseq_ref)
-            elif state == "submitting":
+            elif receipt["state"] == "submitting":
                 _reconcile_receipt(
                     receipt_path,
                     receipt_operation_id,
@@ -324,10 +322,10 @@ def main():
     print(output)
 
     try:
-        state, receipt_dseq, owner, groups = _receipt_identity(receipt_path)
-        dseq_ref.update(owner=owner, groups=groups)
+        receipt, receipt_dseq = receipt_identity(receipt_path, receipt_operation_id)
+        dseq_ref.update(owner=receipt["expected_owner"], groups=receipt["group_population"])
     except Exception as exc:  # noqa: BLE001 - no bound identity means cleanup is held
-        state, receipt_dseq = "unreadable", None
+        receipt, receipt_dseq = None, None
         log_fail(f"HELD: create receipt unreadable ({exc})")
     output_match = re.search(r"DSEQ[:\s]+(\d+)", output)
     output_dseq = output_match.group(1) if output_match else None

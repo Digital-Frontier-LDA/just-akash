@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import ast
+import inspect
 import signal
 import subprocess
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -134,13 +136,127 @@ def test_lifecycle_unreadable_receipt_exits_held_without_losing_the_no_dseq_stat
     monkeypatch.setattr(
         test_lifecycle,
         "receipt_identity",
-        lambda _path: (_ for _ in ()).throw(ValueError("unreadable")),
+        lambda _path, _operation_id: (_ for _ in ()).throw(ValueError("unreadable")),
     )
     monkeypatch.setattr(test_lifecycle, "_summary", lambda _failures: None)
 
     with pytest.raises(SystemExit) as exc:
         test_lifecycle.main()
     assert exc.value.code == 1
+
+
+def test_foreign_receipt_identity_never_acquires_cleanup_authority_and_mutation_is_red(
+    monkeypatch, tmp_path: Path
+) -> None:
+    foreign = {
+        "operation_id": "another-operation",
+        "state": "create_response_received",
+        "dseq": "987654321",
+        "expected_owner": OWNER,
+        "group_population": [{"gseq": 1, "name": "foreign-run"}],
+    }
+    monkeypatch.setattr(paid_create, "decode_receipt", lambda _payload: foreign)
+    path = tmp_path / "foreign-receipt.json"
+    path.write_bytes(b"foreign")
+
+    with pytest.raises(RuntimeError, match="operation ID disagrees"):
+        paid_create.receipt_identity(path, "this-operation")
+
+    source = textwrap.dedent(inspect.getsource(paid_create.receipt_identity))
+    target = 'if receipt["operation_id"] != operation_id:'
+    assert source.count(target) == 1, "operation-binding mutation target must apply once"
+    mutant = source.replace(target, "if False:", 1)
+    assert mutant != source and mutant.count(target) == 0
+    namespace = {
+        "DeploymentReceipt": dict,
+        "Path": Path,
+        "decode_receipt": lambda _payload: foreign,
+    }
+    exec(mutant, namespace)
+    receipt, dseq = namespace["receipt_identity"](path, "this-operation")
+    assert receipt is foreign and dseq == "987654321", (
+        "removing the exact operation binding must expose the foreign cleanup identity"
+    )
+
+
+def test_lifecycle_foreign_response_receipt_reaches_no_cleanup_call_site(
+    monkeypatch, tmp_path: Path
+) -> None:
+    for name in ("AKASH_API_KEY", "AKASH_PROVIDERS", "SSH_PUBKEY"):
+        monkeypatch.setenv(name, "configured")
+    foreign = {
+        "operation_id": "another-operation",
+        "state": "create_response_received",
+        "dseq": "987654321",
+        "expected_owner": OWNER,
+        "group_population": [{"gseq": 1, "name": "foreign-run"}],
+    }
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_bytes(b"foreign")
+    monkeypatch.setattr(paid_create, "decode_receipt", lambda _payload: foreign)
+    monkeypatch.setattr(test_lifecycle.os.path, "exists", lambda _path: True)
+    monkeypatch.setattr(test_lifecycle, "install_signal_cleanup", lambda _ref: None)
+    monkeypatch.setattr(
+        test_lifecycle,
+        "receipt_environment",
+        lambda _label: (receipt_path, "this-operation", {}),
+    )
+    monkeypatch.setattr(
+        test_lifecycle,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "", ""),
+    )
+    monkeypatch.setattr(
+        test_lifecycle,
+        "run_process_group",
+        lambda *_args, **_kwargs: (subprocess.CompletedProcess([], 1, "", ""), False),
+    )
+    monkeypatch.setattr(test_lifecycle, "reconcile_receipt", lambda *_args: None)
+    cleanups: list[dict] = []
+    monkeypatch.setattr(
+        test_lifecycle, "verified_cleanup", lambda ref: cleanups.append(ref.copy()) or True
+    )
+    monkeypatch.setattr(test_lifecycle, "_summary", lambda _failures: None)
+
+    with pytest.raises(SystemExit) as exc:
+        test_lifecycle.main()
+    assert exc.value.code == 1
+    assert cleanups == [], "a foreign response receipt reached the real cleanup call site"
+
+    monkeypatch.setattr(
+        test_lifecycle, "receipt_identity", lambda _path, _operation_id: (foreign, "987654321")
+    )
+    with pytest.raises(SystemExit):
+        test_lifecycle.main()
+    assert cleanups and cleanups[-1]["dseq"] == "987654321", (
+        "the adversarial bypass did not change the cleanup effect"
+    )
+
+
+@pytest.mark.parametrize(
+    ("path_name", "operation_name"),
+    [
+        ("secrets", "receipt_operation_id"),
+        ("shell", "receipt_operation_id"),
+        ("lifecycle", "operation_id"),
+        ("provider", "operation_id"),
+    ],
+)
+def test_every_paid_create_receipt_read_binds_the_current_operation(
+    path_name: str, operation_name: str
+) -> None:
+    source = PATHS[path_name].read_text(encoding="utf-8")
+    calls = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "receipt_identity"
+    ]
+    assert len(calls) == 2, f"{path_name} receipt-read population changed: {len(calls)}"
+    for call in calls:
+        assert len(call.args) == 2
+        assert isinstance(call.args[1], ast.Name) and call.args[1].id == operation_name
 
 
 @pytest.mark.parametrize("path_name", PATHS)

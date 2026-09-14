@@ -17,6 +17,10 @@ from .deployment_receipt import DeploymentReceipt, decode_receipt
 from .provenance import run_id_of
 
 
+class ReceiptOperationMismatch(RuntimeError):
+    """The durable receipt belongs to a different paid-create operation."""
+
+
 def receipt_environment(label: str, *, unique: bool = False) -> tuple[Path, str, dict[str, str]]:
     root = os.environ.get("RUNNER_TEMP")
     if root:
@@ -72,8 +76,13 @@ def run_process_group(
         raise
 
 
-def receipt_identity(path: Path) -> tuple[DeploymentReceipt, str | None]:
+def receipt_identity(path: Path, operation_id: str) -> tuple[DeploymentReceipt, str | None]:
+    """Read identity only from the receipt created for this lifecycle operation."""
     receipt = decode_receipt(path.read_bytes())
+    if receipt["operation_id"] != operation_id:
+        raise ReceiptOperationMismatch(
+            "create receipt operation ID disagrees with this lifecycle operation"
+        )
     dseq = str(receipt["dseq"]) if receipt["state"] == "create_response_received" else None
     return receipt, dseq
 
@@ -111,8 +120,9 @@ def _receipt_run_id(receipt: DeploymentReceipt) -> str:
 
 def reconcile_receipt(path: Path, operation_id: str, started_at: float, ref: dict) -> str | None:
     """Recover a response DSEQ or safely close one uniquely corroborated submit."""
-    receipt, dseq = receipt_identity(path)
-    if receipt["operation_id"] != operation_id:
+    try:
+        receipt, dseq = receipt_identity(path, operation_id)
+    except ReceiptOperationMismatch:
         return None
     run_id = _receipt_run_id(receipt)
     if receipt["operation_id"] == run_id:

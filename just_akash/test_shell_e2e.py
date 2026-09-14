@@ -569,7 +569,7 @@ def main():
         deploy_out, deploy_err, returncode = r.stdout, r.stderr, r.returncode
     except BaseException:
         try:
-            receipt, receipt_dseq = receipt_identity(receipt_path)
+            receipt, receipt_dseq = receipt_identity(receipt_path, receipt_operation_id)
             dseq_ref.update(
                 dseq=receipt_dseq,
                 owner=receipt["expected_owner"],
@@ -588,7 +588,7 @@ def main():
 
     m = _search_streams(_DSEQ_SUMMARY_RE, deploy_out, deploy_err)
     try:
-        receipt, receipt_dseq = receipt_identity(receipt_path)
+        receipt, receipt_dseq = receipt_identity(receipt_path, receipt_operation_id)
         dseq_ref.update(
             owner=receipt["expected_owner"],
             groups=receipt["group_population"],

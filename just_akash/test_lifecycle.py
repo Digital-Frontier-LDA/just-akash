@@ -131,7 +131,7 @@ def main():
         )
     except BaseException:
         try:
-            receipt, receipt_dseq = receipt_identity(receipt_path)
+            receipt, receipt_dseq = receipt_identity(receipt_path, operation_id)
             dseq_ref.update(
                 dseq=receipt_dseq,
                 owner=receipt["expected_owner"],
@@ -148,7 +148,7 @@ def main():
     print(output)
 
     try:
-        receipt, receipt_dseq = receipt_identity(receipt_path)
+        receipt, receipt_dseq = receipt_identity(receipt_path, operation_id)
         dseq_ref.update(owner=receipt["expected_owner"], groups=receipt["group_population"])
         dseq_ref["dseq"] = receipt_dseq
         if receipt_dseq is None:

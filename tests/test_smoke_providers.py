@@ -1244,18 +1244,23 @@ class TestOrphanProbeSweep:
         other = receipt_dir / "provider-smoke-other.json"
         unreadable = receipt_dir / "provider-smoke-unreadable.json"
         for path in (matching, other, unreadable):
-            path.write_text("receipt")
+            path.write_text(str(path))
 
-        def identity(path):
+        def identity(payload):
+            path = Path(payload.decode())
             if path == unreadable:
                 raise ValueError("malformed")
-            return {"expected_owner": OWNER}, old_probe if path == matching else "999"
+            return {
+                "expected_owner": OWNER,
+                "state": "create_response_received",
+                "dseq": old_probe if path == matching else "999",
+            }
 
         api = self._fake_api([{"dseq": old_probe}], {old_probe: self._detail(["probe"])})
         monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
         with (
             patch.object(sp, "_api", return_value=api),
-            patch.object(sp, "receipt_identity", side_effect=identity),
+            patch.object(sp, "decode_receipt", side_effect=identity),
             patch.object(sp, "robust_destroy", return_value=True),
             patch.object(sp.time, "time", return_value=self.NOW),
         ):
