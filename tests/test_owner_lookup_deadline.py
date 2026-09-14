@@ -228,9 +228,7 @@ def test_every_lingering_worker_is_a_daemon_and_cannot_block_exit(console) -> No
     with pytest.raises(OwnerLookupUnresolved):
         wallet_pool._raw_client_for_bound_owner(DSEQ, OWNER, "g")
     lingering = [
-        t
-        for t in threading.enumerate()
-        if t is not threading.main_thread() and t.is_alive()
+        t for t in threading.enumerate() if t is not threading.main_thread() and t.is_alive()
     ]
     assert lingering, "expected at least one abandoned worker from the stall"
     assert all(t.daemon for t in lingering), [t.name for t in lingering if not t.daemon]
@@ -247,9 +245,7 @@ def test_the_process_exits_promptly_with_a_lingering_worker() -> None:
         "print('returned-before-worker')\n"
     )
     started = time.monotonic()
-    proc = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, timeout=30
-    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
     elapsed = time.monotonic() - started
     assert proc.returncode == 0, proc.stderr[-500:]
     assert "returned-before-worker" in proc.stdout
