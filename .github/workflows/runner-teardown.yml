@@ -58,7 +58,25 @@ on:
         default: 'Digital-Frontier-LDA/just-akash'
         type: string
       dseq:
-        description: 'Deployment to close. Empty is a no-op, not an error.'
+        description: >-
+          Deployment to close. Empty is a no-op only with an authoritative
+          no-deployment outcome; an unknown create outcome is HELD.
+        required: false
+        type: string
+        default: ''
+      deployment-outcome:
+        description: >-
+          Create-side effect classification. Pass unknown when a create request may have
+          committed without returning an identity; teardown then fails HELD instead of
+          reporting a clean no-op. Defaults to no-deployment for legacy explicit no-op calls.
+        required: false
+        type: string
+        default: 'no-deployment'
+      create-ambiguous:
+        description: >-
+          'true' when a later create may have committed without returning an identity.
+          The known dseq is still closed and proven, then the job fails HELD with
+          CREATE_OUTCOME_AMBIGUOUS, because a second deployment may exist.
         required: false
         type: string
         default: ''
@@ -119,6 +137,19 @@ on:
       closed:
         description: "'true' only when the lease was READ BACK as closed."
         value: ${{ jobs.teardown.outputs.closed }}
+      held_reason:
+        description: >-
+          Non-empty when the close was HELD without closure authority, so the lease may
+          still be live and holding escrow. OWNER_UNKNOWN: the pool published a DSEQ
+          and group with no create-time owner, and no exhaustive owner registry exists
+          to recover one. The job fails; held_dseq and held_deployment_group locate it.
+        value: ${{ jobs.teardown.outputs.held_reason }}
+      held_dseq:
+        description: 'The exact DSEQ of a HELD lease; empty unless held_reason is set.'
+        value: ${{ jobs.teardown.outputs.held_dseq }}
+      held_deployment_group:
+        description: 'The expected group of a HELD lease; empty unless held_reason is set.'
+        value: ${{ jobs.teardown.outputs.held_deployment_group }}
       deregistered:
         description: 'Offline runner registrations removed.'
         value: ${{ jobs.teardown.outputs.deregistered }}
@@ -142,6 +173,9 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       closed: ${{ steps.close.outputs.closed }}
+      held_reason: ${{ steps.close.outputs.held_reason }}
+      held_dseq: ${{ steps.close.outputs.held_dseq }}
+      held_deployment_group: ${{ steps.close.outputs.held_deployment_group }}
       deregistered: ${{ steps.dereg.outputs.deregistered }}
       deregister_failed: ${{ steps.dereg.outputs.deregister_failed }}
     defaults:
@@ -169,6 +203,8 @@ jobs:
           DSEQ: ${{ inputs.dseq }}
           WALLET_ADDRESS: ${{ inputs.wallet-address }}
           DEPLOYMENT_GROUP: ${{ inputs.deployment-group }}
+          DEPLOYMENT_OUTCOME: ${{ inputs.deployment-outcome }}
+          CREATE_AMBIGUOUS: ${{ inputs.create-ambiguous }}
           TAG_PREFIX: ${{ inputs.tag-prefix }}
         run: |
           set -uo pipefail
@@ -176,6 +212,19 @@ jobs:
           # An ARRAY: the command is multiple words, so a quoted string breaks it and an
           # unquoted one is SC2086.
           JA=(uv run --with . just-akash)
+
+          if [ -z "${DSEQ}" ] && { [ "${DEPLOYMENT_OUTCOME:-unknown}" != "no-deployment" ] || [ "${CREATE_AMBIGUOUS:-}" = "true" ]; }; then
+            HELD_GROUP=""
+            [[ "${DEPLOYMENT_GROUP:-}" =~ ^[A-Za-z0-9._-]+$ ]] && HELD_GROUP="$DEPLOYMENT_GROUP"
+            {
+              echo "closed=unknown"
+              echo "held_reason=CREATE_OUTCOME_AMBIGUOUS"
+              echo "held_dseq="
+              echo "held_deployment_group=$HELD_GROUP"
+            } >> "$GITHUB_OUTPUT"
+            echo "::error title=HELD: create outcome ambiguous, no teardown identity::The create request may have committed but returned no DSEQ. Nothing can be closed automatically; reconcile the create receipt or owner-scoped chain population before another create. group=${HELD_GROUP:-<unknown>}"
+            exit 1
+          fi
 
           if [ -z "${DSEQ}" ]; then
             echo "closed=noop" >> "$GITHUB_OUTPUT"
@@ -220,6 +269,30 @@ jobs:
           # and it cannot have one for the same reason. So the sweeper for leaked pools is
           # OPT-IN, not inference: `python -m just_akash.cleanup_stale --reap-runners`,
           # where the operator asserts the account hosts nothing but their own pools.
+          # ⛔ AN OWNER-LESS RECEIPT IS HELD, NEVER RESOLVED BY PROBING (#348). The
+          # destructive identity is the pair (owner, dseq); a DSEQ alone is not globally
+          # queryable and can collide across owners. Recovering the owner needs the
+          # complete registered owner population read through each independent chain
+          # observer with exactly one agreeing match (df-wiki ownership standard), and
+          # just-akash has no such registry. Trying configured accounts until one reads
+          # the DSEQ is forbidden: it can select a foreign owner. resolve-owner also
+          # refuses --expected-group without --expected-owner. So: no resolve, no
+          # destroy, a FAILED job, and outputs that locate the still-live lease.
+          if [ -z "${WALLET_ADDRESS:-}" ]; then
+            # The group is echoed into GITHUB_OUTPUT and an annotation, so only the
+            # canonical group-name shape is published (DSEQ is digits-only above).
+            HELD_GROUP=""
+            [[ "$DEPLOYMENT_GROUP" =~ ^[A-Za-z0-9._-]+$ ]] && HELD_GROUP="$DEPLOYMENT_GROUP"
+            {
+              echo "closed=unknown"
+              echo "held_reason=OWNER_UNKNOWN"
+              echo "held_dseq=$DSEQ"
+              echo "held_deployment_group=$HELD_GROUP"
+            } >> "$GITHUB_OUTPUT"
+            echo "::error title=HELD: lease owner unknown, no closure authority::dseq=$DSEQ group=${HELD_GROUP:-<non-canonical>} was published without its create-time owner. Nothing was resolved or closed; the lease may still be live and holding escrow. Recover the owner from the exhaustive owner registry (just-akash#351) or an operator, then close the exact (owner, dseq)."
+            exit 1
+          fi
+
           echo "closing dseq=$DSEQ (created by this run; tagged ${TAG_PREFIX}-*)"
 
           # ⛔ RESOLVE OWNER BEFORE DESTROY. After destroy the Console API may
@@ -351,6 +424,20 @@ jobs:
           if [ "$VERIFY_RC" -eq 0 ] && [ "$VERDICT" = "True" ]; then
             echo "closed=true" >> "$GITHUB_OUTPUT"
             echo "lease $DSEQ closed; verifier returned terminal states across two endpoints"
+            # ⛔ THE KNOWN LEASE IS CLOSED, BUT A LATER CREATE MAY HAVE LANDED (#348).
+            # Closing the last known dseq cannot prove there is no second deployment, so
+            # an ambiguous create still fails HELD rather than reporting a clean close.
+            if [ "${CREATE_AMBIGUOUS:-}" = "true" ]; then
+              HELD_GROUP=""
+              [[ "${DEPLOYMENT_GROUP:-}" =~ ^[A-Za-z0-9._-]+$ ]] && HELD_GROUP="$DEPLOYMENT_GROUP"
+              {
+                echo "held_reason=CREATE_OUTCOME_AMBIGUOUS"
+                echo "held_dseq="
+                echo "held_deployment_group=$HELD_GROUP"
+              } >> "$GITHUB_OUTPUT"
+              echo "::error title=HELD: a later create outcome is ambiguous::Known lease $DSEQ is closed and proven, but a later create may have committed without returning a DSEQ. Reconcile the create receipt or the owner-scoped chain population before another create. group=${HELD_GROUP:-<unknown>}"
+              exit 1
+            fi
             exit 0
           fi
           echo "closed=unknown" >> "$GITHUB_OUTPUT"

@@ -77,9 +77,7 @@ def _prepare(path: Path, *, sdl: str = SDL):
     return prepare_receipt(
         str(path),
         operation_id=RUN_ID,
-        expected_owner=OWNER,
-        expected_groups=GROUPS,
-        expected_artifact_digest=sha256_bytes(sdl.encode()),
+        owner=OWNER,
         sdl_content=sdl,
     )
 
@@ -277,39 +275,6 @@ def test_noncanonical_or_out_of_range_dseq_retains_prepared_receipt(
     assert "dseq" not in durable
 
 
-def test_caller_expectations_are_checked_before_a_create_can_spend(tmp_path: Path) -> None:
-    parent = _private_dir(tmp_path / "private")
-    path = parent / "receipt.json"
-    with pytest.raises(RuntimeError, match="complete submitted SDL population"):
-        prepare_receipt(
-            str(path),
-            operation_id=RUN_ID,
-            expected_owner=OWNER,
-            expected_groups=["receipt-primary"],
-            expected_artifact_digest=sha256_bytes(SDL.encode()),
-            sdl_content=SDL,
-        )
-    with pytest.raises(RuntimeError, match="artifact digest mismatch"):
-        prepare_receipt(
-            str(path),
-            operation_id=RUN_ID,
-            expected_owner=OWNER,
-            expected_groups=GROUPS,
-            expected_artifact_digest="0" * 64,
-            sdl_content=SDL,
-        )
-    with pytest.raises(RuntimeError, match="exactly 64 hexadecimal"):
-        prepare_receipt(
-            str(path),
-            operation_id=RUN_ID,
-            expected_owner=OWNER,
-            expected_groups=GROUPS,
-            expected_artifact_digest="not-a-digest",
-            sdl_content=SDL,
-        )
-    assert not path.exists()
-
-
 @pytest.mark.parametrize(
     "owner",
     [
@@ -338,9 +303,7 @@ def test_noncanonical_expected_owner_is_refused(owner: str, tmp_path: Path) -> N
         prepare_receipt(
             str(path),
             operation_id=RUN_ID,
-            expected_owner=owner,
-            expected_groups=GROUPS,
-            expected_artifact_digest=sha256_bytes(SDL.encode()),
+            owner=owner,
             sdl_content=SDL,
         )
     assert not path.exists()
@@ -350,9 +313,7 @@ def _crash_after_emit(path: str) -> None:
     receipt_path, prepared, prepared_bytes = prepare_receipt(
         path,
         operation_id=RUN_ID,
-        expected_owner=OWNER,
-        expected_groups=GROUPS,
-        expected_artifact_digest=sha256_bytes(SDL.encode()),
+        owner=OWNER,
         sdl_content=SDL,
     )
     mark_create_response_received(
@@ -375,12 +336,8 @@ def test_process_kill_after_emit_cannot_lose_the_response_receipt(tmp_path: Path
 
 
 def _receipt_arguments(sdl: str, receipt: Path) -> dict[str, Any]:
-    population, _, digest = artifact_identity(sdl)
     return {
         "receipt_path": str(receipt),
-        "expected_owner": OWNER,
-        "expected_groups": [str(group["name"]) for group in population],
-        "expected_artifact_digest": digest,
         "receipt_operation_id": "github-run-123-attempt-2",
     }
 
@@ -507,7 +464,7 @@ def test_all_receipt_arguments_are_required_together() -> None:
 
 
 @patch("just_akash.deploy.AkashConsoleAPI")
-def test_receipt_refuses_a_digest_of_bytes_changed_during_preparation(
+def test_receipt_derives_identity_after_run_stamp_and_other_sdl_transforms(
     mock_api, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("AKASH_API_KEY", "test-key")
@@ -520,15 +477,25 @@ def test_receipt_refuses_a_digest_of_bytes_changed_during_preparation(
     sdl_path.write_text(unstamped)
     receipt = _private_dir(tmp_path / "private") / "receipt.json"
     client = mock_api.return_value
+    client.account_address.return_value = OWNER
+    client.create_deployment.return_value = {"dseq": "123", "manifest": ""}
 
-    with pytest.raises(RuntimeError, match="exact submitted bytes"):
+    with pytest.raises(RuntimeError, match="No bids received"):
         deploy_module.deploy(
             sdl_path=str(sdl_path),
+            image="example.invalid/transformed:latest",
+            bid_wait=0,
+            bid_wait_retry=0,
             **_receipt_arguments(unstamped, receipt),
         )
 
-    client.create_deployment.assert_not_called()
-    assert not receipt.exists()
+    submitted = client.create_deployment.call_args.args[0]
+    durable = decode_receipt(receipt.read_bytes())
+    population, population_digest, artifact_digest = artifact_identity(submitted)
+    assert durable["expected_owner"] == OWNER
+    assert durable["group_population"] == population
+    assert durable["group_population_digest"] == population_digest
+    assert durable["artifact_digest"] == artifact_digest
 
 
 def test_write_location_effect_mutation_loses_the_dseq_on_early_failure(

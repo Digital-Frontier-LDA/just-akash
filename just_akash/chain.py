@@ -437,6 +437,7 @@ def _corroborated_deployment_group_names(
     sources,
     reader,
     expected_group: str | None = None,
+    expected_population: tuple[tuple[str, str], ...] | None = None,
 ) -> list[str]:
     """Return all group names only when two independent chain sources agree.
 
@@ -537,6 +538,8 @@ def _corroborated_deployment_group_names(
         return []
     if expected_group is not None and snapshots[0] != (("1", expected_group),):
         return []
+    if expected_population is not None and snapshots[0] != expected_population:
+        return []
     return [name for _gseq, name in snapshots[0]]
 
 
@@ -558,6 +561,48 @@ def corroborated_deployment_group_names(owner: str, dseq: str, expected_group: s
         reader=_lcd_get,
         expected_group=expected_group,
     )
+
+
+def corroborated_deployment_group_population(
+    owner: str, dseq: str, expected_population: list[dict[str, object]]
+) -> list[dict[str, object]]:
+    """Return the expected complete population only after two-source agreement.
+
+    ``expected_population`` is the receipt shape: contiguous one-based gseqs and their
+    exact group names.  The destructive caller needs the whole population, rather than
+    the singleton convenience accepted by :func:`corroborated_deployment_group_names`.
+    """
+    if not re.fullmatch(r"[1-9][0-9]{0,19}", dseq) or int(dseq) > 2**64 - 1:
+        return []
+    expected = [
+        {"gseq": index, "name": entry.get("name") if isinstance(entry, dict) else None}
+        for index, entry in enumerate(expected_population, start=1)
+    ]
+    if expected_population != expected or any(
+        not isinstance(entry["name"], str) or not entry["name"] for entry in expected
+    ):
+        return []
+    if os.environ.get("AKASH_REST_URL") is not None:
+        return []
+    if (
+        _source_registry_digest(OWNER_CORROBORATION_SOURCES_V2)
+        != OWNER_CORROBORATION_REGISTRY_SHA256
+    ):
+        return []
+    names = _corroborated_deployment_group_names(
+        owner,
+        dseq,
+        sources=OWNER_CORROBORATION_SOURCES_V2,
+        reader=_lcd_get,
+        expected_population=tuple(
+            (str(entry["gseq"]), entry["name"])
+            for entry in expected
+            if isinstance(entry["name"], str)
+        ),
+    )
+    if names != [entry["name"] for entry in expected]:
+        return []
+    return expected_population
 
 
 def _rfc3339(value: object) -> datetime | None:

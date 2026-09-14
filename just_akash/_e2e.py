@@ -13,11 +13,11 @@ here, not by patching three call sites.
 import json
 import os
 import re
-import shlex
 import signal
 import subprocess
 import sys
 import time
+from contextlib import suppress
 from urllib import request as urllib_request
 
 from ._lease_verification import DEFAULT_ENDPOINTS
@@ -105,16 +105,52 @@ def assert_provider_in_tiers(
 
 
 def _run(
-    cmd: str, *, timeout: int = 60, input_text: str | None = None
+    cmd: list[str],
+    *,
+    timeout: int = 60,
+    input_text: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
-    return subprocess.run(
+    if env is None:
+        return subprocess.run(  # noqa: S603 - argv is constructed by this package
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            input=input_text,
+        )
+    process = subprocess.Popen(  # noqa: S603 - argv is constructed by this package
         cmd,
-        shell=True,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.PIPE if input_text is not None else None,
         text=True,
-        timeout=timeout,
-        input=input_text,
+        env=env,
+        start_new_session=True,
     )
+    try:
+        stdout, stderr = process.communicate(input=input_text, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            stdout, stderr = process.communicate()
+        raise subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr) from None
+    except BaseException:
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            process.communicate()
+        raise
+    return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
 
 
 # Words that mean "the deployment is gone" in `just destroy` output.
@@ -181,7 +217,7 @@ def resolve_deployment_owner(dseq: str) -> str:
     Console deployment record may disappear immediately after close, while the
     settlement verifier still needs the owner-scoped chain identity.
     """
-    cmd = f"uv run just-akash resolve-owner --dseq {shlex.quote(str(dseq))} --json"
+    cmd = ["uv", "run", "just-akash", "resolve-owner", "--dseq", str(dseq), "--json"]
     result = _run(cmd, timeout=60)
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout or "owner resolution failed").strip())
@@ -272,7 +308,7 @@ def _confirm_settled_single_reader(
     for attempt in range(1, attempts + 1):
         got_open = False
         try:
-            cmd = f"uv run just-akash status --dseq {shlex.quote(str(dseq))} --json"
+            cmd = ["uv", "run", "just-akash", "status", "--dseq", str(dseq), "--json"]
             r = _run(cmd, timeout=30)
             if r.returncode == 0 and r.stdout:
                 state = str(json.loads(r.stdout).get("state", "")).strip().lower()
@@ -301,6 +337,8 @@ def robust_destroy(
     dseq: str,
     *,
     owner: str | None = None,
+    group: str | None = None,
+    groups: list[dict[str, object]] | None = None,
     retries: int = 2,
     audit: bool = True,
 ) -> bool:
@@ -318,6 +356,54 @@ def robust_destroy(
     if owner is not None and not is_canonical_akash_address(owner):
         _fail(f"Cleanup held for {dseq}: invalid owner identity")
         return False
+    if group is not None and groups is not None:
+        _fail(f"Cleanup held for {dseq}: conflicting group identities")
+        return False
+    if group is not None and (owner is None or not re.fullmatch(r"[A-Za-z0-9._-]+", group)):
+        _fail(f"Cleanup held for {dseq}: invalid or owner-less group identity")
+        return False
+    if owner is not None and group is None and groups is None:
+        _fail(f"Cleanup held for {dseq}: owner identity has no group identity")
+        return False
+    direct_client = None
+    if groups is not None:
+        if owner is None:
+            _fail(f"Cleanup held for {dseq}: complete group population has no owner")
+            return False
+        from . import chain
+        from .api import AkashConsoleAPI
+        from .wallet_pool import configured_api_keys
+
+        expected = [
+            {"gseq": index, "name": entry.get("name") if isinstance(entry, dict) else None}
+            for index, entry in enumerate(groups, start=1)
+        ]
+        if groups != expected or any(
+            not isinstance(entry["name"], str)
+            or re.fullmatch(r"[A-Za-z0-9._-]+", entry["name"]) is None
+            for entry in expected
+        ):
+            _fail(f"Cleanup held for {dseq}: invalid complete group population")
+            return False
+        if chain.corroborated_deployment_group_population(owner, str(dseq), groups) != groups:
+            _fail(f"Cleanup held for {dseq}: two sources did not prove the exact group population")
+            return False
+        try:
+            keys = configured_api_keys()
+        except Exception as e:  # noqa: BLE001 - identity discovery must fail closed
+            _fail(f"Cleanup held for {dseq}: could not enumerate owner credentials ({e})")
+            return False
+        for key in keys:
+            try:
+                candidate = AkashConsoleAPI(key)
+                if candidate.account_address() == owner:
+                    direct_client = candidate
+                    break
+            except Exception:  # noqa: BLE001 - one unreadable key is not owner evidence
+                continue
+        if direct_client is None:
+            _fail(f"Cleanup held for {dseq}: no configured credential selected the receipt owner")
+            return False
     # Clamp negative retries so a caller mistake (or signal-handler default
     # of retries=1 minus a typo) never silently skips the destroy loop. Empty
     # range with retries<0 used to issue ZERO destroy commands but still
@@ -326,7 +412,27 @@ def robust_destroy(
     last_err = ""
     for attempt in range(1, retries + 2):
         try:
-            r = _run(f"just destroy {shlex.quote(str(dseq))}", input_text="y\n", timeout=60)
+            if direct_client is not None:
+                direct_client.close_deployment(str(dseq))
+                r = subprocess.CompletedProcess([], 0, "Deployment closed", "")
+            elif owner is None or group is None:
+                command = ["just", "destroy", str(dseq)]
+                r = _run(command, input_text="y\n", timeout=60)
+            else:
+                command = [
+                    "uv",
+                    "run",
+                    "just-akash",
+                    "destroy",
+                    "--dseq",
+                    str(dseq),
+                    "--expected-owner",
+                    owner,
+                    "-y",
+                    "--expected-group",
+                    group,
+                ]
+                r = _run(command, input_text="y\n", timeout=60)
             if _destroy_succeeded(r):
                 _pass(
                     f"destroy reported success for {dseq} (attempt {attempt}) "
@@ -375,18 +481,41 @@ def robust_destroy(
     return False
 
 
-def destroy_owned_deployment(dseq: str, *, retries: int = 2, audit: bool = True) -> bool:
+def destroy_owned_deployment(
+    dseq: str,
+    *,
+    owner: str | None = None,
+    group: str | None = None,
+    retries: int = 2,
+    audit: bool = True,
+) -> bool:
     """Resolve owner before the first close byte, then run owner-scoped cleanup.
 
     Owner resolution failure is a hold: a shared wallet DSEQ without its owner is
     insufficient authority to select and verify a deployment.
     """
-    try:
-        owner = resolve_deployment_owner(dseq)
-    except Exception as exc:  # noqa: BLE001 — cleanup reports and holds
-        _fail(f"Cleanup held for {dseq}: owner could not be resolved ({exc})")
-        return False
-    return robust_destroy(dseq, owner=owner, retries=retries, audit=audit)
+    if owner is None:
+        try:
+            owner = resolve_deployment_owner(dseq)
+        except Exception as exc:  # noqa: BLE001 — cleanup reports and holds
+            _fail(f"Cleanup held for {dseq}: owner could not be resolved ({exc})")
+            return False
+    if group is None:
+        # The legacy CLI cannot bind an owner without a group. Read a candidate
+        # singleton group, then let the destroy command independently corroborate
+        # that exact owner/group pair before it selects a wallet or closes anything.
+        from . import chain
+
+        try:
+            names = chain.deployment_group_names(owner, str(dseq))
+        except Exception as exc:  # noqa: BLE001 - discovery failure is a hold
+            _fail(f"Cleanup held for {dseq}: singleton group lookup failed ({exc})")
+            return False
+        if len(names) != 1:
+            _fail(f"Cleanup held for {dseq}: exact singleton group could not be resolved")
+            return False
+        group = names[0]
+    return robust_destroy(dseq, owner=owner, group=group, retries=retries, audit=audit)
 
 
 def _signal_handler(signum, _frame):
@@ -421,7 +550,14 @@ def _signal_handler(signum, _frame):
                         _fail(f"Cleanup held for {dseq}: owner could not be resolved ({exc})")
                         cleaned_any = True
                         continue
-                robust_destroy(dseq, owner=owner, retries=1, audit=True)
+                group = (ref or {}).get("group") or None
+                groups = (ref or {}).get("groups")
+                if isinstance(groups, list):
+                    robust_destroy(dseq, owner=owner, groups=groups, retries=1, audit=True)
+                elif group is None:
+                    robust_destroy(dseq, owner=owner, retries=1, audit=True)
+                else:
+                    robust_destroy(dseq, owner=owner, group=group, retries=1, audit=True)
                 cleaned_any = True
         if not cleaned_any:
             _info("No DSEQ recorded yet — nothing to clean up")

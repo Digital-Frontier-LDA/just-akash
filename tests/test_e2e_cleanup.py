@@ -9,7 +9,6 @@ tier resolution from env vars.
 
 from __future__ import annotations
 
-import shlex
 import signal
 import subprocess
 from itertools import chain, repeat
@@ -20,12 +19,15 @@ import pytest
 from just_akash._e2e import (
     _destroy_succeeded,
     _reset_signal_cleanup_for_tests,
+    _run,
     assert_provider_in_tiers,
     classify_provider,
     install_signal_cleanup,
     resolve_tiers,
     robust_destroy,
 )
+
+OWNER = "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee"
 
 
 @pytest.fixture(autouse=True)
@@ -145,6 +147,24 @@ class TestRobustDestroy:
             ]
             assert robust_destroy("12345") is True
             assert mock_run.call_count == 2
+
+    def test_receipt_bound_destroy_passes_exact_owner_and_group(self):
+        with (
+            patch("just_akash._e2e.subprocess.run") as mock_run,
+            patch("just_akash._e2e._confirm_settled", return_value=True) as settled,
+        ):
+            mock_run.return_value = _completed(0, stdout="Deployment 12345 destroyed")
+            assert robust_destroy("12345", owner=OWNER, group="group-one") is True
+        command = mock_run.call_args.args[0]
+        assert command.count("--expected-owner") == 1
+        assert command.count("--expected-group") == 1
+        assert OWNER in command and "group-one" in command
+        settled.assert_called_once_with("12345", OWNER)
+
+    def test_group_without_owner_is_held_before_any_destroy(self):
+        with patch("just_akash._e2e.subprocess.run") as mock_run:
+            assert robust_destroy("12345", group="group-one") is False
+        mock_run.assert_not_called()
 
     def test_retry_after_first_failure(self):
         with (
@@ -431,7 +451,7 @@ class TestRobustDestroyAdversarial:
             # Exactly 1 destroy + 1 audit = 2 calls. Destroy MUST run.
             assert mock_run.call_count == 2
             destroy_called = any(
-                "just destroy" in str(call.args[0])
+                call.args[0] == ["just", "destroy", "12345"]
                 for call in mock_run.call_args_list
                 if call.args
             )
@@ -739,26 +759,10 @@ class TestDseqWordBoundaryRegexEdges:
             assert robust_destroy("12345") is False
 
 
-class TestRunShellInjectionContract:
-    """Gap #8: `_run` uses `shell=True` and f-string interpolation of dseq.
+class TestRunArgvInjectionContract:
+    """Every local command is an argv vector and never enters a shell parser."""
 
-    Today: dseq="12345 ; rm -rf /tmp/foo" would execute the second command.
-    DSEQs from real Akash are always numeric so this isn't an active exploit,
-    but it IS a security latent. Pin the current contract so a future hardening
-    (shlex.quote / list-of-args) has a clear regression target — if someone
-    decides to quote dseq, this test will fail and force a deliberate update.
-
-    NOTE: this test does NOT execute the injected payload. It only inspects
-    the cmd string passed to subprocess.run.
-    """
-
-    def test_dseq_is_shell_quoted_in_destroy(self):
-        """The destroy command interpolates dseq under shell=True, so it MUST quote
-        it — the same guarantee the audit command carries. (This replaced an earlier
-        test that pinned the raw-interpolation behaviour as a known gap; CodeRabbit,
-        PR #63, rightly flagged that the audit-quoting work left the FIRST command
-        executed still injectable.)
-        """
+    def test_destroy_keeps_an_adversarial_dseq_in_one_argv_element(self):
         with (
             patch("just_akash._e2e.subprocess.run") as mock_run,
             patch("just_akash._e2e.time.sleep"),
@@ -771,25 +775,10 @@ class TestRunShellInjectionContract:
             robust_destroy(payload, audit=True)
 
             cmd = mock_run.call_args_list[0].args[0]
-            # The whole payload is a single quoted argument — the "; echo PWNED" can
-            # no longer be parsed by the shell as a separate command.
-            assert cmd == f"just destroy {shlex.quote(payload)}", (
-                f"destroy command must shell-quote the dseq; got {cmd!r}"
-            )
-            assert "'12345 ; echo PWNED'" in cmd
-            assert cmd.endswith("'")  # closing quote — payload fully contained
+            assert cmd == ["just", "destroy", payload]
+            assert "shell" not in mock_run.call_args_list[0].kwargs
 
-    def test_a_plain_numeric_dseq_needs_no_quoting_change(self):
-        """Guarantee the quoting is transparent for real dseqs: shlex.quote leaves a
-        pure-digit string untouched, so nothing about normal operation changes."""
-        assert shlex.quote("1784291290915") == "1784291290915"
-
-    def test_audit_command_quotes_the_dseq_so_it_stays_injection_safe(self):
-        """The audit can no longer be a static literal — it must name the deployment
-        it is auditing, because `just list` cannot be trusted to say whether escrow
-        is held. The injection-safety GUARANTEE is preserved by quoting: _run uses
-        shell=True, so an unquoted dseq would be a live injection vector.
-        """
+    def test_audit_keeps_an_adversarial_dseq_in_one_argv_element(self):
         with (
             patch("just_akash._e2e.subprocess.run") as mock_run,
             patch("just_akash._e2e.time.sleep"),
@@ -798,12 +787,29 @@ class TestRunShellInjectionContract:
                 _completed(0, stdout="closed"),
                 _completed(0, stdout='{"state": "closed"}'),
             ]
-            robust_destroy("12345; rm -rf /tmp/pwned")
+            payload = "12345; rm -rf /tmp/pwned"
+            robust_destroy(payload)
             audit_cmd = mock_run.call_args_list[1].args[0]
-            assert "'12345; rm -rf /tmp/pwned'" in audit_cmd, (
-                f"the dseq must be shell-quoted in the audit command; got: {audit_cmd}. "
-                "Unquoted user input under shell=True is an injection vector."
-            )
+            assert audit_cmd == [
+                "uv",
+                "run",
+                "just-akash",
+                "status",
+                "--dseq",
+                payload,
+                "--json",
+            ]
+            assert "shell" not in mock_run.call_args_list[1].kwargs
+
+    def test_env_branch_passes_argv_directly_to_popen(self):
+        """The process-group branch used by paid deploys has the same boundary."""
+        payload = "123; echo PWNED"
+        with patch("just_akash._e2e.subprocess.Popen") as mock_popen:
+            mock_popen.return_value.communicate.return_value = ("", "")
+            mock_popen.return_value.returncode = 0
+            _run(["tool", "--dseq", payload], env={"PATH": "/bin"})
+        assert mock_popen.call_args.args[0] == ["tool", "--dseq", payload]
+        assert "shell" not in mock_popen.call_args.kwargs
 
 
 # ── Iter-3 adversarial tests ─────────────────────────────────────────────────
@@ -1340,9 +1346,7 @@ class TestRobustDestroyFalsyDseqDisambiguation:
             )
             # Verify the destroy command was actually issued for "0".
             destroy_cmd = mock_run.call_args_list[0].args[0]
-            assert "just destroy 0" in destroy_cmd, (
-                f"dseq='0' must produce `just destroy 0`; got {destroy_cmd!r}."
-            )
+            assert destroy_cmd == ["just", "destroy", "0"]
 
 
 class TestAuditReadsTheAuthoritativeRecordNotTheList:
@@ -1370,7 +1374,7 @@ class TestAuditReadsTheAuthoritativeRecordNotTheList:
                 _completed(0, stdout='{"state": "closed"}'),
             ]
             robust_destroy("12345")
-            assert self._audit_cmd(mock_run) != "just list"
+            assert self._audit_cmd(mock_run) != ["just", "list"]
             assert "status" in self._audit_cmd(mock_run)
 
     def test_a_stale_list_can_no_longer_cause_a_spurious_leak_report(self):
@@ -1668,5 +1672,5 @@ class TestAuditOverClaimsWhenReaderLagsChainTruth:
             patch("just_akash._e2e.time.sleep"),
         ):
             mock_run.return_value = _completed(0, stdout="Deployment 12345 destroyed")
-            assert robust_destroy("12345", owner=owner) is True
+            assert robust_destroy("12345", owner=owner, group="group-one") is True
         confirm.assert_called_once_with("12345", owner)

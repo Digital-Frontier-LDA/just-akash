@@ -962,9 +962,6 @@ def deploy(
     select: str = "cheapest",
     already_selected: list[str] | None = None,
     receipt_path: str | None = None,
-    expected_owner: str | None = None,
-    expected_groups: list[str] | None = None,
-    expected_artifact_digest: str | None = None,
     receipt_operation_id: str | None = None,
 ) -> dict:
     # deposit is user-controlled (--deposit); reject non-finite/non-positive
@@ -977,19 +974,12 @@ def deploy(
             "bid_wait_retry is the total auction deadline and must be greater than "
             "or equal to bid_wait"
         )
-    receipt_arguments = (
-        receipt_path,
-        expected_owner,
-        expected_groups,
-        expected_artifact_digest,
-        receipt_operation_id,
-    )
+    receipt_arguments = (receipt_path, receipt_operation_id)
     if any(value is not None for value in receipt_arguments) and not all(
         value is not None for value in receipt_arguments
     ):
         raise RuntimeError(
-            "deployment receipt arguments are all-or-none: receipt_path, expected_owner, "
-            "expected_groups, expected_artifact_digest, and receipt_operation_id"
+            "deployment receipt arguments are all-or-none: receipt_path and receipt_operation_id"
         )
     fallback_wait = bid_wait_retry - bid_wait
     # ⛔ VALIDATE BEFORE YOU SPEND. This raises on a bad --select, and it must raise HERE:
@@ -1044,31 +1034,15 @@ def deploy(
     sdl_path = _resolve_sdl_path(sdl_path, gpu)
     _log(logging.INFO, "STEP 1: Preparing SDL")
     sdl_content = _prepare_sdl_content(sdl_path, image=image, env_vars=env_vars)
-    if receipt_path is not None:
-        source_bytes = Path(sdl_path).read_bytes()
-        if sdl_content.encode() != source_bytes:
-            raise RuntimeError(
-                "receipt mode requires --sdl to contain the exact submitted bytes, "
-                "including an already run-scoped placement key and all image/env "
-                "overrides; preparation changed the file, so its caller-supplied "
-                "artifact digest cannot identify the submitted artifact"
-            )
     _check_wallet_credit(client, deposit)
 
     prepared_receipt = None
     if receipt_path is not None:
         actual_owner = client.account_address()
-        if actual_owner != expected_owner:
-            raise RuntimeError(
-                f"receipt expected owner {expected_owner!r} does not match selected signer "
-                f"{actual_owner!r}"
-            )
         prepared_receipt = prepare_receipt(
             receipt_path,
             operation_id=str(receipt_operation_id),
-            expected_owner=actual_owner,
-            expected_groups=list(expected_groups or []),
-            expected_artifact_digest=str(expected_artifact_digest),
+            owner=actual_owner,
             sdl_content=sdl_content,
         )
 
@@ -2359,11 +2333,6 @@ def deploy_main():
         help="Backup provider address (repeatable; overrides AKASH_PROVIDERS_BACKUP)",
     )
     parser.add_argument("--receipt-path")
-    parser.add_argument("--receipt-expected-owner")
-    parser.add_argument(
-        "--receipt-expected-group", action="append", dest="receipt_expected_groups"
-    )
-    parser.add_argument("--receipt-artifact-sha256")
     parser.add_argument("--receipt-operation-id")
     # Mirrors the flag on `just-akash deploy` (cli.py). Both entry points reach the same
     # deploy(), so a flag on only one of them is a trap for whoever uses the other.
@@ -2416,9 +2385,6 @@ def deploy_main():
             # AKASH_PROVIDERS_BACKUP". See _resolve_tier.
             backup_providers=[] if args.no_backup_fallback else args.backup_providers,
             receipt_path=args.receipt_path,
-            expected_owner=args.receipt_expected_owner,
-            expected_groups=args.receipt_expected_groups,
-            expected_artifact_digest=args.receipt_artifact_sha256,
             receipt_operation_id=args.receipt_operation_id,
         )
         sys.exit(0)
