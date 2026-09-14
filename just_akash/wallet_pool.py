@@ -23,6 +23,7 @@ from .owner_lookup import (
     Deadline,
     OwnerLookupUnresolved,
     ask,
+    lookup_owner,  # noqa: F401 - importable from wallet_pool since #374
     unresolved_verdict,
 )
 
