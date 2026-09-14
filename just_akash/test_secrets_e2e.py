@@ -20,6 +20,7 @@ import json as _json
 import os
 import re
 import secrets
+import shlex
 import signal
 import subprocess
 import sys
@@ -64,10 +65,22 @@ def log_info(msg):
     print(f"  {YELLOW}INFO{RESET} {msg}")
 
 
-def run(cmd: str, timeout: int = 60, input_text: str | None = None) -> subprocess.CompletedProcess:
+def run(
+    argv: list[str], timeout: int = 60, input_text: str | None = None
+) -> subprocess.CompletedProcess:
+    """Run one command as an argv list, never through a shell (#371).
+
+    Values reaching these commands (DSEQs, provider-returned data, temp paths) come from
+    external answers. Through a shell, a value such as `1; touch /tmp/pwned` would run as a
+    second command in a job that holds wallet API credentials; as an argv element it is one
+    literal argument. A string is refused rather than split, so no call site can regress to
+    an interpolated command line.
+    """
+    if not isinstance(argv, list) or not all(isinstance(part, str) for part in argv):
+        raise TypeError("run() takes an argv list of strings, never a shell command string")
     return subprocess.run(
-        cmd,
-        shell=True,
+        argv,
+        shell=False,
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -379,7 +392,7 @@ def main():
         ssh_port = None
         provider_addr = None
         for _attempt in range(3):
-            r = run(f"uv run just-akash status --dseq {dseq} --json")
+            r = run(["uv", "run", "just-akash", "status", "--dseq", str(dseq), "--json"])
             try:
                 status_data = _json.loads(r.stdout)
                 ssh_host = status_data.get("ssh_host")
@@ -424,10 +437,19 @@ def main():
                 f.write(f"{env_name}={env_val}\n")
                 f.write("ANOTHER_VAR=hello_world\n")
 
-            inject_cmd = (
-                f"uv run just-akash inject --dseq {dseq} --env-file {env_file} --transport ssh"
-            )
-            log_info(f"Running: {inject_cmd}")
+            inject_cmd = [
+                "uv",
+                "run",
+                "just-akash",
+                "inject",
+                "--dseq",
+                str(dseq),
+                "--env-file",
+                env_file,
+                "--transport",
+                "ssh",
+            ]
+            log_info(f"Running: {shlex.join(inject_cmd)}")
             r = run(inject_cmd, timeout=60)
             print(r.stdout)
             if r.stderr:
@@ -523,11 +545,21 @@ def main():
                     f.write(f"CROSSCHECK_KEY={ls_val}\n")
 
                 remote_path2 = "/tmp/e2e-lease-shell-crosscheck.env"
-                inject_cmd2 = (
-                    f"uv run just-akash inject --dseq {dseq} --env-file {env_file2}"
-                    f" --remote-path {remote_path2} --transport lease-shell"
-                )
-                log_info(f"Running: {inject_cmd2}")
+                inject_cmd2 = [
+                    "uv",
+                    "run",
+                    "just-akash",
+                    "inject",
+                    "--dseq",
+                    str(dseq),
+                    "--env-file",
+                    env_file2,
+                    "--remote-path",
+                    remote_path2,
+                    "--transport",
+                    "lease-shell",
+                ]
+                log_info(f"Running: {shlex.join(inject_cmd2)}")
                 r2 = run(inject_cmd2, timeout=30)
                 if r2.returncode != 0:
                     log_fail(

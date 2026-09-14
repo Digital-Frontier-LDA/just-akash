@@ -58,10 +58,22 @@ def log_info(msg):
     print(f"  {YELLOW}INFO{RESET} {msg}")
 
 
-def run(cmd: str, timeout: int = 60, input_text: str | None = None) -> subprocess.CompletedProcess:
+def run(
+    argv: list[str], timeout: int = 60, input_text: str | None = None
+) -> subprocess.CompletedProcess:
+    """Run one command as an argv list, never through a shell (#371).
+
+    Values reaching these commands (DSEQs, provider-returned data, temp paths) come from
+    external answers. Through a shell, a value such as `1; touch /tmp/pwned` would run as a
+    second command in a job that holds wallet API credentials; as an argv element it is one
+    literal argument. A string is refused rather than split, so no call site can regress to
+    an interpolated command line.
+    """
+    if not isinstance(argv, list) or not all(isinstance(part, str) for part in argv):
+        raise TypeError("run() takes an argv list of strings, never a shell command string")
     return subprocess.run(
-        cmd,
-        shell=True,
+        argv,
+        shell=False,
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -115,7 +127,7 @@ def main():
 
     log_step(2, "just list — check initial state")
 
-    r = run("just list")
+    r = run(["just", "list"])
     if r.returncode != 0:
         log_fail(f"just list failed: {r.stderr.strip()}")
         sys.exit(1)
@@ -193,12 +205,12 @@ def main():
         import contextlib
 
         provider_addr = None
-        rj = run(f"uv run just-akash status --dseq {dseq} --json", timeout=30)
+        rj = run(["uv", "run", "just-akash", "status", "--dseq", str(dseq), "--json"], timeout=30)
         if rj.returncode == 0:
             with contextlib.suppress(json.JSONDecodeError, AttributeError):
                 provider_addr = json.loads(rj.stdout).get("provider")
 
-        r = run(f"just status {dseq}")
+        r = run(["just", "status", str(dseq)])
         status_output = r.stdout
         print(status_output)
 
@@ -226,7 +238,7 @@ def main():
         if not ssh_match:
             log_info("Retrying status for SSH details...")
             time.sleep(5)
-            r = run(f"just status {dseq}")
+            r = run(["just", "status", str(dseq)])
             status_output = r.stdout
             ssh_match = re.search(r"ssh -p (\d+) root@(\S+)", status_output)
 
@@ -284,7 +296,7 @@ def main():
             failures.append("cleanup: destroy or audit failed")
 
     log_step(7, "just list — final audit")
-    r = run("just list")
+    r = run(["just", "list"])
     # Word-boundary match: don't false-positive when our dseq is a substring
     # of another active deployment (e.g. "123" inside "12345").
     if not re.search(rf"(?<!\d){re.escape(dseq)}(?!\d)", r.stdout):

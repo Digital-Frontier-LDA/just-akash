@@ -21,7 +21,6 @@ Each test below runs the REAL `main()` down one of those branches:
 from __future__ import annotations
 
 import json
-import re
 import signal
 import subprocess
 import time
@@ -223,21 +222,19 @@ def _offline_provider(monkeypatch) -> None:
     and `ssh`, simulated in memory so every step passes and main() reaches its `finally`."""
     files: dict[str, str] = {}
 
-    def run(cmd: str, timeout: int = 60, input_text: str | None = None):
-        if "just-akash status" in cmd:
+    def run(argv: list[str], timeout: int = 60, input_text: str | None = None):
+        assert isinstance(argv, list), f"run() must receive argv, got {argv!r}"  # #371
+        if argv[:4] == ["uv", "run", "just-akash", "status"]:
             body = json.dumps(
                 {"ssh_host": "instance.example", "ssh_port": 2222, "provider": PROVIDER}
             )
-            return subprocess.CompletedProcess(cmd, 0, body, "")
-        if "just-akash inject" in cmd:
-            env_file = re.search(r"--env-file (\S+)", cmd)
-            remote = re.search(r"--remote-path (\S+)", cmd)
-            assert env_file, cmd
-            files[remote.group(1) if remote else "/run/secrets/.env"] = Path(
-                env_file.group(1)
-            ).read_text()
-            return subprocess.CompletedProcess(cmd, 0, "Injected 2 variable(s)", "")
-        raise AssertionError(f"unexpected shell-out: {cmd}")
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        if argv[:4] == ["uv", "run", "just-akash", "inject"]:
+            env_file = argv[argv.index("--env-file") + 1]
+            remote = argv[argv.index("--remote-path") + 1] if "--remote-path" in argv else None
+            files[remote or "/run/secrets/.env"] = Path(env_file).read_text()
+            return subprocess.CompletedProcess(argv, 0, "Injected 2 variable(s)", "")
+        raise AssertionError(f"unexpected command: {argv}")
 
     def ssh(argv, **_kwargs):
         remote = argv[-1]
