@@ -17,6 +17,7 @@ from akash_lease_core import WalletCandidate, WalletPolicy, rank_wallets
 
 from . import chain
 from .api import AkashConsoleAPI, _extract_dseq
+from .owner_lookup import OwnerLookupUnresolved, ask, lookup_owner, unresolved_verdict
 
 
 @dataclass(frozen=True)
@@ -295,14 +296,26 @@ def select_client_for_dseq(
     keys = configured_api_keys()
     if not keys:
         raise RuntimeError("AKASH_API_KEY or AKASH_API_KEYS must be set")
+    # ⛔ A READ THAT FAILED IN TRANSPORT IS NOT "THIS WALLET CANNOT READ IT" (#367). An API outage
+    # used to skip every wallet and report the lease unreadable by all of them.
+    unknown = False
     for key in keys:
         client = client_factory(key)
-        try:
-            deployment = client.get_deployment(str(dseq))
-        except RuntimeError:
-            continue
-        if isinstance(deployment, dict) and _extract_dseq(deployment) == str(dseq):
+        kind, deployment = ask(lambda client=client: client.get_deployment(str(dseq)))
+        if kind == "unknown":
+            unknown = True
+        elif (
+            kind == "answered"
+            and isinstance(deployment, dict)
+            and _extract_dseq(deployment) == str(dseq)
+        ):
             return client
+    if unknown:
+        raise OwnerLookupUnresolved(
+            "OWNER_LOOKUP_UNREACHABLE",
+            f"deployment {dseq} could not be read: at least one configured Console wallet did "
+            "not answer within its retry budget, so ownership is unproven, not disproven",
+        )
     raise RuntimeError(
         f"deployment {dseq} was not readable under any of {len(keys)} configured Console wallets"
     )
@@ -331,17 +344,31 @@ def _raw_client_for_bound_owner(
     keys = configured_api_keys()
     if not keys:
         raise RuntimeError("AKASH_API_KEY or AKASH_API_KEYS must be set")
+    # ⛔ AN OUTAGE IS NOT "NOT THE OWNER" (#367). `except RuntimeError: continue` skipped every
+    # credential during a Console connection-reset window and reported an owner mismatch. Only an
+    # address MATCH selects a signer; a transport failure is UNKNOWN (retried within a budget).
     matching = []
+    kinds: set[str] = set()
     for key in keys:
         client = client_factory(key)
-        try:
-            owner = client.account_address()
-        except RuntimeError:
-            continue
-        if owner == expected_owner:
+        kind, owner = lookup_owner(client)
+        if kind == "address" and owner == expected_owner:
             matching.append(client)
+            break
+        kinds.add(kind)
     if not matching:
-        raise RuntimeError("expected owner was not reported by any configured Console credential")
+        verdict = unresolved_verdict(kinds)
+        raise OwnerLookupUnresolved(
+            verdict,
+            "expected owner was not reported by any configured Console credential"
+            if verdict == "NO_CREDENTIAL_MATCHES_OWNER"
+            else "no configured Console credential was proven to be the expected owner "
+            + (
+                "(a credential lookup did not answer within its retry budget)"
+                if verdict == "OWNER_LOOKUP_UNREACHABLE"
+                else "(every credential lookup failed for a non-transport reason)"
+            ),
+        )
     names = chain.corroborated_deployment_group_names(expected_owner, dseq, expected_group)
     if names != [expected_group]:
         raise RuntimeError("owner-bound containment did not prove exact gseq=1 singleton")

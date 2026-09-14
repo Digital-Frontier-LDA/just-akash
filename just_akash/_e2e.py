@@ -353,56 +353,19 @@ def _confirm_settled_single_reader(
 # and the ownership standard forbids selecting a signer without a positive owner match. So
 # an UNKNOWN bound key does not close anything: the scan continues, and "no MATCH, some
 # UNKNOWN" is the typed OWNER_LOOKUP_UNREACHABLE hold.
-OWNER_LOOKUP_ATTEMPTS = 3
-OWNER_LOOKUP_BACKOFF_SECONDS = 1.0
-# The bound key waits longer: 5 attempts, exponential 2+4+8+16 = 30s of backoff in total.
-BOUND_OWNER_LOOKUP_ATTEMPTS = 5
-BOUND_OWNER_LOOKUP_BACKOFF_SECONDS = 2.0
-OWNER_LOOKUP_UNREACHABLE = "OWNER_LOOKUP_UNREACHABLE"
-NO_CREDENTIAL_MATCHES_OWNER = "NO_CREDENTIAL_MATCHES_OWNER"
-# Every key failed for a non-transport reason (401, 403, malformed JWT): no address was read
-# at all, so "no credential matches" would claim a comparison that never happened.
-# ⚠ A MIX is still NO_CREDENTIAL_MATCHES_OWNER: a 403 key beside a key that returned a different
-# address yields no-match although the 403 key's own address was never read. That is safe: a
-# key that cannot mint a JWT cannot close the lease either.
-OWNER_LOOKUP_UNREADABLE = "OWNER_LOOKUP_UNREADABLE"
-
-
-def _is_transport_error(exc: BaseException) -> bool:
-    """A failure that says nothing about which account the key belongs to.
-
-    Measured through the real AkashConsoleAPI with only urlopen patched (DEV7 on #366):
-    connect-phase resets, timeouts and DNS failures arrive as "Connection error: …"; a reset or
-    timeout while reading the body arrives raw; a truncated body arrives as
-    http.client.IncompleteRead, which is NOT an OSError; 5xx, 524, 429 and 408 arrive as
-    AkashAPIError."""
-    import http.client
-
-    from .api import AkashAPIError
-
-    if isinstance(exc, AkashAPIError):
-        return exc.status is not None and (exc.status >= 500 or exc.status in (408, 429))
-    if isinstance(exc, (ConnectionError, TimeoutError, OSError, http.client.IncompleteRead)):
-        return True
-    return isinstance(exc, RuntimeError) and str(exc).startswith("Connection error:")
-
-
-def _lookup_owner(candidate, *, bound: bool = False) -> tuple[str, str | None]:
-    """("address"|"unknown"|"unreadable", address) within the key's retry budget."""
-    attempts = BOUND_OWNER_LOOKUP_ATTEMPTS if bound else OWNER_LOOKUP_ATTEMPTS
-    for attempt in range(1, attempts + 1):
-        try:
-            return "address", candidate.account_address()
-        except Exception as exc:  # noqa: BLE001 - classified below, never read as a mismatch
-            if not _is_transport_error(exc):
-                return "unreadable", None
-            if attempt < attempts:
-                time.sleep(
-                    BOUND_OWNER_LOOKUP_BACKOFF_SECONDS * 2 ** (attempt - 1)
-                    if bound
-                    else OWNER_LOOKUP_BACKOFF_SECONDS * attempt
-                )
-    return "unknown", None
+# The outcomes, budgets, transport classification and verdicts live in owner_lookup, shared with
+# production teardown (#367). Re-exported here under their original names.
+from .owner_lookup import (  # noqa: E402, F401 - re-exported under their original names
+    BOUND_OWNER_LOOKUP_ATTEMPTS,
+    BOUND_OWNER_LOOKUP_BACKOFF_SECONDS,
+    NO_CREDENTIAL_MATCHES_OWNER,
+    OWNER_LOOKUP_ATTEMPTS,
+    OWNER_LOOKUP_BACKOFF_SECONDS,
+    OWNER_LOOKUP_UNREACHABLE,
+    OWNER_LOOKUP_UNREADABLE,
+    unresolved_verdict,
+)
+from .owner_lookup import lookup_owner as _lookup_owner  # noqa: E402
 
 
 def _select_owner_credential(dseq: str, owner: str, keys: list[str], credential: object):
@@ -428,11 +391,7 @@ def _select_owner_credential(dseq: str, owner: str, keys: list[str], credential:
         if kind == "address" and address == owner:
             return candidate, None
         kinds.add(kind)
-    if "unknown" in kinds:
-        return None, OWNER_LOOKUP_UNREACHABLE
-    if "address" in kinds:
-        return None, NO_CREDENTIAL_MATCHES_OWNER
-    return None, OWNER_LOOKUP_UNREADABLE
+    return None, unresolved_verdict(kinds)
 
 
 def robust_destroy(
