@@ -12,10 +12,11 @@ profile, drops `count`, or aggregates across groups picks it, and a correct one 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 
 import pytest
-from akash_lease_core import from_provider_status
+from akash_lease_core import BidRejectionReason, SelectionReason, from_provider_status
 
 from just_akash import deploy as deploy_mod
 from just_akash import wallet_pool
@@ -419,3 +420,161 @@ def test_a_multi_group_gseqless_bid_is_never_silently_assigned_group_1(
         bids=[_bid_without_gseq(CHEAP, "1"), _bid(DEAR, "9")],
     )
     assert "gseqless_bids=1" in caplog.text
+
+
+# ── akash-lease-core v0.15.1 (#50/#51): provider-scoped degradation, through deploy() ─────
+#
+# Q is 60% free and R 30%, both fully readable; P fits on its one readable node but has a
+# second, unreadable node, so its provider-wide free fraction is unknown. On v0.15.0 that
+# single partial bidder turned the WHOLE auction into a cheapest fallback (L1) that also
+# ignored anti-affinity (L2). Capacities are built by the real /status adapter.
+
+EMPTY_Q, HALF_R, PARTIAL_P = "akash1emptiestq", "akash1halffullr", "akash1partialp"
+_ALLOCATABLE = {"cpu": 100_000, "memory": 10**12, "storage_ephemeral": 10**12, "gpu": 0}
+
+
+def _node(free_fraction: float) -> dict:
+    return {
+        "allocatable": dict(_ALLOCATABLE),
+        "available": {k: int(v * free_fraction) for k, v in _ALLOCATABLE.items()},
+    }
+
+
+def _status_of(*nodes: dict) -> dict:
+    return {"cluster": {"inventory": {"available": {"nodes": list(nodes)}}}}
+
+
+DEGRADED_POOL = {
+    EMPTY_Q: from_provider_status(_status_of(_node(0.6))),
+    HALF_R: from_provider_status(_status_of(_node(0.3))),
+    PARTIAL_P: from_provider_status(
+        _status_of(_node(0.9), {"allocatable": dict(_ALLOCATABLE)})  # 2nd node unreadable
+    ),
+}
+
+
+def test_the_degraded_pool_is_what_it_claims_to_be() -> None:
+    """Positive control for L1/L2: two complete providers and one that proves fit only."""
+    from just_akash.request_profile import derive_resource_profiles
+
+    profile = derive_resource_profiles(ONE_GROUP).profiles[1]
+    assert DEGRADED_POOL[EMPTY_Q].ranking_complete_for(profile)
+    assert DEGRADED_POOL[HALF_R].ranking_complete_for(profile)
+    assert not DEGRADED_POOL[PARTIAL_P].ranking_complete_for(profile)
+    partial_nodes = DEGRADED_POOL[PARTIAL_P].node_capacities
+    assert partial_nodes is not None and len(partial_nodes) == 2
+
+
+def _record_decisions(monkeypatch) -> list:
+    """Record every auction result deploy() receives from its real adapter. The reason is
+    compared as the core's enum: deploy.py logs it with an f-string, which renders
+    `emptiest_preferred` on Python 3.10 but `SelectionReason.EMPTIEST_PREFERRED` on 3.13."""
+    decisions: list = []
+    real = deploy_mod._select_auction_bid
+
+    def recording(*args, **kwargs):
+        selected, result = real(*args, **kwargs)
+        decisions.append(result)
+        return selected, result
+
+    monkeypatch.setattr(deploy_mod, "_select_auction_bid", recording)
+    return decisions
+
+
+def test_L1_one_partially_readable_bidder_does_not_degrade_the_auction(
+    run_deploy, monkeypatch
+) -> None:
+    """R is the cheapest complete bidder, so a pool-wide cheapest fallback picks R."""
+    decisions = _record_decisions(monkeypatch)
+    chosen = run_deploy(
+        sdl=ONE_GROUP,
+        capacity=DEGRADED_POOL,
+        bids=[_bid(EMPTY_Q, "9"), _bid(HALF_R, "5"), _bid(PARTIAL_P, "7")],
+        preferred=[EMPTY_Q, HALF_R, PARTIAL_P],
+    )
+    assert decisions, "deploy() never reached the auction adapter"
+    assert decisions[-1].selection_reason is SelectionReason.EMPTIEST_PREFERRED, [
+        d.selection_reason for d in decisions
+    ]
+    assert chosen == EMPTY_Q, "the emptiest complete provider must win beside a partial bidder"
+
+
+def test_L2_the_same_pool_still_steps_away_from_an_already_selected_provider(
+    run_deploy, monkeypatch
+) -> None:
+    """Q is now also the cheapest, so a fallback that ignores anti-affinity picks Q again."""
+    decisions = _record_decisions(monkeypatch)
+    chosen = run_deploy(
+        sdl=ONE_GROUP,
+        capacity=DEGRADED_POOL,
+        bids=[_bid(EMPTY_Q, "1"), _bid(HALF_R, "5"), _bid(PARTIAL_P, "3")],
+        preferred=[EMPTY_Q, HALF_R, PARTIAL_P],
+        already_selected=[EMPTY_Q],
+    )
+    assert decisions, "deploy() never reached the auction adapter"
+    assert chosen != EMPTY_Q, "anti-affinity: Q was already selected this round"
+    assert chosen == HALF_R, [d.selection_reason for d in decisions]
+
+
+# ── akash-lease-core v0.15.2 (#53): a /status integer above float range ─────────────────
+#
+# just_akash.provider_capacity.capacity_for catches (UnsafeProviderURL, URLError,
+# TimeoutError, ValueError, OSError) around from_provider_status — not OverflowError. On
+# v0.15.1 a bidder whose /status carries a 401-digit integer raised OverflowError out of
+# capacity_for and into deploy(). v0.15.2 reads such a value as unreadable capacity.
+
+OVERFLOW_P = "akash1overflowingstatus"
+
+
+def _live_capacity(monkeypatch, bodies: dict[str, str]) -> dict:
+    """A capacity lookup that runs the REAL capacity_for for each address deploy() asks
+    about, at the moment it asks. Only the network edges are stubbed: the chain lookup of
+    the provider's host URI and the HTTPS GET, which returns the raw JSON body text."""
+    from just_akash import provider_capacity
+
+    monkeypatch.setattr(
+        provider_capacity,
+        "provider_host_uri",
+        lambda address, timeout=15: f"https://{address}.example",
+    )
+    monkeypatch.setattr(
+        provider_capacity,
+        "_get_json",
+        lambda url, timeout: json.loads(bodies[url.split("//", 1)[1].split(".example", 1)[0]]),
+    )
+
+    class _Live(dict):
+        def __contains__(self, address: object) -> bool:
+            return address in bodies
+
+        def __getitem__(self, address: str):
+            return provider_capacity.capacity_for(address)
+
+    return _Live()
+
+
+def test_an_overflowing_status_integer_is_unreadable_not_a_crash(run_deploy, monkeypatch) -> None:
+    huge = 10**400
+    overflow_body = json.dumps(
+        _status_of(
+            {
+                "allocatable": dict(_ALLOCATABLE, cpu=huge),
+                "available": dict(_ALLOCATABLE, cpu=huge),
+            }
+        )
+    )
+    assert str(huge) in overflow_body and len(str(huge)) == 401  # the raw text carries it
+    bodies = {OVERFLOW_P: overflow_body, EMPTY_Q: json.dumps(_status_of(_node(0.6)))}
+    decisions = _record_decisions(monkeypatch)
+
+    chosen = run_deploy(
+        sdl=ONE_GROUP,
+        capacity=_live_capacity(monkeypatch, bodies),
+        bids=[_bid(OVERFLOW_P, "1"), _bid(EMPTY_Q, "9")],
+        preferred=[OVERFLOW_P, EMPTY_Q],
+    )
+
+    assert decisions, "deploy() never reached the auction adapter"
+    rejected = [(r.provider, r.reason) for r in decisions[-1].rejected]
+    assert (OVERFLOW_P, BidRejectionReason.REQUIRED_CAPACITY_UNREADABLE) in rejected, rejected
+    assert chosen == EMPTY_Q
