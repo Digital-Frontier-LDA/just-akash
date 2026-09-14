@@ -939,6 +939,7 @@ def _owner_close_evidence(
     sources,
     reader,
     now: datetime,
+    expected_population: tuple[tuple[str, str], ...] | None = None,
 ) -> dict[str, Any] | None:
     """Fresh authority plus a complete signed creation population, or ``None``.
 
@@ -948,15 +949,20 @@ def _owner_close_evidence(
     their totals, raw hashes, decoded order, execution result, and signed create groups
     must agree. Tests inject transport and time only through this private boundary.
     """
-    # Validate the closed registry and exact singleton before doing the authority reads.
+    target_population = expected_population or (("1", expected_group),)
+    target_names = [name for _gseq, name in target_population]
+    # Validate the closed registry and exact population before doing the authority reads.
     # This unpinned observation is containment only and is never reused as authority.
-    if _corroborated_deployment_group_names(
-        owner,
-        dseq,
-        sources=sources,
-        reader=reader,
-        expected_group=expected_group,
-    ) != [expected_group]:
+    if (
+        _corroborated_deployment_group_names(
+            owner,
+            dseq,
+            sources=sources,
+            reader=reader,
+            expected_population=target_population,
+        )
+        != target_names
+    ):
         return None
     bases = [source.get("url") for source in sources if isinstance(source, dict)]
     if len(bases) != len(sources) or len(bases) < 2:
@@ -1088,7 +1094,7 @@ def _owner_close_evidence(
         used.append(source["source_id"])
     if (
         len(used) < 2
-        or snapshot != (("1", expected_group),)
+        or snapshot != target_population
         or created_at is None
         or creation_proof is None
     ):
@@ -1118,6 +1124,7 @@ def _owner_close_evidence(
         "dseq": dseq,
         "gseq": "1",
         "group": expected_group,
+        "groups": [{"gseq": int(gseq), "name": name} for gseq, name in complete_snapshot],
         "population_count": len(complete_snapshot),
         "population_digest": hashlib.sha256(population.encode()).hexdigest(),
         "observed_at": now.isoformat(),
@@ -1152,6 +1159,53 @@ def owner_close_evidence(owner: str, dseq: str, expected_group: str) -> dict[str
         sources=OWNER_CORROBORATION_SOURCES_V2,
         reader=_lcd_get,
         now=datetime.now(timezone.utc),
+    )
+
+
+def owner_close_population_evidence(
+    owner: str, dseq: str, expected_population: list[dict[str, object]]
+) -> dict[str, Any] | None:
+    """Fresh authority for an exact complete ordered deployment population.
+
+    The evidence path binds the two height-pinned ``deployments/info`` snapshots to
+    the one successful signed ``MsgCreateDeployment`` in a creation block whose
+    transaction population is positively exhausted.  This is what proves that the
+    all-group read is complete; the exact info endpoint has no pagination contract or
+    total-count field of its own.
+    """
+    if (
+        not isinstance(dseq, str)
+        or not re.fullmatch(r"[1-9][0-9]{0,19}", dseq)
+        or int(dseq) > 2**64 - 1
+        or not isinstance(owner, str)
+        or not re.fullmatch(r"akash1[a-z0-9]{38,58}", owner)
+        or not isinstance(expected_population, list)
+        or not expected_population
+    ):
+        return None
+    population: list[tuple[str, str]] = []
+    for index, entry in enumerate(expected_population, start=1):
+        if not isinstance(entry, dict) or entry.get("gseq") != index:
+            return None
+        name = entry.get("name")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+            return None
+        population.append((str(index), name))
+    if os.environ.get("AKASH_REST_URL") is not None:
+        return None
+    if (
+        _source_registry_digest(OWNER_CORROBORATION_SOURCES_V2)
+        != OWNER_CORROBORATION_REGISTRY_SHA256
+    ):
+        return None
+    return _owner_close_evidence(
+        owner,
+        dseq,
+        population[0][1],
+        sources=OWNER_CORROBORATION_SOURCES_V2,
+        reader=_lcd_get,
+        now=datetime.now(timezone.utc),
+        expected_population=tuple(population),
     )
 
 
