@@ -10,7 +10,7 @@ Each test below runs the REAL `main()` down one of those branches:
 - `just up` is stubbed. It writes a REAL durable create receipt, using the same
   `deployment_receipt` functions `deploy` uses, at the path and operation ID `main()`
   hands it.
-- `robust_destroy` is stubbed. Each call records the exact `(dseq, owner, groups)` and
+- `robust_destroy` is stubbed. Each call records the exact `(dseq, owner, groups, credential)` and
   whether the receipt still existed at that moment, so "removed only after verified
   closure" is observed, not inferred.
 - Only the branches that need them stub anything further: the two chain observers that
@@ -33,6 +33,7 @@ from just_akash import _e2e
 from just_akash import paid_create as paid
 from just_akash import test_secrets_e2e as target
 from just_akash.deployment_receipt import (
+    CredentialBinding,
     mark_create_response_received,
     mark_submitting,
     prepare_receipt,
@@ -42,6 +43,9 @@ OWNER = "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee"
 PROVIDER = "akash1provider0000000000000000000000000000000"
 GROUP = "just-akash-secrets.abc123def456"
 GROUPS = [{"gseq": 1, "name": GROUP}]
+# deploy() writes the creating credential's position into the receipt (#363); every cleanup
+# site must forward it to robust_destroy as the lookup-order hint.
+BINDING: CredentialBinding = {"credential_index": 0, "credential_count": 1}
 SDL = f"""---
 version: "2.0"
 services:
@@ -114,6 +118,7 @@ def _just_up(monkeypatch, state: dict, *, dseq: str | None, outcome):
                 operation_id=env["JUST_AKASH_RECEIPT_OPERATION_ID"],
                 owner=OWNER,
                 sdl_content=SDL,
+                credential_binding=BINDING,
             )
         )
         if dseq is not None:
@@ -133,7 +138,7 @@ def _just_up(monkeypatch, state: dict, *, dseq: str | None, outcome):
 
 def _destroyed_once(state: dict, label: str, dseq: str) -> None:
     assert [(d[0], d[1], d[2]) for d in state["destroys"]] == [
-        (label, dseq, {"owner": OWNER, "groups": GROUPS})
+        (label, dseq, {"owner": OWNER, "groups": GROUPS, "credential": BINDING})
     ], state["destroys"]
     assert state["destroys"][0][3], "the receipt was removed before the verified closure"
 
@@ -203,8 +208,8 @@ def test_a_reconciled_dseq_the_reconciler_could_not_close_is_closed_by_main(
     assert exit_info.value.code == 1
     calls = [(d[0], d[1], d[2]) for d in e2e["destroys"]]
     assert calls == [
-        ("reconcile", reconciled, {"owner": OWNER, "groups": GROUPS}),
-        ("main", reconciled, {"owner": OWNER, "groups": GROUPS}),
+        ("reconcile", reconciled, {"owner": OWNER, "groups": GROUPS, "credential": BINDING}),
+        ("main", reconciled, {"owner": OWNER, "groups": GROUPS, "credential": BINDING}),
     ], calls
     assert all(d[3] for d in e2e["destroys"]), "the receipt was removed before closure"
     assert not e2e["receipt"].exists()
