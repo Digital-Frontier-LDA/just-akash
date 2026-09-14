@@ -574,6 +574,7 @@ def main():
                 dseq=receipt_dseq,
                 owner=receipt["expected_owner"],
                 groups=receipt["group_population"],
+                credential=receipt.get("credential_binding"),
             )
             if receipt_dseq:
                 verified_cleanup(dseq_ref)
@@ -592,6 +593,7 @@ def main():
         dseq_ref.update(
             owner=receipt["expected_owner"],
             groups=receipt["group_population"],
+            credential=receipt.get("credential_binding"),
         )
         dseq_ref["dseq"] = receipt_dseq
         if receipt_dseq is None:

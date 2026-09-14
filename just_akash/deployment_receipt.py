@@ -22,12 +22,15 @@ import uuid
 from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 
 import yaml
 from yaml.nodes import MappingNode, ScalarNode
 
 from .address import is_canonical_akash_address
+
+if TYPE_CHECKING:
+    from typing_extensions import NotRequired
 
 RECEIPT_TYPE = "just-akash/deployment-create/v1"
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
@@ -43,6 +46,16 @@ _TRANSACTION_KEYS = (
 )
 
 
+class CredentialBinding(TypedDict):
+    """Which configured Console credential created the deployment (#363). Non-secret:
+    a position and the size of the de-duplicated configured list, never key material
+    or a key-derived fingerprint. Cleanup selects that credential directly, so an API
+    outage cannot turn "this key's address could not be read" into "no key owns it"."""
+
+    credential_index: int
+    credential_count: int
+
+
 class _DeploymentReceiptBase(TypedDict):
     receipt_type: str
     operation_id: str
@@ -51,6 +64,7 @@ class _DeploymentReceiptBase(TypedDict):
     group_population_digest: str
     artifact_digest: str
     prepared_at: str
+    credential_binding: NotRequired[CredentialBinding]
 
 
 class PreparedDeploymentReceipt(_DeploymentReceiptBase):
@@ -76,6 +90,34 @@ class CreateResponseDeploymentReceipt(SubmittingDeploymentReceipt):
 DeploymentReceipt = (
     PreparedDeploymentReceipt | SubmittingDeploymentReceipt | CreateResponseDeploymentReceipt
 )
+
+CREDENTIAL_BINDING_KEY = "credential_binding"
+
+
+def credential_binding_for(
+    configured_keys: list[str], api_key: object
+) -> CredentialBinding | None:
+    """Bind the create-time credential by its position in the configured list."""
+    if not isinstance(api_key, str) or api_key not in configured_keys:
+        return None
+    return {
+        "credential_index": configured_keys.index(api_key),
+        "credential_count": len(configured_keys),
+    }
+
+
+def valid_credential_binding(value: object) -> CredentialBinding | None:
+    """The binding if it is well-formed, else None. Never raises."""
+    if not isinstance(value, dict) or set(value) != {"credential_index", "credential_count"}:
+        return None
+    index, count = value.get("credential_index"), value.get("credential_count")
+    if not isinstance(index, int) or isinstance(index, bool):
+        return None
+    if not isinstance(count, int) or isinstance(count, bool):
+        return None
+    if not (count >= 1 and 0 <= index < count):
+        return None
+    return {"credential_index": index, "credential_count": count}
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -269,6 +311,7 @@ def prepare_receipt(
     operation_id: str,
     owner: str,
     sdl_content: str,
+    credential_binding: CredentialBinding | None = None,
 ) -> tuple[Path, PreparedDeploymentReceipt, bytes]:
     """Derive and durably bind the selected signer and exact submitted SDL."""
 
@@ -289,6 +332,11 @@ def prepare_receipt(
         "artifact_digest": artifact_digest,
         "prepared_at": datetime.now(timezone.utc).isoformat(),
     }
+    if credential_binding is not None:
+        binding = valid_credential_binding(credential_binding)
+        if binding is None:
+            raise RuntimeError("receipt credential binding has an invalid shape")
+        receipt["credential_binding"] = binding
     encoded = _canonical_bytes(receipt)
     receipt_path = Path(path)
     _create_durable(receipt_path, encoded)
@@ -383,8 +431,13 @@ def decode_receipt(payload: bytes) -> DeploymentReceipt:
             "response_received_at",
         },
     }
-    if set(document) != base_keys | state_keys[state]:
+    # The credential binding is optional: receipts written before #363 have none.
+    if set(document) - {CREDENTIAL_BINDING_KEY} != base_keys | state_keys[state]:
         raise RuntimeError("deployment receipt fields do not match its typed state")
+    if CREDENTIAL_BINDING_KEY in document and (
+        valid_credential_binding(document[CREDENTIAL_BINDING_KEY]) is None
+    ):
+        raise RuntimeError("deployment receipt credential binding is invalid")
     required_strings = (
         "operation_id",
         "expected_owner",

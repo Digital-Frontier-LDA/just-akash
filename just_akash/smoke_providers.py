@@ -1059,6 +1059,7 @@ def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, s
                 dseq=receipt_dseq,
                 owner=receipt["expected_owner"],
                 groups=receipt["group_population"],
+                credential=receipt.get("credential_binding"),
             )
             if receipt_dseq:
                 verified_cleanup(dseq_ref)
@@ -1070,7 +1071,11 @@ def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, s
     out = (r.stdout or "") + (r.stderr or "")
     try:
         receipt, receipt_dseq = receipt_identity(receipt_path, operation_id)
-        dseq_ref.update(owner=receipt["expected_owner"], groups=receipt["group_population"])
+        dseq_ref.update(
+            owner=receipt["expected_owner"],
+            groups=receipt["group_population"],
+            credential=receipt.get("credential_binding"),
+        )
         dseq_ref["dseq"] = receipt_dseq
         if receipt_dseq is None:
             reconcile_receipt(receipt_path, operation_id, started_at, dseq_ref)
