@@ -457,7 +457,11 @@ def test_a_real_client_transport_failure_that_persists_is_unreachable(
 
 def _receipt_identity_sites():
     """Every place in just_akash that copies a receipt's group population into cleanup
-    identity, and every robust_destroy call that passes a complete group population."""
+    identity, and every robust_destroy call that passes a complete group population.
+
+    Name-independent: an identity copy is any `.update(...)` whose `groups=` value is
+    `<anything>["group_population"]`; it must forward `<the same thing>.get("credential_binding")`.
+    """
     import ast
 
     package = Path(__file__).resolve().parents[1] / "just_akash"
@@ -473,10 +477,12 @@ def _receipt_identity_sites():
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr == "update"
-                and groups is not None
-                and ast.unparse(groups) == "receipt['group_population']"
+                and isinstance(groups, ast.Subscript)
+                and isinstance(groups.slice, ast.Constant)
+                and groups.slice.value == "group_population"
             ):
-                updates.append((where, keywords.get("credential")))
+                source = ast.unparse(groups.value)
+                updates.append((where, source, keywords.get("credential")))
             name = node.func.id if isinstance(node.func, ast.Name) else None
             if name == "robust_destroy" and groups is not None:
                 destroys.append((where, keywords.get("credential")))
@@ -485,6 +491,7 @@ def _receipt_identity_sites():
 
 def test_every_receipt_identity_site_forwards_the_credential_binding() -> None:
     import ast
+    import re
 
     updates, destroys = _receipt_identity_sites()
     # Measured 2026-09-14: 9 identity copies (paid_create 1, smoke_providers 2, test_lifecycle 2,
@@ -494,13 +501,45 @@ def test_every_receipt_identity_site_forwards_the_credential_binding() -> None:
     assert len(destroys) >= 3, destroys
     missing_updates = [
         where
-        for where, value in updates
-        if value is None or ast.unparse(value) != "receipt.get('credential_binding')"
+        for where, source, value in updates
+        if value is None or ast.unparse(value) != f"{source}.get('credential_binding')"
     ]
     assert not missing_updates, (
         f"receipt identity copied without its credential binding: {missing_updates}"
     )
-    missing_destroys = [where for where, value in destroys if value is None]
+    # The credential must be READ from the identity it travels with, not merely present:
+    # `credential=None` would keep the keyword and silently drop the bound-first hint.
+    missing_destroys = [
+        where
+        for where, value in destroys
+        if value is None or not re.search(r"\.get\('credential'\)$", ast.unparse(value))
+    ]
     assert not missing_destroys, (
-        f"robust_destroy called without the credential: {missing_destroys}"
+        f"robust_destroy does not forward the ref's credential: {missing_destroys}"
     )
+
+
+def test_the_signal_handler_forwards_the_credential_binding(monkeypatch) -> None:
+    """Behavioural: SIGTERM cleanup passes the registered ref's binding to robust_destroy."""
+    import signal as signal_module
+
+    calls = []
+    monkeypatch.setattr(
+        _e2e, "robust_destroy", lambda dseq, **kwargs: calls.append((dseq, kwargs)) or True
+    )
+    binding = {"credential_index": 1, "credential_count": 2}
+    ref = {"dseq": "1001", "owner": OWNER, "groups": GROUPS, "credential": binding}
+    _e2e._reset_signal_cleanup_for_tests()
+    _e2e._REGISTERED_DSEQ_REFS.append(ref)
+    try:
+        with pytest.raises(SystemExit) as exit_info:
+            _e2e._signal_handler(signal_module.SIGTERM, None)
+    finally:
+        _e2e._reset_signal_cleanup_for_tests()
+    assert exit_info.value.code == 130
+    assert calls == [
+        (
+            "1001",
+            {"owner": OWNER, "groups": GROUPS, "credential": binding, "retries": 1, "audit": True},
+        )
+    ]

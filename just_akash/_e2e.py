@@ -362,6 +362,9 @@ OWNER_LOOKUP_UNREACHABLE = "OWNER_LOOKUP_UNREACHABLE"
 NO_CREDENTIAL_MATCHES_OWNER = "NO_CREDENTIAL_MATCHES_OWNER"
 # Every key failed for a non-transport reason (401, 403, malformed JWT): no address was read
 # at all, so "no credential matches" would claim a comparison that never happened.
+# ⚠ A MIX is still NO_CREDENTIAL_MATCHES_OWNER: a 403 key beside a key that returned a different
+# address yields no-match although the 403 key's own address was never read. That is safe: a
+# key that cannot mint a JWT cannot close the lease either.
 OWNER_LOOKUP_UNREADABLE = "OWNER_LOOKUP_UNREADABLE"
 
 
