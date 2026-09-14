@@ -171,6 +171,11 @@ jobs:
   teardown:
     name: Close lease and de-register runners
     runs-on: ubuntu-latest
+    # ⛔ MUST EXCEED the owner-lookup deadline + close/audit margin (see
+    # just_akash/owner_lookup.py: 10 + 4 = 14 min at the time of writing), pinned by
+    # tests/test_owner_lookup_deadline.py. A job killed mid-cleanup by its own
+    # timeout is the failure #370 exists to prevent.
+    timeout-minutes: 30
     outputs:
       closed: ${{ steps.close.outputs.closed }}
       held_reason: ${{ steps.close.outputs.held_reason }}

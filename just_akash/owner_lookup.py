@@ -22,6 +22,7 @@ MISMATCH → NO_CREDENTIAL_MATCHES_OWNER; else OWNER_LOOKUP_UNREADABLE (no addre
 from __future__ import annotations
 
 import http.client
+import threading
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -43,6 +44,39 @@ NO_CREDENTIAL_MATCHES_OWNER = "NO_CREDENTIAL_MATCHES_OWNER"
 # different address yields no-match although the 403 credential's address was never read. That is
 # safe: a credential that cannot mint a JWT cannot close the lease either.
 OWNER_LOOKUP_UNREADABLE = "OWNER_LOOKUP_UNREADABLE"
+
+# ⛔ THE WHOLE OWNER-LOOKUP PHASE IS WALL-CLOCK BOUNDED (#370). The per-attempt budgets above
+# bound RETRIES, not time: a full Console stall can cost CONSOLE_HTTP_TIMEOUT (180s, #369) per
+# attempt, and N configured keys multiply it — 8 keys ≈ 79 minutes of a job that must then be
+# killed mid-cleanup with no typed verdict. One deadline ends the phase instead: on expiry the
+# caller raises/returns the typed OWNER_LOOKUP_UNREACHABLE, recording the attempts each key
+# actually made. Sized so deadline + margin stays inside every invoking job's timeout-minutes;
+# the structural test in tests/test_owner_lookup_deadline.py pins that relationship.
+OWNER_LOOKUP_DEADLINE_SECONDS = 600.0
+# Headroom for the close and the settlement audit that follow a successful lookup — the
+# deadline must not consume the job budget the cleanup itself needs.
+OWNER_LOOKUP_JOB_MARGIN_SECONDS = 240.0
+
+
+class Deadline:
+    """A monotonic wall-clock budget shared by every credential and every attempt.
+
+    ``time.monotonic``, never wall time: a clock jump backwards mid-lookup must not
+    re-inflate an expired budget, and a jump forwards must not falsely expire one."""
+
+    def __init__(self, budget: float | None = None) -> None:
+        # Read at CALL time, not definition time, so the deadline can be tuned (and
+        # tested) by overriding the module constant.
+        if budget is None:
+            budget = OWNER_LOOKUP_DEADLINE_SECONDS
+        self._expires_at = time.monotonic() + budget
+
+    def remaining(self) -> float:
+        return max(0.0, self._expires_at - time.monotonic())
+
+    @property
+    def expired(self) -> bool:
+        return self.remaining() <= 0.0
 
 
 class OwnerLookupUnresolved(RuntimeError):
@@ -70,15 +104,68 @@ def is_transport_error(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeError) and str(exc).startswith("Connection error:")
 
 
-def ask(call: Callable[[], Any], *, bound: bool = False) -> tuple[str, Any]:
-    """("answered", value) | ("unknown", None) | ("unreadable", None) within the retry budget."""
+def bounded_call(call: Callable[[], Any], deadline: Deadline) -> tuple[bool, Any]:
+    """Run one lookup call under the deadline's REMAINING wall clock, outside the socket.
+
+    ⛔ WHY OUTSIDE THE SOCKET. A drip server — bytes trickling in slower than any
+    reasonable read, but never stopping — resets the socket timeout with every chunk
+    and defeats it entirely (measured on #369's review: 12.3s elapsed against a 0.5s
+    socket timeout, no TimeoutError). So the bound that matters is a join on the
+    wall clock: the call runs in a daemon worker and the caller waits at most
+    ``deadline.remaining()``.
+
+    On expiry the worker is ABANDONED, not joined. Its late result — if one ever
+    arrives — is discarded by construction: it lands in a holder this function has
+    already returned past, and nobody re-reads it (pinned by test in
+    tests/test_owner_lookup_deadline.py). A lookup is READ-ONLY with respect to lease
+    lifecycle — a JWT mint or a deployment GET cannot close, destroy or transfer
+    anything — so a lingering worker cannot act on the world; it can only be ignored.
+    The worker keeps #369's own socket timeout, so a no-byte stall still ends it; a
+    drip may keep it alive past the deadline. That lingering daemon thread is the
+    accepted residual of this design.
+    """
+    outcome: dict[str, Any] = {}
+
+    def _run() -> None:
+        try:
+            outcome["value"] = call()
+        except BaseException as exc:  # re-raised below ONLY if we outlived the join
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    worker.join(deadline.remaining())
+    if worker.is_alive():
+        return False, None
+    if "error" in outcome:
+        raise outcome["error"]
+    return True, outcome.get("value")
+
+
+def ask(
+    call: Callable[[], Any], *, bound: bool = False, deadline: Deadline | None = None
+) -> tuple[str, Any]:
+    """("answered", value) | ("unknown", None) | ("unreadable", None) within the retry budget.
+
+    With a ``deadline`` the phase budget also applies: each attempt runs under
+    ``bounded_call`` (wall clock outside the socket), an expired attempt returns
+    "unknown" immediately — the budget retries would spend is gone — and no backoff
+    sleeps past an already-expired deadline.
+    """
     attempts = BOUND_OWNER_LOOKUP_ATTEMPTS if bound else OWNER_LOOKUP_ATTEMPTS
     for attempt in range(1, attempts + 1):
         try:
-            return "answered", call()
+            if deadline is None:
+                return "answered", call()
+            answered, value = bounded_call(call, deadline)
+            if not answered:
+                return "unknown", None
+            return "answered", value
         except Exception as exc:  # noqa: BLE001 - classified below, never read as a mismatch
             if not is_transport_error(exc):
                 return "unreadable", None
+            if deadline is not None and deadline.expired:
+                return "unknown", None
             if attempt < attempts:
                 time.sleep(
                     BOUND_OWNER_LOOKUP_BACKOFF_SECONDS * 2 ** (attempt - 1)
@@ -88,9 +175,11 @@ def ask(call: Callable[[], Any], *, bound: bool = False) -> tuple[str, Any]:
     return "unknown", None
 
 
-def lookup_owner(candidate: Any, *, bound: bool = False) -> tuple[str, str | None]:
+def lookup_owner(
+    candidate: Any, *, bound: bool = False, deadline: Deadline | None = None
+) -> tuple[str, str | None]:
     """("address"|"unknown"|"unreadable", address) for one credential's account lookup."""
-    kind, value = ask(candidate.account_address, bound=bound)
+    kind, value = ask(candidate.account_address, bound=bound, deadline=deadline)
     return ("address", value) if kind == "answered" else (kind, None)
 
 

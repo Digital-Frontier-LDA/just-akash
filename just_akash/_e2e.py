@@ -361,12 +361,14 @@ from .owner_lookup import (  # noqa: E402, F401 - re-exported under their origin
     NO_CREDENTIAL_MATCHES_OWNER,
     OWNER_LOOKUP_ATTEMPTS,
     OWNER_LOOKUP_BACKOFF_SECONDS,
+    OWNER_LOOKUP_DEADLINE_SECONDS,
     OWNER_LOOKUP_UNREACHABLE,
     OWNER_LOOKUP_UNREADABLE,
+    Deadline,
+    ask,
     unresolved_verdict,
 )
 from .owner_lookup import is_transport_error as _is_transport_error  # noqa: E402, F401
-from .owner_lookup import lookup_owner as _lookup_owner  # noqa: E402
 
 
 def _select_owner_credential(dseq: str, owner: str, keys: list[str], credential: object):
@@ -386,9 +388,32 @@ def _select_owner_credential(dseq: str, owner: str, keys: list[str], credential:
     elif binding is not None:
         _info(f"Cleanup for {dseq}: credential binding does not fit the configured list")
     kinds: set[str] = set()
+    # ⛔ ONE WALL-CLOCK DEADLINE ACROSS EVERY CREDENTIAL (#370). On expiry the typed
+    # UNREACHABLE is returned with the attempts each credential made, by POSITION —
+    # key material never enters a log line.
+    deadline = Deadline()
+    attempts: list[int] = []
     for index in order:
+        if deadline.expired:
+            _info(
+                f"Cleanup for {dseq}: owner-lookup wall-clock deadline "
+                f"({OWNER_LOOKUP_DEADLINE_SECONDS:.0f}s) expired with {len(attempts)} of "
+                f"{len(keys)} credential(s) tried (attempts per position: {attempts})"
+            )
+            return None, OWNER_LOOKUP_UNREACHABLE
         candidate = AkashConsoleAPI(keys[index])
-        kind, address = _lookup_owner(candidate, bound=index == bound)
+        made = 0
+
+        def _mint(candidate: AkashConsoleAPI = candidate) -> str:
+            nonlocal made
+            made += 1
+            return candidate.account_address()
+
+        # ask() + the kind mapping lookup_owner() applies, with the attempt counted.
+        kind, address = ask(_mint, bound=index == bound, deadline=deadline)
+        attempts.append(made)
+        if kind == "answered":
+            kind = "address"
         if kind == "address" and address == owner:
             return candidate, None
         kinds.add(kind)

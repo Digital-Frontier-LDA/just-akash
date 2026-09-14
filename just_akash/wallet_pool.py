@@ -12,12 +12,19 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+from typing import Any
 
 from akash_lease_core import WalletCandidate, WalletPolicy, rank_wallets
 
 from . import chain
 from .api import AkashConsoleAPI, _extract_dseq
-from .owner_lookup import OwnerLookupUnresolved, ask, lookup_owner, unresolved_verdict
+from .owner_lookup import (
+    OWNER_LOOKUP_DEADLINE_SECONDS,
+    Deadline,
+    OwnerLookupUnresolved,
+    ask,
+    unresolved_verdict,
+)
 
 
 @dataclass(frozen=True)
@@ -298,10 +305,31 @@ def select_client_for_dseq(
         raise RuntimeError("AKASH_API_KEY or AKASH_API_KEYS must be set")
     # ⛔ A READ THAT FAILED IN TRANSPORT IS NOT "THIS WALLET CANNOT READ IT" (#367). An API outage
     # used to skip every wallet and report the lease unreadable by all of them.
+    # ⛔ AND THE PHASE IS WALL-CLOCK BOUNDED (#370): every wallet and every attempt shares one
+    # Deadline; on expiry the typed UNREACHABLE records the attempts each wallet made, by
+    # POSITION — key material never enters a message.
     unknown = False
+    deadline = Deadline()
+    attempts: list[int] = []
     for key in keys:
+        if deadline.expired:
+            raise OwnerLookupUnresolved(
+                "OWNER_LOOKUP_UNREACHABLE",
+                f"deployment {dseq} could not be read: the owner-lookup wall-clock deadline "
+                f"({OWNER_LOOKUP_DEADLINE_SECONDS:.0f}s) expired with {len(attempts)} of "
+                f"{len(keys)} configured wallet(s) tried (attempts per wallet position: "
+                f"{attempts}); ownership is unproven, not disproven",
+            )
         client = client_factory(key)
-        kind, deployment = ask(lambda client=client: client.get_deployment(str(dseq)))
+        made = 0
+
+        def _read(client: AkashConsoleAPI = client) -> Any:
+            nonlocal made
+            made += 1
+            return client.get_deployment(str(dseq))
+
+        kind, deployment = ask(_read, deadline=deadline)
+        attempts.append(made)
         if kind == "unknown":
             unknown = True
         elif (
@@ -347,11 +375,34 @@ def _raw_client_for_bound_owner(
     # ⛔ AN OUTAGE IS NOT "NOT THE OWNER" (#367). `except RuntimeError: continue` skipped every
     # credential during a Console connection-reset window and reported an owner mismatch. Only an
     # address MATCH selects a signer; a transport failure is UNKNOWN (retried within a budget).
+    # ⛔ AND THE PHASE IS WALL-CLOCK BOUNDED (#370): one Deadline across every credential and
+    # attempt; expiry raises the typed UNREACHABLE with attempts per credential POSITION.
     matching = []
     kinds: set[str] = set()
+    deadline = Deadline()
+    attempts: list[int] = []
     for key in keys:
+        if deadline.expired:
+            raise OwnerLookupUnresolved(
+                "OWNER_LOOKUP_UNREACHABLE",
+                f"the owner-lookup wall-clock deadline ({OWNER_LOOKUP_DEADLINE_SECONDS:.0f}s) "
+                f"expired with {len(attempts)} of {len(keys)} configured credential(s) tried "
+                f"(attempts per credential position: {attempts}); ownership is unproven, "
+                "not disproven",
+            )
         client = client_factory(key)
-        kind, owner = lookup_owner(client)
+        made = 0
+
+        def _mint(client: AkashConsoleAPI = client) -> str:
+            nonlocal made
+            made += 1
+            return client.account_address()
+
+        # ask() + the kind mapping lookup_owner() applies, with the attempt counted.
+        kind, owner = ask(_mint, deadline=deadline)
+        attempts.append(made)
+        if kind == "answered":
+            kind = "address"
         if kind == "address" and owner == expected_owner:
             matching.append(client)
             break

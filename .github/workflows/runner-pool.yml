@@ -378,6 +378,13 @@ jobs:
   pool:
     name: Provision ephemeral runner pool on Akash
     runs-on: ubuntu-latest
+    # ⛔ MUST EXCEED the owner-lookup deadline + close/audit margin (see
+    # just_akash/owner_lookup.py: 10 + 4 = 14 min at the time of writing), pinned by
+    # tests/test_owner_lookup_deadline.py. A job killed mid-cleanup by its own
+    # timeout is the failure #370 exists to prevent.
+    # Provisioning + workload + teardown sweeps legitimately run long; 120 keeps
+    # headroom above every observed pool run while still ending a stuck one.
+    timeout-minutes: 120
     outputs:
       dseq: ${{ steps.provision.outputs.dseq }}
       deployment_outcome: ${{ steps.provision.outputs.deployment_outcome }}

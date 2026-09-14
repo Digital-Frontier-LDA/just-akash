@@ -414,6 +414,12 @@ jobs:
   e2e-shell:
     name: E2E lease-shell transport
     runs-on: ubuntu-latest
+    # ⛔ MUST EXCEED the owner-lookup deadline + close/audit margin (see
+    # just_akash/owner_lookup.py: 10 + 4 = 14 min at the time of writing), pinned by
+    # tests/test_owner_lookup_deadline.py. A job killed mid-cleanup by its own
+    # timeout is the failure #370 exists to prevent.
+    # Whole-job e2e observed ~15 min; 45 is 3x headroom.
+    timeout-minutes: 45
     if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')
     steps:
       - name: Checkout
@@ -459,6 +465,12 @@ jobs:
   e2e-secrets:
     name: E2E secrets injection
     runs-on: ubuntu-latest
+    # ⛔ MUST EXCEED the owner-lookup deadline + close/audit margin (see
+    # just_akash/owner_lookup.py: 10 + 4 = 14 min at the time of writing), pinned by
+    # tests/test_owner_lookup_deadline.py. A job killed mid-cleanup by its own
+    # timeout is the failure #370 exists to prevent.
+    # Whole-job e2e observed ~15 min; 45 is 3x headroom.
+    timeout-minutes: 45
     # Run after e2e-shell, never alongside it: both jobs deploy with the same
     # AKASH_API_KEY (one Akash account). Concurrent runs collide on the same
     # deployment and the stale-deployment recovery in deploy.py tears down the
