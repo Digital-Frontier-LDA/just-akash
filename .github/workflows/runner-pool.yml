@@ -930,6 +930,8 @@ jobs:
       #   * The template is checked with an explicit `[ ! -s ]` BEFORE the mint, never with
       #     `$(< file) || fallback`: under `bash -e` on the runner's bash 5.2 that form ended the step
       #     on a missing file with no failure_reason (CI run 34953315385, job 104329251140).
+      #   * `echo failure_reason=RUNNER_SDL_TEMPLATE_MISSING` is UNQUOTED on purpose: quoted, detect-secrets
+      #     1.5.0 flags the literal as a Base64 high-entropy string (just-akash#384 Secret Scan).
       #   * UNCLASSIFIED_ATTEMPT: an attempt that fell into the unclassified `continue` may have
       #     broadcast a create with no DSEQ, so no later refusal narrows the outcome to no-deployment.
       - name: Provision (retry down candidates, tag before waiting)
@@ -1070,7 +1072,7 @@ jobs:
             if [ ! -s /tmp/runner-sdl.yaml ] || ! SDL_TEMPLATE=$(cat /tmp/runner-sdl.yaml) \
               || [[ "$SDL_TEMPLATE" != *@@RUNNER_TOKEN@@* ]]; then
               [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
-              echo "failure_reason=RUNNER_SDL_TEMPLATE_MISSING" >> "$GITHUB_OUTPUT"
+              echo failure_reason=RUNNER_SDL_TEMPLATE_MISSING >> "$GITHUB_OUTPUT"
               echo "::error title=Runner SDL template missing, empty or without its token placeholder::attempt $attempt: nothing minted or deployed."
               echo "::endgroup::"; exit 1
             fi

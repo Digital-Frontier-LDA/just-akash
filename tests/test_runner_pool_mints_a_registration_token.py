@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -93,7 +94,10 @@ def test_on_github_actions_the_fragment_runs_under_the_step_shell():
         [_bash(), "--version"], capture_output=True, text=True, check=True
     ).stdout.splitlines()[0]
     assert _bash() == STEP_BASH, (_bash(), version)
-    print(f"step shell: {STEP_BASH}: {version}")
+    # Past pytest's capture, as an annotation, so the job log names the bash that ran the legs.
+    print(
+        f"::notice title=runner-pool mint legs shell::{STEP_BASH}: {version}", file=sys.__stdout__
+    )
 
 
 def _response(status: int | None, token: str | None = TOKEN) -> str:
@@ -113,9 +117,9 @@ def _response(status: int | None, token: str | None = TOKEN) -> str:
 
 def _run_attempt(
     tmp_path: Path,
-    status=201,
-    token=TOKEN,
-    rc=None,
+    status: int | None = 201,
+    token: str | None = TOKEN,
+    rc: int | None = None,
     placeholder=True,
     created_dseq="",
     unclassified=0,
