@@ -89,10 +89,14 @@ sys.exit(0)
 GH_STUB = r"""#!/usr/bin/env python3
 import json, os, sys
 sc = json.load(open(os.environ["STUB_SCENARIO"]))
+listed = os.path.join(os.environ["STUB_STATE"], "listed")
 if "registration-token" in " ".join(sys.argv[1:]):
-    code = int(sc.get("token_status", 201))
-    print(f"HTTP/2.0 {code} stub\n\n" + ('{"token": "stub-token"}' if code == 201 else "{}"))
+    # Each attempt mints before its deploy (#383); `token_status` is the VERDICT mint's answer,
+    # the one made after the runner listing was read.
+    code = int(sc.get("token_status", 201)) if os.path.exists(listed) else 201
+    print(f"HTTP/2.0 {code} stub\n\n" + ('{"token": "STUBTOKEN"}' if code == 201 else "{}"))
     sys.exit(0 if code == 201 else 1)
+open(listed, "w").close()
 if sc.get("gh_fail"):
     sys.stderr.write("HTTP 503\n"); sys.exit(1)
 runners = []
@@ -153,6 +157,10 @@ def run_step(
     state = tmp_path / "state"
     for d in (work, stubs, state):
         d.mkdir()
+    # The render step's product, which every attempt fills with its minted token (#383).
+    (work / "runner-sdl.yaml").write_text(
+        "env:\n  - RUNNER_TOKEN=@@RUNNER_TOKEN@@\n", encoding="utf-8"
+    )
     for name, body in (
         ("uv", UV_STUB),
         ("gh", GH_STUB),

@@ -594,8 +594,9 @@ def test_the_pool_label_carries_run_identity():
 
 
 def test_the_rendered_sdl_is_echoed_without_the_token():
-    """The SDL embeds a PAT with org runner-registration rights. Actions masks known
-    secrets, but a rendered file printed wholesale is exactly how one escaped before."""
+    """The rendered SDL once embedded the org PAT; it now carries a placeholder that each
+    provision attempt fills with a minted token (#383). A file printed wholesale is exactly
+    how a credential escaped before, so the echo still drops the token line."""
     render = _step("Render runner SDL")["run"]
     assert "grep -vE 'RUNNER_TOKEN'" in render
     assert "cat /tmp/runner-sdl.yaml" not in render
@@ -776,19 +777,9 @@ def test_the_guard_actually_runs_and_decides(key, accepted, tmp_path):
     render = _step("Render runner SDL")["run"]
     script = tmp_path / "render.sh"
     script.write_text(render, encoding="utf-8")
-    # An accepted key reaches the registration-token mint (#383): answer it as GitHub does, 201.
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    (fake_bin / "gh").write_text(
-        "#!/usr/bin/env bash\n"
-        'printf \'HTTP/2.0 201 Created\\r\\n\\r\\n{"token":"AREGTOKEN"}\\n\'\n',
-        encoding="utf-8",
-    )
-    (fake_bin / "gh").chmod(0o755)
     env = {
         **os.environ,
-        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
-        "GH_TOKEN": "x",
+        "GH_RUNNER_PAT": "x",
         "ORG": "o",
         "RUNNER_LABEL": "l",
         "POOL_SIZE": "1",

@@ -391,7 +391,7 @@ jobs:
       create_ambiguous: ${{ steps.provision.outputs.create_ambiguous }}
       provision_healthy: ${{ steps.provision.outputs.provision_healthy }}
       runners_online: ${{ steps.provision.outputs.runners_online }}
-      failure_reason: ${{ steps.pat.outputs.failure_reason || steps.render.outputs.failure_reason || steps.provision.outputs.failure_reason || steps.candidates.outputs.failure_reason }}
+      failure_reason: ${{ steps.pat.outputs.failure_reason || steps.provision.outputs.failure_reason || steps.candidates.outputs.failure_reason }}
       wallet_free_usd: ${{ steps.provision.outputs.wallet_free_usd }}
       runner_hosts_proven: ${{ steps.candidates.outputs.proven_hosts }}
       wallet_index: 'deprecated'
@@ -704,24 +704,26 @@ jobs:
       # ── THE PAT NEVER LEAVES THIS RUNNER (just-akash#383, Borduas-Holdings/blazing#1196) ──
       # ⛔ The SDL used to carry `ACCESS_TOKEN=${GH_RUNNER_PAT}`, so every pool sent the org
       # runner PAT to the Akash Console API (create_deployment receives the full SDL) and to
-      # the lease-winning provider (the manifest). This step now MINTS a registration token
-      # with the PAT and renders `RUNNER_TOKEN=<minted>`; the pinned df-akash-runner image
-      # (build bd9a14d8, entrypoint.sh:35-36) reads RUNNER_TOKEN before ACCESS_TOKEN.
-      #   * STEP-SCOPED: a shell variable in THIS script only, `::add-mask::`ed before any
-      #     use; never a step/job output (GitHub drops secret-bearing job outputs anyway),
-      #     never job- or workflow-level env. It reaches the provider only inside the SDL.
-      #   * 200 or 201 WITH a `.token` is a mint; anything else (202, 204, 4xx, a 2xx with
-      #     no token, no response) refuses with failure_reason=RUNNER_TOKEN_UNMINTED. NOT a
-      #     RUNNER_PAT_* reason: the preflight owns those, and blazing's cleanup reads a
-      #     RUNNER_PAT_* reason as "nothing was deployed" only because the preflight emits it.
-      #   * THE TOKEN LIVES ~1h, so every step from this mint to runners-online is timed:
-      #     render 5 + provision 45 = 50 min, 10 min under the TTL. Measured on blazing (73
-      #     pool runs, 2026-09-15): provision step max 108 s, mean 91 s.
+      # the lease-winning provider (the manifest). This step now renders `RUNNER_TOKEN=@@RUNNER_TOKEN@@`,
+      # a placeholder, and holds no credential at all. The provision step MINTS A REGISTRATION
+      # TOKEN PER ATTEMPT, immediately before that attempt's deploy, and fills the placeholder
+      # into a per-attempt SDL it deletes once the deploy returns. The pinned df-akash-runner
+      # image (build bd9a14d8, entrypoint.sh:35-36) reads RUNNER_TOKEN before ACCESS_TOKEN.
+      #   * STEP-SCOPED: a shell variable in the provision script only, `::add-mask::`ed before
+      #     any use; never a step/job output, never job- or workflow-level env.
+      #   * 200 or 201 WITH an alphanumeric `.token` is a mint; anything else (202, 204, 4xx, a
+      #     2xx with no token, no response) fails closed with failure_reason=RUNNER_TOKEN_UNMINTED
+      #     before that attempt deploys. NOT a RUNNER_PAT_* reason: the preflight owns those.
+      #   * WHY PER ATTEMPT (DEV1's review of #384): a token lives ~1h and a failed attempt costs
+      #     ~21-22 min, so one mint before provision would expire by attempt 3, and a step cap
+      #     short enough to prevent that kills a legitimate retry mid-close. Per attempt, the
+      #     window is only mint -> deploy -> tag -> runners online. Its timed waits are the bid
+      #     windows (--bid-wait 60 + --bid-wait-retry 120) and the wall-clock runners-online
+      #     deadline (runner-wait-tries x 5 s, clamped to 480 = 40 min): 43 min, which leaves 17
+      #     of the hour for the untimed create, lease, manifest and tag calls.
       - name: Render runner SDL
         id: render
-        timeout-minutes: 5
         env:
-          GH_TOKEN: ${{ secrets.GH_RUNNER_PAT }}
           ORG: ${{ inputs.github-org }}
           RUNNER_LABEL: ${{ inputs.runner-label }}
           POOL_SIZE: ${{ inputs.pool-size }}
@@ -815,19 +817,6 @@ jobs:
           # All N replicas share ONE label carrying run identity; the runner image
           # randomises each replica's NAME from the prefix, so the wait loop counts
           # DISTINCT online runners by label rather than by name.
-          RC=0
-          RESP=$(gh api --method POST "orgs/${ORG}/actions/runners/registration-token" -i 2>&1) || RC=$?
-          RUNNER_TOKEN=""
-          if [[ "$RESP" =~ \"token\"\ *:\ *\"([^\"]*)\" ]]; then RUNNER_TOKEN="${BASH_REMATCH[1]}"; fi
-          [ -n "$RUNNER_TOKEN" ] && echo "::add-mask::${RUNNER_TOKEN}"
-          CODE=$(printf '%s' "$RESP" | awk 'NR==1 && $1 ~ /^HTTP/ {print $2}')
-          unset RESP
-          case "${RC}:${CODE}" in 0:200|0:201) ;; *) RUNNER_TOKEN="" ;; esac
-          if [ -z "$RUNNER_TOKEN" ]; then
-            echo "failure_reason=RUNNER_TOKEN_UNMINTED" >> "$GITHUB_OUTPUT"
-            echo "::error title=Runner registration token not minted (HTTP ${CODE:-none received})::Nothing was deployed. The PAT preflight passed moments earlier, so this is a GitHub API condition, not a provider fault."
-            exit 1
-          fi
           cat > /tmp/runner-sdl.yaml <<SDL
           version: "2.0"
           services:
@@ -840,7 +829,7 @@ jobs:
               # qualification and the run that relies on it.
               image: ghcr.io/digital-frontier-lda/df-akash-runner@sha256:aaf3799b5e138abef0831bb8467ded7325164316f0cfde5c183fe6e129eae79e
               env:
-                - RUNNER_TOKEN=${RUNNER_TOKEN}
+                - RUNNER_TOKEN=@@RUNNER_TOKEN@@
                 - ORG_NAME=${ORG}
                 - RUNNER_SCOPE=org
                 # ⛔ 'just-akash-', NOT the shared 'akash-'. This name prefix is the ONLY
@@ -939,8 +928,6 @@ jobs:
       # log — Borduas-Holdings/blazing#664. Out here the parser drops them.
       - name: Provision (retry down candidates, tag before waiting)
         id: provision
-        # The minted RUNNER_TOKEN's window ends here (runners online): see the render step.
-        timeout-minutes: 45
         env:
           AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
           AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}
@@ -1016,6 +1003,7 @@ jobs:
           # every pool instantly "never registered". Clamp like MIN_POOL below.
           case "${RUNNER_WAIT_TRIES}" in ''|*[!0-9]*) RUNNER_WAIT_TRIES=90 ;; esac
           [ "$RUNNER_WAIT_TRIES" -ge 1 ] 2>/dev/null || RUNNER_WAIT_TRIES=90
+          [ "$RUNNER_WAIT_TRIES" -le 480 ] || { echo "::warning::runner-wait-tries ${RUNNER_WAIT_TRIES} clamped to 480: a minted registration token lives ~1h"; RUNNER_WAIT_TRIES=480; }
 
           MIN_POOL="${MIN_POOL_SIZE:-}"
           case "$MIN_POOL" in ''|*[!0-9]*) MIN_POOL="$POOL_SIZE" ;; esac
@@ -1072,9 +1060,27 @@ jobs:
                 exit 1 ;;
             esac
 
+            RC=0
+            RESP=$(gh api --method POST "orgs/${ORG}/actions/runners/registration-token" -i 2>&1) || RC=$?
+            RUNNER_TOKEN=""
+            if [[ "$RESP" =~ \"token\"\ *:\ *\"([^\"]*)\" ]]; then RUNNER_TOKEN="${BASH_REMATCH[1]}"; fi
+            [ -n "$RUNNER_TOKEN" ] && echo "::add-mask::${RUNNER_TOKEN}"
+            CODE=$(printf '%s' "$RESP" | awk 'NR==1 && $1 ~ /^HTTP/ {print $2}')
+            unset RESP
+            case "${RC}:${CODE}:${RUNNER_TOKEN}" in 0:200:*[!A-Za-z0-9]*|0:201:*[!A-Za-z0-9]*) RUNNER_TOKEN="" ;; 0:200:?*|0:201:?*) ;; *) RUNNER_TOKEN="" ;; esac
+            SDL_TEMPLATE=$(< /tmp/runner-sdl.yaml) || SDL_TEMPLATE=""
+            if [ -z "$RUNNER_TOKEN" ] || [[ "$SDL_TEMPLATE" != *@@RUNNER_TOKEN@@* ]]; then
+              [ -n "$CREATED_DSEQ" ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+              echo "failure_reason=RUNNER_TOKEN_UNMINTED" >> "$GITHUB_OUTPUT"
+              echo "::error title=Runner registration token not minted (HTTP ${CODE:-none received})::attempt $attempt: no deploy was made with it. The PAT preflight passed, so this is a GitHub API condition, not a provider fault."
+              echo "::endgroup::"; exit 1
+            fi
+            printf '%s\n' "${SDL_TEMPLATE//@@RUNNER_TOKEN@@/$RUNNER_TOKEN}" > /tmp/runner-sdl.minted.yaml
+            unset SDL_TEMPLATE
             rm -f /tmp/ja.log
-            "${JA[@]}" deploy --sdl /tmp/runner-sdl.yaml --deposit "$REQUIRED_DEPOSIT_USD" --bid-wait 60 \
+            "${JA[@]}" deploy --sdl /tmp/runner-sdl.minted.yaml --deposit "$REQUIRED_DEPOSIT_USD" --bid-wait 60 \
               --bid-wait-retry 120 "${SELECT_ARGS[@]}" "${PROV_ARGS[@]}" 2>&1 | tee /tmp/ja.log || true
+            rm -f /tmp/runner-sdl.minted.yaml
             # ⛔ A FAILED LEASE STILL HOLDS A DEPLOYMENT (#348). just-akash prints the
             # "DSEQ:" summary only after a lease succeeds. When lease creation fails it
             # closes best-effort and emits LEASE_CREATE_FAILED (or REDEPLOY_FAILED) with the
