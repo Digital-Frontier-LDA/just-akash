@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import subprocess
 import textwrap
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -27,10 +28,10 @@ def _completed(returncode=0, stdout="", stderr=""):
 
 
 def test_owner_is_resolved_and_validated_before_destroy():
-    events: list[tuple[str, object]] = []
+    events: list[tuple[str, tuple[str, dict[str, object]]]] = []
 
-    def resolve(dseq):
-        events.append(("resolve", dseq))
+    def resolve(dseq, **kwargs):
+        events.append(("resolve", (dseq, kwargs)))
         return OWNER
 
     def destroy(dseq, **kwargs):
@@ -44,11 +45,23 @@ def test_owner_is_resolved_and_validated_before_destroy():
     ):
         assert _e2e.destroy_owned_deployment(DSEQ) is True
 
+    # Owner resolution and the destroy share ONE lookup ceiling for this cleanup (#378).
+    ceiling_at = events[0][1][1]["ceiling_at"]
+    assert isinstance(ceiling_at, float) and ceiling_at > time.time()
     assert events == [
-        ("resolve", DSEQ),
+        ("resolve", (DSEQ, {"ceiling_at": ceiling_at})),
         (
             "destroy",
-            (DSEQ, {"owner": OWNER, "group": "group-one", "retries": 2, "audit": True}),
+            (
+                DSEQ,
+                {
+                    "owner": OWNER,
+                    "group": "group-one",
+                    "retries": 2,
+                    "audit": True,
+                    "ceiling_at": ceiling_at,
+                },
+            ),
         ),
     ]
 
@@ -177,6 +190,10 @@ def _compiled_destroy(source: str):
         "_destroy_succeeded": lambda _result: True,
         "_fail": lambda _message: None,
         "_pass": lambda _message: None,
+        "_start_cleanup_ceiling": lambda _dseq: 4102444800.0,
+        "_ceiling_env": _e2e._ceiling_env,
+        "OWNER_LOOKUP_UNREACHABLE": _e2e.OWNER_LOOKUP_UNREACHABLE,
+        "OWNER_LOOKUP_UNREACHABLE_EXIT_CODE": _e2e.OWNER_LOOKUP_UNREACHABLE_EXIT_CODE,
         "_run": lambda *_args, **_kwargs: SimpleNamespace(
             returncode=0, stdout="Deployment destroyed", stderr=""
         ),

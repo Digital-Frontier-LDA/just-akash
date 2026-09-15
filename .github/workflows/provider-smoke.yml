@@ -106,7 +106,14 @@ jobs:
           # is non-gating: a benchmark failure never reddens the smoke. Accrued to the
           # telemetry branch as smoke-benchmark.jsonl for the quality analyzer.
           SMOKE_BENCHMARK_FILE: ${{ github.workspace }}/smoke-benchmark.jsonl
-        run: uv run python -m just_akash.smoke_providers ${{ inputs.all && '--all' || '' }}
+        run: |
+          # ⛔ THE STEP'S END, NOT A LOOKUP BUDGET (#378). The smoke loops every provider in one
+          # process (557–717s measured), so a 600s ceiling exported here went stale and every
+          # later probe cleanup exited 75 without a lookup. Each cleanup now takes its own
+          # ceiling, min(now + 600s, this deadline). start + timeout-minutes (40) x 60 - 240s
+          # of close/audit margin; tests/test_owner_lookup_deadline.py pins the literal.
+          export OWNER_LOOKUP_STEP_DEADLINE_AT=$(( $(date +%s) + 40 * 60 - 240 ))
+          uv run python -m just_akash.smoke_providers ${{ inputs.all && '--all' || '' }}
 
       # Snapshot the remaining deploy credit HERE, in the one job that holds the
       # API key — the accrue job (which renders the Prometheus metrics) deliberately
@@ -155,9 +162,16 @@ jobs:
       # Only a runner-infra death (rare) still falls through to the daily sweep.
       - name: Reap any leaked probe
         if: always()
-        timeout-minutes: 10
+        # ⛔ MUST EXCEED the lookup budget (600s) + close/audit margin (240s) = 14 min
+        # (tests/test_owner_lookup_deadline.py). 20 keeps reaping headroom; the old
+        # 10 could not clear budget+margin at all.
+        timeout-minutes: 20
         # AKASH_API_KEY is already in $GITHUB_ENV from the SOPS load step.
-        run: uv run python -m just_akash.smoke_providers --sweep-only --min-age 0
+        run: |
+          # ⛔ THE STEP'S END, NOT A LOOKUP BUDGET (#378): each reap takes min(now + 600s, this).
+          # start + timeout-minutes (20) x 60 - 240s margin; pinned by the lookup-deadline test.
+          export OWNER_LOOKUP_STEP_DEADLINE_AT=$(( $(date +%s) + 20 * 60 - 240 ))
+          uv run python -m just_akash.smoke_providers --sweep-only --min-age 0
 
       - name: Preserve unresolved provider-smoke deployment receipts
         if: always()

@@ -378,6 +378,13 @@ jobs:
   pool:
     name: Provision ephemeral runner pool on Akash
     runs-on: ubuntu-latest
+    # ⛔ MUST EXCEED the owner-lookup deadline + close/audit margin (see
+    # just_akash/owner_lookup.py: 10 + 4 = 14 min at the time of writing), pinned by
+    # tests/test_owner_lookup_deadline.py. A job killed mid-cleanup by its own
+    # timeout is the failure #370 exists to prevent.
+    # Provisioning + workload + teardown sweeps legitimately run long; 120 keeps
+    # headroom above every observed pool run while still ending a stuck one.
+    timeout-minutes: 120
     outputs:
       dseq: ${{ steps.provision.outputs.dseq }}
       deployment_outcome: ${{ steps.provision.outputs.deployment_outcome }}
@@ -922,6 +929,7 @@ jobs:
         run: |
           set -uo pipefail
 
+
           # Fail closed before the first possible submit. Every branch inherits UNKNOWN;
           # only the enumerated no-broadcast sites below may narrow it to no-deployment.
           echo "deployment_outcome=unknown" >> "$GITHUB_OUTPUT"
@@ -1087,8 +1095,18 @@ jobs:
             if [ -n "$DSEQ" ] && [ -z "$PROVIDER" ]; then
               echo "::warning::attempt $attempt: dseq=$DSEQ exists but no Provider line was parsed — closing it so it cannot leak escrow"
               "${JA[@]}" tag --dseq "$DSEQ" --name "${TAG_PREFIX}-${RUN_ID}" || true
+              # ⛔ FRESH ceiling for THIS close window only (#378 repair): the step's own work
+              # (deploys, the runner wait) spends wall time the step-start export could not
+              # spare — a later window inherited an expired ceiling and exited 75 with
+              # "0 of 1 credential(s) tried" while the lease stayed open (DEV1's witness).
+              export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
               for _try in 1 2 3; do
-                "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-orphan.log && break
+                DESTROY_RC=0
+                "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-orphan.log || DESTROY_RC=${PIPESTATUS[0]}
+                # ⛔ 75 = OWNER_LOOKUP_UNREACHABLE (owner_lookup.OWNER_LOOKUP_UNREACHABLE_EXIT_CODE):
+                # the step's shared lookup budget is exhausted — retrying re-spends a dead budget.
+                [ "$DESTROY_RC" -eq 75 ] && break
+                [ "$DESTROY_RC" -eq 0 ] && break
                 grep -qi "Deployment closed" /tmp/ja-orphan.log && break
                 sleep 5
               done
@@ -1336,8 +1354,18 @@ jobs:
             # GitHub's API, and a second attempt just doubles the request load that is
             # the most likely cause.
             if [ "$API_OK" = "0" ]; then
+              # ⛔ FRESH ceiling for THIS close window only (#378 repair): the step's own work
+              # (deploys, the runner wait) spends wall time the step-start export could not
+              # spare — a later window inherited an expired ceiling and exited 75 with
+              # "0 of 1 credential(s) tried" while the lease stayed open (DEV1's witness).
+              export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
               for _try in 1 2 3; do
-                "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-destroy.log && break
+                DESTROY_RC=0
+                "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-destroy.log || DESTROY_RC=${PIPESTATUS[0]}
+                # ⛔ 75 = OWNER_LOOKUP_UNREACHABLE (owner_lookup.OWNER_LOOKUP_UNREACHABLE_EXIT_CODE):
+                # the step's shared lookup budget is exhausted — retrying re-spends a dead budget.
+                [ "$DESTROY_RC" -eq 75 ] && break
+                [ "$DESTROY_RC" -eq 0 ] && break
                 grep -qi "Deployment closed" /tmp/ja-destroy.log && break
                 sleep 5
               done
@@ -1350,8 +1378,18 @@ jobs:
               echo "::warning::attempt $attempt: ${ONLINE:-0}/${POOL_SIZE} online on $PROVIDER (need >= ${MIN_POOL}) — discarding this lease"
               # Escrow-critical, and deliberately a literal locally-parsed --dseq so a
               # destroy-safety lint can prove this only tears down what this loop made.
+              # ⛔ FRESH ceiling for THIS close window only (#378 repair): the step's own work
+              # (deploys, the runner wait) spends wall time the step-start export could not
+              # spare — a later window inherited an expired ceiling and exited 75 with
+              # "0 of 1 credential(s) tried" while the lease stayed open (DEV1's witness).
+              export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
               for _try in 1 2 3; do
-                "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-destroy.log && break
+                DESTROY_RC=0
+                "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-destroy.log || DESTROY_RC=${PIPESTATUS[0]}
+                # ⛔ 75 = OWNER_LOOKUP_UNREACHABLE (owner_lookup.OWNER_LOOKUP_UNREACHABLE_EXIT_CODE):
+                # the step's shared lookup budget is exhausted — retrying re-spends a dead budget.
+                [ "$DESTROY_RC" -eq 75 ] && break
+                [ "$DESTROY_RC" -eq 0 ] && break
                 grep -qi "Deployment closed" /tmp/ja-destroy.log && break
                 sleep 5
               done
@@ -1388,8 +1426,18 @@ jobs:
             # whole standard exists to refuse.
             if [ -z "${RUNNER_VERSIONS:-}" ]; then
               echo "::warning title=Landing gate: version projection empty for a pool reporting ${ONLINE} online::attempt $attempt: the runner listing yielded ${ONLINE} online id(s) and 0 versions on $PROVIDER — the read disagrees with itself, so this lease is discarded rather than trusted."
+              # ⛔ FRESH ceiling for THIS close window only (#378 repair): the step's own work
+              # (deploys, the runner wait) spends wall time the step-start export could not
+              # spare — a later window inherited an expired ceiling and exited 75 with
+              # "0 of 1 credential(s) tried" while the lease stayed open (DEV1's witness).
+              export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
               for _try in 1 2 3; do
-                "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-destroy.log && break
+                DESTROY_RC=0
+                "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-destroy.log || DESTROY_RC=${PIPESTATUS[0]}
+                # ⛔ 75 = OWNER_LOOKUP_UNREACHABLE (owner_lookup.OWNER_LOOKUP_UNREACHABLE_EXIT_CODE):
+                # the step's shared lookup budget is exhausted — retrying re-spends a dead budget.
+                [ "$DESTROY_RC" -eq 75 ] && break
+                [ "$DESTROY_RC" -eq 0 ] && break
                 grep -qi "Deployment closed" /tmp/ja-destroy.log && break
                 sleep 5
               done
@@ -1412,8 +1460,18 @@ jobs:
               if [ "${GATE_DEAD:-0}" -gt 0 ] || [ "${GATE_WRONG:-0}" -gt 0 ]; then
                 echo "::warning title=Landing gate: registered runners are not running::attempt $attempt: ${GATE_DEAD} online runner(s) report NO version and ${GATE_WRONG} report an unexpected one on $PROVIDER — discarding this lease rather than handing the caller a pool of corpses."
                 printf '%s\n' "$RUNNER_VERSIONS" | sort | uniq -c | sed 's/^/    version /'
+                # ⛔ FRESH ceiling for THIS close window only (#378 repair): the step's own work
+                # (deploys, the runner wait) spends wall time the step-start export could not
+                # spare — a later window inherited an expired ceiling and exited 75 with
+                # "0 of 1 credential(s) tried" while the lease stayed open (DEV1's witness).
+                export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
                 for _try in 1 2 3; do
-                  "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-destroy.log && break
+                  DESTROY_RC=0
+                  "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-destroy.log || DESTROY_RC=${PIPESTATUS[0]}
+                  # ⛔ 75 = OWNER_LOOKUP_UNREACHABLE (owner_lookup.OWNER_LOOKUP_UNREACHABLE_EXIT_CODE):
+                  # the step's shared lookup budget is exhausted — retrying re-spends a dead budget.
+                  [ "$DESTROY_RC" -eq 75 ] && break
+                  [ "$DESTROY_RC" -eq 0 ] && break
                   grep -qi "Deployment closed" /tmp/ja-destroy.log && break
                   sleep 5
                 done

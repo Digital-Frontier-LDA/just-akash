@@ -90,6 +90,12 @@ def urlopen_rule_errors(source: str, where: str) -> list[str]:
     (or boolean) literal. Parameterized names (``timeout=timeout``) pass by
     design: a static rule cannot resolve them, and the sites that use them
     thread a required argument, not a default.
+
+    KNOWN STATIC LIMIT (review of #369, M10): a reference built as
+    ``getattr(urllib.request, "url" + "open")`` is invisible to this rule — the
+    attribute name is not the literal ``urlopen`` in the AST. Accepted: dynamic
+    name assembly defeats every static finder, and no such site exists in the
+    package today; the behavioural tests still bound the Console client itself.
     """
     tree = ast.parse(source)
     imported = _urlopen_import_names(tree)

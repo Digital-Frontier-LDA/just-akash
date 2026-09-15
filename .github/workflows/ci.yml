@@ -414,6 +414,12 @@ jobs:
   e2e-shell:
     name: E2E lease-shell transport
     runs-on: ubuntu-latest
+    # ⛔ MUST EXCEED the owner-lookup deadline + close/audit margin (see
+    # just_akash/owner_lookup.py: 10 + 4 = 14 min at the time of writing), pinned by
+    # tests/test_owner_lookup_deadline.py. A job killed mid-cleanup by its own
+    # timeout is the failure #370 exists to prevent.
+    # Whole-job e2e observed ~15 min; 45 is 3x headroom.
+    timeout-minutes: 45
     if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')
     steps:
       - name: Checkout
@@ -445,7 +451,15 @@ jobs:
           age-key: ${{ secrets.SOPS_AGE_KEY }}
 
       - name: Run E2E lease-shell test
-        run: uv run python -m just_akash.test_shell_e2e
+        # A step bound, so the step's lookup deadline below can be derived from it.
+        timeout-minutes: 30
+        run: |
+          # ⛔ THE STEP'S END, NOT A LOOKUP BUDGET (#378): each cleanup takes its own
+          # ceiling, min(now + 600s, this deadline), shared by that cleanup's retries. A
+          # step-start 600s ceiling would go stale while the e2e runs. start + 30 min - 240s
+          # of close/audit margin; tests/test_owner_lookup_deadline.py pins the literal.
+          export OWNER_LOOKUP_STEP_DEADLINE_AT=$(( $(date +%s) + 30 * 60 - 240 ))
+          uv run python -m just_akash.test_shell_e2e
 
       - name: Preserve unresolved lease-shell deployment receipt
         if: always()
@@ -459,6 +473,12 @@ jobs:
   e2e-secrets:
     name: E2E secrets injection
     runs-on: ubuntu-latest
+    # ⛔ MUST EXCEED the owner-lookup deadline + close/audit margin (see
+    # just_akash/owner_lookup.py: 10 + 4 = 14 min at the time of writing), pinned by
+    # tests/test_owner_lookup_deadline.py. A job killed mid-cleanup by its own
+    # timeout is the failure #370 exists to prevent.
+    # Whole-job e2e observed ~15 min; 45 is 3x headroom.
+    timeout-minutes: 45
     # Run after e2e-shell, never alongside it: both jobs deploy with the same
     # AKASH_API_KEY (one Akash account). Concurrent runs collide on the same
     # deployment and the stale-deployment recovery in deploy.py tears down the
@@ -505,7 +525,15 @@ jobs:
           echo "SSH_PUBKEY=$(cat ~/.ssh/id_ed25519.pub)" >> "$GITHUB_ENV"
 
       - name: Run E2E secrets test
-        run: uv run python -m just_akash.test_secrets_e2e
+        # A step bound, so the step's lookup deadline below can be derived from it.
+        timeout-minutes: 30
+        run: |
+          # ⛔ THE STEP'S END, NOT A LOOKUP BUDGET (#378): each cleanup takes its own
+          # ceiling, min(now + 600s, this deadline), shared by that cleanup's retries. A
+          # step-start 600s ceiling would go stale while the e2e runs. start + 30 min - 240s
+          # of close/audit margin; tests/test_owner_lookup_deadline.py pins the literal.
+          export OWNER_LOOKUP_STEP_DEADLINE_AT=$(( $(date +%s) + 30 * 60 - 240 ))
+          uv run python -m just_akash.test_secrets_e2e
 
       - name: Preserve unresolved deployment receipt
         if: always()

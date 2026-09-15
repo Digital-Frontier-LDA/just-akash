@@ -34,6 +34,8 @@ import subprocess
 import sys
 from typing import Any, cast
 
+from .owner_lookup import OwnerLookupUnresolved
+
 NO_SSH_MSG = (
     "No SSH port found on this deployment.\n"
     "\n"
@@ -1921,6 +1923,19 @@ def main():
                 print(f"Deployment {label} destroyed.")
             else:
                 print("Cancelled.")
+        except OwnerLookupUnresolved as e:
+            # ⛔ UNREACHABLE IS ITS OWN EXIT CODE (#378): a retry loop must be able to
+            # tell "the shared budget is gone — retrying is waste" from "failed, try
+            # again". Every other verdict stays exit 1.
+            from .owner_lookup import (
+                OWNER_LOOKUP_UNREACHABLE,
+                OWNER_LOOKUP_UNREACHABLE_EXIT_CODE,
+            )
+
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(
+                OWNER_LOOKUP_UNREACHABLE_EXIT_CODE if e.verdict == OWNER_LOOKUP_UNREACHABLE else 1
+            )
         except RuntimeError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
@@ -2001,6 +2016,16 @@ def main():
                     expected_group=args.expected_group,
                 )
             owner = client.account_address()
+        except OwnerLookupUnresolved as e:
+            from .owner_lookup import (
+                OWNER_LOOKUP_UNREACHABLE,
+                OWNER_LOOKUP_UNREACHABLE_EXIT_CODE,
+            )
+
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(
+                OWNER_LOOKUP_UNREACHABLE_EXIT_CODE if e.verdict == OWNER_LOOKUP_UNREACHABLE else 1
+            )
         except RuntimeError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)

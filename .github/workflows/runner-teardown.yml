@@ -171,6 +171,11 @@ jobs:
   teardown:
     name: Close lease and de-register runners
     runs-on: ubuntu-latest
+    # ⛔ MUST EXCEED the owner-lookup deadline + close/audit margin (see
+    # just_akash/owner_lookup.py: 10 + 4 = 14 min at the time of writing), pinned by
+    # tests/test_owner_lookup_deadline.py. A job killed mid-cleanup by its own
+    # timeout is the failure #370 exists to prevent.
+    timeout-minutes: 30
     outputs:
       closed: ${{ steps.close.outputs.closed }}
       held_reason: ${{ steps.close.outputs.held_reason }}
@@ -212,6 +217,11 @@ jobs:
           # An ARRAY: the command is multiple words, so a quoted string breaks it and an
           # unquoted one is SC2086.
           JA=(uv run --with . just-akash)
+          # ⛔ ONE lookup budget for the WHOLE STEP (#378): every resolve-owner/destroy in
+          # this step — including each retry — shares this absolute ceiling (epoch
+          # seconds); just-akash honours it as min(own budget, ceiling).
+          export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
+
 
           if [ -z "${DSEQ}" ] && { [ "${DEPLOYMENT_OUTCOME:-unknown}" != "no-deployment" ] || [ "${CREATE_AMBIGUOUS:-}" = "true" ]; }; then
             HELD_GROUP=""
@@ -376,9 +386,18 @@ jobs:
           # not among them. The close was accepted and had not yet propagated. It is
           # the OBSERVATION that needed patience, not the action.
           DESTROY_TRIES=0
+          # ⛔ FRESH ceiling for THIS close window (#378 repair): resolve-owner above
+          # spent wall time against the step-start ceiling; the destroy retries get
+          # their own, so the window never inherits a stale one.
+          export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
           for _try in 1 2 3; do
             DESTROY_TRIES=$_try
-            "${JA[@]}" destroy "${DESTROY_ARGS[@]}" 2>&1 | tee /tmp/destroy.log && break
+            DESTROY_RC=0
+            "${JA[@]}" destroy "${DESTROY_ARGS[@]}" 2>&1 | tee /tmp/destroy.log || DESTROY_RC=${PIPESTATUS[0]}
+            # ⛔ 75 = OWNER_LOOKUP_UNREACHABLE (owner_lookup.OWNER_LOOKUP_UNREACHABLE_EXIT_CODE):
+            # the step's shared lookup budget is exhausted — retrying re-spends a dead budget.
+            [ "$DESTROY_RC" -eq 75 ] && break
+            [ "$DESTROY_RC" -eq 0 ] && break
             # A non-zero exit whose output says the deployment is already closed IS a
             # success. Treating it as a failure sends the next reader looking for an
             # outage that never happened.
