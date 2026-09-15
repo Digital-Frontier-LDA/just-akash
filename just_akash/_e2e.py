@@ -110,8 +110,20 @@ def _run(
     timeout: int = 60,
     input_text: str | None = None,
     env: dict[str, str] | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     if env is None:
+        if extra_env is not None:
+            # Overrides on top of the inherited environment, through the same
+            # subprocess.run path as a plain call (no separate process group).
+            return subprocess.run(  # noqa: S603 - argv is constructed by this package
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                input=input_text,
+                env={**os.environ, **extra_env},
+            )
         return subprocess.run(  # noqa: S603 - argv is constructed by this package
             cmd,
             capture_output=True,
@@ -209,7 +221,7 @@ _SETTLED_STATES = TERMINAL_DEPLOYMENT_STATES
 _OPEN_STATES = ("active", "open")
 
 
-def resolve_deployment_owner(dseq: str) -> str:
+def resolve_deployment_owner(dseq: str, *, ceiling_at: float | None = None) -> str:
     """Capture the exact owner while the deployment is still readable.
 
     ``resolve-owner`` walks the configured wallet pool and positively binds the
@@ -218,7 +230,9 @@ def resolve_deployment_owner(dseq: str) -> str:
     settlement verifier still needs the owner-scoped chain identity.
     """
     cmd = ["uv", "run", "just-akash", "resolve-owner", "--dseq", str(dseq), "--json"]
-    result = _run(cmd, timeout=60)
+    result = _run(
+        cmd, timeout=60, extra_env=_ceiling_env(ceiling_at) if ceiling_at is not None else None
+    )
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout or "owner resolution failed").strip())
     try:
@@ -361,18 +375,23 @@ from .owner_lookup import (  # noqa: E402, F401 - re-exported under their origin
     NO_CREDENTIAL_MATCHES_OWNER,
     OWNER_LOOKUP_ATTEMPTS,
     OWNER_LOOKUP_BACKOFF_SECONDS,
+    OWNER_LOOKUP_DEADLINE_AT_ENV,
     OWNER_LOOKUP_DEADLINE_SECONDS,
     OWNER_LOOKUP_UNREACHABLE,
+    OWNER_LOOKUP_UNREACHABLE_EXIT_CODE,
     OWNER_LOOKUP_UNREADABLE,
     Deadline,
     ask,
+    cleanup_ceiling,
     unresolved_verdict,
 )
 from .owner_lookup import is_transport_error as _is_transport_error  # noqa: E402, F401
 from .owner_lookup import lookup_owner as _lookup_owner  # noqa: E402, F401 - original name (#366)
 
 
-def _select_owner_credential(dseq: str, owner: str, keys: list[str], credential: object):
+def _select_owner_credential(
+    dseq: str, owner: str, keys: list[str], credential: object, *, ceiling_at: float | None = None
+):
     """The Console client proven to be ``owner``, or (None, typed verdict).
 
     Only an address MATCH selects a client. Never logs key material."""
@@ -392,7 +411,9 @@ def _select_owner_credential(dseq: str, owner: str, keys: list[str], credential:
     # ⛔ ONE WALL-CLOCK DEADLINE ACROSS EVERY CREDENTIAL (#370). On expiry the typed
     # UNREACHABLE is returned with the attempts each credential made, by POSITION —
     # key material never enters a log line.
-    deadline = Deadline()
+    # ``ceiling_at`` is this cleanup's own ceiling (robust_destroy); without it the step's
+    # OWNER_LOOKUP_DEADLINE_AT, if any, still binds.
+    deadline = Deadline(ceiling_at=ceiling_at)
     attempts: list[int] = []
     for scan_position, index in enumerate(order):
         if deadline.expired:
@@ -414,7 +435,9 @@ def _select_owner_credential(dseq: str, owner: str, keys: list[str], credential:
         # ⭐ PER-CREDENTIAL SHARE of the remaining budget (remaining / untried in
         # scan order, the bound key first): a dripping bound key must not starve a
         # later credential that would answer.
-        share = Deadline(deadline.remaining() / (len(order) - scan_position))
+        share = Deadline(
+            deadline.remaining() / (len(order) - scan_position), ceiling_at=ceiling_at
+        )
         kind, address = ask(_mint, bound=index == bound, deadline=share)
         attempts.append(made)
         if kind == "answered":
@@ -429,6 +452,32 @@ def _select_owner_credential(dseq: str, owner: str, keys: list[str], credential:
     return None, unresolved_verdict(kinds)
 
 
+def _ceiling_env(ceiling_at: float) -> dict[str, str]:
+    """The override for a cleanup's subprocess: this cleanup's ceiling, not the step's."""
+    return {OWNER_LOOKUP_DEADLINE_AT_ENV: f"{ceiling_at:.3f}"}
+
+
+def _start_cleanup_ceiling(dseq: str) -> float | None:
+    """This cleanup's ceiling, or None after reporting why the cleanup is held.
+
+    ⛔ ONE PER CLEANUP, computed when the cleanup starts and shared by its retries (#378):
+    a ceiling recomputed per retry would mint a fresh budget per attempt and break the bound.
+    """
+    try:
+        ceiling_at = cleanup_ceiling()
+    except ValueError as exc:
+        _fail(f"Cleanup held for {dseq}: {exc}")
+        return None
+    if ceiling_at <= time.time():
+        _fail(
+            f"Cleanup held for {dseq}: {OWNER_LOOKUP_UNREACHABLE} — the step's lookup deadline "
+            "has already passed, so ownership cannot be proven in this step (unproven, not "
+            "disproven); no destroy was attempted"
+        )
+        return None
+    return ceiling_at
+
+
 def robust_destroy(
     dseq: str,
     *,
@@ -438,6 +487,7 @@ def robust_destroy(
     credential: object = None,
     retries: int = 2,
     audit: bool = True,
+    ceiling_at: float | None = None,
 ) -> bool:
     """Destroy a deployment with retry-on-fail and post-destroy audit.
 
@@ -450,6 +500,11 @@ def robust_destroy(
     """
     if not dseq:
         return True
+    if ceiling_at is None:
+        ceiling_at = _start_cleanup_ceiling(str(dseq))
+        if ceiling_at is None:
+            return False
+    cleanup_env = _ceiling_env(ceiling_at)
     if owner is not None and not is_canonical_akash_address(owner):
         _fail(f"Cleanup held for {dseq}: invalid owner identity")
         return False
@@ -489,7 +544,9 @@ def robust_destroy(
         except Exception as e:  # noqa: BLE001 - identity discovery must fail closed
             _fail(f"Cleanup held for {dseq}: could not enumerate owner credentials ({e})")
             return False
-        direct_client, verdict = _select_owner_credential(str(dseq), owner, keys, credential)
+        direct_client, verdict = _select_owner_credential(
+            str(dseq), owner, keys, credential, ceiling_at=ceiling_at
+        )
         if direct_client is None:
             _fail(
                 f"Cleanup held for {dseq}: {verdict} — no configured credential was proven "
@@ -509,7 +566,7 @@ def robust_destroy(
                 r = subprocess.CompletedProcess([], 0, "Deployment closed", "")
             elif owner is None or group is None:
                 command = ["just", "destroy", str(dseq)]
-                r = _run(command, input_text="y\n", timeout=60)
+                r = _run(command, input_text="y\n", timeout=60, extra_env=cleanup_env)
             else:
                 command = [
                     "uv",
@@ -524,7 +581,17 @@ def robust_destroy(
                     "--expected-group",
                     group,
                 ]
-                r = _run(command, input_text="y\n", timeout=60)
+                r = _run(command, input_text="y\n", timeout=60, extra_env=cleanup_env)
+            if r.returncode == OWNER_LOOKUP_UNREACHABLE_EXIT_CODE:
+                # ⛔ 75 ENDS THIS CLEANUP (#378). The destroy's owner lookup exhausted THIS
+                # cleanup's ceiling: a retry would re-spend a dead budget, and nothing was
+                # closed. Ownership is unproven, not disproven, so this is a hold.
+                _fail(
+                    f"Cleanup held for {dseq}: {OWNER_LOOKUP_UNREACHABLE} — the destroy's "
+                    f"owner lookup exhausted this cleanup's budget (exit {r.returncode}); not "
+                    "retried, nothing closed"
+                )
+                return False
             if _destroy_succeeded(r):
                 _pass(
                     f"destroy reported success for {dseq} (attempt {attempt}) "
@@ -584,11 +651,15 @@ def destroy_owned_deployment(
     """Resolve owner before the first close byte, then run owner-scoped cleanup.
 
     Owner resolution failure is a hold: a shared wallet DSEQ without its owner is
-    insufficient authority to select and verify a deployment.
+    insufficient authority to select and verify a deployment. Owner resolution and the
+    destroy share ONE lookup ceiling for this cleanup.
     """
+    ceiling_at = _start_cleanup_ceiling(str(dseq))
+    if ceiling_at is None:
+        return False
     if owner is None:
         try:
-            owner = resolve_deployment_owner(dseq)
+            owner = resolve_deployment_owner(dseq, ceiling_at=ceiling_at)
         except Exception as exc:  # noqa: BLE001 — cleanup reports and holds
             _fail(f"Cleanup held for {dseq}: owner could not be resolved ({exc})")
             return False
@@ -607,7 +678,9 @@ def destroy_owned_deployment(
             _fail(f"Cleanup held for {dseq}: exact singleton group could not be resolved")
             return False
         group = names[0]
-    return robust_destroy(dseq, owner=owner, group=group, retries=retries, audit=audit)
+    return robust_destroy(
+        dseq, owner=owner, group=group, retries=retries, audit=audit, ceiling_at=ceiling_at
+    )
 
 
 def _signal_handler(signum, _frame):

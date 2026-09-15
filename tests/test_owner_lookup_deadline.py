@@ -48,6 +48,7 @@ from just_akash import api, chain, owner_lookup, wallet_pool
 from just_akash.owner_lookup import (
     OWNER_LOOKUP_DEADLINE_SECONDS,
     OWNER_LOOKUP_JOB_MARGIN_SECONDS,
+    OWNER_LOOKUP_STEP_DEADLINE_AT_ENV,
     OWNER_LOOKUP_UNREACHABLE_EXIT_CODE,
     Deadline,
     OwnerLookupUnresolved,
@@ -84,6 +85,18 @@ _OWNER_LOOKUP_JOB_MARKERS = (
     # _select_owner_credential (#378 repair): the smoke and its reap-sweep are
     # lookup windows too.
     "just_akash.smoke_providers",
+)
+# Steps whose lookups happen inside PYTHON cleanups (robust_destroy per probe or per E2E
+# deployment). They get one ceiling PER CLEANUP from the code, bounded by a step deadline the
+# workflow exports as an END bound; a step-start OWNER_LOOKUP_DEADLINE_AT would go stale.
+_PYTHON_CLEANUP_MARKERS = (
+    "just_akash.test_shell_e2e",
+    "just_akash.test_secrets_e2e",
+    "just_akash.smoke_providers",
+)
+_STEP_DEADLINE_RE = re.compile(
+    r"OWNER_LOOKUP_STEP_DEADLINE_AT=\$\(\(\s*\$\(date \+%s\)"
+    r"\s*\+\s*(\d+)\s*\*\s*60\s*-\s*(\d+)\s*\)\)"
 )
 
 
@@ -531,45 +544,52 @@ def _lookup_steps_and_jobs(workflows_dir: Path = WORKFLOWS):
                     if m and _code(line):
                         budget = float(m.group(1))
                         break
-                steps.append((st.get("name") or job_name, budget, run))
+                steps.append((st.get("name") or job_name, budget, run, st.get("timeout-minutes")))
             if steps:
                 found.append((path.name, job_name, job.get("timeout-minutes"), steps))
     return found
 
 
-def test_every_lookup_window_has_a_fresh_ceiling_and_every_retry_loop_stops_on_unreachable():
-    """(DEV1 interim + parts 1-2.) Per JOB: every retry WINDOW containing a lookup
-    carries its OWN fresh OWNER_LOOKUP_DEADLINE_AT export in its preamble (a step-start
-    ceiling goes stale while the step's deploys and runner waits spend the clock); every
-    lookup marker outside a window is preceded by a step-level export; every retry loop
-    over a lookup breaks on the UNREACHABLE exit code; timeout-minutes clears
-    exports x budget + margin. TEST_OWNER_LOOKUP_WORKFLOWS_DIR re-runs the derivation
-    against a historical tree.
+def _python_cleanup_step_violations(where: str, preceding: list[str], step_timeout) -> list[str]:
+    """A step running Python cleanups exports the step END bound, matching its own timeout.
 
-    ⚠ WHICH LEG FIRES WHERE: on b0d6727/5009c4f's trees this goes red through the
-    MISSING-EXPORT legs (no ceiling at all, budget None → the window check is never
-    reached); the timeout ARITHMETIC leg needs exports present but a timeout too
-    small, which no historical tree has — the companion fixture test below fires it
-    instead. Verified red on 5009c4f (pool windows + both smoke steps) via the env
-    override."""
-    import os
+    ⛔ NOT a step-start OWNER_LOOKUP_DEADLINE_AT (#378 blocker): the smoke loops providers in
+    one process for 557–717s, so every cleanup after 600s inherited an expired ceiling and
+    exited 75 without a lookup. Each cleanup now takes min(now + 600, step deadline) in code.
+    """
+    violations = []
+    stale = [c for c in preceding if "OWNER_LOOKUP_DEADLINE_AT=" in c]
+    if stale:
+        violations.append(
+            f"{where}: exports a step-start OWNER_LOOKUP_DEADLINE_AT before Python cleanups — "
+            "it goes stale while the step runs; export OWNER_LOOKUP_STEP_DEADLINE_AT instead"
+        )
+    exports = [m for c in preceding if (m := _STEP_DEADLINE_RE.search(c))]
+    if not exports:
+        violations.append(
+            f"{where}: Python cleanups with no OWNER_LOOKUP_STEP_DEADLINE_AT export "
+            "(step start + timeout-minutes x 60 - margin)"
+        )
+        return violations
+    minutes, margin = (int(g) for g in exports[-1].groups())
+    if step_timeout is None:
+        violations.append(f"{where}: exports a step deadline but the step has no timeout-minutes")
+    elif minutes != int(step_timeout) or margin != int(OWNER_LOOKUP_JOB_MARGIN_SECONDS):
+        violations.append(
+            f"{where}: OWNER_LOOKUP_STEP_DEADLINE_AT is start + {minutes} x 60 - {margin}, "
+            f"which does not equal the step's timeout-minutes={step_timeout} x 60 - margin "
+            f"({OWNER_LOOKUP_JOB_MARGIN_SECONDS:.0f}s)"
+        )
+    return violations
 
-    workflows_dir = Path(os.environ.get("TEST_OWNER_LOOKUP_WORKFLOWS_DIR") or WORKFLOWS)
+
+def _lookup_violations(workflows_dir: Path) -> list[str]:
+    """Every violation of the owner-lookup budget rule in ``workflows_dir``."""
     jobs = _lookup_steps_and_jobs(workflows_dir)
-    # ⛔ POPULATION FIRST: a finder that locates zero invoking jobs is broken, not
-    # satisfied — the deadline would then be protected by nothing.
-    assert len(jobs) >= 4, f"owner-lookup job finder located only {jobs}; widen it"
-    # ⛔ AND THE SMOKE POPULATION IS NAMED: removing the smoke_providers marker
-    # would blind the finder to provider-smoke.yml silently (the floor of 4 would
-    # still hold). This assertion is what makes marker removal red.
-    assert any(workflow == "provider-smoke.yml" for workflow, *_ in jobs), (
-        "provider-smoke.yml vanished from the lookup population — a marker was "
-        "dropped, not the smoke made safe"
-    )
     violations = []
     for workflow, job, timeout_minutes, steps in jobs:
         exports_in_job = 0
-        for step_name, _budget, run in steps:
+        for step_name, _budget, run, step_timeout in steps:
             lines = run.splitlines()
             code = [_code(ln) for ln in lines]
             in_window = False
@@ -602,6 +622,12 @@ def test_every_lookup_window_has_a_fresh_ceiling_and_every_retry_loop_stops_on_u
                         window_has_lookup = True
                     if f"-eq {OWNER_LOOKUP_UNREACHABLE_EXIT_CODE}" in cl:
                         window_stops = True
+                elif any(marker in cl for marker in _PYTHON_CLEANUP_MARKERS):
+                    violations.extend(
+                        _python_cleanup_step_violations(
+                            f"{workflow}:{job}/{step_name}", code[:i], step_timeout
+                        )
+                    )
                 else:
                     if _has_lookup_marker(cl):
                         before = [
@@ -623,6 +649,39 @@ def test_every_lookup_window_has_a_fresh_ceiling_and_every_retry_loop_stops_on_u
                 f"{exports_in_job} fresh ceiling(s) x 600s + margin "
                 f"({OWNER_LOOKUP_JOB_MARGIN_SECONDS:.0f}s) = {required:.1f} min"
             )
+    return violations
+
+
+def test_every_lookup_window_has_a_fresh_ceiling_and_every_retry_loop_stops_on_unreachable():
+    """(DEV1 interim + parts 1-2.) Per JOB: every retry WINDOW containing a lookup
+    carries its OWN fresh OWNER_LOOKUP_DEADLINE_AT export in its preamble (a step-start
+    ceiling goes stale while the step's deploys and runner waits spend the clock); every
+    lookup marker outside a window is preceded by a step-level export; every retry loop
+    over a lookup breaks on the UNREACHABLE exit code; timeout-minutes clears
+    exports x budget + margin. TEST_OWNER_LOOKUP_WORKFLOWS_DIR re-runs the derivation
+    against a historical tree.
+
+    ⚠ WHICH LEG FIRES WHERE: on b0d6727/5009c4f's trees this goes red through the
+    MISSING-EXPORT legs (no ceiling at all, budget None → the window check is never
+    reached); the timeout ARITHMETIC leg needs exports present but a timeout too
+    small, which no historical tree has — the companion fixture test below fires it
+    instead. Verified red on 5009c4f (pool windows + both smoke steps) via the env
+    override."""
+    import os
+
+    workflows_dir = Path(os.environ.get("TEST_OWNER_LOOKUP_WORKFLOWS_DIR") or WORKFLOWS)
+    jobs = _lookup_steps_and_jobs(workflows_dir)
+    # ⛔ POPULATION FIRST: a finder that locates zero invoking jobs is broken, not
+    # satisfied — the deadline would then be protected by nothing.
+    assert len(jobs) >= 4, f"owner-lookup job finder located only {jobs}; widen it"
+    # ⛔ AND THE SMOKE POPULATION IS NAMED: removing the smoke_providers marker
+    # would blind the finder to provider-smoke.yml silently (the floor of 4 would
+    # still hold). This assertion is what makes marker removal red.
+    assert any(workflow == "provider-smoke.yml" for workflow, *_ in jobs), (
+        "provider-smoke.yml vanished from the lookup population — a marker was "
+        "dropped, not the smoke made safe"
+    )
+    violations = _lookup_violations(workflows_dir)
     assert not violations, "\n".join(violations)
 
 
@@ -655,7 +714,7 @@ def test_the_timeout_arithmetic_leg_fires_on_a_too_small_timeout(tmp_path) -> No
     assert timeout_minutes == 5
     exports = sum(
         1
-        for _, _, run in steps
+        for _, _, run, _ in steps
         for ln in run.splitlines()
         if "OWNER_LOOKUP_DEADLINE_AT=" in ln and _code(ln)
     )
@@ -663,3 +722,218 @@ def test_the_timeout_arithmetic_leg_fires_on_a_too_small_timeout(tmp_path) -> No
     assert exports == 1 and required > timeout_minutes, (
         "fixture must sit strictly inside the arithmetic violation region"
     )
+    # ⛔ THE RULE ITSELF MUST SAY SO (#378 review, W8): recomputing the formula here would
+    # stay green if the rule's own comparison were disabled.
+    violations = _lookup_violations(tmp_path)
+    assert any("timeout-minutes=5 does not clear" in v for v in violations), violations
+
+
+def _python_cleanup_fixture(tmp_path: Path, run: str, step_timeout: int | None = 40) -> list[str]:
+    timeout = f"        timeout-minutes: {step_timeout}\n" if step_timeout is not None else ""
+    (tmp_path / "smoke.yml").write_text(
+        "on: [push]\n"
+        "jobs:\n"
+        "  smoke:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    timeout-minutes: 70\n"
+        "    steps:\n"
+        "      - name: Run provider smoke test\n" + timeout + "        run: |\n" + run,
+        encoding="utf-8",
+    )
+    return _lookup_violations(tmp_path)
+
+
+def test_a_python_cleanup_step_with_the_step_deadline_matching_its_timeout_is_clean(tmp_path):
+    run = (
+        "          export OWNER_LOOKUP_STEP_DEADLINE_AT=$(( $(date +%s) + 40 * 60 - 240 ))\n"
+        "          uv run python -m just_akash.smoke_providers\n"
+    )
+    assert _python_cleanup_fixture(tmp_path, run) == []
+
+
+@pytest.mark.parametrize(
+    ("label", "run", "step_timeout", "expected"),
+    [
+        (
+            "stale step-start ceiling",
+            "          export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))\n"
+            "          export OWNER_LOOKUP_STEP_DEADLINE_AT=$(( $(date +%s) + 40 * 60 - 240 ))\n"
+            "          uv run python -m just_akash.smoke_providers\n",
+            40,
+            "goes stale while the step runs",
+        ),
+        (
+            "no step deadline",
+            "          uv run python -m just_akash.smoke_providers\n",
+            40,
+            "no OWNER_LOOKUP_STEP_DEADLINE_AT export",
+        ),
+        (
+            "margin removed",
+            "          export OWNER_LOOKUP_STEP_DEADLINE_AT=$(( $(date +%s) + 40 * 60 - 0 ))\n"
+            "          uv run python -m just_akash.smoke_providers\n",
+            40,
+            "does not equal the step's timeout-minutes=40",
+        ),
+        (
+            "minutes disagree with the step timeout",
+            "          export OWNER_LOOKUP_STEP_DEADLINE_AT=$(( $(date +%s) + 60 * 60 - 240 ))\n"
+            "          uv run python -m just_akash.smoke_providers\n",
+            40,
+            "does not equal the step's timeout-minutes=40",
+        ),
+        (
+            "no step timeout",
+            "          export OWNER_LOOKUP_STEP_DEADLINE_AT=$(( $(date +%s) + 40 * 60 - 240 ))\n"
+            "          uv run python -m just_akash.smoke_providers\n",
+            None,
+            "the step has no timeout-minutes",
+        ),
+    ],
+)
+def test_the_step_deadline_leg_fires(tmp_path, label, run, step_timeout, expected) -> None:
+    violations = _python_cleanup_fixture(tmp_path, run, step_timeout)
+    assert any(expected in v for v in violations), (label, violations)
+
+
+# ── one ceiling per cleanup, bounded by the step's end (#378 blocker) ────────────────────
+
+
+_CHILD_LOOKUP = (
+    "from just_akash.owner_lookup import Deadline, ask\n"
+    "made = []\n"
+    "ask(lambda: made.append(1) or 'akash1x', deadline=Deadline())\n"
+    "print(len(made))\n"
+)
+
+
+def _destroy_through_a_real_child(monkeypatch, *, outcome: int = 0) -> list[dict]:
+    """Replace the destroy subprocess with a REAL child process that runs one owner lookup
+    under the environment robust_destroy gives it, and reports how many attempts it made."""
+    from just_akash import _e2e
+
+    real_run = _e2e._run
+    calls: list[dict] = []
+
+    def run(cmd, **kwargs):
+        child = real_run(
+            [sys.executable, "-c", _CHILD_LOOKUP],
+            timeout=30,
+            extra_env={
+                **kwargs.get("extra_env", {}),
+                "PYTHONPATH": str(Path(__file__).parents[1]),
+            },
+        )
+        attempts = int(child.stdout.strip() or 0)
+        calls.append({"cmd": cmd, "extra_env": kwargs.get("extra_env"), "attempts": attempts})
+        if outcome:
+            return subprocess.CompletedProcess(cmd, outcome, "", "")
+        return subprocess.CompletedProcess(cmd, 0, "Deployment closed", "")
+
+    monkeypatch.setattr(_e2e, "_run", run)
+    monkeypatch.setattr(_e2e.time, "sleep", lambda _s: None)
+    return calls
+
+
+def test_a_cleanup_601s_into_the_step_still_looks_up(monkeypatch) -> None:
+    """(a) The smoke blocker, through a real process boundary: the step exported a ceiling
+    601s ago, and this cleanup's destroy subprocess must still get a fresh one and look up."""
+    from just_akash import _e2e
+
+    monkeypatch.setenv(owner_lookup.OWNER_LOOKUP_DEADLINE_AT_ENV, str(time.time() - 1.0))
+    monkeypatch.setenv(OWNER_LOOKUP_STEP_DEADLINE_AT_ENV, str(time.time() + 3600))
+    calls = _destroy_through_a_real_child(monkeypatch)
+
+    assert _e2e.robust_destroy(DSEQ, owner=OWNER, group="g", audit=False) is True
+    assert len(calls) == 1
+    ceiling = float(calls[0]["extra_env"][owner_lookup.OWNER_LOOKUP_DEADLINE_AT_ENV])
+    assert ceiling == pytest.approx(time.time() + OWNER_LOOKUP_DEADLINE_SECONDS, abs=5)
+    assert calls[0]["attempts"] > 0, "the child's lookup ran under the stale ceiling"
+
+
+def test_the_in_process_owner_selection_ignores_a_stale_step_ceiling(console, monkeypatch) -> None:
+    """(a) The in-process path: robust_destroy's own _select_owner_credential under a ceiling
+    that expired before the cleanup started still mints and matches."""
+    from just_akash import _e2e
+
+    monkeypatch.setenv(owner_lookup.OWNER_LOOKUP_DEADLINE_AT_ENV, str(time.time() - 601))
+    console["mint"][KEYS[0]] = _jwt(OWNER)
+    monkeypatch.setattr(
+        chain, "corroborated_deployment_group_population", lambda _o, _d, groups: groups
+    )
+    closed = []
+    monkeypatch.setattr(
+        api.AkashConsoleAPI, "close_deployment", lambda self, dseq: closed.append(dseq)
+    )
+    groups = [{"gseq": 1, "name": "g"}]
+
+    assert _e2e.robust_destroy(DSEQ, owner=OWNER, groups=groups, audit=False) is True
+    assert closed == [DSEQ]
+
+
+def test_a_step_deadline_before_now_plus_600_is_the_ceiling(monkeypatch) -> None:
+    """(b) A late cleanup gets only what the step has left."""
+    from just_akash import _e2e
+
+    step_end = time.time() + 120
+    monkeypatch.setenv(OWNER_LOOKUP_STEP_DEADLINE_AT_ENV, str(step_end))
+    assert owner_lookup.cleanup_ceiling() == pytest.approx(step_end, abs=0.001)
+    calls = _destroy_through_a_real_child(monkeypatch)
+
+    assert _e2e.robust_destroy(DSEQ, owner=OWNER, group="g", audit=False) is True
+    ceiling = float(calls[0]["extra_env"][owner_lookup.OWNER_LOOKUP_DEADLINE_AT_ENV])
+    assert ceiling == pytest.approx(step_end, abs=0.01)
+
+
+def test_a_step_deadline_already_passed_holds_without_a_destroy(monkeypatch, capsys) -> None:
+    """(c) Design: nothing is attempted. The step has no time left to prove ownership, so the
+    cleanup is held as UNREACHABLE with zero destroy calls, never a hang."""
+    from just_akash import _e2e
+
+    monkeypatch.setenv(OWNER_LOOKUP_STEP_DEADLINE_AT_ENV, str(time.time() - 1))
+    calls = _destroy_through_a_real_child(monkeypatch)
+
+    assert _e2e.robust_destroy(DSEQ, owner=OWNER, group="g", audit=False) is False
+    assert _e2e.destroy_owned_deployment(DSEQ, owner=OWNER, group="g", audit=False) is False
+    assert calls == []
+    assert "OWNER_LOOKUP_UNREACHABLE" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("malformed", ["soon", "nan", "inf"])
+def test_a_malformed_step_deadline_holds_loudly(monkeypatch, capsys, malformed) -> None:
+    """NaN and inf parse as floats; min(ceiling, nan) would silently drop the step bound."""
+    from just_akash import _e2e
+
+    monkeypatch.setenv(OWNER_LOOKUP_STEP_DEADLINE_AT_ENV, malformed)
+    with pytest.raises(ValueError, match="epoch seconds"):
+        owner_lookup.cleanup_ceiling()
+    calls = _destroy_through_a_real_child(monkeypatch)
+    assert _e2e.robust_destroy(DSEQ, owner=OWNER, group="g", audit=False) is False
+    assert calls == []
+    assert "must be epoch seconds" in capsys.readouterr().out
+
+
+def test_exit_75_ends_the_cleanup_without_a_retry(monkeypatch, capsys) -> None:
+    """(d) 75: this cleanup's budget is gone and nothing was closed — no retry, a hold."""
+    from just_akash import _e2e
+
+    calls = _destroy_through_a_real_child(monkeypatch, outcome=OWNER_LOOKUP_UNREACHABLE_EXIT_CODE)
+
+    assert _e2e.robust_destroy(DSEQ, owner=OWNER, group="g", retries=2, audit=True) is False
+    assert len(calls) == 1, "a 75 must not be retried"
+    out = capsys.readouterr().out
+    assert "OWNER_LOOKUP_UNREACHABLE" in out and "not retried" in out
+
+
+def test_one_ceiling_is_shared_by_a_cleanups_retries(monkeypatch) -> None:
+    """A ceiling recomputed per retry would mint a fresh budget per attempt."""
+    from just_akash import _e2e
+
+    calls = _destroy_through_a_real_child(monkeypatch, outcome=1)
+    clock = iter([1000.0 + n for n in range(100)])
+    monkeypatch.setattr(owner_lookup.time, "time", lambda: next(clock))
+
+    assert _e2e.robust_destroy(DSEQ, owner=OWNER, group="g", retries=2, audit=False) is True
+    ceilings = {c["extra_env"][owner_lookup.OWNER_LOOKUP_DEADLINE_AT_ENV] for c in calls}
+    assert len(calls) == 3
+    assert len(ceilings) == 1, f"each retry got its own ceiling: {sorted(ceilings)}"

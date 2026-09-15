@@ -107,10 +107,12 @@ jobs:
           # telemetry branch as smoke-benchmark.jsonl for the quality analyzer.
           SMOKE_BENCHMARK_FILE: ${{ github.workspace }}/smoke-benchmark.jsonl
         run: |
-          # ⛔ ONE lookup budget for the smoke's lookups (#378): probe destroys and
-          # the sweep's closes share this absolute ceiling (epoch seconds);
-          # just-akash honours it as min(own budget, ceiling).
-          export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
+          # ⛔ THE STEP'S END, NOT A LOOKUP BUDGET (#378). The smoke loops every provider in one
+          # process (557–717s measured), so a 600s ceiling exported here went stale and every
+          # later probe cleanup exited 75 without a lookup. Each cleanup now takes its own
+          # ceiling, min(now + 600s, this deadline). start + timeout-minutes (40) x 60 - 240s
+          # of close/audit margin; tests/test_owner_lookup_deadline.py pins the literal.
+          export OWNER_LOOKUP_STEP_DEADLINE_AT=$(( $(date +%s) + 40 * 60 - 240 ))
           uv run python -m just_akash.smoke_providers ${{ inputs.all && '--all' || '' }}
 
       # Snapshot the remaining deploy credit HERE, in the one job that holds the
@@ -166,8 +168,9 @@ jobs:
         timeout-minutes: 20
         # AKASH_API_KEY is already in $GITHUB_ENV from the SOPS load step.
         run: |
-          # ⛔ ONE lookup budget for this sweep's closes (#378).
-          export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
+          # ⛔ THE STEP'S END, NOT A LOOKUP BUDGET (#378): each reap takes min(now + 600s, this).
+          # start + timeout-minutes (20) x 60 - 240s margin; pinned by the lookup-deadline test.
+          export OWNER_LOOKUP_STEP_DEADLINE_AT=$(( $(date +%s) + 20 * 60 - 240 ))
           uv run python -m just_akash.smoke_providers --sweep-only --min-age 0
 
       - name: Preserve unresolved provider-smoke deployment receipts

@@ -22,6 +22,7 @@ MISMATCH → NO_CREDENTIAL_MATCHES_OWNER; else OWNER_LOOKUP_UNREADABLE (no addre
 from __future__ import annotations
 
 import http.client
+import math
 import os
 import threading
 import time
@@ -73,6 +74,44 @@ OWNER_LOOKUP_DEADLINE_AT_ENV = "OWNER_LOOKUP_DEADLINE_AT"
 # next sweep) gets a fresh budget; this step must not burn more of it.
 OWNER_LOOKUP_UNREACHABLE_EXIT_CODE = 75
 
+# ⛔ ONE CEILING PER CLEANUP, BOUNDED BY THE STEP'S OWN END (#378 review). A step that loops
+# many cleanups in ONE process (provider smoke: one probe per provider, 557–717s measured)
+# cannot share a 600s ceiling exported at step start: every cleanup after the first 600s
+# inherits an already-expired ceiling and exits 75 in under a second without a single
+# lookup. So each cleanup mints its own ceiling when it starts, `min(now + budget, step
+# end)`, shared by that cleanup's retries. The step end is exported ONCE as an END bound,
+# `OWNER_LOOKUP_STEP_DEADLINE_AT = step start + timeout-minutes x 60 - margin`, so a late
+# cleanup gets only what the step really has left and ends typed instead of being killed
+# by the runner mid-close. tests/test_owner_lookup_deadline.py pins the literal against
+# each step's timeout-minutes.
+OWNER_LOOKUP_STEP_DEADLINE_AT_ENV = "OWNER_LOOKUP_STEP_DEADLINE_AT"
+
+
+def cleanup_ceiling(now: float | None = None) -> float:
+    """The epoch-seconds lookup ceiling for ONE cleanup starting now.
+
+    ``min(now + OWNER_LOOKUP_DEADLINE_SECONDS, OWNER_LOOKUP_STEP_DEADLINE_AT)``. An inherited
+    OWNER_LOOKUP_DEADLINE_AT is deliberately NOT consulted: it is the stale step-start
+    ceiling this replaces. A malformed step deadline raises, like a malformed ceiling.
+    """
+    if now is None:
+        now = time.time()
+    ceiling = now + OWNER_LOOKUP_DEADLINE_SECONDS
+    step_at = os.environ.get(OWNER_LOOKUP_STEP_DEADLINE_AT_ENV)
+    if step_at:
+        try:
+            step_deadline = float(step_at)
+        except ValueError:
+            step_deadline = math.nan
+        # float() also accepts "nan" and "inf": min(ceiling, nan) is ceiling, so a NaN step
+        # deadline would be ignored silently. Only a finite epoch bounds the step.
+        if not math.isfinite(step_deadline):
+            raise ValueError(
+                f"{OWNER_LOOKUP_STEP_DEADLINE_AT_ENV} must be epoch seconds, got {step_at!r}"
+            )
+        ceiling = min(ceiling, step_deadline)
+    return ceiling
+
 
 class Deadline:
     """A monotonic wall-clock budget shared by every credential and every attempt.
@@ -80,15 +119,20 @@ class Deadline:
     ``time.monotonic``, never wall time: a clock jump backwards mid-lookup must not
     re-inflate an expired budget, and a jump forwards must not falsely expire one."""
 
-    def __init__(self, budget: float | None = None) -> None:
+    def __init__(self, budget: float | None = None, *, ceiling_at: float | None = None) -> None:
         # Read at CALL time, not definition time, so the deadline can be tuned (and
         # tested) by overriding the module constant.
         if budget is None:
             budget = OWNER_LOOKUP_DEADLINE_SECONDS
         self._expires_at = time.monotonic() + budget
+        self._wall_expires_at: float | None = None
+        if ceiling_at is not None:
+            # An explicit per-cleanup ceiling (cleanup_ceiling) overrides the environment.
+            self._wall_expires_at = ceiling_at
+            return
         env_at = os.environ.get(OWNER_LOOKUP_DEADLINE_AT_ENV)
         if not env_at:
-            self._wall_expires_at: float | None = None
+            self._wall_expires_at = None
         else:
             try:
                 self._wall_expires_at = float(env_at)
