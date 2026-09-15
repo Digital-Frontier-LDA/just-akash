@@ -594,10 +594,11 @@ def test_the_pool_label_carries_run_identity():
 
 
 def test_the_rendered_sdl_is_echoed_without_the_token():
-    """The SDL embeds a PAT with org runner-registration rights. Actions masks known
-    secrets, but a rendered file printed wholesale is exactly how one escaped before."""
+    """The rendered SDL once embedded the org PAT; it now carries a placeholder that each
+    provision attempt fills with a minted token (#383). A file printed wholesale is exactly
+    how a credential escaped before, so the echo still drops the token line."""
     render = _step("Render runner SDL")["run"]
-    assert "grep -vE 'ACCESS_TOKEN'" in render
+    assert "grep -vE 'RUNNER_TOKEN'" in render
     assert "cat /tmp/runner-sdl.yaml" not in render
 
 
@@ -1026,7 +1027,7 @@ MUTATIONS = [
         "402 is distinct",
         lambda s: s.replace("failure_reason=WALLET_UNDERFUNDED", "failure_reason=INFRA"),
     ),
-    ("sdl token redacted", lambda s: s.replace("grep -vE 'ACCESS_TOKEN'", "cat")),
+    ("sdl token redacted", lambda s: s.replace("grep -vE 'RUNNER_TOKEN'", "cat")),
     (
         "pool image matches the probe",
         lambda s: s.replace(

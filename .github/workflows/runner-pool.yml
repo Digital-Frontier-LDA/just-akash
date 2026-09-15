@@ -662,10 +662,68 @@ jobs:
             exit 1
           fi
 
+      # ── ATTRIBUTION IS NOT OPTIONAL ─────────────────────────────────────────────
+      # ⛔ THIS IS WHAT MAKES A LEAKED POOL IMPOSSIBLE TO CREATE RATHER THAN MERELY
+      # DETECTABLE. Before this, `placement-key` said WHOSE a deployment is and nothing
+      # said WHETHER IT IS STILL NEEDED, so every reaper had to fall back to age -- a
+      # proxy. Measured on one shared wallet 2026-09-08: 112 of 128 active deployments
+      # carried no run reference at all, and a consumer's 6h age floor left 69 of 83
+      # pools protected-and-unreapable at any instant, because a floor as the PRIMARY
+      # rule guarantees a standing population of `floor x leak-rate`.
+      #
+      # ⚠ AND `tag-prefix` DOES NOT DO THIS, THOUGH ITS DOCS AT THE TOP OF THIS FILE SAY
+      # IT DOES. `just-akash tag` writes .tags.json inside the INSTALLED PACKAGE
+      # DIRECTORY (api.py:31), which every fresh `uvx` install destroys, so the run id
+      # never leaves the runner. A consumer built an hourly sweeper on that tag and it
+      # reported "47 active deployments, 0 carry a ci-<run_id> tag ... Filter is working
+      # as designed; nothing to sweep" while having never reclaimed a lease. See #311.
+      #
+      # ⇒ The placement key is the only marker that is author-controlled, written
+      # ATOMICALLY inside MsgCreateDeployment, immutable afterwards, and readable from
+      # the chain with ZERO auth -- which is what a sweeper in another repo, holding no
+      # key for this wallet, actually has.
+      #
+      # ⚠ IDEMPOTENT ON PURPOSE. blazing#962 stamps caller-side, and Blazing-Back has
+      # shipped `dfci-infra-runner-run-<id>-end` for months. Double-stamping would give
+      # them a name their own sweeper's `run-(\d+)` no longer matches -- so a callee
+      # that "improved" attribution would silently DISABLE it for the two consumers
+      # already doing it right.
+      # ⛔ THE IDEMPOTENCY TEST MUST VALIDATE THE SEGMENT, NOT JUST SPOT `-run-`.
+      #    `*-run-[0-9]*` also matches `foo-run-1abc-end`, which would be treated as
+      #    already attributed and skip stamping -- producing a pool whose run segment
+      #    no sweeper's `run-([0-9]+)` can resolve. That is an UNATTRIBUTABLE pool
+      #    created by the very block whose job is to make attribution mandatory, and it
+      #    would look stamped to a human reading the name.
+      #
+      #    So: extract the segment after the LAST `-run-`, up to the next `-`, and
+      #    require it to be digits. Malformed REFUSES rather than stamping on top --
+      #    `foo-run-1abc-end-run-123-end` carries two run segments and the first one
+      #    wins for any greedy matcher.
+      #   (The attribution stamp itself is the `_rest`/`_seg` block in the script below.)
+      #
+      # ── THE PAT NEVER LEAVES THIS RUNNER (just-akash#383, Borduas-Holdings/blazing#1196) ──
+      # ⛔ The SDL used to carry `ACCESS_TOKEN=${GH_RUNNER_PAT}`, so every pool sent the org
+      # runner PAT to the Akash Console API (create_deployment receives the full SDL) and to
+      # the lease-winning provider (the manifest). This step now renders `RUNNER_TOKEN=@@RUNNER_TOKEN@@`,
+      # a placeholder, and holds no credential at all. The provision step MINTS A REGISTRATION
+      # TOKEN PER ATTEMPT, immediately before that attempt's deploy, and fills the placeholder
+      # into a per-attempt SDL it deletes once the deploy returns. The pinned df-akash-runner
+      # image (build bd9a14d8, entrypoint.sh:35-36) reads RUNNER_TOKEN before ACCESS_TOKEN.
+      #   * STEP-SCOPED: a shell variable in the provision script only, `::add-mask::`ed before
+      #     any use; never a step/job output, never job- or workflow-level env.
+      #   * 200 or 201 WITH an alphanumeric `.token` is a mint; anything else (202, 204, 4xx, a
+      #     2xx with no token, no response) fails closed with failure_reason=RUNNER_TOKEN_UNMINTED
+      #     before that attempt deploys. NOT a RUNNER_PAT_* reason: the preflight owns those.
+      #   * WHY PER ATTEMPT (DEV1's review of #384): a token lives ~1h and a failed attempt costs
+      #     ~21-22 min, so one mint before provision would expire by attempt 3, and a step cap
+      #     short enough to prevent that kills a legitimate retry mid-close. Per attempt, the
+      #     window is only mint -> deploy -> tag -> runners online. Its timed waits are the bid
+      #     windows (--bid-wait 60 + --bid-wait-retry 120) and the wall-clock runners-online
+      #     deadline (runner-wait-tries x 5 s, clamped to 480 = 40 min): 43 min, which leaves 17
+      #     of the hour for the untimed create, lease, manifest and tag calls.
       - name: Render runner SDL
         id: render
         env:
-          GH_RUNNER_PAT: ${{ secrets.GH_RUNNER_PAT }}
           ORG: ${{ inputs.github-org }}
           RUNNER_LABEL: ${{ inputs.runner-label }}
           POOL_SIZE: ${{ inputs.pool-size }}
@@ -724,43 +782,6 @@ jobs:
             dcloud|dcloud-*) echo "::error title=runner-pool::placement-key '${PLACEMENT_KEY}' is the Akash-wide default placement name, owned by nobody. A reaper aimed at it would match strangers' deployments. Namespace it to your repo." >&2; exit 2 ;;
             dfci-infra-*)    echo "::error title=runner-pool::placement-key '${PLACEMENT_KEY}' is the SIBLING repo's prefix, which its sweeper reaps on a schedule. Stamping it would have that sweeper close this pool mid-CI." >&2; exit 2 ;;
           esac
-          # ── ATTRIBUTION IS NOT OPTIONAL ─────────────────────────────────────────────
-          # ⛔ THIS IS WHAT MAKES A LEAKED POOL IMPOSSIBLE TO CREATE RATHER THAN MERELY
-          # DETECTABLE. Before this, `placement-key` said WHOSE a deployment is and nothing
-          # said WHETHER IT IS STILL NEEDED, so every reaper had to fall back to age -- a
-          # proxy. Measured on one shared wallet 2026-09-08: 112 of 128 active deployments
-          # carried no run reference at all, and a consumer's 6h age floor left 69 of 83
-          # pools protected-and-unreapable at any instant, because a floor as the PRIMARY
-          # rule guarantees a standing population of `floor x leak-rate`.
-          #
-          # ⚠ AND `tag-prefix` DOES NOT DO THIS, THOUGH ITS DOCS AT THE TOP OF THIS FILE SAY
-          # IT DOES. `just-akash tag` writes .tags.json inside the INSTALLED PACKAGE
-          # DIRECTORY (api.py:31), which every fresh `uvx` install destroys, so the run id
-          # never leaves the runner. A consumer built an hourly sweeper on that tag and it
-          # reported "47 active deployments, 0 carry a ci-<run_id> tag ... Filter is working
-          # as designed; nothing to sweep" while having never reclaimed a lease. See #311.
-          #
-          # ⇒ The placement key is the only marker that is author-controlled, written
-          # ATOMICALLY inside MsgCreateDeployment, immutable afterwards, and readable from
-          # the chain with ZERO auth -- which is what a sweeper in another repo, holding no
-          # key for this wallet, actually has.
-          #
-          # ⚠ IDEMPOTENT ON PURPOSE. blazing#962 stamps caller-side, and Blazing-Back has
-          # shipped `dfci-infra-runner-run-<id>-end` for months. Double-stamping would give
-          # them a name their own sweeper's `run-(\d+)` no longer matches -- so a callee
-          # that "improved" attribution would silently DISABLE it for the two consumers
-          # already doing it right.
-          # ⛔ THE IDEMPOTENCY TEST MUST VALIDATE THE SEGMENT, NOT JUST SPOT `-run-`.
-          #    `*-run-[0-9]*` also matches `foo-run-1abc-end`, which would be treated as
-          #    already attributed and skip stamping -- producing a pool whose run segment
-          #    no sweeper's `run-([0-9]+)` can resolve. That is an UNATTRIBUTABLE pool
-          #    created by the very block whose job is to make attribution mandatory, and it
-          #    would look stamped to a human reading the name.
-          #
-          #    So: extract the segment after the LAST `-run-`, up to the next `-`, and
-          #    require it to be digits. Malformed REFUSES rather than stamping on top --
-          #    `foo-run-1abc-end-run-123-end` carries two run segments and the first one
-          #    wins for any greedy matcher.
           _rest="${PLACEMENT_KEY##*-run-}"
           _seg="${_rest%%-*}"
           case "${PLACEMENT_KEY}" in
@@ -808,7 +829,7 @@ jobs:
               # qualification and the run that relies on it.
               image: ghcr.io/digital-frontier-lda/df-akash-runner@sha256:aaf3799b5e138abef0831bb8467ded7325164316f0cfde5c183fe6e129eae79e
               env:
-                - ACCESS_TOKEN=${GH_RUNNER_PAT}
+                - RUNNER_TOKEN=@@RUNNER_TOKEN@@
                 - ORG_NAME=${ORG}
                 - RUNNER_SCOPE=org
                 # ⛔ 'just-akash-', NOT the shared 'akash-'. This name prefix is the ONLY
@@ -883,7 +904,7 @@ jobs:
                 count: ${POOL_SIZE}
           SDL
           echo "--- rendered SDL (token redacted) ---"
-          grep -vE 'ACCESS_TOKEN' /tmp/runner-sdl.yaml
+          grep -vE 'RUNNER_TOKEN' /tmp/runner-sdl.yaml
 
       # ── Why the runner listing is read in three steps, not one ────────────────
       # `gh api --paginate` emits one JSON document per page. A throttled or transient
@@ -905,6 +926,14 @@ jobs:
       # ⚠ This prose lives OUT here on purpose. Comments inside a `run:` scalar count
       # toward the job's size, and an oversized job makes GitHub build zero jobs with no
       # log — Borduas-Holdings/blazing#664. Out here the parser drops them.
+      # ── PER-ATTEMPT MINT GUARDS (just-akash#383/#384; comments here, not in `run:`, cost no job size) ──
+      #   * The template is checked with an explicit `[ ! -s ]` BEFORE the mint, never with
+      #     `$(< file) || fallback`: under `bash -e` on the runner's bash 5.2 that form ended the step
+      #     on a missing file with no failure_reason (CI run 34953315385, job 104329251140).
+      #   * `echo failure_reason=RUNNER_SDL_TEMPLATE_MISSING` is UNQUOTED on purpose: quoted, detect-secrets
+      #     1.5.0 flags the literal as a Base64 high-entropy string (just-akash#384 Secret Scan).
+      #   * UNCLASSIFIED_ATTEMPT: an attempt that fell into the unclassified `continue` may have
+      #     broadcast a create with no DSEQ, so no later refusal narrows the outcome to no-deployment.
       - name: Provision (retry down candidates, tag before waiting)
         id: provision
         env:
@@ -961,6 +990,7 @@ jobs:
           # no-deployment or erase that identity. A later ambiguous POST is different:
           # it must publish unknown because it may have created a second deployment.
           CREATED_DSEQ=""
+          UNCLASSIFIED_ATTEMPT=0
 
           # ⛔ A LEASE IS TERMINAL ONLY ON TWO-ENDPOINT CHAIN AGREEMENT (#347). A
           # destroy that exits 0 has only had its close ACCEPTED (cli.py destroy), and
@@ -982,6 +1012,7 @@ jobs:
           # every pool instantly "never registered". Clamp like MIN_POOL below.
           case "${RUNNER_WAIT_TRIES}" in ''|*[!0-9]*) RUNNER_WAIT_TRIES=90 ;; esac
           [ "$RUNNER_WAIT_TRIES" -ge 1 ] 2>/dev/null || RUNNER_WAIT_TRIES=90
+          [ "$RUNNER_WAIT_TRIES" -le 480 ] || { echo "::warning::runner-wait-tries ${RUNNER_WAIT_TRIES} clamped to 480: a minted registration token lives ~1h"; RUNNER_WAIT_TRIES=480; }
 
           MIN_POOL="${MIN_POOL_SIZE:-}"
           case "$MIN_POOL" in ''|*[!0-9]*) MIN_POOL="$POOL_SIZE" ;; esac
@@ -1017,7 +1048,7 @@ jobs:
             # Never degrade an exhausted/denied allowlist into unrestricted
             # marketplace selection; that would re-admit every standing trap.
             if [ "${#PROV_ARGS[@]}" -eq 0 ]; then
-              [ -n "$CREATED_DSEQ" ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+              [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
               echo "failure_reason=NO_ELIGIBLE_BIDDER" >> "$GITHUB_OUTPUT"
               echo "::error title=No eligible provider remains::All configured preferred and fallback providers are standing-denied or failed during this run."
               echo "::endgroup::"; exit 1
@@ -1033,14 +1064,46 @@ jobs:
               "") ;;
               cheapest|emptiest) SELECT_ARGS=(--select "$PROVIDER_SELECT") ;;
               *)
-                [ -n "$CREATED_DSEQ" ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+                [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
                 echo "::error title=provider-select::must be 'cheapest' or 'emptiest', got '${PROVIDER_SELECT}'"
                 exit 1 ;;
             esac
 
+            if [ ! -s /tmp/runner-sdl.yaml ] || ! SDL_TEMPLATE=$(cat /tmp/runner-sdl.yaml) \
+              || [[ "$SDL_TEMPLATE" != *@@RUNNER_TOKEN@@* ]]; then
+              [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+              echo failure_reason=RUNNER_SDL_TEMPLATE_MISSING >> "$GITHUB_OUTPUT"
+              echo "::error title=Runner SDL template missing, empty or without its token placeholder::attempt $attempt: nothing minted or deployed."
+              echo "::endgroup::"; exit 1
+            fi
+            RC=0
+            RESP=$(gh api --method POST "orgs/${ORG}/actions/runners/registration-token" -i 2>&1) || RC=$?
+            RUNNER_TOKEN=""
+            if [[ "$RESP" =~ \"token\"\ *:\ *\"([^\"]*)\" ]]; then RUNNER_TOKEN="${BASH_REMATCH[1]}"; fi
+            [ -n "$RUNNER_TOKEN" ] && echo "::add-mask::${RUNNER_TOKEN}"
+            CODE=$(printf '%s' "$RESP" | awk 'NR==1 && $1 ~ /^HTTP/ {print $2}')
+            unset RESP
+            case "${RC}:${CODE}:${RUNNER_TOKEN}" in 0:200:*[!A-Za-z0-9]*|0:201:*[!A-Za-z0-9]*) RUNNER_TOKEN="" ;; 0:200:?*|0:201:?*) ;; *) RUNNER_TOKEN="" ;; esac
+            if [ -z "$RUNNER_TOKEN" ]; then
+              [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+              echo "failure_reason=RUNNER_TOKEN_UNMINTED" >> "$GITHUB_OUTPUT"
+              echo "::error title=Runner registration token not minted (HTTP ${CODE:-none received})::attempt $attempt: nothing deployed. The PAT preflight passed: a GitHub API condition, not a provider fault."
+              echo "::endgroup::"; exit 1
+            fi
+            if ! printf '%s\n' "${SDL_TEMPLATE//@@RUNNER_TOKEN@@/$RUNNER_TOKEN}" > /tmp/runner-sdl.minted.yaml \
+              || grep -q '@@RUNNER_TOKEN@@' /tmp/runner-sdl.minted.yaml; then
+              rm -f -- /tmp/runner-sdl.minted.yaml
+              [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+              echo "failure_reason=RUNNER_SDL_UNRENDERED" >> "$GITHUB_OUTPUT"
+              echo "::error title=Per-attempt runner SDL not rendered::attempt $attempt: write failed or placeholder left; nothing deployed."
+              echo "::endgroup::"; exit 1
+            fi
+            unset SDL_TEMPLATE
             rm -f /tmp/ja.log
-            "${JA[@]}" deploy --sdl /tmp/runner-sdl.yaml --deposit "$REQUIRED_DEPOSIT_USD" --bid-wait 60 \
-              --bid-wait-retry 120 "${SELECT_ARGS[@]}" "${PROV_ARGS[@]}" 2>&1 | tee /tmp/ja.log || true
+            DEPLOY_RC=0
+            "${JA[@]}" deploy --sdl /tmp/runner-sdl.minted.yaml --deposit "$REQUIRED_DEPOSIT_USD" --bid-wait 60 \
+              --bid-wait-retry 120 "${SELECT_ARGS[@]}" "${PROV_ARGS[@]}" 2>&1 | tee /tmp/ja.log || DEPLOY_RC=${PIPESTATUS[0]}
+            rm -f /tmp/runner-sdl.minted.yaml
             # ⛔ A FAILED LEASE STILL HOLDS A DEPLOYMENT (#348). just-akash prints the
             # "DSEQ:" summary only after a lease succeeds. When lease creation fails it
             # closes best-effort and emits LEASE_CREATE_FAILED (or REDEPLOY_FAILED) with the
@@ -1121,7 +1184,7 @@ jobs:
                 # Only the exact Console 402/PaymentRequired rejection is proven
                 # pre-broadcast. Generic insufficient wording remains UNKNOWN.
                 if grep -qiE 'PaymentRequiredError|HTTP 402' /tmp/ja.log 2>/dev/null; then
-                  [ -n "$CREATED_DSEQ" ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+                  [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
                 fi
                 echo "failure_reason=WALLET_UNDERFUNDED" >> "$GITHUB_OUTPUT"
                 echo "::error title=Akash rejected the deploy: INSUFFICIENT BALANCE::No order was created and no provider was asked to bid, so retrying cannot help. Top up the wallet."
@@ -1188,7 +1251,8 @@ jobs:
               echo "::group::unclassified deploy failure — raw output"
               tail -40 /tmp/ja.log 2>/dev/null || echo "(no output captured)"
               echo "::endgroup::"
-              echo "::warning::attempt $attempt: no lease within the bid window — cause NOT classified. The raw output is in the group above; if it names an account-sequence or transaction error, that string belongs in this workflow's matcher."
+              UNCLASSIFIED_ATTEMPT=1
+              echo "::warning::attempt $attempt: no lease within the bid window (deploy exit ${DEPLOY_RC}) — cause NOT classified. The raw output is in the group above; if it names an account-sequence or transaction error, that string belongs in this workflow's matcher."
               echo "::endgroup::"; continue
             fi
             SAW_BID=1
