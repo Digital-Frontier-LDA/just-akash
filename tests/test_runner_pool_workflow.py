@@ -597,7 +597,7 @@ def test_the_rendered_sdl_is_echoed_without_the_token():
     """The SDL embeds a PAT with org runner-registration rights. Actions masks known
     secrets, but a rendered file printed wholesale is exactly how one escaped before."""
     render = _step("Render runner SDL")["run"]
-    assert "grep -vE 'ACCESS_TOKEN'" in render
+    assert "grep -vE 'RUNNER_TOKEN'" in render
     assert "cat /tmp/runner-sdl.yaml" not in render
 
 
@@ -776,9 +776,19 @@ def test_the_guard_actually_runs_and_decides(key, accepted, tmp_path):
     render = _step("Render runner SDL")["run"]
     script = tmp_path / "render.sh"
     script.write_text(render, encoding="utf-8")
+    # An accepted key reaches the registration-token mint (#383): answer it as GitHub does, 201.
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text(
+        "#!/usr/bin/env bash\n"
+        'printf \'HTTP/2.0 201 Created\\r\\n\\r\\n{"token":"AREGTOKEN"}\\n\'\n',
+        encoding="utf-8",
+    )
+    (fake_bin / "gh").chmod(0o755)
     env = {
         **os.environ,
-        "GH_RUNNER_PAT": "x",
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        "GH_TOKEN": "x",
         "ORG": "o",
         "RUNNER_LABEL": "l",
         "POOL_SIZE": "1",
@@ -1026,7 +1036,7 @@ MUTATIONS = [
         "402 is distinct",
         lambda s: s.replace("failure_reason=WALLET_UNDERFUNDED", "failure_reason=INFRA"),
     ),
-    ("sdl token redacted", lambda s: s.replace("grep -vE 'ACCESS_TOKEN'", "cat")),
+    ("sdl token redacted", lambda s: s.replace("grep -vE 'RUNNER_TOKEN'", "cat")),
     (
         "pool image matches the probe",
         lambda s: s.replace(

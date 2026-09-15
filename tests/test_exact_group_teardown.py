@@ -86,11 +86,21 @@ def test_render_publishes_the_name_used_by_both_sdl_group_maps(tmp_path):
         step for step in pool["jobs"]["pool"]["steps"] if step.get("name") == "Render runner SDL"
     )
     output = tmp_path / "output"
+    # The render step mints a registration token (#383); answer the mint as GitHub does, 201.
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text(
+        "#!/usr/bin/env bash\n"
+        'printf \'HTTP/2.0 201 Created\\r\\n\\r\\n{"token":"AREGTOKEN"}\\n\'\n',
+        encoding="utf-8",
+    )
+    (fake_bin / "gh").chmod(0o755)
     result = subprocess.run(
         ["bash", "-e", "-o", "pipefail", "-c", render["run"]],
         env={
             **os.environ,
-            "GH_RUNNER_PAT": "secret",
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "GH_TOKEN": "secret",
             "ORG": "Digital-Frontier-LDA",
             "RUNNER_LABEL": "exact-group-test",
             "POOL_SIZE": "1",
