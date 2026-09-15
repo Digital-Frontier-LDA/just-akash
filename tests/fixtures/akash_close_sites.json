@@ -1,0 +1,177 @@
+[
+  {
+    "callee": "robust_destroy",
+    "count": 3,
+    "kind": "python",
+    "path": "just_akash/_e2e.py",
+    "scope": "_signal_handler"
+  },
+  {
+    "callee": "robust_destroy",
+    "count": 1,
+    "kind": "python",
+    "path": "just_akash/_e2e.py",
+    "scope": "destroy_owned_deployment"
+  },
+  {
+    "callee": "close_deployment",
+    "count": 1,
+    "kind": "python",
+    "path": "just_akash/_e2e.py",
+    "scope": "robust_destroy"
+  },
+  {
+    "callee": "close_deployment",
+    "count": 1,
+    "kind": "python",
+    "path": "just_akash/api.py",
+    "scope": "AkashConsoleAPI.close_all_deployments"
+  },
+  {
+    "callee": "close_all_deployments",
+    "count": 1,
+    "kind": "python",
+    "path": "just_akash/api.py",
+    "scope": "api_main"
+  },
+  {
+    "callee": "close_deployment",
+    "count": 1,
+    "kind": "python",
+    "path": "just_akash/api.py",
+    "scope": "api_main"
+  },
+  {
+    "callee": "close_deployment",
+    "count": 1,
+    "kind": "python",
+    "path": "just_akash/capacity.py",
+    "scope": "probe_order_sdl"
+  },
+  {
+    "callee": "close_deployment",
+    "count": 1,
+    "kind": "python",
+    "path": "just_akash/cleanup_stale.py",
+    "scope": "run"
+  },
+  {
+    "callee": "close_all_deployments",
+    "count": 1,
+    "kind": "python",
+    "path": "just_akash/cli.py",
+    "scope": "main"
+  },
+  {
+    "callee": "close_deployment",
+    "count": 2,
+    "kind": "python",
+    "path": "just_akash/cli.py",
+    "scope": "main"
+  },
+  {
+    "callee": "close_deployment",
+    "count": 1,
+    "kind": "python",
+    "path": "just_akash/close_orphans.py",
+    "scope": "run"
+  },
+  {
+    "callee": "close_deployment",
+    "count": 1,
+    "kind": "python",
+    "path": "just_akash/deploy.py",
+    "scope": "_close_proven_orphan"
+  },
+  {
+    "callee": "close_deployment",
+    "count": 1,
+    "kind": "python",
+    "path": "just_akash/deploy.py",
+    "scope": "_close_stale_for_retry"
+  },
+  {
+    "callee": "close_deployment",
+    "count": 7,
+    "kind": "python",
+    "path": "just_akash/deploy.py",
+    "scope": "deploy"
+  },
+  {
+    "callee": "close_deployment",
+    "count": 2,
+    "kind": "python",
+    "path": "just_akash/deploy.py",
+    "scope": "deploy._redeploy_and_reselect"
+  },
+  {
+    "callee": "destroy",
+    "count": 1,
+    "kind": "python",
+    "path": "just_akash/ip_smoke.py",
+    "scope": "run_ip_stage"
+  },
+  {
+    "callee": "robust_destroy",
+    "count": 1,
+    "kind": "python",
+    "path": "just_akash/paid_create.py",
+    "scope": "verified_cleanup"
+  },
+  {
+    "callee": "_destroy",
+    "count": 1,
+    "kind": "python",
+    "path": "just_akash/runner_probe.py",
+    "scope": "probe_once"
+  },
+  {
+    "callee": "robust_destroy",
+    "count": 1,
+    "kind": "python",
+    "path": "just_akash/smoke_providers.py",
+    "scope": "sweep_orphan_probes"
+  },
+  {
+    "callee": "robust_destroy",
+    "count": 1,
+    "kind": "python",
+    "path": "just_akash/test_secrets_e2e.py",
+    "scope": "_verified_cleanup"
+  },
+  {
+    "callee": "close_deployment",
+    "count": 1,
+    "kind": "python",
+    "path": "just_akash/wallet_pool.py",
+    "scope": "_AuthorizedBoundOwnerCloser.close_deployment"
+  },
+  {
+    "callee": "destroy",
+    "count": 5,
+    "kind": "shell",
+    "path": ".github/workflows/runner-pool.yml",
+    "scope": ""
+  },
+  {
+    "callee": "destroy",
+    "count": 1,
+    "kind": "shell",
+    "path": ".github/workflows/runner-teardown.yml",
+    "scope": ""
+  },
+  {
+    "callee": "destroy",
+    "count": 3,
+    "kind": "shell",
+    "path": "Justfile",
+    "scope": ""
+  },
+  {
+    "callee": "destroy-all",
+    "count": 1,
+    "kind": "shell",
+    "path": "Justfile",
+    "scope": ""
+  }
+]

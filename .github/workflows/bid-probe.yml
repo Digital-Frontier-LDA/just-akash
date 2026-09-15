@@ -198,7 +198,7 @@ jobs:
         timeout-minutes: 10
         run: |
           command -v uv >/dev/null || { echo "uv absent — setup failed, so no orders were created"; exit 0; }
-          uv run python -m just_akash.cleanup_stale --only-service probe --execute
+          uv run python -m just_akash.cleanup_stale --only-service probe --ownership-register '{"just-akash-":"Digital-Frontier-LDA/just-akash"}' --execute
 
   # Publish to the telemetry branch from a separate job, so the privileged
   # contents:write token never runs alongside the code holding the API key.
