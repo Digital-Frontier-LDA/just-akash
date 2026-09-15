@@ -537,9 +537,12 @@ def test_the_signal_handler_forwards_the_credential_binding(monkeypatch) -> None
     finally:
         _e2e._reset_signal_cleanup_for_tests()
     assert exit_info.value.code == 130
-    assert calls == [
-        (
-            "1001",
-            {"owner": OWNER, "groups": GROUPS, "credential": binding, "retries": 1, "audit": True},
-        )
-    ]
+    assert len(calls) == 1
+    dseq, kwargs = calls[0]
+    # The interrupt cleanup's one lookup ceiling (#378) rides along; its value is pinned by
+    # tests/test_owner_lookup_deadline.py, so here it only has to be a real epoch ceiling.
+    assert isinstance(kwargs.pop("ceiling_at"), float)
+    assert (dseq, kwargs) == (
+        "1001",
+        {"owner": OWNER, "groups": GROUPS, "credential": binding, "retries": 1, "audit": True},
+    )

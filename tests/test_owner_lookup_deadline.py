@@ -937,3 +937,90 @@ def test_one_ceiling_is_shared_by_a_cleanups_retries(monkeypatch) -> None:
     ceilings = {c["extra_env"][owner_lookup.OWNER_LOOKUP_DEADLINE_AT_ENV] for c in calls}
     assert len(calls) == 3
     assert len(ceilings) == 1, f"each retry got its own ceiling: {sorted(ceilings)}"
+
+
+def _record_cleanup_ceilings(monkeypatch) -> tuple[list[float | None], list[dict | None]]:
+    """(ceilings resolve-owner was given, env each destroy subprocess got), with a clock that
+    moves 50s on every read so a second, later ceiling cannot coincide with the first."""
+    from just_akash import _e2e
+
+    clock = iter([1000.0 + 50 * n for n in range(200)])
+    monkeypatch.setattr(owner_lookup.time, "time", lambda: next(clock))
+    resolved: list[float | None] = []
+
+    def resolve(dseq, *, ceiling_at=None):
+        resolved.append(ceiling_at)
+        return OWNER
+
+    destroys: list[dict | None] = []
+
+    def run(cmd, **kwargs):
+        destroys.append(kwargs.get("extra_env"))
+        return subprocess.CompletedProcess(cmd, 0, "Deployment closed", "")
+
+    monkeypatch.setattr(_e2e, "resolve_deployment_owner", resolve)
+    monkeypatch.setattr(_e2e, "_run", run)
+    monkeypatch.setattr(_e2e.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(_e2e, "_confirm_settled", lambda *_a, **_k: True)
+    return resolved, destroys
+
+
+def test_owner_resolution_and_the_destroy_share_one_cleanup_ceiling(monkeypatch) -> None:
+    """destroy_owned_deployment (what smoke_providers calls as robust_destroy) resolves the owner
+    and then destroys under ONE ceiling. A destroy that minted its own after resolve-owner had
+    spent part of the budget would get a fresh 600s: up to twice the bound per probe."""
+    from just_akash import _e2e
+
+    resolved, destroys = _record_cleanup_ceilings(monkeypatch)
+
+    assert _e2e.destroy_owned_deployment(DSEQ, group="g", audit=False) is True
+    assert len(resolved) == 1 and resolved[0] is not None, "owner resolution ran without a ceiling"
+    assert len(destroys) == 1
+    destroy_ceiling = float(destroys[0][owner_lookup.OWNER_LOOKUP_DEADLINE_AT_ENV])
+    assert destroy_ceiling == pytest.approx(resolved[0], abs=0.001), (
+        f"resolve-owner used {resolved[0]} but the destroy got {destroy_ceiling}: a second budget"
+    )
+
+
+def test_interrupt_cleanup_shares_one_ceiling_between_resolution_and_destroy(monkeypatch) -> None:
+    """The signal handler is a cleanup entry point too: an interrupted e2e resolves the owner
+    and destroys under the same single ceiling, never an unbounded resolve plus a fresh budget."""
+    from just_akash import _e2e
+
+    resolved, destroys = _record_cleanup_ceilings(monkeypatch)
+    monkeypatch.setattr(_e2e, "_REGISTERED_DSEQ_REFS", [{"dseq": DSEQ, "group": "g"}])
+    monkeypatch.setattr(_e2e, "_HANDLER_RUNNING", False)
+
+    with pytest.raises(SystemExit) as exited:
+        _e2e._signal_handler(2, None)
+    assert exited.value.code == 130
+    assert len(resolved) == 1 and resolved[0] is not None, (
+        "interrupt cleanup resolved without a ceiling"
+    )
+    assert len(destroys) == 1
+    destroy_ceiling = float(destroys[0][owner_lookup.OWNER_LOOKUP_DEADLINE_AT_ENV])
+    assert destroy_ceiling == pytest.approx(resolved[0], abs=0.001)
+
+
+def test_interrupt_cleanup_holds_when_the_step_deadline_has_passed(monkeypatch, capsys) -> None:
+    """With no time left in the step, the interrupt path holds before resolving or destroying."""
+    from just_akash import _e2e
+
+    monkeypatch.setenv(OWNER_LOOKUP_STEP_DEADLINE_AT_ENV, str(time.time() - 1))
+    resolved: list = []
+    destroys: list = []
+    monkeypatch.setattr(
+        _e2e, "resolve_deployment_owner", lambda *a, **k: resolved.append(k) or OWNER
+    )
+    monkeypatch.setattr(
+        _e2e,
+        "_run",
+        lambda cmd, **k: destroys.append(k) or subprocess.CompletedProcess(cmd, 0, "", ""),
+    )
+    monkeypatch.setattr(_e2e, "_REGISTERED_DSEQ_REFS", [{"dseq": DSEQ, "group": "g"}])
+    monkeypatch.setattr(_e2e, "_HANDLER_RUNNING", False)
+
+    with pytest.raises(SystemExit):
+        _e2e._signal_handler(2, None)
+    assert resolved == [] and destroys == []
+    assert "OWNER_LOOKUP_UNREACHABLE" in capsys.readouterr().out

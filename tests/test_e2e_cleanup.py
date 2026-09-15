@@ -35,7 +35,8 @@ def _reset_e2e_state(monkeypatch):
     """Each test starts with a clean signal registry."""
     monkeypatch.setattr(
         "just_akash._e2e.resolve_deployment_owner",
-        lambda _dseq: "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee",
+        # ceiling_at: the interrupt cleanup passes its one per-cleanup lookup ceiling (#378).
+        lambda _dseq, *, ceiling_at=None: "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee",
     )
     _reset_signal_cleanup_for_tests()
     yield
@@ -269,11 +270,14 @@ class TestInstallSignalCleanup:
         ):
             handlers[signal.SIGINT](signal.SIGINT, None)
         assert exc.value.code == 130
-        mock_destroy.assert_called_once_with(
-            "9999",
-            owner="akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee",
-            retries=1,
-            audit=True,
+        mock_destroy.assert_called_once()
+        args, kwargs = mock_destroy.call_args
+        # The interrupt cleanup's one lookup ceiling (#378); its value is pinned in
+        # tests/test_owner_lookup_deadline.py.
+        assert isinstance(kwargs.pop("ceiling_at"), float)
+        assert (args, kwargs) == (
+            ("9999",),
+            {"owner": "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee", "retries": 1, "audit": True},
         )
 
     def test_handler_skips_destroy_when_dseq_unset(self, monkeypatch, capsys):
