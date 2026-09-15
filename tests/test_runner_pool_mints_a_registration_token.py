@@ -47,9 +47,13 @@ REGISTRATION_TOKEN_TTL_MINUTES = 60
 WINDOW_MARGIN_MINUTES = 10
 
 # Indentation as YAML parses the `run:` block scalar: the attempt loop body is two spaces in.
-MINT_START = (
-    '  RC=0\n  RESP=$(gh api --method POST "orgs/${ORG}/actions/runners/registration-token"'
-)
+# The attempt's fragment starts at its provider-policy selection, before the template check and the
+# mint, so reordering those two cannot break the extraction. The template check is an explicit
+# `[ ! -s ]` and an external `cat`: on the CI runner's bash 5.2, `$(< file) || fallback` under
+# `bash -e` ended the script on a missing file with no reason (CI run 34953315385).
+MINT_START = "  SELECT_ARGS=()\n"
+# GitHub runs a `run:` step as `/usr/bin/bash -e {0}` on its Ubuntu runners.
+STEP_BASH = "/usr/bin/bash"
 MINT_END = f"  rm -f {MINTED}\n"
 
 
@@ -71,6 +75,27 @@ def _mint_fragment(provision_run: str) -> str:
     return provision_run[start : provision_run.index(MINT_END) + len(MINT_END)]
 
 
+def _bash() -> str:
+    """The step's own shell on GitHub Actions; elsewhere the bash on PATH."""
+    if os.environ.get("GITHUB_ACTIONS") == "true" and Path(STEP_BASH).exists():
+        return STEP_BASH
+    found = shutil.which("bash")
+    assert found, "needs bash"
+    return found
+
+
+def test_on_github_actions_the_fragment_runs_under_the_step_shell():
+    """Pins the executed legs to the binary a `run:` step uses on the runner image, and records
+    its version in the result, so a bash-version-specific failure is reproduced where it lives."""
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        pytest.skip("only meaningful on a GitHub-hosted runner")
+    version = subprocess.run(
+        [_bash(), "--version"], capture_output=True, text=True, check=True
+    ).stdout.splitlines()[0]
+    assert _bash() == STEP_BASH, (_bash(), version)
+    print(f"step shell: {STEP_BASH}: {version}")
+
+
 def _response(status: int | None, token: str | None = TOKEN) -> str:
     """What `gh api -i` prints: status line, headers, blank line, body."""
     if status is None:
@@ -86,18 +111,40 @@ def _response(status: int | None, token: str | None = TOKEN) -> str:
     return f"HTTP/2.0 {status} {reason}\r\nContent-Type: application/json\r\n\r\n{body}"
 
 
-def _run_attempt(tmp_path: Path, status=201, token=TOKEN, rc=None, placeholder=True):
-    """Execute the REAL fragment with `gh` and the deploy CLI stubbed and the /tmp paths moved."""
+def _run_attempt(
+    tmp_path: Path,
+    status=201,
+    token=TOKEN,
+    rc=None,
+    placeholder=True,
+    created_dseq="",
+    unclassified=0,
+    minted=None,
+    patch=None,
+    placeholders=1,
+):
+    """Execute the REAL fragment with `gh` and the deploy CLI stubbed and the /tmp paths moved.
+
+    `patch` rewrites the fragment's source (an effect leg for a defence the real code never
+    reaches); `minted` overrides where the per-attempt SDL is written."""
     template = tmp_path / "runner-sdl.yaml"
     line = f"RUNNER_TOKEN={PLACEHOLDER}" if placeholder else "RUNNER_TOKEN=missing"
-    if placeholder is not None:  # None: the render step's template is missing altogether
+    if placeholder == "empty":
+        template.write_text("")
+    elif placeholder == "unreadable":
+        template.write_text(f"RUNNER_TOKEN={PLACEHOLDER}\n")
+        template.chmod(0)
+    elif placeholder is not None:  # None: the render step's template is missing altogether
+        extra = f"      - ALSO={PLACEHOLDER}\n" * (placeholders - 1)
         template.write_text(
             'version: "2.0"\nservices:\n  runner:\n    env:\n'
-            f"      - {line}\n      - ORG_NAME=testorg\n"
+            f"      - {line}\n{extra}      - ORG_NAME=testorg\n"
         )
-    minted = tmp_path / "runner-sdl.minted.yaml"
+    minted = Path(minted) if minted is not None else tmp_path / "runner-sdl.minted.yaml"
     deployed = tmp_path / "deployed-sdl"
     fragment = _mint_fragment(_step("provision")["run"])
+    if patch is not None:
+        fragment = patch(fragment)
     fragment = fragment.replace(TEMPLATE, str(template)).replace(MINTED, str(minted))
     fragment = fragment.replace("/tmp/ja.log", str(tmp_path / "ja.log"))
     fake_bin = tmp_path / "bin"
@@ -125,8 +172,9 @@ def _run_attempt(tmp_path: Path, status=201, token=TOKEN, rc=None, placeholder=T
     script = tmp_path / "attempt.sh"
     script.write_text(
         "set -uo pipefail\n"
-        "attempt=1\nCREATED_DSEQ=\nREQUIRED_DEPOSIT_USD=5\n"
-        "SELECT_ARGS=()\nPROV_ARGS=(--provider p)\n"
+        f"attempt=1\nCREATED_DSEQ={created_dseq}\nUNCLASSIFIED_ATTEMPT={unclassified}\n"
+        "REQUIRED_DEPOSIT_USD=5\n"
+        "PROV_ARGS=(--provider p)\n"
         "JA=(fake-ja)\n" + fragment,
         encoding="utf-8",
     )
@@ -137,11 +185,12 @@ def _run_attempt(tmp_path: Path, status=201, token=TOKEN, rc=None, placeholder=T
         "FAKE_RC": str(rc),
         "GH_TOKEN": PAT,
         "ORG": "testorg",
+        "PROVIDER_SELECT": "",
         "GITHUB_OUTPUT": str(output),
     }
     # Actions runs a `run:` step as `bash -e {0}`.
     proc = subprocess.run(
-        ["bash", "-e", str(script)], env=env, capture_output=True, text=True, timeout=30
+        [_bash(), "-e", str(script)], env=env, capture_output=True, text=True, timeout=30
     )
     assert "unexpected EOF" not in proc.stderr, proc.stderr
     path_file = tmp_path / "deployed-sdl.path"
@@ -150,7 +199,7 @@ def _run_attempt(tmp_path: Path, status=201, token=TOKEN, rc=None, placeholder=T
         deployed=deployed.read_text(encoding="utf-8") if deployed.exists() else None,
         deployed_path=path_file.read_text().strip() if path_file.exists() else None,
         minted_left=minted.exists(),
-        template=template.read_text(encoding="utf-8") if template.exists() else "",
+        template=template.read_text(encoding="utf-8") if placeholder in (True, False) else "",
         output=output.read_text(encoding="utf-8") if output.exists() else "",
         calls=calls.read_text(encoding="utf-8").splitlines() if calls.exists() else [],
         minted_path=str(minted),
@@ -201,8 +250,6 @@ def test_a_200_mint_is_accepted(tmp_path):
         (201, "AB&CD", 0, True),
         (201, TOKEN, 1, True),
         (None, None, 1, True),
-        (201, TOKEN, 0, False),
-        (201, TOKEN, 0, None),
     ],
     ids=[
         "202",
@@ -215,8 +262,6 @@ def test_a_200_mint_is_accepted(tmp_path):
         "201-non-alphanumeric-token",
         "201-but-gh-exited-nonzero",
         "no-response",
-        "template-without-placeholder",
-        "template-missing",
     ],
 )
 def test_anything_but_a_usable_mint_refuses_before_that_attempt_deploys(
@@ -232,6 +277,82 @@ def test_anything_but_a_usable_mint_refuses_before_that_attempt_deploys(
     assert r.deployed is None, "the deploy ran without a usable minted token"
     assert "::error title=Runner registration token not minted" in r.proc.stdout + r.proc.stderr
     assert PAT not in r.proc.stdout + r.proc.stderr
+
+
+@pytest.mark.parametrize(
+    "placeholder",
+    [False, None, "empty", "unreadable"],
+    ids=["without-placeholder", "missing", "empty", "unreadable"],
+)
+def test_an_unusable_template_refuses_before_any_token_is_minted(tmp_path, placeholder):
+    r = _run_attempt(tmp_path, status=201, placeholder=placeholder)
+
+    assert r.proc.returncode == 1, (r.proc.returncode, r.proc.stderr)
+    assert "failure_reason=RUNNER_SDL_TEMPLATE_MISSING" in r.output, r.output
+    assert "RUNNER_TOKEN_UNMINTED" not in r.output
+    assert "deployment_outcome=no-deployment" in r.output
+    assert r.calls == [], "a token was minted for a template that cannot carry it"
+    assert r.deployed is None
+    assert "::error title=Runner SDL template missing" in r.proc.stdout + r.proc.stderr
+
+
+def test_a_failed_write_of_the_minted_sdl_refuses_before_the_deploy(tmp_path):
+    r = _run_attempt(tmp_path, minted=tmp_path / "no-such-dir" / "runner-sdl.minted.yaml")
+
+    assert r.proc.returncode == 1, (r.proc.returncode, r.proc.stderr)
+    assert "failure_reason=RUNNER_SDL_UNRENDERED" in r.output, r.output
+    assert "deployment_outcome=no-deployment" in r.output
+    assert r.deployed is None
+    assert "::error title=Per-attempt runner SDL not rendered" in r.proc.stdout + r.proc.stderr
+
+
+def test_a_template_with_the_placeholder_twice_is_filled_everywhere(tmp_path):
+    r = _run_attempt(tmp_path, placeholders=2)
+
+    assert r.proc.returncode == 0, r.proc.stderr
+    assert r.deployed is not None and PLACEHOLDER not in r.deployed
+    assert r.deployed.count(TOKEN) == 2
+
+
+def test_the_placeholder_check_refuses_a_minted_sdl_that_kept_one(tmp_path):
+    """Effect leg: the real substitution replaces every placeholder, so only a broken one (here,
+    replace-first) can leave one behind. The pre-deploy check must catch it."""
+    full = '"${SDL_TEMPLATE//@@RUNNER_TOKEN@@/$RUNNER_TOKEN}"'
+
+    def first_only(fragment: str) -> str:
+        assert fragment.count(full) == 1
+        return fragment.replace(full, '"${SDL_TEMPLATE/@@RUNNER_TOKEN@@/$RUNNER_TOKEN}"')
+
+    r = _run_attempt(tmp_path, placeholders=2, patch=first_only)
+
+    assert r.proc.returncode == 1, (r.proc.returncode, r.proc.stderr)
+    assert "failure_reason=RUNNER_SDL_UNRENDERED" in r.output, r.output
+    assert r.deployed is None, "a minted SDL still carrying a placeholder was deployed"
+    assert not r.minted_left, "the refused per-attempt SDL (it carries a token) was left on disk"
+
+
+def test_a_refusal_after_an_unclassified_attempt_never_narrows(tmp_path):
+    """An unclassified attempt may have broadcast a create with no DSEQ (DEV1): a later refusal
+    must leave the outcome unknown, never no-deployment."""
+    r = _run_attempt(tmp_path, status=401, token=None, rc=1, unclassified=1)
+
+    assert r.proc.returncode == 1, r.proc.stderr
+    assert "failure_reason=RUNNER_TOKEN_UNMINTED" in r.output, r.output
+    assert "deployment_outcome" not in r.output, "a refusal narrowed over an unclassified attempt"
+
+
+def test_a_refused_later_attempt_never_narrows_an_earlier_created_lease(tmp_path):
+    """Attempt 1 created a lease (CREATED_DSEQ is set); attempt 2's mint fails. The outcome must
+    stay what attempt 1 published: blazing's cleanup accepts zero registrations for this reason
+    only when the outcome is no-deployment."""
+    r = _run_attempt(tmp_path, status=401, token=None, rc=1, created_dseq="1001")
+
+    assert r.proc.returncode == 1, r.proc.stderr
+    assert "failure_reason=RUNNER_TOKEN_UNMINTED" in r.output, r.output
+    assert "deployment_outcome" not in r.output, (
+        "a refusal after a created lease rewrote the outcome"
+    )
+    assert r.deployed is None
 
 
 # --------------------------------------------------------------------------- structure
@@ -259,7 +380,11 @@ def test_the_token_is_masked_before_its_first_use_and_never_published():
     lines = _code(_mint_fragment(_step("provision")["run"])).splitlines()
     mask = [i for i, line in enumerate(lines) if 'echo "::add-mask::${RUNNER_TOKEN}"' in line]
     assert len(mask) == 1, mask
-    before = [line.strip() for line in lines[: mask[0]] if "RUNNER_TOKEN" in line]
+    before = [
+        line.strip()
+        for line in lines[: mask[0]]
+        if "RUNNER_TOKEN" in line and PLACEHOLDER not in line
+    ]
     assert len(before) == 2 and before[0] == 'RUNNER_TOKEN=""', before
     assert before[1].startswith('if [[ "$RESP" =~ ')
     assert 'RUNNER_TOKEN="${BASH_REMATCH[1]}"' in before[1]

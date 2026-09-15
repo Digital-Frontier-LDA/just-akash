@@ -1483,13 +1483,6 @@ BASELINE: dict[tuple[str, str, str, str], tuple[int, str]] = {
         "pool/Provision (retry down candidates, tag before waiting)",
         "58f543325b69",  # pragma: allowlist secret
     ): (1, "`grep -c` exits 1 on zero matches while printing 0; the count is gated"),
-    # --bid-wait-retry 120 "${SELECT_ARGS[@]}" "${PROV_ARGS[@]}" 2>&1 | tee …
-    (
-        "R2",
-        ".github/workflows/runner-pool.yml",
-        "pool/Provision (retry down candidates, tag before waiting)",
-        "76a6828d2ce6",  # pragma: allowlist secret
-    ): (1, "deploy outcome is read from the log; DSEQ and LEASE_CREATE_FAILED recovery below"),
     # ONLINE=$(printf '%s\n' "$RUNNER_IDS" | grep -c . || true)
     (
         "R2",

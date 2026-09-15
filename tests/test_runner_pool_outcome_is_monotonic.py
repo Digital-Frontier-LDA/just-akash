@@ -64,7 +64,7 @@ if sub == "deploy":
         print(f"Wallet: {r.get('wallet', scenario.get('owner'))}")
     if r.get("text"):
         print(r["text"])
-    sys.exit(0)
+    sys.exit(int(r.get("rc", 0)))
 if sub == "destroy":
     ok = scenario.get("destroy", {}).get(arg("--dseq"), "fail") == "ok"
     print(f"Deployment {arg('--dseq')} destroyed." if ok else "Error: close failed")
@@ -93,7 +93,14 @@ listed = os.path.join(os.environ["STUB_STATE"], "listed")
 if "registration-token" in " ".join(sys.argv[1:]):
     # Each attempt mints before its deploy (#383); `token_status` is the VERDICT mint's answer,
     # the one made after the runner listing was read.
-    code = int(sc.get("token_status", 201)) if os.path.exists(listed) else 201
+    if os.path.exists(listed):
+        code = int(sc.get("token_status", 201))
+    else:  # the Nth pre-deploy mint answers mint_statuses[N] (default 201)
+        path = os.path.join(os.environ["STUB_STATE"], "mints")
+        n = int(open(path).read()) if os.path.exists(path) else 0
+        open(path, "w").write(str(n + 1))
+        statuses = sc.get("mint_statuses", [])
+        code = int(statuses[n]) if n < len(statuses) else 201
     print(f"HTTP/2.0 {code} stub\n\n" + ('{"token": "STUBTOKEN"}' if code == 201 else "{}"))
     sys.exit(0 if code == 201 else 1)
 open(listed, "w").close()
@@ -539,6 +546,50 @@ def test_s5b_a_new_dseq_without_a_wallet_never_keeps_the_old_owner_and_stops(
     assert not [c for c in r["calls"] if c.endswith("dseq=1002") and not c.startswith("deploy")], (
         f"an owner-less lease was acted on: {r['calls']}"
     )
+    assert_monotonic(r)
+
+
+def test_a_mint_refused_after_an_unclassified_attempt_keeps_the_outcome_unknown(
+    tmp_path: Path,
+) -> None:
+    """DEV1 (#384): attempt 1 fails unclassified with no DSEQ (its create may still have been
+    broadcast); attempt 2's mint is refused. Nothing may narrow the outcome to no-deployment,
+    and the unclassified warning carries the deploy's own exit code."""
+    r = run_step(
+        tmp_path,
+        {
+            "owner": OWNER,
+            "rounds": [{"text": "Error: connection reset", "rc": 3}],
+            "mint_statuses": [201, 401],
+        },
+    )
+    assert r["rc"] != 0
+    assert deploys(r) == 1, r["calls"]
+    assert last(r, "failure_reason") == "RUNNER_TOKEN_UNMINTED", r["writes"]
+    outcomes = [v for k, v in r["writes"] if k == "deployment_outcome"]
+    assert outcomes == ["unknown"], outcomes
+    assert "(deploy exit 3)" in r["log"], r["log"][-2000:]
+    assert_monotonic(r)
+
+
+def test_a_402_after_an_unclassified_attempt_keeps_the_outcome_unknown(tmp_path: Path) -> None:
+    """The same guard on a pre-existing narrowing site: a proven pre-broadcast 402 in attempt 2
+    says nothing about attempt 1's unclassified create."""
+    r = run_step(
+        tmp_path,
+        {
+            "owner": OWNER,
+            "rounds": [
+                {"text": "Error: connection reset"},
+                {"text": "PaymentRequiredError: HTTP 402"},
+            ],
+        },
+    )
+    assert r["rc"] != 0
+    assert deploys(r) == 2, r["calls"]
+    assert last(r, "failure_reason") == "WALLET_UNDERFUNDED", r["writes"]
+    outcomes = [v for k, v in r["writes"] if k == "deployment_outcome"]
+    assert outcomes == ["unknown"], outcomes
     assert_monotonic(r)
 
 

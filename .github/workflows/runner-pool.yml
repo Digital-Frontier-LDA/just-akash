@@ -926,6 +926,12 @@ jobs:
       # ⚠ This prose lives OUT here on purpose. Comments inside a `run:` scalar count
       # toward the job's size, and an oversized job makes GitHub build zero jobs with no
       # log — Borduas-Holdings/blazing#664. Out here the parser drops them.
+      # ── PER-ATTEMPT MINT GUARDS (just-akash#383/#384; comments here, not in `run:`, cost no job size) ──
+      #   * The template is checked with an explicit `[ ! -s ]` BEFORE the mint, never with
+      #     `$(< file) || fallback`: under `bash -e` on the runner's bash 5.2 that form ended the step
+      #     on a missing file with no failure_reason (CI run 34953315385, job 104329251140).
+      #   * UNCLASSIFIED_ATTEMPT: an attempt that fell into the unclassified `continue` may have
+      #     broadcast a create with no DSEQ, so no later refusal narrows the outcome to no-deployment.
       - name: Provision (retry down candidates, tag before waiting)
         id: provision
         env:
@@ -982,6 +988,7 @@ jobs:
           # no-deployment or erase that identity. A later ambiguous POST is different:
           # it must publish unknown because it may have created a second deployment.
           CREATED_DSEQ=""
+          UNCLASSIFIED_ATTEMPT=0
 
           # ⛔ A LEASE IS TERMINAL ONLY ON TWO-ENDPOINT CHAIN AGREEMENT (#347). A
           # destroy that exits 0 has only had its close ACCEPTED (cli.py destroy), and
@@ -1039,7 +1046,7 @@ jobs:
             # Never degrade an exhausted/denied allowlist into unrestricted
             # marketplace selection; that would re-admit every standing trap.
             if [ "${#PROV_ARGS[@]}" -eq 0 ]; then
-              [ -n "$CREATED_DSEQ" ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+              [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
               echo "failure_reason=NO_ELIGIBLE_BIDDER" >> "$GITHUB_OUTPUT"
               echo "::error title=No eligible provider remains::All configured preferred and fallback providers are standing-denied or failed during this run."
               echo "::endgroup::"; exit 1
@@ -1055,11 +1062,18 @@ jobs:
               "") ;;
               cheapest|emptiest) SELECT_ARGS=(--select "$PROVIDER_SELECT") ;;
               *)
-                [ -n "$CREATED_DSEQ" ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+                [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
                 echo "::error title=provider-select::must be 'cheapest' or 'emptiest', got '${PROVIDER_SELECT}'"
                 exit 1 ;;
             esac
 
+            if [ ! -s /tmp/runner-sdl.yaml ] || ! SDL_TEMPLATE=$(cat /tmp/runner-sdl.yaml) \
+              || [[ "$SDL_TEMPLATE" != *@@RUNNER_TOKEN@@* ]]; then
+              [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+              echo "failure_reason=RUNNER_SDL_TEMPLATE_MISSING" >> "$GITHUB_OUTPUT"
+              echo "::error title=Runner SDL template missing, empty or without its token placeholder::attempt $attempt: nothing minted or deployed."
+              echo "::endgroup::"; exit 1
+            fi
             RC=0
             RESP=$(gh api --method POST "orgs/${ORG}/actions/runners/registration-token" -i 2>&1) || RC=$?
             RUNNER_TOKEN=""
@@ -1068,18 +1082,25 @@ jobs:
             CODE=$(printf '%s' "$RESP" | awk 'NR==1 && $1 ~ /^HTTP/ {print $2}')
             unset RESP
             case "${RC}:${CODE}:${RUNNER_TOKEN}" in 0:200:*[!A-Za-z0-9]*|0:201:*[!A-Za-z0-9]*) RUNNER_TOKEN="" ;; 0:200:?*|0:201:?*) ;; *) RUNNER_TOKEN="" ;; esac
-            SDL_TEMPLATE=$(< /tmp/runner-sdl.yaml) || SDL_TEMPLATE=""
-            if [ -z "$RUNNER_TOKEN" ] || [[ "$SDL_TEMPLATE" != *@@RUNNER_TOKEN@@* ]]; then
-              [ -n "$CREATED_DSEQ" ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+            if [ -z "$RUNNER_TOKEN" ]; then
+              [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
               echo "failure_reason=RUNNER_TOKEN_UNMINTED" >> "$GITHUB_OUTPUT"
-              echo "::error title=Runner registration token not minted (HTTP ${CODE:-none received})::attempt $attempt: no deploy was made with it. The PAT preflight passed, so this is a GitHub API condition, not a provider fault."
+              echo "::error title=Runner registration token not minted (HTTP ${CODE:-none received})::attempt $attempt: nothing deployed. The PAT preflight passed: a GitHub API condition, not a provider fault."
               echo "::endgroup::"; exit 1
             fi
-            printf '%s\n' "${SDL_TEMPLATE//@@RUNNER_TOKEN@@/$RUNNER_TOKEN}" > /tmp/runner-sdl.minted.yaml
+            if ! printf '%s\n' "${SDL_TEMPLATE//@@RUNNER_TOKEN@@/$RUNNER_TOKEN}" > /tmp/runner-sdl.minted.yaml \
+              || grep -q '@@RUNNER_TOKEN@@' /tmp/runner-sdl.minted.yaml; then
+              rm -f -- /tmp/runner-sdl.minted.yaml
+              [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+              echo "failure_reason=RUNNER_SDL_UNRENDERED" >> "$GITHUB_OUTPUT"
+              echo "::error title=Per-attempt runner SDL not rendered::attempt $attempt: write failed or placeholder left; nothing deployed."
+              echo "::endgroup::"; exit 1
+            fi
             unset SDL_TEMPLATE
             rm -f /tmp/ja.log
+            DEPLOY_RC=0
             "${JA[@]}" deploy --sdl /tmp/runner-sdl.minted.yaml --deposit "$REQUIRED_DEPOSIT_USD" --bid-wait 60 \
-              --bid-wait-retry 120 "${SELECT_ARGS[@]}" "${PROV_ARGS[@]}" 2>&1 | tee /tmp/ja.log || true
+              --bid-wait-retry 120 "${SELECT_ARGS[@]}" "${PROV_ARGS[@]}" 2>&1 | tee /tmp/ja.log || DEPLOY_RC=${PIPESTATUS[0]}
             rm -f /tmp/runner-sdl.minted.yaml
             # ⛔ A FAILED LEASE STILL HOLDS A DEPLOYMENT (#348). just-akash prints the
             # "DSEQ:" summary only after a lease succeeds. When lease creation fails it
@@ -1161,7 +1182,7 @@ jobs:
                 # Only the exact Console 402/PaymentRequired rejection is proven
                 # pre-broadcast. Generic insufficient wording remains UNKNOWN.
                 if grep -qiE 'PaymentRequiredError|HTTP 402' /tmp/ja.log 2>/dev/null; then
-                  [ -n "$CREATED_DSEQ" ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+                  [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
                 fi
                 echo "failure_reason=WALLET_UNDERFUNDED" >> "$GITHUB_OUTPUT"
                 echo "::error title=Akash rejected the deploy: INSUFFICIENT BALANCE::No order was created and no provider was asked to bid, so retrying cannot help. Top up the wallet."
@@ -1228,7 +1249,8 @@ jobs:
               echo "::group::unclassified deploy failure — raw output"
               tail -40 /tmp/ja.log 2>/dev/null || echo "(no output captured)"
               echo "::endgroup::"
-              echo "::warning::attempt $attempt: no lease within the bid window — cause NOT classified. The raw output is in the group above; if it names an account-sequence or transaction error, that string belongs in this workflow's matcher."
+              UNCLASSIFIED_ATTEMPT=1
+              echo "::warning::attempt $attempt: no lease within the bid window (deploy exit ${DEPLOY_RC}) — cause NOT classified. The raw output is in the group above; if it names an account-sequence or transaction error, that string belongs in this workflow's matcher."
               echo "::endgroup::"; continue
             fi
             SAW_BID=1
