@@ -707,10 +707,17 @@ def _signal_handler(signum, _frame):
         for ref in list(_REGISTERED_DSEQ_REFS):
             dseq = (ref or {}).get("dseq") or ""
             if dseq:
+                # ONE ceiling for this cleanup, shared by owner resolution and the destroy, the
+                # same as destroy_owned_deployment (#378): resolving first and letting
+                # robust_destroy mint its own would give the destroy a second, fresh budget.
+                ceiling_at = _start_cleanup_ceiling(str(dseq))
+                if ceiling_at is None:
+                    cleaned_any = True
+                    continue
                 owner = (ref or {}).get("owner") or None
                 if owner is None:
                     try:
-                        owner = resolve_deployment_owner(dseq)
+                        owner = resolve_deployment_owner(dseq, ceiling_at=ceiling_at)
                     except Exception as exc:  # noqa: BLE001 — signal cleanup holds safely
                         _fail(f"Cleanup held for {dseq}: owner could not be resolved ({exc})")
                         cleaned_any = True
@@ -725,11 +732,19 @@ def _signal_handler(signum, _frame):
                         credential=(ref or {}).get("credential"),
                         retries=1,
                         audit=True,
+                        ceiling_at=ceiling_at,
                     )
                 elif group is None:
-                    robust_destroy(dseq, owner=owner, retries=1, audit=True)
+                    robust_destroy(dseq, owner=owner, retries=1, audit=True, ceiling_at=ceiling_at)
                 else:
-                    robust_destroy(dseq, owner=owner, group=group, retries=1, audit=True)
+                    robust_destroy(
+                        dseq,
+                        owner=owner,
+                        group=group,
+                        retries=1,
+                        audit=True,
+                        ceiling_at=ceiling_at,
+                    )
                 cleaned_any = True
         if not cleaned_any:
             _info("No DSEQ recorded yet — nothing to clean up")
