@@ -5,6 +5,19 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Merge-queue prerequisite. `Ruff lint + format`, `Pyright type check` and
+  # `Unit tests` are required checks on main; with a merge queue required, a check
+  # that does not also run on `merge_group` never reports for the queued commit, so
+  # the entry waits out the status-check timeout and is ejected.
+  #
+  # What runs in the queue: lint, typecheck, unit-tests. What does NOT, by the
+  # existing job-level `if:`s: both E2E jobs (they create PAID Akash deployments,
+  # are not required, and still run on the post-merge push) and the dependabot
+  # note. symbol-presence-check is skipped explicitly, see that job.
+  #
+  # Concurrency below needs no change: a merge group's github.ref is
+  # refs/heads/gh-readonly-queue/main/pr-<n>-<sha>, unique per group.
+  merge_group:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -172,6 +185,12 @@ jobs:
   symbol-presence-check:
     name: Symbol-presence check (Python files)
     runs-on: ubuntu-latest
+    # Not on merge_group. Advisory and PR-scoped by design: its provenance guard
+    # (checker script from the BASE, never the head) exists only for pull_request,
+    # so a queue run would take the `else` branch below and execute the copy of the
+    # checker the PR itself carries. It is not a required context, so skipping it
+    # cannot stall the queue; the PR run and the post-merge push run are unchanged.
+    if: github.event_name != 'merge_group'
     # Read-only: the job checks out the repo and shells to `git` for
     # merge-base / diff / log; it writes nothing and needs nothing
     # else. Explicit per-job permissions also scope the new job
