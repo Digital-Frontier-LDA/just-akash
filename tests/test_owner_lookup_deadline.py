@@ -976,7 +976,9 @@ def test_owner_resolution_and_the_destroy_share_one_cleanup_ceiling(monkeypatch)
     assert _e2e.destroy_owned_deployment(DSEQ, group="g", audit=False) is True
     assert len(resolved) == 1 and resolved[0] is not None, "owner resolution ran without a ceiling"
     assert len(destroys) == 1
-    destroy_ceiling = float(destroys[0][owner_lookup.OWNER_LOOKUP_DEADLINE_AT_ENV])
+    destroy_env = destroys[0]
+    assert destroy_env is not None, "the destroy ran without a ceiling env"
+    destroy_ceiling = float(destroy_env[owner_lookup.OWNER_LOOKUP_DEADLINE_AT_ENV])
     assert destroy_ceiling == pytest.approx(resolved[0], abs=0.001), (
         f"resolve-owner used {resolved[0]} but the destroy got {destroy_ceiling}: a second budget"
     )
@@ -998,7 +1000,9 @@ def test_interrupt_cleanup_shares_one_ceiling_between_resolution_and_destroy(mon
         "interrupt cleanup resolved without a ceiling"
     )
     assert len(destroys) == 1
-    destroy_ceiling = float(destroys[0][owner_lookup.OWNER_LOOKUP_DEADLINE_AT_ENV])
+    destroy_env = destroys[0]
+    assert destroy_env is not None, "the destroy ran without a ceiling env"
+    destroy_ceiling = float(destroy_env[owner_lookup.OWNER_LOOKUP_DEADLINE_AT_ENV])
     assert destroy_ceiling == pytest.approx(resolved[0], abs=0.001)
 
 
