@@ -1006,6 +1006,42 @@ def test_interrupt_cleanup_shares_one_ceiling_between_resolution_and_destroy(mon
     assert destroy_ceiling == pytest.approx(resolved[0], abs=0.001)
 
 
+@pytest.mark.parametrize(
+    "ref_extra",
+    [
+        {"group": "g"},
+        {
+            "groups": [{"gseq": 1, "name": "g"}],
+            "credential": {"credential_index": 0, "credential_count": 1},
+        },
+        {},
+    ],
+    ids=["group", "groups", "no-group"],
+)
+def test_every_interrupt_destroy_branch_gets_the_resolved_ceiling(monkeypatch, ref_extra) -> None:
+    """(just-akash#382 review) The handler resolves the owner BEFORE splitting into its three
+    robust_destroy calls, so each branch must hand the destroy the ceiling the resolution used.
+    A branch that minted a fresh one is still a float: the value is what has to be equal."""
+    from just_akash import _e2e
+
+    resolved, _destroys = _record_cleanup_ceilings(monkeypatch)
+    destroyed: list[float | None] = []
+    monkeypatch.setattr(
+        _e2e,
+        "robust_destroy",
+        lambda dseq, **kwargs: destroyed.append(kwargs.get("ceiling_at")) or True,
+    )
+    monkeypatch.setattr(_e2e, "_REGISTERED_DSEQ_REFS", [{"dseq": DSEQ, **ref_extra}])
+    monkeypatch.setattr(_e2e, "_HANDLER_RUNNING", False)
+
+    with pytest.raises(SystemExit):
+        _e2e._signal_handler(2, None)
+    assert len(resolved) == 1 and resolved[0] is not None
+    assert destroyed == [pytest.approx(resolved[0], abs=0.001)], (
+        f"resolution used {resolved[0]}, the destroy branch got {destroyed}"
+    )
+
+
 def test_interrupt_cleanup_holds_when_the_step_deadline_has_passed(monkeypatch, capsys) -> None:
     """With no time left in the step, the interrupt path holds before resolving or destroying."""
     from just_akash import _e2e
