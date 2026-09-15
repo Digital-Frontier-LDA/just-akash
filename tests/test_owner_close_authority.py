@@ -273,6 +273,54 @@ def test_complete_creation_population_with_second_group_cannot_authorize_singlet
     )
 
 
+def test_complete_signed_multi_group_population_can_be_bound_exactly():
+    population = (("1", GROUP), ("2", "sidecar"))
+    reader, _ = _reader(
+        current_groups=population,
+        create_groups=(GROUP, "sidecar"),
+    )
+    evidence = chain._owner_close_evidence(
+        OWNER,
+        DSEQ,
+        GROUP,
+        sources=SOURCES,
+        reader=reader,
+        now=NOW,
+        expected_population=population,
+    )
+    assert evidence is not None
+    assert evidence["groups"] == [
+        {"gseq": 1, "name": GROUP},
+        {"gseq": 2, "name": "sidecar"},
+    ]
+    assert evidence["population_count"] == 2
+
+
+def test_public_population_authority_preserves_the_exact_order(monkeypatch):
+    calls = []
+    expected = [{"gseq": 1, "name": GROUP}, {"gseq": 2, "name": "sidecar"}]
+
+    def authority(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"groups": expected}
+
+    monkeypatch.delenv("AKASH_REST_URL", raising=False)
+    monkeypatch.setattr(chain, "_owner_close_evidence", authority)
+    assert chain.owner_close_population_evidence(OWNER, DSEQ, expected) == {"groups": expected}
+    assert calls[0][0] == (OWNER, DSEQ, GROUP)
+    assert calls[0][1]["expected_population"] == (("1", GROUP), ("2", "sidecar"))
+
+    calls.clear()
+    for invalid in (
+        [],
+        [{"gseq": 2, "name": GROUP}],
+        [{"gseq": 1, "name": GROUP}, {"gseq": 3, "name": "sidecar"}],
+        [{"gseq": 1, "name": "contains spaces"}],
+    ):
+        assert chain.owner_close_population_evidence(OWNER, DSEQ, invalid) is None
+    assert calls == []
+
+
 def test_block_raw_population_truncation_effect_mutation():
     def truncate(_path, _base, _height, doc):
         if "/txs/block/" in _path:
@@ -735,3 +783,115 @@ def test_destroy_bypass_mutation_is_detected():
     mutated = source.replace(target, "closer, evidence = bypass_authority(", 1)
     with pytest.raises(AssertionError):
         _assert_destroy_authority_wiring(mutated)
+
+
+# ── the two-view floor, pinned-vs-unpinned agreement, and the pinned-LCD refusal ──────
+
+
+def test_one_pinned_view_that_abstains_leaves_a_single_view_which_is_not_authority():
+    """Two pinned views are required. Here the second source answers the tip and block reads
+    but its pinned deployment read abstains (transport), so only one view proves the
+    population. One view is not two, however complete it is."""
+
+    def second_view_unavailable(path, base, height, doc):
+        if base == SOURCES[1]["url"] and "/deployments/info" in path and height == 100:
+            raise RuntimeError("transport unavailable")
+        return doc
+
+    reader, calls = _reader(mutate=second_view_unavailable)
+    assert (
+        chain._owner_close_evidence(OWNER, DSEQ, GROUP, sources=SOURCES, reader=reader, now=NOW)
+        is None
+    )
+    pinned = [c for c in calls if "/deployments/info" in c[1] and c[2] == 100]
+    assert [c[0] for c in pinned] == [SOURCES[0]["url"], SOURCES[1]["url"]], (
+        "both sources must have been asked, so the refusal is the floor and not a skipped read"
+    )
+
+
+def test_pinned_population_that_disagrees_with_the_unpinned_one_is_not_authority():
+    """Unpinned reads agree on [runner-run-7, sidecar]; both height-pinned views and the signed
+    create say [runner-run-7, other]. Group 1 matches, so only a whole-population comparison
+    refuses. Not an honest-chain state (groups are fixed at creation): this needs the two
+    registered sources to serve inconsistent data, and it is the one fixture that reaches the
+    pinned comparison."""
+
+    expected = (("1", GROUP), ("2", "sidecar"))
+    pinned = (("1", GROUP), ("2", "other"))
+
+    def pinned_differs(path, _base, height, doc):
+        if "/deployments/info" in path and height == 100:
+            return _info(pinned)
+        return doc
+
+    reader, calls = _reader(
+        current_groups=expected, create_groups=(GROUP, "other"), mutate=pinned_differs
+    )
+    assert (
+        chain._owner_close_evidence(
+            OWNER,
+            DSEQ,
+            GROUP,
+            sources=SOURCES,
+            reader=reader,
+            now=NOW,
+            expected_population=expected,
+        )
+        is None
+    )
+    unpinned = [c for c in calls if "/deployments/info" in c[1] and c[2] is None]
+    assert len(unpinned) == 2, "the unpinned containment read must have agreed first"
+
+
+def test_a_caller_expectation_the_registry_does_not_hold_is_refused_before_any_pinned_read():
+    """The reachable mismatch: the caller expects [runner-run-7, sidecar] (from its own
+    rest_urls read), while every registered source and the signed create say
+    [runner-run-7, other]. The unpinned containment check refuses it, so no height-pinned
+    deployment read is ever made."""
+
+    expected = (("1", GROUP), ("2", "sidecar"))
+    registry = (("1", GROUP), ("2", "other"))
+    reader, calls = _reader(current_groups=registry, create_groups=(GROUP, "other"))
+    assert (
+        chain._owner_close_evidence(
+            OWNER,
+            DSEQ,
+            GROUP,
+            sources=SOURCES,
+            reader=reader,
+            now=NOW,
+            expected_population=expected,
+        )
+        is None
+    )
+    unpinned = [c for c in calls if "/deployments/info" in c[1] and c[2] is None]
+    pinned = [c for c in calls if "/deployments/info" in c[1] and c[2] is not None]
+    # The verdict alone cannot tell which check refused: with containment removed, the pinned
+    # comparison refuses this honest state too. What containment adds is refusing it first.
+    assert pinned == [], "containment must refuse before any height-pinned read"
+    assert len(unpinned) == 2, "both registered sources must have been asked"
+
+
+def test_singleton_evidence_refuses_a_pinned_lcd_without_reading(monkeypatch):
+    """The singleton path used by bound-owner client selection and destroy has the same rail."""
+
+    calls = []
+    monkeypatch.setattr(chain, "_owner_close_evidence", lambda *a, **k: calls.append(a) or {})
+    monkeypatch.setenv("AKASH_REST_URL", "https://pinned-lcd.example")
+    assert chain.owner_close_evidence(OWNER, DSEQ, GROUP) is None
+    assert calls == []
+    monkeypatch.delenv("AKASH_REST_URL")
+    assert chain.owner_close_evidence(OWNER, DSEQ, GROUP) == {}
+    assert len(calls) == 1, "control: without the pin the same call reaches the evidence path"
+
+
+def test_population_evidence_refuses_a_pinned_lcd_without_reading(monkeypatch):
+    calls = []
+    monkeypatch.setattr(chain, "_owner_close_evidence", lambda *a, **k: calls.append(a) or {})
+    monkeypatch.setenv("AKASH_REST_URL", "https://pinned-lcd.example")
+    population = [{"gseq": 1, "name": GROUP}, {"gseq": 2, "name": "sidecar"}]
+    assert chain.owner_close_population_evidence(OWNER, DSEQ, population) is None
+    assert calls == []
+    monkeypatch.delenv("AKASH_REST_URL")
+    assert chain.owner_close_population_evidence(OWNER, DSEQ, population) == {}
+    assert len(calls) == 1, "control: without the pin the same call reaches the evidence path"

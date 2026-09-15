@@ -208,16 +208,16 @@ jobs:
               echo ""
               echo "- \`execute\` input: \`${EXECUTE:-<unset>}\`"
               echo "- \`CLEANUP_AUTO_EXECUTE\`: \`${AUTO_EXECUTE:-<unset>}\`"
-              echo "- args: \`--reap-runners --reap-owned --execute\`"
+              echo "- args: \`--reap-runners --reap-owned --ownership-register <local-register> --execute\`"
             } >> "$GITHUB_STEP_SUMMARY"
-            uv run python -m just_akash.cleanup_stale --reap-runners --reap-owned --execute
+            uv run python -m just_akash.cleanup_stale --reap-runners --reap-owned --ownership-register '{"just-akash-":"Digital-Frontier-LDA/just-akash"}' --execute
           else
             {
               echo "### Stale sweep: dry run (reported only, closed nothing)"
               echo ""
               echo "- \`execute\` input: \`${EXECUTE:-<unset>}\`"
               echo "- \`CLEANUP_AUTO_EXECUTE\`: \`${AUTO_EXECUTE:-<unset>}\`"
-              echo "- args: \`--reap-runners --reap-owned\`"
+              echo "- args: \`--reap-runners --reap-owned --ownership-register <local-register>\`"
             } >> "$GITHUB_STEP_SUMMARY"
-            uv run python -m just_akash.cleanup_stale --reap-runners --reap-owned
+            uv run python -m just_akash.cleanup_stale --reap-runners --reap-owned --ownership-register '{"just-akash-":"Digital-Frontier-LDA/just-akash"}'
           fi

@@ -636,7 +636,12 @@ def python_quorums(module: ast.Module, rel: str) -> list[Hit]:
                 scope[arg.arg] = default.value
                 # A quorum parameter whose default is below two: `quorum: int = 1` lets every
                 # caller that omits it succeed on one observer, however the count is taken.
-                if arg.arg in QUORUM_KEYWORDS and default.value < 2:
+                # A bool is an int in Python, but `required: bool = False` is a flag, not a count.
+                if (
+                    arg.arg in QUORUM_KEYWORDS
+                    and not isinstance(default.value, bool)
+                    and default.value < 2
+                ):
                     hits.append(
                         Hit(
                             "R4",
@@ -1718,6 +1723,9 @@ _PY_CONTROL = {
     ),
     "R3 branch returns 2": (
         "def main():\n    if verdict == UNKNOWN:\n        return 2\n    return 0\n"
+    ),
+    "R4 a bool parameter default is a flag, not a count": (
+        "def add_option(name, required: bool = False):\n    return name\n"
     ),
     "R4 quorum parameter defaults to two": (
         "def quorum_value(readings, quorum: int = 2):\n"
