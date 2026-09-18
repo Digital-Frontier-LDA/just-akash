@@ -175,7 +175,26 @@ class AkashAPIError(RuntimeError):
 class AkashConsoleAPI:
     # Ceiling for list_deployments. See that method's docstring: the server's
     # hasMore/total cannot detect truncation, so we over-ask and warn at the ceiling.
-    LIST_LIMIT = 1000
+    #
+    # ⛔ 100 IS THE SERVER'S MAXIMUM, NOT A PREFERENCE. This was 1000 until
+    # 2026-09-18, when the Console API began rejecting it outright and naming the
+    # bound in its own response body:
+    #
+    #     GET /v1/deployments?limit=1000 -> HTTP 400
+    #     {"code":"validation_error","data":[{"code":"too_big","maximum":100,
+    #       "inclusive":true,"path":["limit"]}]}
+    #
+    # Every caller raised AkashAPIError, which took down `Cleanup stale deployments`
+    # and `Provider canary` here plus ci_cleanup_runner_deployments.py (Blazing-Back)
+    # and akash-stale-sweep.sh (blazing) — 8 consecutive CI failures across 3
+    # workflows from 2026-09-17T23:15Z. Raising this above 100 breaks all of them
+    # again; the server, not this constant, decides the ceiling.
+    #
+    # The "over-ask" design survives intact: observed holdings are 15-27
+    # deployments, so 100 still keeps ~4x headroom. What DID change is that the
+    # `len(deployments) >= LIST_LIMIT` warning below was effectively unreachable at
+    # 1000 and is reachable at 100 — it is now load-bearing, and tested as such.
+    LIST_LIMIT = 100
 
     """Client for Akash Console API (https://console-api.akash.network)"""
 
