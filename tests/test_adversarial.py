@@ -844,6 +844,14 @@ class TestListDeploymentsFailsLoud:
     # three repos. The constant is the thing under test, so it cannot also be the oracle.
     SERVER_MAX_LIMIT = 100
 
+    # The OTHER end of the range, and it is a different constraint with a different owner.
+    # SERVER_MAX_LIMIT is imposed on us from outside; this floor is our own requirement:
+    # observed holdings are 15-27 deployments, so a limit below this would make
+    # `len(deployments) >= LIST_LIMIT` fire on a normal account and TRUNCATE the list that
+    # two deleting sweepers consume. 50 is comfortably above the observed maximum and
+    # comfortably below the server cap, so it constrains without pinning.
+    MIN_USABLE_LIMIT = 50
+
     @patch.object(AkashConsoleAPI, "_request")
     def test_request_never_asks_for_more_than_the_server_accepts(self, mock_req):
         """A limit above the server's maximum is a hard 400, not a large page.
@@ -851,6 +859,13 @@ class TestListDeploymentsFailsLoud:
         The Console API rejects `?limit=1000` with
         `{"code":"too_big","maximum":100,"path":["limit"]}`. Pin the literal 100:
         deriving the expectation from LIST_LIMIT would pass for any value.
+
+        ⚠ TWO BOUNDS, NOT ONE EQUALITY. CodeRabbit proposed `asked == SERVER_MAX_LIMIT` on
+        the correct observation that `<=` alone admits a *reduced* limit. The observation is
+        right and the fix is not: equality conflates the server's constraint with ours, so
+        it would fail a CORRECT change (the server raising its cap to 500, and us following)
+        while still not explaining which bound was violated. Asserting each end separately,
+        with its own reason, catches the reduction AND survives a legitimate cap change.
         """
         mock_req.return_value = {"data": {"deployments": []}}
         AkashConsoleAPI("key").list_deployments()
@@ -867,6 +882,12 @@ class TestListDeploymentsFailsLoud:
             f"asked for limit={asked}, but the Console API rejects anything above "
             f"{self.SERVER_MAX_LIMIT} with a 400 (see #387). Raising LIST_LIMIT above "
             f"the server's cap breaks every sweeper in three repos."
+        )
+        assert asked >= self.MIN_USABLE_LIMIT, (
+            f"asked for limit={asked}, which is below the {self.MIN_USABLE_LIMIT} needed to "
+            f"list a normal account without truncating. Observed holdings are 15-27, so a "
+            f"limit this low makes the ceiling warning fire routinely and under-reports to "
+            f"ci_cleanup_runner_deployments.py and akash-stale-sweep.sh, which delete."
         )
 
     @patch.object(AkashConsoleAPI, "_request")
