@@ -1058,28 +1058,16 @@ jobs:
           # PROVIDER_CAPACITY — exactly the bucket swallow this function exists to
           # stop. A JSON parser reads whatever the producer emits, today and tomorrow.
           diag_last_code() {
-            # Read the latest akash-diag error code from /tmp/ja.log. Heredoc
-            # written so the python body stays indented inside the YAML literal
-            # block; the multi-line script is otherwise broken by the YAML
-            # scanner's column-1 key rule.
-            python3 - "$1" <<'PYEOF'
-            import json, sys
-            last = ""
-            try:
-                with open(sys.argv[1]) as f:
-                    for ln in f:
-                        try:
-                            d = json.loads(ln)
-                        except Exception:
-                            continue
-                        if d.get("type") == "akash-diag" and d.get("level") == "error":
-                            code = d.get("code") or ""
-                            if code:
-                                last = code
-            except (FileNotFoundError, IndexError):
-                pass
-            sys.stdout.write(last)
-            PYEOF
+            # Read the latest akash-diag error code from /tmp/ja.log. The helper
+            # lives in `just_akash/_diag_helper.py` rather than inline here
+            # because (a) embedding a multi-line Python script in a YAML literal
+            # block breaks the heredoc terminator's column-0 requirement under
+            # CI's bash, and (b) the helper is unit-testable directly when it
+            # is a module. Two `uv run` invocations per provision attempt —
+            # inner loop UNCLASSIFIED branch and post-loop PROVIDER_CAPACITY
+            # gate — are negligible against the workflow's own per-attempt
+            # wall-clock.
+            uv run --with . python -m just_akash._diag_helper "$1" 2>/dev/null
           }
 
           # A free-text input feeding `seq`: junk would make the wait loop a no-op and

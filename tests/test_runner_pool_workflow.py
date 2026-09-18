@@ -35,6 +35,14 @@ WF_PATH = Path(
     )
 )
 SRC = WF_PATH.read_text(encoding="utf-8")
+
+# The akash-diag helper extracted from the workflow to its own module so that
+# (a) embedding a multi-line Python script in a YAML literal block does not
+# break the heredoc terminator's column-0 requirement in CI, and (b) the
+# helper is unit-testable directly. Tests below read BOTH the workflow
+# (which calls it) AND the helper (which parses the JSON).
+DIAG_HELPER_PATH = Path(__file__).resolve().parents[1] / "just_akash" / "_diag_helper.py"
+DIAG_HELPER_SRC = DIAG_HELPER_PATH.read_text(encoding="utf-8")
 DOC = yaml.safe_load(SRC)
 CALL = (DOC.get("on") or DOC.get(True))["workflow_call"]
 INPUTS = CALL["inputs"]
@@ -416,16 +424,27 @@ def test_akash_diag_matcher_reads_structured_json_not_english_text():
     enumerate every Code enum member, and a new member would silently fall
     back to PROVIDER_CAPACITY — exactly the bucket swallow this function
     exists to stop.
+
+    The parse logic lives in `just_akash/_diag_helper.py` (extracted from
+    the workflow's YAML literal block — the heredoc terminator's column-0
+    requirement broke in CI when the script was inline). The workflow calls
+    the helper. The helper is what actually does the parsing.
     """
     code = _code(SRC)
 
-    # The helper exists and reads the JSON envelope.
+    # The workflow has the bash function that calls the helper.
     assert "diag_last_code" in code, "the akash-diag helper is missing from the workflow"
-    assert '"type"' in code and '"akash-diag"' in code, (
-        "the matcher must recognise the typed envelope, not grep English"
+    assert "just_akash._diag_helper" in code, (
+        "diag_last_code must invoke the extracted helper module — an inline "
+        "heredoc broke the column-0 terminator in CI"
     )
-    assert re.search(r"json\.loads\(", code), (
-        "the matcher must parse JSON, not text-match — that is the bug it replaces"
+
+    # The helper parses JSON, not text. Read the helper's source.
+    assert '"type"' in DIAG_HELPER_SRC and '"akash-diag"' in DIAG_HELPER_SRC, (
+        "the helper must recognise the typed envelope, not grep English"
+    )
+    assert re.search(r"json\.loads\(", DIAG_HELPER_SRC), (
+        "the helper must parse JSON, not text-match — that is the bug it replaces"
     )
 
 
@@ -460,8 +479,10 @@ def test_every_code_member_is_reachable_through_the_workflow():
     """
     code = _code(SRC)
 
-    assert '"code"' in code and "get(\"code\")" in code, (
-        "the matcher must extract the `code` field — that is the typed truth"
+    # The workflow extracts the code field via the helper and surfaces it as
+    # failure_reason in both the inner loop and the post-loop.
+    assert 'get("code")' in DIAG_HELPER_SRC or "get('code')" in DIAG_HELPER_SRC, (
+        "the helper must extract the `code` field — that is the typed truth"
     )
     assert "failure_reason=$DIAG_CODE" in code, (
         "the inner-loop matcher must surface the code as failure_reason"
@@ -489,7 +510,11 @@ def test_deploy_or_lease_family_codes_are_not_silently_bucket_swallowed():
         # still emit their specific reason. If the akash-diag matcher
         # accidentally caught one of these, it would emit `failure_reason=
         # DEPLOY_CREATE_FAILED` and the consumer would treat it as NOT_PRODUCED.
-        if code_value in {"NO_DSEQ_RETURNED", "DEPLOY_CREATE_FAILED", "DEPLOY_CREATE_ORPHAN_SUSPECTED"}:
+        if code_value in {
+            "NO_DSEQ_RETURNED",
+            "DEPLOY_CREATE_FAILED",
+            "DEPLOY_CREATE_ORPHAN_SUSPECTED",
+        }:
             assert "failure_reason=CREATE_OUTCOME_AMBIGUOUS" in code, (
                 f"{code_value} routes through CREATE_OUTCOME_AMBIGUOUS; if that "
                 f"matcher is gone the akash-diag path would surface the code "
