@@ -101,7 +101,28 @@ def _unwrap_data(response: Any) -> dict[str, Any]:
 class AkashConsoleAPI:
     # Ceiling for list_deployments. See that method's docstring: the server's
     # hasMore/total cannot detect truncation, so we over-ask and warn at the ceiling.
-    LIST_LIMIT = 1000
+    #
+    # ⛔ BACKPORT of #388 onto this pinned base. 100 IS THE SERVER'S MAXIMUM, NOT A
+    # PREFERENCE. On 2026-09-18 the Console API began rejecting anything above it and
+    # names the bound in its own response body:
+    #
+    #     GET /v1/deployments?limit=1000 -> HTTP 400
+    #     {"code":"validation_error","data":[{"code":"too_big","maximum":100,
+    #       "inclusive":true,"path":["limit"]}]}
+    #
+    # WHY THIS EXISTS AS A BACKPORT RATHER THAN A PIN BUMP. main already carries the fix
+    # (dd7097d310), but Blazing-Back's escrow reaper pins THIS sha via
+    # `just-akash-ref: adc379bc` in escrow-reaper.yml, and moving it to main is 73 commits
+    # — including +619/-30 on cleanup_stale.py, which is the reaper's own entrypoint, and
+    # +144/-3 on this file. That is a dependency upgrade, not a fix delivery, and it cannot
+    # be validated while the Akash pools are failing (Blazing-Back#2131). This branch gives
+    # the reaper the one-line fix with a one-commit delta.
+    #
+    # Deliberately NOT pagination: list_deployments' docstring rules it out because
+    # `hasMore` is verified always-false, so a page-until-short-page loop would terminate on
+    # a field that lies, in a path that DELETES INFRASTRUCTURE. Observed holdings are 15-27,
+    # so 100 keeps ~4x headroom and the ceiling warning below stays the truncation defence.
+    LIST_LIMIT = 100
 
     """Client for Akash Console API (https://console-api.akash.network)"""
 

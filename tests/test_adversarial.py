@@ -2,6 +2,7 @@
 
 import contextlib
 import json
+import re
 import sys
 from unittest.mock import MagicMock, patch
 
@@ -842,12 +843,34 @@ class TestListDeploymentsFailsLoud:
 
         VERIFIED live: `?limit=1` returns total=1, hasMore=false while 15+ exist.
         A bare request would silently take whatever page the server chose.
+
+        ⛔ THIS ASSERTION USED TO BE VACUOUS, and it is why the 400 shipped. It read
+        `f"limit={AkashConsoleAPI.LIST_LIMIT}" in path`, which derives the expectation from
+        the constant under test — so it passed for 1000, the value the Console API rejects.
+        The constant cannot also be the oracle. Pins the LITERAL server bound instead.
         """
         mock_req.return_value = {"data": {"deployments": []}}
         AkashConsoleAPI("key").list_deployments()
+
+        # NON-VACUITY: a request never made asks for nothing and satisfies any bound.
+        assert mock_req.call_count == 1, "list_deployments must issue exactly one request"
+
         path = mock_req.call_args[0][1]
-        assert f"limit={AkashConsoleAPI.LIST_LIMIT}" in path, (
-            f"list_deployments must request an explicit limit; asked for {path!r}"
+        match = re.search(r"[?&]limit=(\d+)", path)
+        assert match, f"list_deployments must request an explicit limit; asked for {path!r}"
+        asked = int(match.group(1))
+        # 100 is the server's documented maximum: it answers `{"code":"too_big","maximum":100,
+        # "path":["limit"]}` above it. Mutation: restore 1000; this must go red.
+        assert asked <= 100, (
+            f"asked for limit={asked}, but the Console API rejects anything above 100 with a "
+            f"400. Raising LIST_LIMIT above the server's cap breaks every sweeper that calls "
+            f"list_deployments."
+        )
+        # The other end: below this a normal account (observed holdings 15-27) truncates, and
+        # the sweepers that consume this DELETE. Mutation: set LIST_LIMIT=10; this must go red.
+        assert asked >= 50, (
+            f"asked for limit={asked}, below the 50 needed to list a normal account without "
+            f"truncating and under-reporting to the deleting sweepers."
         )
 
     @patch.object(AkashConsoleAPI, "_request")
