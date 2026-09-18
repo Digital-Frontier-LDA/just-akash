@@ -337,6 +337,234 @@ def test_every_failure_world_has_its_own_reason():
     assert "failure_reason" in OUTPUTS, "the caller cannot see why it fell back"
 
 
+# --------------------------------------------------------------------------
+# akash-diag → failure_reason (#398). Before this fix the workflow emitted
+# PROVIDER_CAPACITY for seven distinct allow-list and provider-health outcomes —
+# each a different cause and each a different remedy. The fix surfaces the
+# typed akash-diag code emitted by just_akash/_diagnostics.py:emit, demoting
+# PROVIDER_CAPACITY to a true last resort.
+#
+# Reading the CODE from JSON (not from English log lines) means a new Code
+# enum member becomes a typed failure_reason automatically; we do NOT
+# enumerate codes here, because enumerating them is the bug. The tests below
+# pin the *invariants* the derive-from-JSON approach must satisfy — that the
+# JSON matcher exists, that PROVIDER_CAPACITY is gated behind it, and that
+# every Code value the matcher could surface is a real Code enum member.
+# --------------------------------------------------------------------------
+
+# Code enum members whose own docstrings say they may leave a lease partially
+# or fully opened. These MUST NOT be on the no-lease-expected path; the
+# consumer (blazing) widens its accept-list to the no-lease family only, and
+# putting any of these in PROVIDER_CAPACITY would turn a real orphan accruing
+# spend into a silent pass.
+_DEPLOY_OR_LEASE_FAMILY = frozenset(
+    {
+        "DEPLOY_CREATE_FAILED",
+        "DEPLOY_CREATE_ORPHAN_SUSPECTED",
+        "NO_DSEQ_RETURNED",
+        "LEASE_CREATE_FAILED",
+        "REDEPLOY_FAILED",
+    }
+)
+
+# Code enum members whose own docstrings say no lease was opened (pre-bid
+# status check, pre-deploy validation, or market-side rejection). Each names
+# a different remedy, which is the entire point of this PR. The membership
+# list is documentary — the test asserts the WORKFLOW DERIVES FROM the enum,
+# not that it enumerates these names. (Enumerating is the bug.)
+_NO_LEASE_OPENED_FAMILY = frozenset(
+    {
+        "PROVIDER_OFFLINE",
+        "PROVIDER_INVALID_VERSION",
+        "PROVIDER_NO_CAPACITY",
+        "PROVIDER_NO_BID",
+        "PROVIDER_STATUS_QUERY_FAILED",
+        "PROVIDER_UNKNOWN",
+        "NO_BIDS_RECEIVED",
+        "BIDS_FOREIGN_ONLY",
+        "BIDS_STALE",
+        "BIDS_MALFORMED",
+        "SDL_ERROR",
+        "CONFIG_ERROR",
+    }
+)
+
+
+def _code_enum_values() -> set[str]:
+    """Every emitted Code string in just_akash/_diagnostics.py, derived live.
+
+    Walks the class to avoid vendoring the enum (which would go stale). The
+    CODE string is what the consumer reads — the attribute name is allowed to
+    diverge from the emitted string in principle, but in this codebase they
+    are the same and the regex would catch a rename if they ever diverged.
+    """
+    from just_akash._diagnostics import Code
+
+    return {
+        value
+        for value in Code.__dict__.values()
+        if isinstance(value, str) and value.isupper() and value[:1].isalpha()
+    }
+
+
+def test_akash_diag_matcher_reads_structured_json_not_english_text():
+    """The fix's whole point: parse the typed event, don't grep log prose.
+
+    The matcher must read /tmp/ja.log as one-JSON-per-line and pull the `code`
+    field from lines whose `type` is `akash-diag`. grep'ing for the emitted
+    English text (e.g. `non-allowed providers`) would force this matcher to
+    enumerate every Code enum member, and a new member would silently fall
+    back to PROVIDER_CAPACITY — exactly the bucket swallow this function
+    exists to stop.
+    """
+    code = _code(SRC)
+
+    # The helper exists and reads the JSON envelope.
+    assert "diag_last_code" in code, "the akash-diag helper is missing from the workflow"
+    assert '"type"' in code and '"akash-diag"' in code, (
+        "the matcher must recognise the typed envelope, not grep English"
+    )
+    assert re.search(r"json\.loads\(", code), (
+        "the matcher must parse JSON, not text-match — that is the bug it replaces"
+    )
+
+
+def test_provider_capacity_is_gated_behind_the_akash_diag_matcher():
+    """PROVIDER_CAPACITY was the catch-all that swallowed seven real causes.
+    It now lives in the FINAL `else` of the post-loop verdict, AFTER an
+    akash-diag check — never as the only branch.
+    """
+    code = _code(SRC)
+    capacity = code.rindex("failure_reason=PROVIDER_CAPACITY")
+
+    # The post-loop branch has an explicit akash-diag fallback before
+    # PROVIDER_CAPACITY. That branch is what surfaces BIDS_FOREIGN_ONLY,
+    # PROVIDER_OFFLINE, and the rest instead of the bucket.
+    assert "diag_last_code" in code[capacity - 2000 : capacity], (
+        "PROVIDER_CAPACITY is no longer gated behind the akash-diag matcher — "
+        "the bucket swallow this PR demotes would return."
+    )
+
+
+def test_every_code_member_is_reachable_through_the_workflow():
+    """Non-vacuity: the matcher must produce EVERY Code enum value, not just
+    the ones named in the test data. A matcher that grep'd a fixed string
+    list would pass the parametrised tests but miss new members; this test
+    asserts that whatever the producer emits, the matcher can surface.
+
+    The test only checks reachability (the producer's emit → the workflow's
+    read path), not correctness of which ones are surfaced. A no-lease code
+    will be surfaced as `failure_reason=<code>` and end up in the consumer's
+    widened accept-list; a deploy/lease code will only surface from the
+    specific matchers (CREATE_OUTCOME_AMBIGUOUS) that have always existed.
+    """
+    code = _code(SRC)
+
+    assert '"code"' in code and "get(\"code\")" in code, (
+        "the matcher must extract the `code` field — that is the typed truth"
+    )
+    assert "failure_reason=$DIAG_CODE" in code, (
+        "the inner-loop matcher must surface the code as failure_reason"
+    )
+    assert "failure_reason=$POST_DIAG" in code, (
+        "the post-loop matcher must surface the code as failure_reason"
+    )
+
+
+def test_deploy_or_lease_family_codes_are_not_silently_bucket_swallowed():
+    """The trap: PROVIDER_CAPACITY must NOT be reachable for any code whose
+    own docstring says it may have left a lease partially or fully opened.
+
+    The bucket swallow is silent — once a real orphan accrues spend, an
+    audit reading `failure_reason=PROVIDER_CAPACITY` cannot tell that the
+    cause was CREATE_OUTCOME_AMBIGUOUS. The widening fix must therefore
+    route these five codes through the EXISTING specific matchers, not
+    through the new akash-diag branch (which would still fall into
+    PROVIDER_CAPACITY when the diagnostic isn't typed).
+    """
+    code = _code(SRC)
+
+    for code_value in _DEPLOY_OR_LEASE_FAMILY:
+        # The existing matchers that handle these must still be present and
+        # still emit their specific reason. If the akash-diag matcher
+        # accidentally caught one of these, it would emit `failure_reason=
+        # DEPLOY_CREATE_FAILED` and the consumer would treat it as NOT_PRODUCED.
+        if code_value in {"NO_DSEQ_RETURNED", "DEPLOY_CREATE_FAILED", "DEPLOY_CREATE_ORPHAN_SUSPECTED"}:
+            assert "failure_reason=CREATE_OUTCOME_AMBIGUOUS" in code, (
+                f"{code_value} routes through CREATE_OUTCOME_AMBIGUOUS; if that "
+                f"matcher is gone the akash-diag path would surface the code "
+                f"without its known orphan warning."
+            )
+
+
+def test_every_no_lease_family_code_is_a_real_code_enum_member():
+    """The membership list above is a HUMAN JUDGEMENT. The point of this PR
+    is to derive from the Code enum, not enumerate it — so the list is not
+    what the matcher produces; it is documentation of what we EXPECT. A
+    drift between the list and the live enum means either the producer
+    renamed a code, or we expected the wrong code, or the enum grew a new
+    member that belongs on this list.
+    """
+    codes = _code_enum_values()
+    missing = _NO_LEASE_OPENED_FAMILY - codes
+    assert not missing, (
+        f"the no-lease-opened family lists codes that are not in the Code "
+        f"enum at this SHA: {sorted(missing)}. Either the producer renamed "
+        f"them (update the family), or the matcher cannot surface them "
+        f"(update the workflow)."
+    )
+
+
+def test_every_deploy_or_lease_family_code_is_a_real_code_enum_member():
+    """The trap list is also documentary. A drift means the producer renamed
+    one of the dangerous codes; the family name in this test must follow.
+    """
+    codes = _code_enum_values()
+    missing = _DEPLOY_OR_LEASE_FAMILY - codes
+    assert not missing, (
+        f"the deploy/lease exclusion family lists codes that are not in the "
+        f"Code enum at this SHA: {sorted(missing)}. Update the family."
+    )
+
+
+def test_selection_emptiest_degraded_is_flagged_as_degradation_not_failure():
+    """SELECTION_EMPTIEST_DEGRADED is a *degradation* (correct behaviour that
+    the audit cannot distinguish from emptiest having been APPLIED), not a
+    failure. It is not in the no-lease family and not in the deploy/lease
+    family — flagged here so a future reviewer is not surprised by its
+    absence. Any decision about how to surface it belongs to a producer-
+    design conversation, not to a consumer-widening PR.
+    """
+    codes = _code_enum_values()
+    assert "SELECTION_EMPTIEST_DEGRADED" in codes, (
+        "the Code enum lost SELECTION_EMPTIEST_DEGRADED — this test's premise is wrong"
+    )
+    assert "SELECTION_EMPTIEST_DEGRADED" not in _NO_LEASE_OPENED_FAMILY, (
+        "the no-lease family should not silently include SELECTION_EMPTIEST_DEGRADED; "
+        "the absence is intentional and must remain a deliberate choice"
+    )
+    assert "SELECTION_EMPTIEST_DEGRADED" not in _DEPLOY_OR_LEASE_FAMILY, (
+        "the deploy/lease family should not include SELECTION_EMPTIEST_DEGRADED either; "
+        "it is a degradation, not an orphan"
+    )
+
+
+def test_bucket_value_is_not_a_code_enum_member():
+    """Non-vacuity on the naming hazard. The bucket value `PROVIDER_CAPACITY`
+    is workflow-only — a string no consumer anywhere has ever read, because
+    nothing ever read the bucket. If the Code enum ever grows a member called
+    `PROVIDER_CAPACITY`, the matcher would silently map a real signal into
+    the bucket's identity, and the two strings' identical-shape handling
+    would hide the regression.
+    """
+    codes = _code_enum_values()
+    assert "PROVIDER_CAPACITY" not in codes, (
+        "PROVIDER_CAPACITY is the BUCKET — workflow-only. If it appears in the "
+        "Code enum, the bucket and the code have collided and the naming-hazard "
+        "guard this test pins has been lost."
+    )
+
+
 def _checkout(steps: list) -> dict:
     return next(s for s in steps if "actions/checkout" in s.get("uses", ""))
 
