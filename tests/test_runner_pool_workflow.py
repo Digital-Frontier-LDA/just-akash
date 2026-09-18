@@ -739,7 +739,11 @@ with open(sys.argv[1]) as f:
             event = json.loads(line)
         except ValueError:
             continue
-        if isinstance(event, dict) and event.get('type') == 'akash-diag' and event.get('level') == 'error':
+        if (
+            isinstance(event, dict)
+            and event.get('type') == 'akash-diag'
+            and event.get('level') == 'error'
+        ):
             code = event.get('code')
             if isinstance(code, str) and code:
                 last = code
