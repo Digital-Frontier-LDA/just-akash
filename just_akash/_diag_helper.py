@@ -47,7 +47,37 @@ def read_last_error_code(log_path: str | Path) -> str:
                     and event.get("type") == "akash-diag"
                     and event.get("level") == "error"
                 ):
-                    code = event.get("code") or ""
+                    code = event.get("code")
+                    if code is None:
+                        # Missing `code` key — skip silently (existing
+                        # contract; pinned by
+                        # test_ignores_events_without_code_field).
+                        continue
+                    # Tightened from `or ""` because the prior form accepted
+                    # ANY truthy value — including integers, dicts, lists —
+                    # silently coercing them through `if code:` and writing
+                    # them to `last`. The signature is `-> str`, the consumer
+                    # (`failure_reason=<code>`) types it as str, and the
+                    # YAML emission path would emit `failure_reason=42` for
+                    # an integer code without raising. Raise on non-string
+                    # so the contract violation is loud.
+                    #
+                    # ⛔ COMPOUNDS WITH #389's LAST_KNOWN_DIAG FIX (Change 1).
+                    # A raise here makes `uv run` (the helper's caller in
+                    # runner-pool.yml) exit non-zero, which the workflow's
+                    # diag_last_code wrapper treats as fail-open: DIAG_CODE=""
+                    # for that attempt. Without Change 1's preservation,
+                    # the prior good value would be lost; with Change 1,
+                    # LAST_KNOWN_DIAG carries the cause forward. The two
+                    # fixes are paired — drop either one and a non-string
+                    # code wipes the diagnostic.
+                    if not isinstance(code, str):
+                        raise TypeError(
+                            f"akash-diag code must be str; got "
+                            f"{type(code).__name__}={code!r}. This is a "
+                            f"contract violation by the producer — flagging "
+                            f"loudly rather than silently coercing."
+                        )
                     if code:
                         last = code
     except (FileNotFoundError, IndexError, OSError):

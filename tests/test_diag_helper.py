@@ -158,6 +158,39 @@ def test_ignores_events_without_code_field(tmp_path):
     assert read_last_error_code(path) == "BIDS_STALE"
 
 
+@pytest.mark.parametrize(
+    "code,type_name",
+    [
+        (42, "int"),
+        (3.14, "float"),
+        (True, "bool"),
+        (["PROVIDER_NO_BID"], "list"),
+        ({"k": "v"}, "dict"),
+    ],
+)
+def test_raises_type_error_on_non_string_code_field(tmp_path, code, type_name):
+    """Non-string `code` is a contract violation — type as `-> str`, emit as
+    `failure_reason=<code>`. Silent coercion would emit `failure_reason=42`
+    for an integer code with no error, masking a producer contract bug.
+
+    Compounds with Change 1's LAST_KNOWN_DIAG fix: the raise makes `uv run`
+    exit non-zero, the workflow's diag_last_code is fail-open, DIAG_CODE=""
+    for that attempt, and the prior good value (LAST_KNOWN_DIAG) is what
+    surfaces the cause. Drop Change 1 and the same raise would wipe the
+    diagnostic — drop Change 2 and the same raise would never fire.
+
+    Mutant: drop the `raise TypeError` → the helper returns the non-string
+    (int, list, dict) or skips it silently depending on shape, and this
+    test goes red.
+    """
+    path = _write_log(
+        tmp_path,
+        [{"type": "akash-diag", "level": "error", "code": code}],
+    )
+    with pytest.raises(TypeError, match=f"akash-diag code must be str; got {type_name}"):
+        read_last_error_code(path)
+
+
 def test_handles_unreadable_file_gracefully(tmp_path):
     """A file that exists but cannot be read (permissions, broken handle)
     must not raise — it must return empty so the post-loop falls through to
