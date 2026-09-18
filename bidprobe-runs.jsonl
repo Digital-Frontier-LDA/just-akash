@@ -276,3 +276,4 @@
 {"run_id":"35314277986","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-09-18T06:18:03Z","attempt":"1","accrued_at":"2026-09-18T06:54:37Z","published":true}
 {"run_id":"35328238215","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-09-18T09:11:35Z","attempt":"1","accrued_at":"2026-09-18T09:48:26Z","published":true}
 {"run_id":"35343678744","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-09-18T12:15:14Z","attempt":"1","accrued_at":"2026-09-18T12:33:55Z","published":true}
+{"run_id":"35360747569","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-09-18T15:10:12Z","attempt":"1","accrued_at":"2026-09-18T15:17:01Z","published":true}
