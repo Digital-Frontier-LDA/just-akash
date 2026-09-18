@@ -448,6 +448,72 @@ def test_akash_diag_matcher_reads_structured_json_not_english_text():
     )
 
 
+def test_every_diag_last_code_call_passes_an_argument():
+    """Every call site of `diag_last_code()` MUST pass /tmp/ja.log explicitly.
+
+    The function body references `$1` and the `run:` block runs under
+    `set -uo pipefail` (line 995). An unbound `$1` aborts bash before
+    `failure_reason=` is written — strictly worse than the bucket this PR
+    demotes, because a bucket at least emits a value.
+
+    A hidden default inside the function (`${1:-/tmp/ja.log}`) would let a
+    caller read the wrong file without noticing; explicit-argument at every
+    call site is the safer shape. CodeRabbit caught this on the original
+    PR and we are pinning it.
+
+    The test walks every `$(diag_last_code ...)` and `diag_last_code ...` site
+    in the rendered workflow and asserts each carries a positional argument.
+    """
+    code = _code(SRC)
+
+    # The function definition itself (so we do not match the body of it).
+    fn_match = re.search(
+        r"diag_last_code\(\)\s*\{[^}]*\}",
+        code,
+        re.DOTALL,
+    )
+    assert fn_match is not None, "diag_last_code function is missing from the workflow"
+
+    # Strip the function definition; every remaining `diag_last_code` mention
+    # in the rendered shell is a call site.
+    call_sites = re.sub(
+        r"diag_last_code\(\)\s*\{[^}]*\}",
+        "",
+        code,
+        flags=re.DOTALL,
+    )
+    # A comment that names the function (e.g. "via diag_last_code above")
+    # is not a call site. Match the invocation form only: bare word followed
+    # by whitespace and a non-newline argument (or a $(...) wrapping it).
+    bare_calls = re.findall(r"(?<![\$\w])diag_last_code(?!\s*\()", call_sites)
+
+    failures = []
+    for site in bare_calls:
+        # Look at the line the bare mention sits on.
+        line_no = call_sites[: call_sites.index(site)].count("\n") + 1
+        line = call_sites.splitlines()[line_no - 1]
+        # A call must carry at least one whitespace-separated token after
+        # the function name. Comments are stripped by `_code`, so any token
+        # after the function name in a rendered call site IS an argument.
+        after = line.split("diag_last_code", 1)[1].strip()
+        # Inside a $( ... ) wrapping the call: count tokens between the call
+        # and the closing `)`. Strip a trailing `)` if the line ends with one.
+        after = after.rstrip().rstrip(")").strip()
+        if not after:
+            failures.append(
+                f"line {line_no}: 'diag_last_code' called with no argument "
+                f"under set -uo pipefail — bash aborts before failure_reason= "
+                f"is written. Pass /tmp/ja.log explicitly."
+            )
+
+    assert not failures, (
+        "every diag_last_code call site must pass /tmp/ja.log explicitly; "
+        "with set -uo pipefail an unbound $1 aborts bash before any "
+        "failure_reason is emitted — strictly worse than the bucket this "
+        "PR demotes.\n\n" + "\n".join(failures)
+    )
+
+
 def test_provider_capacity_is_gated_behind_the_akash_diag_matcher():
     """PROVIDER_CAPACITY was the catch-all that swallowed seven real causes.
     It now lives in the FINAL `else` of the post-loop verdict, AFTER an

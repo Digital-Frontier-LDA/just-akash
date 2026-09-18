@@ -1067,6 +1067,16 @@ jobs:
             # inner loop UNCLASSIFIED branch and post-loop PROVIDER_CAPACITY
             # gate — are negligible against the workflow's own per-attempt
             # wall-clock.
+            #
+            # ⛔ CALLERS MUST PASS /tmp/ja.log EXPLICITLY. With `set -uo pipefail`
+            # in effect for this `run:` block (line 995), expanding an unbound
+            # `$1` is an unbound-variable error and bash aborts before writing
+            # `failure_reason=` — which is WORSE than the bucket we are demoting,
+            # because a bucket at least emits a value. A hidden default inside
+            # this function (`${1:-/tmp/ja.log}`) would let callers read the
+            # wrong file without noticing; explicit-argument at every call
+            # site is the safer shape. Pinned by
+            # test_every_diag_last_code_call_passes_an_argument.
             uv run --with . python -m just_akash._diag_helper "$1" 2>/dev/null
           }
 
@@ -1322,7 +1332,7 @@ jobs:
               # Each such reason names a different remedy — folding them into
               # PROVIDER_CAPACITY (the bucket that swallowed them) reported a market
               # outage that may never have happened.
-              DIAG_CODE=$(diag_last_code)
+              DIAG_CODE=$(diag_last_code /tmp/ja.log)
               if [ -n "$DIAG_CODE" ]; then
                 [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
                 echo "failure_reason=$DIAG_CODE" >> "$GITHUB_OUTPUT"
@@ -1751,7 +1761,7 @@ jobs:
             # PROVIDER_CAPACITY. The two read identically to a skim; the underscore
             # is the distinction. The downstream consumer (blazing) widens its
             # accept-list to match.
-            POST_DIAG=$(diag_last_code)
+            POST_DIAG=$(diag_last_code /tmp/ja.log)
             if [ -n "$POST_DIAG" ]; then
               echo "failure_reason=$POST_DIAG" >> "$GITHUB_OUTPUT"
               echo "::error title=just-akash code: $POST_DIAG::no lease across ${MAX_ATTEMPTS} attempts, but deploy.py emitted this typed diagnostic — see /tmp/ja.log for the full event. Each Code names a different remedy, which is why they are not collapsed into PROVIDER_CAPACITY."
