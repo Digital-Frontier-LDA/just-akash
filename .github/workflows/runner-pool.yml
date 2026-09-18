@@ -1834,8 +1834,8 @@ jobs:
             # the value the case below actually matches AND the value we
             # write to failure_reason. Without this binding the case branch
             # would match on the substituted value but print `$POST_DIAG`
-            # (still empty), giving `failure_reason=` and an empty error
-            # title — silently dropping the cause.
+            # (still empty), giving an empty failure_reason field and an empty
+            # error title — silently dropping the cause.
             EFFECTIVE_DIAG="${POST_DIAG:-$LAST_KNOWN_DIAG}"
             #
             # The cross-repo constraint is checked at PR-open time: every
