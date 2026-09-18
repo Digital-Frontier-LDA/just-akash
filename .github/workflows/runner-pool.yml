@@ -1117,6 +1117,16 @@ jobs:
           EXCLUDED=$(printf '%s' "${STANDING_EXCLUDED_CSV:-}" | tr ',' ' ')
           SAW_BID=0
           SAW_SEQ_CONTENTION=0
+          # ⛔ PRESERVE THE CAUSE ACROSS ATTEMPTS (#389 follow-up). A successful
+          # diag_last_code read that returned a non-empty code is the ONLY
+          # source of ground truth for which Code the producer actually emitted.
+          # If we wait until post-loop, the next iteration's `rm -f /tmp/ja.log`
+          # (line 1193) has already wiped the log and the cause is gone. Capture
+          # it here on every successful non-empty read. Empty results from a
+          # FAILED `uv run` MUST NOT overwrite the prior good value — that is
+          # the entire invariant. Pinned by
+          # test_diagnostic_preserved_when_a_subsequent_attempt_wipes_the_log.
+          LAST_KNOWN_DIAG=""
 
           for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
             echo "::group::provision attempt $attempt/$MAX_ATTEMPTS"
@@ -1357,6 +1367,16 @@ jobs:
               # string from a corrupted log or a future producer must NOT escape into
               # the declared `failure_reason` output set. Unknown values fall through
               # to the unclassified branch (continue) — they cannot become failure_reason.
+              #
+              # ⛔ PRESERVE THE CAUSE BEFORE THE NEXT ATTEMPT WIPES IT (#389 follow-up).
+              # Empty DIAG_CODE here means EITHER "log was empty" OR "diag_last_code
+              # failed". We do not distinguish — both fall through to unclassified,
+              # both leave LAST_KNOWN_DIAG unchanged. A non-empty DIAG_CODE updates
+              # LAST_KNOWN_DIAG; the post-loop verdict prefers POST_DIAG and falls
+              # back to LAST_KNOWN_DIAG before reaching PROVIDER_CAPACITY.
+              if [ -n "$DIAG_CODE" ]; then
+                LAST_KNOWN_DIAG=$DIAG_CODE
+              fi
               case "$DIAG_CODE" in
                 WALLET_INSUFFICIENT_CREDIT|WALLET_LOW_CREDIT|WALLET_CREDIT_QUERY_FAILED|PROVIDER_OFFLINE|PROVIDER_INVALID_VERSION|PROVIDER_NO_CAPACITY|PROVIDER_NO_BID|PROVIDER_STATUS_QUERY_FAILED|PROVIDER_UNKNOWN|NO_BIDS_RECEIVED|BIDS_FOREIGN_ONLY|BIDS_STALE|BIDS_MALFORMED|SELECTION_EMPTIEST_DEGRADED|DEPLOY_CREATE_FAILED|DEPLOY_CREATE_ORPHAN_SUSPECTED|NO_DSEQ_RETURNED|LEASE_CREATE_FAILED|REDEPLOY_FAILED|SDL_ERROR|CONFIG_ERROR|LEASE_DOWN|EXEC_EXIT_CODE_UNKNOWN)
                   [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
@@ -1803,6 +1823,21 @@ jobs:
             # in the declared output set. Pinned by
             # test_post_diag_is_bounded_by_the_code_enum_with_a_declared_fallback.
             #
+            # ⛔ THREE-TIER VERDICT (#389 follow-up). Prefer POST_DIAG (this
+            # attempt's diagnostic); fall back to LAST_KNOWN_DIAG (preserved
+            # from any prior successful read this run); fall back to
+            # PROVIDER_CAPACITY. The bucket is LAST, not FIRST — accepting
+            # the catch-all would auto-accept every failure and defeat the
+            # typed-diagnostic effort.
+            #
+            # EFFECTIVE_DIAG is the union of POST_DIAG and LAST_KNOWN_DIAG —
+            # the value the case below actually matches AND the value we
+            # write to failure_reason. Without this binding the case branch
+            # would match on the substituted value but print `$POST_DIAG`
+            # (still empty), giving `failure_reason=` and an empty error
+            # title — silently dropping the cause.
+            EFFECTIVE_DIAG="${POST_DIAG:-$LAST_KNOWN_DIAG}"
+            #
             # The cross-repo constraint is checked at PR-open time: every
             # Code member listed below must also be present in blazing's
             # ACCEPTED_ZERO_FAILURE_REASONS (or its named-exclusion list)
@@ -1811,10 +1846,10 @@ jobs:
             # members are documented in PR B-prime; widening the enum
             # without the matching blazing accept-list is the locked-out
             # shape.
-            case "$POST_DIAG" in
+            case "$EFFECTIVE_DIAG" in
               WALLET_INSUFFICIENT_CREDIT|WALLET_LOW_CREDIT|WALLET_CREDIT_QUERY_FAILED|PROVIDER_OFFLINE|PROVIDER_INVALID_VERSION|PROVIDER_NO_CAPACITY|PROVIDER_NO_BID|PROVIDER_STATUS_QUERY_FAILED|PROVIDER_UNKNOWN|NO_BIDS_RECEIVED|BIDS_FOREIGN_ONLY|BIDS_STALE|BIDS_MALFORMED|SELECTION_EMPTIEST_DEGRADED|DEPLOY_CREATE_FAILED|DEPLOY_CREATE_ORPHAN_SUSPECTED|NO_DSEQ_RETURNED|LEASE_CREATE_FAILED|REDEPLOY_FAILED|SDL_ERROR|CONFIG_ERROR|LEASE_DOWN|EXEC_EXIT_CODE_UNKNOWN)
-                echo "failure_reason=$POST_DIAG" >> "$GITHUB_OUTPUT"
-                echo "::error title=just-akash code: $POST_DIAG::no lease across ${MAX_ATTEMPTS} attempts, but deploy.py emitted this typed diagnostic — see /tmp/ja.log for the full event. Each Code names a different remedy, which is why they are not collapsed into PROVIDER_CAPACITY."
+                echo "failure_reason=$EFFECTIVE_DIAG" >> "$GITHUB_OUTPUT"
+                echo "::error title=just-akash code: $EFFECTIVE_DIAG::no lease across ${MAX_ATTEMPTS} attempts, but deploy.py emitted this typed diagnostic — see /tmp/ja.log for the full event. Each Code names a different remedy, which is why they are not collapsed into PROVIDER_CAPACITY."
                 ;;
               *)
                 echo "failure_reason=PROVIDER_CAPACITY" >> "$GITHUB_OUTPUT"

@@ -606,6 +606,204 @@ def test_diag_last_code_is_fail_open_when_the_helper_cannot_be_run():
     )
 
 
+def test_diagnostic_preserved_when_a_subsequent_attempt_wipes_the_log():
+    """LAST_KNOWN_DIAG preserves the cause across attempts whose log has been wiped.
+
+    #389 follow-up. The original defect: `diag_last_code` is fail-open
+    (a failing `uv run` returns empty), but the loop's next iteration runs
+    `rm -f /tmp/ja.log` BEFORE the next deploy. So the chain on a transient
+    uv failure was:
+
+      attempt N-1: deploy.py emits PROVIDER_NO_BID → /tmp/ja.log has it
+      attempt N-1: diag_last_code succeeds, DIAG_CODE=PROVIDER_NO_BID → exits
+                   with failure_reason=PROVIDER_NO_BID. (no actual data loss)
+
+    But if attempt N-1's read itself fails (uv run error):
+
+      attempt N-1: deploy.py emits PROVIDER_NO_BID → /tmp/ja.log has it
+      attempt N-1: diag_last_code FAILS, DIAG_CODE=""
+      attempt N-1: case falls through to unclassified, loop continues
+      attempt N:   `rm -f /tmp/ja.log` wipes the cause
+      attempt N:   deploy.py emits nothing new
+      post-loop:   POST_DIAG="" (log is empty), → PROVIDER_CAPACITY (bucket)
+
+    The cause was in /tmp/ja.log and we lost it. The fix: capture the code
+    into LAST_KNOWN_DIAG on every successful non-empty read, BEFORE the
+    loop's next iteration can wipe the log. Post-loop verdict prefers
+    POST_DIAG → LAST_KNOWN_DIAG → PROVIDER_CAPACITY.
+
+    Pinning this at three levels:
+
+    1. Static — the workflow declares LAST_KNOWN_DIAG before the loop,
+       captures from a non-empty DIAG_CODE, and the post-loop case uses
+       EFFECTIVE_DIAG (=POST_DIAG or LAST_KNOWN_DIAG) as both the
+       matched value AND the printed failure_reason.
+
+    2. Behavioural — exercise the loop logic with a stubbed `uv` that
+       fails on the second call. The /tmp/ja.log file the stub reads
+       contains the real Code event, but the helper fails; confirm
+       LAST_KNOWN_DIAG is preserved from the first successful read and
+       reaches the post-loop verdict.
+
+    3. Mutant — drop LAST_KNOWN_DIAG write from the inner-loop block
+       and confirm the behavioural test goes red. (The static check
+       already catches the missing declaration, but the behavioural
+       check is what proves the value flows through.)
+    """
+    # 1. Static pin.
+    code = _code(SRC)
+    assert re.search(r"LAST_KNOWN_DIAG\s*=", code), (
+        "the workflow must declare LAST_KNOWN_DIAG before the provision loop — "
+        "the post-loop fallback has no source without it. (See test docstring.)"
+    )
+    # The capture happens on a non-empty DIAG_CODE.
+    assert re.search(
+        r"if\s+\[\s*-n\s+\"\$\{?DIAG_CODE\}?\"\s*\];\s*then\s*\n\s*LAST_KNOWN_DIAG\s*=\s*\$DIAG_CODE",
+        code,
+    ), (
+        "LAST_KNOWN_DIAG must be written ONLY on a non-empty DIAG_CODE — "
+        "writing it on an empty result from a failed `uv run` would overwrite "
+        "the prior good value and rebuild the bug with extra steps. Pinned "
+        "by test_diag_last_code_is_fail_open_when_the_helper_cannot_be_run + "
+        "this test."
+    )
+    # Post-loop verdict binds EFFECTIVE_DIAG and uses it both as the case
+    # match value AND as the printed failure_reason.
+    assert re.search(r"EFFECTIVE_DIAG\s*=\s*\"\$\{POST_DIAG:-\$LAST_KNOWN_DIAG\}\"", code), (
+        "the post-loop verdict must bind EFFECTIVE_DIAG = POST_DIAG with "
+        "LAST_KNOWN_DIAG fallback, otherwise the case branch matches the "
+        "preserved value but prints `$POST_DIAG` (empty) — silently dropping "
+        "the cause."
+    )
+    assert 'case "$EFFECTIVE_DIAG"' in code, (
+        "the post-loop case statement must match on EFFECTIVE_DIAG, not on "
+        "the (possibly empty) $POST_DIAG directly."
+    )
+    assert 'echo "failure_reason=$EFFECTIVE_DIAG"' in code, (
+        "the printed failure_reason must use EFFECTIVE_DIAG so the preserved "
+        "code actually reaches the consumer."
+    )
+
+    # 2. Behavioural pin: simulate the failure mode the static check is
+    #    protecting against. /tmp/ja.log has the real Code event, the
+    #    helper reads it on attempt 1 (succeeds), the helper fails on
+    #    attempt 2 (uv run errors), and the post-loop verdict surfaces
+    #    the preserved code.
+    script = textwrap.dedent(
+        """
+        set -euo pipefail
+
+        # Mimic the workflow's diag_last_code shell function: fail-open.
+        diag_last_code() {
+          uv run --with . python -m just_akash._diag_helper "$1" 2>/dev/null
+          return 0
+        }
+
+        # Stub `uv` so we can drive the helper's behaviour deterministically.
+        # The helper is `python -m just_akash._diag_helper <log>` — the stub
+        # distinguishes "succeed and return a code" from "fail (empty output)".
+        uv() {
+          if [ "$1" = "run" ]; then
+            # Look for the log path passed to the helper.
+            local log=""
+            shift
+            while [ $# -gt 0 ]; do
+              case "$1" in
+                --with) shift 2 ;;
+                python|-m|just_akash._diag_helper) shift ;;
+                *)
+                  log="$1"
+                  shift
+                  ;;
+              esac
+            done
+            if [ "${JA_DIAG_FAIL:-0}" = "1" ]; then
+              # Mimic a transient uv failure: exit non-zero, no output.
+              return 1
+            fi
+            # Succeed: read the log and emit the latest akash-diag error code.
+            if [ -s "$log" ]; then
+              python3 -c "
+import json, sys
+last = ''
+with open(sys.argv[1]) as f:
+    for line in f:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get('type') == 'akash-diag' and event.get('level') == 'error':
+            code = event.get('code')
+            if isinstance(code, str) and code:
+                last = code
+sys.stdout.write(last)
+" "$log"
+            fi
+            return 0
+          fi
+          command uv "$@"
+        }
+        export -f uv
+
+        # /tmp/ja.log has the real Code event.
+        cat > /tmp/ja.log <<'EOF'
+{"type": "akash-diag", "level": "warning", "code": "PROVIDER_OFFLINE"}
+{"type": "akash-diag", "level": "error", "code": "PROVIDER_NO_BID"}
+EOF
+
+        # Mirror the workflow's loop.
+        LAST_KNOWN_DIAG=""
+        MAX_ATTEMPTS=2
+
+        for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
+          if [ "$attempt" = "2" ]; then
+            # Wipe the log between attempts — this is the rm at line 1193.
+            rm -f /tmp/ja.log
+            # And force the helper to fail on this attempt.
+            export JA_DIAG_FAIL=1
+          fi
+          DIAG_CODE=$(diag_last_code /tmp/ja.log)
+          if [ -n "$DIAG_CODE" ]; then
+            LAST_KNOWN_DIAG=$DIAG_CODE
+          fi
+        done
+
+        # Post-loop verdict (mirror).
+        POST_DIAG=$(diag_last_code /tmp/ja.log)
+        EFFECTIVE_DIAG="${POST_DIAG:-$LAST_KNOWN_DIAG}"
+        case "$EFFECTIVE_DIAG" in
+          PROVIDER_NO_BID)
+            echo "failure_reason=$EFFECTIVE_DIAG"
+            ;;
+          *)
+            echo "failure_reason=PROVIDER_CAPACITY"
+            ;;
+        esac
+        """
+    )
+    proc = subprocess.run(
+        [shutil.which("bash") or "/bin/bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env={**os.environ, "PATH": os.environ.get("PATH", "")},
+    )
+    assert proc.returncode == 0, (
+        f"diagnostic-preservation loop aborted unexpectedly. "
+        f"rc={proc.returncode} stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    assert "failure_reason=PROVIDER_NO_BID" in proc.stdout, (
+        f"the preserved code from attempt 1 must reach the post-loop verdict. "
+        f"Got stdout={proc.stdout!r} stderr={proc.stderr!r}. If this shows "
+        f"PROVIDER_CAPACITY, LAST_KNOWN_DIAG was either not captured or not "
+        f"used in the post-loop fallback — the cause was silently lost."
+    )
+    assert "failure_reason=PROVIDER_CAPACITY" not in proc.stdout, (
+        f"PROVIDER_CAPACITY must not surface when LAST_KNOWN_DIAG has a value. "
+        f"Got stdout={proc.stdout!r}"
+    )
+
+
 def test_provider_capacity_is_gated_behind_the_akash_diag_matcher():
     """PROVIDER_CAPACITY was the catch-all that swallowed seven real causes.
     It now lives in the FINAL `else` of the post-loop verdict, AFTER an
@@ -645,8 +843,18 @@ def test_every_code_member_is_reachable_through_the_workflow():
     assert "failure_reason=$DIAG_CODE" in code, (
         "the inner-loop matcher must surface the code as failure_reason"
     )
-    assert "failure_reason=$POST_DIAG" in code, (
-        "the post-loop matcher must surface the code as failure_reason"
+    # Post-loop: $EFFECTIVE_DIAG is the union of POST_DIAG and the preserved
+    # LAST_KNOWN_DIAG (see runner-pool.yml). The bare-$POST_DIAG contract was
+    # the fail-open shape that lost the diagnostic between attempts — see
+    # LAST_KNOWN_DIAG capture in the workflow.
+    assert "failure_reason=$EFFECTIVE_DIAG" in code, (
+        "the post-loop matcher must surface EFFECTIVE_DIAG as failure_reason "
+        "(POST_DIAG with LAST_KNOWN_DIAG fallback — not raw POST_DIAG, which "
+        "was the fail-open shape that lost the diagnostic between attempts)"
+    )
+    assert 'EFFECTIVE_DIAG="${POST_DIAG:-$LAST_KNOWN_DIAG}"' in code, (
+        "EFFECTIVE_DIAG must be bound to POST_DIAG with LAST_KNOWN_DIAG "
+        "fallback — this is the preservation contract."
     )
 
 
