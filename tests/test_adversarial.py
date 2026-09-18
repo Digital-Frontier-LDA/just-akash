@@ -2,12 +2,14 @@
 
 import contextlib
 import json
+import re
 import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from just_akash.api import (
+    AkashAPIError,
     AkashConsoleAPI,
     _extract_bid_price,
     _extract_dseq,
@@ -836,23 +838,44 @@ class TestListDeploymentsFailsLoud:
         mock_req.return_value = {"data": {"deployments": []}}
         assert AkashConsoleAPI("key").list_deployments() == []
 
-    @patch.object(AkashConsoleAPI, "_request")
-    def test_request_asks_for_an_explicit_limit(self, mock_req):
-        """The server's hasMore/total cannot detect truncation, so we must over-ask.
+    # The server caps `limit` at 100 (#387). These tests pin the LITERAL bound, not
+    # `LIST_LIMIT` read back — an assertion of the form `f"limit={LIST_LIMIT}" in path`
+    # is vacuous: it passes for 1000, which is the value that 400'd every sweeper in
+    # three repos. The constant is the thing under test, so it cannot also be the oracle.
+    SERVER_MAX_LIMIT = 100
 
-        VERIFIED live: `?limit=1` returns total=1, hasMore=false while 15+ exist.
-        A bare request would silently take whatever page the server chose.
+    @patch.object(AkashConsoleAPI, "_request")
+    def test_request_never_asks_for_more_than_the_server_accepts(self, mock_req):
+        """A limit above the server's maximum is a hard 400, not a large page.
+
+        The Console API rejects `?limit=1000` with
+        `{"code":"too_big","maximum":100,"path":["limit"]}`. Pin the literal 100:
+        deriving the expectation from LIST_LIMIT would pass for any value.
         """
         mock_req.return_value = {"data": {"deployments": []}}
         AkashConsoleAPI("key").list_deployments()
+
+        # NON-VACUITY: a request that was never made asks for nothing, and would
+        # satisfy every bound below trivially.
+        assert mock_req.call_count == 1, "list_deployments must issue exactly one request"
+
         path = mock_req.call_args[0][1]
-        assert f"limit={AkashConsoleAPI.LIST_LIMIT}" in path, (
-            f"list_deployments must request an explicit limit; asked for {path!r}"
+        match = re.search(r"[?&]limit=(\d+)", path)
+        assert match, f"list_deployments must request an explicit limit; asked for {path!r}"
+        asked = int(match.group(1))
+        assert asked <= self.SERVER_MAX_LIMIT, (
+            f"asked for limit={asked}, but the Console API rejects anything above "
+            f"{self.SERVER_MAX_LIMIT} with a 400 (see #387). Raising LIST_LIMIT above "
+            f"the server's cap breaks every sweeper in three repos."
         )
 
     @patch.object(AkashConsoleAPI, "_request")
     def test_hitting_the_ceiling_warns(self, mock_req, capsys):
-        """At the ceiling, truncated and complete are indistinguishable — say so."""
+        """At the ceiling, truncated and complete are indistinguishable — say so.
+
+        This warning was effectively unreachable at LIST_LIMIT=1000 and is reachable
+        at 100, so it is now load-bearing rather than decorative.
+        """
         rows = [
             {"deployment": {"state": "active"}, "dseq": str(i)}
             for i in range(AkashConsoleAPI.LIST_LIMIT)
@@ -860,6 +883,69 @@ class TestListDeploymentsFailsLoud:
         mock_req.return_value = {"data": {"deployments": rows}}
         AkashConsoleAPI("key").list_deployments(active_only=False)
         assert "may be TRUNCATED" in capsys.readouterr().err
+
+    @patch.object(AkashConsoleAPI, "_request")
+    def test_one_below_the_ceiling_does_not_warn(self, mock_req, capsys):
+        """THE OTHER HALF. Without this, a warning that fires ALWAYS also passes.
+
+        `test_hitting_the_ceiling_warns` alone cannot tell a correct boundary from a
+        `>= 0` comparison, so it cannot detect an off-by-one in either direction.
+        """
+        rows = [
+            {"deployment": {"state": "active"}, "dseq": str(i)}
+            for i in range(AkashConsoleAPI.LIST_LIMIT - 1)
+        ]
+        mock_req.return_value = {"data": {"deployments": rows}}
+        result = AkashConsoleAPI("key").list_deployments(active_only=False)
+
+        # NON-VACUITY: if the rows were dropped, "no warning" would be trivially true.
+        assert len(result) == AkashConsoleAPI.LIST_LIMIT - 1
+        assert "may be TRUNCATED" not in capsys.readouterr().err
+
+    @patch.object(AkashConsoleAPI, "_request")
+    def test_a_limit_validation_400_raises_rather_than_reporting_an_empty_account(self, mock_req):
+        """The fail-closed contract, asserted instead of assumed.
+
+        Two DELETING consumers treat a falsy result as "nothing to do"
+        (ci_cleanup_runner_deployments.py, akash-stale-sweep.sh). A 400 that returned
+        `[]` would read to them as an empty account and exit 0 as "Nothing to do" —
+        strictly worse than the loud break, because it is silent.
+        """
+        # Constructed the way api.py's own raise site does, carrying the VERBATIM
+        # body the Console API returned on 2026-09-18. A hand-paraphrased error is a
+        # stub less faithful than the tool, and would not have caught that `status`
+        # is a required keyword-only argument.
+        mock_req.side_effect = AkashAPIError(
+            "API Error (400): Validation error",
+            status=400,
+            body=json.dumps(
+                {
+                    "error": "BadRequestError",
+                    "message": "Validation error",
+                    "code": "validation_error",
+                    "type": "validation_error",
+                    "data": [
+                        {
+                            "code": "too_big",
+                            "maximum": 100,
+                            "type": "number",
+                            "inclusive": True,
+                            "exact": False,
+                            "message": "Number must be less than or equal to 100",
+                            "path": ["limit"],
+                        }
+                    ],
+                }
+            ),
+            error_name="BadRequestError",
+        )
+        with pytest.raises(AkashAPIError, match="400") as caught:
+            AkashConsoleAPI("key").list_deployments()
+
+        # The raise must carry the structured fields, not just the message — a bare
+        # re-raise would still satisfy `pytest.raises` above.
+        assert caught.value.status == 400
+        assert '"path": ["limit"]' in caught.value.body
 
 
 class TestExtractSshInfoNonIterablePorts:
