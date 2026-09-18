@@ -514,6 +514,98 @@ def test_every_diag_last_code_call_passes_an_argument():
     )
 
 
+def test_diag_last_code_is_fail_open_when_the_helper_cannot_be_run():
+    """The diagnostic enrichment step MUST NOT abort the provisioning loop.
+
+    With `set -uo pipefail` (line 995), a command substitution whose command
+    exits non-zero aborts the enclosing `run:` block. `uv run` can fail in
+    three real shapes:
+
+    - The harness runs the rendered block with `cwd=tmp_path` — no
+      `pyproject.toml`, so `uv run --with .` fails to resolve the project.
+    - Cold CI caches: uv's resolver hits a transient network or index
+      error and exits non-zero before `python -m` runs.
+    - Lockfile drift: a pinned dep in `pyproject.toml` is unavailable on
+      the runner's mirror; resolver fails after build.
+
+    In production, every shape used to convert a single recoverable
+    failure into a hard abort of the entire provisioning loop — every
+    attempt after attempt 1 is skipped, every retry is gone, every
+    `failure_reason=` is unwritten. That is strictly worse than the bucket
+    this PR demotes: a bucket at least names a value; an abort names
+    nothing.
+
+    The fix lives INSIDE the function (`return 0` after the `uv run`),
+    not at the call sites (`|| true` at each `VAR=$(diag_last_code ...)`).
+    Putting it in the function means future call sites inherit the
+    fail-open property without remembering to add a guard.
+
+    The test pins the invariant at two levels:
+
+    1. Static: the function body must end with `return 0` so a failing
+       `uv run` cannot propagate.
+    2. Behavioural: synthesise a failing function and exercise the same
+       assignment shape (`VAR=$(...)` under `set -e`) the workflow uses.
+       Confirm the outer block reaches the line after the assignment —
+       which the unfixed function would have aborted at.
+    """
+    code = _code(SRC)
+    fn_match = re.search(
+        r"diag_last_code\(\)\s*\{[^}]*\}",
+        code,
+        re.DOTALL,
+    )
+    assert fn_match is not None, "diag_last_code function is missing from the workflow"
+    body = fn_match.group(0)
+
+    # 1. Static pin: the function MUST end with `return 0` after the uv run.
+    #    Without it, the bare failing `uv run` exits non-zero and the
+    #    function inherits that exit status; the assignment then aborts.
+    assert re.search(
+        r"uv run --with \. python -m just_akash\._diag_helper.*\n\s*return 0\s*\n\s*\}",
+        body,
+    ), (
+        "diag_last_code() must end with `return 0` so a failing `uv run` "
+        "cannot abort the enclosing provisioning loop under set -e. The "
+        "fix lives inside the function (not `|| true` at the call sites) "
+        "so future call sites inherit the fail-open property."
+    )
+
+    # 2. Behavioural pin: run the assignment shape the workflow uses and
+    #    confirm a failing helper does not abort the enclosing block.
+    #    The harness at test_runner_pool_outcome_is_monotonic.py also
+    #    covers this — `bash -e -c <script>` with a stubbed `uv` that
+    #    exits non-zero on `just_akash._diag_helper` — but that test
+    #    covers 12 specific provision-block scenarios, not the bare
+    #    assignment invariant. This test pins the bare invariant
+    #    directly so a future refactor that re-introduces `|| true` at
+    #    the call sites (instead of inside the function) still goes red.
+    script = (
+        "set -euo pipefail\n"
+        "diag_last_code() {\n"
+        '    uv run --with . python -m just_akash._diag_helper "$1" 2>/dev/null\n'
+        "    return 0\n"
+        "}\n"
+        "VAR=$(diag_last_code /tmp/ja.log)\n"
+        'echo "after:VAR=${VAR}"\n'
+    )
+    proc = subprocess.run(
+        [shutil.which("bash") or "/bin/bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert proc.returncode == 0, (
+        f"diag_last_code fail-open invariant violated: the assignment "
+        f"aborted the enclosing block. rc={proc.returncode} "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    assert "after:VAR=" in proc.stdout, (
+        f"diag_last_code assignment did not complete: "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+
+
 def test_provider_capacity_is_gated_behind_the_akash_diag_matcher():
     """PROVIDER_CAPACITY was the catch-all that swallowed seven real causes.
     It now lives in the FINAL `else` of the post-loop verdict, AFTER an

@@ -1077,7 +1077,26 @@ jobs:
             # wrong file without noticing; explicit-argument at every call
             # site is the safer shape. Pinned by
             # test_every_diag_last_code_call_passes_an_argument.
+            #
+            # ⛔ THIS FUNCTION IS FAIL-OPEN BY CONSTRUCTION. The diagnostic
+            # enrichment step exists to surface a richer failure_reason; it
+            # MUST NOT become the cause of a missing failure_reason. The
+            # `uv run` invocation can fail in the harness (no pyproject.toml
+            # in `cwd=tmp_path`), in cold CI caches (resolver errors), and in
+            # production (transient lockfile mismatch). Any of those would
+            # surface as a non-zero exit here; under `set -e`, a failing
+            # command substitution in `VAR=$(diag_last_code ...)` aborts the
+            # outer block — killing the entire provisioning loop after a
+            # SINGLE attempt, regardless of how many remain. `return 0`
+            # rescues the function's exit status so the assignment always
+            # succeeds and emits empty string when the helper cannot be run.
+            # The downstream `if [ -n "$DIAG_CODE" ]` / `case "$POST_DIAG"`
+            # then fall through to the bucket they were already going to
+            # demote, which is the documented behaviour. Future call sites
+            # inherit the property without remembering `|| true`. Pinned by
+            # test_diag_last_code_is_fail_open_when_the_helper_cannot_be_run.
             uv run --with . python -m just_akash._diag_helper "$1" 2>/dev/null
+            return 0
           }
 
           # A free-text input feeding `seq`: junk would make the wait loop a no-op and
@@ -1762,13 +1781,34 @@ jobs:
             # is the distinction. The downstream consumer (blazing) widens its
             # accept-list to match.
             POST_DIAG=$(diag_last_code /tmp/ja.log)
-            if [ -n "$POST_DIAG" ]; then
-              echo "failure_reason=$POST_DIAG" >> "$GITHUB_OUTPUT"
-              echo "::error title=just-akash code: $POST_DIAG::no lease across ${MAX_ATTEMPTS} attempts, but deploy.py emitted this typed diagnostic — see /tmp/ja.log for the full event. Each Code names a different remedy, which is why they are not collapsed into PROVIDER_CAPACITY."
-            else
-              echo "failure_reason=PROVIDER_CAPACITY" >> "$GITHUB_OUTPUT"
-              echo "::error title=No provider bid::No eligible provider bid within the window across ${MAX_ATTEMPTS} attempts, and no akash-diag code was emitted. This is a market/capacity condition, not a code failure — investigate per-provider health."
-            fi
+            # ⛔ POST_DIAG IS BOUNDED TO THE Code ENUM (fail-closed). The
+            # `diag_last_code` helper returns whatever JSON it parses; an
+            # arbitrary string from a corrupted /tmp/ja.log or a future
+            # producer must NOT escape into the declared `failure_reason`
+            # output set. The case statement below enumerates every member
+            # of just_akash._diagnostics.Code; anything else falls through
+            # to PROVIDER_CAPACITY, which is the documented bucket and IS
+            # in the declared output set. Pinned by
+            # test_post_diag_is_bounded_by_the_code_enum_with_a_declared_fallback.
+            #
+            # The cross-repo constraint is checked at PR-open time: every
+            # Code member listed below must also be present in blazing's
+            # ACCEPTED_ZERO_FAILURE_REASONS (or its named-exclusion list)
+            # so the runner-registration cleanup does not misclassify a
+            # real Code value as MISSING_EXPECTED. The current 23 Code
+            # members are documented in PR B-prime; widening the enum
+            # without the matching blazing accept-list is the locked-out
+            # shape.
+            case "$POST_DIAG" in
+              WALLET_INSUFFICIENT_CREDIT|WALLET_LOW_CREDIT|WALLET_CREDIT_QUERY_FAILED|PROVIDER_OFFLINE|PROVIDER_INVALID_VERSION|PROVIDER_NO_CAPACITY|PROVIDER_NO_BID|PROVIDER_STATUS_QUERY_FAILED|PROVIDER_UNKNOWN|NO_BIDS_RECEIVED|BIDS_FOREIGN_ONLY|BIDS_STALE|BIDS_MALFORMED|SELECTION_EMPTIEST_DEGRADED|DEPLOY_CREATE_FAILED|DEPLOY_CREATE_ORPHAN_SUSPECTED|NO_DSEQ_RETURNED|LEASE_CREATE_FAILED|REDEPLOY_FAILED|SDL_ERROR|CONFIG_ERROR|LEASE_DOWN|EXEC_EXIT_CODE_UNKNOWN)
+                echo "failure_reason=$POST_DIAG" >> "$GITHUB_OUTPUT"
+                echo "::error title=just-akash code: $POST_DIAG::no lease across ${MAX_ATTEMPTS} attempts, but deploy.py emitted this typed diagnostic — see /tmp/ja.log for the full event. Each Code names a different remedy, which is why they are not collapsed into PROVIDER_CAPACITY."
+                ;;
+              *)
+                echo "failure_reason=PROVIDER_CAPACITY" >> "$GITHUB_OUTPUT"
+                echo "::error title=No provider bid::No eligible provider bid within the window across ${MAX_ATTEMPTS} attempts, and no akash-diag code was emitted. This is a market/capacity condition, not a code failure — investigate per-provider health."
+                ;;
+            esac
           fi
           exit 1
 
