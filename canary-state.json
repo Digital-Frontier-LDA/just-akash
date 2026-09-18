@@ -1,62 +1,62 @@
 {
   "alphavps": {
     "boot_id": "098e8305950844c3",
-    "checks_total": 1737,
+    "checks_total": 1738,
     "closures": {
       "self": 15
     },
     "deployed": 1,
-    "disk_write_seconds": 0.001472,
+    "disk_write_seconds": 0.002529,
     "dns_fail": 1293.0,
-    "dns_ok": 229337.0,
+    "dns_ok": 229559.0,
     "dseq": "1789100716448",
     "egress_fail": 1292.0,
-    "egress_ok": 229338.0,
-    "last_collect": 1789731703.0587242,
+    "egress_ok": 229560.0,
+    "last_collect": 1789735022.3711529,
     "lease_lifetime_hours": 0.5709128088888888,
     "lease_replacements_total": 22,
     "raw_dns_fail": 1290.0,
-    "raw_dns_ok": 14901.0,
+    "raw_dns_ok": 15123.0,
     "raw_egress_fail": 1289.0,
-    "raw_egress_ok": 14902.0,
+    "raw_egress_ok": 15124.0,
     "reachable": 1,
     "restarts_total": 44,
-    "sched_jitter_seconds": 0.000287,
-    "scrape_seconds": 0.3901,
+    "sched_jitter_seconds": 0.000296,
+    "scrape_seconds": 0.4059,
     "unreachable_checks_total": 28,
-    "uptime_seconds": 242880.861
+    "uptime_seconds": 246200.193
   },
   "hetzner_hel": {
     "boot_id": "f6fd2d2de12049d1",
-    "checks_total": 1738,
+    "checks_total": 1739,
     "closures": {
       "open": 1,
       "self": 16
     },
     "deployed": 1,
-    "disk_write_seconds": 0.000573,
+    "disk_write_seconds": 0.001415,
     "dns_fail": 0.0,
-    "dns_ok": 232029.0,
+    "dns_ok": 232250.0,
     "dseq": "1789100804519",
     "egress_fail": 7.0,
-    "egress_ok": 232022.0,
-    "last_collect": 1789731703.0587242,
+    "egress_ok": 232243.0,
+    "last_collect": 1789735022.3711529,
     "lease_lifetime_hours": 0.5494101327777777,
     "lease_replacements_total": 23,
     "raw_dns_fail": 0.0,
-    "raw_dns_ok": 16207.0,
+    "raw_dns_ok": 16428.0,
     "raw_egress_fail": 0.0,
-    "raw_egress_ok": 16207.0,
+    "raw_egress_ok": 16428.0,
     "reachable": 1,
     "restarts_total": 23,
-    "sched_jitter_seconds": 8.9e-05,
-    "scrape_seconds": 0.5643,
+    "sched_jitter_seconds": 9.6e-05,
+    "scrape_seconds": 0.4586,
     "unreachable_checks_total": 49,
-    "uptime_seconds": 243115.194
+    "uptime_seconds": 246434.431
   },
   "onidc": {
     "boot_id": "a9bc26f7d90c48ee",
-    "checks_total": 1688,
+    "checks_total": 1689,
     "closures": {
       "self": 15
     },
@@ -67,7 +67,7 @@
     "dseq": "1789100636167",
     "egress_fail": 343.0,
     "egress_ok": 220132.0,
-    "last_collect": 1789731703.0587242,
+    "last_collect": 1789735022.3711529,
     "lease_lifetime_hours": 0.5916496544444444,
     "lease_replacements_total": 22,
     "raw_dns_fail": 75.0,
@@ -77,8 +77,8 @@
     "reachable": 0,
     "restarts_total": 44,
     "sched_jitter_seconds": 0.245062,
-    "scrape_seconds": 20.0348,
-    "unreachable_checks_total": 55,
+    "scrape_seconds": 20.0537,
+    "unreachable_checks_total": 56,
     "uptime_seconds": 234617.931
   }
 }
