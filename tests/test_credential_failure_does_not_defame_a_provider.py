@@ -250,13 +250,18 @@ def test_every_reason_this_block_emits_is_already_declared_as_an_output() -> Non
 
 
 def test_post_diag_is_bounded_by_the_code_enum_with_a_declared_fallback() -> None:
-    """POST_DIAG must be validated against the Code enum before emission.
+    """The post-loop verdict variable must be validated against the Code enum.
 
     A separate test from the general declared-output guard because the
     failure shape is different: the Code enum can grow (new members
     added in just_akash._diagnostics.py) and the cross-repo constraint
-    needs to be visible at PR-open time, not just at runtime. Pinned at
-    `case "$POST_DIAG" in <every Code> | *) PROVIDER_CAPACITY ;; esac`.
+    needs to be visible at PR-open time, not just at runtime.
+
+    The post-loop case was previously `case "$POST_DIAG"` (this attempt's
+    diag read); #389 follow-up made it `case "$EFFECTIVE_DIAG"` so a
+    preserved LAST_KNOWN_DIAG from a wiped log can still surface. The
+    enum-bounding contract is the same: every Code member must appear in
+    the arm, with PROVIDER_CAPACITY as the default fallback.
     """
     import re
 
@@ -265,15 +270,15 @@ def test_post_diag_is_bounded_by_the_code_enum_with_a_declared_fallback() -> Non
     block = _verdict_block()
     code_enum = {v for k, v in vars(Code).items() if not k.startswith("_") and isinstance(v, str)}
 
-    case_match = re.search(r'case "\$POST_DIAG" in(.*?)\besac\b', block, re.DOTALL)
+    case_match = re.search(r'case "\$EFFECTIVE_DIAG" in(.*?)\besac\b', block, re.DOTALL)
     assert case_match, (
-        "POST_DIAG must be guarded by a `case` statement listing every "
+        "EFFECTIVE_DIAG must be guarded by a `case` statement listing every "
         "Code enum member, with PROVIDER_CAPACITY as the default fallback."
     )
     arm = case_match.group(1)
     for code in sorted(code_enum):
         assert code in arm, (
-            f"Code.{code} is missing from POST_DIAG's case-guard. A "
+            f"Code.{code} is missing from EFFECTIVE_DIAG's case-guard. A "
             f"future deploy.py emission of this code would silently "
             f"fall through to PROVIDER_CAPACITY."
         )
