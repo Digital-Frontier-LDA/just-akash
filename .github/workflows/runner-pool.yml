@@ -1352,12 +1352,24 @@ jobs:
               # PROVIDER_CAPACITY (the bucket that swallowed them) reported a market
               # outage that may never have happened.
               DIAG_CODE=$(diag_last_code /tmp/ja.log)
-              if [ -n "$DIAG_CODE" ]; then
-                [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
-                echo "failure_reason=$DIAG_CODE" >> "$GITHUB_OUTPUT"
-                echo "::error title=just-akash code: $DIAG_CODE::deploy.py emitted this typed diagnostic before exiting — see /tmp/ja.log for the full event. Each Code names a different remedy, which is why they are not collapsed into PROVIDER_CAPACITY."
-                echo "::endgroup::"; exit 1
-              fi
+              # ⛔ DIAG_CODE IS BOUNDED TO THE Code ENUM, same shape as POST_DIAG below.
+              # The helper reads whatever JSON it parses from /tmp/ja.log; an arbitrary
+              # string from a corrupted log or a future producer must NOT escape into
+              # the declared `failure_reason` output set. Unknown values fall through
+              # to the unclassified branch (continue) — they cannot become failure_reason.
+              case "$DIAG_CODE" in
+                WALLET_INSUFFICIENT_CREDIT|WALLET_LOW_CREDIT|WALLET_CREDIT_QUERY_FAILED|PROVIDER_OFFLINE|PROVIDER_INVALID_VERSION|PROVIDER_NO_CAPACITY|PROVIDER_NO_BID|PROVIDER_STATUS_QUERY_FAILED|PROVIDER_UNKNOWN|NO_BIDS_RECEIVED|BIDS_FOREIGN_ONLY|BIDS_STALE|BIDS_MALFORMED|SELECTION_EMPTIEST_DEGRADED|DEPLOY_CREATE_FAILED|DEPLOY_CREATE_ORPHAN_SUSPECTED|NO_DSEQ_RETURNED|LEASE_CREATE_FAILED|REDEPLOY_FAILED|SDL_ERROR|CONFIG_ERROR|LEASE_DOWN|EXEC_EXIT_CODE_UNKNOWN)
+                  [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+                  echo "failure_reason=$DIAG_CODE" >> "$GITHUB_OUTPUT"
+                  echo "::error title=just-akash code: $DIAG_CODE::deploy.py emitted this typed diagnostic before exiting — see /tmp/ja.log for the full event. Each Code names a different remedy, which is why they are not collapsed into PROVIDER_CAPACITY."
+                  echo "::endgroup::"; exit 1
+                  ;;
+                *)
+                  # Unknown value (or empty after fail-open) — treat as unclassified,
+                  # fall through to the raw-output branch below. The literal
+                  # `failure_reason=` is not written for this case.
+                  ;;
+              esac
 
               echo "::group::unclassified deploy failure — raw output"
               tail -40 /tmp/ja.log 2>/dev/null || echo "(no output captured)"

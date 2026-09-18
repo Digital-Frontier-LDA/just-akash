@@ -232,9 +232,11 @@ def test_every_reason_this_block_emits_is_already_declared_as_an_output() -> Non
             f"the bucket — exactly the swallow this PR demoted."
         )
         # The default branch (`*)`) must emit a literal in the declared set.
-        default_match = re.search(r"\*\)(.*?)(?:\n\s*;;|\Z)", arm, re.DOTALL)
+        default_match = re.search(r"\*\)\s*\n(.*?)\n\s*;;", arm, re.DOTALL)
         assert default_match, f"{var}'s case-guard has no `*)` default branch"
-        default_body = default_match.group(1)
+        # Strip bash `# comments` so a documentation comment naming
+        # `failure_reason=` does not trip the literal-extraction below.
+        default_body = re.sub(r"#[^\n]*", "", default_match.group(1))
         default_literal = re.search(r"failure_reason=([A-Z_]+)", default_body)
         assert default_literal, (
             f"{var}'s default branch must emit a literal "
@@ -275,3 +277,54 @@ def test_post_diag_is_bounded_by_the_code_enum_with_a_declared_fallback() -> Non
             f"future deploy.py emission of this code would silently "
             f"fall through to PROVIDER_CAPACITY."
         )
+
+
+def test_diag_code_in_the_inner_loop_is_also_bounded_by_the_code_enum() -> None:
+    """The inner-loop DIAG_CODE site must NOT emit an unvalidated value.
+
+    Two emit sites exist for akash-diag codes: the inner-loop branch
+    (line ~1354) and the post-loop verdict branch (line ~1783). Both
+    read from `diag_last_code /tmp/ja.log` and emit
+    `failure_reason=$VAR`. The post-loop site is bounded by the
+    test_post_diag_is_bounded_by_the_code_enum_with_a_declared_fallback
+    test; the inner-loop site must also be bounded.
+
+    The inner-loop case-guard's default branch (`*)`) MUST NOT emit a
+    `failure_reason=` line — an unknown value at attempt N should be
+    treated as unclassified and re-tried at attempt N+1, the same as
+    the no-DIAG_CODE branch. The bucket is reserved for the post-loop
+    verdict (no more attempts remaining) where the producer truly had
+    nothing else to say.
+    """
+    import re
+
+    from just_akash._diagnostics import Code
+
+    code_enum = {v for k, v in vars(Code).items() if not k.startswith("_") and isinstance(v, str)}
+    workflow_text = WORKFLOW.read_text(encoding="utf-8")
+
+    case_match = re.search(r'case "\$DIAG_CODE" in(.*?)\besac\b', workflow_text, re.DOTALL)
+    assert case_match, (
+        "DIAG_CODE in the inner-loop must be guarded by a `case` "
+        "statement listing every Code enum member, with no `failure_reason=` "
+        "in the default branch."
+    )
+    arm = case_match.group(1)
+    for code in sorted(code_enum):
+        assert code in arm, (
+            f"Code.{code} is missing from DIAG_CODE's case-guard. An "
+            f"unknown value would currently fall through to the raw-output "
+            f"branch with no failure_reason — but a future Code added to "
+            f"the enum without an arm here would NOT be guarded."
+        )
+
+    default_match = re.search(r"\*\)\s*\n(.*?)\n\s*;;", arm, re.DOTALL)
+    assert default_match, "DIAG_CODE's case-guard has no `*)` default branch"
+    # Strip bash `# comments` so a documentation comment naming
+    # `failure_reason=` does not trip the assertion below.
+    default_body = re.sub(r"#[^\n]*", "", default_match.group(1))
+    assert "failure_reason=" not in default_body, (
+        "DIAG_CODE's default branch must NOT emit failure_reason — an "
+        "unknown value at attempt N re-tries at N+1; the bucket belongs "
+        "only to the post-loop verdict (no attempts remaining)."
+    )
