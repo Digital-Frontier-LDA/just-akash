@@ -485,12 +485,19 @@ def test_every_diag_last_code_call_passes_an_argument():
     # A comment that names the function (e.g. "via diag_last_code above")
     # is not a call site. Match the invocation form only: bare word followed
     # by whitespace and a non-newline argument (or a $(...) wrapping it).
-    bare_calls = re.findall(r"(?<![\$\w])diag_last_code(?!\s*\()", call_sites)
+    #
+    # Use finditer (not findall) because findall returns the matched STRINGS,
+    # and every match here is the literal "diag_last_code" — the same string
+    # each iteration. `call_sites.index(site)` would then resolve every
+    # iteration to the FIRST occurrence, so a missing argument on the second
+    # (or later) call site would never be reported. match.start() gives the
+    # actual offset of THIS match, which is what we need.
+    bare_calls = list(re.finditer(r"(?<![\$\w])diag_last_code(?!\s*\()", call_sites))
 
     failures = []
-    for site in bare_calls:
+    for match in bare_calls:
         # Look at the line the bare mention sits on.
-        line_no = call_sites[: call_sites.index(site)].count("\n") + 1
+        line_no = call_sites[: match.start()].count("\n") + 1
         line = call_sites.splitlines()[line_no - 1]
         # A call must carry at least one whitespace-separated token after
         # the function name. Comments are stripped by `_code`, so any token
