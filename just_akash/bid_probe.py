@@ -144,6 +144,61 @@ deployment:
       count: 1
 """.format(models="\n".join(f"                - model: {m}" for m in GPU_PROBE_MODELS))
 
+# ⭐ THE SHAPE WE ACTUALLY SELL, WHICH IS NOT THE SHAPE ABOVE.
+# `_SDL_GPU` asks for the smallest thing that can carry a GPU (1 cpu, 512Mi, 256Mi) because
+# it answers ONE question: is the provider bidding at all. That is the right shape for a
+# health probe and the wrong shape for a PRICE, and the difference is not small --
+# proxy-akash's catalog renders 8 cores / 32Gi / 200Gi per GPU instance, which is 64x the
+# memory and 800x the storage. A bid measured on the minimal order cannot size a price
+# ceiling for the order that fleet actually submits to its own provider.
+# ⚠ THIS EXISTS BECAUSE A REVIEWER CAUGHT THE SUBSTITUTION (Copilot, proxy-akash #51): a
+# ceiling derived from the minimal shape can sit BELOW the real bid, and the order then
+# draws no bid and expires -- a failure that reads as "the provider is down" rather than
+# "we asked the wrong question".
+# ⛔ KEEP THE TWO SEPARATE. Do not widen `_SDL_GPU` to this shape: the health question wants
+# the cheapest order that proves the provider bids, the price question wants the order we
+# sell, and one SDL cannot answer both without making the cheaper answer more expensive.
+_SDL_GPU_SUPPLY = """\
+---
+version: "2.0"
+services:
+  probe:
+    image: alpine:3.19
+    command: ["sh", "-c", "sleep 60"]
+    expose:
+      - port: 80
+        as: 80
+        to:
+          - global: true
+profiles:
+  compute:
+    probe:
+      resources:
+        cpu:
+          units: 8
+        memory:
+          size: 32Gi
+        storage:
+          size: 200Gi
+        gpu:
+          units: 1
+          attributes:
+            vendor:
+              nvidia:
+{models}
+  placement:
+    akash:
+      pricing:
+        probe:
+          denom: uact
+          amount: 5000000
+deployment:
+  probe:
+    akash:
+      profile: probe
+      count: 1
+""".format(models="\n".join(f"                - model: {m}" for m in GPU_PROBE_MODELS))
+
 _SDL_PERSISTENT_BETA3 = """\
 ---
 version: "2.0"
@@ -239,6 +294,7 @@ SCENARIOS: dict[str, Scenario] = {
     for s in (
         Scenario("cpu", _SDL_CPU),
         Scenario("gpu", _SDL_GPU),
+        Scenario("gpu-supply", _SDL_GPU_SUPPLY),
         Scenario("persistent-beta3", _SDL_PERSISTENT_BETA3),
         Scenario("ip-lease", _SDL_IP_LEASE),
     )
@@ -275,7 +331,7 @@ PROVIDERS: tuple[ProviderTarget, ...] = (
     ProviderTarget(
         cluster="onidc",
         wallet="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",  # pragma: allowlist secret
-        capabilities=frozenset({"cpu", "gpu", "persistent-beta3", "ip-lease"}),
+        capabilities=frozenset({"cpu", "gpu", "gpu-supply", "persistent-beta3", "ip-lease"}),
         attributes={
             "region": "eu-west",
             "organization": "digital frontier",
