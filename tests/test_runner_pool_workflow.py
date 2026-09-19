@@ -1063,97 +1063,155 @@ EOF
     )
 
 
-def test_archive_walk_prefers_newest_at_ten_plus_attempts():
-    """The walk must prefer the NEWEST archive even when MAX_ATTEMPTS >= 10.
+def test_archive_walk_prefers_newest_at_ten_plus_attempts(tmp_path):
+    """PROPERTY (load-bearing): the post-loop archive walk prefers the
+    NEWEST archive even when MAX_ATTEMPTS >= 10.
 
     #389 follow-up. The first iteration used `ls -1r /tmp/ja.log.*`, which
     is LEXICAL sort: `.10` sorts before `.2`, so with MAX_ATTEMPTS=10+ the
-    walk would silently pick an OLDER diagnostic over the newest. MAX_ATTEMPTS=3
-    hides the bug; MAX_ATTEMPTS=10 (entirely plausible for a flaky provider)
-    makes it live. The test name is the property assertion; the property must
-    be the thing the test enforces, not the mechanism.
+    walk would silently pick an OLDER diagnostic over the newest.
+    MAX_ATTEMPTS=3 hides the bug; MAX_ATTEMPTS=10 (entirely plausible for
+    a flaky provider) makes it live. The test name is the property
+    assertion; the property must be the thing the test enforces.
 
-    This test is the load-bearing one. It seeds 11 archives where every
-    archive carries a different known Code value, drives the post-loop walk
-    in isolation, and asserts the NEWEST archive's code wins. If the walk
-    ever returns to a glob-sort (lexical or otherwise that misorders 10 vs
-    2), this test goes red with a name that names the failure.
+    DRIVES THE ACTUAL PRODUCTION CODE. This test does NOT embed a copy of
+    the walk loop in its heredoc — the previous shape did, which meant a
+    future production mutation (e.g., "simplifying" `seq MAX_ATTEMPTS -1
+    1` to `ls -1r` or to `seq 1 MAX_ATTEMPTS`) could leave this test
+    green: the test was running a copy of the loop, not the production
+    code. A guard whose name says "prefers newest" but only exercises a
+    copy is a guard whose name lies about what it checks.
 
-    The mechanism assertion (test_archive_walk_iterates_attempt_numbers_not_glob_sort)
-    is a secondary guard — it pins the implementation but does NOT replace
-    the property check. A test that asserts only the mechanism is a
-    guard whose name lies about what it checks.
+    Instead, this test:
+      1. Extracts the archive-walk block verbatim from
+         `.github/workflows/runner-pool.yml` (the `if [ -z "$POST_DIAG" ];
+         then ... fi` containing `for a in $(seq ... -1 1)`).
+      2. Writes it to a temp file.
+      3. Stubs `diag_last_code` with a JSON-line parser matching
+         `just_akash._diag_helper.read_last_error_code`.
+      4. Seeds 11 archives, each carrying a unique `ARCHIVE_N` code.
+      5. Sources the production block into a driver that initialises
+         `POST_DIAG=""` and `MAX_ATTEMPTS=11`.
+      6. Asserts the walk picks `ARCHIVE_11`.
+
+    A production mutation is automatically reflected here. The mechanism
+    assertion (`test_archive_walk_iterates_attempt_numbers_not_glob_sort`)
+    is a secondary guard — it pins the implementation form so a future
+    "simplification" is visible in code review, but it does NOT replace
+    this property check.
     """
-    script = textwrap.dedent(
-        """
-        set -euo pipefail
-
-        # Stub diag_last_code: return a unique code derived from the path.
-        # Archive /tmp/ja.log.11 must be the NEWEST, so its code is the
-        # one the walk should surface.
-        diag_last_code() {
-          local p="$1"
-          # Path like /tmp/ja.log.N — extract N as the unique code suffix.
-          local n="${p##*/tmp/ja.log.}"
-          echo "ARCHIVE_${n}"
-          return 0
-        }
-
-        # Stub `uv` so any embedded invocation of the real helper is a no-op.
-        uv() {
-          if [ "$1" = "run" ]; then
-            diag_last_code "${@: -1}"
-            return 0
-          fi
-          command uv "$@"
-        }
-        export -f uv
-        export -f diag_last_code
-
-        # Seed 11 archives with non-empty content (the workflow only writes
-        # a non-empty log into the archive slot, so the stub reads them).
-        MAX_ATTEMPTS=11
-        for i in $(seq 1 "$MAX_ATTEMPTS"); do
-          printf '{"type":"akash-diag","level":"error","code":"ARCHIVE_%s"}\n' "$i" \
-            > "/tmp/ja.log.$i"
-        done
-
-        # POST_DIAG is empty (live log was wiped) — drive the walk.
-        POST_DIAG=""
-        if [ -z "$POST_DIAG" ]; then
-          for a in $(seq "${MAX_ATTEMPTS}" -1 1); do
-            archive="/tmp/ja.log.$a"
-            [ -f "$archive" ] || continue
-            attempt_code=$(diag_last_code "$archive" 2>/dev/null || echo "")
-            if [ -n "$attempt_code" ]; then
-              POST_DIAG="$attempt_code"
-              break
-            fi
-          done
-        fi
-
-        echo "POST_DIAG=$POST_DIAG"
-        # Cleanup so the test does not leak state.
-        rm -f /tmp/ja.log.* 2>/dev/null || true
-        """
+    # Locate the production archive-walk block. The block is `if [ -z
+    # "$POST_DIAG" ]; then ... fi` at 12-space YAML indent, containing
+    # the seq-based loop. Non-greedy body capture stops at the first
+    # matching `fi` at the SAME 12-space indent (the inner `if [ -n
+    # "$attempt_code" ]; then ... fi` is at 16 spaces, so it does not
+    # match the end anchor).
+    block_pattern = re.compile(
+        r"^(            if \[ -z \"\$POST_DIAG\" \]; then\n"
+        r"(?:.*\n)*?"
+        r"            fi\n)",
+        re.MULTILINE,
     )
+    block_match = block_pattern.search(SRC)
+    assert block_match is not None, (
+        "archive-walk block not found in runner-pool.yml — expected a "
+        '`if [ -z "$POST_DIAG" ]; then ... fi` block at 12-space '
+        "indent containing the seq-based loop. If the workflow shape "
+        "changed, update this test (and the production code) together."
+    )
+    production_block = block_match.group(0)
+    # The block must read /tmp/ja.log.<a> directly so the test's
+    # /tmp/ja.log.N seeding is visible to the walk. (A glob-based block
+    # would still see them — but this is a tripwire so a refactor that
+    # loses the deterministic path naming fails LOUD, not silently.)
+    assert 'archive="/tmp/ja.log.$a"' in production_block, (
+        f"extracted archive-walk block does not read /tmp/ja.log.<a> "
+        f"directly. Refactor with care — the test seeds files at that "
+        f"exact path.\nBlock:\n{production_block}"
+    )
+
+    # Write the production block to a temp file so its workflow
+    # indentation does not burden the Python source's line-length budget.
+    block_file = tmp_path / "production_archive_walk.sh"
+    block_file.write_text(production_block)
+
+    # Driver script (also written to a file for the same reason). Stubs
+    # diag_last_code with a JSON-line parser mirroring the real helper,
+    # seeds 11 archives, sources the production block, asserts the
+    # newest wins. Cleanup runs on EXIT so a mid-script failure does not
+    # leak /tmp/ja.log.* into sibling tests.
+    driver_file = tmp_path / "driver.sh"
+    driver_file.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "trap 'rm -f /tmp/ja.log.*' EXIT\n"
+        "\n"
+        "# Stub diag_last_code: parse the JSON-line file like the real\n"
+        "# just_akash._diag_helper.read_last_error_code and emit the\n"
+        "# LAST error-level akash-diag code. This is the contract the\n"
+        "# production block depends on.\n"
+        "diag_last_code() {\n"
+        "  python3 -c '\n"
+        "import json, sys\n"
+        'last = ""\n'
+        "with open(sys.argv[1]) as h:\n"
+        "    for line in h:\n"
+        "        try:\n"
+        "            event = json.loads(line)\n"
+        "        except ValueError:\n"
+        "            continue\n"
+        "        if (isinstance(event, dict)\n"
+        '            and event.get("type") == "akash-diag"\n'
+        '            and event.get("level") == "error"\n'
+        '            and isinstance(event.get("code"), str)):\n'
+        '            last = event["code"]\n'
+        "sys.stdout.write(last)\n"
+        '\' "$1"\n'
+        "}\n"
+        "export -f diag_last_code\n"
+        "\n"
+        "# Seed 11 archives with non-empty JSON-lines content. The newest\n"
+        "# is /tmp/ja.log.11 and must be the winner.\n"
+        "MAX_ATTEMPTS=11\n"
+        "export MAX_ATTEMPTS\n"
+        'for i in $(seq 1 "$MAX_ATTEMPTS"); do\n'
+        '  python3 -c "\n'
+        "import json\n"
+        "print(json.dumps({'type':'akash-diag','level':'error','code':'ARCHIVE_' + str($i)}))\n"
+        '" > "/tmp/ja.log.$i"\n'
+        "done\n"
+        "\n"
+        "# Live log was wiped; POST_DIAG starts empty — drives the walk.\n"
+        'POST_DIAG=""\n'
+        "export POST_DIAG\n"
+        "\n"
+        f"# Source the production block (extracted from runner-pool.yml).\n"
+        f"# A mutation in the workflow is automatically reflected here.\n"
+        f'source "{block_file}"\n'
+        "\n"
+        'echo "POST_DIAG=$POST_DIAG"\n'
+    )
+
     proc = subprocess.run(
-        [shutil.which("bash") or "/bin/bash", "-c", script],
+        [shutil.which("bash") or "/bin/bash", str(driver_file)],
         capture_output=True,
         text=True,
         timeout=15,
         env={**os.environ, "PATH": os.environ.get("PATH", "")},
     )
     assert proc.returncode == 0, (
-        f"archive-walk isolated driver failed. rc={proc.returncode} "
+        f"production archive-walk block failed. rc={proc.returncode} "
         f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
     )
     assert "POST_DIAG=ARCHIVE_11" in proc.stdout, (
         f"the walk must prefer the NEWEST archive (ARCHIVE_11 when "
         f"MAX_ATTEMPTS=11). Got stdout={proc.stdout!r} stderr={proc.stderr!r}. "
-        f"If this shows ARCHIVE_1..ARCHIVE_9 or any archive < 11, the walk "
-        f"is lexical-sorting or otherwise misordering — at MAX_ATTEMPTS >= 10 "
-        f"this would route the wrong diagnostic to failure_reason."
+        f"If this shows ARCHIVE_1..ARCHIVE_9 or any archive < 11, the "
+        f"walk is lexical-sorting or otherwise misordering — at "
+        f"MAX_ATTEMPTS >= 10 this would route the wrong diagnostic to "
+        f"failure_reason. A future production mutation to the walk "
+        f"loop in runner-pool.yml MUST also update this test (and "
+        f"test_archive_walk_iterates_attempt_numbers_not_glob_sort)."
     )
 
 
