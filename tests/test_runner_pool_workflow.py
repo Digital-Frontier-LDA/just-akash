@@ -872,8 +872,7 @@ EOF
         f"surface for the whole log."
     )
     assert "failure_reason=PROVIDER_NO_BID" in proc.stdout, (
-        f"the trailing valid event must surface as failure_reason. "
-        f"Got stdout={proc.stdout!r}"
+        f"the trailing valid event must surface as failure_reason. Got stdout={proc.stdout!r}"
     )
     assert "failure_reason=PROVIDER_CAPACITY" not in proc.stdout, (
         f"PROVIDER_CAPACITY must NOT appear when a valid trailing code exists. "
@@ -1024,7 +1023,8 @@ EOF
             attempt_code=$(diag_last_code "$archive" 2>/dev/null || echo "")
             if [ -n "$attempt_code" ]; then
               POST_DIAG="$attempt_code"
-              echo "::notice title=just-akash archive walk::recovered diagnostic '$attempt_code' from $archive after helper fail-open on the live log"
+              echo "::notice title=just-akash archive walk::recovered from $archive"
+              echo "::notice::'$attempt_code' (helper failed on live log)"
               break
             fi
           done
@@ -1114,7 +1114,8 @@ def test_archive_walk_prefers_newest_at_ten_plus_attempts():
         # a non-empty log into the archive slot, so the stub reads them).
         MAX_ATTEMPTS=11
         for i in $(seq 1 "$MAX_ATTEMPTS"); do
-          printf '{"type":"akash-diag","level":"error","code":"ARCHIVE_%s"}\\n' "$i" > "/tmp/ja.log.$i"
+          printf '{"type":"akash-diag","level":"error","code":"ARCHIVE_%s"}\n' "$i" \
+            > "/tmp/ja.log.$i"
         done
 
         # POST_DIAG is empty (live log was wiped) — drive the walk.
@@ -1185,7 +1186,7 @@ def test_archive_walk_iterates_attempt_numbers_not_glob_sort():
         "puts .10 before .2)."
     )
     # The walk must read /tmp/ja.log.<a> directly, not via a glob expansion.
-    assert 'archive="/tmp/ja.log.$a"' in code or 'archive=/tmp/ja.log.$a' in code, (
+    assert 'archive="/tmp/ja.log.$a"' in code or "archive=/tmp/ja.log.$a" in code, (
         "the archive walk must read a deterministic path (`/tmp/ja.log.<a>`) "
         "rather than expanding a glob — the latter reintroduces lexical-sort "
         "ordering as a footgun."
@@ -1194,6 +1195,9 @@ def test_archive_walk_iterates_attempt_numbers_not_glob_sort():
     walk_match = re.search(
         r"for\s+a\s+in\s+\$\(\s*seq\s+\"\$\{?MAX_ATTEMPTS\}?\"\s+-1\s+1\s*\)",
         code,
+    )
+    assert walk_match is not None, (
+        "the post-loop walk must iterate `seq MAX_ATTEMPTS -1 1` (asserted above)"
     )
     walk_block = code[walk_match.start() : code.index("done", walk_match.start()) + 4]
     assert "break" in walk_block, (
@@ -1214,7 +1218,7 @@ def test_archive_cleanup_runs_after_verdict():
         r"for\s+a\s+in\s+\$\(\s*seq\s+\"\$\{?MAX_ATTEMPTS\}?\"\s+-1\s+1\s*\)",
         code,
     )
-    assert walk_match, "the post-loop walk must exist (seq-based)"
+    assert walk_match is not None, "the post-loop walk must exist (seq-based)"
     # After the case esac and before the next outer scope, the cleanup must run.
     post_verdict = code[walk_match.end() :]
     assert re.search(r"rm\s+-f\s+/tmp/ja\.log\.\*", post_verdict), (

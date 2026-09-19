@@ -168,9 +168,7 @@ def test_ignores_events_without_code_field(tmp_path):
         ({"k": "v"}, "dict"),
     ],
 )
-def test_non_string_code_is_skipped_and_warning_logged(
-    tmp_path, caplog, code, type_name
-):
+def test_non_string_code_is_skipped_and_warning_logged(tmp_path, caplog, code, type_name):
     """Non-string `code` is a producer contract violation — signature is
     `-> str`, consumer types it as str, and the YAML emission path would
     write `failure_reason=42` for an integer code without raising.
@@ -215,9 +213,7 @@ def test_non_string_code_is_skipped_and_warning_logged(
         f"the trailing valid event is what failure_reason should reflect."
     )
     type_records = [
-        r
-        for r in caplog.records
-        if r.levelno == logging.WARNING and type_name in r.getMessage()
+        r for r in caplog.records if r.levelno == logging.WARNING and type_name in r.getMessage()
     ]
     assert type_records, (
         f"Expected a WARNING log naming the type {type_name}; got "

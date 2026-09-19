@@ -1928,7 +1928,10 @@ jobs:
             # after a successful failure_reason binding is dead weight,
             # and a stale archive from a misconfigured re-run could
             # mislead the next archive walk if the helper fails twice.
-            rm -f /tmp/ja.log.* 2>/dev/null || true
+            # `rm -f` is documented to never fail on a missing path, so no
+            # `|| true` swallow is needed; test_no_new_unmeasured_green.py's
+            # R2 forbids it on a verdict step.
+            rm -f /tmp/ja.log.*
           fi
           exit 1
 

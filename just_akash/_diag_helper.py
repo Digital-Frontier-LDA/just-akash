@@ -26,7 +26,6 @@ import logging
 import sys
 from pathlib import Path
 
-
 log = logging.getLogger(__name__)
 
 
@@ -81,7 +80,7 @@ def read_last_error_code(log_path: str | Path) -> str:
                     # test_non_string_code_is_skipped_and_warning_logged
                     # (parametrised over int/float/bool/list/dict) and the
                     # workflow-level
-                    # test_no_provider_capacity_misattribution_when_malformed_event_precedes_valid_one.
+                    # test_no_provider_capacity_misattribution_when_malformed_event_precedes_valid_one.  # noqa: E501
                     if not isinstance(code, str):
                         log.warning(
                             "akash-diag code must be str; got %s=%r. "
