@@ -168,27 +168,63 @@ def test_ignores_events_without_code_field(tmp_path):
         ({"k": "v"}, "dict"),
     ],
 )
-def test_raises_type_error_on_non_string_code_field(tmp_path, code, type_name):
-    """Non-string `code` is a contract violation — type as `-> str`, emit as
-    `failure_reason=<code>`. Silent coercion would emit `failure_reason=42`
-    for an integer code with no error, masking a producer contract bug.
+def test_non_string_code_is_skipped_and_warning_logged(
+    tmp_path, caplog, code, type_name
+):
+    """Non-string `code` is a producer contract violation — signature is
+    `-> str`, consumer types it as str, and the YAML emission path would
+    write `failure_reason=42` for an integer code without raising.
 
-    Compounds with Change 1's LAST_KNOWN_DIAG fix: the raise makes `uv run`
-    exit non-zero, the workflow's diag_last_code is fail-open, DIAG_CODE=""
-    for that attempt, and the prior good value (LAST_KNOWN_DIAG) is what
-    surfaces the cause. Drop Change 1 and the same raise would wipe the
-    diagnostic — drop Change 2 and the same raise would never fire.
+    Skip-and-log-at-warning, NOT raise. A raise poisons this helper's
+    diagnostic surface for the WHOLE log: on attempt 1 with no
+    LAST_KNOWN_DIAG fallback, the very first malformed event makes
+    `uv run` exit non-zero, the workflow's diag_last_code is fail-open,
+    DIAG_CODE="", and the post-loop verdict routes to PROVIDER_CAPACITY
+    — the exact misattribution this PR series exists to demote.
 
-    Mutant: drop the `raise TypeError` → the helper returns the non-string
-    (int, list, dict) or skips it silently depending on shape, and this
-    test goes red.
+    Skip-and-log keeps the valid code AND records the producer bug for
+    the human reader (WARNING level so it surfaces in CI logs without
+    poisoning the diagnostic surface). The follow-up workflow-level
+    test pins the no-PROVIDER_CAPACITY-misattribution end-to-end.
+
+    Mutants caught:
+      - Drop the `log.warning(...)` → the producer bug is invisible; caplog
+        assertion fires naming the missing record.
+      - Drop the `continue` → the helper would return "" for the malformed
+        event AND never see the trailing valid event; result assertion
+        fires naming the missing PROVIDER_NO_BID.
+      - Replace with `raise TypeError(...)` → the helper aborts on the
+        malformed event; result assertion fires (no PROVIDER_NO_BID
+        returned) AND no WARNING log record is emitted; caplog assertion
+        fires naming the missing record.
     """
-    path = _write_log(
+    import logging
+
+    log_path = _write_log(
         tmp_path,
-        [{"type": "akash-diag", "level": "error", "code": code}],
+        [
+            {"type": "akash-diag", "level": "error", "code": code},
+            {"type": "akash-diag", "level": "error", "code": "PROVIDER_NO_BID"},
+        ],
     )
-    with pytest.raises(TypeError, match=f"akash-diag code must be str; got {type_name}"):
-        read_last_error_code(path)
+    with caplog.at_level(logging.WARNING, logger="just_akash._diag_helper"):
+        result = read_last_error_code(log_path)
+    assert result == "PROVIDER_NO_BID", (
+        f"Expected the LAST valid code; got {result!r}. A non-string code "
+        f"({type_name}={code!r}) must NOT poison the helper's output — "
+        f"the trailing valid event is what failure_reason should reflect."
+    )
+    type_records = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and type_name in r.getMessage()
+    ]
+    assert type_records, (
+        f"Expected a WARNING log naming the type {type_name}; got "
+        f"{[r.getMessage() for r in caplog.records]}. The producer bug "
+        f"must be recorded — silently swallowing it would erase the only "
+        f"signal that the producer's contract is broken."
+    )
 
 
 def test_handles_unreadable_file_gracefully(tmp_path):

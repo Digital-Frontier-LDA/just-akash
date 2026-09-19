@@ -1200,6 +1200,23 @@ jobs:
               echo "::endgroup::"; exit 1
             fi
             unset SDL_TEMPLATE
+            # ⛔ ARCHIVE THE PRIOR ATTEMPT'S LOG BEFORE WIPING IT (#389 follow-up).
+            # LAST_KNOWN_DIAG closes the helper-succeeded-but-DIAG_CODE-was-empty
+            # gap (it captures on every non-empty read). It does NOT close the
+            # gap where the helper itself fails: `uv run` errors (cold cache,
+            # lockfile drift, harness `cwd=tmp_path` without a pyproject.toml)
+            # make DIAG_CODE="" via fail-open, but the log still has a valid
+            # Code event. Without archiving, the next iteration's `rm -f`
+            # wipes that event and the post-loop verdict finds nothing.
+            # Archive the prior log verbatim (only when non-empty — an empty
+            # prior attempt would still need an archive slot, but `cp /dev/null`
+            # would copy a 0-byte file that the post-loop walk can skip). The
+            # post-loop verdict walks /tmp/ja.log.* in REVERSE chronological
+            # order, taking the FIRST non-empty diag read as POST_DIAG. Pinned
+            # by test_archive_walk_recovers_priors_after_helper_fail_open.
+            if [ -s /tmp/ja.log ] && [ -n "${attempt:-}" ]; then
+              cp /tmp/ja.log /tmp/ja.log."$attempt"
+            fi
             rm -f /tmp/ja.log
             DEPLOY_RC=0
             "${JA[@]}" deploy --sdl /tmp/runner-sdl.minted.yaml --deposit "$REQUIRED_DEPOSIT_USD" --bid-wait 60 \
@@ -1813,6 +1830,52 @@ jobs:
             # is the distinction. The downstream consumer (blazing) widens its
             # accept-list to match.
             POST_DIAG=$(diag_last_code /tmp/ja.log)
+            # ⛔ ARCHIVE WALK (#389 follow-up, code-review #2). LAST_KNOWN_DIAG
+            # closes the helper-succeeded-but-DIAG_CODE-was-empty gap (capture
+            # is gated on non-empty DIAG_CODE), but it does NOT close the
+            # gap where the helper itself fails: a `uv run` error (cold cache,
+            # lockfile drift, harness cwd without pyproject.toml) makes the
+            # diag_last_code wrapper fail-open, DIAG_CODE="" for that
+            # attempt, LAST_KNOWN_DIAG un-updated, then the next iteration's
+            # `rm -f /tmp/ja.log` wipes the only evidence that this attempt
+            # HAD a valid code earlier in the run. Without archiving the
+            # post-loop verdict has nothing to fall back to and routes to
+            # PROVIDER_CAPACITY — the exact misattribution this PR exists
+            # to demote, but the one LAST_KNOWN_DIAG does not catch.
+            #
+            # Walk /tmp/ja.log.* in REVERSE chronological order (latest
+            # attempt's archive first; older ones after), running each
+            # through diag_last_code. Take the FIRST non-empty result.
+            # Reverse order is load-bearing: the most recent failed attempt
+            # is more diagnostic than older ones (state of the cluster,
+            # network conditions, etc.) so prefer it. An empty result from
+            # the live log + empty archives means deploy.py raised before
+            # reaching the diagnostic emitter (the legitimate
+            # PROVIDER_CAPACITY case).
+            #
+            # ⛔ ITERATE BY ATTEMPT NUMBER, NOT BY GLOB+SORT. `ls -1r` is
+            # LEXICAL sort: with MAX_ATTEMPTS >= 10, attempt `.10` sorts
+            # before `.2`, so the walk would silently pick an OLDER
+            # diagnostic over the newest. MAX_ATTEMPTS=3 today hides the
+            # bug; MAX_ATTEMPTS=10 (entirely plausible for a flaky
+            # provider) makes it live. Iterating MAX_ATTEMPTS..1 and
+            # reading /tmp/ja.log.<a> if it exists is deterministic,
+            # needs no sort, and cannot drift with the filename format.
+            # Pinned by test_archive_walk_iterates_attempt_numbers_not_glob_sort
+            # (mechanism) AND test_archive_walk_prefers_newest_at_ten_plus_attempts
+            # (property — newest wins even when 11+ archives exist).
+            if [ -z "$POST_DIAG" ]; then
+              for a in $(seq "${MAX_ATTEMPTS}" -1 1); do
+                archive="/tmp/ja.log.$a"
+                [ -f "$archive" ] || continue
+                attempt_code=$(diag_last_code "$archive" 2>/dev/null || echo "")
+                if [ -n "$attempt_code" ]; then
+                  POST_DIAG="$attempt_code"
+                  echo "::notice title=just-akash archive walk::recovered diagnostic '$attempt_code' from $archive after helper fail-open on the live log"
+                  break
+                fi
+              done
+            fi
             # ⛔ POST_DIAG IS BOUNDED TO THE Code ENUM (fail-closed). The
             # `diag_last_code` helper returns whatever JSON it parses; an
             # arbitrary string from a corrupted /tmp/ja.log or a future
@@ -1824,11 +1887,12 @@ jobs:
             # test_post_diag_is_bounded_by_the_code_enum_with_a_declared_fallback.
             #
             # ⛔ THREE-TIER VERDICT (#389 follow-up). Prefer POST_DIAG (this
-            # attempt's diagnostic); fall back to LAST_KNOWN_DIAG (preserved
-            # from any prior successful read this run); fall back to
-            # PROVIDER_CAPACITY. The bucket is LAST, not FIRST — accepting
-            # the catch-all would auto-accept every failure and defeat the
-            # typed-diagnostic effort.
+            # attempt's diagnostic, possibly recovered from an archive);
+            # fall back to LAST_KNOWN_DIAG (preserved from any prior
+            # successful read this run); fall back to PROVIDER_CAPACITY.
+            # The bucket is LAST, not FIRST — accepting the catch-all would
+            # auto-accept every failure and defeat the typed-diagnostic
+            # effort.
             #
             # EFFECTIVE_DIAG is the union of POST_DIAG and LAST_KNOWN_DIAG —
             # the value the case below actually matches AND the value we
@@ -1856,6 +1920,15 @@ jobs:
                 echo "::error title=No provider bid::No eligible provider bid within the window across ${MAX_ATTEMPTS} attempts, and no akash-diag code was emitted. This is a market/capacity condition, not a code failure — investigate per-provider health."
                 ;;
             esac
+            # ⛔ ARCHIVE CLEANUP (#389 follow-up). Remove /tmp/ja.log.*
+            # archives after the verdict is bound. Archives from a previous
+            # invocation would survive only inside a single job's lifetime
+            # (each Akash provisioning job gets a fresh runner), but the
+            # pattern here matches the per-attempt wipe: anything left
+            # after a successful failure_reason binding is dead weight,
+            # and a stale archive from a misconfigured re-run could
+            # mislead the next archive walk if the helper fails twice.
+            rm -f /tmp/ja.log.* 2>/dev/null || true
           fi
           exit 1
 

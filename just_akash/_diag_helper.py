@@ -22,17 +22,21 @@ helper exists to fix at the machine-readable layer.
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from pathlib import Path
+
+
+log = logging.getLogger(__name__)
 
 
 def read_last_error_code(log_path: str | Path) -> str:
     """Return the LAST ``{"type":"akash-diag","level":"error","code":"X"}`` event's ``code``.
 
     Returns an empty string if the file is missing, empty, unreadable, or
-    contains no error-level akash-diag events. Malformed JSON lines are
-    skipped without raising — diagnostics must never break the operation
-    they report on.
+    contains no error-level akash-diag events. Malformed JSON lines and
+    malformed event shapes are skipped without raising — diagnostics must
+    never break the operation they report on.
     """
     last = ""
     try:
@@ -59,25 +63,33 @@ def read_last_error_code(log_path: str | Path) -> str:
                     # them to `last`. The signature is `-> str`, the consumer
                     # (`failure_reason=<code>`) types it as str, and the
                     # YAML emission path would emit `failure_reason=42` for
-                    # an integer code without raising. Raise on non-string
-                    # so the contract violation is loud.
+                    # an integer code without raising.
                     #
-                    # ⛔ COMPOUNDS WITH #389's LAST_KNOWN_DIAG FIX (Change 1).
-                    # A raise here makes `uv run` (the helper's caller in
-                    # runner-pool.yml) exit non-zero, which the workflow's
-                    # diag_last_code wrapper treats as fail-open: DIAG_CODE=""
-                    # for that attempt. Without Change 1's preservation,
-                    # the prior good value would be lost; with Change 1,
-                    # LAST_KNOWN_DIAG carries the cause forward. The two
-                    # fixes are paired — drop either one and a non-string
-                    # code wipes the diagnostic.
+                    # Skip-and-log-at-warning (NOT raise). A raise poisons
+                    # this helper's diagnostic surface for the whole log: the
+                    # very first malformed event in an otherwise-valid run
+                    # would make the helper exit non-zero, the workflow's
+                    # diag_last_code wrapper is fail-open so DIAG_CODE=""
+                    # for that attempt, and on attempt 1 with no
+                    # LAST_KNOWN_DIAG fallback the post-loop verdict routes
+                    # to PROVIDER_CAPACITY — the exact misattribution this
+                    # PR series exists to demote. Skip-and-log keeps the
+                    # valid code AND records the producer's contract
+                    # violation for the human reader (warning-level so it
+                    # surfaces in CI logs without poisoning the diagnostic
+                    # surface). Pinned by
+                    # test_non_string_code_is_skipped_and_warning_logged
+                    # (parametrised over int/float/bool/list/dict) and the
+                    # workflow-level
+                    # test_no_provider_capacity_misattribution_when_malformed_event_precedes_valid_one.
                     if not isinstance(code, str):
-                        raise TypeError(
-                            f"akash-diag code must be str; got "
-                            f"{type(code).__name__}={code!r}. This is a "
-                            f"contract violation by the producer — flagging "
-                            f"loudly rather than silently coercing."
+                        log.warning(
+                            "akash-diag code must be str; got %s=%r. "
+                            "Skipping malformed event and continuing scan.",
+                            type(code).__name__,
+                            code,
                         )
+                        continue
                     if code:
                         last = code
     except (FileNotFoundError, IndexError, OSError):

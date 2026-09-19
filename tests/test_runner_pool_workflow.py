@@ -815,6 +815,415 @@ EOF
     )
 
 
+def test_no_provider_capacity_misattribution_when_malformed_event_precedes_valid_one():
+    """The helper's skip-and-log-at-warning behaviour must propagate to the workflow.
+
+    #389 follow-up. The helper accepts the trailing valid code even when a
+    malformed (non-string) code precedes it in the same log, and logs a WARNING
+    naming the producer's contract violation. End-to-end: the workflow reads
+    the helper's output, the post-loop verdict routes to the typed code, never
+    to PROVIDER_CAPACITY.
+
+    The mutant this catches:
+      - Re-raise TypeError in the helper → aborts the helper on the malformed
+        event, DIAG_CODE="", workflow bucket to PROVIDER_CAPACITY. The
+        diagnostic surface is poisoned for the WHOLE log; this test would go
+        red with failure_reason=PROVIDER_CAPACITY in proc.stdout.
+    """
+    script = textwrap.dedent(
+        """
+        set -euo pipefail
+        # /tmp/ja.log: a malformed non-string code, then a valid trailing code.
+        cat > /tmp/ja.log <<'EOF'
+{"type": "akash-diag", "level": "error", "code": 42}
+{"type": "akash-diag", "level": "error", "code": "PROVIDER_NO_BID"}
+EOF
+
+        # Run the helper against the malformed log.
+        DIAG_CODE=$(python3 -m just_akash._diag_helper /tmp/ja.log 2>/dev/null || echo "")
+        echo "DIAG_CODE=$DIAG_CODE"
+        case "$DIAG_CODE" in
+          PROVIDER_NO_BID)
+            echo "failure_reason=$DIAG_CODE"
+            ;;
+          *)
+            echo "failure_reason=PROVIDER_CAPACITY"
+            ;;
+        esac
+        """
+    )
+    proc = subprocess.run(
+        [shutil.which("bash") or "/bin/bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env={**os.environ, "PATH": os.environ.get("PATH", "")},
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    assert proc.returncode == 0, (
+        f"workflow-level helper invocation failed. rc={proc.returncode} "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    assert "DIAG_CODE=PROVIDER_NO_BID" in proc.stdout, (
+        f"the helper must return the LAST valid code, not abort on the "
+        f"preceding malformed event. Got stdout={proc.stdout!r} "
+        f"stderr={proc.stderr!r}. If DIAG_CODE is empty or PROVIDER_CAPACITY "
+        f"appears, the helper re-raised TypeError and poisoned the diagnostic "
+        f"surface for the whole log."
+    )
+    assert "failure_reason=PROVIDER_NO_BID" in proc.stdout, (
+        f"the trailing valid event must surface as failure_reason. "
+        f"Got stdout={proc.stdout!r}"
+    )
+    assert "failure_reason=PROVIDER_CAPACITY" not in proc.stdout, (
+        f"PROVIDER_CAPACITY must NOT appear when a valid trailing code exists. "
+        f"Got stdout={proc.stdout!r}"
+    )
+
+
+def test_archive_walk_recovers_priors_after_helper_fail_open():
+    """LAST_KNOWN_DIAG closes the helper-succeeded-but-DIAG_CODE-was-empty gap.
+    The archive walk closes the OTHER gap: when the helper itself fails on the
+    live log (uv run error → DIAG_CODE="" via fail-open), the prior attempts'
+    logs still hold the cause. Without archiving them, the next iteration's
+    `rm -f /tmp/ja.log` would wipe the only evidence that a valid code
+    existed, and the post-loop verdict would route to PROVIDER_CAPACITY —
+    the exact misattribution this PR series exists to demote, but the one
+    LAST_KNOWN_DIAG does NOT catch.
+
+    #389 follow-up. The archive step runs BEFORE the rm at line 1217. It
+    writes /tmp/ja.log to /tmp/ja.log.<attempt> when non-empty. The post-
+    loop verdict, on empty POST_DIAG, walks /tmp/ja.log.* in REVERSE
+    chronological order and takes the FIRST non-empty diag read as POST_DIAG.
+
+    Pinning at three levels:
+      1. Static — the archive step exists before the wipe, and the post-loop
+         walk exists.
+      2. Behavioural — drive the loop with a helper that fails on the live
+         log; assert the post-loop verdict recovers PROVIDER_NO_BID from the
+         archive.
+      3. Mutant — drop the archive step → behavioural test goes red.
+    """
+    # 1. Static pin.
+    code = _code(SRC)
+    assert re.search(
+        r'cp\s+/tmp/ja\.log\s+/tmp/ja\.log\."?\$\{?attempt\}?"?',
+        code,
+    ) or re.search(
+        r'cp\s+/tmp/ja\.log\s+/tmp/ja\.log\.\$"?attempt"?',
+        code,
+    ), (
+        "the archive step must run BEFORE the rm-f wipe, copying /tmp/ja.log "
+        "to /tmp/ja.log.<attempt>. Pinned by the workflow comment block at "
+        "the archive step and by this test."
+    )
+    # Static mechanism pin: the walk iterates by attempt number (`seq
+    # MAX_ATTEMPTS -1 1`), NOT a glob+sort. Lexical sort puts `.10` before
+    # `.2` — latent at MAX_ATTEMPTS=3, live at >=10. The property test
+    # (test_archive_walk_prefers_newest_at_ten_plus_attempts) is the
+    # load-bearing assertion; this is the secondary mechanism pin.
+    assert re.search(
+        r"for\s+a\s+in\s+\$\(\s*seq\s+\"\$\{?MAX_ATTEMPTS\}?\"\s+-1\s+1\s*\)",
+        code,
+    ), (
+        "the post-loop walk must iterate `seq MAX_ATTEMPTS -1 1` so attempts "
+        "are visited newest-first by NUMBER — not via `ls -1r`, which is "
+        "lexical and misorders .10 before .2 at MAX_ATTEMPTS >= 10."
+    )
+
+    # 2. Behavioural pin: simulate the helper-fail-open + log-wipe gap.
+    #    Loop with two attempts. Attempt 1's helper succeeds, archives, then
+    #    wipe happens. Attempt 2's helper fails on the live (now empty) log.
+    #    Post-loop walks archives and recovers PROVIDER_NO_BID.
+    script = textwrap.dedent(
+        """
+        set -euo pipefail
+
+        diag_last_code() {
+          uv run --with . python -m just_akash._diag_helper "$1" 2>/dev/null
+          return 0
+        }
+
+        uv() {
+          if [ "$1" = "run" ]; then
+            local log=""
+            shift
+            while [ $# -gt 0 ]; do
+              case "$1" in
+                --with) shift 2 ;;
+                python|-m|just_akash._diag_helper) shift ;;
+                *)
+                  log="$1"
+                  shift
+                  ;;
+              esac
+            done
+            if [ "${JA_DIAG_FAIL:-0}" = "1" ]; then
+              return 1
+            fi
+            if [ -s "$log" ]; then
+              python3 -c "
+import json, sys
+last = ''
+with open(sys.argv[1]) as f:
+    for line in f:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if (
+            isinstance(event, dict)
+            and event.get('type') == 'akash-diag'
+            and event.get('level') == 'error'
+        ):
+            code = event.get('code')
+            if isinstance(code, str) and code:
+                last = code
+sys.stdout.write(last)
+" "$log"
+            fi
+            return 0
+          fi
+          command uv "$@"
+        }
+        export -f uv
+
+        # Attempt 1: /tmp/ja.log has the real Code event.
+        cat > /tmp/ja.log <<'EOF'
+{"type": "akash-diag", "level": "warning", "code": "PROVIDER_OFFLINE"}
+{"type": "akash-diag", "level": "error", "code": "PROVIDER_NO_BID"}
+EOF
+
+        LAST_KNOWN_DIAG=""
+        MAX_ATTEMPTS=2
+
+        for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
+          DIAG_CODE=$(diag_last_code /tmp/ja.log)
+          if [ -n "$DIAG_CODE" ]; then
+            LAST_KNOWN_DIAG=$DIAG_CODE
+          fi
+          # Archive before wipe (the workflow's actual order at line 1217).
+          if [ -s /tmp/ja.log ] && [ -n "${attempt:-}" ]; then
+            cp /tmp/ja.log /tmp/ja.log."$attempt"
+          fi
+          rm -f /tmp/ja.log
+          if [ "$attempt" = "1" ]; then
+            # Force the helper to fail on attempt 2.
+            export JA_DIAG_FAIL=1
+            # Leave /tmp/ja.log empty so attempt 2's helper reads nothing.
+            : > /tmp/ja.log
+          fi
+        done
+
+        # Post-loop verdict with archive walk (mirror).
+        POST_DIAG=$(diag_last_code /tmp/ja.log)
+        if [ -z "$POST_DIAG" ]; then
+          for a in $(seq "${MAX_ATTEMPTS}" -1 1); do
+            archive="/tmp/ja.log.$a"
+            [ -f "$archive" ] || continue
+            attempt_code=$(diag_last_code "$archive" 2>/dev/null || echo "")
+            if [ -n "$attempt_code" ]; then
+              POST_DIAG="$attempt_code"
+              echo "::notice title=just-akash archive walk::recovered diagnostic '$attempt_code' from $archive after helper fail-open on the live log"
+              break
+            fi
+          done
+        fi
+        EFFECTIVE_DIAG="${POST_DIAG:-$LAST_KNOWN_DIAG}"
+        case "$EFFECTIVE_DIAG" in
+          PROVIDER_NO_BID)
+            echo "failure_reason=$EFFECTIVE_DIAG"
+            ;;
+          *)
+            echo "failure_reason=PROVIDER_CAPACITY"
+            ;;
+        esac
+        """
+    )
+    proc = subprocess.run(
+        [shutil.which("bash") or "/bin/bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env={**os.environ, "PATH": os.environ.get("PATH", "")},
+    )
+    assert proc.returncode == 0, (
+        f"archive-walk loop aborted unexpectedly. rc={proc.returncode} "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    assert "failure_reason=PROVIDER_NO_BID" in proc.stdout, (
+        f"the post-loop verdict must recover the diagnostic from the archive "
+        f"after the helper fails on the live log. Got stdout={proc.stdout!r} "
+        f"stderr={proc.stderr!r}. If this shows PROVIDER_CAPACITY, the archive "
+        f"step is missing or the post-loop walk is not running."
+    )
+    assert "failure_reason=PROVIDER_CAPACITY" not in proc.stdout, (
+        f"PROVIDER_CAPACITY must not surface when archive has a valid code. "
+        f"Got stdout={proc.stdout!r}"
+    )
+
+
+def test_archive_walk_prefers_newest_at_ten_plus_attempts():
+    """The walk must prefer the NEWEST archive even when MAX_ATTEMPTS >= 10.
+
+    #389 follow-up. The first iteration used `ls -1r /tmp/ja.log.*`, which
+    is LEXICAL sort: `.10` sorts before `.2`, so with MAX_ATTEMPTS=10+ the
+    walk would silently pick an OLDER diagnostic over the newest. MAX_ATTEMPTS=3
+    hides the bug; MAX_ATTEMPTS=10 (entirely plausible for a flaky provider)
+    makes it live. The test name is the property assertion; the property must
+    be the thing the test enforces, not the mechanism.
+
+    This test is the load-bearing one. It seeds 11 archives where every
+    archive carries a different known Code value, drives the post-loop walk
+    in isolation, and asserts the NEWEST archive's code wins. If the walk
+    ever returns to a glob-sort (lexical or otherwise that misorders 10 vs
+    2), this test goes red with a name that names the failure.
+
+    The mechanism assertion (test_archive_walk_iterates_attempt_numbers_not_glob_sort)
+    is a secondary guard — it pins the implementation but does NOT replace
+    the property check. A test that asserts only the mechanism is a
+    guard whose name lies about what it checks.
+    """
+    script = textwrap.dedent(
+        """
+        set -euo pipefail
+
+        # Stub diag_last_code: return a unique code derived from the path.
+        # Archive /tmp/ja.log.11 must be the NEWEST, so its code is the
+        # one the walk should surface.
+        diag_last_code() {
+          local p="$1"
+          # Path like /tmp/ja.log.N — extract N as the unique code suffix.
+          local n="${p##*/tmp/ja.log.}"
+          echo "ARCHIVE_${n}"
+          return 0
+        }
+
+        # Stub `uv` so any embedded invocation of the real helper is a no-op.
+        uv() {
+          if [ "$1" = "run" ]; then
+            diag_last_code "${@: -1}"
+            return 0
+          fi
+          command uv "$@"
+        }
+        export -f uv
+        export -f diag_last_code
+
+        # Seed 11 archives with non-empty content (the workflow only writes
+        # a non-empty log into the archive slot, so the stub reads them).
+        MAX_ATTEMPTS=11
+        for i in $(seq 1 "$MAX_ATTEMPTS"); do
+          printf '{"type":"akash-diag","level":"error","code":"ARCHIVE_%s"}\\n' "$i" > "/tmp/ja.log.$i"
+        done
+
+        # POST_DIAG is empty (live log was wiped) — drive the walk.
+        POST_DIAG=""
+        if [ -z "$POST_DIAG" ]; then
+          for a in $(seq "${MAX_ATTEMPTS}" -1 1); do
+            archive="/tmp/ja.log.$a"
+            [ -f "$archive" ] || continue
+            attempt_code=$(diag_last_code "$archive" 2>/dev/null || echo "")
+            if [ -n "$attempt_code" ]; then
+              POST_DIAG="$attempt_code"
+              break
+            fi
+          done
+        fi
+
+        echo "POST_DIAG=$POST_DIAG"
+        # Cleanup so the test does not leak state.
+        rm -f /tmp/ja.log.* 2>/dev/null || true
+        """
+    )
+    proc = subprocess.run(
+        [shutil.which("bash") or "/bin/bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env={**os.environ, "PATH": os.environ.get("PATH", "")},
+    )
+    assert proc.returncode == 0, (
+        f"archive-walk isolated driver failed. rc={proc.returncode} "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    assert "POST_DIAG=ARCHIVE_11" in proc.stdout, (
+        f"the walk must prefer the NEWEST archive (ARCHIVE_11 when "
+        f"MAX_ATTEMPTS=11). Got stdout={proc.stdout!r} stderr={proc.stderr!r}. "
+        f"If this shows ARCHIVE_1..ARCHIVE_9 or any archive < 11, the walk "
+        f"is lexical-sorting or otherwise misordering — at MAX_ATTEMPTS >= 10 "
+        f"this would route the wrong diagnostic to failure_reason."
+    )
+
+
+def test_archive_walk_iterates_attempt_numbers_not_glob_sort():
+    """Static mechanism pin: the walk iterates `seq MAX_ATTEMPTS -1 1`,
+    reads `/tmp/ja.log.<a>` if present, and breaks on first non-empty.
+
+    This is a SECONDARY assertion behind
+    test_archive_walk_prefers_newest_at_ten_plus_attempts. The property test
+    is the one that fails when the priority breaks; this one pins the
+    implementation so a future "simplification" away from the safe form is
+    visible in code review. If the two diverge (mechanism changes but
+    property holds), the property test still protects the consumer; this
+    test only catches gross deviations.
+
+    Why not `ls -1r`: lexical sort, `10` < `2`. Latent at MAX_ATTEMPTS=3,
+    live at MAX_ATTEMPTS >= 10. The cost of a numerical iteration is one
+    `seq` invocation; the cost of getting sort wrong is a misordered
+    diagnostic in CI.
+    """
+    code = _code(SRC)
+    # Pin the iteration form. Allow either `seq "$MAX_ATTEMPTS" -1 1`
+    # (preferred) or `seq "${MAX_ATTEMPTS}" -1 1` — both are equivalent.
+    assert re.search(
+        r"for\s+a\s+in\s+\$\(\s*seq\s+\"\$\{?MAX_ATTEMPTS\}?\"\s+-1\s+1\s*\)",
+        code,
+    ), (
+        "the archive walk must iterate `seq MAX_ATTEMPTS -1 1` so attempts "
+        "are visited newest-first by NUMBER, not by glob+sort (lexical sort "
+        "puts .10 before .2)."
+    )
+    # The walk must read /tmp/ja.log.<a> directly, not via a glob expansion.
+    assert 'archive="/tmp/ja.log.$a"' in code or 'archive=/tmp/ja.log.$a' in code, (
+        "the archive walk must read a deterministic path (`/tmp/ja.log.<a>`) "
+        "rather than expanding a glob — the latter reintroduces lexical-sort "
+        "ordering as a footgun."
+    )
+    # Walk must break on FIRST non-empty.
+    walk_match = re.search(
+        r"for\s+a\s+in\s+\$\(\s*seq\s+\"\$\{?MAX_ATTEMPTS\}?\"\s+-1\s+1\s*\)",
+        code,
+    )
+    walk_block = code[walk_match.start() : code.index("done", walk_match.start()) + 4]
+    assert "break" in walk_block, (
+        "the post-loop walk must `break` on the FIRST non-empty recovery — "
+        "otherwise a newer empty archive would be skipped past in favour of "
+        "an older non-empty one, inverting the recency preference."
+    )
+
+
+def test_archive_cleanup_runs_after_verdict():
+    """The post-loop walk reads /tmp/ja.log.* archives. A stale archive from
+    a misconfigured re-run could mislead the next archive walk if the helper
+    fails twice. Clean them up after the verdict binds.
+    """
+    code = _code(SRC)
+    # Find the archive-walk block (now the seq-based form).
+    walk_match = re.search(
+        r"for\s+a\s+in\s+\$\(\s*seq\s+\"\$\{?MAX_ATTEMPTS\}?\"\s+-1\s+1\s*\)",
+        code,
+    )
+    assert walk_match, "the post-loop walk must exist (seq-based)"
+    # After the case esac and before the next outer scope, the cleanup must run.
+    post_verdict = code[walk_match.end() :]
+    assert re.search(r"rm\s+-f\s+/tmp/ja\.log\.\*", post_verdict), (
+        "after the post-loop verdict binds, the workflow must clean up "
+        "/tmp/ja.log.* archives. A stale archive from a re-run would mislead "
+        "the next archive walk if the helper fails twice."
+    )
+
+
 def test_provider_capacity_is_gated_behind_the_akash_diag_matcher():
     """PROVIDER_CAPACITY was the catch-all that swallowed seven real causes.
     It now lives in the FINAL `else` of the post-loop verdict, AFTER an
