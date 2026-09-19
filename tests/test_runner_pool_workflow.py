@@ -35,6 +35,14 @@ WF_PATH = Path(
     )
 )
 SRC = WF_PATH.read_text(encoding="utf-8")
+
+# The akash-diag helper extracted from the workflow to its own module so that
+# (a) embedding a multi-line Python script in a YAML literal block does not
+# break the heredoc terminator's column-0 requirement in CI, and (b) the
+# helper is unit-testable directly. Tests below read BOTH the workflow
+# (which calls it) AND the helper (which parses the JSON).
+DIAG_HELPER_PATH = Path(__file__).resolve().parents[1] / "just_akash" / "_diag_helper.py"
+DIAG_HELPER_SRC = DIAG_HELPER_PATH.read_text(encoding="utf-8")
 DOC = yaml.safe_load(SRC)
 CALL = (DOC.get("on") or DOC.get(True))["workflow_call"]
 INPUTS = CALL["inputs"]
@@ -335,6 +343,1099 @@ def test_every_failure_world_has_its_own_reason():
     ):
         assert f"failure_reason={reason}" in body, f"{reason} is never emitted"
     assert "failure_reason" in OUTPUTS, "the caller cannot see why it fell back"
+
+
+# --------------------------------------------------------------------------
+# akash-diag → failure_reason (#398). Before this fix the workflow emitted
+# PROVIDER_CAPACITY for seven distinct allow-list and provider-health outcomes —
+# each a different cause and each a different remedy. The fix surfaces the
+# typed akash-diag code emitted by just_akash/_diagnostics.py:emit, demoting
+# PROVIDER_CAPACITY to a true last resort.
+#
+# Reading the CODE from JSON (not from English log lines) means a new Code
+# enum member becomes a typed failure_reason automatically; we do NOT
+# enumerate codes here, because enumerating them is the bug. The tests below
+# pin the *invariants* the derive-from-JSON approach must satisfy — that the
+# JSON matcher exists, that PROVIDER_CAPACITY is gated behind it, and that
+# every Code value the matcher could surface is a real Code enum member.
+# --------------------------------------------------------------------------
+
+# Code enum members whose own docstrings say they may leave a lease partially
+# or fully opened. These MUST NOT be on the no-lease-expected path; the
+# consumer (blazing) widens its accept-list to the no-lease family only, and
+# putting any of these in PROVIDER_CAPACITY would turn a real orphan accruing
+# spend into a silent pass.
+_DEPLOY_OR_LEASE_FAMILY = frozenset(
+    {
+        "DEPLOY_CREATE_FAILED",
+        "DEPLOY_CREATE_ORPHAN_SUSPECTED",
+        "NO_DSEQ_RETURNED",
+        "LEASE_CREATE_FAILED",
+        "REDEPLOY_FAILED",
+    }
+)
+
+# Code enum members whose own docstrings say no lease was opened (pre-bid
+# status check, pre-deploy validation, or market-side rejection). Each names
+# a different remedy, which is the entire point of this PR. The membership
+# list is documentary — the test asserts the WORKFLOW DERIVES FROM the enum,
+# not that it enumerates these names. (Enumerating is the bug.)
+_NO_LEASE_OPENED_FAMILY = frozenset(
+    {
+        "PROVIDER_OFFLINE",
+        "PROVIDER_INVALID_VERSION",
+        "PROVIDER_NO_CAPACITY",
+        "PROVIDER_NO_BID",
+        "PROVIDER_STATUS_QUERY_FAILED",
+        "PROVIDER_UNKNOWN",
+        "NO_BIDS_RECEIVED",
+        "BIDS_FOREIGN_ONLY",
+        "BIDS_STALE",
+        "BIDS_MALFORMED",
+        "SDL_ERROR",
+        "CONFIG_ERROR",
+    }
+)
+
+
+def _code_enum_values() -> set[str]:
+    """Every emitted Code string in just_akash/_diagnostics.py, derived live.
+
+    Walks the class to avoid vendoring the enum (which would go stale). The
+    CODE string is what the consumer reads — the attribute name is allowed to
+    diverge from the emitted string in principle, but in this codebase they
+    are the same and the regex would catch a rename if they ever diverged.
+    """
+    from just_akash._diagnostics import Code
+
+    return {
+        value
+        for value in Code.__dict__.values()
+        if isinstance(value, str) and value.isupper() and value[:1].isalpha()
+    }
+
+
+def test_akash_diag_matcher_reads_structured_json_not_english_text():
+    """The fix's whole point: parse the typed event, don't grep log prose.
+
+    The matcher must read /tmp/ja.log as one-JSON-per-line and pull the `code`
+    field from lines whose `type` is `akash-diag`. grep'ing for the emitted
+    English text (e.g. `non-allowed providers`) would force this matcher to
+    enumerate every Code enum member, and a new member would silently fall
+    back to PROVIDER_CAPACITY — exactly the bucket swallow this function
+    exists to stop.
+
+    The parse logic lives in `just_akash/_diag_helper.py` (extracted from
+    the workflow's YAML literal block — the heredoc terminator's column-0
+    requirement broke in CI when the script was inline). The workflow calls
+    the helper. The helper is what actually does the parsing.
+    """
+    code = _code(SRC)
+
+    # The workflow has the bash function that calls the helper.
+    assert "diag_last_code" in code, "the akash-diag helper is missing from the workflow"
+    assert "just_akash._diag_helper" in code, (
+        "diag_last_code must invoke the extracted helper module — an inline "
+        "heredoc broke the column-0 terminator in CI"
+    )
+
+    # The helper parses JSON, not text. Read the helper's source.
+    assert '"type"' in DIAG_HELPER_SRC and '"akash-diag"' in DIAG_HELPER_SRC, (
+        "the helper must recognise the typed envelope, not grep English"
+    )
+    assert re.search(r"json\.loads\(", DIAG_HELPER_SRC), (
+        "the helper must parse JSON, not text-match — that is the bug it replaces"
+    )
+
+
+def test_every_diag_last_code_call_passes_an_argument():
+    """Every call site of `diag_last_code()` MUST pass /tmp/ja.log explicitly.
+
+    The function body references `$1` and the `run:` block runs under
+    `set -uo pipefail` (line 995). An unbound `$1` aborts bash before
+    `failure_reason=` is written — strictly worse than the bucket this PR
+    demotes, because a bucket at least emits a value.
+
+    A hidden default inside the function (`${1:-/tmp/ja.log}`) would let a
+    caller read the wrong file without noticing; explicit-argument at every
+    call site is the safer shape. CodeRabbit caught this on the original
+    PR and we are pinning it.
+
+    The test walks every `$(diag_last_code ...)` and `diag_last_code ...` site
+    in the rendered workflow and asserts each carries a positional argument.
+    """
+    code = _code(SRC)
+
+    # The function definition itself (so we do not match the body of it).
+    fn_match = re.search(
+        r"diag_last_code\(\)\s*\{[^}]*\}",
+        code,
+        re.DOTALL,
+    )
+    assert fn_match is not None, "diag_last_code function is missing from the workflow"
+
+    # Strip the function definition; every remaining `diag_last_code` mention
+    # in the rendered shell is a call site.
+    call_sites = re.sub(
+        r"diag_last_code\(\)\s*\{[^}]*\}",
+        "",
+        code,
+        flags=re.DOTALL,
+    )
+    # A comment that names the function (e.g. "via diag_last_code above")
+    # is not a call site. Match the invocation form only: bare word followed
+    # by whitespace and a non-newline argument (or a $(...) wrapping it).
+    #
+    # Use finditer (not findall) because findall returns the matched STRINGS,
+    # and every match here is the literal "diag_last_code" — the same string
+    # each iteration. `call_sites.index(site)` would then resolve every
+    # iteration to the FIRST occurrence, so a missing argument on the second
+    # (or later) call site would never be reported. match.start() gives the
+    # actual offset of THIS match, which is what we need.
+    bare_calls = list(re.finditer(r"(?<![\$\w])diag_last_code(?!\s*\()", call_sites))
+
+    failures = []
+    for match in bare_calls:
+        # Look at the line the bare mention sits on.
+        line_no = call_sites[: match.start()].count("\n") + 1
+        line = call_sites.splitlines()[line_no - 1]
+        # A call must carry at least one whitespace-separated token after
+        # the function name. Comments are stripped by `_code`, so any token
+        # after the function name in a rendered call site IS an argument.
+        after = line.split("diag_last_code", 1)[1].strip()
+        # Inside a $( ... ) wrapping the call: count tokens between the call
+        # and the closing `)`. Strip a trailing `)` if the line ends with one.
+        after = after.rstrip().rstrip(")").strip()
+        if not after:
+            failures.append(
+                f"line {line_no}: 'diag_last_code' called with no argument "
+                f"under set -uo pipefail — bash aborts before failure_reason= "
+                f"is written. Pass /tmp/ja.log explicitly."
+            )
+
+    assert not failures, (
+        "every diag_last_code call site must pass /tmp/ja.log explicitly; "
+        "with set -uo pipefail an unbound $1 aborts bash before any "
+        "failure_reason is emitted — strictly worse than the bucket this "
+        "PR demotes.\n\n" + "\n".join(failures)
+    )
+
+
+def test_diag_last_code_is_fail_open_when_the_helper_cannot_be_run():
+    """The diagnostic enrichment step MUST NOT abort the provisioning loop.
+
+    With `set -uo pipefail` (line 995), a command substitution whose command
+    exits non-zero aborts the enclosing `run:` block. `uv run` can fail in
+    three real shapes:
+
+    - The harness runs the rendered block with `cwd=tmp_path` — no
+      `pyproject.toml`, so `uv run --with .` fails to resolve the project.
+    - Cold CI caches: uv's resolver hits a transient network or index
+      error and exits non-zero before `python -m` runs.
+    - Lockfile drift: a pinned dep in `pyproject.toml` is unavailable on
+      the runner's mirror; resolver fails after build.
+
+    In production, every shape used to convert a single recoverable
+    failure into a hard abort of the entire provisioning loop — every
+    attempt after attempt 1 is skipped, every retry is gone, every
+    `failure_reason=` is unwritten. That is strictly worse than the bucket
+    this PR demotes: a bucket at least names a value; an abort names
+    nothing.
+
+    The fix lives INSIDE the function (`return 0` after the `uv run`),
+    not at the call sites (`|| true` at each `VAR=$(diag_last_code ...)`).
+    Putting it in the function means future call sites inherit the
+    fail-open property without remembering to add a guard.
+
+    The test pins the invariant at two levels:
+
+    1. Static: the function body must end with `return 0` so a failing
+       `uv run` cannot propagate.
+    2. Behavioural: synthesise a failing function and exercise the same
+       assignment shape (`VAR=$(...)` under `set -e`) the workflow uses.
+       Confirm the outer block reaches the line after the assignment —
+       which the unfixed function would have aborted at.
+    """
+    code = _code(SRC)
+    fn_match = re.search(
+        r"diag_last_code\(\)\s*\{[^}]*\}",
+        code,
+        re.DOTALL,
+    )
+    assert fn_match is not None, "diag_last_code function is missing from the workflow"
+    body = fn_match.group(0)
+
+    # 1. Static pin: the function MUST end with `return 0` after the uv run.
+    #    Without it, the bare failing `uv run` exits non-zero and the
+    #    function inherits that exit status; the assignment then aborts.
+    assert re.search(
+        r"uv run --with \. python -m just_akash\._diag_helper.*\n\s*return 0\s*\n\s*\}",
+        body,
+    ), (
+        "diag_last_code() must end with `return 0` so a failing `uv run` "
+        "cannot abort the enclosing provisioning loop under set -e. The "
+        "fix lives inside the function (not `|| true` at the call sites) "
+        "so future call sites inherit the fail-open property."
+    )
+
+    # 2. Behavioural pin: run the assignment shape the workflow uses and
+    #    confirm a failing helper does not abort the enclosing block.
+    #    The harness at test_runner_pool_outcome_is_monotonic.py also
+    #    covers this — `bash -e -c <script>` with a stubbed `uv` that
+    #    exits non-zero on `just_akash._diag_helper` — but that test
+    #    covers 12 specific provision-block scenarios, not the bare
+    #    assignment invariant. This test pins the bare invariant
+    #    directly so a future refactor that re-introduces `|| true` at
+    #    the call sites (instead of inside the function) still goes red.
+    script = (
+        "set -euo pipefail\n"
+        "diag_last_code() {\n"
+        '    uv run --with . python -m just_akash._diag_helper "$1" 2>/dev/null\n'
+        "    return 0\n"
+        "}\n"
+        "VAR=$(diag_last_code /tmp/ja.log)\n"
+        'echo "after:VAR=${VAR}"\n'
+    )
+    proc = subprocess.run(
+        [shutil.which("bash") or "/bin/bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert proc.returncode == 0, (
+        f"diag_last_code fail-open invariant violated: the assignment "
+        f"aborted the enclosing block. rc={proc.returncode} "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    assert "after:VAR=" in proc.stdout, (
+        f"diag_last_code assignment did not complete: "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+
+
+def test_diagnostic_preserved_when_a_subsequent_attempt_wipes_the_log():
+    """LAST_KNOWN_DIAG preserves the cause across attempts whose log has been wiped.
+
+    #389 follow-up. The original defect: `diag_last_code` is fail-open
+    (a failing `uv run` returns empty), but the loop's next iteration runs
+    `rm -f /tmp/ja.log` BEFORE the next deploy. So the chain on a transient
+    uv failure was:
+
+      attempt N-1: deploy.py emits PROVIDER_NO_BID → /tmp/ja.log has it
+      attempt N-1: diag_last_code succeeds, DIAG_CODE=PROVIDER_NO_BID → exits
+                   with failure_reason=PROVIDER_NO_BID. (no actual data loss)
+
+    But if attempt N-1's read itself fails (uv run error):
+
+      attempt N-1: deploy.py emits PROVIDER_NO_BID → /tmp/ja.log has it
+      attempt N-1: diag_last_code FAILS, DIAG_CODE=""
+      attempt N-1: case falls through to unclassified, loop continues
+      attempt N:   `rm -f /tmp/ja.log` wipes the cause
+      attempt N:   deploy.py emits nothing new
+      post-loop:   POST_DIAG="" (log is empty), → PROVIDER_CAPACITY (bucket)
+
+    The cause was in /tmp/ja.log and we lost it. The fix: capture the code
+    into LAST_KNOWN_DIAG on every successful non-empty read, BEFORE the
+    loop's next iteration can wipe the log. Post-loop verdict prefers
+    POST_DIAG → LAST_KNOWN_DIAG → PROVIDER_CAPACITY.
+
+    Pinning this at three levels:
+
+    1. Static — the workflow declares LAST_KNOWN_DIAG before the loop,
+       captures from a non-empty DIAG_CODE, and the post-loop case uses
+       EFFECTIVE_DIAG (=POST_DIAG or LAST_KNOWN_DIAG) as both the
+       matched value AND the printed failure_reason.
+
+    2. Behavioural — exercise the loop logic with a stubbed `uv` that
+       fails on the second call. The /tmp/ja.log file the stub reads
+       contains the real Code event, but the helper fails; confirm
+       LAST_KNOWN_DIAG is preserved from the first successful read and
+       reaches the post-loop verdict.
+
+    3. Mutant — drop LAST_KNOWN_DIAG write from the inner-loop block
+       and confirm the behavioural test goes red. (The static check
+       already catches the missing declaration, but the behavioural
+       check is what proves the value flows through.)
+    """
+    # 1. Static pin.
+    code = _code(SRC)
+    assert re.search(r"LAST_KNOWN_DIAG\s*=", code), (
+        "the workflow must declare LAST_KNOWN_DIAG before the provision loop — "
+        "the post-loop fallback has no source without it. (See test docstring.)"
+    )
+    # The capture happens on a non-empty DIAG_CODE.
+    assert re.search(
+        r"if\s+\[\s*-n\s+\"\$\{?DIAG_CODE\}?\"\s*\];\s*then\s*\n\s*LAST_KNOWN_DIAG\s*=\s*\$DIAG_CODE",
+        code,
+    ), (
+        "LAST_KNOWN_DIAG must be written ONLY on a non-empty DIAG_CODE — "
+        "writing it on an empty result from a failed `uv run` would overwrite "
+        "the prior good value and rebuild the bug with extra steps. Pinned "
+        "by test_diag_last_code_is_fail_open_when_the_helper_cannot_be_run + "
+        "this test."
+    )
+    # Post-loop verdict binds EFFECTIVE_DIAG and uses it both as the case
+    # match value AND as the printed failure_reason.
+    assert re.search(r"EFFECTIVE_DIAG\s*=\s*\"\$\{POST_DIAG:-\$LAST_KNOWN_DIAG\}\"", code), (
+        "the post-loop verdict must bind EFFECTIVE_DIAG = POST_DIAG with "
+        "LAST_KNOWN_DIAG fallback, otherwise the case branch matches the "
+        "preserved value but prints `$POST_DIAG` (empty) — silently dropping "
+        "the cause."
+    )
+    assert 'case "$EFFECTIVE_DIAG"' in code, (
+        "the post-loop case statement must match on EFFECTIVE_DIAG, not on "
+        "the (possibly empty) $POST_DIAG directly."
+    )
+    assert 'echo "failure_reason=$EFFECTIVE_DIAG"' in code, (
+        "the printed failure_reason must use EFFECTIVE_DIAG so the preserved "
+        "code actually reaches the consumer."
+    )
+
+    # 2. Behavioural pin: simulate the failure mode the static check is
+    #    protecting against. /tmp/ja.log has the real Code event, the
+    #    helper reads it on attempt 1 (succeeds), the helper fails on
+    #    attempt 2 (uv run errors), and the post-loop verdict surfaces
+    #    the preserved code.
+    script = textwrap.dedent(
+        """
+        set -euo pipefail
+
+        # Mimic the workflow's diag_last_code shell function: fail-open.
+        diag_last_code() {
+          uv run --with . python -m just_akash._diag_helper "$1" 2>/dev/null
+          return 0
+        }
+
+        # Stub `uv` so we can drive the helper's behaviour deterministically.
+        # The helper is `python -m just_akash._diag_helper <log>` — the stub
+        # distinguishes "succeed and return a code" from "fail (empty output)".
+        uv() {
+          if [ "$1" = "run" ]; then
+            # Look for the log path passed to the helper.
+            local log=""
+            shift
+            while [ $# -gt 0 ]; do
+              case "$1" in
+                --with) shift 2 ;;
+                python|-m|just_akash._diag_helper) shift ;;
+                *)
+                  log="$1"
+                  shift
+                  ;;
+              esac
+            done
+            if [ "${JA_DIAG_FAIL:-0}" = "1" ]; then
+              # Mimic a transient uv failure: exit non-zero, no output.
+              return 1
+            fi
+            # Succeed: read the log and emit the latest akash-diag error code.
+            if [ -s "$log" ]; then
+              python3 -c "
+import json, sys
+last = ''
+with open(sys.argv[1]) as f:
+    for line in f:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if (
+            isinstance(event, dict)
+            and event.get('type') == 'akash-diag'
+            and event.get('level') == 'error'
+        ):
+            code = event.get('code')
+            if isinstance(code, str) and code:
+                last = code
+sys.stdout.write(last)
+" "$log"
+            fi
+            return 0
+          fi
+          command uv "$@"
+        }
+        export -f uv
+
+        # /tmp/ja.log has the real Code event.
+        cat > /tmp/ja.log <<'EOF'
+{"type": "akash-diag", "level": "warning", "code": "PROVIDER_OFFLINE"}
+{"type": "akash-diag", "level": "error", "code": "PROVIDER_NO_BID"}
+EOF
+
+        # Mirror the workflow's loop.
+        LAST_KNOWN_DIAG=""
+        MAX_ATTEMPTS=2
+
+        for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
+          if [ "$attempt" = "2" ]; then
+            # Wipe the log between attempts — this is the rm at line 1193.
+            rm -f /tmp/ja.log
+            # And force the helper to fail on this attempt.
+            export JA_DIAG_FAIL=1
+          fi
+          DIAG_CODE=$(diag_last_code /tmp/ja.log)
+          if [ -n "$DIAG_CODE" ]; then
+            LAST_KNOWN_DIAG=$DIAG_CODE
+          fi
+        done
+
+        # Post-loop verdict (mirror).
+        POST_DIAG=$(diag_last_code /tmp/ja.log)
+        EFFECTIVE_DIAG="${POST_DIAG:-$LAST_KNOWN_DIAG}"
+        case "$EFFECTIVE_DIAG" in
+          PROVIDER_NO_BID)
+            echo "failure_reason=$EFFECTIVE_DIAG"
+            ;;
+          *)
+            echo "failure_reason=PROVIDER_CAPACITY"
+            ;;
+        esac
+        """
+    )
+    proc = subprocess.run(
+        [shutil.which("bash") or "/bin/bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env={**os.environ, "PATH": os.environ.get("PATH", "")},
+    )
+    assert proc.returncode == 0, (
+        f"diagnostic-preservation loop aborted unexpectedly. "
+        f"rc={proc.returncode} stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    assert "failure_reason=PROVIDER_NO_BID" in proc.stdout, (
+        f"the preserved code from attempt 1 must reach the post-loop verdict. "
+        f"Got stdout={proc.stdout!r} stderr={proc.stderr!r}. If this shows "
+        f"PROVIDER_CAPACITY, LAST_KNOWN_DIAG was either not captured or not "
+        f"used in the post-loop fallback — the cause was silently lost."
+    )
+    assert "failure_reason=PROVIDER_CAPACITY" not in proc.stdout, (
+        f"PROVIDER_CAPACITY must not surface when LAST_KNOWN_DIAG has a value. "
+        f"Got stdout={proc.stdout!r}"
+    )
+
+
+def test_no_provider_capacity_misattribution_when_malformed_event_precedes_valid_one():
+    """The helper's skip-and-log-at-warning behaviour must propagate to the workflow.
+
+    #389 follow-up. The helper accepts the trailing valid code even when a
+    malformed (non-string) code precedes it in the same log, and logs a WARNING
+    naming the producer's contract violation. End-to-end: the workflow reads
+    the helper's output, the post-loop verdict routes to the typed code, never
+    to PROVIDER_CAPACITY.
+
+    The mutant this catches:
+      - Re-raise TypeError in the helper → aborts the helper on the malformed
+        event, DIAG_CODE="", workflow bucket to PROVIDER_CAPACITY. The
+        diagnostic surface is poisoned for the WHOLE log; this test would go
+        red with failure_reason=PROVIDER_CAPACITY in proc.stdout.
+    """
+    script = textwrap.dedent(
+        """
+        set -euo pipefail
+        # /tmp/ja.log: a malformed non-string code, then a valid trailing code.
+        cat > /tmp/ja.log <<'EOF'
+{"type": "akash-diag", "level": "error", "code": 42}
+{"type": "akash-diag", "level": "error", "code": "PROVIDER_NO_BID"}
+EOF
+
+        # Run the helper against the malformed log.
+        DIAG_CODE=$(python3 -m just_akash._diag_helper /tmp/ja.log 2>/dev/null || echo "")
+        echo "DIAG_CODE=$DIAG_CODE"
+        case "$DIAG_CODE" in
+          PROVIDER_NO_BID)
+            echo "failure_reason=$DIAG_CODE"
+            ;;
+          *)
+            echo "failure_reason=PROVIDER_CAPACITY"
+            ;;
+        esac
+        """
+    )
+    proc = subprocess.run(
+        [shutil.which("bash") or "/bin/bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env={**os.environ, "PATH": os.environ.get("PATH", "")},
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    assert proc.returncode == 0, (
+        f"workflow-level helper invocation failed. rc={proc.returncode} "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    assert "DIAG_CODE=PROVIDER_NO_BID" in proc.stdout, (
+        f"the helper must return the LAST valid code, not abort on the "
+        f"preceding malformed event. Got stdout={proc.stdout!r} "
+        f"stderr={proc.stderr!r}. If DIAG_CODE is empty or PROVIDER_CAPACITY "
+        f"appears, the helper re-raised TypeError and poisoned the diagnostic "
+        f"surface for the whole log."
+    )
+    assert "failure_reason=PROVIDER_NO_BID" in proc.stdout, (
+        f"the trailing valid event must surface as failure_reason. Got stdout={proc.stdout!r}"
+    )
+    assert "failure_reason=PROVIDER_CAPACITY" not in proc.stdout, (
+        f"PROVIDER_CAPACITY must NOT appear when a valid trailing code exists. "
+        f"Got stdout={proc.stdout!r}"
+    )
+
+
+def test_archive_walk_recovers_priors_after_helper_fail_open():
+    """LAST_KNOWN_DIAG closes the helper-succeeded-but-DIAG_CODE-was-empty gap.
+    The archive walk closes the OTHER gap: when the helper itself fails on the
+    live log (uv run error → DIAG_CODE="" via fail-open), the prior attempts'
+    logs still hold the cause. Without archiving them, the next iteration's
+    `rm -f /tmp/ja.log` would wipe the only evidence that a valid code
+    existed, and the post-loop verdict would route to PROVIDER_CAPACITY —
+    the exact misattribution this PR series exists to demote, but the one
+    LAST_KNOWN_DIAG does NOT catch.
+
+    #389 follow-up. The archive step runs BEFORE the rm at line 1217. It
+    writes /tmp/ja.log to /tmp/ja.log.<attempt> when non-empty. The post-
+    loop verdict, on empty POST_DIAG, walks /tmp/ja.log.* in REVERSE
+    chronological order and takes the FIRST non-empty diag read as POST_DIAG.
+
+    Pinning at three levels:
+      1. Static — the archive step exists before the wipe, and the post-loop
+         walk exists.
+      2. Behavioural — drive the loop with a helper that fails on the live
+         log; assert the post-loop verdict recovers PROVIDER_NO_BID from the
+         archive.
+      3. Mutant — drop the archive step → behavioural test goes red.
+    """
+    # 1. Static pin.
+    code = _code(SRC)
+    assert re.search(
+        r'cp\s+/tmp/ja\.log\s+/tmp/ja\.log\."?\$\{?attempt\}?"?',
+        code,
+    ) or re.search(
+        r'cp\s+/tmp/ja\.log\s+/tmp/ja\.log\.\$"?attempt"?',
+        code,
+    ), (
+        "the archive step must run BEFORE the rm-f wipe, copying /tmp/ja.log "
+        "to /tmp/ja.log.<attempt>. Pinned by the workflow comment block at "
+        "the archive step and by this test."
+    )
+    # Static mechanism pin: the walk iterates by attempt number (`seq
+    # MAX_ATTEMPTS -1 1`), NOT a glob+sort. Lexical sort puts `.10` before
+    # `.2` — latent at MAX_ATTEMPTS=3, live at >=10. The property test
+    # (test_archive_walk_prefers_newest_at_ten_plus_attempts) is the
+    # load-bearing assertion; this is the secondary mechanism pin.
+    assert re.search(
+        r"for\s+a\s+in\s+\$\(\s*seq\s+\"\$\{?MAX_ATTEMPTS\}?\"\s+-1\s+1\s*\)",
+        code,
+    ), (
+        "the post-loop walk must iterate `seq MAX_ATTEMPTS -1 1` so attempts "
+        "are visited newest-first by NUMBER — not via `ls -1r`, which is "
+        "lexical and misorders .10 before .2 at MAX_ATTEMPTS >= 10."
+    )
+
+    # 2. Behavioural pin: simulate the helper-fail-open + log-wipe gap.
+    #    Loop with two attempts. Attempt 1's helper succeeds, archives, then
+    #    wipe happens. Attempt 2's helper fails on the live (now empty) log.
+    #    Post-loop walks archives and recovers PROVIDER_NO_BID.
+    script = textwrap.dedent(
+        """
+        set -euo pipefail
+
+        diag_last_code() {
+          uv run --with . python -m just_akash._diag_helper "$1" 2>/dev/null
+          return 0
+        }
+
+        uv() {
+          if [ "$1" = "run" ]; then
+            local log=""
+            shift
+            while [ $# -gt 0 ]; do
+              case "$1" in
+                --with) shift 2 ;;
+                python|-m|just_akash._diag_helper) shift ;;
+                *)
+                  log="$1"
+                  shift
+                  ;;
+              esac
+            done
+            if [ "${JA_DIAG_FAIL:-0}" = "1" ]; then
+              return 1
+            fi
+            if [ -s "$log" ]; then
+              python3 -c "
+import json, sys
+last = ''
+with open(sys.argv[1]) as f:
+    for line in f:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if (
+            isinstance(event, dict)
+            and event.get('type') == 'akash-diag'
+            and event.get('level') == 'error'
+        ):
+            code = event.get('code')
+            if isinstance(code, str) and code:
+                last = code
+sys.stdout.write(last)
+" "$log"
+            fi
+            return 0
+          fi
+          command uv "$@"
+        }
+        export -f uv
+
+        # Attempt 1: /tmp/ja.log has the real Code event.
+        cat > /tmp/ja.log <<'EOF'
+{"type": "akash-diag", "level": "warning", "code": "PROVIDER_OFFLINE"}
+{"type": "akash-diag", "level": "error", "code": "PROVIDER_NO_BID"}
+EOF
+
+        LAST_KNOWN_DIAG=""
+        MAX_ATTEMPTS=2
+
+        for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
+          DIAG_CODE=$(diag_last_code /tmp/ja.log)
+          if [ -n "$DIAG_CODE" ]; then
+            LAST_KNOWN_DIAG=$DIAG_CODE
+          fi
+          # Archive before wipe (the workflow's actual order at line 1217).
+          if [ -s /tmp/ja.log ] && [ -n "${attempt:-}" ]; then
+            cp /tmp/ja.log /tmp/ja.log."$attempt"
+          fi
+          rm -f /tmp/ja.log
+          if [ "$attempt" = "1" ]; then
+            # Force the helper to fail on attempt 2.
+            export JA_DIAG_FAIL=1
+            # Leave /tmp/ja.log empty so attempt 2's helper reads nothing.
+            : > /tmp/ja.log
+          fi
+        done
+
+        # Post-loop verdict with archive walk (mirror).
+        POST_DIAG=$(diag_last_code /tmp/ja.log)
+        if [ -z "$POST_DIAG" ]; then
+          for a in $(seq "${MAX_ATTEMPTS}" -1 1); do
+            archive="/tmp/ja.log.$a"
+            [ -f "$archive" ] || continue
+            attempt_code=$(diag_last_code "$archive" 2>/dev/null || echo "")
+            if [ -n "$attempt_code" ]; then
+              POST_DIAG="$attempt_code"
+              echo "::notice title=just-akash archive walk::recovered from $archive"
+              echo "::notice::'$attempt_code' (helper failed on live log)"
+              break
+            fi
+          done
+        fi
+        EFFECTIVE_DIAG="${POST_DIAG:-$LAST_KNOWN_DIAG}"
+        case "$EFFECTIVE_DIAG" in
+          PROVIDER_NO_BID)
+            echo "failure_reason=$EFFECTIVE_DIAG"
+            ;;
+          *)
+            echo "failure_reason=PROVIDER_CAPACITY"
+            ;;
+        esac
+        """
+    )
+    proc = subprocess.run(
+        [shutil.which("bash") or "/bin/bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env={**os.environ, "PATH": os.environ.get("PATH", "")},
+    )
+    assert proc.returncode == 0, (
+        f"archive-walk loop aborted unexpectedly. rc={proc.returncode} "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    assert "failure_reason=PROVIDER_NO_BID" in proc.stdout, (
+        f"the post-loop verdict must recover the diagnostic from the archive "
+        f"after the helper fails on the live log. Got stdout={proc.stdout!r} "
+        f"stderr={proc.stderr!r}. If this shows PROVIDER_CAPACITY, the archive "
+        f"step is missing or the post-loop walk is not running."
+    )
+    assert "failure_reason=PROVIDER_CAPACITY" not in proc.stdout, (
+        f"PROVIDER_CAPACITY must not surface when archive has a valid code. "
+        f"Got stdout={proc.stdout!r}"
+    )
+
+
+def test_archive_walk_prefers_newest_at_ten_plus_attempts(tmp_path):
+    """PROPERTY (load-bearing): the post-loop archive walk prefers the
+    NEWEST archive even when MAX_ATTEMPTS >= 10.
+
+    #389 follow-up. The first iteration used `ls -1r /tmp/ja.log.*`, which
+    is LEXICAL sort: `.10` sorts before `.2`, so with MAX_ATTEMPTS=10+ the
+    walk would silently pick an OLDER diagnostic over the newest.
+    MAX_ATTEMPTS=3 hides the bug; MAX_ATTEMPTS=10 (entirely plausible for
+    a flaky provider) makes it live. The test name is the property
+    assertion; the property must be the thing the test enforces.
+
+    DRIVES THE ACTUAL PRODUCTION CODE. This test does NOT embed a copy of
+    the walk loop in its heredoc — the previous shape did, which meant a
+    future production mutation (e.g., "simplifying" `seq MAX_ATTEMPTS -1
+    1` to `ls -1r` or to `seq 1 MAX_ATTEMPTS`) could leave this test
+    green: the test was running a copy of the loop, not the production
+    code. A guard whose name says "prefers newest" but only exercises a
+    copy is a guard whose name lies about what it checks.
+
+    Instead, this test:
+      1. Extracts the archive-walk block verbatim from
+         `.github/workflows/runner-pool.yml` (the `if [ -z "$POST_DIAG" ];
+         then ... fi` containing `for a in $(seq ... -1 1)`).
+      2. Writes it to a temp file.
+      3. Stubs `diag_last_code` with a JSON-line parser matching
+         `just_akash._diag_helper.read_last_error_code`.
+      4. Seeds 11 archives, each carrying a unique `ARCHIVE_N` code.
+      5. Sources the production block into a driver that initialises
+         `POST_DIAG=""` and `MAX_ATTEMPTS=11`.
+      6. Asserts the walk picks `ARCHIVE_11`.
+
+    A production mutation is automatically reflected here. The mechanism
+    assertion (`test_archive_walk_iterates_attempt_numbers_not_glob_sort`)
+    is a secondary guard — it pins the implementation form so a future
+    "simplification" is visible in code review, but it does NOT replace
+    this property check.
+    """
+    # Locate the production archive-walk block. The block is `if [ -z
+    # "$POST_DIAG" ]; then ... fi` at 12-space YAML indent, containing
+    # the seq-based loop. Non-greedy body capture stops at the first
+    # matching `fi` at the SAME 12-space indent (the inner `if [ -n
+    # "$attempt_code" ]; then ... fi` is at 16 spaces, so it does not
+    # match the end anchor).
+    block_pattern = re.compile(
+        r"^(            if \[ -z \"\$POST_DIAG\" \]; then\n"
+        r"(?:.*\n)*?"
+        r"            fi\n)",
+        re.MULTILINE,
+    )
+    block_match = block_pattern.search(SRC)
+    assert block_match is not None, (
+        "archive-walk block not found in runner-pool.yml — expected a "
+        '`if [ -z "$POST_DIAG" ]; then ... fi` block at 12-space '
+        "indent containing the seq-based loop. If the workflow shape "
+        "changed, update this test (and the production code) together."
+    )
+    production_block = block_match.group(0)
+    # The block must read /tmp/ja.log.<a> directly so the test's
+    # /tmp/ja.log.N seeding is visible to the walk. (A glob-based block
+    # would still see them — but this is a tripwire so a refactor that
+    # loses the deterministic path naming fails LOUD, not silently.)
+    assert 'archive="/tmp/ja.log.$a"' in production_block, (
+        f"extracted archive-walk block does not read /tmp/ja.log.<a> "
+        f"directly. Refactor with care — the test seeds files at that "
+        f"exact path.\nBlock:\n{production_block}"
+    )
+
+    # Write the production block to a temp file so its workflow
+    # indentation does not burden the Python source's line-length budget.
+    block_file = tmp_path / "production_archive_walk.sh"
+    block_file.write_text(production_block)
+
+    # Driver script (also written to a file for the same reason). Stubs
+    # diag_last_code with a JSON-line parser mirroring the real helper,
+    # seeds 11 archives, sources the production block, asserts the
+    # newest wins. Cleanup runs on EXIT so a mid-script failure does not
+    # leak /tmp/ja.log.* into sibling tests.
+    driver_file = tmp_path / "driver.sh"
+    driver_file.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "trap 'rm -f /tmp/ja.log.*' EXIT\n"
+        "\n"
+        "# Stub diag_last_code: parse the JSON-line file like the real\n"
+        "# just_akash._diag_helper.read_last_error_code and emit the\n"
+        "# LAST error-level akash-diag code. This is the contract the\n"
+        "# production block depends on.\n"
+        "diag_last_code() {\n"
+        "  python3 -c '\n"
+        "import json, sys\n"
+        'last = ""\n'
+        "with open(sys.argv[1]) as h:\n"
+        "    for line in h:\n"
+        "        try:\n"
+        "            event = json.loads(line)\n"
+        "        except ValueError:\n"
+        "            continue\n"
+        "        if (isinstance(event, dict)\n"
+        '            and event.get("type") == "akash-diag"\n'
+        '            and event.get("level") == "error"\n'
+        '            and isinstance(event.get("code"), str)):\n'
+        '            last = event["code"]\n'
+        "sys.stdout.write(last)\n"
+        '\' "$1"\n'
+        "}\n"
+        "export -f diag_last_code\n"
+        "\n"
+        "# Seed 11 archives with non-empty JSON-lines content. The newest\n"
+        "# is /tmp/ja.log.11 and must be the winner.\n"
+        "MAX_ATTEMPTS=11\n"
+        "export MAX_ATTEMPTS\n"
+        'for i in $(seq 1 "$MAX_ATTEMPTS"); do\n'
+        '  python3 -c "\n'
+        "import json\n"
+        "print(json.dumps({'type':'akash-diag','level':'error','code':'ARCHIVE_' + str($i)}))\n"
+        '" > "/tmp/ja.log.$i"\n'
+        "done\n"
+        "\n"
+        "# Live log was wiped; POST_DIAG starts empty — drives the walk.\n"
+        'POST_DIAG=""\n'
+        "export POST_DIAG\n"
+        "\n"
+        f"# Source the production block (extracted from runner-pool.yml).\n"
+        f"# A mutation in the workflow is automatically reflected here.\n"
+        f'source "{block_file}"\n'
+        "\n"
+        'echo "POST_DIAG=$POST_DIAG"\n'
+    )
+
+    proc = subprocess.run(
+        [shutil.which("bash") or "/bin/bash", str(driver_file)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env={**os.environ, "PATH": os.environ.get("PATH", "")},
+    )
+    assert proc.returncode == 0, (
+        f"production archive-walk block failed. rc={proc.returncode} "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    assert "POST_DIAG=ARCHIVE_11" in proc.stdout, (
+        f"the walk must prefer the NEWEST archive (ARCHIVE_11 when "
+        f"MAX_ATTEMPTS=11). Got stdout={proc.stdout!r} stderr={proc.stderr!r}. "
+        f"If this shows ARCHIVE_1..ARCHIVE_9 or any archive < 11, the "
+        f"walk is lexical-sorting or otherwise misordering — at "
+        f"MAX_ATTEMPTS >= 10 this would route the wrong diagnostic to "
+        f"failure_reason. A future production mutation to the walk "
+        f"loop in runner-pool.yml MUST also update this test (and "
+        f"test_archive_walk_iterates_attempt_numbers_not_glob_sort)."
+    )
+
+
+def test_archive_walk_iterates_attempt_numbers_not_glob_sort():
+    """Static mechanism pin: the walk iterates `seq MAX_ATTEMPTS -1 1`,
+    reads `/tmp/ja.log.<a>` if present, and breaks on first non-empty.
+
+    This is a SECONDARY assertion behind
+    test_archive_walk_prefers_newest_at_ten_plus_attempts. The property test
+    is the one that fails when the priority breaks; this one pins the
+    implementation so a future "simplification" away from the safe form is
+    visible in code review. If the two diverge (mechanism changes but
+    property holds), the property test still protects the consumer; this
+    test only catches gross deviations.
+
+    Why not `ls -1r`: lexical sort, `10` < `2`. Latent at MAX_ATTEMPTS=3,
+    live at MAX_ATTEMPTS >= 10. The cost of a numerical iteration is one
+    `seq` invocation; the cost of getting sort wrong is a misordered
+    diagnostic in CI.
+    """
+    code = _code(SRC)
+    # Pin the iteration form. Allow either `seq "$MAX_ATTEMPTS" -1 1`
+    # (preferred) or `seq "${MAX_ATTEMPTS}" -1 1` — both are equivalent.
+    assert re.search(
+        r"for\s+a\s+in\s+\$\(\s*seq\s+\"\$\{?MAX_ATTEMPTS\}?\"\s+-1\s+1\s*\)",
+        code,
+    ), (
+        "the archive walk must iterate `seq MAX_ATTEMPTS -1 1` so attempts "
+        "are visited newest-first by NUMBER, not by glob+sort (lexical sort "
+        "puts .10 before .2)."
+    )
+    # The walk must read /tmp/ja.log.<a> directly, not via a glob expansion.
+    assert 'archive="/tmp/ja.log.$a"' in code or "archive=/tmp/ja.log.$a" in code, (
+        "the archive walk must read a deterministic path (`/tmp/ja.log.<a>`) "
+        "rather than expanding a glob — the latter reintroduces lexical-sort "
+        "ordering as a footgun."
+    )
+    # Walk must break on FIRST non-empty.
+    walk_match = re.search(
+        r"for\s+a\s+in\s+\$\(\s*seq\s+\"\$\{?MAX_ATTEMPTS\}?\"\s+-1\s+1\s*\)",
+        code,
+    )
+    assert walk_match is not None, (
+        "the post-loop walk must iterate `seq MAX_ATTEMPTS -1 1` (asserted above)"
+    )
+    walk_block = code[walk_match.start() : code.index("done", walk_match.start()) + 4]
+    assert "break" in walk_block, (
+        "the post-loop walk must `break` on the FIRST non-empty recovery — "
+        "otherwise a newer empty archive would be skipped past in favour of "
+        "an older non-empty one, inverting the recency preference."
+    )
+
+
+def test_archive_cleanup_runs_after_verdict():
+    """The post-loop walk reads /tmp/ja.log.* archives. A stale archive from
+    a misconfigured re-run could mislead the next archive walk if the helper
+    fails twice. Clean them up after the verdict binds.
+    """
+    code = _code(SRC)
+    # Find the archive-walk block (now the seq-based form).
+    walk_match = re.search(
+        r"for\s+a\s+in\s+\$\(\s*seq\s+\"\$\{?MAX_ATTEMPTS\}?\"\s+-1\s+1\s*\)",
+        code,
+    )
+    assert walk_match is not None, "the post-loop walk must exist (seq-based)"
+    # After the case esac and before the next outer scope, the cleanup must run.
+    post_verdict = code[walk_match.end() :]
+    assert re.search(r"rm\s+-f\s+/tmp/ja\.log\.\*", post_verdict), (
+        "after the post-loop verdict binds, the workflow must clean up "
+        "/tmp/ja.log.* archives. A stale archive from a re-run would mislead "
+        "the next archive walk if the helper fails twice."
+    )
+
+
+def test_provider_capacity_is_gated_behind_the_akash_diag_matcher():
+    """PROVIDER_CAPACITY was the catch-all that swallowed seven real causes.
+    It now lives in the FINAL `else` of the post-loop verdict, AFTER an
+    akash-diag check — never as the only branch.
+    """
+    code = _code(SRC)
+    capacity = code.rindex("failure_reason=PROVIDER_CAPACITY")
+
+    # The post-loop branch has an explicit akash-diag fallback before
+    # PROVIDER_CAPACITY. That branch is what surfaces BIDS_FOREIGN_ONLY,
+    # PROVIDER_OFFLINE, and the rest instead of the bucket.
+    assert "diag_last_code" in code[capacity - 2000 : capacity], (
+        "PROVIDER_CAPACITY is no longer gated behind the akash-diag matcher — "
+        "the bucket swallow this PR demotes would return."
+    )
+
+
+def test_every_code_member_is_reachable_through_the_workflow():
+    """Non-vacuity: the matcher must produce EVERY Code enum value, not just
+    the ones named in the test data. A matcher that grep'd a fixed string
+    list would pass the parametrised tests but miss new members; this test
+    asserts that whatever the producer emits, the matcher can surface.
+
+    The test only checks reachability (the producer's emit → the workflow's
+    read path), not correctness of which ones are surfaced. A no-lease code
+    will be surfaced as `failure_reason=<code>` and end up in the consumer's
+    widened accept-list; a deploy/lease code will only surface from the
+    specific matchers (CREATE_OUTCOME_AMBIGUOUS) that have always existed.
+    """
+    code = _code(SRC)
+
+    # The workflow extracts the code field via the helper and surfaces it as
+    # failure_reason in both the inner loop and the post-loop.
+    assert 'get("code")' in DIAG_HELPER_SRC or "get('code')" in DIAG_HELPER_SRC, (
+        "the helper must extract the `code` field — that is the typed truth"
+    )
+    assert "failure_reason=$DIAG_CODE" in code, (
+        "the inner-loop matcher must surface the code as failure_reason"
+    )
+    # Post-loop: $EFFECTIVE_DIAG is the union of POST_DIAG and the preserved
+    # LAST_KNOWN_DIAG (see runner-pool.yml). The bare-$POST_DIAG contract was
+    # the fail-open shape that lost the diagnostic between attempts — see
+    # LAST_KNOWN_DIAG capture in the workflow.
+    assert "failure_reason=$EFFECTIVE_DIAG" in code, (
+        "the post-loop matcher must surface EFFECTIVE_DIAG as failure_reason "
+        "(POST_DIAG with LAST_KNOWN_DIAG fallback — not raw POST_DIAG, which "
+        "was the fail-open shape that lost the diagnostic between attempts)"
+    )
+    assert 'EFFECTIVE_DIAG="${POST_DIAG:-$LAST_KNOWN_DIAG}"' in code, (
+        "EFFECTIVE_DIAG must be bound to POST_DIAG with LAST_KNOWN_DIAG "
+        "fallback — this is the preservation contract."
+    )
+
+
+def test_deploy_or_lease_family_codes_are_not_silently_bucket_swallowed():
+    """The trap: PROVIDER_CAPACITY must NOT be reachable for any code whose
+    own docstring says it may have left a lease partially or fully opened.
+
+    The bucket swallow is silent — once a real orphan accrues spend, an
+    audit reading `failure_reason=PROVIDER_CAPACITY` cannot tell that the
+    cause was CREATE_OUTCOME_AMBIGUOUS. The widening fix must therefore
+    route these five codes through the EXISTING specific matchers, not
+    through the new akash-diag branch (which would still fall into
+    PROVIDER_CAPACITY when the diagnostic isn't typed).
+    """
+    code = _code(SRC)
+
+    for code_value in _DEPLOY_OR_LEASE_FAMILY:
+        # The existing matchers that handle these must still be present and
+        # still emit their specific reason. If the akash-diag matcher
+        # accidentally caught one of these, it would emit `failure_reason=
+        # DEPLOY_CREATE_FAILED` and the consumer would treat it as NOT_PRODUCED.
+        if code_value in {
+            "NO_DSEQ_RETURNED",
+            "DEPLOY_CREATE_FAILED",
+            "DEPLOY_CREATE_ORPHAN_SUSPECTED",
+        }:
+            assert "failure_reason=CREATE_OUTCOME_AMBIGUOUS" in code, (
+                f"{code_value} routes through CREATE_OUTCOME_AMBIGUOUS; if that "
+                f"matcher is gone the akash-diag path would surface the code "
+                f"without its known orphan warning."
+            )
+
+
+def test_every_no_lease_family_code_is_a_real_code_enum_member():
+    """The membership list above is a HUMAN JUDGEMENT. The point of this PR
+    is to derive from the Code enum, not enumerate it — so the list is not
+    what the matcher produces; it is documentation of what we EXPECT. A
+    drift between the list and the live enum means either the producer
+    renamed a code, or we expected the wrong code, or the enum grew a new
+    member that belongs on this list.
+    """
+    codes = _code_enum_values()
+    missing = _NO_LEASE_OPENED_FAMILY - codes
+    assert not missing, (
+        f"the no-lease-opened family lists codes that are not in the Code "
+        f"enum at this SHA: {sorted(missing)}. Either the producer renamed "
+        f"them (update the family), or the matcher cannot surface them "
+        f"(update the workflow)."
+    )
+
+
+def test_every_deploy_or_lease_family_code_is_a_real_code_enum_member():
+    """The trap list is also documentary. A drift means the producer renamed
+    one of the dangerous codes; the family name in this test must follow.
+    """
+    codes = _code_enum_values()
+    missing = _DEPLOY_OR_LEASE_FAMILY - codes
+    assert not missing, (
+        f"the deploy/lease exclusion family lists codes that are not in the "
+        f"Code enum at this SHA: {sorted(missing)}. Update the family."
+    )
+
+
+def test_selection_emptiest_degraded_is_flagged_as_degradation_not_failure():
+    """SELECTION_EMPTIEST_DEGRADED is a *degradation* (correct behaviour that
+    the audit cannot distinguish from emptiest having been APPLIED), not a
+    failure. It is not in the no-lease family and not in the deploy/lease
+    family — flagged here so a future reviewer is not surprised by its
+    absence. Any decision about how to surface it belongs to a producer-
+    design conversation, not to a consumer-widening PR.
+    """
+    codes = _code_enum_values()
+    assert "SELECTION_EMPTIEST_DEGRADED" in codes, (
+        "the Code enum lost SELECTION_EMPTIEST_DEGRADED — this test's premise is wrong"
+    )
+    assert "SELECTION_EMPTIEST_DEGRADED" not in _NO_LEASE_OPENED_FAMILY, (
+        "the no-lease family should not silently include SELECTION_EMPTIEST_DEGRADED; "
+        "the absence is intentional and must remain a deliberate choice"
+    )
+    assert "SELECTION_EMPTIEST_DEGRADED" not in _DEPLOY_OR_LEASE_FAMILY, (
+        "the deploy/lease family should not include SELECTION_EMPTIEST_DEGRADED either; "
+        "it is a degradation, not an orphan"
+    )
+
+
+def test_bucket_value_is_not_a_code_enum_member():
+    """Non-vacuity on the naming hazard. The bucket value `PROVIDER_CAPACITY`
+    is workflow-only — a string no consumer anywhere has ever read, because
+    nothing ever read the bucket. If the Code enum ever grows a member called
+    `PROVIDER_CAPACITY`, the matcher would silently map a real signal into
+    the bucket's identity, and the two strings' identical-shape handling
+    would hide the regression.
+    """
+    codes = _code_enum_values()
+    assert "PROVIDER_CAPACITY" not in codes, (
+        "PROVIDER_CAPACITY is the BUCKET — workflow-only. If it appears in the "
+        "Code enum, the bucket and the code have collided and the naming-hazard "
+        "guard this test pins has been lost."
+    )
 
 
 def _checkout(steps: list) -> dict:

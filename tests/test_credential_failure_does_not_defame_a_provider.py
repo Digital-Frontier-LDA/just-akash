@@ -158,15 +158,178 @@ def test_a_live_credential_still_names_the_provider(tmp_path) -> None:
 
 
 def test_every_reason_this_block_emits_is_already_declared_as_an_output() -> None:
-    """No new vocabulary: a caller keying on failure_reason must not meet a surprise."""
+    """No new vocabulary: a caller keying on failure_reason must not meet a surprise.
+
+    Three emission shapes exist in the verdict block:
+
+    1. Literal `failure_reason=<CODE>` — every literal MUST appear in the
+       declared `workflow_call.outputs.failure_reason` description.
+    2. Dynamic `failure_reason=$<VAR>` — bounded by a `case` statement
+       whose arms list every Code enum member AND whose default branch
+       emits a literal that IS in the declared set. An arbitrary string
+       from a corrupted log file or a future producer must NOT escape
+       into the output contract.
+    3. Default branch — must emit a literal in the declared set (the
+       bucket PROVIDER_CAPACITY is the documented one).
+
+    The Code enum (just_akash/_diagnostics.py) is the closed set of valid
+    codes. The cross-repo constraint — every Code must also be in
+    blazing's ACCEPTED_ZERO_FAILURE_REASONS or its named-exclusion list —
+    is checked at PR-open time, not here. The test's job is the local
+    contract: no emission escapes into the declared output set.
+    """
+    import re
+
+    from just_akash._diagnostics import Code
+
     doc = yaml.safe_load(WORKFLOW.read_text())
     declared = str(
         ((doc.get("on") or doc.get(True))["workflow_call"]["outputs"])["failure_reason"]
     )
-    emitted = {
-        line.split("failure_reason=")[1].split('"')[0]
-        for line in _verdict_block().splitlines()
-        if "failure_reason=" in line
-    }
-    missing = sorted(r for r in emitted if r not in declared)
-    assert not missing, f"emitted but never declared to callers: {missing}"
+    code_enum = {v for k, v in vars(Code).items() if not k.startswith("_") and isinstance(v, str)}
+
+    block = _verdict_block()
+    static_emitted: set[str] = set()
+    dynamic_emitted: set[str] = set()
+    for line in block.splitlines():
+        if "failure_reason=" not in line:
+            continue
+        rest = line.split("failure_reason=", 1)[1].split('"')[0]
+        if rest.startswith("$"):
+            dynamic_emitted.add(rest)
+        else:
+            static_emitted.add(rest)
+
+    missing = sorted(r for r in static_emitted if r not in declared)
+    assert not missing, (
+        f"literal emissions not in the declared output set: {missing}. "
+        f"Every `failure_reason=<CODE>` literal in the verdict block must "
+        f"appear in workflow_call.outputs.failure_reason so callers can "
+        f"key on the value."
+    )
+
+    # Dynamic emissions must be bounded by a `case` statement whose arms
+    # list every Code enum member AND whose default branch emits a literal
+    # in the declared set. Without the case-guard, an arbitrary string
+    # from /tmp/ja.log would escape into the output contract.
+    for var in sorted(dynamic_emitted):
+        case_match = re.search(
+            rf'case "{re.escape(var)}" in(.*?)\besac\b',
+            block,
+            re.DOTALL,
+        )
+        assert case_match, (
+            f"dynamic emission {var} has no `case` guard in the verdict "
+            f"block. Any value read from /tmp/ja.log (or future producer) "
+            f"must be validated against the Code enum before emission."
+        )
+        arm = case_match.group(1)
+        missing_codes = sorted(c for c in code_enum if c not in arm)
+        assert not missing_codes, (
+            f"{var}'s case-guard is missing Code enum members: "
+            f"{missing_codes}. A new Code added to just_akash._diagnostics "
+            f"without a matching arm here would silently fall through to "
+            f"the bucket — exactly the swallow this PR demoted."
+        )
+        # The default branch (`*)`) must emit a literal in the declared set.
+        default_match = re.search(r"\*\)\s*\n(.*?)\n\s*;;", arm, re.DOTALL)
+        assert default_match, f"{var}'s case-guard has no `*)` default branch"
+        # Strip bash `# comments` so a documentation comment naming
+        # `failure_reason=` does not trip the literal-extraction below.
+        default_body = re.sub(r"#[^\n]*", "", default_match.group(1))
+        default_literal = re.search(r"failure_reason=([A-Z_]+)", default_body)
+        assert default_literal, (
+            f"{var}'s default branch must emit a literal "
+            f"`failure_reason=<CODE>`; got: {default_body.strip()!r}"
+        )
+        assert default_literal.group(1) in declared, (
+            f"{var}'s default fallback ({default_literal.group(1)}) is "
+            f"not in the declared output set. PROVIDER_CAPACITY is the "
+            f"documented bucket and is in the declared set."
+        )
+
+
+def test_post_diag_is_bounded_by_the_code_enum_with_a_declared_fallback() -> None:
+    """The post-loop verdict variable must be validated against the Code enum.
+
+    A separate test from the general declared-output guard because the
+    failure shape is different: the Code enum can grow (new members
+    added in just_akash._diagnostics.py) and the cross-repo constraint
+    needs to be visible at PR-open time, not just at runtime.
+
+    The post-loop case was previously `case "$POST_DIAG"` (this attempt's
+    diag read); #389 follow-up made it `case "$EFFECTIVE_DIAG"` so a
+    preserved LAST_KNOWN_DIAG from a wiped log can still surface. The
+    enum-bounding contract is the same: every Code member must appear in
+    the arm, with PROVIDER_CAPACITY as the default fallback.
+    """
+    import re
+
+    from just_akash._diagnostics import Code
+
+    block = _verdict_block()
+    code_enum = {v for k, v in vars(Code).items() if not k.startswith("_") and isinstance(v, str)}
+
+    case_match = re.search(r'case "\$EFFECTIVE_DIAG" in(.*?)\besac\b', block, re.DOTALL)
+    assert case_match, (
+        "EFFECTIVE_DIAG must be guarded by a `case` statement listing every "
+        "Code enum member, with PROVIDER_CAPACITY as the default fallback."
+    )
+    arm = case_match.group(1)
+    for code in sorted(code_enum):
+        assert code in arm, (
+            f"Code.{code} is missing from EFFECTIVE_DIAG's case-guard. A "
+            f"future deploy.py emission of this code would silently "
+            f"fall through to PROVIDER_CAPACITY."
+        )
+
+
+def test_diag_code_in_the_inner_loop_is_also_bounded_by_the_code_enum() -> None:
+    """The inner-loop DIAG_CODE site must NOT emit an unvalidated value.
+
+    Two emit sites exist for akash-diag codes: the inner-loop branch
+    (line ~1354) and the post-loop verdict branch (line ~1783). Both
+    read from `diag_last_code /tmp/ja.log` and emit
+    `failure_reason=$VAR`. The post-loop site is bounded by the
+    test_post_diag_is_bounded_by_the_code_enum_with_a_declared_fallback
+    test; the inner-loop site must also be bounded.
+
+    The inner-loop case-guard's default branch (`*)`) MUST NOT emit a
+    `failure_reason=` line — an unknown value at attempt N should be
+    treated as unclassified and re-tried at attempt N+1, the same as
+    the no-DIAG_CODE branch. The bucket is reserved for the post-loop
+    verdict (no more attempts remaining) where the producer truly had
+    nothing else to say.
+    """
+    import re
+
+    from just_akash._diagnostics import Code
+
+    code_enum = {v for k, v in vars(Code).items() if not k.startswith("_") and isinstance(v, str)}
+    workflow_text = WORKFLOW.read_text(encoding="utf-8")
+
+    case_match = re.search(r'case "\$DIAG_CODE" in(.*?)\besac\b', workflow_text, re.DOTALL)
+    assert case_match, (
+        "DIAG_CODE in the inner-loop must be guarded by a `case` "
+        "statement listing every Code enum member, with no `failure_reason=` "
+        "in the default branch."
+    )
+    arm = case_match.group(1)
+    for code in sorted(code_enum):
+        assert code in arm, (
+            f"Code.{code} is missing from DIAG_CODE's case-guard. An "
+            f"unknown value would currently fall through to the raw-output "
+            f"branch with no failure_reason — but a future Code added to "
+            f"the enum without an arm here would NOT be guarded."
+        )
+
+    default_match = re.search(r"\*\)\s*\n(.*?)\n\s*;;", arm, re.DOTALL)
+    assert default_match, "DIAG_CODE's case-guard has no `*)` default branch"
+    # Strip bash `# comments` so a documentation comment naming
+    # `failure_reason=` does not trip the assertion below.
+    default_body = re.sub(r"#[^\n]*", "", default_match.group(1))
+    assert "failure_reason=" not in default_body, (
+        "DIAG_CODE's default branch must NOT emit failure_reason — an "
+        "unknown value at attempt N re-tries at N+1; the bucket belongs "
+        "only to the post-loop verdict (no attempts remaining)."
+    )

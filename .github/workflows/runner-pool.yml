@@ -331,7 +331,10 @@ on:
           RUNNER_PAT_INVALID, WALLET_UNDERFUNDED, WALLET_TX_CONTENTION,
           NO_ELIGIBLE_BIDDER, PROVIDER_CAPACITY, RUNNER_NEVER_REGISTERED,
           GITHUB_API_UNAVAILABLE, INDETERMINATE, LEASE_CLOSE_UNVERIFIED,
-          LEASE_OWNER_UNREADABLE, CREATE_OUTCOME_AMBIGUOUS, DIAGNOSTICS_DISABLED — or
+          LEASE_OWNER_UNREADABLE, CREATE_OUTCOME_AMBIGUOUS, DIAGNOSTICS_DISABLED,
+          PROVIDER_OFFLINE, PROVIDER_INVALID_VERSION, PROVIDER_NO_BID,
+          PROVIDER_STATUS_QUERY_FAILED, PROVIDER_UNKNOWN,
+          NO_BIDS_RECEIVED, BIDS_FOREIGN_ONLY, BIDS_STALE, BIDS_MALFORMED — or
           empty on success.
           Each implies a different remedy, which is why they are not collapsed into "infra".
 
@@ -346,6 +349,39 @@ on:
           WALLET_TX_CONTENTION   concurrent provisioners on one Cosmos account reject
                                  each other; no order is created, so the market never
                                  saw the request and PROVIDER_CAPACITY is fiction
+
+          PROVIDER_CAPACITY IS A LAST RESORT, NOT A CATCH-ALL (#398). The bucket swallowed
+          seven distinct allow-list and provider-health outcomes — each a different cause
+          and each a different remedy. The akash-diag JSON emitted by just_akash
+          (just_akash/_diagnostics.py) names them verbatim:
+
+          BIDS_FOREIGN_ONLY      every bid was from a non-allow-listed provider — a
+                                 BID IS PROOF OF LIFE (provider online, has capacity),
+                                 so the failure can only mean OUR allow-list rejected
+                                 what arrived. Remedy: review the allow-list, not the
+                                 providers.
+          NO_BIDS_RECEIVED       the auction closed with zero bids. Distinct from
+                                 BIDS_FOREIGN_ONLY because nothing bid at all (a market
+                                 condition), not because all bids were rejected. Remedy:
+                                 check provider health, not the allow-list.
+          BIDS_STALE             bids aged out of 'open' before the auction closed.
+                                 Remedy: shorten bid-wait or relax timing.
+          BIDS_MALFORMED         every bid entry failed schema. Almost always a CLI /
+                                 on-chain version drift, not a provider fault. Remedy:
+                                 upgrade just-akash and the CLI together.
+          PROVIDER_OFFLINE       allow-listed provider reports isOnline=false on-chain.
+                                 Remedy: wait for the provider or remove from allow-list.
+          PROVIDER_INVALID_VERSION
+                                 provider reports isValidVersion=false on-chain. Remedy:
+                                 pin the akash CLI to a version the provider supports.
+          PROVIDER_NO_BID        on-chain status looks healthy but no bid was returned.
+                                 Provider-side fault; qualify with runner-probe.
+          PROVIDER_STATUS_QUERY_FAILED
+                                 could not read provider status at all. UNKNOWN, not
+                                 runner_deny: same reason runner_probe.py marks the
+                                 ambiguous case 'unknown'.
+          PROVIDER_UNKNOWN       provider not in the registry. Almost always a typo in
+                                 the allow-list or a renamed Akash address.
         value: ${{ jobs.pool.outputs.failure_reason }}
       wallet_free_usd:
         description: 'Free credit after escrow at provision time.'
@@ -1008,6 +1044,61 @@ jobs:
             [ "$rc" -eq 0 ] && [ "$verdict" = "True" ]
           }
 
+          # ⛔ READ THE DIAGNOSTIC, NOT THE ENGLISH (#398). just_akash/_diagnostics.py
+          # writes one JSON event per diagnosable outcome to /tmp/ja.log with
+          # {"type":"akash-diag","level":"error|warning","code":"X",...}. The CODE
+          # is the typed truth; the English `_log` lines are decoration. Returning
+          # the LATEST error code (not the first) because the most recent attempt is
+          # the one whose outcome the loop is reporting — earlier attempts may have
+          # emitted codes for transient conditions that the latest attempt resolved
+          # or replaced.
+          #
+          # Grepping English text would force this matcher to enumerate every Code
+          # enum member, and a new member would silently fall back to
+          # PROVIDER_CAPACITY — exactly the bucket swallow this function exists to
+          # stop. A JSON parser reads whatever the producer emits, today and tomorrow.
+          diag_last_code() {
+            # Read the latest akash-diag error code from /tmp/ja.log. The helper
+            # lives in `just_akash/_diag_helper.py` rather than inline here
+            # because (a) embedding a multi-line Python script in a YAML literal
+            # block breaks the heredoc terminator's column-0 requirement under
+            # CI's bash, and (b) the helper is unit-testable directly when it
+            # is a module. Two `uv run` invocations per provision attempt —
+            # inner loop UNCLASSIFIED branch and post-loop PROVIDER_CAPACITY
+            # gate — are negligible against the workflow's own per-attempt
+            # wall-clock.
+            #
+            # ⛔ CALLERS MUST PASS /tmp/ja.log EXPLICITLY. With `set -uo pipefail`
+            # in effect for this `run:` block (line 995), expanding an unbound
+            # `$1` is an unbound-variable error and bash aborts before writing
+            # `failure_reason=` — which is WORSE than the bucket we are demoting,
+            # because a bucket at least emits a value. A hidden default inside
+            # this function (`${1:-/tmp/ja.log}`) would let callers read the
+            # wrong file without noticing; explicit-argument at every call
+            # site is the safer shape. Pinned by
+            # test_every_diag_last_code_call_passes_an_argument.
+            #
+            # ⛔ THIS FUNCTION IS FAIL-OPEN BY CONSTRUCTION. The diagnostic
+            # enrichment step exists to surface a richer failure_reason; it
+            # MUST NOT become the cause of a missing failure_reason. The
+            # `uv run` invocation can fail in the harness (no pyproject.toml
+            # in `cwd=tmp_path`), in cold CI caches (resolver errors), and in
+            # production (transient lockfile mismatch). Any of those would
+            # surface as a non-zero exit here; under `set -e`, a failing
+            # command substitution in `VAR=$(diag_last_code ...)` aborts the
+            # outer block — killing the entire provisioning loop after a
+            # SINGLE attempt, regardless of how many remain. `return 0`
+            # rescues the function's exit status so the assignment always
+            # succeeds and emits empty string when the helper cannot be run.
+            # The downstream `if [ -n "$DIAG_CODE" ]` / `case "$POST_DIAG"`
+            # then fall through to the bucket they were already going to
+            # demote, which is the documented behaviour. Future call sites
+            # inherit the property without remembering `|| true`. Pinned by
+            # test_diag_last_code_is_fail_open_when_the_helper_cannot_be_run.
+            uv run --with . python -m just_akash._diag_helper "$1" 2>/dev/null
+            return 0
+          }
+
           # A free-text input feeding `seq`: junk would make the wait loop a no-op and
           # every pool instantly "never registered". Clamp like MIN_POOL below.
           case "${RUNNER_WAIT_TRIES}" in ''|*[!0-9]*) RUNNER_WAIT_TRIES=90 ;; esac
@@ -1026,6 +1117,16 @@ jobs:
           EXCLUDED=$(printf '%s' "${STANDING_EXCLUDED_CSV:-}" | tr ',' ' ')
           SAW_BID=0
           SAW_SEQ_CONTENTION=0
+          # ⛔ PRESERVE THE CAUSE ACROSS ATTEMPTS (#389 follow-up). A successful
+          # diag_last_code read that returned a non-empty code is the ONLY
+          # source of ground truth for which Code the producer actually emitted.
+          # If we wait until post-loop, the next iteration's `rm -f /tmp/ja.log`
+          # (line 1193) has already wiped the log and the cause is gone. Capture
+          # it here on every successful non-empty read. Empty results from a
+          # FAILED `uv run` MUST NOT overwrite the prior good value — that is
+          # the entire invariant. Pinned by
+          # test_diagnostic_preserved_when_a_subsequent_attempt_wipes_the_log.
+          LAST_KNOWN_DIAG=""
 
           for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
             echo "::group::provision attempt $attempt/$MAX_ATTEMPTS"
@@ -1099,6 +1200,23 @@ jobs:
               echo "::endgroup::"; exit 1
             fi
             unset SDL_TEMPLATE
+            # ⛔ ARCHIVE THE PRIOR ATTEMPT'S LOG BEFORE WIPING IT (#389 follow-up).
+            # LAST_KNOWN_DIAG closes the helper-succeeded-but-DIAG_CODE-was-empty
+            # gap (it captures on every non-empty read). It does NOT close the
+            # gap where the helper itself fails: `uv run` errors (cold cache,
+            # lockfile drift, harness `cwd=tmp_path` without a pyproject.toml)
+            # make DIAG_CODE="" via fail-open, but the log still has a valid
+            # Code event. Without archiving, the next iteration's `rm -f`
+            # wipes that event and the post-loop verdict finds nothing.
+            # Archive the prior log verbatim (only when non-empty — an empty
+            # prior attempt would still need an archive slot, but `cp /dev/null`
+            # would copy a 0-byte file that the post-loop walk can skip). The
+            # post-loop verdict walks /tmp/ja.log.* in REVERSE chronological
+            # order, taking the FIRST non-empty diag read as POST_DIAG. Pinned
+            # by test_archive_walk_recovers_priors_after_helper_fail_open.
+            if [ -s /tmp/ja.log ] && [ -n "${attempt:-}" ]; then
+              cp /tmp/ja.log /tmp/ja.log."$attempt"
+            fi
             rm -f /tmp/ja.log
             DEPLOY_RC=0
             "${JA[@]}" deploy --sdl /tmp/runner-sdl.minted.yaml --deposit "$REQUIRED_DEPOSIT_USD" --bid-wait 60 \
@@ -1248,6 +1366,48 @@ jobs:
               # workflow exists to stop reporting. Printing the raw output is what turns
               # the next occurrence into evidence, so the matcher can be corrected from
               # a real string instead of a plausible one.
+
+              # ⛔ SURFACE THE TYPED DIAGNOSTIC, NOT THE BUCKET (#398). If just-akash
+              # emitted a structured akash-diag event with level=error before exiting,
+              # that code names the cause — BIDS_FOREIGN_ONLY, NO_BIDS_RECEIVED,
+              # BIDS_STALE, BIDS_MALFORMED, PROVIDER_OFFLINE, PROVIDER_INVALID_VERSION,
+              # PROVIDER_NO_BID, PROVIDER_STATUS_QUERY_FAILED, PROVIDER_UNKNOWN, and
+              # the rest. Reading it from JSON (via diag_last_code above) means a new
+              # Code enum member becomes a typed failure_reason automatically; we do
+              # NOT enumerate the codes here, because enumerating them is the bug.
+              # Each such reason names a different remedy — folding them into
+              # PROVIDER_CAPACITY (the bucket that swallowed them) reported a market
+              # outage that may never have happened.
+              DIAG_CODE=$(diag_last_code /tmp/ja.log)
+              # ⛔ DIAG_CODE IS BOUNDED TO THE Code ENUM, same shape as POST_DIAG below.
+              # The helper reads whatever JSON it parses from /tmp/ja.log; an arbitrary
+              # string from a corrupted log or a future producer must NOT escape into
+              # the declared `failure_reason` output set. Unknown values fall through
+              # to the unclassified branch (continue) — they cannot become failure_reason.
+              #
+              # ⛔ PRESERVE THE CAUSE BEFORE THE NEXT ATTEMPT WIPES IT (#389 follow-up).
+              # Empty DIAG_CODE here means EITHER "log was empty" OR "diag_last_code
+              # failed". We do not distinguish — both fall through to unclassified,
+              # both leave LAST_KNOWN_DIAG unchanged. A non-empty DIAG_CODE updates
+              # LAST_KNOWN_DIAG; the post-loop verdict prefers POST_DIAG and falls
+              # back to LAST_KNOWN_DIAG before reaching PROVIDER_CAPACITY.
+              if [ -n "$DIAG_CODE" ]; then
+                LAST_KNOWN_DIAG=$DIAG_CODE
+              fi
+              case "$DIAG_CODE" in
+                WALLET_INSUFFICIENT_CREDIT|WALLET_LOW_CREDIT|WALLET_CREDIT_QUERY_FAILED|PROVIDER_OFFLINE|PROVIDER_INVALID_VERSION|PROVIDER_NO_CAPACITY|PROVIDER_NO_BID|PROVIDER_STATUS_QUERY_FAILED|PROVIDER_UNKNOWN|NO_BIDS_RECEIVED|BIDS_FOREIGN_ONLY|BIDS_STALE|BIDS_MALFORMED|SELECTION_EMPTIEST_DEGRADED|DEPLOY_CREATE_FAILED|DEPLOY_CREATE_ORPHAN_SUSPECTED|NO_DSEQ_RETURNED|LEASE_CREATE_FAILED|REDEPLOY_FAILED|SDL_ERROR|CONFIG_ERROR|LEASE_DOWN|EXEC_EXIT_CODE_UNKNOWN)
+                  [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+                  echo "failure_reason=$DIAG_CODE" >> "$GITHUB_OUTPUT"
+                  echo "::error title=just-akash code: $DIAG_CODE::deploy.py emitted this typed diagnostic before exiting — see /tmp/ja.log for the full event. Each Code names a different remedy, which is why they are not collapsed into PROVIDER_CAPACITY."
+                  echo "::endgroup::"; exit 1
+                  ;;
+                *)
+                  # Unknown value (or empty after fail-open) — treat as unclassified,
+                  # fall through to the raw-output branch below. The literal
+                  # `failure_reason=` is not written for this case.
+                  ;;
+              esac
+
               echo "::group::unclassified deploy failure — raw output"
               tail -40 /tmp/ja.log 2>/dev/null || echo "(no output captured)"
               echo "::endgroup::"
@@ -1655,8 +1815,123 @@ jobs:
             echo "failure_reason=WALLET_TX_CONTENTION" >> "$GITHUB_OUTPUT"
             echo "::error title=The wallet could not carry the deploy: concurrent transactions::AKASH_API_KEY is ONE Cosmos account and cannot have two transactions in flight — the losers are rejected with an account-sequence mismatch, and nothing in just_akash retries it. This is NOT a market condition and NOT a provider fault. GitHub concurrency groups are scoped per repository, so they cannot serialise callers in different repos. At spike, give each concurrent provisioner its OWN Akash account, or funnel provisioning through one repo that serialises on the akash-wallet group."
           else
-            echo "failure_reason=PROVIDER_CAPACITY" >> "$GITHUB_OUTPUT"
-            echo "::error title=No provider bid::No eligible provider bid within the window across ${MAX_ATTEMPTS} attempts. This is a market/capacity condition, not a code failure."
+            # ⛔ PROVIDER_CAPACITY IS A LAST RESORT, NOT A CATCH-ALL (#398). The bucket
+            # swallowed seven distinct allow-list and provider-health outcomes — each a
+            # different cause and each a different remedy. If ANY attempt across the
+            # loop emitted a typed akash-diag code, surface it; only fall through to
+            # PROVIDER_CAPACITY when no attempt left a code (e.g. deploy.py raised
+            # before reaching the diagnostic emitter, or the log was truncated by a
+            # signal).
+            #
+            # ⚠ NAMING HAZARD: the bucket value is PROVIDER_CAPACITY. A real
+            # no-capacity outcome emits Code.PROVIDER_NO_CAPACITY (with the
+            # underscore), which this branch surfaces verbatim — NOT as
+            # PROVIDER_CAPACITY. The two read identically to a skim; the underscore
+            # is the distinction. The downstream consumer (blazing) widens its
+            # accept-list to match.
+            POST_DIAG=$(diag_last_code /tmp/ja.log)
+            # ⛔ ARCHIVE WALK (#389 follow-up, code-review #2). LAST_KNOWN_DIAG
+            # closes the helper-succeeded-but-DIAG_CODE-was-empty gap (capture
+            # is gated on non-empty DIAG_CODE), but it does NOT close the
+            # gap where the helper itself fails: a `uv run` error (cold cache,
+            # lockfile drift, harness cwd without pyproject.toml) makes the
+            # diag_last_code wrapper fail-open, DIAG_CODE="" for that
+            # attempt, LAST_KNOWN_DIAG un-updated, then the next iteration's
+            # `rm -f /tmp/ja.log` wipes the only evidence that this attempt
+            # HAD a valid code earlier in the run. Without archiving the
+            # post-loop verdict has nothing to fall back to and routes to
+            # PROVIDER_CAPACITY — the exact misattribution this PR exists
+            # to demote, but the one LAST_KNOWN_DIAG does not catch.
+            #
+            # Walk /tmp/ja.log.* in REVERSE chronological order (latest
+            # attempt's archive first; older ones after), running each
+            # through diag_last_code. Take the FIRST non-empty result.
+            # Reverse order is load-bearing: the most recent failed attempt
+            # is more diagnostic than older ones (state of the cluster,
+            # network conditions, etc.) so prefer it. An empty result from
+            # the live log + empty archives means deploy.py raised before
+            # reaching the diagnostic emitter (the legitimate
+            # PROVIDER_CAPACITY case).
+            #
+            # ⛔ ITERATE BY ATTEMPT NUMBER, NOT BY GLOB+SORT. `ls -1r` is
+            # LEXICAL sort: with MAX_ATTEMPTS >= 10, attempt `.10` sorts
+            # before `.2`, so the walk would silently pick an OLDER
+            # diagnostic over the newest. MAX_ATTEMPTS=3 today hides the
+            # bug; MAX_ATTEMPTS=10 (entirely plausible for a flaky
+            # provider) makes it live. Iterating MAX_ATTEMPTS..1 and
+            # reading /tmp/ja.log.<a> if it exists is deterministic,
+            # needs no sort, and cannot drift with the filename format.
+            # Pinned by test_archive_walk_iterates_attempt_numbers_not_glob_sort
+            # (mechanism) AND test_archive_walk_prefers_newest_at_ten_plus_attempts
+            # (property — newest wins even when 11+ archives exist).
+            if [ -z "$POST_DIAG" ]; then
+              for a in $(seq "${MAX_ATTEMPTS}" -1 1); do
+                archive="/tmp/ja.log.$a"
+                [ -f "$archive" ] || continue
+                attempt_code=$(diag_last_code "$archive" 2>/dev/null || echo "")
+                if [ -n "$attempt_code" ]; then
+                  POST_DIAG="$attempt_code"
+                  echo "::notice title=just-akash archive walk::recovered diagnostic '$attempt_code' from $archive after helper fail-open on the live log"
+                  break
+                fi
+              done
+            fi
+            # ⛔ POST_DIAG IS BOUNDED TO THE Code ENUM (fail-closed). The
+            # `diag_last_code` helper returns whatever JSON it parses; an
+            # arbitrary string from a corrupted /tmp/ja.log or a future
+            # producer must NOT escape into the declared `failure_reason`
+            # output set. The case statement below enumerates every member
+            # of just_akash._diagnostics.Code; anything else falls through
+            # to PROVIDER_CAPACITY, which is the documented bucket and IS
+            # in the declared output set. Pinned by
+            # test_post_diag_is_bounded_by_the_code_enum_with_a_declared_fallback.
+            #
+            # ⛔ THREE-TIER VERDICT (#389 follow-up). Prefer POST_DIAG (this
+            # attempt's diagnostic, possibly recovered from an archive);
+            # fall back to LAST_KNOWN_DIAG (preserved from any prior
+            # successful read this run); fall back to PROVIDER_CAPACITY.
+            # The bucket is LAST, not FIRST — accepting the catch-all would
+            # auto-accept every failure and defeat the typed-diagnostic
+            # effort.
+            #
+            # EFFECTIVE_DIAG is the union of POST_DIAG and LAST_KNOWN_DIAG —
+            # the value the case below actually matches AND the value we
+            # write to failure_reason. Without this binding the case branch
+            # would match on the substituted value but print `$POST_DIAG`
+            # (still empty), giving an empty failure_reason field and an empty
+            # error title — silently dropping the cause.
+            EFFECTIVE_DIAG="${POST_DIAG:-$LAST_KNOWN_DIAG}"
+            #
+            # The cross-repo constraint is checked at PR-open time: every
+            # Code member listed below must also be present in blazing's
+            # ACCEPTED_ZERO_FAILURE_REASONS (or its named-exclusion list)
+            # so the runner-registration cleanup does not misclassify a
+            # real Code value as MISSING_EXPECTED. The current 23 Code
+            # members are documented in PR B-prime; widening the enum
+            # without the matching blazing accept-list is the locked-out
+            # shape.
+            case "$EFFECTIVE_DIAG" in
+              WALLET_INSUFFICIENT_CREDIT|WALLET_LOW_CREDIT|WALLET_CREDIT_QUERY_FAILED|PROVIDER_OFFLINE|PROVIDER_INVALID_VERSION|PROVIDER_NO_CAPACITY|PROVIDER_NO_BID|PROVIDER_STATUS_QUERY_FAILED|PROVIDER_UNKNOWN|NO_BIDS_RECEIVED|BIDS_FOREIGN_ONLY|BIDS_STALE|BIDS_MALFORMED|SELECTION_EMPTIEST_DEGRADED|DEPLOY_CREATE_FAILED|DEPLOY_CREATE_ORPHAN_SUSPECTED|NO_DSEQ_RETURNED|LEASE_CREATE_FAILED|REDEPLOY_FAILED|SDL_ERROR|CONFIG_ERROR|LEASE_DOWN|EXEC_EXIT_CODE_UNKNOWN)
+                echo "failure_reason=$EFFECTIVE_DIAG" >> "$GITHUB_OUTPUT"
+                echo "::error title=just-akash code: $EFFECTIVE_DIAG::no lease across ${MAX_ATTEMPTS} attempts, but deploy.py emitted this typed diagnostic — see /tmp/ja.log for the full event. Each Code names a different remedy, which is why they are not collapsed into PROVIDER_CAPACITY."
+                ;;
+              *)
+                echo "failure_reason=PROVIDER_CAPACITY" >> "$GITHUB_OUTPUT"
+                echo "::error title=No provider bid::No eligible provider bid within the window across ${MAX_ATTEMPTS} attempts, and no akash-diag code was emitted. This is a market/capacity condition, not a code failure — investigate per-provider health."
+                ;;
+            esac
+            # ⛔ ARCHIVE CLEANUP (#389 follow-up). Remove /tmp/ja.log.*
+            # archives after the verdict is bound. Archives from a previous
+            # invocation would survive only inside a single job's lifetime
+            # (each Akash provisioning job gets a fresh runner), but the
+            # pattern here matches the per-attempt wipe: anything left
+            # after a successful failure_reason binding is dead weight,
+            # and a stale archive from a misconfigured re-run could
+            # mislead the next archive walk if the helper fails twice.
+            # `rm -f` is documented to never fail on a missing path, so no
+            # `|| true` swallow is needed; test_no_new_unmeasured_green.py's
+            # R2 forbids it on a verdict step.
+            rm -f /tmp/ja.log.*
           fi
           exit 1
 
