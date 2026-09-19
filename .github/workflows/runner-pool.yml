@@ -1996,7 +1996,7 @@ jobs:
     # not touch runner-teardown.yml or this line skips identity with a note naming the
     # pending repin. Every self-pin must be a 40-hex SHA, never a branch or tag, and never a
     # commit that exists only on a PR branch.
-    uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@61ffce693fdbb0c7fdfe681a1b03de7b9fece2a5
+    uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@048cbc4b8dd2e018cb07159949ab8fc67476f5a4
     with:
       # The last KNOWN lease always reaches teardown so it is closed and proven. An
       # ambiguous later create travels beside it as create-ambiguous: teardown closes
