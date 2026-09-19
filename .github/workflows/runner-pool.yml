@@ -19,6 +19,11 @@
 #       needs: pool
 #       runs-on: ${{ fromJSON(needs.pool.outputs.runner-targets) }}
 #
+# Successful provisioning hands a live pool to the caller. The caller MUST run its
+# runner-teardown job with always(), needing the pool and every consumer job; it must
+# also adopt the independent scheduled cleanup backstop. Internal cleanup below is
+# rollback for failed/cancelled provisioning, not cleanup after successful handoff.
+#
 # `runner-targets` is the whole ergonomic point: it is the pool's label set when the
 # pool is healthy and ["ubuntu-latest"] when it is not, so a caller's `runs-on` degrades
 # to hosted runners instead of failing. That fallback COSTS MONEY, so this workflow works
@@ -31,9 +36,33 @@
 # grows the bill. Every failure here names which world it came from.
 #
 # ── TAG-PREFIX IS REQUIRED AND HAS NO DEFAULT ───────────────────────────────────
-# Deployments are tagged `<tag-prefix>-<run_id>` so a sweeper can reap this run's lease
-# and NOTHING else. A shared default once caused a sibling repo's cleanup to destroy a
-# live deployment, because both used the same `ci-<id>` shape. Put your repo name in it.
+# A shared default once caused a sibling repo's cleanup to destroy a live deployment,
+# because both used the same `ci-<id>` shape. Put your repo name in it.
+#
+# ⛔ CORRECTED. This said "Deployments are tagged `<tag-prefix>-<run_id>` SO A SWEEPER CAN
+# REAP THIS RUN'S LEASE and nothing else." That is not what happens. `just-akash tag`
+# writes `.tags.json` inside the INSTALLED PACKAGE DIRECTORY (`just_akash/api.py:31`),
+# and every CI job installs the CLI freshly via `uvx`, so the file is destroyed before any
+# later job or any sweeper reads it. The run id never leaves the runner and never reaches
+# the chain.
+#
+# ⚠ THE PROSE WAS LOAD-BEARING AND WRONG, WHICH IS WORSE THAN ABSENT. A consumer built an
+# hourly sweeper selecting on that tag. It reported:
+#
+#     [sweeper] 47 active deployments
+#     [sweeper] 0 carry a ci-<run_id> tag
+#               (47 with other tags, 0 untagged). Filter is working as designed; nothing to sweep.
+#
+# It had never reclaimed a lease. Both readings were artefacts of `""` vs `null`, and the
+# alarm branch was unreachable, so the reassuring branch ran every hour.
+#
+# ⇒ WHAT ACTUALLY CARRIES THE RUN ID IS `placement-key`, stamped below. It is
+# author-controlled, written ATOMICALLY inside MsgCreateDeployment, immutable afterwards,
+# and readable from the chain with ZERO auth — which is what a sweeper in another repo,
+# holding no key for this wallet, actually has. See #311.
+#
+# `tag-prefix` remains required because it still namespaces the local tag file and callers
+# pass it today; it is simply not the reaping key.
 name: Akash runner pool
 
 on:
@@ -50,6 +79,28 @@ on:
           name: a shared default once let one repo's cleanup destroy another's live
           deployment.
         required: true
+        type: string
+      placement-key:
+        description: >-
+          The on-chain `group_spec.name` this pool's deployments carry — the provenance
+          marker a reaper matches on. Defaults to `just-akash-runner`, so a caller that
+          does not set it is byte-identical to before.
+
+          ⛔ SET THIS IF YOU ADOPT `reusable-akash-escrow-reaper.yml`. That workflow
+          requires a `placement-prefix` with no default, deliberately, because a prefix
+          matching nothing gives an INERT reaper — one that reports 0 forever over an
+          unswept account. The default below is shared by every consumer of this
+          workflow on a shared Console wallet, so a consumer adopting the reaper with
+          `placement-prefix: just-akash-` would claim EVERY other consumer's pools and
+          this repo's own provider canary. Namespace it to your repo instead.
+
+          ⚠ THE DEFAULT IS ALSO WHAT PROTECTS AN UNCHANGED CALLER. `just-akash-runner`
+          is what the sibling repo's sweeper spares; see just_akash/provenance.py, which
+          records why the placement KEY carries this and not an attribute. A caller that
+          changes it and does not adopt a reaper aimed at the new value has unstamped its
+          pools relative to every existing filter — change it and adopt in one change.
+        required: false
+        default: just-akash-runner
         type: string
       just-akash-ref:
         description: >-
@@ -145,7 +196,40 @@ on:
         type: boolean
         default: true
       required-deposit-usd:
-        description: 'Free credit needed before attempting a deploy.'
+        # ⛔ THIS IS THE ESCROW DEPOSIT, AND IT IS THE POOL'S HARD LIFETIME. It is passed
+        # straight to `just-akash deploy --deposit` (below) and NOWHERE ELSE — there is no
+        # balance precondition in this workflow. The old description said "free credit needed
+        # before attempting a deploy", which named a check that does not exist here, so a
+        # caller reading it would believe lowering this weakens a safety gate. It does not:
+        # it shortens how long a LEAKED pool keeps billing.
+        #
+        # ⇒ WHY THAT MATTERS. Akash closes a deployment when its escrow is exhausted, so the
+        # deposit is a self-terminating TTL that needs no reaper, no event, no credential and
+        # no correct code — the only leak bound that holds when every other layer fails. It is
+        # also the only one nobody had chosen: this default was inherited, not sized.
+        #
+        # MEASURED on chain 2026-09-08, blazing's runner pools (zero auth, anyone can repeat
+        # it): funds 1,988,192 uact against a lease rate of 69 uact/block = 28,814 blocks
+        # ~= 48.0h, identical across every active stamped pool. The longest CI run this
+        # provisions for is ~2h. So an undetected leak bills for 24x the job it served.
+        #
+        # ⇒ The chain's own floor is `min_deposits` = 500,000 uact (akash/deployment params),
+        # which is ~12.1h at that rate. So the bound is tunable between ~12h and whatever you
+        # fund, and 48h is not a decision anyone made.
+        #
+        # ⚠ WHY THIS IS NOT SIMPLY LOWERED HERE. The input is denominated in USD and the
+        # deposit lands in uact, so the TTL a given number buys FLOATS with price. A value
+        # chosen close to the chain floor becomes a REJECTED DEPLOY when the price moves, and
+        # this input gates every CI pool in every consuming repo. Tightening it is a real
+        # improvement to a last-resort bound traded against live-CI breakage, which is a
+        # decision for whoever owns that trade — not a tidy-up. Denominating it in uact would
+        # remove the coupling and is the better fix.
+        description: >-
+          Escrow deposit for the pool, in USD, passed to `just-akash deploy --deposit`.
+          ⛔ NOT a credit precondition — this is the pool's self-terminating lifetime:
+          escrow exhaustion closes the deployment, so this is the hard bound on how long a
+          LEAKED pool bills. Measured 2026-09-08: the '5' default buys ~48h against a ~2h
+          job. The chain floor is 500,000 uact (~12h at the same rate).
         required: false
         type: string
         default: '5'
@@ -158,6 +242,20 @@ on:
           cheapest). Measured 2026-08-27: both readable vetted providers sit ~93% full,
           so on a contended market `emptiest` raises the per-attempt bid rate. Shipped
           in the CLI by #211; unreachable from any consumer until this input.
+        required: false
+        type: string
+        default: ''
+      expected-runner-version:
+        description: >-
+          OPTIONAL. When set, the landing gate also discards a lease whose online runners
+          report a version other than this one.
+
+          ⚠ EMPTY BY DEFAULT, AND THAT IS THE POINT. The gate's standing behaviour is to
+          reject a runner reporting NO version — one that registered, took the mandated
+          auto-update, and died. Pinning a version number here turns this into a static
+          floor that passes today and rots at the next release, which is the exact defect
+          the auto-update mandate exists to avoid. Set it only for a deliberate,
+          time-boxed pin, and remove it again.
         required: false
         type: string
         default: ''
@@ -196,6 +294,26 @@ on:
       dseq:
         description: 'Deployment sequence number; empty when no lease survived.'
         value: ${{ jobs.pool.outputs.dseq }}
+      deployment_outcome:
+        description: >-
+          Typed create outcome: created only with a parsed DSEQ, no-deployment only on
+          an authoritative pre-create/no-broadcast branch, unknown otherwise.
+        value: ${{ jobs.pool.outputs.deployment_outcome }}
+      create_ambiguous:
+        description: >-
+          'true' when a later create request may have committed without returning an
+          identity. The published dseq is then only the last KNOWN lease: teardown must
+          close it and still fail HELD, because a second deployment may exist.
+        value: ${{ jobs.pool.outputs.create_ambiguous }}
+      held_reason:
+        description: 'Why rollback was HELD without closure authority.'
+        value: ${{ jobs.teardown.outputs.held_reason }}
+      held_dseq:
+        description: 'Exact DSEQ of a HELD rollback, when one was returned.'
+        value: ${{ jobs.teardown.outputs.held_dseq }}
+      held_deployment_group:
+        description: 'Expected group of a HELD rollback, when canonical.'
+        value: ${{ jobs.teardown.outputs.held_deployment_group }}
       provision_healthy:
         description: "'true' iff a usable pool came online. Key your fallback on this."
         value: ${{ jobs.pool.outputs.provision_healthy }}
@@ -212,8 +330,13 @@ on:
           WHY a fallback happened, when it did. One of RUNNER_PAT_MISSING,
           RUNNER_PAT_INVALID, WALLET_UNDERFUNDED, WALLET_TX_CONTENTION,
           NO_ELIGIBLE_BIDDER, PROVIDER_CAPACITY, RUNNER_NEVER_REGISTERED,
-          GITHUB_API_UNAVAILABLE, INDETERMINATE — or empty on success. Each implies a
-          different remedy, which is why they are not collapsed into "infra".
+          GITHUB_API_UNAVAILABLE, INDETERMINATE, LEASE_CLOSE_UNVERIFIED,
+          LEASE_OWNER_UNREADABLE, CREATE_OUTCOME_AMBIGUOUS, DIAGNOSTICS_DISABLED,
+          PROVIDER_OFFLINE, PROVIDER_INVALID_VERSION, PROVIDER_NO_BID,
+          PROVIDER_STATUS_QUERY_FAILED, PROVIDER_UNKNOWN,
+          NO_BIDS_RECEIVED, BIDS_FOREIGN_ONLY, BIDS_STALE, BIDS_MALFORMED — or
+          empty on success.
+          Each implies a different remedy, which is why they are not collapsed into "infra".
 
           Three of them are explicitly NOT statements about a provider, and each was
           measured misreporting as one:
@@ -226,6 +349,39 @@ on:
           WALLET_TX_CONTENTION   concurrent provisioners on one Cosmos account reject
                                  each other; no order is created, so the market never
                                  saw the request and PROVIDER_CAPACITY is fiction
+
+          PROVIDER_CAPACITY IS A LAST RESORT, NOT A CATCH-ALL (#398). The bucket swallowed
+          seven distinct allow-list and provider-health outcomes — each a different cause
+          and each a different remedy. The akash-diag JSON emitted by just_akash
+          (just_akash/_diagnostics.py) names them verbatim:
+
+          BIDS_FOREIGN_ONLY      every bid was from a non-allow-listed provider — a
+                                 BID IS PROOF OF LIFE (provider online, has capacity),
+                                 so the failure can only mean OUR allow-list rejected
+                                 what arrived. Remedy: review the allow-list, not the
+                                 providers.
+          NO_BIDS_RECEIVED       the auction closed with zero bids. Distinct from
+                                 BIDS_FOREIGN_ONLY because nothing bid at all (a market
+                                 condition), not because all bids were rejected. Remedy:
+                                 check provider health, not the allow-list.
+          BIDS_STALE             bids aged out of 'open' before the auction closed.
+                                 Remedy: shorten bid-wait or relax timing.
+          BIDS_MALFORMED         every bid entry failed schema. Almost always a CLI /
+                                 on-chain version drift, not a provider fault. Remedy:
+                                 upgrade just-akash and the CLI together.
+          PROVIDER_OFFLINE       allow-listed provider reports isOnline=false on-chain.
+                                 Remedy: wait for the provider or remove from allow-list.
+          PROVIDER_INVALID_VERSION
+                                 provider reports isValidVersion=false on-chain. Remedy:
+                                 pin the akash CLI to a version the provider supports.
+          PROVIDER_NO_BID        on-chain status looks healthy but no bid was returned.
+                                 Provider-side fault; qualify with runner-probe.
+          PROVIDER_STATUS_QUERY_FAILED
+                                 could not read provider status at all. UNKNOWN, not
+                                 runner_deny: same reason runner_probe.py marks the
+                                 ambiguous case 'unknown'.
+          PROVIDER_UNKNOWN       provider not in the registry. Almost always a typo in
+                                 the allow-list or a renamed Akash address.
         value: ${{ jobs.pool.outputs.failure_reason }}
       wallet_free_usd:
         description: 'Free credit after escrow at provision time.'
@@ -240,6 +396,11 @@ on:
           The Akash account that actually provisioned this pool. Teardown locates the
           DSEQ owner across the supplied pool instead of re-deriving a positional choice.
         value: ${{ jobs.pool.outputs.wallet_address }}
+      deployment_group:
+        description: >-
+          The final submitted group_spec.name after runner-pool applies its run stamp.
+          Published independently of provisioning success for bound rollback and teardown.
+        value: ${{ jobs.pool.outputs.deployment_group }}
       runner_hosts_proven:
         description: >-
           Supplied providers marked runner_host and not runner_deny. Below 3, one silent
@@ -253,8 +414,17 @@ jobs:
   pool:
     name: Provision ephemeral runner pool on Akash
     runs-on: ubuntu-latest
+    # ⛔ MUST EXCEED the owner-lookup deadline + close/audit margin (see
+    # just_akash/owner_lookup.py: 10 + 4 = 14 min at the time of writing), pinned by
+    # tests/test_owner_lookup_deadline.py. A job killed mid-cleanup by its own
+    # timeout is the failure #370 exists to prevent.
+    # Provisioning + workload + teardown sweeps legitimately run long; 120 keeps
+    # headroom above every observed pool run while still ending a stuck one.
+    timeout-minutes: 120
     outputs:
       dseq: ${{ steps.provision.outputs.dseq }}
+      deployment_outcome: ${{ steps.provision.outputs.deployment_outcome }}
+      create_ambiguous: ${{ steps.provision.outputs.create_ambiguous }}
       provision_healthy: ${{ steps.provision.outputs.provision_healthy }}
       runners_online: ${{ steps.provision.outputs.runners_online }}
       failure_reason: ${{ steps.pat.outputs.failure_reason || steps.provision.outputs.failure_reason || steps.candidates.outputs.failure_reason }}
@@ -262,6 +432,7 @@ jobs:
       runner_hosts_proven: ${{ steps.candidates.outputs.proven_hosts }}
       wallet_index: 'deprecated'
       wallet_address: ${{ steps.provision.outputs.wallet_address }}
+      deployment_group: ${{ steps.render.outputs.deployment_group }}
       runner-targets: ${{ steps.provision.outputs.runner_targets || '["ubuntu-latest"]' }}
     # Every `run` below needs just-akash's OWN source, never the caller's checkout.
     defaults:
@@ -306,6 +477,34 @@ jobs:
       # "switch back to hosted runners", which is the bill this workflow exists to remove.
       #
       # One API call turns 15 silent minutes into an immediate, named failure.
+      # ⛔ `RC=$?` ON A LINE OF ITS OWN NEVER RAN. This step's shell is `bash -e {0}`
+      # (the Actions default), and `set -uo pipefail` does NOT clear `-e`. A bare
+      # `VAR=$(cmd)` whose command fails is itself a failing command, so `-e` killed
+      # the shell AT the assignment — before `RC` was read, before `CODE` was parsed,
+      # and before any diagnostic could print.
+      #
+      # ⇒ The step exited 1 with NO annotation and NO summary. Every word of the
+      #   "CI is not broken, Akash is fine, and no provider is at fault" message —
+      #   written precisely so a credential failure would not be misread as a provider
+      #   outage — was unreachable exactly when it was needed.
+      #
+      #   Measured on blazing: `Provision Fast-Tests pool` failed 23 consecutive times
+      #   on main, and its check annotation was the bare string "Process completed with
+      #   exit code 1". Nobody could tell whether the PAT had expired, the org listing
+      #   was rate-limited, or a provider was down — which is the exact confusion
+      #   `failure_reason` exists to prevent.
+      #
+      # ⛔ AND A NONZERO EXIT IS NOT A VERDICT. Mapping every failure to
+      #   RUNNER_PAT_INVALID re-created that same defect one level up: 401, 403, 404,
+      #   429, 5xx and a transport failure with no HTTP response at all all reported
+      #   "your PAT is invalid", and `${CODE:-401}` ASSERTED a 401 that had never been
+      #   received. A preflight whose stated purpose is saying WHY it failed must not
+      #   collapse five causes into one. Classify, then conclude — and when there is no
+      #   status, say so rather than inventing the worst one.
+      #
+      # ⚠ This prose lives OUT here on purpose. Comments inside a `run:` scalar count
+      # toward the job's size, and an oversized job makes GitHub build zero jobs with no
+      # log — Borduas-Holdings/blazing#664, just-akash#247. Out here the parser drops them.
       - name: Preflight — the runner PAT must still be valid
         id: pat
         env:
@@ -318,28 +517,168 @@ jobs:
             echo "::error title=GH_RUNNER_PAT is not set::The pool cannot register runners without it. NOT a provider fault and NOT an Akash outage."
             exit 1
           fi
-          # ONE request, not two. Calling it twice doubles the latency and the API
-          # spend, and lets the two disagree: the status line could come from a call
-          # that succeeded while the branch is taken on a call that failed, reporting a
-          # code that never belonged to the failure.
-          RESP=$(gh api "orgs/${ORG}/actions/runners?per_page=1" -i 2>&1)
-          RC=$?
-          CODE=$(printf '%s' "$RESP" | awk 'NR==1{print $2}')
+          # ONE request, not two. Two calls double latency and API spend and can
+          # disagree: the status line could come from a call that succeeded while
+          # the branch is taken on one that failed.
+          # ⚠ `|| RC=$?` keeps the assignment inside a list, which `-e` does not act
+          #   on. Do NOT simplify to a bare `RESP=$(...)`; see the note above.
+          RC=0
+          # ⛔ THE WRITE VERB, NOT THE READ. Every container does
+          # POST .../actions/runners/registration-token (the image exchanges
+          # ACCESS_TOKEN=<PAT> for one), and `count: ${POOL_SIZE}` means EVERY replica
+          # does it independently. A GET only proves the PAT can LIST runners, so a
+          # read-only PAT passed this gate and then 403'd in all N replicas — the exact
+          # failure this step exists to prevent (#260).
+          #
+          # ⚠ PARITY, NOT OVER-DEMANDING. Minting a registration token is precisely what
+          # the container does; this asks for no scope the workload does not already use.
+          # Demanding more than the workload needs is a different bug, and it bites
+          # whoever provisions the next token.
+          RESP=$(gh api --method POST "orgs/${ORG}/actions/runners/registration-token" -i 2>&1) || RC=$?
+          # ⛔ THE RESPONSE CARRIES A LIVE CREDENTIAL. A successful mint returns
+          # {"token":"A...","expires_at":...} — a registration token valid ~1h. Mask it
+          # the instant it is captured, BEFORE any branch can print it: this same step
+          # now echoes the raw response in its unexpected-status arm (#253), so the verb
+          # change and that arm would otherwise combine into a token in a public log.
+          # ⛔ `|| true` for the same reason as the BAD_PAGES assignment below: `| head -1`
+          # can SIGPIPE sed on a large enough match set, `pipefail` is on, and a non-zero
+          # command substitution under `bash -e` aborts AT THE ASSIGNMENT — here that
+          # would skip the ::add-mask:: on the very token this line exists to find.
+          MINTED=$(printf '%s' "$RESP" | sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p' | head -1) || true
+          [ -n "$MINTED" ] && echo "::add-mask::${MINTED}"
+          # $1 ~ /^HTTP/ guards the no-response case: without it, awk prints the
+          # second WORD of an arbitrary error string as though it were a status.
+          CODE=$(printf '%s' "$RESP" | awk 'NR==1 && $1 ~ /^HTTP/ {print $2}')
           if [ "$RC" -ne 0 ]; then
-            echo "failure_reason=RUNNER_PAT_INVALID" >> "$GITHUB_OUTPUT"
+            # Classify before concluding. Rationale in the comment above this step.
+            REASON=GITHUB_API_UNAVAILABLE
+            case "$CODE" in
+              401)
+                REASON=RUNNER_PAT_INVALID
+                TITLE="GH_RUNNER_PAT is expired or revoked"
+                FIX="Rotate the PAT. It needs org runner-registration rights." ;;
+              403)
+                if printf '%s' "$RESP" | grep -qiE '^x-ratelimit-remaining: *0|rate limit|abuse detection'; then
+                  TITLE="GitHub API rate limit reached"
+                  FIX="Wait for the limit to reset and re-run. The PAT is not implicated."
+                else
+                  REASON=RUNNER_PAT_INVALID
+                  TITLE="GH_RUNNER_PAT cannot mint a runner registration token"
+                  FIX="Grant the PAT org runner-registration (WRITE) rights. Read access to the runner list is not enough — every container mints a token."
+                fi ;;
+              404)
+                REASON=RUNNER_PAT_INVALID
+                TITLE="org ${ORG} is not visible to GH_RUNNER_PAT, or it cannot register runners there"
+                FIX="Check the org name, then the PAT's org access. GitHub returns 404 rather than 403 for resources a token may not see." ;;
+              429)
+                TITLE="GitHub API rate limit reached"
+                FIX="Wait for the limit to reset and re-run. The PAT is not implicated." ;;
+              5??)
+                TITLE="GitHub API returned HTTP ${CODE}"
+                FIX="A GitHub-side failure. Re-run; if it persists check githubstatus.com." ;;
+              "")
+                TITLE="no HTTP response from the GitHub API"
+                FIX="A transport failure (DNS, TLS, timeout, proxy). Re-run. NOTHING here indicts the PAT." ;;
+              *)
+                TITLE="unexpected HTTP ${CODE} from the GitHub API"
+                FIX="The full API response is in this step's log, under 'Unexpected preflight response'."
+                # ⛔ PRINT IT, DO NOT PROMISE IT. The fix text said "read the response
+                # below" and RESP was captured, parsed twice, and never emitted — so the
+                # ONE arm that fires when the status is unrecognised, i.e. when the
+                # operator has least to go on, sent them to output that does not exist.
+                # This is the branch least likely to have been exercised, which is
+                # exactly why the fix's own defect hid in it.
+                #
+                # ⛔ AND IT IS UNTRUSTED OUTPUT. A response body echoed raw into an
+                # Actions log can forge workflow commands — a line beginning `::error::`
+                # or `::stop-commands::` is a COMMAND, not text (same CWE-117 shape as
+                # just-akash#252). `::stop-commands::` with a random token neutralises the
+                # whole block, and MUST be resumed before ::endgroup:: or that is disabled
+                # too. Bounded, because an HTML error page should not bury the summary.
+                RESP_TOKEN=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d " \n")
+                echo "::group::Unexpected preflight response (HTTP ${CODE:-none received})"
+                echo "::stop-commands::${RESP_TOKEN}"
+                # ⛔ NO PIPE, and that is the point. `printf ... | head -c` SIGPIPEs
+                # printf once the body exceeds the pipe buffer; `pipefail` is on
+                # (set -uo pipefail, top of this step) so the pipeline returns 141,
+                # and Actions runs `run:` under `bash -e`, so THE STEP DIES THERE —
+                # before the resume token, before ::endgroup::, and before
+                # failure_reason is written, which is this step's entire purpose.
+                # Measured: survives 130000 bytes, dies at 150000 on macOS; the
+                # Linux runner's 64KiB buffer makes it earlier. NOT >4000 — a test
+                # at 8000 passes and proves nothing.
+                # This file already documented the hazard ~500 lines below (the
+                # BAD_PAGES guarded assignment, "pipefail IS ON HERE") and this arm
+                # had the same shape unguarded. A here-string is a file, not a pipe,
+                # so there is no reader to close early and no signal to survive —
+                # removing the pipe removes the class, where `|| true` would only
+                # mask it and would also swallow real errors.
+                head -c 4000 <<< "$RESP"
+                # ⛔ UNCONDITIONAL, and it must STAY unconditional. `head -c` cuts by
+                # BYTES, and `<<<` appends one newline, so at EXACTLY 4000 bytes of
+                # $RESP the cut keeps the payload and discards that newline — leaving
+                # the cursor mid-line.
+                # The resume token below is honoured only at line start, so at exactly
+                # that length ::stop-commands:: would never be lifted and workflow
+                # commands would stay disabled for the REST OF THIS JOB — which runs to
+                # line ~1246 and includes the `::add-mask::` on the minted verdict
+                # token. That fails OPEN on secret masking, not closed on injection.
+                # 3999 and 4001 both work; only 4000 does not, so a test NEAR the bound
+                # cannot express it — see test_resume_token_survives_an_exact_4000_byte_body.
+                printf '\n'
+                if [ "$(printf '%s' "$RESP" | wc -c)" -gt 4000 ]; then
+                  printf '[truncated at 4000 bytes]\n'
+                fi
+                echo "::${RESP_TOKEN}::"
+                echo "::endgroup::" ;;
+            esac
+            CODE_TEXT="${CODE:-none received}"
+            echo "failure_reason=${REASON}" >> "$GITHUB_OUTPUT"
+            if [ "$REASON" = "RUNNER_PAT_INVALID" ]; then
+              CLASS="a CREDENTIAL failure, not a provider or Akash failure"
+            else
+              CLASS="a GITHUB API failure — the token mint was never attempted successfully, so the PAT is UNPROVEN, not disproven"
+            fi
             {
-              echo "## The runner PAT is expired or lacks org access"
+              echo "## ${TITLE}"
               echo
               echo "**CI is not broken, Akash is fine, and no provider is at fault.**"
-              echo "\`GH_RUNNER_PAT\` cannot read \`orgs/${ORG}/actions/runners\` (HTTP ${CODE:-401})."
+              echo "\`GH_RUNNER_PAT\` could not mint a runner registration token for \`orgs/${ORG}\`."
+              echo "HTTP status: ${CODE_TEXT}. Classified: \`${REASON}\`."
               echo
               echo "Without this check the runner would simply never register, the pool would"
               echo "time out after ~15 minutes, and the run would report"
               echo "\`RUNNER_NEVER_REGISTERED\` — which reads exactly like a broken provider."
               echo
-              echo "**Fix:** rotate the PAT. It needs org runner-registration rights."
+              echo "**Fix:** ${FIX}"
             } >> "$GITHUB_STEP_SUMMARY"
-            echo "::error title=GH_RUNNER_PAT expired or lacks org access (HTTP ${CODE:-401})::This is a CREDENTIAL failure, not a provider or Akash failure. Untreated it surfaces 15 minutes later as 'runner did not come online'. Rotate the PAT."
+            # ⛔ FLATTEN BEFORE EMITTING A WORKFLOW COMMAND. `${ORG}` is a
+            # caller-supplied `workflow_call` input and flows into TITLE; an embedded
+            # CR/LF would END the `::error ...::` line and let the remainder start a
+            # NEW workflow command. Third entry point for this same class today: an
+            # exception message (#252), an HTTP response body (this PR's fallback
+            # arm), and now a workflow input.
+            #
+            # Normalised HERE, at the point of emission, rather than at ORG — any
+            # future value interpolated into this line is covered too, which
+            # sanitising one input would not do.
+            # ⛔ ORDER IS LOAD-BEARING: '%' FIRST, ALWAYS. The runner percent-DECODES
+            # command properties and data, so escaping ':' to '%3A' before escaping '%'
+            # would re-escape the '%' we just wrote and double-encode every value. The
+            # toolkit's own escapeProperty does '%' -> CR -> LF -> ':' -> ',' for this
+            # reason. Escape '%' last and the annotation renders as '%253A'.
+            #
+            # CR/LF are DELETED rather than encoded (see above): a multi-line annotation
+            # is not wanted here, and deleting cannot be undone by a later decode.
+            #
+            # TITLE and CODE_TEXT land in the PROPERTY section (`title=...`), which also
+            # needs ':' and ',' — an embedded '::' truncates the property list and ','
+            # injects a further property (e.g. file=/etc/passwd, which re-points the
+            # annotation). CLASS lands in the DATA section, where neither is special.
+            TITLE=$(printf '%s' "$TITLE" | tr -d '\r\n' | sed -e 's/%/%25/g' -e 's/:/%3A/g' -e 's/,/%2C/g')
+            CODE_TEXT=$(printf '%s' "$CODE_TEXT" | tr -d '\r\n' | sed -e 's/%/%25/g' -e 's/:/%3A/g' -e 's/,/%2C/g')
+            CLASS=$(printf '%s' "$CLASS" | tr -d '\r\n' | sed -e 's/%/%25/g')
+            echo "::error title=${TITLE} (HTTP status: ${CODE_TEXT})::This is ${CLASS}. Untreated it surfaces 15 minutes later as 'runner did not come online'."
             exit 1
           fi
           echo "runner PAT valid for ${ORG}"
@@ -359,9 +698,68 @@ jobs:
             exit 1
           fi
 
+      # ── ATTRIBUTION IS NOT OPTIONAL ─────────────────────────────────────────────
+      # ⛔ THIS IS WHAT MAKES A LEAKED POOL IMPOSSIBLE TO CREATE RATHER THAN MERELY
+      # DETECTABLE. Before this, `placement-key` said WHOSE a deployment is and nothing
+      # said WHETHER IT IS STILL NEEDED, so every reaper had to fall back to age -- a
+      # proxy. Measured on one shared wallet 2026-09-08: 112 of 128 active deployments
+      # carried no run reference at all, and a consumer's 6h age floor left 69 of 83
+      # pools protected-and-unreapable at any instant, because a floor as the PRIMARY
+      # rule guarantees a standing population of `floor x leak-rate`.
+      #
+      # ⚠ AND `tag-prefix` DOES NOT DO THIS, THOUGH ITS DOCS AT THE TOP OF THIS FILE SAY
+      # IT DOES. `just-akash tag` writes .tags.json inside the INSTALLED PACKAGE
+      # DIRECTORY (api.py:31), which every fresh `uvx` install destroys, so the run id
+      # never leaves the runner. A consumer built an hourly sweeper on that tag and it
+      # reported "47 active deployments, 0 carry a ci-<run_id> tag ... Filter is working
+      # as designed; nothing to sweep" while having never reclaimed a lease. See #311.
+      #
+      # ⇒ The placement key is the only marker that is author-controlled, written
+      # ATOMICALLY inside MsgCreateDeployment, immutable afterwards, and readable from
+      # the chain with ZERO auth -- which is what a sweeper in another repo, holding no
+      # key for this wallet, actually has.
+      #
+      # ⚠ IDEMPOTENT ON PURPOSE. blazing#962 stamps caller-side, and Blazing-Back has
+      # shipped `dfci-infra-runner-run-<id>-end` for months. Double-stamping would give
+      # them a name their own sweeper's `run-(\d+)` no longer matches -- so a callee
+      # that "improved" attribution would silently DISABLE it for the two consumers
+      # already doing it right.
+      # ⛔ THE IDEMPOTENCY TEST MUST VALIDATE THE SEGMENT, NOT JUST SPOT `-run-`.
+      #    `*-run-[0-9]*` also matches `foo-run-1abc-end`, which would be treated as
+      #    already attributed and skip stamping -- producing a pool whose run segment
+      #    no sweeper's `run-([0-9]+)` can resolve. That is an UNATTRIBUTABLE pool
+      #    created by the very block whose job is to make attribution mandatory, and it
+      #    would look stamped to a human reading the name.
+      #
+      #    So: extract the segment after the LAST `-run-`, up to the next `-`, and
+      #    require it to be digits. Malformed REFUSES rather than stamping on top --
+      #    `foo-run-1abc-end-run-123-end` carries two run segments and the first one
+      #    wins for any greedy matcher.
+      #   (The attribution stamp itself is the `_rest`/`_seg` block in the script below.)
+      #
+      # ── THE PAT NEVER LEAVES THIS RUNNER (just-akash#383, Borduas-Holdings/blazing#1196) ──
+      # ⛔ The SDL used to carry `ACCESS_TOKEN=${GH_RUNNER_PAT}`, so every pool sent the org
+      # runner PAT to the Akash Console API (create_deployment receives the full SDL) and to
+      # the lease-winning provider (the manifest). This step now renders `RUNNER_TOKEN=@@RUNNER_TOKEN@@`,
+      # a placeholder, and holds no credential at all. The provision step MINTS A REGISTRATION
+      # TOKEN PER ATTEMPT, immediately before that attempt's deploy, and fills the placeholder
+      # into a per-attempt SDL it deletes once the deploy returns. The pinned df-akash-runner
+      # image (build bd9a14d8, entrypoint.sh:35-36) reads RUNNER_TOKEN before ACCESS_TOKEN.
+      #   * STEP-SCOPED: a shell variable in the provision script only, `::add-mask::`ed before
+      #     any use; never a step/job output, never job- or workflow-level env.
+      #   * 200 or 201 WITH an alphanumeric `.token` is a mint; anything else (202, 204, 4xx, a
+      #     2xx with no token, no response) fails closed with failure_reason=RUNNER_TOKEN_UNMINTED
+      #     before that attempt deploys. NOT a RUNNER_PAT_* reason: the preflight owns those.
+      #   * WHY PER ATTEMPT (DEV1's review of #384): a token lives ~1h and a failed attempt costs
+      #     ~21-22 min, so one mint before provision would expire by attempt 3, and a step cap
+      #     short enough to prevent that kills a legitimate retry mid-close. Per attempt, the
+      #     window is only mint -> deploy -> tag -> runners online. Its timed waits are the bid
+      #     windows (--bid-wait 60 + --bid-wait-retry 120) and the wall-clock runners-online
+      #     deadline (runner-wait-tries x 5 s, clamped to 480 = 40 min): 43 min, which leaves 17
+      #     of the hour for the untimed create, lease, manifest and tag calls.
       - name: Render runner SDL
+        id: render
         env:
-          GH_RUNNER_PAT: ${{ secrets.GH_RUNNER_PAT }}
           ORG: ${{ inputs.github-org }}
           RUNNER_LABEL: ${{ inputs.runner-label }}
           POOL_SIZE: ${{ inputs.pool-size }}
@@ -369,8 +767,89 @@ jobs:
           MEMORY: ${{ inputs.memory }}
           STORAGE: ${{ inputs.storage }}
           EPHEMERAL: ${{ inputs.ephemeral }}
+          PLACEMENT_KEY: ${{ inputs.placement-key }}
+          # Required for the attribution stamp below. github.run_id is numeric and
+          # server-supplied; it is not caller-controlled.
+          GH_RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
+          # ⛔ FAIL CLOSED ON THE ONE INPUT WHOSE FAILURE MODE IS SILENT. An empty or
+          # foreign placement key does not break the deploy — it produces a lease nobody
+          # can claim, or one a sibling's sweeper will close mid-CI, and both look like a
+          # provider fault from here. The three refusals below are the three ways it has
+          # actually gone wrong on this wallet:
+          #   * blank            — `group_spec.name` must be non-empty on chain, and a
+          #                        caller passing "" would fail at MsgCreateDeployment
+          #                        with a message about the SDL, not about this input.
+          #   * dcloud           — the network-wide DEFAULT placement name, used by most
+          #                        SDLs on Akash and owned by nobody. Measured in
+          #                        Borduas-Holdings/blazing 2026-09-02: its killcron probe
+          #                        stamped `dcloud`, so no prefix could claim it without
+          #                        also claiming strangers' deployments.
+          #   * dfci-infra-*     — the SIBLING's prefix, which its sweeper REAPS on a
+          #                        schedule. just_akash/provenance.py:66 keeps this value
+          #                        as SIBLING_REAPED_PREFIX and a test pins the two equal,
+          #                        so this literal cannot drift from the module's.
+          # ⛔ NORMALISE BEFORE JUDGING, OR THE JUDGEMENT IS BYPASSABLE. `dcloud ` with a
+          # trailing space does not match the `dcloud` pattern below, so an unnormalised
+          # value walks straight past the reserved-key checks and is then written into the
+          # SDL — where the whitespace is silently swallowed by the YAML parser and the
+          # deployment is stamped `dcloud` after all. Raised by CodeRabbit on the PR that
+          # added this input.
+          #
+          # ⚠ TRIM THE ENDS, DO NOT DELETE ALL WHITESPACE. Deleting it everywhere turns an
+          # embedded newline into a silent JOIN — `x\ny` became the perfectly valid key
+          # `xy` and was accepted, which is the caller getting a different marker than it
+          # asked for. Trimming leaves an interior character to fail the shape check below,
+          # so a surprising value is REFUSED rather than quietly repaired.
+          PLACEMENT_KEY="${PLACEMENT_KEY#"${PLACEMENT_KEY%%[![:space:]]*}"}"
+          PLACEMENT_KEY="${PLACEMENT_KEY%"${PLACEMENT_KEY##*[![:space:]]}"}"
+          # ⛔ AND THE KEY IS INTERPOLATED INTO A YAML HEREDOC, so its SHAPE is not
+          # cosmetic: a value containing `:` or a newline does not produce a bad key, it
+          # produces a DIFFERENT DOCUMENT. Restricting to what a placement key can
+          # actually be closes that as well as the whitespace case — one rule instead of a
+          # list of forbidden characters nobody will keep current.
+          case "${PLACEMENT_KEY}" in
+            *[!A-Za-z0-9._-]*|-*|.*|"")
+              echo "::error title=runner-pool::placement-key '${PLACEMENT_KEY}' is not a plain placement key. It is interpolated into the SDL, so it must match [A-Za-z0-9][A-Za-z0-9._-]* — anything else can restructure the document rather than name a key." >&2
+              exit 2 ;;
+          esac
+          case "${PLACEMENT_KEY}" in
+            dcloud|dcloud-*) echo "::error title=runner-pool::placement-key '${PLACEMENT_KEY}' is the Akash-wide default placement name, owned by nobody. A reaper aimed at it would match strangers' deployments. Namespace it to your repo." >&2; exit 2 ;;
+            dfci-infra-*)    echo "::error title=runner-pool::placement-key '${PLACEMENT_KEY}' is the SIBLING repo's prefix, which its sweeper reaps on a schedule. Stamping it would have that sweeper close this pool mid-CI." >&2; exit 2 ;;
+          esac
+          _rest="${PLACEMENT_KEY##*-run-}"
+          _seg="${_rest%%-*}"
+          case "${PLACEMENT_KEY}" in
+            *-run-*)
+              case "${_seg}" in
+                ""|*[!0-9]*)
+                  echo "::error title=runner-pool::placement-key '${PLACEMENT_KEY}' contains a '-run-' segment that is not a plain run id ('${_seg}'). Refusing rather than stamping a second one: a key with two run segments resolves to whichever a sweeper matches first, and a key with a malformed one resolves to nothing." >&2
+                  exit 2 ;;
+              esac
+              ;;  # already attributed, and the segment is a real run id
+            *)
+              # ⚠ `:-` so an unset var reaches the check below instead of killing the
+              #    step on `set -u` with "unbound variable". Both refuse, but only one
+              #    says WHY -- and an unattributed pool is the thing this exists to stop.
+              case "${GH_RUN_ID:-}" in
+                ""|*[!0-9]*)
+                  echo "::error title=runner-pool::GH_RUN_ID is '${GH_RUN_ID:-}', not a plain run id. The attribution stamp is interpolated into the SDL, and an unattributed pool is one no sweeper can prove is closable." >&2
+                  exit 2 ;;
+              esac
+              PLACEMENT_KEY="${PLACEMENT_KEY}-run-${GH_RUN_ID:-}-end"
+              ;;
+          esac
+          # Re-assert the shape AFTER the stamp. The appended segment is digits and dashes,
+          # so this cannot fail today -- which is exactly why it is here: a future change to
+          # the stamp must not be able to restructure the SDL document.
+          case "${PLACEMENT_KEY}" in
+            *[!A-Za-z0-9._-]*|-*|.*|"")
+              echo "::error title=runner-pool::placement key after the attribution stamp is '${PLACEMENT_KEY}', which is not a plain placement key." >&2
+              exit 2 ;;
+          esac
+          echo "placement key (on-chain group_spec.name): ${PLACEMENT_KEY}"
+          echo "deployment_group=${PLACEMENT_KEY}" >> "$GITHUB_OUTPUT"
           # All N replicas share ONE label carrying run identity; the runner image
           # randomises each replica's NAME from the prefix, so the wait loop counts
           # DISTINCT online runners by label rather than by name.
@@ -381,20 +860,20 @@ jobs:
               # THE SAME DIGEST sdl/github-runner-probe.yaml qualifies against, and a
               # test asserts they stay equal. A provider earns runner_host by scheduling
               # the probe image three consecutive times; running a different image here
-              # means the pool trusts a measurement taken of something else. `:latest`
+              # means the pool trusts a measurement taken of something else. ':latest'
               # made that gap permanent and silent — the tag can move between the
               # qualification and the run that relies on it.
-              image: ghcr.io/akash-network/github-runner@sha256:7509763af8209796f3e7fde5fb536c742075ec1a59ad1b36e3c9c27bc3bafc67
+              image: ghcr.io/digital-frontier-lda/df-akash-runner@sha256:aaf3799b5e138abef0831bb8467ded7325164316f0cfde5c183fe6e129eae79e
               env:
-                - ACCESS_TOKEN=${GH_RUNNER_PAT}
+                - RUNNER_TOKEN=@@RUNNER_TOKEN@@
                 - ORG_NAME=${ORG}
                 - RUNNER_SCOPE=org
-                # ⛔ `just-akash-`, NOT the shared `akash-`. This name prefix is the ONLY
+                # ⛔ 'just-akash-', NOT the shared 'akash-'. This name prefix is the ONLY
                 # thing a de-registration backstop can scope itself by — GitHub cannot
                 # filter runners by label — so a prefix shared with another repo's
                 # producers means either repo's reaper deletes the other's registrations.
                 # Blazing-Back/akash-runner.yml and blazing/akash-runner.yml both emit
-                # `akash-*` today. `just-akash-` matches this repo's own Akash placement
+                # 'akash-*' today. 'just-akash-' matches this repo's own Akash placement
                 # convention (just-akash-runner.*, just-akash-canary.*, just-akash-backtest.*),
                 # so it is adopted, not invented.
                 #
@@ -423,8 +902,8 @@ jobs:
                 # org listing fills with records while nothing ever runs, and why a paid
                 # lease burns for its whole life having executed nothing.
                 #
-                # ⚠ SETTING IT TO `false` DOES NOT WORK. Measured, run 31614227678: with
-                # `DISABLE_AUTO_UPDATE=false` the container still printed "Disable auto
+                # ⚠ SETTING IT TO 'false' DOES NOT WORK. Measured, run 31614227678: with
+                # 'DISABLE_AUTO_UPDATE=false' the container still printed "Disable auto
                 # update option is enabled" and stayed on 2.334.0. The entrypoint tests the
                 # variable's PRESENCE, not its value, so any non-empty string — including
                 # "false" — applies --disableupdate. The line must be ABSENT.
@@ -442,27 +921,55 @@ jobs:
                   cpu: { units: ${CPU} }
                   memory: { size: ${MEMORY} }
                   storage: { size: ${STORAGE} }
-            # PROVENANCE — the placement key becomes `group_spec.name` on chain, and
+            # PROVENANCE — the placement key becomes 'group_spec.name' on chain, and
             # it is what stops a sibling repo's sweeper closing this pool mid-CI. Our
             # Console wallet is shared, and Blazing-Back reaps any NON-GPU deployment
             # older than 12h as a presumed leak; a runner pool is non-GPU, and with
-            # `ephemeral: false` it legitimately outlives 12h. Unstamped, it matched
+            # 'ephemeral: false' it legitimately outlives 12h. Unstamped, it matched
             # that filter — and the symptom would be runners vanishing mid-job, read
             # back as RUNNER_NEVER_REGISTERED against a provider that did nothing wrong.
             # See just_akash/provenance.py for why the key, and not an attribute.
             placement:
-              just-akash-runner:
+              ${PLACEMENT_KEY}:
                 pricing:
                   runner: { denom: uact, amount: 100000 }
           deployment:
             runner:
-              just-akash-runner:
+              ${PLACEMENT_KEY}:
                 profile: runner
                 count: ${POOL_SIZE}
           SDL
           echo "--- rendered SDL (token redacted) ---"
-          grep -vE 'ACCESS_TOKEN' /tmp/runner-sdl.yaml
+          grep -vE 'RUNNER_TOKEN' /tmp/runner-sdl.yaml
 
+      # ── Why the runner listing is read in three steps, not one ────────────────
+      # `gh api --paginate` emits one JSON document per page. A throttled or transient
+      # failure mid-pagination is an error object — {"message":"API rate limit
+      # exceeded",...} — with no `.runners` key. `.runners[]` on it raises "Cannot
+      # iterate over null" and jq exits 5, and because this step runs under GitHub's
+      # default `bash -e {0}`, a failing command substitution aborts AT THE ASSIGNMENT:
+      # `GH_RC=$?` and the whole GITHUB_API_UNAVAILABLE branch never execute. The
+      # handling was written correctly and was simply unreachable.
+      #
+      # MEASURED, Borduas-Holdings/blazing run 33796902050: the lease was created and
+      # tagged, the wait loop printed `0/4 online` three times, then
+      # `jq: error (at <stdin>:5): Cannot iterate over null (null)` and
+      # `Process completed with exit code 5` — jq's runtime-error code surfacing as the
+      # step's. No diagnosis, and the lease outlived the run: that DSEQ (1788463980879)
+      # appears in this repo's own cleanup-stale verdict table at 0.7d as
+      # `-> STALE-runner`. See issue #250 for why nothing then closed it.
+      #
+      # ⚠ This prose lives OUT here on purpose. Comments inside a `run:` scalar count
+      # toward the job's size, and an oversized job makes GitHub build zero jobs with no
+      # log — Borduas-Holdings/blazing#664. Out here the parser drops them.
+      # ── PER-ATTEMPT MINT GUARDS (just-akash#383/#384; comments here, not in `run:`, cost no job size) ──
+      #   * The template is checked with an explicit `[ ! -s ]` BEFORE the mint, never with
+      #     `$(< file) || fallback`: under `bash -e` on the runner's bash 5.2 that form ended the step
+      #     on a missing file with no failure_reason (CI run 34953315385, job 104329251140).
+      #   * `echo failure_reason=RUNNER_SDL_TEMPLATE_MISSING` is UNQUOTED on purpose: quoted, detect-secrets
+      #     1.5.0 flags the literal as a Base64 high-entropy string (just-akash#384 Secret Scan).
+      #   * UNCLASSIFIED_ATTEMPT: an attempt that fell into the unclassified `continue` may have
+      #     broadcast a create with no DSEQ, so no later refusal narrows the outcome to no-deployment.
       - name: Provision (retry down candidates, tag before waiting)
         id: provision
         env:
@@ -480,10 +987,30 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           MAX_ATTEMPTS: '3'
           RUNNER_WAIT_TRIES: ${{ inputs.runner-wait-tries }}
+          EXPECTED_RUNNER_VERSION: ${{ inputs.expected-runner-version }}
           REQUIRED_DEPOSIT_USD: ${{ inputs.required-deposit-usd }}
           PROVIDER_SELECT: ${{ inputs.provider-select }}
+          DEPLOYMENT_GROUP: ${{ steps.render.outputs.deployment_group }}
         run: |
           set -uo pipefail
+
+
+          # Fail closed before the first possible submit. Every branch inherits UNKNOWN;
+          # only the enumerated no-broadcast sites below may narrow it to no-deployment.
+          echo "deployment_outcome=unknown" >> "$GITHUB_OUTPUT"
+
+          # ⛔ THE CLASSIFICATION BELOW READS just-akash's STRUCTURED DIAGNOSTICS (#348).
+          # AKASH_DIAGNOSTICS=off silences them, so an ambiguous create or a failed lease
+          # that still holds a DSEQ would fall through to "unclassified" and RETRY. Refuse
+          # before any create instead: nothing has been submitted, so no-deployment is
+          # authoritative here.
+          case "$(printf '%s' "${AKASH_DIAGNOSTICS:-}" | tr '[:upper:]' '[:lower:]')" in
+            off|0|false)
+              echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+              echo "failure_reason=DIAGNOSTICS_DISABLED" >> "$GITHUB_OUTPUT"
+              echo "::error title=AKASH_DIAGNOSTICS is disabled::The provision step classifies create and lease failures from just-akash's structured diagnostics. With them off, an ambiguous create would be retried. Unset AKASH_DIAGNOSTICS or set it to 1."
+              exit 1 ;;
+          esac
 
           # Wallet selection belongs to just-akash. It receives the complete pool,
           # measures authoritative free credit, and chooses the richest funded account.
@@ -494,10 +1021,89 @@ jobs:
           # Arrays are the only form that is both correct and lint-clean.
           JA=(uv run --with . just-akash)
 
+          # ⛔ KNOWN EFFECTS ARE MONOTONIC FOR THE RUN (#347). Once a round parses a
+          # DSEQ, a later authoritative pre-broadcast failure cannot publish
+          # no-deployment or erase that identity. A later ambiguous POST is different:
+          # it must publish unknown because it may have created a second deployment.
+          CREATED_DSEQ=""
+          UNCLASSIFIED_ATTEMPT=0
+
+          # ⛔ A LEASE IS TERMINAL ONLY ON TWO-ENDPOINT CHAIN AGREEMENT (#347). A
+          # destroy that exits 0 has only had its close ACCEPTED (cli.py destroy), and
+          # destroy-side text such as "Deployment closed" is not proof
+          # (_lease_verification.py). This is the rule runner-teardown.yml already
+          # enforces: verify-closed exits 0 AND reports a typed closed=True. An empty
+          # DSEQ or owner, or an unreadable verdict, is NOT proven.
+          lease_is_terminal() {
+            local dseq="$1" owner="$2" rc=0 verdict=False
+            [ -n "$dseq" ] && [ -n "$owner" ] || return 1
+            "${JA[@]}" verify-closed --dseq "$dseq" --owner "$owner" --json \
+              >/tmp/ja-verify.json 2>/tmp/ja-verify.err || rc=$?
+            verdict=$(python3 -c "import json,sys;print(json.load(sys.stdin).get('closed') is True)" \
+              </tmp/ja-verify.json 2>/dev/null || echo False)
+            [ "$rc" -eq 0 ] && [ "$verdict" = "True" ]
+          }
+
+          # ⛔ READ THE DIAGNOSTIC, NOT THE ENGLISH (#398). just_akash/_diagnostics.py
+          # writes one JSON event per diagnosable outcome to /tmp/ja.log with
+          # {"type":"akash-diag","level":"error|warning","code":"X",...}. The CODE
+          # is the typed truth; the English `_log` lines are decoration. Returning
+          # the LATEST error code (not the first) because the most recent attempt is
+          # the one whose outcome the loop is reporting — earlier attempts may have
+          # emitted codes for transient conditions that the latest attempt resolved
+          # or replaced.
+          #
+          # Grepping English text would force this matcher to enumerate every Code
+          # enum member, and a new member would silently fall back to
+          # PROVIDER_CAPACITY — exactly the bucket swallow this function exists to
+          # stop. A JSON parser reads whatever the producer emits, today and tomorrow.
+          diag_last_code() {
+            # Read the latest akash-diag error code from /tmp/ja.log. The helper
+            # lives in `just_akash/_diag_helper.py` rather than inline here
+            # because (a) embedding a multi-line Python script in a YAML literal
+            # block breaks the heredoc terminator's column-0 requirement under
+            # CI's bash, and (b) the helper is unit-testable directly when it
+            # is a module. Two `uv run` invocations per provision attempt —
+            # inner loop UNCLASSIFIED branch and post-loop PROVIDER_CAPACITY
+            # gate — are negligible against the workflow's own per-attempt
+            # wall-clock.
+            #
+            # ⛔ CALLERS MUST PASS /tmp/ja.log EXPLICITLY. With `set -uo pipefail`
+            # in effect for this `run:` block (line 995), expanding an unbound
+            # `$1` is an unbound-variable error and bash aborts before writing
+            # `failure_reason=` — which is WORSE than the bucket we are demoting,
+            # because a bucket at least emits a value. A hidden default inside
+            # this function (`${1:-/tmp/ja.log}`) would let callers read the
+            # wrong file without noticing; explicit-argument at every call
+            # site is the safer shape. Pinned by
+            # test_every_diag_last_code_call_passes_an_argument.
+            #
+            # ⛔ THIS FUNCTION IS FAIL-OPEN BY CONSTRUCTION. The diagnostic
+            # enrichment step exists to surface a richer failure_reason; it
+            # MUST NOT become the cause of a missing failure_reason. The
+            # `uv run` invocation can fail in the harness (no pyproject.toml
+            # in `cwd=tmp_path`), in cold CI caches (resolver errors), and in
+            # production (transient lockfile mismatch). Any of those would
+            # surface as a non-zero exit here; under `set -e`, a failing
+            # command substitution in `VAR=$(diag_last_code ...)` aborts the
+            # outer block — killing the entire provisioning loop after a
+            # SINGLE attempt, regardless of how many remain. `return 0`
+            # rescues the function's exit status so the assignment always
+            # succeeds and emits empty string when the helper cannot be run.
+            # The downstream `if [ -n "$DIAG_CODE" ]` / `case "$POST_DIAG"`
+            # then fall through to the bucket they were already going to
+            # demote, which is the documented behaviour. Future call sites
+            # inherit the property without remembering `|| true`. Pinned by
+            # test_diag_last_code_is_fail_open_when_the_helper_cannot_be_run.
+            uv run --with . python -m just_akash._diag_helper "$1" 2>/dev/null
+            return 0
+          }
+
           # A free-text input feeding `seq`: junk would make the wait loop a no-op and
           # every pool instantly "never registered". Clamp like MIN_POOL below.
           case "${RUNNER_WAIT_TRIES}" in ''|*[!0-9]*) RUNNER_WAIT_TRIES=90 ;; esac
           [ "$RUNNER_WAIT_TRIES" -ge 1 ] 2>/dev/null || RUNNER_WAIT_TRIES=90
+          [ "$RUNNER_WAIT_TRIES" -le 480 ] || { echo "::warning::runner-wait-tries ${RUNNER_WAIT_TRIES} clamped to 480: a minted registration token lives ~1h"; RUNNER_WAIT_TRIES=480; }
 
           MIN_POOL="${MIN_POOL_SIZE:-}"
           case "$MIN_POOL" in ''|*[!0-9]*) MIN_POOL="$POOL_SIZE" ;; esac
@@ -511,6 +1117,16 @@ jobs:
           EXCLUDED=$(printf '%s' "${STANDING_EXCLUDED_CSV:-}" | tr ',' ' ')
           SAW_BID=0
           SAW_SEQ_CONTENTION=0
+          # ⛔ PRESERVE THE CAUSE ACROSS ATTEMPTS (#389 follow-up). A successful
+          # diag_last_code read that returned a non-empty code is the ONLY
+          # source of ground truth for which Code the producer actually emitted.
+          # If we wait until post-loop, the next iteration's `rm -f /tmp/ja.log`
+          # (line 1193) has already wiped the log and the cause is gone. Capture
+          # it here on every successful non-empty read. Empty results from a
+          # FAILED `uv run` MUST NOT overwrite the prior good value — that is
+          # the entire invariant. Pinned by
+          # test_diagnostic_preserved_when_a_subsequent_attempt_wipes_the_log.
+          LAST_KNOWN_DIAG=""
 
           for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
             echo "::group::provision attempt $attempt/$MAX_ATTEMPTS"
@@ -533,6 +1149,7 @@ jobs:
             # Never degrade an exhausted/denied allowlist into unrestricted
             # marketplace selection; that would re-admit every standing trap.
             if [ "${#PROV_ARGS[@]}" -eq 0 ]; then
+              [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
               echo "failure_reason=NO_ELIGIBLE_BIDDER" >> "$GITHUB_OUTPUT"
               echo "::error title=No eligible provider remains::All configured preferred and fallback providers are standing-denied or failed during this run."
               echo "::endgroup::"; exit 1
@@ -547,13 +1164,77 @@ jobs:
             case "${PROVIDER_SELECT:-}" in
               "") ;;
               cheapest|emptiest) SELECT_ARGS=(--select "$PROVIDER_SELECT") ;;
-              *) echo "::error title=provider-select::must be 'cheapest' or 'emptiest', got '${PROVIDER_SELECT}'"; exit 1 ;;
+              *)
+                [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+                echo "::error title=provider-select::must be 'cheapest' or 'emptiest', got '${PROVIDER_SELECT}'"
+                exit 1 ;;
             esac
 
+            if [ ! -s /tmp/runner-sdl.yaml ] || ! SDL_TEMPLATE=$(cat /tmp/runner-sdl.yaml) \
+              || [[ "$SDL_TEMPLATE" != *@@RUNNER_TOKEN@@* ]]; then
+              [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+              echo failure_reason=RUNNER_SDL_TEMPLATE_MISSING >> "$GITHUB_OUTPUT"
+              echo "::error title=Runner SDL template missing, empty or without its token placeholder::attempt $attempt: nothing minted or deployed."
+              echo "::endgroup::"; exit 1
+            fi
+            RC=0
+            RESP=$(gh api --method POST "orgs/${ORG}/actions/runners/registration-token" -i 2>&1) || RC=$?
+            RUNNER_TOKEN=""
+            if [[ "$RESP" =~ \"token\"\ *:\ *\"([^\"]*)\" ]]; then RUNNER_TOKEN="${BASH_REMATCH[1]}"; fi
+            [ -n "$RUNNER_TOKEN" ] && echo "::add-mask::${RUNNER_TOKEN}"
+            CODE=$(printf '%s' "$RESP" | awk 'NR==1 && $1 ~ /^HTTP/ {print $2}')
+            unset RESP
+            case "${RC}:${CODE}:${RUNNER_TOKEN}" in 0:200:*[!A-Za-z0-9]*|0:201:*[!A-Za-z0-9]*) RUNNER_TOKEN="" ;; 0:200:?*|0:201:?*) ;; *) RUNNER_TOKEN="" ;; esac
+            if [ -z "$RUNNER_TOKEN" ]; then
+              [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+              echo "failure_reason=RUNNER_TOKEN_UNMINTED" >> "$GITHUB_OUTPUT"
+              echo "::error title=Runner registration token not minted (HTTP ${CODE:-none received})::attempt $attempt: nothing deployed. The PAT preflight passed: a GitHub API condition, not a provider fault."
+              echo "::endgroup::"; exit 1
+            fi
+            if ! printf '%s\n' "${SDL_TEMPLATE//@@RUNNER_TOKEN@@/$RUNNER_TOKEN}" > /tmp/runner-sdl.minted.yaml \
+              || grep -q '@@RUNNER_TOKEN@@' /tmp/runner-sdl.minted.yaml; then
+              rm -f -- /tmp/runner-sdl.minted.yaml
+              [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+              echo "failure_reason=RUNNER_SDL_UNRENDERED" >> "$GITHUB_OUTPUT"
+              echo "::error title=Per-attempt runner SDL not rendered::attempt $attempt: write failed or placeholder left; nothing deployed."
+              echo "::endgroup::"; exit 1
+            fi
+            unset SDL_TEMPLATE
+            # ⛔ ARCHIVE THE PRIOR ATTEMPT'S LOG BEFORE WIPING IT (#389 follow-up).
+            # LAST_KNOWN_DIAG closes the helper-succeeded-but-DIAG_CODE-was-empty
+            # gap (it captures on every non-empty read). It does NOT close the
+            # gap where the helper itself fails: `uv run` errors (cold cache,
+            # lockfile drift, harness `cwd=tmp_path` without a pyproject.toml)
+            # make DIAG_CODE="" via fail-open, but the log still has a valid
+            # Code event. Without archiving, the next iteration's `rm -f`
+            # wipes that event and the post-loop verdict finds nothing.
+            # Archive the prior log verbatim (only when non-empty — an empty
+            # prior attempt would still need an archive slot, but `cp /dev/null`
+            # would copy a 0-byte file that the post-loop walk can skip). The
+            # post-loop verdict walks /tmp/ja.log.* in REVERSE chronological
+            # order, taking the FIRST non-empty diag read as POST_DIAG. Pinned
+            # by test_archive_walk_recovers_priors_after_helper_fail_open.
+            if [ -s /tmp/ja.log ] && [ -n "${attempt:-}" ]; then
+              cp /tmp/ja.log /tmp/ja.log."$attempt"
+            fi
             rm -f /tmp/ja.log
-            "${JA[@]}" deploy --sdl /tmp/runner-sdl.yaml --deposit "$REQUIRED_DEPOSIT_USD" --bid-wait 60 \
-              --bid-wait-retry 120 "${SELECT_ARGS[@]}" "${PROV_ARGS[@]}" 2>&1 | tee /tmp/ja.log || true
-            DSEQ=$(awk -F': +' '/^[[:space:]]*DSEQ:/{print $2; exit}' /tmp/ja.log || true)
+            DEPLOY_RC=0
+            "${JA[@]}" deploy --sdl /tmp/runner-sdl.minted.yaml --deposit "$REQUIRED_DEPOSIT_USD" --bid-wait 60 \
+              --bid-wait-retry 120 "${SELECT_ARGS[@]}" "${PROV_ARGS[@]}" 2>&1 | tee /tmp/ja.log || DEPLOY_RC=${PIPESTATUS[0]}
+            rm -f /tmp/runner-sdl.minted.yaml
+            # ⛔ A FAILED LEASE STILL HOLDS A DEPLOYMENT (#348). just-akash prints the
+            # "DSEQ:" summary only after a lease succeeds. When lease creation fails it
+            # closes best-effort and emits LEASE_CREATE_FAILED (or REDEPLOY_FAILED) with the
+            # dseq, then raises. That deployment is real until proven closed, so the same
+            # single read also recovers its identity from that diagnostic line; the paths
+            # below then refuse to create again until it is proven closed.
+            DSEQ=$(awk -F': +' '
+              /^[[:space:]]*DSEQ:/ && !found { summary = $2; found = 1 }
+              /"code": "(LEASE_CREATE_FAILED|REDEPLOY_FAILED)"/ && match($0, /"dseq": "[1-9][0-9]*"/) {
+                recovered = substr($0, RSTART + 9, RLENGTH - 10)
+              }
+              END { if (found) print summary; else if (recovered != "") print recovered }
+            ' /tmp/ja.log || true)
             # ⭐ PUBLISH THE DSEQ THE MOMENT IT EXISTS — before tagging, before the
             # registration wait, before anything can fail or be cancelled. The
             # success block below also writes it, but a run that dies mid-wait
@@ -564,9 +1245,29 @@ jobs:
             # round overwrites this, so the surviving value names the CURRENT lease;
             # an already-closed round's dseq is a harmless no-op for the teardown
             # ("already closed|not found" → verified-closed). (#1439 pattern.)
-            echo "dseq=$DSEQ" >> "$GITHUB_OUTPUT"
+            [ -n "$DSEQ" ] && echo "dseq=$DSEQ" >> "$GITHUB_OUTPUT"
+            [ -n "$DSEQ" ] && echo "deployment_outcome=created" >> "$GITHUB_OUTPUT"
+            [ -n "$DSEQ" ] && CREATED_DSEQ="$DSEQ"
             PROVIDER=$(awk -F': +' '/^[[:space:]]*Provider:/{print $2; exit}' /tmp/ja.log || true)
             WALLET=$(awk -F': +' '/^[[:space:]]*Wallet:/{print $2; exit}' /tmp/ja.log || true)
+            # Publish the create-time owner as soon as it is available. Internal
+            # rollback runs only on a failed handoff, so a success-only publication
+            # leaves precisely that teardown without the bound-owner fallback.
+            # ⛔ THE OWNER IS PART OF THE SAME RECORD AS THE DSEQ (#348). A round with no
+            # DSEQ writes neither, so the previous pair stands. A round WITH a DSEQ always
+            # writes this round's owner, even an empty one: just-akash prints DSEQ
+            # unconditionally but Wallet only conditionally, so skipping an empty owner
+            # would pair the NEW dseq with the OLD owner. An unreadable owner cannot be
+            # closed under --expected-owner, so stop here, before any destroy or retry,
+            # and leave this DSEQ as the published identity.
+            if [ -n "$DSEQ" ]; then
+              echo "wallet_address=$WALLET" >> "$GITHUB_OUTPUT"
+              if [ -z "$WALLET" ]; then
+                echo "failure_reason=LEASE_OWNER_UNREADABLE" >> "$GITHUB_OUTPUT"
+                echo "::error title=Lease owner is UNREADABLE::dseq=$DSEQ was created but the deploy output named no Wallet. Stopping before any close or another deploy; the external teardown must resolve this DSEQ's owner."
+                echo "::endgroup::"; exit 1
+              fi
+            fi
             WALLET_UACT=$(awk '/^[[:space:]]*Wallet available:/{print $(NF-1); exit}' /tmp/ja.log || true)
 
             # A DSEQ with no PROVIDER is a REAL deployment we would otherwise walk away
@@ -575,11 +1276,22 @@ jobs:
             if [ -n "$DSEQ" ] && [ -z "$PROVIDER" ]; then
               echo "::warning::attempt $attempt: dseq=$DSEQ exists but no Provider line was parsed — closing it so it cannot leak escrow"
               "${JA[@]}" tag --dseq "$DSEQ" --name "${TAG_PREFIX}-${RUN_ID}" || true
+              # ⛔ FRESH ceiling for THIS close window only (#378 repair): the step's own work
+              # (deploys, the runner wait) spends wall time the step-start export could not
+              # spare — a later window inherited an expired ceiling and exited 75 with
+              # "0 of 1 credential(s) tried" while the lease stayed open (DEV1's witness).
+              export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
               for _try in 1 2 3; do
-                "${JA[@]}" destroy --dseq "$DSEQ" -y 2>&1 | tee /tmp/ja-orphan.log && break
+                DESTROY_RC=0
+                "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-orphan.log || DESTROY_RC=${PIPESTATUS[0]}
+                # ⛔ 75 = OWNER_LOOKUP_UNREACHABLE (owner_lookup.OWNER_LOOKUP_UNREACHABLE_EXIT_CODE):
+                # the step's shared lookup budget is exhausted — retrying re-spends a dead budget.
+                [ "$DESTROY_RC" -eq 75 ] && break
+                [ "$DESTROY_RC" -eq 0 ] && break
                 grep -qi "Deployment closed" /tmp/ja-orphan.log && break
                 sleep 5
               done
+              lease_is_terminal "$DSEQ" "$WALLET" || { echo "failure_reason=LEASE_CLOSE_UNVERIFIED" >> "$GITHUB_OUTPUT"; echo "::error title=Internal lease close is UNVERIFIED::dseq=$DSEQ did not reach a terminal state across two chain endpoints. Stopping before another deploy so this lease stays the published identity for the external teardown."; echo "::endgroup::"; exit 1; }
             fi
 
             if [ -z "$DSEQ" ] || [ -z "$PROVIDER" ]; then
@@ -587,6 +1299,11 @@ jobs:
               # order exists, so no provider ever saw it — calling that "no bid" sends
               # the investigation at providers instead of at the balance.
               if grep -qiE 'PaymentRequiredError|Insufficient balance|HTTP 402' /tmp/ja.log 2>/dev/null; then
+                # Only the exact Console 402/PaymentRequired rejection is proven
+                # pre-broadcast. Generic insufficient wording remains UNKNOWN.
+                if grep -qiE 'PaymentRequiredError|HTTP 402' /tmp/ja.log 2>/dev/null; then
+                  [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+                fi
                 echo "failure_reason=WALLET_UNDERFUNDED" >> "$GITHUB_OUTPUT"
                 echo "::error title=Akash rejected the deploy: INSUFFICIENT BALANCE::No order was created and no provider was asked to bid, so retrying cannot help. Top up the wallet."
                 echo "::endgroup::"; exit 1
@@ -617,6 +1334,22 @@ jobs:
                 echo "::endgroup::"; continue
               fi
 
+              # A failed or malformed create response is not evidence that the POST had
+              # no effect. In particular NO_DSEQ_RETURNED means Console answered after
+              # accepting the non-idempotent request but supplied no usable identity.
+              # Never issue another create in that state: external teardown receives the
+              # typed unknown outcome and must report HELD rather than a clean empty no-op.
+              if grep -qE '"code"[[:space:]]*:[[:space:]]*"(NO_DSEQ_RETURNED|DEPLOY_CREATE_FAILED|DEPLOY_CREATE_ORPHAN_SUSPECTED)"|NON-RETRYABLE CREATE OUTCOME AMBIGUOUS|No DSEQ returned from API' /tmp/ja.log 2>/dev/null; then
+                # Ambiguity from THIS later create dominates any closed identity from
+                # an earlier round. The stale DSEQ may remain published for diagnosis,
+                # but teardown must see unknown and hold rather than close/no-op it.
+                echo "deployment_outcome=unknown" >> "$GITHUB_OUTPUT"
+                echo "create_ambiguous=true" >> "$GITHUB_OUTPUT"
+                echo "failure_reason=CREATE_OUTCOME_AMBIGUOUS" >> "$GITHUB_OUTPUT"
+                echo "::error title=Create outcome is AMBIGUOUS::The non-idempotent create may have committed without returning a usable DSEQ. Stopping before another create; teardown will hold this run for receipt or owner-scoped chain reconciliation."
+                echo "::endgroup::"; exit 1
+              fi
+
               # UNCLASSIFIED, and it must SAY so rather than defaulting to the market.
               #
               # The two matchers above are not equally evidenced. The 402 signature is
@@ -633,10 +1366,53 @@ jobs:
               # workflow exists to stop reporting. Printing the raw output is what turns
               # the next occurrence into evidence, so the matcher can be corrected from
               # a real string instead of a plausible one.
+
+              # ⛔ SURFACE THE TYPED DIAGNOSTIC, NOT THE BUCKET (#398). If just-akash
+              # emitted a structured akash-diag event with level=error before exiting,
+              # that code names the cause — BIDS_FOREIGN_ONLY, NO_BIDS_RECEIVED,
+              # BIDS_STALE, BIDS_MALFORMED, PROVIDER_OFFLINE, PROVIDER_INVALID_VERSION,
+              # PROVIDER_NO_BID, PROVIDER_STATUS_QUERY_FAILED, PROVIDER_UNKNOWN, and
+              # the rest. Reading it from JSON (via diag_last_code above) means a new
+              # Code enum member becomes a typed failure_reason automatically; we do
+              # NOT enumerate the codes here, because enumerating them is the bug.
+              # Each such reason names a different remedy — folding them into
+              # PROVIDER_CAPACITY (the bucket that swallowed them) reported a market
+              # outage that may never have happened.
+              DIAG_CODE=$(diag_last_code /tmp/ja.log)
+              # ⛔ DIAG_CODE IS BOUNDED TO THE Code ENUM, same shape as POST_DIAG below.
+              # The helper reads whatever JSON it parses from /tmp/ja.log; an arbitrary
+              # string from a corrupted log or a future producer must NOT escape into
+              # the declared `failure_reason` output set. Unknown values fall through
+              # to the unclassified branch (continue) — they cannot become failure_reason.
+              #
+              # ⛔ PRESERVE THE CAUSE BEFORE THE NEXT ATTEMPT WIPES IT (#389 follow-up).
+              # Empty DIAG_CODE here means EITHER "log was empty" OR "diag_last_code
+              # failed". We do not distinguish — both fall through to unclassified,
+              # both leave LAST_KNOWN_DIAG unchanged. A non-empty DIAG_CODE updates
+              # LAST_KNOWN_DIAG; the post-loop verdict prefers POST_DIAG and falls
+              # back to LAST_KNOWN_DIAG before reaching PROVIDER_CAPACITY.
+              if [ -n "$DIAG_CODE" ]; then
+                LAST_KNOWN_DIAG=$DIAG_CODE
+              fi
+              case "$DIAG_CODE" in
+                WALLET_INSUFFICIENT_CREDIT|WALLET_LOW_CREDIT|WALLET_CREDIT_QUERY_FAILED|PROVIDER_OFFLINE|PROVIDER_INVALID_VERSION|PROVIDER_NO_CAPACITY|PROVIDER_NO_BID|PROVIDER_STATUS_QUERY_FAILED|PROVIDER_UNKNOWN|NO_BIDS_RECEIVED|BIDS_FOREIGN_ONLY|BIDS_STALE|BIDS_MALFORMED|SELECTION_EMPTIEST_DEGRADED|DEPLOY_CREATE_FAILED|DEPLOY_CREATE_ORPHAN_SUSPECTED|NO_DSEQ_RETURNED|LEASE_CREATE_FAILED|REDEPLOY_FAILED|SDL_ERROR|CONFIG_ERROR|LEASE_DOWN|EXEC_EXIT_CODE_UNKNOWN)
+                  [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+                  echo "failure_reason=$DIAG_CODE" >> "$GITHUB_OUTPUT"
+                  echo "::error title=just-akash code: $DIAG_CODE::deploy.py emitted this typed diagnostic before exiting — see /tmp/ja.log for the full event. Each Code names a different remedy, which is why they are not collapsed into PROVIDER_CAPACITY."
+                  echo "::endgroup::"; exit 1
+                  ;;
+                *)
+                  # Unknown value (or empty after fail-open) — treat as unclassified,
+                  # fall through to the raw-output branch below. The literal
+                  # `failure_reason=` is not written for this case.
+                  ;;
+              esac
+
               echo "::group::unclassified deploy failure — raw output"
               tail -40 /tmp/ja.log 2>/dev/null || echo "(no output captured)"
               echo "::endgroup::"
-              echo "::warning::attempt $attempt: no lease within the bid window — cause NOT classified. The raw output is in the group above; if it names an account-sequence or transaction error, that string belongs in this workflow's matcher."
+              UNCLASSIFIED_ATTEMPT=1
+              echo "::warning::attempt $attempt: no lease within the bid window (deploy exit ${DEPLOY_RC}) — cause NOT classified. The raw output is in the group above; if it names an account-sequence or transaction error, that string belongs in this workflow's matcher."
               echo "::endgroup::"; continue
             fi
             SAW_BID=1
@@ -709,10 +1485,60 @@ jobs:
               # `--paginate` without `--jq` emits one JSON object per page, and jq reads
               # that concatenated stream natively — so the per-page filtering that makes
               # a line-per-match correct across pages is unchanged.
-              RUNNER_IDS=$(gh api --paginate "orgs/${ORG}/actions/runners?per_page=100" 2>/tmp/gh-runners.err \
-                | jq -r --arg L "$RUNNER_LABEL" \
-                  '.runners[] | select(.status=="online") | select(any(.labels[].name; .==$L)) | .id')
-              GH_RC=$?
+              # An error page has no `.runners`, and `.runners[]` on it exits jq 5 —
+              # which under `bash -e {0}` aborts at the ASSIGNMENT, so `GH_RC=$?` and the
+              # unreadable-listing branch below never run. Null-safety alone would be
+              # worse (a throttled page would silently undercount and a healthy pool would
+              # be discarded), so an error page is detected and routed to that branch.
+              # Full incident: see the comment above this step.
+              GH_RC=0
+              RUNNER_PAGES=$(gh api --paginate "orgs/${ORG}/actions/runners?per_page=100" 2>/tmp/gh-runners.err) || GH_RC=$?
+              if [ "$GH_RC" -eq 0 ]; then
+                # `has("runners")` distinguishes a listing from an error object. An empty
+                # org returns {"total_count":0,"runners":[]} — has the key, counts as 0.
+                # COUNT LINES, NEVER `| length` — the same rule the online count follows
+                # below, and for the same reason: an aggregating filter is per-document.
+                # One line per bad page, `grep -c .` collapses it to one integer.
+                BAD_PAGES=$(printf '%s' "$RUNNER_PAGES" | jq -r 'select(has("runners") | not) | 1' 2>/dev/null | grep -c . || true)
+                if [ "${BAD_PAGES:-0}" -ne 0 ]; then
+                  # ⚠ GUARDED ASSIGNMENT, because `| head -1` can SIGPIPE jq. With
+                  # `pipefail` on and enough documents, head closes the pipe early and
+                  # jq dies 141 — a non-zero substitution, which under `bash -e` aborts
+                  # AT THE ASSIGNMENT and reintroduces the exact defect this block fixes,
+                  # inside the handler for it. Reproduced: 3 docs -> rc=0, 20,000 docs ->
+                  # rc=141. ⛔ AND `pipefail` IS ON HERE — this step opens with
+                  # `set -uo pipefail`, so the risk is live, not theoretical. (I first
+                  # wrote that it was off; the awk I checked with had silently failed.
+                  # Measuring the parsed step said otherwise.) `|| _why=""` makes any
+                  # exit code survivable. (Reported by Copilot on PR #251.)
+                  _why=$(printf '%s' "$RUNNER_PAGES" | jq -r 'select(has("runners") | not) | .message // "no message field"' 2>/dev/null | head -1) || _why=""
+                  echo "  runner listing unreadable (${BAD_PAGES} error page(s)): ${_why:-unparseable}"
+                  sleep 15
+                  continue
+                fi
+              fi
+              RUNNER_IDS=$(printf '%s' "$RUNNER_PAGES" | jq -r --arg L "$RUNNER_LABEL" \
+                  '(.runners // [])[] | select(.status=="online") | select(any(.labels[].name; .==$L)) | .id') || GH_RC=$?
+              # ---- LANDING GATE, part 1 of 2: project the VERSION out of the SAME read ----
+              # akash-github-runner#69. Auto-update is MANDATED here (DISABLE_AUTO_UPDATE must
+              # be absent) because a static version floor rots at the next deprecation. True,
+              # and it weighs only one pump. The other is auto-update ITSELF: measured on
+              # borduas-pool dseq 1788575148893 (2026-09-05), a HEALTHY 2.336.0 runner already
+              # "Listening for Jobs", with NO deprecation message anywhere in its log, took the
+              # mandated 2.337.0 update, exited, FAILED to deregister, and died on
+              # `Could not load file or assembly 'System.Linq.Parallel'`.
+              # Register -> die -> restart -> re-register, unbounded.
+              #
+              # ★ `null` IS THE CASE THAT MATTERS. A runner that registered and then died
+              # reports NO version while still listing as `online`, so the count above cannot
+              # tell it from a working one. That corpse is what this projects.
+              #
+              # Deliberately reuses $RUNNER_PAGES rather than issuing a second listing read:
+              # this poll already pages the WHOLE org listing every 5s, and the comment above
+              # explains why that budget is the binding constraint here. A second read would
+              # spend quota to learn something the first read already contains.
+              RUNNER_VERSIONS=$(printf '%s' "$RUNNER_PAGES" | jq -r --arg L "$RUNNER_LABEL" \
+                '(.runners // [])[] | select(.status=="online") | select(any(.labels[].name; .==$L)) | (.version // "null")') || GH_RC=$?
               if [ "$GH_RC" -ne 0 ]; then
                 # Deliberately NOT the 5s cadence: if this is the secondary limit (a
                 # per-MINUTE budget) then retrying at 5s spends the recovery window.
@@ -752,8 +1578,18 @@ jobs:
             # GitHub's API, and a second attempt just doubles the request load that is
             # the most likely cause.
             if [ "$API_OK" = "0" ]; then
+              # ⛔ FRESH ceiling for THIS close window only (#378 repair): the step's own work
+              # (deploys, the runner wait) spends wall time the step-start export could not
+              # spare — a later window inherited an expired ceiling and exited 75 with
+              # "0 of 1 credential(s) tried" while the lease stayed open (DEV1's witness).
+              export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
               for _try in 1 2 3; do
-                "${JA[@]}" destroy --dseq "$DSEQ" -y 2>&1 | tee /tmp/ja-destroy.log && break
+                DESTROY_RC=0
+                "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-destroy.log || DESTROY_RC=${PIPESTATUS[0]}
+                # ⛔ 75 = OWNER_LOOKUP_UNREACHABLE (owner_lookup.OWNER_LOOKUP_UNREACHABLE_EXIT_CODE):
+                # the step's shared lookup budget is exhausted — retrying re-spends a dead budget.
+                [ "$DESTROY_RC" -eq 75 ] && break
+                [ "$DESTROY_RC" -eq 0 ] && break
                 grep -qi "Deployment closed" /tmp/ja-destroy.log && break
                 sleep 5
               done
@@ -766,13 +1602,107 @@ jobs:
               echo "::warning::attempt $attempt: ${ONLINE:-0}/${POOL_SIZE} online on $PROVIDER (need >= ${MIN_POOL}) — discarding this lease"
               # Escrow-critical, and deliberately a literal locally-parsed --dseq so a
               # destroy-safety lint can prove this only tears down what this loop made.
+              # ⛔ FRESH ceiling for THIS close window only (#378 repair): the step's own work
+              # (deploys, the runner wait) spends wall time the step-start export could not
+              # spare — a later window inherited an expired ceiling and exited 75 with
+              # "0 of 1 credential(s) tried" while the lease stayed open (DEV1's witness).
+              export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
               for _try in 1 2 3; do
-                "${JA[@]}" destroy --dseq "$DSEQ" -y 2>&1 | tee /tmp/ja-destroy.log && break
+                DESTROY_RC=0
+                "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-destroy.log || DESTROY_RC=${PIPESTATUS[0]}
+                # ⛔ 75 = OWNER_LOOKUP_UNREACHABLE (owner_lookup.OWNER_LOOKUP_UNREACHABLE_EXIT_CODE):
+                # the step's shared lookup budget is exhausted — retrying re-spends a dead budget.
+                [ "$DESTROY_RC" -eq 75 ] && break
+                [ "$DESTROY_RC" -eq 0 ] && break
                 grep -qi "Deployment closed" /tmp/ja-destroy.log && break
                 sleep 5
               done
+              lease_is_terminal "$DSEQ" "$WALLET" || { echo "failure_reason=LEASE_CLOSE_UNVERIFIED" >> "$GITHUB_OUTPUT"; echo "::error title=Internal lease close is UNVERIFIED::dseq=$DSEQ did not reach a terminal state across two chain endpoints. Stopping before another deploy so this lease stays the published identity for the external teardown."; echo "::endgroup::"; exit 1; }
               EXCLUDED="$EXCLUDED $PROVIDER"
               echo "::endgroup::"; continue
+            fi
+
+            # ---- LANDING GATE, part 2 of 2: a corpse that registered still counts as online ----
+            # The count above cannot tell a working runner from one that registered, took the
+            # mandated update, and died -- both list as `online`. Part 1 projected the version
+            # out of that same read; this refuses the lease when it is missing.
+            #
+            # ⚠ THE COST IS NOT LOCAL TO THIS POOL, which is why the lease is closed rather than
+            # merely warned about. Every restart adds an org runner registration, and the org
+            # listing's PAGE COUNT sets the pre-strike CI quota floor for every repo on the
+            # shared PAT. Measured 2026-09-05: 1,732 registrations org-wide; a 300-runner sample
+            # was 300/300 offline, 0 busy, version: null. A repo can be refused CI by a pump it
+            # does not run and cannot see.
+            #
+            # ⚠ NO VERSION LITERAL LIVES HERE. `expected-runner-version` is optional and empty by
+            # default, so the gate's standing behaviour is to reject only a MISSING version -- the
+            # corpse. Pinning a number here would be a static floor, the exact defect the
+            # auto-update mandate exists to avoid, reintroduced by its own guard.
+            # ⚠ AN EMPTY PROJECTION HERE IS A CONTRADICTION, NOT A CLEAN POOL. This point is
+            # only reached once ONLINE >= MIN_POOL, so the same read that produced N ids must
+            # produce N versions. Zero means the projection failed while the count succeeded,
+            # and accepting that would let an unreadable verdict pass as a healthy one -- the
+            # failure this gate exists to stop, arriving through the gate itself.
+            #
+            # Found by testing the decision against synthetic inputs. The conformance rule
+            # passes on the PROJECTION alone, so it cannot see whether the decision is sound;
+            # a gate that satisfies its own rule and accepts everything is the shape this
+            # whole standard exists to refuse.
+            if [ -z "${RUNNER_VERSIONS:-}" ]; then
+              echo "::warning title=Landing gate: version projection empty for a pool reporting ${ONLINE} online::attempt $attempt: the runner listing yielded ${ONLINE} online id(s) and 0 versions on $PROVIDER — the read disagrees with itself, so this lease is discarded rather than trusted."
+              # ⛔ FRESH ceiling for THIS close window only (#378 repair): the step's own work
+              # (deploys, the runner wait) spends wall time the step-start export could not
+              # spare — a later window inherited an expired ceiling and exited 75 with
+              # "0 of 1 credential(s) tried" while the lease stayed open (DEV1's witness).
+              export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
+              for _try in 1 2 3; do
+                DESTROY_RC=0
+                "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-destroy.log || DESTROY_RC=${PIPESTATUS[0]}
+                # ⛔ 75 = OWNER_LOOKUP_UNREACHABLE (owner_lookup.OWNER_LOOKUP_UNREACHABLE_EXIT_CODE):
+                # the step's shared lookup budget is exhausted — retrying re-spends a dead budget.
+                [ "$DESTROY_RC" -eq 75 ] && break
+                [ "$DESTROY_RC" -eq 0 ] && break
+                grep -qi "Deployment closed" /tmp/ja-destroy.log && break
+                sleep 5
+              done
+              lease_is_terminal "$DSEQ" "$WALLET" || { echo "failure_reason=LEASE_CLOSE_UNVERIFIED" >> "$GITHUB_OUTPUT"; echo "::error title=Internal lease close is UNVERIFIED::dseq=$DSEQ did not reach a terminal state across two chain endpoints. Stopping before another deploy so this lease stays the published identity for the external teardown."; echo "::endgroup::"; exit 1; }
+              EXCLUDED="$EXCLUDED $PROVIDER"
+              echo "::endgroup::"; continue
+            fi
+            if [ -n "${RUNNER_VERSIONS:-}" ]; then
+              # ⚠ -F ON EVERY VERSION COMPARISON. Without it grep reads the pattern as a
+              # REGEX, and a version is full of `.` — which matches any character. Measured:
+              # against versions [2.337.0, 2X337X0, 2.336.0] with EXPECTED=2.337.0,
+              # `grep -cvx` counts 1 wrong and `grep -cvxF` counts 2. The regex form treats
+              # 2X337X0 as CORRECT, so it UNDER-counts wrong versions — a gate failing open,
+              # which is the direction that lets a bad pool through.
+              GATE_DEAD=$(printf '%s\n' "$RUNNER_VERSIONS" | grep -cxF -- "null" || true)
+              GATE_WRONG=0
+              if [ -n "${EXPECTED_RUNNER_VERSION:-}" ]; then
+                GATE_WRONG=$(printf '%s\n' "$RUNNER_VERSIONS" | grep -vxF -- "null" | grep -cvxF -- "${EXPECTED_RUNNER_VERSION}" || true)
+              fi
+              if [ "${GATE_DEAD:-0}" -gt 0 ] || [ "${GATE_WRONG:-0}" -gt 0 ]; then
+                echo "::warning title=Landing gate: registered runners are not running::attempt $attempt: ${GATE_DEAD} online runner(s) report NO version and ${GATE_WRONG} report an unexpected one on $PROVIDER — discarding this lease rather than handing the caller a pool of corpses."
+                printf '%s\n' "$RUNNER_VERSIONS" | sort | uniq -c | sed 's/^/    version /'
+                # ⛔ FRESH ceiling for THIS close window only (#378 repair): the step's own work
+                # (deploys, the runner wait) spends wall time the step-start export could not
+                # spare — a later window inherited an expired ceiling and exited 75 with
+                # "0 of 1 credential(s) tried" while the lease stayed open (DEV1's witness).
+                export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
+                for _try in 1 2 3; do
+                  DESTROY_RC=0
+                  "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-destroy.log || DESTROY_RC=${PIPESTATUS[0]}
+                  # ⛔ 75 = OWNER_LOOKUP_UNREACHABLE (owner_lookup.OWNER_LOOKUP_UNREACHABLE_EXIT_CODE):
+                  # the step's shared lookup budget is exhausted — retrying re-spends a dead budget.
+                  [ "$DESTROY_RC" -eq 75 ] && break
+                  [ "$DESTROY_RC" -eq 0 ] && break
+                  grep -qi "Deployment closed" /tmp/ja-destroy.log && break
+                  sleep 5
+                done
+                lease_is_terminal "$DSEQ" "$WALLET" || { echo "failure_reason=LEASE_CLOSE_UNVERIFIED" >> "$GITHUB_OUTPUT"; echo "::error title=Internal lease close is UNVERIFIED::dseq=$DSEQ did not reach a terminal state across two chain endpoints. Stopping before another deploy so this lease stays the published identity for the external teardown."; echo "::endgroup::"; exit 1; }
+                EXCLUDED="$EXCLUDED $PROVIDER"
+                echo "::endgroup::"; continue
+              fi
             fi
 
             {
@@ -818,10 +1748,42 @@ jobs:
             # ⛔ ONE request, not two — same reason the preflight says so: two calls can
             # disagree, and reporting a status line from a call that succeeded while
             # branching on one that failed names a code that never belonged to the failure.
-            VERDICT_RESP=$(gh api "orgs/${ORG}/actions/runners?per_page=1" -i 2>&1) || true
-            VERDICT_CODE=$(printf '%s' "$VERDICT_RESP" | awk 'NR==1{print $2}')
+            # ⛔ THE WRITE VERB HERE TOO, AND THIS SITE IS THE MORE SERIOUS ONE.
+            # This step decides whether to blame a PROVIDER. Its own 401 text says the
+            # container "mints its registration token with this same credential" — it
+            # NAMED the write path while testing a read. So a PAT that can list runners
+            # but cannot mint returned 200 here, the check fell through, and the run
+            # accused a host that did nothing wrong. A preflight failing a run is
+            # recoverable; a fabricated provider fault is somebody else's reputation.
+            VERDICT_RESP=$(gh api --method POST "orgs/${ORG}/actions/runners/registration-token" -i 2>&1) || true
+            # Same live-credential masking as the preflight; this response body carries
+            # a registration token on success.
+            # ⛔ `|| true` — same SIGPIPE-under-pipefail hazard as MINTED above. This one
+            # guards the VERDICT token's mask, so an abort here loses the masking of a
+            # live credential AND kills the step.
+            VERDICT_MINTED=$(printf '%s' "$VERDICT_RESP" | sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p' | head -1) || true
+            [ -n "$VERDICT_MINTED" ] && echo "::add-mask::${VERDICT_MINTED}"
+            # ⛔ THE SAME GUARD AS THE PREFLIGHT, AND IT MATTERS MORE HERE.
+            # Without `$1 ~ /^HTTP/`, awk prints the second WORD of an arbitrary
+            # error string as though it were a status: `dial tcp: lookup ... timeout`
+            # yields `tcp:`, which then SELECTS A CASE ARM. I added this guard at the
+            # preflight, wrote the comment explaining it, and left the sibling site
+            # unguarded in the same change.
+            #
+            # ⚠ AND THIS SITE HAS NO SECOND SIGNAL. The preflight captures `|| RC=$?`
+            # and branches on it; the capture above ends `|| true`, discarding the
+            # return code deliberately — a non-zero gh exit must not kill the step
+            # before the case can classify it. That leaves the status line as the ONLY
+            # evidence, so an unguarded parse is the whole input, not one input of two.
+            # With the guard, no status line yields an EMPTY code, `${VERDICT_CODE:-000}`
+            # sends it to `*)`, and the run reports INDETERMINATE and accuses nobody.
+            VERDICT_CODE=$(printf '%s' "$VERDICT_RESP" | awk 'NR==1 && $1 ~ /^HTTP/ {print $2}')
             case "${VERDICT_CODE:-000}" in
-              200)
+              # ⛔ 201, NOT 200. A successful mint is 201 Created. Leaving this as 200
+              # would send every HEALTHY credential to the `*)` arm and report
+              # INDETERMINATE — "the credential could not be re-checked" — on a run
+              # where it was re-checked and was fine.
+              200|201)
                 : ;;   # the credential still works, so the provider verdict below stands
               401)
                 echo "failure_reason=RUNNER_PAT_INVALID" >> "$GITHUB_OUTPUT"
@@ -853,36 +1815,197 @@ jobs:
             echo "failure_reason=WALLET_TX_CONTENTION" >> "$GITHUB_OUTPUT"
             echo "::error title=The wallet could not carry the deploy: concurrent transactions::AKASH_API_KEY is ONE Cosmos account and cannot have two transactions in flight — the losers are rejected with an account-sequence mismatch, and nothing in just_akash retries it. This is NOT a market condition and NOT a provider fault. GitHub concurrency groups are scoped per repository, so they cannot serialise callers in different repos. At spike, give each concurrent provisioner its OWN Akash account, or funnel provisioning through one repo that serialises on the akash-wallet group."
           else
-            echo "failure_reason=PROVIDER_CAPACITY" >> "$GITHUB_OUTPUT"
-            echo "::error title=No provider bid::No eligible provider bid within the window across ${MAX_ATTEMPTS} attempts. This is a market/capacity condition, not a code failure."
+            # ⛔ PROVIDER_CAPACITY IS A LAST RESORT, NOT A CATCH-ALL (#398). The bucket
+            # swallowed seven distinct allow-list and provider-health outcomes — each a
+            # different cause and each a different remedy. If ANY attempt across the
+            # loop emitted a typed akash-diag code, surface it; only fall through to
+            # PROVIDER_CAPACITY when no attempt left a code (e.g. deploy.py raised
+            # before reaching the diagnostic emitter, or the log was truncated by a
+            # signal).
+            #
+            # ⚠ NAMING HAZARD: the bucket value is PROVIDER_CAPACITY. A real
+            # no-capacity outcome emits Code.PROVIDER_NO_CAPACITY (with the
+            # underscore), which this branch surfaces verbatim — NOT as
+            # PROVIDER_CAPACITY. The two read identically to a skim; the underscore
+            # is the distinction. The downstream consumer (blazing) widens its
+            # accept-list to match.
+            POST_DIAG=$(diag_last_code /tmp/ja.log)
+            # ⛔ ARCHIVE WALK (#389 follow-up, code-review #2). LAST_KNOWN_DIAG
+            # closes the helper-succeeded-but-DIAG_CODE-was-empty gap (capture
+            # is gated on non-empty DIAG_CODE), but it does NOT close the
+            # gap where the helper itself fails: a `uv run` error (cold cache,
+            # lockfile drift, harness cwd without pyproject.toml) makes the
+            # diag_last_code wrapper fail-open, DIAG_CODE="" for that
+            # attempt, LAST_KNOWN_DIAG un-updated, then the next iteration's
+            # `rm -f /tmp/ja.log` wipes the only evidence that this attempt
+            # HAD a valid code earlier in the run. Without archiving the
+            # post-loop verdict has nothing to fall back to and routes to
+            # PROVIDER_CAPACITY — the exact misattribution this PR exists
+            # to demote, but the one LAST_KNOWN_DIAG does not catch.
+            #
+            # Walk /tmp/ja.log.* in REVERSE chronological order (latest
+            # attempt's archive first; older ones after), running each
+            # through diag_last_code. Take the FIRST non-empty result.
+            # Reverse order is load-bearing: the most recent failed attempt
+            # is more diagnostic than older ones (state of the cluster,
+            # network conditions, etc.) so prefer it. An empty result from
+            # the live log + empty archives means deploy.py raised before
+            # reaching the diagnostic emitter (the legitimate
+            # PROVIDER_CAPACITY case).
+            #
+            # ⛔ ITERATE BY ATTEMPT NUMBER, NOT BY GLOB+SORT. `ls -1r` is
+            # LEXICAL sort: with MAX_ATTEMPTS >= 10, attempt `.10` sorts
+            # before `.2`, so the walk would silently pick an OLDER
+            # diagnostic over the newest. MAX_ATTEMPTS=3 today hides the
+            # bug; MAX_ATTEMPTS=10 (entirely plausible for a flaky
+            # provider) makes it live. Iterating MAX_ATTEMPTS..1 and
+            # reading /tmp/ja.log.<a> if it exists is deterministic,
+            # needs no sort, and cannot drift with the filename format.
+            # Pinned by test_archive_walk_iterates_attempt_numbers_not_glob_sort
+            # (mechanism) AND test_archive_walk_prefers_newest_at_ten_plus_attempts
+            # (property — newest wins even when 11+ archives exist).
+            if [ -z "$POST_DIAG" ]; then
+              for a in $(seq "${MAX_ATTEMPTS}" -1 1); do
+                archive="/tmp/ja.log.$a"
+                [ -f "$archive" ] || continue
+                attempt_code=$(diag_last_code "$archive" 2>/dev/null || echo "")
+                if [ -n "$attempt_code" ]; then
+                  POST_DIAG="$attempt_code"
+                  echo "::notice title=just-akash archive walk::recovered diagnostic '$attempt_code' from $archive after helper fail-open on the live log"
+                  break
+                fi
+              done
+            fi
+            # ⛔ POST_DIAG IS BOUNDED TO THE Code ENUM (fail-closed). The
+            # `diag_last_code` helper returns whatever JSON it parses; an
+            # arbitrary string from a corrupted /tmp/ja.log or a future
+            # producer must NOT escape into the declared `failure_reason`
+            # output set. The case statement below enumerates every member
+            # of just_akash._diagnostics.Code; anything else falls through
+            # to PROVIDER_CAPACITY, which is the documented bucket and IS
+            # in the declared output set. Pinned by
+            # test_post_diag_is_bounded_by_the_code_enum_with_a_declared_fallback.
+            #
+            # ⛔ THREE-TIER VERDICT (#389 follow-up). Prefer POST_DIAG (this
+            # attempt's diagnostic, possibly recovered from an archive);
+            # fall back to LAST_KNOWN_DIAG (preserved from any prior
+            # successful read this run); fall back to PROVIDER_CAPACITY.
+            # The bucket is LAST, not FIRST — accepting the catch-all would
+            # auto-accept every failure and defeat the typed-diagnostic
+            # effort.
+            #
+            # EFFECTIVE_DIAG is the union of POST_DIAG and LAST_KNOWN_DIAG —
+            # the value the case below actually matches AND the value we
+            # write to failure_reason. Without this binding the case branch
+            # would match on the substituted value but print `$POST_DIAG`
+            # (still empty), giving an empty failure_reason field and an empty
+            # error title — silently dropping the cause.
+            EFFECTIVE_DIAG="${POST_DIAG:-$LAST_KNOWN_DIAG}"
+            #
+            # The cross-repo constraint is checked at PR-open time: every
+            # Code member listed below must also be present in blazing's
+            # ACCEPTED_ZERO_FAILURE_REASONS (or its named-exclusion list)
+            # so the runner-registration cleanup does not misclassify a
+            # real Code value as MISSING_EXPECTED. The current 23 Code
+            # members are documented in PR B-prime; widening the enum
+            # without the matching blazing accept-list is the locked-out
+            # shape.
+            case "$EFFECTIVE_DIAG" in
+              WALLET_INSUFFICIENT_CREDIT|WALLET_LOW_CREDIT|WALLET_CREDIT_QUERY_FAILED|PROVIDER_OFFLINE|PROVIDER_INVALID_VERSION|PROVIDER_NO_CAPACITY|PROVIDER_NO_BID|PROVIDER_STATUS_QUERY_FAILED|PROVIDER_UNKNOWN|NO_BIDS_RECEIVED|BIDS_FOREIGN_ONLY|BIDS_STALE|BIDS_MALFORMED|SELECTION_EMPTIEST_DEGRADED|DEPLOY_CREATE_FAILED|DEPLOY_CREATE_ORPHAN_SUSPECTED|NO_DSEQ_RETURNED|LEASE_CREATE_FAILED|REDEPLOY_FAILED|SDL_ERROR|CONFIG_ERROR|LEASE_DOWN|EXEC_EXIT_CODE_UNKNOWN)
+                echo "failure_reason=$EFFECTIVE_DIAG" >> "$GITHUB_OUTPUT"
+                echo "::error title=just-akash code: $EFFECTIVE_DIAG::no lease across ${MAX_ATTEMPTS} attempts, but deploy.py emitted this typed diagnostic — see /tmp/ja.log for the full event. Each Code names a different remedy, which is why they are not collapsed into PROVIDER_CAPACITY."
+                ;;
+              *)
+                echo "failure_reason=PROVIDER_CAPACITY" >> "$GITHUB_OUTPUT"
+                echo "::error title=No provider bid::No eligible provider bid within the window across ${MAX_ATTEMPTS} attempts, and no akash-diag code was emitted. This is a market/capacity condition, not a code failure — investigate per-provider health."
+                ;;
+            esac
+            # ⛔ ARCHIVE CLEANUP (#389 follow-up). Remove /tmp/ja.log.*
+            # archives after the verdict is bound. Archives from a previous
+            # invocation would survive only inside a single job's lifetime
+            # (each Akash provisioning job gets a fresh runner), but the
+            # pattern here matches the per-attempt wipe: anything left
+            # after a successful failure_reason binding is dead weight,
+            # and a stale archive from a misconfigured re-run could
+            # mislead the next archive walk if the helper fails twice.
+            # `rm -f` is documented to never fail on a missing path, so no
+            # `|| true` swallow is needed; test_no_new_unmeasured_green.py's
+            # R2 forbids it on a verdict step.
+            rm -f /tmp/ja.log.*
           fi
           exit 1
 
-  # ── THE POOL CLOSES ITS OWN LEASE ──────────────────────────────────────────────
-  #
-  # ⭐ INTERNALISED TEARDOWN (2026-08-23). runner-teardown.yml existed, was correct,
-  # and was called by ZERO workflows — the pool→work→teardown pairing lived only in
-  # its own docstring, so every pool run abandoned its lease at job end. Measured:
-  # 13 × just-akash-runner.<hash> held 65 ACT for up to 23.5h; eleven were created
-  # in eight minutes (2026-08-22 14:16-14:24Z) by runs whose teardown never existed.
-  #
-  # This job makes teardown a PROPERTY OF THE POOL rather than a duty of the caller.
-  # The docstring's consumer-assembled protocol assumed every caller remembers the
-  # three-job shape; internalising removes that assumption — a future caller cannot
-  # forget what it never had to add. (Same inversion #1439/#1390 applied to
-  # close-follows-creation; also a correction to the C5 addendum's standard.)
-  #
-  # `if: always()` UNCONDITIONALLY — no result gate, no dseq precondition. A pool
-  # that fails before leasing produces an EMPTY dseq, and runner-teardown.yml treats
-  # empty as a successful no-op ("nothing to close"). Gating here would re-train the
-  # success-gating this job exists to remove.
+  # ── ROLLBACK BEFORE SUCCESSFUL HANDOFF ────────────────────────────────────────
+  # The reusable workflow must finish before caller consumer jobs can start.
+  # Closing on successful provisioning here would hand them already-dead runners.
+  # Failed/cancelled provisioning keeps its internal rollback; successful provision
+  # transfers cleanup to the caller's always() teardown after every consumer finishes.
+  # Publish dseq early: rollback needs the created lease even if validation fails.
+  # Abrupt cancellation can prevent GitHub from exposing job outputs or scheduling
+  # cleanup despite always(). The independently scheduled backstop remains required;
+  # this predicate does not make cancellation delivery or output retention reliable.
   teardown:
-    name: Close lease and de-register runners (the pool owns this)
+    name: Roll back failed or cancelled pool provisioning
     needs: [pool]
-    if: always()
-    uses: ./.github/workflows/runner-teardown.yml
+    if: always() && needs.pool.result != 'success'
+    # ⛔ FULL PATH AT A PINNED SHA, NEVER `./`. A reusable workflow's job runs in the
+    # CALLER's context, so a bare `./` resolves inside the CALLER's tree — where this
+    # file does not exist. The job then cannot be created, the graph cannot be built,
+    # and the consumer's run dies with `jobs=0`: a startup_failure rendered as a
+    # generic "workflow file issue" against THEIR workflow, for a defect in ours.
+    #
+    # ⚠ IT WORKS PERFECTLY HERE, WHICH IS WHY IT SHIPPED. In this repo's own CI the
+    # caller IS just-akash, so `./` resolves. A reusable workflow cannot test its own
+    # cross-repo callability from inside its own repo. Measured 2026-09-03:
+    # Borduas-Holdings/blazing bumped past #243 and both of its Akash workflows
+    # returned startup_failure with zero jobs (just-akash#247).
+    #
+    # ⚠ AND IT IS A RECURRENCE. akash-github-runner#149 was the same bug one repo over,
+    # with the same `jobs=0` signature; its test now records the rule verbatim:
+    # "a bare `./` resolves inside the CALLER's tree […] every consumer run died with
+    # jobs=0" (test_reusable_conformance_workflow.py:88).
+    #
+    # ⇒ The pin is not trusted, it is CHECKED:
+    # test_the_nested_teardown_pin_matches_the_file_it_calls asserts the teardown at this
+    # SHA is byte-identical — to the BASE branch's copy on a pull request, and to the
+    # working copy everywhere else — so the two cannot drift silently.
+    # ⚠ NOT "lags by exactly one commit" — this comment said that, and the guard does not
+    # check it. Commit DISTANCE is not enforceable here: a multi-commit PR or a squash
+    # merge breaks it while the pin stays correct. IDENTITY is the property that matters,
+    # and it is the one asserted. The test docstring records the same correction.
+    #
+    # ⛔ IDENTITY IS NOT SUFFICIENT ON ITS OWN, AND THIS COMMENT USED TO IMPLY IT WAS.
+    # The identity guard forces this pin onto a commit whose teardown matches byte for
+    # byte, and mid-PR the only such commit is the BRANCH commit — which is exactly
+    # what a SQUASH MERGE destroys. #308 was squashed, leaving this line pointing at
+    # d5e64da8 (`compare d5e64da8...main` -> "diverged"), so Actions could not resolve
+    # the nested `uses:` while building the job graph and every downstream caller died
+    # as a STARTUP FAILURE: jobs=0, no logs, nothing naming the missing ref. blazing#927
+    # burned three commits on it. The previous pin survived only because ITS PR was not
+    # squashed (`compare c2cad20a...main` -> "ahead").
+    #
+    # ⇒ So TWO independent properties are asserted, and both are required:
+    #   identity     — test_the_nested_teardown_pin_matches_the_file_it_calls
+    #   REACHABILITY — test_the_nested_teardown_pin_is_reachable_from_main
+    # ⛔ ON A PULL REQUEST THIS PIN MUST ALREADY BE ON THE BASE BRANCH (just-akash#364).
+    # The reachability guard used to accept any ancestor of HEAD, and a PR-only commit
+    # always is one — #348 → 16be7deb orphaned 1ad3913b that way. A PR that edits
+    # runner-teardown.yml therefore leaves this pin at base (identity is judged against the
+    # base copy there), and a follow-up change repins to the post-merge main SHA, which the
+    # identity guard names on main. Until that repin lands only main is red: a PR that does
+    # not touch runner-teardown.yml or this line skips identity with a note naming the
+    # pending repin. Every self-pin must be a 40-hex SHA, never a branch or tag, and never a
+    # commit that exists only on a PR branch.
+    uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@61ffce693fdbb0c7fdfe681a1b03de7b9fece2a5
     with:
+      # The last KNOWN lease always reaches teardown so it is closed and proven. An
+      # ambiguous later create travels beside it as create-ambiguous: teardown closes
+      # the known dseq and still fails HELD with CREATE_OUTCOME_AMBIGUOUS.
       dseq: ${{ needs.pool.outputs.dseq }}
+      deployment-outcome: ${{ needs.pool.outputs.deployment_outcome }}
+      create-ambiguous: ${{ needs.pool.outputs.create_ambiguous }}
+      wallet-address: ${{ needs.pool.outputs.wallet_address }}
+      deployment-group: ${{ needs.pool.outputs.deployment_group }}
       tag-prefix: ${{ inputs.tag-prefix }}
       runner-label: ${{ inputs.runner-label }}
       # ⭐ inputs.github-org, NOT github.organization — that context property DOES NOT
@@ -893,6 +2016,17 @@ jobs:
       # so the teardown MUST name the same org the registration used — guaranteed
       # consistent by reading the SAME input, not by reconstructing it from context.
       github-org: ${{ inputs.github-org }}
+      # ⛔ REQUIRED BY THE CALLEE, WITH NO DEFAULT — and omitting it did not fail HERE.
+      # runner-teardown.yml declares `just-akash-ref` required. A reusable call that
+      # omits a required input cannot be turned into a job, so GitHub abandons the whole
+      # graph: the CONSUMER's run returns startup_failure with ZERO jobs, no logs and no
+      # annotation. Measured 2026-09-03 from Borduas-Holdings/blazing#798 — both of its
+      # workflows that call this one died that way, while the same branch with the
+      # previous pin (017b9e0b, which had no nested teardown at all) built 14 jobs.
+      # ⚠ THIS REPO'S OWN CI CANNOT SEE IT. Nothing here calls runner-pool.yml as a
+      # reusable, so the broken graph is only ever built in a consumer. Same blind spot
+      # as the `./` defect in #248, one input along.
+      just-akash-ref: ${{ inputs.just-akash-ref }}
     secrets:
       AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
       AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}

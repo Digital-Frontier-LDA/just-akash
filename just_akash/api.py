@@ -23,6 +23,15 @@ from typing import Any
 
 logger = logging.getLogger("akash.api")
 
+# ⛔ THE ONE SOCKET TIMEOUT FOR EVERY CONSOLE HTTP CALL (#368). Without it, a socket
+# that connects and then never sends a byte raised nothing at all — a lookup or close
+# could hang until the GitHub job timeout, and no retry budget bounds that in wall time.
+# 180s rather than something tight because the origin is MEASURED to answer slowly and
+# still usefully: a committed-then-500 arrived 103s into the request, Cloudflare's own
+# 524 at 125s (deploy.py `_report_suspected_orphans` records the shape). Cutting inside
+# that envelope would turn answers we currently get — and can classify — into unknowns.
+CONSOLE_HTTP_TIMEOUT = 180.0
+
 
 def _ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -98,10 +107,94 @@ def _unwrap_data(response: Any) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+class AkashAPIError(RuntimeError):
+    """An HTTP error from the Console API, carrying the fields that tell an
+    UPSTREAM failure from OUR bad request.
+
+    ⛔ EVERY HTTP ERROR USED TO ARRIVE AS THE SAME `RuntimeError`. A Cloudflare
+    524 — the proxy giving up on Akash's origin after 120s — was indistinguishable
+    from a 400 saying our SDL is wrong, except by substring-matching the message.
+    So an upstream outage read as a test failure, the E2E leg looked "flaky", and
+    it got re-run by hand at real Akash cost per round (#266).
+
+    ⚠ STILL A RuntimeError SUBCLASS, DELIBERATELY — and the distinction is worth
+    stating precisely, because an earlier wording here was not. `except
+    RuntimeError` still catches it, so every handler in the tree keeps working.
+    But `type(e)` is now `AkashAPIError`, NOT `RuntimeError`: a caller testing
+    `type(e) is RuntimeError` would break. Nothing does today. Saying this
+    "changes neither the type callers catch" was true of the CATCH and false of
+    the TYPE — accurate enough to be believed and imprecise enough to mislead.
+
+    WHAT IS CONTRACTUALLY PRESERVED IS THE STRING. `str(e)` is byte-identical to
+    the message this used to raise, because parsing it is what callers actually
+    do — `"already exists" in str(e).lower()` in deploy.py, `_is_credit_error` in
+    cleanup_stale. The structured fields are added BESIDE the message, never
+    inside it, so no substring match can shift underneath those callers.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int,
+        body: str = "",
+        retryable: bool | None = None,
+        retry_after: int | None = None,
+        error_name: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.body = body
+        # ⚠ `retryable` is the UPSTREAM'S CLAIM, recorded, not believed. See
+        # is_upstream_timeout() for why this must not be read as "safe to repeat".
+        self.retryable = retryable
+        self.retry_after = retry_after
+        self.error_name = error_name
+
+    def is_upstream_timeout(self) -> bool:
+        """True when the PROXY gave up on the origin — 524, or an explicit
+        origin_response_timeout.
+
+        ⛔ THIS DOES NOT MEAN "SAFE TO RETRY", AND THE DISTINCTION IS THE WHOLE
+        POINT. Cloudflare's `retryable: true` describes ITS OWN proxy semantics;
+        it cannot describe whether Akash's origin committed the transaction,
+        because Cloudflare does not know. This repo has MEASURED the other case:
+        `_report_suspected_orphans` in deploy.py records that "a gateway 500, a
+        PROXY TIMEOUT or a dropped connection can land AFTER the transaction
+        committed — measured shape: HTTP 500 returned 103 SECONDS into the
+        request". The 524 in #266 arrived at 125s. Same shape.
+
+        So this answers "was the fault ours?" — which is what decides whether a
+        red E2E leg indicts the change under test. It does NOT answer "may I send
+        it again?", which for a non-idempotent create needs a positive read-back.
+        """
+
+        return self.status == 524 or self.error_name == "origin_response_timeout"
+
+
 class AkashConsoleAPI:
     # Ceiling for list_deployments. See that method's docstring: the server's
     # hasMore/total cannot detect truncation, so we over-ask and warn at the ceiling.
-    LIST_LIMIT = 1000
+    #
+    # ⛔ 100 IS THE SERVER'S MAXIMUM, NOT A PREFERENCE. This was 1000 until
+    # 2026-09-18, when the Console API began rejecting it outright and naming the
+    # bound in its own response body:
+    #
+    #     GET /v1/deployments?limit=1000 -> HTTP 400
+    #     {"code":"validation_error","data":[{"code":"too_big","maximum":100,
+    #       "inclusive":true,"path":["limit"]}]}
+    #
+    # Every caller raised AkashAPIError, which took down `Cleanup stale deployments`
+    # and `Provider canary` here plus ci_cleanup_runner_deployments.py (Blazing-Back)
+    # and akash-stale-sweep.sh (blazing) — 8 consecutive CI failures across 3
+    # workflows from 2026-09-17T23:15Z. Raising this above 100 breaks all of them
+    # again; the server, not this constant, decides the ceiling.
+    #
+    # The "over-ask" design survives intact: observed holdings are 15-27
+    # deployments, so 100 still keeps ~4x headroom. What DID change is that the
+    # `len(deployments) >= LIST_LIMIT` warning below was effectively unreachable at
+    # 1000 and is reachable at 100 — it is now load-bearing, and tested as such.
+    LIST_LIMIT = 100
 
     """Client for Akash Console API (https://console-api.akash.network)"""
 
@@ -142,7 +235,7 @@ class AkashConsoleAPI:
 
         try:
             t0 = datetime.now(timezone.utc)
-            with urllib.request.urlopen(req) as response:  # noqa: S310
+            with urllib.request.urlopen(req, timeout=CONSOLE_HTTP_TIMEOUT) as response:  # noqa: S310
                 response_data = response.read().decode("utf-8")
                 elapsed_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
                 if response_data:
@@ -167,6 +260,7 @@ class AkashConsoleAPI:
                 f"[{_ts()}] API {method} {endpoint} -> HTTP {e.code} ({elapsed_ms}ms) "
                 f"body={error_body[:500]}"
             )
+            error_json: Any = None
             try:
                 error_json = json.loads(error_body)
                 error_msg = (
@@ -176,7 +270,54 @@ class AkashConsoleAPI:
                 )
             except json.JSONDecodeError:
                 error_msg = error_body
-            raise RuntimeError(f"API Error ({e.code}): {error_msg}") from e
+            # Structure recorded alongside the unchanged message. Cloudflare puts
+            # these at the top level of its JSON error body; absent fields stay None
+            # rather than being defaulted, because "the upstream said nothing" and
+            # "the upstream said false" are different facts.
+            retryable = retry_after = None
+            error_name = ""
+            if isinstance(error_json, dict):
+                raw_retryable = error_json.get("retryable")
+                retryable = raw_retryable if isinstance(raw_retryable, bool) else None
+                raw_after = error_json.get("retry_after")
+                # ⛔ `bool` IS a subclass of `int`, so `isinstance(True, int)` is True
+                # and `"retry_after": true` would be stored as True — logged as
+                # "retry_after=Trues". Note the mirror: `retryable` above uses
+                # isinstance(..., bool), which correctly rejects an int. Same two
+                # fields, opposite type confusion, and this is the THIRD asymmetry
+                # between them in this PR (absent-vs-False, truthiness-vs-0, now
+                # bool-vs-int). A pair of adjacent fields with different rules is
+                # where a rule applied once stops being applied twice.
+                retry_after = (
+                    raw_after
+                    if isinstance(raw_after, int) and not isinstance(raw_after, bool)
+                    else None
+                )
+                raw_name = error_json.get("error_name")
+                error_name = raw_name if isinstance(raw_name, str) else ""
+            raise AkashAPIError(
+                f"API Error ({e.code}): {error_msg}",
+                status=e.code,
+                body=error_body,
+                retryable=retryable,
+                retry_after=retry_after,
+                error_name=error_name,
+            ) from e
+        except TimeoutError as e:
+            # ⛔ TRANSPORT, UNKNOWN OUTCOME (#368). The endpoint connected and then
+            # went silent past CONSOLE_HTTP_TIMEOUT: whether the request was applied
+            # is as unknown as with a dropped connection, and raising AkashAPIError
+            # here would claim an HTTP verdict the server never sent.
+            # ⚠ THIS BLOCK LOGS; THE CLASSIFICATION COMES FROM PROPAGATION. The
+            # re-raised type is TimeoutError only because it arrived as one —
+            # TimeoutError is a SIBLING of URLError, not a subclass, so the
+            # handler below never catches it and the raw type reaches the caller
+            # whether or not this block exists. Its whole effect is the loud
+            # elapsed-time log; deleting it would silence the timeout, not
+            # re-classify it.
+            elapsed_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
+            logger.error(f"[{_ts()}] API {method} {endpoint} -> TIMEOUT after {elapsed_ms}ms: {e}")
+            raise
         except urllib.error.URLError as e:
             logger.error(f"[{_ts()}] API {method} {endpoint} -> URLError: {e}")
             raise RuntimeError(f"Connection error: {e}") from e

@@ -1,35 +1,10 @@
-"""The pool OWNS its teardown — the leak of 2026-08-23 closed at the structural layer.
+"""The pool owns failed/cancelled provisioning rollback until successful handoff.
 
-★ THE MEASURED DEFECT (census 2026-08-23 13:20Z, TEAMLEAD): 13 `just-akash-runner.<hash>`
-deployments held 65 ACT of escrow for up to 23.5h — eleven created in EIGHT MINUTES
-(2026-08-22 14:16-14:24Z). Root cause, two layers:
-
-  1. runner-teardown.yml existed, was correct, and was called by ZERO workflows — the
-     pool→work→teardown pairing lived only in ITS OWN DOCSTRING. Documentation asserted
-     a property nothing implemented.
-  2. Even a wired teardown would have seen an EMPTY dseq on the runs that leaked most:
-     the pool publishes `dseq` to GITHUB_OUTPUT only in the success block (:685-695,
-     ending `exit 0`). A cancelled or failed run — exactly the runs that leave a lease
-     alive — produced no output at all.
-
-THE FIX (two parts, both pinned here):
-  A. An INTERNALIZED teardown job in runner-pool.yml: `needs: [pool]`, `if: always()`,
-     calling the existing runner-teardown.yml. Every future caller INHERITS correct
-     teardown instead of remembering to assemble it — the same inversion #1439/#1390
-     applied to close-follows-creation. This also CORRECTS THE C5 STANDARD: the
-     addendum's three-job protocol assumes the CONSUMER assembles pool→work→teardown;
-     internalizing removes that assumption.
-  B. EARLY dseq publication: the dseq is written to GITHUB_OUTPUT IMMEDIATELY after
-     lease creation, before tagging/registration, so a later failure or cancellation
-     still leaves the close identity available. (DEV5's #1439 pattern; empirically
-     confirmed there by the failed-provision CI run.)
-
-⚠ THE NO-OP DISCIPLINE (TEAMLEAD's explicit requirement): a pool that fails BEFORE
-creating a lease must produce a teardown that exits 0 saying "nothing to close", NOT a
-red. A teardown that reds on every failed pool trains people to gate it back on
-success — which is precisely how the Blazing-Back defect was born. runner-teardown.yml
-already implements this (`if [ -z "${DSEQ}" ]` → noop exit 0); the wiring must not
-add a non-empty precondition that re-breaks it.
+The caller cannot start consumers until the reusable workflow finishes. Internal
+unconditional close therefore destroys a healthy pool before its consumers run.
+Early dseq publication still matters: rollback must receive the lease created before
+registration or validation fails. Abrupt cancellation can suppress job outputs or
+cleanup scheduling, so independent scheduled cleanup remains required.
 """
 
 from __future__ import annotations
@@ -38,6 +13,7 @@ import os
 import re
 from pathlib import Path
 
+import pytest
 import yaml
 
 WF_PATH = Path(
@@ -54,6 +30,18 @@ JOBS = DOC["jobs"]
 # ── Part A: the internalized teardown job ──────────────────────────────────────
 
 
+# GitHub owner and repo names must START with an alphanumeric, which is what keeps a
+# lone `.` or `..` component out. Without that anchor `././…` and `../../…` match.
+OUR_TEARDOWN = "Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml"
+
+# The shape check is kept as well: it is what the parametrised rejection cases below
+# exercise, and it states WHY an arbitrary path is wrong, not merely that it differs.
+TEARDOWN_MUST_MATCH = (
+    r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*"
+    r"/\.github/workflows/runner-teardown\.yml"
+)
+
+
 def test_the_pool_workflow_declares_a_teardown_job():
     """★★ THE FIX. A job named teardown exists in runner-pool.yml itself — not in a
     docstring, not in a consumer's memory. Zero-wired-teardown was the leak."""
@@ -63,31 +51,103 @@ def test_the_pool_workflow_declares_a_teardown_job():
     )
 
 
-def test_teardown_needs_the_pool_and_runs_always():
-    """if: always() — the whole point. A success-gated teardown skips exactly the
-    runs that failed, which are the ones holding a live lease. (The Blazing-Back
-    twin of this defect: `if: always() && needs...result == 'success'` under a
-    comment saying 'Always runs (even on failure/cancel)'.)"""
+def test_teardown_needs_the_pool_and_only_rolls_back_failed_handoff():
     td = JOBS.get("teardown", {})
     needs = td.get("needs")
-    cond = str(td.get("if", ""))
-    assert "pool" in (needs if isinstance(needs, list) else [needs] if needs else []), (
-        f"teardown does not need the pool job: {needs!r}"
-    )
-    assert re.search(r"always\(\)", cond), f"teardown is not if: always(): {cond!r}"
-    assert "result" not in cond and "success" not in cond, (
-        f"teardown's predicate gates on an upstream result — the exact defect this "
-        f"fix exists to remove: {cond!r}"
+    assert "pool" in (needs if isinstance(needs, list) else [needs] if needs else [])
+    assert td.get("if") == "always() && needs.pool.result != 'success'", (
+        "internal cleanup must run for failed/cancelled provisioning and leave successful "
+        "handoff alive until caller consumers finish"
     )
 
 
 def test_teardown_calls_the_existing_reusable_teardown():
     """It CALLS runner-teardown.yml rather than duplicating its shell — the close
     logic (ownership-by-provenance, verify-don't-trust, per-label de-registration)
-    is already correct and guarded; a copy would fork it."""
+    is already correct and guarded; a copy would fork it.
+
+    ⚠ THE PROPERTY, NOT THE LITERAL — and this test previously asserted the literal.
+    `uses.endswith("runner-teardown.yml")` was true only of the `./` form, so it went RED
+    on the fix for just-akash#247 and stayed GREEN on the defect: a reusable's `./`
+    resolves in the CALLER's tree, so every consumer's run died with `jobs=0`. That is
+    exactly the trap akash-github-runner#149 records — "asserting the caller-relative
+    literal made the broken form mandatory: green on the defect, red on the fix" — and
+    this file walked into it one repo over.
+
+    So: it must name runner-teardown.yml, by full path, at a pinned SHA.
+    """
     td = JOBS.get("teardown", {})
     uses = str(td.get("uses", ""))
-    assert uses.endswith("runner-teardown.yml"), f"teardown does not reuse the workflow: {uses!r}"
+    path, _, ref = uses.partition("@")
+    # ⚠ THE FULLY-QUALIFIED PATH, NOT A SUFFIX. `endswith(...)` plus "not `./`" still
+    # accepts `runner-teardown.yml@<sha>` and `../runner-teardown.yml@<sha>`, neither of
+    # which resolves from a consumer — so the guard would pass on values that reproduce
+    # the very bug it exists to stop.
+    # ⚠ AND THE COMPONENTS MUST BE REAL OWNER/REPO NAMES. A character class of
+    # `[A-Za-z0-9._-]+` matches a lone `.` or `..`, so `././…` and `../../…` both
+    # satisfied a "fully qualified" regex while still being caller-relative — the
+    # guard would have gone green on the exact defect again. GitHub owner and repo
+    # names must begin with an alphanumeric, so requiring that closes it.
+    # ⚠ WELL-FORMED IS NOT THE SAME AS OURS. The pattern below proves only the SHAPE of
+    # a cross-repo reference; a typo'd owner, or another repository entirely, satisfies it
+    # just as well. And the SHA check that follows is a LOCAL `git show`, which succeeds
+    # on any commit we happen to have — it does not verify the path. So assert the
+    # identity first, then the shape, then the pin.
+    # (Reported by CodeRabbit on just-akash#248.)
+    assert path == OUR_TEARDOWN, (
+        f"teardown must call {OUR_TEARDOWN}, got {uses!r}. Another owner/repo is a "
+        "perfectly well-formed reference to a workflow this repo does not control."
+    )
+    assert re.fullmatch(TEARDOWN_MUST_MATCH, path), (
+        f"teardown must call <owner>/<repo>/.github/workflows/runner-teardown.yml, got "
+        f"{uses!r}. A bare `./` or a relative path resolves in the CONSUMER's tree and "
+        "makes this workflow uncallable from any other repo (just-akash#247)."
+    )
+    assert re.fullmatch(r"[0-9a-f]{40}", ref), (
+        f"teardown must pin the reusable to a 40-hex SHA, got {ref!r} — an unpinned ref "
+        "lets the close logic change under a consumer that changed nothing."
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "./.github/workflows/runner-teardown.yml",
+        "././.github/workflows/runner-teardown.yml",
+        "../.github/workflows/runner-teardown.yml",
+        "../../.github/workflows/runner-teardown.yml",
+        ".github/workflows/runner-teardown.yml",
+        "runner-teardown.yml",
+    ],
+)
+def test_caller_relative_forms_are_rejected(path):
+    """Every one of these resolves in the CONSUMER's tree, which is just-akash#247.
+
+    `././…` and `../../…` are the ones that matter: they passed the first version of
+    this guard, because `[A-Za-z0-9._-]+` happily matches a lone `.` or `..`.
+    """
+    assert not re.fullmatch(TEARDOWN_MUST_MATCH, path)
+
+
+def test_a_well_formed_reference_to_someone_elses_repo_is_not_enough():
+    """Shape is not identity — the gap CodeRabbit found on just-akash#248.
+
+    `Someone-Else/their-fork/.github/workflows/runner-teardown.yml` is a perfectly
+    well-formed cross-repo reference. It passes the shape pattern, and the SHA check
+    that follows is a LOCAL `git show` that never looks at the path, so a typo'd owner
+    could satisfy both while GitHub loads a workflow this repo does not control.
+    """
+    foreign = "Someone-Else/their-fork/.github/workflows/runner-teardown.yml"
+    assert re.fullmatch(TEARDOWN_MUST_MATCH, foreign), "shape check should accept it"
+    assert foreign != OUR_TEARDOWN, "identity check must reject it"
+
+
+def test_the_real_reference_is_accepted():
+    """Known-negative: the guard must not reject the form the fix actually uses."""
+    assert re.fullmatch(
+        TEARDOWN_MUST_MATCH,
+        OUR_TEARDOWN,
+    )
 
 
 def test_teardown_passes_the_pools_own_dseq():
@@ -98,6 +158,19 @@ def test_teardown_passes_the_pools_own_dseq():
     assert withs.get("dseq") == "${{ needs.pool.outputs.dseq }}", (
         f"teardown does not consume the pool's dseq output: {withs!r}"
     )
+
+
+def test_teardown_passes_the_pools_create_time_owner():
+    td = JOBS.get("teardown", {})
+    withs = td.get("with", {}) or {}
+    assert withs.get("wallet-address") == "${{ needs.pool.outputs.wallet_address }}"
+
+
+def test_wallet_address_is_published_before_failure_prone_validation():
+    parse = SRC.find("WALLET=$(awk")
+    publish = SRC.find('echo "wallet_address=$WALLET" >> "$GITHUB_OUTPUT"')
+    first_validation = SRC.find('if [ -n "$DSEQ" ] && [ -z "$PROVIDER" ]', parse)
+    assert parse != -1 and parse < publish < first_validation
 
 
 def test_teardown_forwards_the_secrets_the_close_needs():
@@ -201,7 +274,7 @@ def test_teardown_has_no_nonempty_dseq_precondition():
     """⚠ TEAMLEAD's explicit requirement: the WIRING must not add a precondition like
     `needs.pool.outputs.dseq != ''`. runner-teardown.yml already treats empty as a
     successful no-op; gating it in the caller would re-train the success-gating this
-    fix removes. The if: must be always() and nothing else conditional on the dseq."""
+    fix removes. Rollback must not add an identity-presence condition."""
     td = JOBS.get("teardown", {})
     cond = str(td.get("if", ""))
     assert "dseq" not in cond, (

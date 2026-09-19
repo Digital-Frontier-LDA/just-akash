@@ -11,12 +11,14 @@ gets deleted every ~12 hours and a metric that lies about whose fault it was.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from just_akash.provenance import (
     PLACEMENT_PREFIX,
     SIBLING_REAPED_PREFIX,
     _heredocs,
     inline_sdls,
+    is_templated,
     placement_keys,
     run_id_of,
     run_scoped,
@@ -65,16 +67,62 @@ def test_the_inline_workflow_sdls_are_actually_found():
     assert any("runner-pool" in label for label, _ in found), [lbl for lbl, _ in found]
 
 
+# A placement key rendered from a caller input rather than written literally. The pool's
+# key became `${PLACEMENT_KEY}` so a consumer adopting the canonical escrow reaper can
+# namespace its own deployments; see runner-pool.yml's `placement-key` input.
+#
+# ⛔ ASKED OF THE MODULE, NOT RE-TYPED HERE. This was a private `^\$\{[A-Z_]+\}$`, stricter
+# than what `_KEY_RE` accepts — so `${PLACEMENT_KEY2}` would have been SCANNED as a
+# template and then JUDGED as a literal, failing for not starting with the repo prefix.
+# A guard that disagrees with the scanner it guards is worse than no guard.
+
+
+def _pool_input_default(name: str) -> str:
+    """The default of one `runner-pool.yml` workflow_call input.
+
+    Read from the workflow rather than passed in, so this guard and the pool's own tests
+    cannot disagree about what a caller who sets nothing actually deploys.
+    """
+    import yaml
+
+    wf = Path(__file__).resolve().parents[1] / ".github/workflows/runner-pool.yml"
+    doc = yaml.safe_load(wf.read_text())
+    call = (doc.get("on") or doc.get(True))["workflow_call"]
+    return str(call["inputs"][name]["default"])
+
+
 def test_every_inline_sdl_stamps_the_repo_prefix():
     """An unstamped runner pool is precisely what the sibling sweeper closes: non-GPU,
     and with `ephemeral: false` legitimately older than 12h. The symptom is runners
     vanishing mid-job, read back as RUNNER_NEVER_REGISTERED against a provider that did
     nothing wrong — a fabricated provider fault, which is the failure this whole runner
-    stack exists to stop manufacturing."""
+    stack exists to stop manufacturing.
+
+    ⛔ ONE KEY IS NOW RENDERED FROM AN INPUT, AND THIS IS NOT A WEAKENING. The claim is
+    unchanged — every deployment this repo creates carries an OWNED marker — but for the
+    pool the value moved out of the SDL text, so asserting the text would assert the
+    wrong object. A templated key is accepted only against the two halves that now carry
+    the property, each with its own test in test_runner_pool_workflow.py:
+
+        the DEFAULT is stamped   test_the_placement_key_is_optional_and_defaults_...
+        foreign values REFUSED   test_the_guard_actually_runs_and_decides (executed)
+
+    A literal key still has to be stamped here, so this cannot be sidestepped by writing
+    one — and a template that is not backed by both halves is a hole, which is why the
+    default is re-checked below rather than taken on trust.
+    """
     for label, text in inline_sdls():
         keys = placement_keys(text)
         assert keys, f"{label}: no placement key found in the rendered SDL"
         for key in keys:
+            if is_templated(key):
+                default = _pool_input_default("placement-key")
+                assert default.startswith(PLACEMENT_PREFIX), (
+                    f"{label}: placement key {key!r} is rendered from an input whose "
+                    f"default is {default!r}, which does not start with {PLACEMENT_PREFIX!r}. "
+                    f"A caller that sets nothing would deploy unstamped."
+                )
+                continue
             assert key.startswith(PLACEMENT_PREFIX), (
                 f"{label}: placement key {key!r} does not start with {PLACEMENT_PREFIX!r}. "
                 f"Unstamped deployments are indistinguishable from a CI leak on the "
@@ -83,6 +131,11 @@ def test_every_inline_sdl_stamps_the_repo_prefix():
 
 
 def test_no_inline_sdl_wears_the_siblings_reaped_prefix():
+    """⚠ A TEMPLATED KEY PASSES THIS TRIVIALLY — `${PLACEMENT_KEY}` never starts with
+    `dfci-infra-` — so for the templated case the real claim is that the workflow REFUSES
+    the sibling's prefix at run time. That is asserted where it can be executed:
+    test_the_guard_refuses_the_sibling_prefix_the_module_names, and behaviourally in
+    test_the_guard_actually_runs_and_decides. This function keeps the literal case."""
     for label, text in inline_sdls():
         for key in placement_keys(text):
             assert not key.startswith(SIBLING_REAPED_PREFIX), (
@@ -475,3 +528,17 @@ def test_the_key_is_not_rewritten_inside_a_comment_or_block_scalar():
     out, _ = stamp_run(sdl, RUN)
     assert "        just-akash-a:" in out, "block scalar content was rewritten"
     assert "# see just-akash-a: for the placement" in out, "a comment was rewritten"
+
+
+def test_the_template_predicate_agrees_with_the_scanner():
+    """⛔ ONE DEFINITION, ASSERTED. A caller asking "is this a template?" must get the same
+    answer the scanner gave when it ACCEPTED the key. A stricter private copy — this test
+    once carried `^\\$\\{[A-Z_]+\\}$` — scans `${PLACEMENT_KEY2}` as a template and then
+    judges it as a literal, failing it for not starting with the repo prefix. The two must
+    not be able to disagree."""
+    for key in ("${PLACEMENT_KEY}", "${PLACEMENT_KEY2}", "${x}", "${_k9}"):
+        sdl = f"profiles:\n  placement:\n    {key}:\n"
+        assert placement_keys(sdl) == [key], f"scanner missed {key}"
+        assert is_templated(key), f"predicate disagrees with the scanner on {key}"
+    for key in ("just-akash-runner", "borduas", "dcloud"):
+        assert not is_templated(key), f"{key} is a literal, not a template"

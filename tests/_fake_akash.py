@@ -172,7 +172,7 @@ class _ConsoleApp:
 
     def get_deployment(self, dseq: str) -> dict:
         return {
-            "deployment": {"state": "active", "dseq": dseq},
+            "deployment": {"state": "active", "id": {"dseq": dseq}},
             "leases": [
                 {
                     "id": {"provider": _PROVIDER},

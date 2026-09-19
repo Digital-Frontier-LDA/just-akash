@@ -19,8 +19,13 @@ dependencies = [
     # same package the DigitalFrontier control plane consumes, so protocol and
     # provider-selection decisions have exactly ONE implementation.
     # Pinned to a release wheel (not a branch) so the protocol cannot shift
-    # under an installed CLI.
-    "akash-lease-core @ https://github.com/Digital-Frontier-LDA/akash-lease-core/releases/download/v0.9.0/akash_lease_core-0.9.0-py3-none-any.whl#sha256=e1aea5d9fce79de6f8b897ed39c3c582b241a9bf2e55dc2c1d81485f8ab88fa3",
+    # under an installed CLI. v0.15.2 is tag -> ff07e2e8: akash-lease-core#51 (provider-
+    # scoped EMPTIEST degradation, anti-affinity in both emptiest fallbacks, contradiction/
+    # proven-negative capacity verdicts) plus #53 (an integer above float range is an
+    # unreadable capacity, not an OverflowError), on top of #49's per-node fit. The wheel
+    # is the artifact published from that commit by release run 34815913580.
+    # tests/test_core_pin_contains_request_profile_selection.py goes red on a mis-pin.
+    "akash-lease-core @ https://github.com/Digital-Frontier-LDA/akash-lease-core/releases/download/v0.15.2/akash_lease_core-0.15.2-py3-none-any.whl#sha256=2abb038c332188511b79160021845746822ab27014493b053df688a1609f3b3a",
 ]
 
 [project.scripts]

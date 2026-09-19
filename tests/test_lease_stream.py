@@ -12,6 +12,7 @@ import pytest
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 from websockets.frames import Close
 
+from just_akash.transport import lease_shell
 from just_akash.transport.base import TransportConfig
 from just_akash.transport.lease_shell import LeaseShellTransport
 
@@ -566,6 +567,32 @@ class TestStreamReconnect:
 # ── bounded snapshot (--duration) ────────────────────────────────────
 
 
+class _FakeClock:
+    """A monotonic clock the test drives, standing in for the `time` module.
+
+    ⛔ WHY THE WHOLE MODULE, not just `monotonic`. `lease_shell` does `import time`
+    and reaches for `time.monotonic` and `time.sleep`. Patching `time.monotonic`
+    through that reference would reach the real `time` module and change it process
+    wide for the duration; replacing the module ATTRIBUTE on `lease_shell` scopes the
+    fake to the code under test and leaves pytest's own timing alone.
+
+    `sleep` advances the clock instead of waiting, so a modelled wait costs the
+    deadline arithmetic exactly what it should and costs the suite nothing.
+    """
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self._now = start
+
+    def monotonic(self) -> float:
+        return self._now
+
+    def sleep(self, seconds: float) -> None:
+        self._now += seconds
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
+
+
 class TestSnapshotDuration:
     """``duration`` bounds a stream client-side so a provider that keeps a
     non-follow logs/events connection open (instead of closing it after the
@@ -573,22 +600,55 @@ class TestSnapshotDuration:
     """
 
     def test_duration_returns_on_a_silent_stream(self):
-        import time as _time
+        """A provider that never sends and never closes must not hold the client.
 
+        ⛔ WHAT THIS ASSERTS, AND WHY NOT WALL CLOCK. The property is that every
+        `recv` is bounded by the REMAINING WINDOW rather than the 300s default —
+        that is what stops the hang. The previous version inferred it from a 0.2s
+        real-time budget and then asserted `ws.timeouts` was non-empty, which made
+        the result depend on machine speed: `_stream` computes
+        `deadline = monotonic() + duration` and returns at the top of the loop if the
+        deadline has already passed, so on a loaded host the connection setup spent
+        the whole 0.2s and `recv` was never reached. The code was right; the test was
+        reporting the machine. (just-akash#300.)
+
+        Widening the budget would not fix that — it is the same race with a longer
+        fuse. Instead the clock is driven by the test, so the deadline arithmetic is
+        exact and no real time passes at all.
+        """
+        import threading
+
+        clock = _FakeClock(start=1000.0)
         t = _make_transport()
 
         class SilentWebSocket:
-            """recv() waits out its timeout then raises TimeoutError — models a
-            provider that never sends a frame and never closes the socket."""
+            """Never sends a frame, never closes — waits out each recv timeout.
+
+            The wait is charged to the FAKE clock, so it is instantaneous in real
+            time while still advancing the deadline exactly as a real wait would.
+            """
 
             def __init__(self):
                 self.timeouts: list = []
                 self.sent_messages: list = []
 
             def recv(self, timeout=None):
+                # ⛔ BACKPRESSURE, restored deliberately. The original fake slept for
+                # real, which throttled the loop; charging the wait to a fake clock
+                # removed that, so a REGRESSED `stream_events` would busy-spin as fast
+                # as the interpreter allows. That only bites on the failure path — but
+                # the failure path is the whole point of this test, and handing someone
+                # a pegged core at the moment they start debugging a regression is how
+                # a guard gets muted instead of read. (Reported by Copilot on #301.)
+                #
+                # So the worker is given a way out: once the main thread has stopped
+                # waiting it sets `stop`, and the next recv ends the stream cleanly
+                # rather than spinning until the process exits.
+                if stop.is_set():
+                    raise ConnectionClosedOK(None, None)
                 self.timeouts.append(timeout)
                 if timeout:
-                    _time.sleep(min(timeout, 0.5))
+                    clock.advance(timeout)
                 raise TimeoutError
 
             def send(self, data):
@@ -605,17 +665,72 @@ class TestSnapshotDuration:
 
         ws = SilentWebSocket()
         with (
+            patch.object(lease_shell, "time", clock),
             patch.object(t, "_fetch_jwt", return_value="jwt"),
             patch("just_akash.transport.lease_shell.connect", return_value=ws),
         ):
-            start = _time.monotonic()
-            t.stream_events(duration=0.2)  # must RETURN, not hang
-            elapsed = _time.monotonic() - start
+            # ⛔ A HANG DETECTOR, NOT A PERFORMANCE BOUND — and the difference is the
+            # whole point of #300. With the clock faked, the real work here is under a
+            # millisecond, so a 10s join cannot flake: it fires only if the call never
+            # returns. The old 0.2s assertion bounded work that genuinely took ~0.2s,
+            # which is a race. An assertion cannot catch a hang from after the call,
+            # so the call has to run where it can be abandoned.
+            done = threading.Event()
+            stop = threading.Event()
 
-        assert elapsed < 5.0, f"duration bound failed — stream ran {elapsed:.2f}s"
-        # Every recv was bounded by the remaining window, never the 300s default.
-        assert ws.timeouts, "recv was never called"
-        assert max(ws.timeouts) <= 0.2 + 1e-6, ws.timeouts
+            def _run():
+                try:
+                    t.stream_events(duration=0.2)
+                finally:
+                    done.set()
+
+            worker = threading.Thread(target=_run, daemon=True)
+            worker.start()
+            try:
+                returned = done.wait(timeout=10.0)
+            finally:
+                # Unconditional: on the pass path the worker is already finished and
+                # this is a no-op; on the fail path it is the only thing that stops it.
+                stop.set()
+                worker.join(timeout=5.0)
+                worker_still_running = worker.is_alive()
+
+        assert returned, (
+            "stream_events did not return — the duration bound is not cutting the "
+            "stream off, which is the hang this parameter exists to prevent.\n"
+            "worker cleaned up after `stop`: "
+            f"{'no — it is STILL SPINNING' if worker_still_running else 'yes'}"
+        )
+        # ⛔ Asserted even on the pass path, because its value is on the FAIL path: a
+        # guard whose own failure leaves a core pegged gets deleted by the next person
+        # under time pressure, and then the regression it was catching ships.
+        assert not worker_still_running, (
+            "the worker outlived the assertion — `stop` did not end the stream, so a "
+            "regressed stream_events would spin until the process exits"
+        )
+
+        # ⛔ THE ACTUAL PROPERTY, in two parts: exactly one recv, and it was bounded by
+        # the remaining window rather than the 300s default.
+        #
+        # ⚠ `approx`, and the reason is worth stating because I first wrote this as an
+        # exact `== [0.2]` claiming "the clock is under test control so there is no
+        # drift to tolerate". That was wrong and the test said so immediately: it
+        # observed 0.20000000000004547. The drift is not in the clock, it is in the
+        # deadline ARITHMETIC — `(start + 0.2) - start` at a start of 1000.0 loses
+        # precision at the fourteenth digit. Choosing start=0.0 would make the
+        # subtraction exact, but a real monotonic clock returns large values, so that
+        # would be a test tuned to a magnitude the system never sees. A 5e-14
+        # discrepancy is irrelevant to "is this bounded by the window or by 300s",
+        # which is the question, so tolerate it and say why.
+        assert len(ws.timeouts) == 1, (
+            f"expected exactly one recv before the window closed, got {ws.timeouts} — "
+            "more than one means a recv was issued after the deadline had passed"
+        )
+        assert ws.timeouts[0] == pytest.approx(0.2), (
+            f"recv was bounded by {ws.timeouts[0]}, not the remaining 0.2s window — a "
+            "value of 300 is the default recv timeout, meaning the window was not "
+            "applied and the client would wait five minutes on a silent provider"
+        )
 
     @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf"), 0.0, -1.0])
     def test_non_finite_or_nonpositive_duration_is_rejected_before_connecting(self, bad):

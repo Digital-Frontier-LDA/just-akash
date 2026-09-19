@@ -58,7 +58,7 @@ def _mock_client(deployment=None):
         }
     client = MagicMock()
     client.api_key = _KEY
-    client.get_deployment.return_value = deployment
+    client.get_deployment.return_value = {**deployment, "dseq": "99999"}
     client.list_deployments.return_value = [{"dseq": "99999"}]
     return client
 

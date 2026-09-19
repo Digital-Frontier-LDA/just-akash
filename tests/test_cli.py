@@ -11,7 +11,13 @@ def _run_cli(monkeypatch, args):
     monkeypatch.setattr(sys, "argv", args)
     from just_akash.cli import main
 
-    return main()
+    # Dispatch-only fixtures model ownership separately from command behavior.
+    # Positive ownership is exercised through wallet_pool and resolve-owner CLI tests.
+    with patch(
+        "just_akash.wallet_pool.select_client_for_dseq",
+        side_effect=lambda dseq, *, client_factory: client_factory("test-key"),
+    ):
+        return main()
 
 
 class TestCliNoCommand:
@@ -315,6 +321,8 @@ class TestCliDeployPassesArgs:
             # multi-region deployment across distinct providers instead of stacking
             # every group on the single cheapest one.
             already_selected=[],
+            receipt_path=None,
+            receipt_operation_id=None,
         )
 
     @patch("just_akash.deploy.deploy")
@@ -339,6 +347,25 @@ class TestCliDeployPassesArgs:
         kwargs = mock_deploy.call_args.kwargs
         assert kwargs["preferred_providers"] == ["akash1pref1", "akash1pref2"]
         assert kwargs["backup_providers"] == ["akash1back1"]
+
+    @patch("just_akash.deploy.deploy")
+    def test_deploy_passes_receipt_location_and_operation(self, mock_deploy, monkeypatch):
+        with pytest.raises(SystemExit) as exc_info:
+            _run_cli(
+                monkeypatch,
+                [
+                    "just-akash",
+                    "deploy",
+                    "--receipt-path",
+                    "/private/receipts/run.json",
+                    "--receipt-operation-id",
+                    "github-run-123-attempt-2",
+                ],
+            )
+        assert exc_info.value.code == 0
+        kwargs = mock_deploy.call_args.kwargs
+        assert kwargs["receipt_path"] == "/private/receipts/run.json"
+        assert kwargs["receipt_operation_id"] == "github-run-123-attempt-2"
 
 
 class TestCliConnect:

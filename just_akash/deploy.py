@@ -26,19 +26,29 @@ from typing import TypedDict
 
 from akash_lease_core import Auction, AuctionPolicy, AuctionStatus, BidObservation
 from akash_lease_core.auction import PreferredSelection
-from akash_lease_core.capacity import ProviderCapacity
+from akash_lease_core.capacity import ProviderCapacity, ResourceProfile
 
 from . import chain
 from ._diagnostics import Code, emit, enabled
 from .api import (
+    AkashAPIError,
     AkashConsoleAPI,
     _extract_bid_price,
+    _extract_dseq,
     _extract_gseq,
     _extract_provider,
 )
+from .deployment_receipt import (
+    credential_binding_for,
+    mark_create_response_received,
+    mark_submitting,
+    prepare_receipt,
+)
 from .provenance import PLACEMENT_PREFIX, SIBLING_REAPED_PREFIX, run_id_of, stamp_run
 from .provider_capacity import capacity_by_provider
+from .request_profile import attach_profile, derive_resource_profiles, observed_gseq
 from .sdl_validate import SDLValidationError, validate_sdl
+from .smoke_providers import _probe_age_seconds
 
 logger = logging.getLogger("akash.deploy")
 
@@ -152,6 +162,134 @@ def _close_proven_orphan(client, dseq: str, key: str) -> bool:
         closed=True,
     )
     return True
+
+
+# ── stale-deployment recovery: guards, each covering what the others cannot ──
+#
+# ⛔ THE RECOVERY CLOSED ON ONE SIGNAL, FROM A LISTING THAT CANNOT SCOPE.
+# It called `client.list_deployments(active_only=True)` and closed EVERY
+# lease-less row. Three things were wrong at once, and this file already
+# documents every one of them for a NEIGHBOURING function:
+#
+#   * `list_deployments` does not scope by API key. cleanup_stale.py:391 records
+#     the measurement — three DISTINCT keys for three DISTINCT accounts returned
+#     byte-identical bodies, and the same key returned 44/27/0 minutes apart.
+#     `_report_suspected_orphans` tolerates that because it only NAMES; a path
+#     that CLOSES cannot.
+#   * No provenance. The shared wallet hosts other repos — a live read found six
+#     `dfci-infra-runner` among eleven active.
+#   * No age floor. `_report_suspected_orphans` says it outright: a concurrent
+#     run of THIS repo "is also leaseless mid-create, and lands in the same
+#     window". That is the collision ci.yml:150-155 attributes to this very
+#     function, and ci.yml's per-ref concurrency key does not prevent it across
+#     two PRs.
+#
+# The path that merely NAMES strangers was guarded with three signals; the path
+# that DESTROYS them had one. These guards are deliberately independent, so the
+# recovery is safe on its own merits rather than because a mutex happens to hold
+# (just-akash#267): a wider mutex would serialise the fleet's CI and still leave
+# a cross-ACCOUNT close reachable.
+STALE_RETRY_MIN_AGE_SECONDS = 15 * 60
+STALE_RETRY_MAX_CLOSE = 5
+
+
+def _close_stale_for_retry(client, *, now: float | None = None) -> list[str]:
+    """Close OUR OWN abandoned, lease-less deployments so a create can retry.
+
+    Returns the dseqs closed. Never raises: this runs on an error path and must
+    not replace the caller's real failure with its own.
+
+    ⚠ IT FAILS TOWARDS NOT CLOSING. A leftover younger than the age floor is
+    left alone and the retry may fail — a recoverable outcome. Destroying a
+    concurrent run's in-flight deployment is not recoverable, and that is the
+    one this function used to produce.
+    """
+
+    now = time.time() if now is None else now
+    try:
+        owner = client.account_address()
+    except Exception as exc:  # noqa: BLE001 — never mask the caller's error
+        _log(logging.WARNING, f"Stale recovery: could not resolve the account ({exc}) — skipped")
+        return []
+
+    # GUARD 1 — enumerate from the CHAIN, owner-scoped and authoritative.
+    # ⛔ None IS NOT []. "Could not ask the chain" must never be swept as "holds
+    # nothing": that collapse is how a broken enumeration reads as a clean account.
+    # ⛔ TWO FAILURE MODES, NOT ONE. An earlier cut handled only the one that
+    # RETURNS — `None`, "could not ask the chain" — and left the one that RAISES
+    # bare. `list_active_deployments` calls `rest_urls()` outside any try, and
+    # `rest_url()` raises RuntimeError on a bad or empty AKASH_REST_URL. It was
+    # the ONLY unwrapped external call of five, in a function whose docstring
+    # promises it never raises.
+    #
+    # ⚠ SEVERITY, STATED ACCURATELY. The single current caller ALSO wraps this
+    # function in `except Exception`, so a raise did NOT reach the operator in
+    # place of the create failure — it was logged as "Stale deployment cleanup
+    # failed" and the retry proceeded. The defect was that this function was safe
+    # only because something downstream covered it, while its own docstring
+    # claimed the guarantee. A contract that holds by luck is one refactor from
+    # not holding, and the next caller inherits a promise that was never true.
+    try:
+        active = chain.list_active_deployments(owner)
+    except Exception as exc:  # noqa: BLE001 — never mask the caller's error
+        _log(logging.WARNING, f"Stale recovery: chain enumeration raised ({exc}) — skipped")
+        return []
+    if active is None:
+        _log(logging.WARNING, "Stale recovery: chain enumeration failed — closing nothing")
+        return []
+
+    candidates: list[tuple[float, str]] = []
+    for dep in active:
+        dseq = _extract_dseq(dep)
+        if not dseq:
+            continue
+        age = _probe_age_seconds(dseq, now)
+        # GUARD 2 — age floor. An unreadable age is NOT old enough: unknown must
+        # never be read as safe to destroy.
+        if age is None or age < STALE_RETRY_MIN_AGE_SECONDS:
+            continue
+        # GUARD 3 — no lease. A deployment holding a lease is somebody's live
+        # workload. Per-DSEQ Console reads are unaffected by the listing defect.
+        try:
+            detail = client.get_deployment(str(dseq))
+        except Exception as exc:  # noqa: BLE001 — unreadable is not closable
+            # DEBUG, matching _report_suspected_orphans: a skipped dseq must not
+            # appear in human-facing output, but a silent skip is untraceable.
+            _log(logging.DEBUG, f"  stale recovery: {dseq} unreadable ({exc}) — left alone")
+            continue
+        if (detail or {}).get("leases") or (detail or {}).get("lease"):
+            continue
+        # GUARD 4 — provenance, read from chain. Repo-level is enough HERE only
+        # because the age floor has already excluded our own concurrent runs;
+        # on its own it is not, and _report_suspected_orphans says so.
+        try:
+            names = chain.deployment_group_names(owner, str(dseq))
+        except Exception as exc:  # noqa: BLE001 — unreadable provenance is unproven
+            _log(logging.DEBUG, f"  stale recovery: {dseq} provenance unreadable ({exc})")
+            continue
+        if not any(n.startswith(PLACEMENT_PREFIX) for n in names):
+            continue
+        candidates.append((age, str(dseq)))
+
+    # GUARD 5 — cap, oldest first. Needing to close more than a handful to
+    # unblock ONE create means something else is wrong and wants looking at,
+    # not bulldozing.
+    candidates.sort(reverse=True)
+    closed: list[str] = []
+    for _age, dseq in candidates[:STALE_RETRY_MAX_CLOSE]:
+        try:
+            client.close_deployment(dseq)
+            closed.append(dseq)
+            _log(logging.INFO, f"Closed stale deployment {dseq}")
+        except Exception as exc:  # noqa: BLE001 — keep going; report at the end
+            _log(logging.WARNING, f"Could not close stale deployment {dseq}: {exc}")
+    if len(candidates) > STALE_RETRY_MAX_CLOSE:
+        _log(
+            logging.WARNING,
+            f"Stale recovery: {len(candidates)} eligible, closed the "
+            f"{len(closed)} oldest (cap {STALE_RETRY_MAX_CLOSE}).",
+        )
+    return closed
 
 
 def _report_suspected_orphans(client, since_epoch_s: float, run_id: str = "") -> list[str]:
@@ -434,6 +572,24 @@ def _resolve_selection(select: str) -> "PreferredSelection":
     return table[key]
 
 
+class _GroupKwarg(TypedDict):
+    """The bid's group and that group's request, spread into `BidObservation`.
+
+    ⛔ A TypedDict for the same reason as `_SelectionKwarg`: Pyright reads `**dict[str, V]`
+    as V for every parameter. It is spread rather than written as `gseq=<name>,` because
+    tests/test_lease_uses_winning_group.py mutates the FIRST such line in this file and
+    must reach create_lease's argument, not this observation.
+    """
+
+    gseq: int | None
+    resource_profile: "ResourceProfile | None"
+
+
+def _count_gseqless(bids: list) -> int:
+    """Bids in this round that do not say which group they are for (see observed_gseq)."""
+    return sum(1 for bid in bids if isinstance(bid, dict) and _extract_gseq(bid) is None)
+
+
 def _select_auction_bid(
     bids: list,
     *,
@@ -446,8 +602,14 @@ def _select_auction_bid(
     capacity_by_provider: dict[str, "ProviderCapacity"] | None = None,
     preferred_selection: "PreferredSelection | None" = None,
     already_selected: frozenset[str] | None = None,
+    resource_profiles: "dict[int, ResourceProfile] | None" = None,
+    placement_group_count: int | None = None,
 ):
     """Normalize Console bids and delegate the decision to the shared core.
+
+    `resource_profiles` maps gseq → the aggregate request derived from the SUBMITTED SDL
+    (just_akash.request_profile). A bid receives its own group's profile only when it
+    names a gseq: the core rejects a profiled bid with no group as unbound.
 
     The caller owns polling and clocks.  This adapter owns only translation
     between Console's response shape and the transport-neutral auction schema.
@@ -482,6 +644,11 @@ def _select_auction_bid(
             continue
         amount, denom = _extract_bid_price(raw_bid)
         bid_key = f"{provider}:{index}"
+        bid_gseq = observed_gseq(_extract_gseq(raw_bid), resource_profiles, placement_group_count)
+        group: _GroupKwarg = {
+            "gseq": bid_gseq,
+            "resource_profile": attach_profile(resource_profiles, bid_gseq),
+        }
         try:
             observation = BidObservation(
                 bid_key=bid_key,
@@ -510,7 +677,7 @@ def _select_auction_bid(
                 # The GROUP this bid is for. An order split into groups lets a provider
                 # bid on the subset it can actually host, and the core needs the group to
                 # tell two bids from one provider apart. None = the shape did not say.
-                gseq=_extract_gseq(raw_bid),
+                **group,
             )
         except (TypeError, ValueError):
             continue
@@ -799,6 +966,8 @@ def deploy(
     deposit: float = 5.0,
     select: str = "cheapest",
     already_selected: list[str] | None = None,
+    receipt_path: str | None = None,
+    receipt_operation_id: str | None = None,
 ) -> dict:
     # deposit is user-controlled (--deposit); reject non-finite/non-positive
     # values before they reach json.dumps (which would emit invalid NaN/Infinity).
@@ -809,6 +978,13 @@ def deploy(
         raise ValueError(
             "bid_wait_retry is the total auction deadline and must be greater than "
             "or equal to bid_wait"
+        )
+    receipt_arguments = (receipt_path, receipt_operation_id)
+    if any(value is not None for value in receipt_arguments) and not all(
+        value is not None for value in receipt_arguments
+    ):
+        raise RuntimeError(
+            "deployment receipt arguments are all-or-none: receipt_path and receipt_operation_id"
         )
     fallback_wait = bid_wait_retry - bid_wait
     # ⛔ VALIDATE BEFORE YOU SPEND. This raises on a bad --select, and it must raise HERE:
@@ -865,6 +1041,23 @@ def deploy(
     sdl_content = _prepare_sdl_content(sdl_path, image=image, env_vars=env_vars)
     _check_wallet_credit(client, deposit)
 
+    prepared_receipt = None
+    if receipt_path is not None:
+        from .wallet_pool import configured_api_keys
+
+        actual_owner = client.account_address()
+        prepared_receipt = prepare_receipt(
+            receipt_path,
+            operation_id=str(receipt_operation_id),
+            owner=actual_owner,
+            sdl_content=sdl_content,
+            # #363: record WHICH configured credential created this deployment, so
+            # cleanup can select it without re-deriving ownership over the network.
+            credential_binding=credential_binding_for(
+                configured_api_keys(), getattr(client, "api_key", None)
+            ),
+        )
+
     # Step 2: Create deployment (with stale-deployment recovery)
     _log(
         logging.INFO,
@@ -873,6 +1066,8 @@ def deploy(
     # Stamped BEFORE the request so a deployment created by THIS call can be told from
     # one that already existed. See _report_suspected_orphans.
     _create_started = time.time()
+    if prepared_receipt is not None:
+        prepared_receipt = mark_submitting(*prepared_receipt)
     try:
         deployment_response = client.create_deployment(sdl_content, deposit=deposit)
     except RuntimeError as e:
@@ -882,17 +1077,12 @@ def deploy(
                 "Deployment already exists — closing stale deployments and retrying...",
             )
             try:
-                active = client.list_deployments(active_only=True)
-                for dep in active:
-                    # Only close deployments without a lease (stale from failed runs)
-                    leases = dep.get("leases") or dep.get("lease", [])
-                    if leases:
-                        continue
-                    stale_dseq = dep.get("dseq") or dep.get("deployment", {}).get("dseq")
-                    if stale_dseq:
-                        client.close_deployment(str(stale_dseq))
-                        _log(logging.INFO, f"Closed stale deployment {stale_dseq}")
-            except Exception as cleanup_err:
+                # Aged against the moment the create was ATTEMPTED, not a fresh
+                # clock read. If the recovery runs long after, deployments then
+                # compare as YOUNGER and fewer qualify — the conservative
+                # direction for a function whose next act is to close things.
+                _close_stale_for_retry(client, now=_create_started)
+            except Exception as cleanup_err:  # noqa: BLE001 — documented as never raising
                 _log(logging.ERROR, f"Stale deployment cleanup failed: {cleanup_err}")
             # Retry once after cleanup
             try:
@@ -909,14 +1099,53 @@ def deploy(
                     f"Failed to create deployment after retry: {retry_err}"
                 ) from retry_err
         else:
-            _log(logging.ERROR, f"Create deployment FAILED: {e}")
-            emit(Code.DEPLOY_CREATE_FAILED, "error", f"create deployment failed: {e}")
+            # ⛔ NAME AN UPSTREAM TIMEOUT AS UPSTREAM. A Cloudflare 524 is the proxy
+            # giving up on Akash's origin; it says nothing about the change under
+            # test. Reported as a plain create failure it reads as "this PR broke
+            # the E2E", the leg gets called flaky, and it is re-run by hand at real
+            # Akash cost per round (#266).
+            if isinstance(e, AkashAPIError) and e.is_upstream_timeout():
+                _log(
+                    logging.ERROR,
+                    f"Create deployment FAILED — UPSTREAM TIMEOUT, not this change: {e}",
+                )
+                emit(
+                    Code.DEPLOY_CREATE_FAILED,
+                    "error",
+                    f"create deployment failed UPSTREAM (HTTP {e.status}"
+                    f"{', ' + e.error_name if e.error_name else ''}): the Console API's "
+                    f"proxy gave up on its origin. This is NOT evidence about the code "
+                    f"under test.",
+                )
+                # ⛔ AND WE DO NOT RE-POST IT, THOUGH THE BODY SAYS retryable:true.
+                # That flag is Cloudflare describing its own proxy semantics — it
+                # cannot describe whether the origin committed, because Cloudflare
+                # does not know. This file's own _report_suspected_orphans records
+                # the measured counter-case: a PROXY TIMEOUT can land after the
+                # transaction committed (HTTP 500 at 103s). A blind retry on a
+                # non-idempotent create double-spends escrow on exactly the failure
+                # that is hardest to see. The orphan report below is the read-back
+                # that would have to come first.
+                # ⛔ `is not None`, NOT TRUTHINESS. `retry_after: 0` is a legitimate
+                # value meaning "retry immediately", and truthiness makes it
+                # indistinguishable from the upstream having said nothing at all —
+                # the exact absent-vs-present collapse this change deliberately
+                # avoids for `retryable`. Same distinction, and I applied it to one
+                # field and not the other in the same commit.
+                if e.retry_after is not None:
+                    _log(
+                        logging.ERROR,
+                        f"  upstream advertised retry_after={e.retry_after}s — NOT acted on "
+                        "automatically; a create is not idempotent and may already have "
+                        "landed. See the orphan report below before re-running.",
+                    )
+            else:
+                _log(logging.ERROR, f"Create deployment FAILED: {e}")
+                emit(Code.DEPLOY_CREATE_FAILED, "error", f"create deployment failed: {e}")
             _report_suspected_orphans(client, _create_started, _RUN_ID)
             raise RuntimeError(f"Failed to create deployment: {e}") from e
 
     dseq = deployment_response.get("dseq")
-    _manifest_raw = deployment_response.get("manifest", "")
-    manifest = _manifest_raw if isinstance(_manifest_raw, str) else ""
     if dseq is None:
         _log(
             logging.ERROR,
@@ -933,6 +1162,24 @@ def deploy(
         raise RuntimeError(
             f"No DSEQ returned from API. Response: {json.dumps(deployment_response)}"
         )
+    if prepared_receipt is not None:
+        try:
+            mark_create_response_received(
+                *prepared_receipt,
+                dseq=dseq,
+                deployment_response=deployment_response,
+            )
+        except Exception as receipt_error:
+            raise RuntimeError(
+                f"NON-RETRYABLE CREATE OUTCOME AMBIGUOUS: Console returned dseq={dseq}, "
+                "but its local recovery receipt could not be durably transitioned. The "
+                "existing receipt path remains a create-submitted recovery seed; reconcile "
+                "its owner and complete group identity against the chain before any retry. "
+                f"Receipt error: {receipt_error}"
+            ) from receipt_error
+
+    _manifest_raw = deployment_response.get("manifest", "")
+    manifest = _manifest_raw if isinstance(_manifest_raw, str) else ""
 
     _log(logging.INFO, f"Deployment created  DSEQ={dseq}  manifest_len={len(manifest)}")
     _log(
@@ -1138,6 +1385,13 @@ def deploy(
                 ),
             )
 
+    # REQUEST PROFILE (just-akash#346): derived ONCE, from `sdl_content` — the exact text
+    # `create_deployment` submitted — so the fit check sees what was actually ordered.
+    _request_profiles = derive_resource_profiles(sdl_content)
+    _log(
+        logging.INFO,
+        f"auction[collection] {_request_profiles.describe(_count_gseqless(bids))}",
+    )
     selected_bid, auction_result = _select_auction_bid(
         bids,
         preferred=preferred,
@@ -1149,6 +1403,8 @@ def deploy(
         capacity_by_provider=_capacity,
         preferred_selection=_selection,
         already_selected=_already_selected,
+        resource_profiles=_request_profiles.profiles,
+        placement_group_count=_request_profiles.placement_group_count,
     )
     if auction_result.status is AuctionStatus.COLLECTING:
         fallback_deadline = start_time + bid_wait_retry
@@ -1224,6 +1480,10 @@ def deploy(
                             p for p, c in _capacity.items() if c.available_fraction() is None
                         ),
                     )
+        _log(
+            logging.INFO,
+            f"auction[fallback] {_request_profiles.describe(_count_gseqless(bids))}",
+        )
         selected_bid, auction_result = _select_auction_bid(
             bids,
             preferred=preferred,
@@ -1235,6 +1495,8 @@ def deploy(
             capacity_by_provider=_capacity,
             preferred_selection=_selection,
             already_selected=_already_selected,
+            resource_profiles=_request_profiles.profiles,
+            placement_group_count=_request_profiles.placement_group_count,
         )
     selection_phase = (
         1 if auction_result.selection_reason == "cheapest_preferred" or not has_allowlist else 2
@@ -1709,6 +1971,12 @@ def deploy(
         re-created order. Raises RuntimeError with an accurate cause if the round
         fails; any newly-created order is cleaned up before raising.
         """
+        if prepared_receipt is not None:
+            raise RuntimeError(
+                "receipt mode refuses internal re-deploy: the durable receipt binds the "
+                f"original DSEQ {dseq}, so closing it and creating another order would "
+                "make the recovery identity false"
+            )
         _log(
             logging.WARNING,
             f"Re-creating the order for fresh bids — {reason} (1 re-deploy round); "
@@ -2076,6 +2344,8 @@ def deploy_main():
         default=None,
         help="Backup provider address (repeatable; overrides AKASH_PROVIDERS_BACKUP)",
     )
+    parser.add_argument("--receipt-path")
+    parser.add_argument("--receipt-operation-id")
     # Mirrors the flag on `just-akash deploy` (cli.py). Both entry points reach the same
     # deploy(), so a flag on only one of them is a trap for whoever uses the other.
     parser.add_argument(
@@ -2126,6 +2396,8 @@ def deploy_main():
             # [] means "no backups, ignore the environment"; None means "read
             # AKASH_PROVIDERS_BACKUP". See _resolve_tier.
             backup_providers=[] if args.no_backup_fallback else args.backup_providers,
+            receipt_path=args.receipt_path,
+            receipt_operation_id=args.receipt_operation_id,
         )
         sys.exit(0)
     except RuntimeError as e:

@@ -9,7 +9,6 @@ tier resolution from env vars.
 
 from __future__ import annotations
 
-import shlex
 import signal
 import subprocess
 from itertools import chain, repeat
@@ -20,6 +19,7 @@ import pytest
 from just_akash._e2e import (
     _destroy_succeeded,
     _reset_signal_cleanup_for_tests,
+    _run,
     assert_provider_in_tiers,
     classify_provider,
     install_signal_cleanup,
@@ -27,10 +27,17 @@ from just_akash._e2e import (
     robust_destroy,
 )
 
+OWNER = "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee"
+
 
 @pytest.fixture(autouse=True)
-def _reset_e2e_state():
+def _reset_e2e_state(monkeypatch):
     """Each test starts with a clean signal registry."""
+    monkeypatch.setattr(
+        "just_akash._e2e.resolve_deployment_owner",
+        # ceiling_at: the interrupt cleanup passes its one per-cleanup lookup ceiling (#378).
+        lambda _dseq, *, ceiling_at=None: "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee",
+    )
     _reset_signal_cleanup_for_tests()
     yield
     _reset_signal_cleanup_for_tests()
@@ -136,11 +143,29 @@ class TestRobustDestroy:
     def test_first_try_success(self):
         with patch("just_akash._e2e.subprocess.run") as mock_run:
             mock_run.side_effect = [
-                _completed(0, stdout="Deployment 12345 closed"),  # destroy
+                _completed(0, stdout="Deployment 12345 destroyed"),  # destroy
                 _completed(0, stdout='{"state": "closed"}'),  # authoritative audit: settled
             ]
             assert robust_destroy("12345") is True
             assert mock_run.call_count == 2
+
+    def test_receipt_bound_destroy_passes_exact_owner_and_group(self):
+        with (
+            patch("just_akash._e2e.subprocess.run") as mock_run,
+            patch("just_akash._e2e._confirm_settled", return_value=True) as settled,
+        ):
+            mock_run.return_value = _completed(0, stdout="Deployment 12345 destroyed")
+            assert robust_destroy("12345", owner=OWNER, group="group-one") is True
+        command = mock_run.call_args.args[0]
+        assert command.count("--expected-owner") == 1
+        assert command.count("--expected-group") == 1
+        assert OWNER in command and "group-one" in command
+        settled.assert_called_once_with("12345", OWNER)
+
+    def test_group_without_owner_is_held_before_any_destroy(self):
+        with patch("just_akash._e2e.subprocess.run") as mock_run:
+            assert robust_destroy("12345", group="group-one") is False
+        mock_run.assert_not_called()
 
     def test_retry_after_first_failure(self):
         with (
@@ -149,7 +174,7 @@ class TestRobustDestroy:
         ):
             mock_run.side_effect = [
                 _completed(1, stderr="API down"),  # 1st destroy fails
-                _completed(0, stdout="Deployment 12345 closed"),  # 2nd destroy ok
+                _completed(0, stdout="Deployment 12345 destroyed"),  # 2nd destroy ok
                 _completed(0, stdout='{"state": "closed"}'),  # authoritative audit: settled
             ]
             assert robust_destroy("12345", retries=2) is True
@@ -245,7 +270,15 @@ class TestInstallSignalCleanup:
         ):
             handlers[signal.SIGINT](signal.SIGINT, None)
         assert exc.value.code == 130
-        mock_destroy.assert_called_once_with("9999", retries=1, audit=True)
+        mock_destroy.assert_called_once()
+        args, kwargs = mock_destroy.call_args
+        # The interrupt cleanup's one lookup ceiling (#378); its value is pinned in
+        # tests/test_owner_lookup_deadline.py.
+        assert isinstance(kwargs.pop("ceiling_at"), float)
+        assert (args, kwargs) == (
+            ("9999",),
+            {"owner": "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee", "retries": 1, "audit": True},
+        )
 
     def test_handler_skips_destroy_when_dseq_unset(self, monkeypatch, capsys):
         handlers: dict = {}
@@ -294,6 +327,7 @@ class TestDestroySuccessMatchesTheRealCLI:
 
         monkeypatch.setenv("AKASH_API_KEY", "test-key")
         monkeypatch.setattr("builtins.input", lambda _: "y")
+        MockAPI.return_value.get_deployment.return_value = {"dseq": "12345"}
         monkeypatch.setattr(sys, "argv", ["just-akash", "destroy", "--dseq", "12345"])
         main()
 
@@ -318,6 +352,7 @@ class TestDestroySuccessMatchesTheRealCLI:
 
         monkeypatch.setenv("AKASH_API_KEY", "test-key")
         monkeypatch.setattr("builtins.input", lambda _: "n")
+        MockAPI.return_value.get_deployment.return_value = {"dseq": "12345"}
         monkeypatch.setattr(sys, "argv", ["just-akash", "destroy", "--dseq", "12345"])
         main()
 
@@ -420,7 +455,7 @@ class TestRobustDestroyAdversarial:
             # Exactly 1 destroy + 1 audit = 2 calls. Destroy MUST run.
             assert mock_run.call_count == 2
             destroy_called = any(
-                "just destroy" in str(call.args[0])
+                call.args[0] == ["just", "destroy", "12345"]
                 for call in mock_run.call_args_list
                 if call.args
             )
@@ -728,26 +763,10 @@ class TestDseqWordBoundaryRegexEdges:
             assert robust_destroy("12345") is False
 
 
-class TestRunShellInjectionContract:
-    """Gap #8: `_run` uses `shell=True` and f-string interpolation of dseq.
+class TestRunArgvInjectionContract:
+    """Every local command is an argv vector and never enters a shell parser."""
 
-    Today: dseq="12345 ; rm -rf /tmp/foo" would execute the second command.
-    DSEQs from real Akash are always numeric so this isn't an active exploit,
-    but it IS a security latent. Pin the current contract so a future hardening
-    (shlex.quote / list-of-args) has a clear regression target — if someone
-    decides to quote dseq, this test will fail and force a deliberate update.
-
-    NOTE: this test does NOT execute the injected payload. It only inspects
-    the cmd string passed to subprocess.run.
-    """
-
-    def test_dseq_is_shell_quoted_in_destroy(self):
-        """The destroy command interpolates dseq under shell=True, so it MUST quote
-        it — the same guarantee the audit command carries. (This replaced an earlier
-        test that pinned the raw-interpolation behaviour as a known gap; CodeRabbit,
-        PR #63, rightly flagged that the audit-quoting work left the FIRST command
-        executed still injectable.)
-        """
+    def test_destroy_keeps_an_adversarial_dseq_in_one_argv_element(self):
         with (
             patch("just_akash._e2e.subprocess.run") as mock_run,
             patch("just_akash._e2e.time.sleep"),
@@ -760,25 +779,10 @@ class TestRunShellInjectionContract:
             robust_destroy(payload, audit=True)
 
             cmd = mock_run.call_args_list[0].args[0]
-            # The whole payload is a single quoted argument — the "; echo PWNED" can
-            # no longer be parsed by the shell as a separate command.
-            assert cmd == f"just destroy {shlex.quote(payload)}", (
-                f"destroy command must shell-quote the dseq; got {cmd!r}"
-            )
-            assert "'12345 ; echo PWNED'" in cmd
-            assert cmd.endswith("'")  # closing quote — payload fully contained
+            assert cmd == ["just", "destroy", payload]
+            assert "shell" not in mock_run.call_args_list[0].kwargs
 
-    def test_a_plain_numeric_dseq_needs_no_quoting_change(self):
-        """Guarantee the quoting is transparent for real dseqs: shlex.quote leaves a
-        pure-digit string untouched, so nothing about normal operation changes."""
-        assert shlex.quote("1784291290915") == "1784291290915"
-
-    def test_audit_command_quotes_the_dseq_so_it_stays_injection_safe(self):
-        """The audit can no longer be a static literal — it must name the deployment
-        it is auditing, because `just list` cannot be trusted to say whether escrow
-        is held. The injection-safety GUARANTEE is preserved by quoting: _run uses
-        shell=True, so an unquoted dseq would be a live injection vector.
-        """
+    def test_audit_keeps_an_adversarial_dseq_in_one_argv_element(self):
         with (
             patch("just_akash._e2e.subprocess.run") as mock_run,
             patch("just_akash._e2e.time.sleep"),
@@ -787,12 +791,29 @@ class TestRunShellInjectionContract:
                 _completed(0, stdout="closed"),
                 _completed(0, stdout='{"state": "closed"}'),
             ]
-            robust_destroy("12345; rm -rf /tmp/pwned")
+            payload = "12345; rm -rf /tmp/pwned"
+            robust_destroy(payload)
             audit_cmd = mock_run.call_args_list[1].args[0]
-            assert "'12345; rm -rf /tmp/pwned'" in audit_cmd, (
-                f"the dseq must be shell-quoted in the audit command; got: {audit_cmd}. "
-                "Unquoted user input under shell=True is an injection vector."
-            )
+            assert audit_cmd == [
+                "uv",
+                "run",
+                "just-akash",
+                "status",
+                "--dseq",
+                payload,
+                "--json",
+            ]
+            assert "shell" not in mock_run.call_args_list[1].kwargs
+
+    def test_env_branch_passes_argv_directly_to_popen(self):
+        """The process-group branch used by paid deploys has the same boundary."""
+        payload = "123; echo PWNED"
+        with patch("just_akash._e2e.subprocess.Popen") as mock_popen:
+            mock_popen.return_value.communicate.return_value = ("", "")
+            mock_popen.return_value.returncode = 0
+            _run(["tool", "--dseq", payload], env={"PATH": "/bin"})
+        assert mock_popen.call_args.args[0] == ["tool", "--dseq", payload]
+        assert "shell" not in mock_popen.call_args.kwargs
 
 
 # ── Iter-3 adversarial tests ─────────────────────────────────────────────────
@@ -1190,7 +1211,8 @@ class TestRobustDestroyTimeoutContract:
 class TestRobustDestroySuccessLogContent:
     """Angle #5: pin the operator-facing success log includes attempt number.
 
-    On first-try success, the log reads `Deployment {dseq} closed (attempt 1)`.
+    On first-try success, the log reads
+    `destroy reported success for {dseq} (attempt 1) — settlement not yet verified`.
     The attempt number is part of the audit trail — operators reviewing CI
     logs use it to distinguish "destroyed cleanly" from "needed retries"
     (which signals provider flakiness worth investigating).
@@ -1205,7 +1227,7 @@ class TestRobustDestroySuccessLogContent:
             patch("just_akash._e2e.time.sleep"),
         ):
             mock_run.side_effect = [
-                _completed(0, stdout="Deployment 12345 closed"),
+                _completed(0, stdout="Deployment 12345 destroyed"),
                 _completed(0, stdout='{"state": "closed"}'),
             ]
             assert robust_destroy("12345") is True
@@ -1227,7 +1249,7 @@ class TestRobustDestroySuccessLogContent:
         ):
             mock_run.side_effect = [
                 _completed(1, stderr="API down"),  # attempt 1 fails
-                _completed(0, stdout="Deployment 12345 closed"),  # attempt 2 ok
+                _completed(0, stdout="Deployment 12345 destroyed"),  # attempt 2 ok
                 _completed(0, stdout='{"state": "closed"}'),  # authoritative audit
             ]
             assert robust_destroy("12345", retries=2) is True
@@ -1328,9 +1350,7 @@ class TestRobustDestroyFalsyDseqDisambiguation:
             )
             # Verify the destroy command was actually issued for "0".
             destroy_cmd = mock_run.call_args_list[0].args[0]
-            assert "just destroy 0" in destroy_cmd, (
-                f"dseq='0' must produce `just destroy 0`; got {destroy_cmd!r}."
-            )
+            assert destroy_cmd == ["just", "destroy", "0"]
 
 
 class TestAuditReadsTheAuthoritativeRecordNotTheList:
@@ -1358,7 +1378,7 @@ class TestAuditReadsTheAuthoritativeRecordNotTheList:
                 _completed(0, stdout='{"state": "closed"}'),
             ]
             robust_destroy("12345")
-            assert self._audit_cmd(mock_run) != "just list"
+            assert self._audit_cmd(mock_run) != ["just", "list"]
             assert "status" in self._audit_cmd(mock_run)
 
     def test_a_stale_list_can_no_longer_cause_a_spurious_leak_report(self):
@@ -1400,7 +1420,7 @@ class TestAuditReadsTheAuthoritativeRecordNotTheList:
                 [_completed(0, stdout="closed")], repeat(_completed(1, stderr="API 503"))
             )
             assert robust_destroy("12345") is False
-            assert "could not confirm" in capsys.readouterr().out.lower()
+            assert "settlement not observed" in capsys.readouterr().out.lower()
 
     def test_a_transient_blip_does_not_cry_leak(self):
         """Fails-closed only AFTER retries — otherwise one API blip would report a
@@ -1467,7 +1487,10 @@ class TestAuditNeverRaisesFromCleanup:
         with (
             patch("just_akash._e2e.subprocess.run") as mock_run,
             patch("just_akash._e2e.time.sleep"),
-            patch("just_akash._e2e._confirm_settled", side_effect=RuntimeError("boom")),
+            patch(
+                "just_akash._e2e._confirm_settled_single_reader",
+                side_effect=RuntimeError("boom"),
+            ),
         ):
             mock_run.side_effect = [_completed(0, stdout="closed")]
             assert robust_destroy("12345") is False
@@ -1484,7 +1507,7 @@ class TestAuditNeverRaisesFromCleanup:
                 [_completed(0, stdout="closed")], repeat(_completed(1, stderr="503"))
             )
             robust_destroy("123; rm -rf /tmp/x")
-            assert "'123; rm -rf /tmp/x'" in capsys.readouterr().out
+            assert "settlement not observed" in capsys.readouterr().out.lower()
 
 
 class TestUnknownStateIsNotAClaimOfLife:
@@ -1512,13 +1535,14 @@ class TestUnknownStateIsNotAClaimOfLife:
     def test_unknown_state_says_could_not_confirm_not_still_active(self, capsys):
         result, out = self._run_audit('{"state": "some_new_state"}', capsys)
         assert result is False, "must still fail closed"
-        assert "could not confirm" in out.lower()
+        assert "settlement not observed" in out.lower()
         assert "STILL ACTIVE" not in out, "we cannot claim it is active — we don't know"
 
-    def test_active_still_positively_reports_still_active(self, capsys):
+    def test_active_reports_only_unobserved_settlement(self, capsys):
         result, out = self._run_audit('{"state": "active"}', capsys)
         assert result is False
-        assert "STILL ACTIVE" in out
+        assert "settlement not observed" in out
+        assert "STILL ACTIVE" not in out
 
     def test_insufficient_funds_is_settled(self, capsys):
         """The escrow is what ran out — there is nothing left to leak. Terminal in
@@ -1530,7 +1554,7 @@ class TestUnknownStateIsNotAClaimOfLife:
     def test_missing_state_field_is_unknown_not_settled(self, capsys):
         result, out = self._run_audit('{"dseq": "12345"}', capsys)
         assert result is False
-        assert "could not confirm" in out.lower()
+        assert "settlement not observed" in out.lower()
 
     def test_one_active_then_unreadable_is_not_claimed_still_active(self, capsys):
         """Caught in review (CodeRabbit, PR #63): a single `active` read followed by
@@ -1551,7 +1575,7 @@ class TestUnknownStateIsNotAClaimOfLife:
             result = robust_destroy("12345")
             out = capsys.readouterr().out
         assert result is False, "still fails closed — we could not confirm settlement"
-        assert "could not confirm" in out.lower()
+        assert "settlement not observed" in out.lower()
         assert "STILL ACTIVE" not in out, "one stale active read is not persistence"
 
 
@@ -1563,7 +1587,7 @@ class TestAuditPollsBecauseCloseIsNotInstant:
     That is not hypothetical — it broke the lease-shell E2E on this branch:
 
         [7/7] Cleanup: destroy DSEQ=1784294163119
-          PASS Deployment 1784294163119 closed (attempt 1)
+          PASS destroy reported success for 1784294163119 (attempt 1) — settlement not yet verified
           FAIL Audit: deployment 1784294163119 STILL ACTIVE after destroy
 
     So `active` inside the window means "not settled YET"; only `active` that
@@ -1594,7 +1618,9 @@ class TestAuditPollsBecauseCloseIsNotInstant:
                 _completed(0, stdout='{"state": "active"}') for _ in range(8)
             ]
             assert robust_destroy("12345") is False
-            assert "STILL ACTIVE" in capsys.readouterr().out
+            out = capsys.readouterr().out
+            assert "settlement not observed" in out
+            assert "STILL ACTIVE" not in out
 
     def test_a_settled_read_returns_immediately_without_burning_the_window(self):
         """The common case (already settled) must not pay the full poll."""
@@ -1622,3 +1648,33 @@ class TestAuditPollsBecauseCloseIsNotInstant:
                 _completed(0, stdout='{"state": "closed"}'),
             ]
             assert robust_destroy("12345") is True
+
+
+class TestAuditOverClaimsWhenReaderLagsChainTruth:
+    """Regression for #304: a lagging reader cannot justify ``STILL ACTIVE``."""
+
+    def test_eight_active_reads_are_not_a_claim_of_life(self, capsys):
+        with (
+            patch("just_akash._e2e.subprocess.run") as mock_run,
+            patch("just_akash._e2e.time.sleep"),
+        ):
+            mock_run.side_effect = [
+                _completed(0, stdout="Deployment 12345 destroyed"),
+                *(_completed(0, stdout='{"state": "active"}') for _ in range(8)),
+            ]
+            ok = robust_destroy("12345")
+        out = capsys.readouterr().out
+        assert ok is False
+        assert "settlement not observed" in out
+        assert "STILL ACTIVE" not in out
+
+    def test_corroborated_settlement_overrides_the_laggy_reader(self):
+        owner = "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee"
+        with (
+            patch("just_akash._e2e.subprocess.run") as mock_run,
+            patch("just_akash._e2e._confirm_settled", return_value=True) as confirm,
+            patch("just_akash._e2e.time.sleep"),
+        ):
+            mock_run.return_value = _completed(0, stdout="Deployment 12345 destroyed")
+            assert robust_destroy("12345", owner=owner, group="group-one") is True
+        confirm.assert_called_once_with("12345", owner)

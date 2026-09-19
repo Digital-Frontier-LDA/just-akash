@@ -7,14 +7,27 @@ classified, and how each feature check reads a subprocess result.
 
 from __future__ import annotations
 
+import inspect
 import os
-import re
 import subprocess
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from just_akash import smoke_providers as sp
+
+OWNER = "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee"
+
+
+def test_provider_receipts_are_uploaded_only_after_the_final_sweep() -> None:
+    workflow = (Path(__file__).parents[1] / ".github/workflows/provider-smoke.yml").read_text(
+        encoding="utf-8"
+    )
+    reap = "- name: Reap any leaked probe"
+    upload = "- name: Preserve unresolved provider-smoke deployment receipts"
+    assert workflow.count(reap) == workflow.count(upload) == 1
+    assert workflow.index(reap) < workflow.index(upload)
 
 
 def _completed(stdout: str = "", stderr: str = "", returncode: int = 0):
@@ -30,9 +43,9 @@ class TestDeployClassification:
             sp, "_run", return_value=_completed("Deployment Summary:\n  DSEQ: 123456\n")
         ):
             dseq, note = sp._deploy("sdl", "akash1prov", ref)
-        assert dseq == "123456"
-        assert note == "ok"
-        assert ref["dseq"] == "123456"  # registered for signal cleanup
+        assert dseq is None
+        assert note == "deploy-failed"
+        assert ref["dseq"] is None  # output without a receipt has no cleanup authority
 
     def test_dseq_equals_form(self):
         ref: dict = {"dseq": None}
@@ -40,7 +53,7 @@ class TestDeployClassification:
             sp, "_run", return_value=_completed("DSEQ=987 provider=akash1x price=5")
         ):
             dseq, _ = sp._deploy("sdl", "p", ref)
-        assert dseq == "987"
+        assert dseq is None
 
     def test_no_bid_is_not_a_deploy_failure(self):
         ref: dict = {"dseq": None}
@@ -236,7 +249,7 @@ class TestDeployMisreportsRegressions:
         ref: dict = {"dseq": None}
         with patch.object(sp, "_run", return_value=_completed(self.REAL_NO_BID, returncode=1)):
             sp._deploy("sdl", "p", ref)
-        assert ref["dseq"] == "1784289527633"
+        assert ref["dseq"] is None
 
     def test_exit_code_is_what_decides_success_not_the_printed_dseq(self):
         """Same output, only the exit code differs — that alone must flip the note."""
@@ -245,7 +258,7 @@ class TestDeployMisreportsRegressions:
             _, ok_note = sp._deploy("sdl", "p", ref)
         with patch.object(sp, "_run", return_value=_completed(self.REAL_NO_BID, returncode=1)):
             _, bad_note = sp._deploy("sdl", "p", ref)
-        assert (ok_note, bad_note) == ("ok", "no-bid")
+        assert (ok_note, bad_note) == ("no-bid", "no-bid")
 
     # The issue-#19 stale-bid path: deploy CLOSES the original order and re-creates a
     # new one, so the transcript carries two dseqs. The last is the live lease.
@@ -266,15 +279,15 @@ class TestDeployMisreportsRegressions:
         ref: dict = {"dseq": None}
         with patch.object(sp, "_run", return_value=_completed(self.REDEPLOY, returncode=0)):
             dseq, note = sp._deploy("sdl", "p", ref)
-        assert note == "ok"
-        assert dseq == "2222222222222", "must return the LIVE lease, not the closed original"
+        assert note == "deploy-failed"
+        assert dseq is None
 
     def test_redeploy_points_cleanup_at_the_live_lease(self):
         """The escrow-safety half: cleanup must target the dseq that is actually up."""
         ref: dict = {"dseq": None}
         with patch.object(sp, "_run", return_value=_completed(self.REDEPLOY, returncode=0)):
             sp._deploy("sdl", "p", ref)
-        assert ref["dseq"] == "2222222222222", "cleanup aimed at the closed dseq leaks escrow"
+        assert ref["dseq"] is None, "unverified output acquired cleanup authority"
 
 
 class TestExecCheck:
@@ -1197,6 +1210,7 @@ class TestOrphanProbeSweep:
     # ── the sweep itself ─────────────────────────────────────────────
     def _fake_api(self, deployments, details):
         api = MagicMock()
+        api.account_address.return_value = OWNER
         api.list_deployments.return_value = deployments
         api.get_deployment.side_effect = lambda dseq, owner=None: details[dseq]
         return api
@@ -1220,7 +1234,56 @@ class TestOrphanProbeSweep:
         ):
             swept = sp.sweep_orphan_probes()
         assert swept == [old_probe]
-        rd.assert_called_once_with(old_probe)
+        rd.assert_called_once_with(old_probe, owner=OWNER, group=sp.PROBE_GROUP)
+
+    def test_successful_sweep_deletes_only_its_resolved_receipt(self, monkeypatch, tmp_path):
+        old_probe = self._dseq_aged(7200)
+        receipt_dir = tmp_path / "just-akash-deployment-receipts"
+        receipt_dir.mkdir()
+        matching = receipt_dir / "provider-smoke-matching.json"
+        other = receipt_dir / "provider-smoke-other.json"
+        unreadable = receipt_dir / "provider-smoke-unreadable.json"
+        for path in (matching, other, unreadable):
+            path.write_text(str(path))
+
+        def identity(payload):
+            path = Path(payload.decode())
+            if path == unreadable:
+                raise ValueError("malformed")
+            return {
+                "expected_owner": OWNER,
+                "state": "create_response_received",
+                "dseq": old_probe if path == matching else "999",
+            }
+
+        api = self._fake_api([{"dseq": old_probe}], {old_probe: self._detail(["probe"])})
+        monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+        with (
+            patch.object(sp, "_api", return_value=api),
+            patch.object(sp, "decode_receipt", side_effect=identity),
+            patch.object(sp, "robust_destroy", return_value=True),
+            patch.object(sp.time, "time", return_value=self.NOW),
+        ):
+            assert sp.sweep_orphan_probes() == [old_probe]
+        assert not matching.exists()
+        assert other.exists() and unreadable.exists()
+
+        source = inspect.getsource(sp.sweep_orphan_probes)
+        call = "_delete_resolved_provider_smoke_receipts(dseq, owner)"
+        assert source.count(call) == 1, "receipt deletion call-site target must apply once"
+
+    def test_failed_or_dry_run_sweep_keeps_receipts(self):
+        old_probe = self._dseq_aged(7200)
+        api = self._fake_api([{"dseq": old_probe}], {old_probe: self._detail(["probe"])})
+        for dry_run, destroy_result in ((False, False), (True, True)):
+            with (
+                patch.object(sp, "_api", return_value=api),
+                patch.object(sp, "robust_destroy", return_value=destroy_result),
+                patch.object(sp, "_delete_resolved_provider_smoke_receipts") as delete,
+                patch.object(sp.time, "time", return_value=self.NOW),
+            ):
+                sp.sweep_orphan_probes(dry_run=dry_run)
+            delete.assert_not_called()
 
     def test_sweep_dry_run_destroys_nothing(self, capsys):
         old_probe = self._dseq_aged(7200)
@@ -2307,11 +2370,11 @@ class TestBidWaitInvariant:
     exactly that command, so every deploy died in ~250ms before touching the
     network and all three providers scored FAIL for five days.
 
-    Nothing caught it: _deploy's own tests mock _run, so the command string was
+    Nothing caught it: _deploy's own tests mock _run, so the command argv was
     never checked against the callee's contract.
     """
 
-    def _built_command(self) -> str:
+    def _built_command(self) -> list[str]:
         captured: dict = {}
 
         def fake_run(cmd, **kw):
@@ -2323,10 +2386,11 @@ class TestBidWaitInvariant:
         return captured["cmd"]
 
     @staticmethod
-    def _flag(cmd: str, flag: str) -> int:
-        m = re.search(rf"{re.escape(flag)} (\d+)", cmd)
-        assert m is not None, f"{flag} missing or reformatted in the built command: {cmd}"
-        return int(m.group(1))
+    def _flag(cmd: list[str], flag: str) -> int:
+        assert cmd.count(flag) == 1, f"{flag} missing or duplicated in built argv: {cmd}"
+        index = cmd.index(flag)
+        assert index + 1 < len(cmd), f"{flag} has no value in built argv: {cmd}"
+        return int(cmd[index + 1])
 
     def test_retry_is_at_least_the_wait(self):
         cmd = self._built_command()

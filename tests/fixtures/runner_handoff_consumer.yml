@@ -1,0 +1,56 @@
+# Offline fixture: revision input and provider addresses are inert placeholders.
+# Offline consumer graph from df-cicd@061d2d09b1f939f2531d7c63117a806d28dca46b templates/akash-runner-ci.yml.
+# Used to test scheduling and output wiring; never executed as a live workflow.
+name: Akash-backed CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pool:
+    uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-pool.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa # runner image df-akash-runner@sha256:aaf3799b
+    with:
+      just-akash-ref: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa # MUST equal the workflow pin
+      runner-label: ci-example-${{ github.run_id }}
+      tag-prefix: ci-example
+      github-org: Borduas-Holdings
+      # Collect preferred bids for 60s and choose the cheapest. Only then enter
+      # bounded first-bid fallback; Hurricane can never pre-empt a DF provider.
+      # runner_deny is the standing excluded_providers set and is removed before
+      # either auction tier is passed to just-akash.
+      providers: >-
+        [{"address":"akash1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","preferred":true,"name":"DFC Lisbon"},{"address":"akash1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","preferred":true,"name":"DFC Helsinki"},{"address":"akash1cccccccccccccccccccccccccccccccccccccc","preferred":true,"runner_host":true,"name":"DFC Sofia"},{"address":"akash1dddddddddddddddddddddddddddddddddddddd","preferred":false,"runner_host":true,"ci_only":true,"name":"Qualified CI fallback 1"},{"address":"akash1eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","preferred":false,"runner_host":true,"ci_only":true,"name":"Qualified CI fallback 2"},{"address":"akash1ffffffffffffffffffffffffffffffffffffff","ci_only":true,"name":"Hurricane Electric (last-resort fallback)"},{"address":"akash1gggggggggggggggggggggggggggggggggggggg","runner_deny":true,"ci_only":true,"name":"Standing runner trap"}]
+      pool-size: '2'
+      min-pool-size: '1'
+      ephemeral: false
+    secrets:
+      AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
+      AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}
+      GH_RUNNER_PAT: ${{ secrets.GH_RUNNER_PAT }}
+
+  work:
+    needs: [pool]
+    runs-on: ${{ fromJSON(needs.pool.outputs.runner-targets) }}
+    steps:
+      - uses: actions/checkout@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa # v4
+        with: { persist-credentials: false }
+      - run: ./your-ci-command
+
+  teardown:
+    needs: [pool, work]
+    if: ${{ always() }}
+    uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa # runner image df-akash-runner@sha256:aaf3799b
+    with:
+      just-akash-ref: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa # MUST equal the workflow pin
+      dseq: ${{ needs.pool.outputs.dseq }}
+      runner-label: ci-example-${{ github.run_id }}
+      tag-prefix: ci-example
+      github-org: Borduas-Holdings
+      wallet-address: ${{ needs.pool.outputs.wallet_address }}
+    secrets:
+      AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
+      AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}
+      GH_RUNNER_PAT: ${{ secrets.GH_RUNNER_PAT }}

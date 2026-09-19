@@ -12,10 +12,15 @@ reports safety it never checked.
 
 from __future__ import annotations
 
+import ast
 import os
+import pathlib
 import re
+import shlex
+import shutil
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -29,12 +34,30 @@ WF_PATH = Path(
         Path(__file__).resolve().parents[1] / ".github/workflows/runner-pool.yml",
     )
 )
-SRC = WF_PATH.read_text()
+SRC = WF_PATH.read_text(encoding="utf-8")
+
+# The akash-diag helper extracted from the workflow to its own module so that
+# (a) embedding a multi-line Python script in a YAML literal block does not
+# break the heredoc terminator's column-0 requirement in CI, and (b) the
+# helper is unit-testable directly. Tests below read BOTH the workflow
+# (which calls it) AND the helper (which parses the JSON).
+DIAG_HELPER_PATH = Path(__file__).resolve().parents[1] / "just_akash" / "_diag_helper.py"
+DIAG_HELPER_SRC = DIAG_HELPER_PATH.read_text(encoding="utf-8")
 DOC = yaml.safe_load(SRC)
 CALL = (DOC.get("on") or DOC.get(True))["workflow_call"]
 INPUTS = CALL["inputs"]
 OUTPUTS = CALL["outputs"]
 STEPS = DOC["jobs"]["pool"]["steps"]
+
+
+# A cross-repo-callable reusable reference: owner and repo, then the workflow path, then
+# a pinned SHA. Each component is anchored to `[A-Za-z0-9]` because GitHub owner and repo
+# names must begin with one — without that anchor a lone `.` or `..` matches the class and
+# `././…` and `../../…` sail through, which is exactly the hole this guard exists to close.
+REUSABLE_WORKFLOW_REF = (
+    r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*"
+    r"/\.github/workflows/[A-Za-z0-9._-]+\.ya?ml@[0-9a-f]{40}"
+)
 
 
 def _step(fragment: str) -> dict:
@@ -115,11 +138,15 @@ def test_the_lease_is_tagged_before_the_wait_not_after():
 
 def test_teardown_targets_one_locally_parsed_dseq():
     """A sweep destroyed 14 third-party deployments once. Every destroy here must name
-    a single DSEQ parsed from this job's own deploy output — never a tag glob, never
-    an --all."""
-    for m in re.finditer(r'"\$\{JA\[@\]\}" destroy[^\n]*', PROVISION["run"]):
-        line = m.group(0)
+    a single DSEQ parsed from this job's own deploy output and carry the owner emitted by
+    that same create attempt. The count pins every immediate rollback call site."""
+    destroys = re.findall(r'"\$\{JA\[@\]\}" destroy[^\n]*', PROVISION["run"])
+    assert len(destroys) == 5
+    for line in destroys:
         assert '--dseq "$DSEQ"' in line, f"destroy must name this run's dseq: {line}"
+        assert '--expected-owner "$WALLET"' in line, (
+            f"destroy must retain this create attempt's owner: {line}"
+        )
         assert not re.search(r"--all\b|--tag\b|\*", line), f"blast radius too wide: {line}"
 
 
@@ -318,6 +345,1099 @@ def test_every_failure_world_has_its_own_reason():
     assert "failure_reason" in OUTPUTS, "the caller cannot see why it fell back"
 
 
+# --------------------------------------------------------------------------
+# akash-diag → failure_reason (#398). Before this fix the workflow emitted
+# PROVIDER_CAPACITY for seven distinct allow-list and provider-health outcomes —
+# each a different cause and each a different remedy. The fix surfaces the
+# typed akash-diag code emitted by just_akash/_diagnostics.py:emit, demoting
+# PROVIDER_CAPACITY to a true last resort.
+#
+# Reading the CODE from JSON (not from English log lines) means a new Code
+# enum member becomes a typed failure_reason automatically; we do NOT
+# enumerate codes here, because enumerating them is the bug. The tests below
+# pin the *invariants* the derive-from-JSON approach must satisfy — that the
+# JSON matcher exists, that PROVIDER_CAPACITY is gated behind it, and that
+# every Code value the matcher could surface is a real Code enum member.
+# --------------------------------------------------------------------------
+
+# Code enum members whose own docstrings say they may leave a lease partially
+# or fully opened. These MUST NOT be on the no-lease-expected path; the
+# consumer (blazing) widens its accept-list to the no-lease family only, and
+# putting any of these in PROVIDER_CAPACITY would turn a real orphan accruing
+# spend into a silent pass.
+_DEPLOY_OR_LEASE_FAMILY = frozenset(
+    {
+        "DEPLOY_CREATE_FAILED",
+        "DEPLOY_CREATE_ORPHAN_SUSPECTED",
+        "NO_DSEQ_RETURNED",
+        "LEASE_CREATE_FAILED",
+        "REDEPLOY_FAILED",
+    }
+)
+
+# Code enum members whose own docstrings say no lease was opened (pre-bid
+# status check, pre-deploy validation, or market-side rejection). Each names
+# a different remedy, which is the entire point of this PR. The membership
+# list is documentary — the test asserts the WORKFLOW DERIVES FROM the enum,
+# not that it enumerates these names. (Enumerating is the bug.)
+_NO_LEASE_OPENED_FAMILY = frozenset(
+    {
+        "PROVIDER_OFFLINE",
+        "PROVIDER_INVALID_VERSION",
+        "PROVIDER_NO_CAPACITY",
+        "PROVIDER_NO_BID",
+        "PROVIDER_STATUS_QUERY_FAILED",
+        "PROVIDER_UNKNOWN",
+        "NO_BIDS_RECEIVED",
+        "BIDS_FOREIGN_ONLY",
+        "BIDS_STALE",
+        "BIDS_MALFORMED",
+        "SDL_ERROR",
+        "CONFIG_ERROR",
+    }
+)
+
+
+def _code_enum_values() -> set[str]:
+    """Every emitted Code string in just_akash/_diagnostics.py, derived live.
+
+    Walks the class to avoid vendoring the enum (which would go stale). The
+    CODE string is what the consumer reads — the attribute name is allowed to
+    diverge from the emitted string in principle, but in this codebase they
+    are the same and the regex would catch a rename if they ever diverged.
+    """
+    from just_akash._diagnostics import Code
+
+    return {
+        value
+        for value in Code.__dict__.values()
+        if isinstance(value, str) and value.isupper() and value[:1].isalpha()
+    }
+
+
+def test_akash_diag_matcher_reads_structured_json_not_english_text():
+    """The fix's whole point: parse the typed event, don't grep log prose.
+
+    The matcher must read /tmp/ja.log as one-JSON-per-line and pull the `code`
+    field from lines whose `type` is `akash-diag`. grep'ing for the emitted
+    English text (e.g. `non-allowed providers`) would force this matcher to
+    enumerate every Code enum member, and a new member would silently fall
+    back to PROVIDER_CAPACITY — exactly the bucket swallow this function
+    exists to stop.
+
+    The parse logic lives in `just_akash/_diag_helper.py` (extracted from
+    the workflow's YAML literal block — the heredoc terminator's column-0
+    requirement broke in CI when the script was inline). The workflow calls
+    the helper. The helper is what actually does the parsing.
+    """
+    code = _code(SRC)
+
+    # The workflow has the bash function that calls the helper.
+    assert "diag_last_code" in code, "the akash-diag helper is missing from the workflow"
+    assert "just_akash._diag_helper" in code, (
+        "diag_last_code must invoke the extracted helper module — an inline "
+        "heredoc broke the column-0 terminator in CI"
+    )
+
+    # The helper parses JSON, not text. Read the helper's source.
+    assert '"type"' in DIAG_HELPER_SRC and '"akash-diag"' in DIAG_HELPER_SRC, (
+        "the helper must recognise the typed envelope, not grep English"
+    )
+    assert re.search(r"json\.loads\(", DIAG_HELPER_SRC), (
+        "the helper must parse JSON, not text-match — that is the bug it replaces"
+    )
+
+
+def test_every_diag_last_code_call_passes_an_argument():
+    """Every call site of `diag_last_code()` MUST pass /tmp/ja.log explicitly.
+
+    The function body references `$1` and the `run:` block runs under
+    `set -uo pipefail` (line 995). An unbound `$1` aborts bash before
+    `failure_reason=` is written — strictly worse than the bucket this PR
+    demotes, because a bucket at least emits a value.
+
+    A hidden default inside the function (`${1:-/tmp/ja.log}`) would let a
+    caller read the wrong file without noticing; explicit-argument at every
+    call site is the safer shape. CodeRabbit caught this on the original
+    PR and we are pinning it.
+
+    The test walks every `$(diag_last_code ...)` and `diag_last_code ...` site
+    in the rendered workflow and asserts each carries a positional argument.
+    """
+    code = _code(SRC)
+
+    # The function definition itself (so we do not match the body of it).
+    fn_match = re.search(
+        r"diag_last_code\(\)\s*\{[^}]*\}",
+        code,
+        re.DOTALL,
+    )
+    assert fn_match is not None, "diag_last_code function is missing from the workflow"
+
+    # Strip the function definition; every remaining `diag_last_code` mention
+    # in the rendered shell is a call site.
+    call_sites = re.sub(
+        r"diag_last_code\(\)\s*\{[^}]*\}",
+        "",
+        code,
+        flags=re.DOTALL,
+    )
+    # A comment that names the function (e.g. "via diag_last_code above")
+    # is not a call site. Match the invocation form only: bare word followed
+    # by whitespace and a non-newline argument (or a $(...) wrapping it).
+    #
+    # Use finditer (not findall) because findall returns the matched STRINGS,
+    # and every match here is the literal "diag_last_code" — the same string
+    # each iteration. `call_sites.index(site)` would then resolve every
+    # iteration to the FIRST occurrence, so a missing argument on the second
+    # (or later) call site would never be reported. match.start() gives the
+    # actual offset of THIS match, which is what we need.
+    bare_calls = list(re.finditer(r"(?<![\$\w])diag_last_code(?!\s*\()", call_sites))
+
+    failures = []
+    for match in bare_calls:
+        # Look at the line the bare mention sits on.
+        line_no = call_sites[: match.start()].count("\n") + 1
+        line = call_sites.splitlines()[line_no - 1]
+        # A call must carry at least one whitespace-separated token after
+        # the function name. Comments are stripped by `_code`, so any token
+        # after the function name in a rendered call site IS an argument.
+        after = line.split("diag_last_code", 1)[1].strip()
+        # Inside a $( ... ) wrapping the call: count tokens between the call
+        # and the closing `)`. Strip a trailing `)` if the line ends with one.
+        after = after.rstrip().rstrip(")").strip()
+        if not after:
+            failures.append(
+                f"line {line_no}: 'diag_last_code' called with no argument "
+                f"under set -uo pipefail — bash aborts before failure_reason= "
+                f"is written. Pass /tmp/ja.log explicitly."
+            )
+
+    assert not failures, (
+        "every diag_last_code call site must pass /tmp/ja.log explicitly; "
+        "with set -uo pipefail an unbound $1 aborts bash before any "
+        "failure_reason is emitted — strictly worse than the bucket this "
+        "PR demotes.\n\n" + "\n".join(failures)
+    )
+
+
+def test_diag_last_code_is_fail_open_when_the_helper_cannot_be_run():
+    """The diagnostic enrichment step MUST NOT abort the provisioning loop.
+
+    With `set -uo pipefail` (line 995), a command substitution whose command
+    exits non-zero aborts the enclosing `run:` block. `uv run` can fail in
+    three real shapes:
+
+    - The harness runs the rendered block with `cwd=tmp_path` — no
+      `pyproject.toml`, so `uv run --with .` fails to resolve the project.
+    - Cold CI caches: uv's resolver hits a transient network or index
+      error and exits non-zero before `python -m` runs.
+    - Lockfile drift: a pinned dep in `pyproject.toml` is unavailable on
+      the runner's mirror; resolver fails after build.
+
+    In production, every shape used to convert a single recoverable
+    failure into a hard abort of the entire provisioning loop — every
+    attempt after attempt 1 is skipped, every retry is gone, every
+    `failure_reason=` is unwritten. That is strictly worse than the bucket
+    this PR demotes: a bucket at least names a value; an abort names
+    nothing.
+
+    The fix lives INSIDE the function (`return 0` after the `uv run`),
+    not at the call sites (`|| true` at each `VAR=$(diag_last_code ...)`).
+    Putting it in the function means future call sites inherit the
+    fail-open property without remembering to add a guard.
+
+    The test pins the invariant at two levels:
+
+    1. Static: the function body must end with `return 0` so a failing
+       `uv run` cannot propagate.
+    2. Behavioural: synthesise a failing function and exercise the same
+       assignment shape (`VAR=$(...)` under `set -e`) the workflow uses.
+       Confirm the outer block reaches the line after the assignment —
+       which the unfixed function would have aborted at.
+    """
+    code = _code(SRC)
+    fn_match = re.search(
+        r"diag_last_code\(\)\s*\{[^}]*\}",
+        code,
+        re.DOTALL,
+    )
+    assert fn_match is not None, "diag_last_code function is missing from the workflow"
+    body = fn_match.group(0)
+
+    # 1. Static pin: the function MUST end with `return 0` after the uv run.
+    #    Without it, the bare failing `uv run` exits non-zero and the
+    #    function inherits that exit status; the assignment then aborts.
+    assert re.search(
+        r"uv run --with \. python -m just_akash\._diag_helper.*\n\s*return 0\s*\n\s*\}",
+        body,
+    ), (
+        "diag_last_code() must end with `return 0` so a failing `uv run` "
+        "cannot abort the enclosing provisioning loop under set -e. The "
+        "fix lives inside the function (not `|| true` at the call sites) "
+        "so future call sites inherit the fail-open property."
+    )
+
+    # 2. Behavioural pin: run the assignment shape the workflow uses and
+    #    confirm a failing helper does not abort the enclosing block.
+    #    The harness at test_runner_pool_outcome_is_monotonic.py also
+    #    covers this — `bash -e -c <script>` with a stubbed `uv` that
+    #    exits non-zero on `just_akash._diag_helper` — but that test
+    #    covers 12 specific provision-block scenarios, not the bare
+    #    assignment invariant. This test pins the bare invariant
+    #    directly so a future refactor that re-introduces `|| true` at
+    #    the call sites (instead of inside the function) still goes red.
+    script = (
+        "set -euo pipefail\n"
+        "diag_last_code() {\n"
+        '    uv run --with . python -m just_akash._diag_helper "$1" 2>/dev/null\n'
+        "    return 0\n"
+        "}\n"
+        "VAR=$(diag_last_code /tmp/ja.log)\n"
+        'echo "after:VAR=${VAR}"\n'
+    )
+    proc = subprocess.run(
+        [shutil.which("bash") or "/bin/bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert proc.returncode == 0, (
+        f"diag_last_code fail-open invariant violated: the assignment "
+        f"aborted the enclosing block. rc={proc.returncode} "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    assert "after:VAR=" in proc.stdout, (
+        f"diag_last_code assignment did not complete: "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+
+
+def test_diagnostic_preserved_when_a_subsequent_attempt_wipes_the_log():
+    """LAST_KNOWN_DIAG preserves the cause across attempts whose log has been wiped.
+
+    #389 follow-up. The original defect: `diag_last_code` is fail-open
+    (a failing `uv run` returns empty), but the loop's next iteration runs
+    `rm -f /tmp/ja.log` BEFORE the next deploy. So the chain on a transient
+    uv failure was:
+
+      attempt N-1: deploy.py emits PROVIDER_NO_BID → /tmp/ja.log has it
+      attempt N-1: diag_last_code succeeds, DIAG_CODE=PROVIDER_NO_BID → exits
+                   with failure_reason=PROVIDER_NO_BID. (no actual data loss)
+
+    But if attempt N-1's read itself fails (uv run error):
+
+      attempt N-1: deploy.py emits PROVIDER_NO_BID → /tmp/ja.log has it
+      attempt N-1: diag_last_code FAILS, DIAG_CODE=""
+      attempt N-1: case falls through to unclassified, loop continues
+      attempt N:   `rm -f /tmp/ja.log` wipes the cause
+      attempt N:   deploy.py emits nothing new
+      post-loop:   POST_DIAG="" (log is empty), → PROVIDER_CAPACITY (bucket)
+
+    The cause was in /tmp/ja.log and we lost it. The fix: capture the code
+    into LAST_KNOWN_DIAG on every successful non-empty read, BEFORE the
+    loop's next iteration can wipe the log. Post-loop verdict prefers
+    POST_DIAG → LAST_KNOWN_DIAG → PROVIDER_CAPACITY.
+
+    Pinning this at three levels:
+
+    1. Static — the workflow declares LAST_KNOWN_DIAG before the loop,
+       captures from a non-empty DIAG_CODE, and the post-loop case uses
+       EFFECTIVE_DIAG (=POST_DIAG or LAST_KNOWN_DIAG) as both the
+       matched value AND the printed failure_reason.
+
+    2. Behavioural — exercise the loop logic with a stubbed `uv` that
+       fails on the second call. The /tmp/ja.log file the stub reads
+       contains the real Code event, but the helper fails; confirm
+       LAST_KNOWN_DIAG is preserved from the first successful read and
+       reaches the post-loop verdict.
+
+    3. Mutant — drop LAST_KNOWN_DIAG write from the inner-loop block
+       and confirm the behavioural test goes red. (The static check
+       already catches the missing declaration, but the behavioural
+       check is what proves the value flows through.)
+    """
+    # 1. Static pin.
+    code = _code(SRC)
+    assert re.search(r"LAST_KNOWN_DIAG\s*=", code), (
+        "the workflow must declare LAST_KNOWN_DIAG before the provision loop — "
+        "the post-loop fallback has no source without it. (See test docstring.)"
+    )
+    # The capture happens on a non-empty DIAG_CODE.
+    assert re.search(
+        r"if\s+\[\s*-n\s+\"\$\{?DIAG_CODE\}?\"\s*\];\s*then\s*\n\s*LAST_KNOWN_DIAG\s*=\s*\$DIAG_CODE",
+        code,
+    ), (
+        "LAST_KNOWN_DIAG must be written ONLY on a non-empty DIAG_CODE — "
+        "writing it on an empty result from a failed `uv run` would overwrite "
+        "the prior good value and rebuild the bug with extra steps. Pinned "
+        "by test_diag_last_code_is_fail_open_when_the_helper_cannot_be_run + "
+        "this test."
+    )
+    # Post-loop verdict binds EFFECTIVE_DIAG and uses it both as the case
+    # match value AND as the printed failure_reason.
+    assert re.search(r"EFFECTIVE_DIAG\s*=\s*\"\$\{POST_DIAG:-\$LAST_KNOWN_DIAG\}\"", code), (
+        "the post-loop verdict must bind EFFECTIVE_DIAG = POST_DIAG with "
+        "LAST_KNOWN_DIAG fallback, otherwise the case branch matches the "
+        "preserved value but prints `$POST_DIAG` (empty) — silently dropping "
+        "the cause."
+    )
+    assert 'case "$EFFECTIVE_DIAG"' in code, (
+        "the post-loop case statement must match on EFFECTIVE_DIAG, not on "
+        "the (possibly empty) $POST_DIAG directly."
+    )
+    assert 'echo "failure_reason=$EFFECTIVE_DIAG"' in code, (
+        "the printed failure_reason must use EFFECTIVE_DIAG so the preserved "
+        "code actually reaches the consumer."
+    )
+
+    # 2. Behavioural pin: simulate the failure mode the static check is
+    #    protecting against. /tmp/ja.log has the real Code event, the
+    #    helper reads it on attempt 1 (succeeds), the helper fails on
+    #    attempt 2 (uv run errors), and the post-loop verdict surfaces
+    #    the preserved code.
+    script = textwrap.dedent(
+        """
+        set -euo pipefail
+
+        # Mimic the workflow's diag_last_code shell function: fail-open.
+        diag_last_code() {
+          uv run --with . python -m just_akash._diag_helper "$1" 2>/dev/null
+          return 0
+        }
+
+        # Stub `uv` so we can drive the helper's behaviour deterministically.
+        # The helper is `python -m just_akash._diag_helper <log>` — the stub
+        # distinguishes "succeed and return a code" from "fail (empty output)".
+        uv() {
+          if [ "$1" = "run" ]; then
+            # Look for the log path passed to the helper.
+            local log=""
+            shift
+            while [ $# -gt 0 ]; do
+              case "$1" in
+                --with) shift 2 ;;
+                python|-m|just_akash._diag_helper) shift ;;
+                *)
+                  log="$1"
+                  shift
+                  ;;
+              esac
+            done
+            if [ "${JA_DIAG_FAIL:-0}" = "1" ]; then
+              # Mimic a transient uv failure: exit non-zero, no output.
+              return 1
+            fi
+            # Succeed: read the log and emit the latest akash-diag error code.
+            if [ -s "$log" ]; then
+              python3 -c "
+import json, sys
+last = ''
+with open(sys.argv[1]) as f:
+    for line in f:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if (
+            isinstance(event, dict)
+            and event.get('type') == 'akash-diag'
+            and event.get('level') == 'error'
+        ):
+            code = event.get('code')
+            if isinstance(code, str) and code:
+                last = code
+sys.stdout.write(last)
+" "$log"
+            fi
+            return 0
+          fi
+          command uv "$@"
+        }
+        export -f uv
+
+        # /tmp/ja.log has the real Code event.
+        cat > /tmp/ja.log <<'EOF'
+{"type": "akash-diag", "level": "warning", "code": "PROVIDER_OFFLINE"}
+{"type": "akash-diag", "level": "error", "code": "PROVIDER_NO_BID"}
+EOF
+
+        # Mirror the workflow's loop.
+        LAST_KNOWN_DIAG=""
+        MAX_ATTEMPTS=2
+
+        for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
+          if [ "$attempt" = "2" ]; then
+            # Wipe the log between attempts — this is the rm at line 1193.
+            rm -f /tmp/ja.log
+            # And force the helper to fail on this attempt.
+            export JA_DIAG_FAIL=1
+          fi
+          DIAG_CODE=$(diag_last_code /tmp/ja.log)
+          if [ -n "$DIAG_CODE" ]; then
+            LAST_KNOWN_DIAG=$DIAG_CODE
+          fi
+        done
+
+        # Post-loop verdict (mirror).
+        POST_DIAG=$(diag_last_code /tmp/ja.log)
+        EFFECTIVE_DIAG="${POST_DIAG:-$LAST_KNOWN_DIAG}"
+        case "$EFFECTIVE_DIAG" in
+          PROVIDER_NO_BID)
+            echo "failure_reason=$EFFECTIVE_DIAG"
+            ;;
+          *)
+            echo "failure_reason=PROVIDER_CAPACITY"
+            ;;
+        esac
+        """
+    )
+    proc = subprocess.run(
+        [shutil.which("bash") or "/bin/bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env={**os.environ, "PATH": os.environ.get("PATH", "")},
+    )
+    assert proc.returncode == 0, (
+        f"diagnostic-preservation loop aborted unexpectedly. "
+        f"rc={proc.returncode} stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    assert "failure_reason=PROVIDER_NO_BID" in proc.stdout, (
+        f"the preserved code from attempt 1 must reach the post-loop verdict. "
+        f"Got stdout={proc.stdout!r} stderr={proc.stderr!r}. If this shows "
+        f"PROVIDER_CAPACITY, LAST_KNOWN_DIAG was either not captured or not "
+        f"used in the post-loop fallback — the cause was silently lost."
+    )
+    assert "failure_reason=PROVIDER_CAPACITY" not in proc.stdout, (
+        f"PROVIDER_CAPACITY must not surface when LAST_KNOWN_DIAG has a value. "
+        f"Got stdout={proc.stdout!r}"
+    )
+
+
+def test_no_provider_capacity_misattribution_when_malformed_event_precedes_valid_one():
+    """The helper's skip-and-log-at-warning behaviour must propagate to the workflow.
+
+    #389 follow-up. The helper accepts the trailing valid code even when a
+    malformed (non-string) code precedes it in the same log, and logs a WARNING
+    naming the producer's contract violation. End-to-end: the workflow reads
+    the helper's output, the post-loop verdict routes to the typed code, never
+    to PROVIDER_CAPACITY.
+
+    The mutant this catches:
+      - Re-raise TypeError in the helper → aborts the helper on the malformed
+        event, DIAG_CODE="", workflow bucket to PROVIDER_CAPACITY. The
+        diagnostic surface is poisoned for the WHOLE log; this test would go
+        red with failure_reason=PROVIDER_CAPACITY in proc.stdout.
+    """
+    script = textwrap.dedent(
+        """
+        set -euo pipefail
+        # /tmp/ja.log: a malformed non-string code, then a valid trailing code.
+        cat > /tmp/ja.log <<'EOF'
+{"type": "akash-diag", "level": "error", "code": 42}
+{"type": "akash-diag", "level": "error", "code": "PROVIDER_NO_BID"}
+EOF
+
+        # Run the helper against the malformed log.
+        DIAG_CODE=$(python3 -m just_akash._diag_helper /tmp/ja.log 2>/dev/null || echo "")
+        echo "DIAG_CODE=$DIAG_CODE"
+        case "$DIAG_CODE" in
+          PROVIDER_NO_BID)
+            echo "failure_reason=$DIAG_CODE"
+            ;;
+          *)
+            echo "failure_reason=PROVIDER_CAPACITY"
+            ;;
+        esac
+        """
+    )
+    proc = subprocess.run(
+        [shutil.which("bash") or "/bin/bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env={**os.environ, "PATH": os.environ.get("PATH", "")},
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    assert proc.returncode == 0, (
+        f"workflow-level helper invocation failed. rc={proc.returncode} "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    assert "DIAG_CODE=PROVIDER_NO_BID" in proc.stdout, (
+        f"the helper must return the LAST valid code, not abort on the "
+        f"preceding malformed event. Got stdout={proc.stdout!r} "
+        f"stderr={proc.stderr!r}. If DIAG_CODE is empty or PROVIDER_CAPACITY "
+        f"appears, the helper re-raised TypeError and poisoned the diagnostic "
+        f"surface for the whole log."
+    )
+    assert "failure_reason=PROVIDER_NO_BID" in proc.stdout, (
+        f"the trailing valid event must surface as failure_reason. Got stdout={proc.stdout!r}"
+    )
+    assert "failure_reason=PROVIDER_CAPACITY" not in proc.stdout, (
+        f"PROVIDER_CAPACITY must NOT appear when a valid trailing code exists. "
+        f"Got stdout={proc.stdout!r}"
+    )
+
+
+def test_archive_walk_recovers_priors_after_helper_fail_open():
+    """LAST_KNOWN_DIAG closes the helper-succeeded-but-DIAG_CODE-was-empty gap.
+    The archive walk closes the OTHER gap: when the helper itself fails on the
+    live log (uv run error → DIAG_CODE="" via fail-open), the prior attempts'
+    logs still hold the cause. Without archiving them, the next iteration's
+    `rm -f /tmp/ja.log` would wipe the only evidence that a valid code
+    existed, and the post-loop verdict would route to PROVIDER_CAPACITY —
+    the exact misattribution this PR series exists to demote, but the one
+    LAST_KNOWN_DIAG does NOT catch.
+
+    #389 follow-up. The archive step runs BEFORE the rm at line 1217. It
+    writes /tmp/ja.log to /tmp/ja.log.<attempt> when non-empty. The post-
+    loop verdict, on empty POST_DIAG, walks /tmp/ja.log.* in REVERSE
+    chronological order and takes the FIRST non-empty diag read as POST_DIAG.
+
+    Pinning at three levels:
+      1. Static — the archive step exists before the wipe, and the post-loop
+         walk exists.
+      2. Behavioural — drive the loop with a helper that fails on the live
+         log; assert the post-loop verdict recovers PROVIDER_NO_BID from the
+         archive.
+      3. Mutant — drop the archive step → behavioural test goes red.
+    """
+    # 1. Static pin.
+    code = _code(SRC)
+    assert re.search(
+        r'cp\s+/tmp/ja\.log\s+/tmp/ja\.log\."?\$\{?attempt\}?"?',
+        code,
+    ) or re.search(
+        r'cp\s+/tmp/ja\.log\s+/tmp/ja\.log\.\$"?attempt"?',
+        code,
+    ), (
+        "the archive step must run BEFORE the rm-f wipe, copying /tmp/ja.log "
+        "to /tmp/ja.log.<attempt>. Pinned by the workflow comment block at "
+        "the archive step and by this test."
+    )
+    # Static mechanism pin: the walk iterates by attempt number (`seq
+    # MAX_ATTEMPTS -1 1`), NOT a glob+sort. Lexical sort puts `.10` before
+    # `.2` — latent at MAX_ATTEMPTS=3, live at >=10. The property test
+    # (test_archive_walk_prefers_newest_at_ten_plus_attempts) is the
+    # load-bearing assertion; this is the secondary mechanism pin.
+    assert re.search(
+        r"for\s+a\s+in\s+\$\(\s*seq\s+\"\$\{?MAX_ATTEMPTS\}?\"\s+-1\s+1\s*\)",
+        code,
+    ), (
+        "the post-loop walk must iterate `seq MAX_ATTEMPTS -1 1` so attempts "
+        "are visited newest-first by NUMBER — not via `ls -1r`, which is "
+        "lexical and misorders .10 before .2 at MAX_ATTEMPTS >= 10."
+    )
+
+    # 2. Behavioural pin: simulate the helper-fail-open + log-wipe gap.
+    #    Loop with two attempts. Attempt 1's helper succeeds, archives, then
+    #    wipe happens. Attempt 2's helper fails on the live (now empty) log.
+    #    Post-loop walks archives and recovers PROVIDER_NO_BID.
+    script = textwrap.dedent(
+        """
+        set -euo pipefail
+
+        diag_last_code() {
+          uv run --with . python -m just_akash._diag_helper "$1" 2>/dev/null
+          return 0
+        }
+
+        uv() {
+          if [ "$1" = "run" ]; then
+            local log=""
+            shift
+            while [ $# -gt 0 ]; do
+              case "$1" in
+                --with) shift 2 ;;
+                python|-m|just_akash._diag_helper) shift ;;
+                *)
+                  log="$1"
+                  shift
+                  ;;
+              esac
+            done
+            if [ "${JA_DIAG_FAIL:-0}" = "1" ]; then
+              return 1
+            fi
+            if [ -s "$log" ]; then
+              python3 -c "
+import json, sys
+last = ''
+with open(sys.argv[1]) as f:
+    for line in f:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if (
+            isinstance(event, dict)
+            and event.get('type') == 'akash-diag'
+            and event.get('level') == 'error'
+        ):
+            code = event.get('code')
+            if isinstance(code, str) and code:
+                last = code
+sys.stdout.write(last)
+" "$log"
+            fi
+            return 0
+          fi
+          command uv "$@"
+        }
+        export -f uv
+
+        # Attempt 1: /tmp/ja.log has the real Code event.
+        cat > /tmp/ja.log <<'EOF'
+{"type": "akash-diag", "level": "warning", "code": "PROVIDER_OFFLINE"}
+{"type": "akash-diag", "level": "error", "code": "PROVIDER_NO_BID"}
+EOF
+
+        LAST_KNOWN_DIAG=""
+        MAX_ATTEMPTS=2
+
+        for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
+          DIAG_CODE=$(diag_last_code /tmp/ja.log)
+          if [ -n "$DIAG_CODE" ]; then
+            LAST_KNOWN_DIAG=$DIAG_CODE
+          fi
+          # Archive before wipe (the workflow's actual order at line 1217).
+          if [ -s /tmp/ja.log ] && [ -n "${attempt:-}" ]; then
+            cp /tmp/ja.log /tmp/ja.log."$attempt"
+          fi
+          rm -f /tmp/ja.log
+          if [ "$attempt" = "1" ]; then
+            # Force the helper to fail on attempt 2.
+            export JA_DIAG_FAIL=1
+            # Leave /tmp/ja.log empty so attempt 2's helper reads nothing.
+            : > /tmp/ja.log
+          fi
+        done
+
+        # Post-loop verdict with archive walk (mirror).
+        POST_DIAG=$(diag_last_code /tmp/ja.log)
+        if [ -z "$POST_DIAG" ]; then
+          for a in $(seq "${MAX_ATTEMPTS}" -1 1); do
+            archive="/tmp/ja.log.$a"
+            [ -f "$archive" ] || continue
+            attempt_code=$(diag_last_code "$archive" 2>/dev/null || echo "")
+            if [ -n "$attempt_code" ]; then
+              POST_DIAG="$attempt_code"
+              echo "::notice title=just-akash archive walk::recovered from $archive"
+              echo "::notice::'$attempt_code' (helper failed on live log)"
+              break
+            fi
+          done
+        fi
+        EFFECTIVE_DIAG="${POST_DIAG:-$LAST_KNOWN_DIAG}"
+        case "$EFFECTIVE_DIAG" in
+          PROVIDER_NO_BID)
+            echo "failure_reason=$EFFECTIVE_DIAG"
+            ;;
+          *)
+            echo "failure_reason=PROVIDER_CAPACITY"
+            ;;
+        esac
+        """
+    )
+    proc = subprocess.run(
+        [shutil.which("bash") or "/bin/bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env={**os.environ, "PATH": os.environ.get("PATH", "")},
+    )
+    assert proc.returncode == 0, (
+        f"archive-walk loop aborted unexpectedly. rc={proc.returncode} "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    assert "failure_reason=PROVIDER_NO_BID" in proc.stdout, (
+        f"the post-loop verdict must recover the diagnostic from the archive "
+        f"after the helper fails on the live log. Got stdout={proc.stdout!r} "
+        f"stderr={proc.stderr!r}. If this shows PROVIDER_CAPACITY, the archive "
+        f"step is missing or the post-loop walk is not running."
+    )
+    assert "failure_reason=PROVIDER_CAPACITY" not in proc.stdout, (
+        f"PROVIDER_CAPACITY must not surface when archive has a valid code. "
+        f"Got stdout={proc.stdout!r}"
+    )
+
+
+def test_archive_walk_prefers_newest_at_ten_plus_attempts(tmp_path):
+    """PROPERTY (load-bearing): the post-loop archive walk prefers the
+    NEWEST archive even when MAX_ATTEMPTS >= 10.
+
+    #389 follow-up. The first iteration used `ls -1r /tmp/ja.log.*`, which
+    is LEXICAL sort: `.10` sorts before `.2`, so with MAX_ATTEMPTS=10+ the
+    walk would silently pick an OLDER diagnostic over the newest.
+    MAX_ATTEMPTS=3 hides the bug; MAX_ATTEMPTS=10 (entirely plausible for
+    a flaky provider) makes it live. The test name is the property
+    assertion; the property must be the thing the test enforces.
+
+    DRIVES THE ACTUAL PRODUCTION CODE. This test does NOT embed a copy of
+    the walk loop in its heredoc — the previous shape did, which meant a
+    future production mutation (e.g., "simplifying" `seq MAX_ATTEMPTS -1
+    1` to `ls -1r` or to `seq 1 MAX_ATTEMPTS`) could leave this test
+    green: the test was running a copy of the loop, not the production
+    code. A guard whose name says "prefers newest" but only exercises a
+    copy is a guard whose name lies about what it checks.
+
+    Instead, this test:
+      1. Extracts the archive-walk block verbatim from
+         `.github/workflows/runner-pool.yml` (the `if [ -z "$POST_DIAG" ];
+         then ... fi` containing `for a in $(seq ... -1 1)`).
+      2. Writes it to a temp file.
+      3. Stubs `diag_last_code` with a JSON-line parser matching
+         `just_akash._diag_helper.read_last_error_code`.
+      4. Seeds 11 archives, each carrying a unique `ARCHIVE_N` code.
+      5. Sources the production block into a driver that initialises
+         `POST_DIAG=""` and `MAX_ATTEMPTS=11`.
+      6. Asserts the walk picks `ARCHIVE_11`.
+
+    A production mutation is automatically reflected here. The mechanism
+    assertion (`test_archive_walk_iterates_attempt_numbers_not_glob_sort`)
+    is a secondary guard — it pins the implementation form so a future
+    "simplification" is visible in code review, but it does NOT replace
+    this property check.
+    """
+    # Locate the production archive-walk block. The block is `if [ -z
+    # "$POST_DIAG" ]; then ... fi` at 12-space YAML indent, containing
+    # the seq-based loop. Non-greedy body capture stops at the first
+    # matching `fi` at the SAME 12-space indent (the inner `if [ -n
+    # "$attempt_code" ]; then ... fi` is at 16 spaces, so it does not
+    # match the end anchor).
+    block_pattern = re.compile(
+        r"^(            if \[ -z \"\$POST_DIAG\" \]; then\n"
+        r"(?:.*\n)*?"
+        r"            fi\n)",
+        re.MULTILINE,
+    )
+    block_match = block_pattern.search(SRC)
+    assert block_match is not None, (
+        "archive-walk block not found in runner-pool.yml — expected a "
+        '`if [ -z "$POST_DIAG" ]; then ... fi` block at 12-space '
+        "indent containing the seq-based loop. If the workflow shape "
+        "changed, update this test (and the production code) together."
+    )
+    production_block = block_match.group(0)
+    # The block must read /tmp/ja.log.<a> directly so the test's
+    # /tmp/ja.log.N seeding is visible to the walk. (A glob-based block
+    # would still see them — but this is a tripwire so a refactor that
+    # loses the deterministic path naming fails LOUD, not silently.)
+    assert 'archive="/tmp/ja.log.$a"' in production_block, (
+        f"extracted archive-walk block does not read /tmp/ja.log.<a> "
+        f"directly. Refactor with care — the test seeds files at that "
+        f"exact path.\nBlock:\n{production_block}"
+    )
+
+    # Write the production block to a temp file so its workflow
+    # indentation does not burden the Python source's line-length budget.
+    block_file = tmp_path / "production_archive_walk.sh"
+    block_file.write_text(production_block)
+
+    # Driver script (also written to a file for the same reason). Stubs
+    # diag_last_code with a JSON-line parser mirroring the real helper,
+    # seeds 11 archives, sources the production block, asserts the
+    # newest wins. Cleanup runs on EXIT so a mid-script failure does not
+    # leak /tmp/ja.log.* into sibling tests.
+    driver_file = tmp_path / "driver.sh"
+    driver_file.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "trap 'rm -f /tmp/ja.log.*' EXIT\n"
+        "\n"
+        "# Stub diag_last_code: parse the JSON-line file like the real\n"
+        "# just_akash._diag_helper.read_last_error_code and emit the\n"
+        "# LAST error-level akash-diag code. This is the contract the\n"
+        "# production block depends on.\n"
+        "diag_last_code() {\n"
+        "  python3 -c '\n"
+        "import json, sys\n"
+        'last = ""\n'
+        "with open(sys.argv[1]) as h:\n"
+        "    for line in h:\n"
+        "        try:\n"
+        "            event = json.loads(line)\n"
+        "        except ValueError:\n"
+        "            continue\n"
+        "        if (isinstance(event, dict)\n"
+        '            and event.get("type") == "akash-diag"\n'
+        '            and event.get("level") == "error"\n'
+        '            and isinstance(event.get("code"), str)):\n'
+        '            last = event["code"]\n'
+        "sys.stdout.write(last)\n"
+        '\' "$1"\n'
+        "}\n"
+        "export -f diag_last_code\n"
+        "\n"
+        "# Seed 11 archives with non-empty JSON-lines content. The newest\n"
+        "# is /tmp/ja.log.11 and must be the winner.\n"
+        "MAX_ATTEMPTS=11\n"
+        "export MAX_ATTEMPTS\n"
+        'for i in $(seq 1 "$MAX_ATTEMPTS"); do\n'
+        '  python3 -c "\n'
+        "import json\n"
+        "print(json.dumps({'type':'akash-diag','level':'error','code':'ARCHIVE_' + str($i)}))\n"
+        '" > "/tmp/ja.log.$i"\n'
+        "done\n"
+        "\n"
+        "# Live log was wiped; POST_DIAG starts empty — drives the walk.\n"
+        'POST_DIAG=""\n'
+        "export POST_DIAG\n"
+        "\n"
+        f"# Source the production block (extracted from runner-pool.yml).\n"
+        f"# A mutation in the workflow is automatically reflected here.\n"
+        f'source "{block_file}"\n'
+        "\n"
+        'echo "POST_DIAG=$POST_DIAG"\n'
+    )
+
+    proc = subprocess.run(
+        [shutil.which("bash") or "/bin/bash", str(driver_file)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env={**os.environ, "PATH": os.environ.get("PATH", "")},
+    )
+    assert proc.returncode == 0, (
+        f"production archive-walk block failed. rc={proc.returncode} "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    assert "POST_DIAG=ARCHIVE_11" in proc.stdout, (
+        f"the walk must prefer the NEWEST archive (ARCHIVE_11 when "
+        f"MAX_ATTEMPTS=11). Got stdout={proc.stdout!r} stderr={proc.stderr!r}. "
+        f"If this shows ARCHIVE_1..ARCHIVE_9 or any archive < 11, the "
+        f"walk is lexical-sorting or otherwise misordering — at "
+        f"MAX_ATTEMPTS >= 10 this would route the wrong diagnostic to "
+        f"failure_reason. A future production mutation to the walk "
+        f"loop in runner-pool.yml MUST also update this test (and "
+        f"test_archive_walk_iterates_attempt_numbers_not_glob_sort)."
+    )
+
+
+def test_archive_walk_iterates_attempt_numbers_not_glob_sort():
+    """Static mechanism pin: the walk iterates `seq MAX_ATTEMPTS -1 1`,
+    reads `/tmp/ja.log.<a>` if present, and breaks on first non-empty.
+
+    This is a SECONDARY assertion behind
+    test_archive_walk_prefers_newest_at_ten_plus_attempts. The property test
+    is the one that fails when the priority breaks; this one pins the
+    implementation so a future "simplification" away from the safe form is
+    visible in code review. If the two diverge (mechanism changes but
+    property holds), the property test still protects the consumer; this
+    test only catches gross deviations.
+
+    Why not `ls -1r`: lexical sort, `10` < `2`. Latent at MAX_ATTEMPTS=3,
+    live at MAX_ATTEMPTS >= 10. The cost of a numerical iteration is one
+    `seq` invocation; the cost of getting sort wrong is a misordered
+    diagnostic in CI.
+    """
+    code = _code(SRC)
+    # Pin the iteration form. Allow either `seq "$MAX_ATTEMPTS" -1 1`
+    # (preferred) or `seq "${MAX_ATTEMPTS}" -1 1` — both are equivalent.
+    assert re.search(
+        r"for\s+a\s+in\s+\$\(\s*seq\s+\"\$\{?MAX_ATTEMPTS\}?\"\s+-1\s+1\s*\)",
+        code,
+    ), (
+        "the archive walk must iterate `seq MAX_ATTEMPTS -1 1` so attempts "
+        "are visited newest-first by NUMBER, not by glob+sort (lexical sort "
+        "puts .10 before .2)."
+    )
+    # The walk must read /tmp/ja.log.<a> directly, not via a glob expansion.
+    assert 'archive="/tmp/ja.log.$a"' in code or "archive=/tmp/ja.log.$a" in code, (
+        "the archive walk must read a deterministic path (`/tmp/ja.log.<a>`) "
+        "rather than expanding a glob — the latter reintroduces lexical-sort "
+        "ordering as a footgun."
+    )
+    # Walk must break on FIRST non-empty.
+    walk_match = re.search(
+        r"for\s+a\s+in\s+\$\(\s*seq\s+\"\$\{?MAX_ATTEMPTS\}?\"\s+-1\s+1\s*\)",
+        code,
+    )
+    assert walk_match is not None, (
+        "the post-loop walk must iterate `seq MAX_ATTEMPTS -1 1` (asserted above)"
+    )
+    walk_block = code[walk_match.start() : code.index("done", walk_match.start()) + 4]
+    assert "break" in walk_block, (
+        "the post-loop walk must `break` on the FIRST non-empty recovery — "
+        "otherwise a newer empty archive would be skipped past in favour of "
+        "an older non-empty one, inverting the recency preference."
+    )
+
+
+def test_archive_cleanup_runs_after_verdict():
+    """The post-loop walk reads /tmp/ja.log.* archives. A stale archive from
+    a misconfigured re-run could mislead the next archive walk if the helper
+    fails twice. Clean them up after the verdict binds.
+    """
+    code = _code(SRC)
+    # Find the archive-walk block (now the seq-based form).
+    walk_match = re.search(
+        r"for\s+a\s+in\s+\$\(\s*seq\s+\"\$\{?MAX_ATTEMPTS\}?\"\s+-1\s+1\s*\)",
+        code,
+    )
+    assert walk_match is not None, "the post-loop walk must exist (seq-based)"
+    # After the case esac and before the next outer scope, the cleanup must run.
+    post_verdict = code[walk_match.end() :]
+    assert re.search(r"rm\s+-f\s+/tmp/ja\.log\.\*", post_verdict), (
+        "after the post-loop verdict binds, the workflow must clean up "
+        "/tmp/ja.log.* archives. A stale archive from a re-run would mislead "
+        "the next archive walk if the helper fails twice."
+    )
+
+
+def test_provider_capacity_is_gated_behind_the_akash_diag_matcher():
+    """PROVIDER_CAPACITY was the catch-all that swallowed seven real causes.
+    It now lives in the FINAL `else` of the post-loop verdict, AFTER an
+    akash-diag check — never as the only branch.
+    """
+    code = _code(SRC)
+    capacity = code.rindex("failure_reason=PROVIDER_CAPACITY")
+
+    # The post-loop branch has an explicit akash-diag fallback before
+    # PROVIDER_CAPACITY. That branch is what surfaces BIDS_FOREIGN_ONLY,
+    # PROVIDER_OFFLINE, and the rest instead of the bucket.
+    assert "diag_last_code" in code[capacity - 2000 : capacity], (
+        "PROVIDER_CAPACITY is no longer gated behind the akash-diag matcher — "
+        "the bucket swallow this PR demotes would return."
+    )
+
+
+def test_every_code_member_is_reachable_through_the_workflow():
+    """Non-vacuity: the matcher must produce EVERY Code enum value, not just
+    the ones named in the test data. A matcher that grep'd a fixed string
+    list would pass the parametrised tests but miss new members; this test
+    asserts that whatever the producer emits, the matcher can surface.
+
+    The test only checks reachability (the producer's emit → the workflow's
+    read path), not correctness of which ones are surfaced. A no-lease code
+    will be surfaced as `failure_reason=<code>` and end up in the consumer's
+    widened accept-list; a deploy/lease code will only surface from the
+    specific matchers (CREATE_OUTCOME_AMBIGUOUS) that have always existed.
+    """
+    code = _code(SRC)
+
+    # The workflow extracts the code field via the helper and surfaces it as
+    # failure_reason in both the inner loop and the post-loop.
+    assert 'get("code")' in DIAG_HELPER_SRC or "get('code')" in DIAG_HELPER_SRC, (
+        "the helper must extract the `code` field — that is the typed truth"
+    )
+    assert "failure_reason=$DIAG_CODE" in code, (
+        "the inner-loop matcher must surface the code as failure_reason"
+    )
+    # Post-loop: $EFFECTIVE_DIAG is the union of POST_DIAG and the preserved
+    # LAST_KNOWN_DIAG (see runner-pool.yml). The bare-$POST_DIAG contract was
+    # the fail-open shape that lost the diagnostic between attempts — see
+    # LAST_KNOWN_DIAG capture in the workflow.
+    assert "failure_reason=$EFFECTIVE_DIAG" in code, (
+        "the post-loop matcher must surface EFFECTIVE_DIAG as failure_reason "
+        "(POST_DIAG with LAST_KNOWN_DIAG fallback — not raw POST_DIAG, which "
+        "was the fail-open shape that lost the diagnostic between attempts)"
+    )
+    assert 'EFFECTIVE_DIAG="${POST_DIAG:-$LAST_KNOWN_DIAG}"' in code, (
+        "EFFECTIVE_DIAG must be bound to POST_DIAG with LAST_KNOWN_DIAG "
+        "fallback — this is the preservation contract."
+    )
+
+
+def test_deploy_or_lease_family_codes_are_not_silently_bucket_swallowed():
+    """The trap: PROVIDER_CAPACITY must NOT be reachable for any code whose
+    own docstring says it may have left a lease partially or fully opened.
+
+    The bucket swallow is silent — once a real orphan accrues spend, an
+    audit reading `failure_reason=PROVIDER_CAPACITY` cannot tell that the
+    cause was CREATE_OUTCOME_AMBIGUOUS. The widening fix must therefore
+    route these five codes through the EXISTING specific matchers, not
+    through the new akash-diag branch (which would still fall into
+    PROVIDER_CAPACITY when the diagnostic isn't typed).
+    """
+    code = _code(SRC)
+
+    for code_value in _DEPLOY_OR_LEASE_FAMILY:
+        # The existing matchers that handle these must still be present and
+        # still emit their specific reason. If the akash-diag matcher
+        # accidentally caught one of these, it would emit `failure_reason=
+        # DEPLOY_CREATE_FAILED` and the consumer would treat it as NOT_PRODUCED.
+        if code_value in {
+            "NO_DSEQ_RETURNED",
+            "DEPLOY_CREATE_FAILED",
+            "DEPLOY_CREATE_ORPHAN_SUSPECTED",
+        }:
+            assert "failure_reason=CREATE_OUTCOME_AMBIGUOUS" in code, (
+                f"{code_value} routes through CREATE_OUTCOME_AMBIGUOUS; if that "
+                f"matcher is gone the akash-diag path would surface the code "
+                f"without its known orphan warning."
+            )
+
+
+def test_every_no_lease_family_code_is_a_real_code_enum_member():
+    """The membership list above is a HUMAN JUDGEMENT. The point of this PR
+    is to derive from the Code enum, not enumerate it — so the list is not
+    what the matcher produces; it is documentation of what we EXPECT. A
+    drift between the list and the live enum means either the producer
+    renamed a code, or we expected the wrong code, or the enum grew a new
+    member that belongs on this list.
+    """
+    codes = _code_enum_values()
+    missing = _NO_LEASE_OPENED_FAMILY - codes
+    assert not missing, (
+        f"the no-lease-opened family lists codes that are not in the Code "
+        f"enum at this SHA: {sorted(missing)}. Either the producer renamed "
+        f"them (update the family), or the matcher cannot surface them "
+        f"(update the workflow)."
+    )
+
+
+def test_every_deploy_or_lease_family_code_is_a_real_code_enum_member():
+    """The trap list is also documentary. A drift means the producer renamed
+    one of the dangerous codes; the family name in this test must follow.
+    """
+    codes = _code_enum_values()
+    missing = _DEPLOY_OR_LEASE_FAMILY - codes
+    assert not missing, (
+        f"the deploy/lease exclusion family lists codes that are not in the "
+        f"Code enum at this SHA: {sorted(missing)}. Update the family."
+    )
+
+
+def test_selection_emptiest_degraded_is_flagged_as_degradation_not_failure():
+    """SELECTION_EMPTIEST_DEGRADED is a *degradation* (correct behaviour that
+    the audit cannot distinguish from emptiest having been APPLIED), not a
+    failure. It is not in the no-lease family and not in the deploy/lease
+    family — flagged here so a future reviewer is not surprised by its
+    absence. Any decision about how to surface it belongs to a producer-
+    design conversation, not to a consumer-widening PR.
+    """
+    codes = _code_enum_values()
+    assert "SELECTION_EMPTIEST_DEGRADED" in codes, (
+        "the Code enum lost SELECTION_EMPTIEST_DEGRADED — this test's premise is wrong"
+    )
+    assert "SELECTION_EMPTIEST_DEGRADED" not in _NO_LEASE_OPENED_FAMILY, (
+        "the no-lease family should not silently include SELECTION_EMPTIEST_DEGRADED; "
+        "the absence is intentional and must remain a deliberate choice"
+    )
+    assert "SELECTION_EMPTIEST_DEGRADED" not in _DEPLOY_OR_LEASE_FAMILY, (
+        "the deploy/lease family should not include SELECTION_EMPTIEST_DEGRADED either; "
+        "it is a degradation, not an orphan"
+    )
+
+
+def test_bucket_value_is_not_a_code_enum_member():
+    """Non-vacuity on the naming hazard. The bucket value `PROVIDER_CAPACITY`
+    is workflow-only — a string no consumer anywhere has ever read, because
+    nothing ever read the bucket. If the Code enum ever grows a member called
+    `PROVIDER_CAPACITY`, the matcher would silently map a real signal into
+    the bucket's identity, and the two strings' identical-shape handling
+    would hide the regression.
+    """
+    codes = _code_enum_values()
+    assert "PROVIDER_CAPACITY" not in codes, (
+        "PROVIDER_CAPACITY is the BUCKET — workflow-only. If it appears in the "
+        "Code enum, the bucket and the code have collided and the naming-hazard "
+        "guard this test pins has been lost."
+    )
+
+
 def _checkout(steps: list) -> dict:
     return next(s for s in steps if "actions/checkout" in s.get("uses", ""))
 
@@ -394,7 +1514,9 @@ def test_the_pool_runs_the_image_providers_were_qualified_against():
 
     The probe SDL already explains why it pins a digest; this asserts the pool did not
     quietly opt out of that reasoning."""
-    probe_sdl = (Path(__file__).resolve().parents[1] / "sdl/github-runner-probe.yaml").read_text()
+    probe_sdl = (Path(__file__).resolve().parents[1] / "sdl/github-runner-probe.yaml").read_text(
+        encoding="utf-8"
+    )
 
     def _image(text: str, what: str) -> str:
         m = re.search(r"image:\s*(\S+)", text)
@@ -573,10 +1695,11 @@ def test_the_pool_label_carries_run_identity():
 
 
 def test_the_rendered_sdl_is_echoed_without_the_token():
-    """The SDL embeds a PAT with org runner-registration rights. Actions masks known
-    secrets, but a rendered file printed wholesale is exactly how one escaped before."""
+    """The rendered SDL once embedded the org PAT; it now carries a placeholder that each
+    provision attempt fills with a minted token (#383). A file printed wholesale is exactly
+    how a credential escaped before, so the echo still drops the token line."""
     render = _step("Render runner SDL")["run"]
-    assert "grep -vE 'ACCESS_TOKEN'" in render
+    assert "grep -vE 'RUNNER_TOKEN'" in render
     assert "cat /tmp/runner-sdl.yaml" not in render
 
 
@@ -651,18 +1774,353 @@ def test_provider_select_reaches_the_deploy_invocation():
 # Anti-vacuity — prove the guards above can actually fail
 # --------------------------------------------------------------------------
 
+# ─── placement key: the on-chain ownership marker ────────────────────────────
+#
+# ⛔ WHY THIS IS AN INPUT AT ALL. The key was a literal, and the comment beside it said
+# what it is for: it becomes `group_spec.name` on chain and is what stops a sibling
+# repo's sweeper closing this pool mid-CI. But every consumer of this workflow shares one
+# Console wallet, so a literal means every consumer's pools carry the SAME marker — and
+# `reusable-akash-escrow-reaper.yml` requires a `placement-prefix` with no default
+# precisely so a consumer cannot claim what is not its own. With one shared value, the
+# only prefix matching a consumer's pools also matches everyone else's, including this
+# repo's provider canary. Measured 2026-09-03 in Borduas-Holdings/blazing: three
+# different placement keys across four producers, and the pools — the biggest spender —
+# were the ones no prefix could safely claim.
+
+
+def test_the_placement_key_is_optional_and_defaults_to_the_module_s_marker():
+    """A caller that does not set it must be byte-identical to before the input existed.
+
+    The default is asserted against `provenance.PLACEMENT_PREFIX` rather than typed here,
+    so changing the module's marker cannot silently leave this workflow stamping the old
+    one — the drift shape this repo fixes by importing constants instead of copying them.
+    """
+    from just_akash.provenance import PLACEMENT_PREFIX
+
+    spec = INPUTS["placement-key"]
+    assert spec.get("required") is False, (
+        "placement-key must be optional, or every existing caller breaks"
+    )
+    assert spec["default"] == f"{PLACEMENT_PREFIX}runner", (
+        f"the default is {spec['default']!r} but the module stamps {PLACEMENT_PREFIX!r} — "
+        "a caller that sets nothing would get a marker no sweeper in this repo matches"
+    )
+
+
+def test_both_sdl_sites_take_the_key_from_the_input():
+    """`placement.<KEY>` and `deployment.<svc>.<KEY>` must be the SAME key.
+
+    Substituting one and leaving the other a literal renders an SDL whose deployment
+    references a placement that does not exist — rejected at MsgCreateDeployment, with a
+    message about the SDL rather than about this input.
+    """
+    render = _step("Render runner SDL")["run"]
+    assert render.count("${PLACEMENT_KEY}:") == 2, (
+        "expected the key under both `placement:` and `deployment.runner:`; found "
+        f"{render.count('${PLACEMENT_KEY}:')}"
+    )
+    assert "just-akash-runner:" not in render, (
+        "the SDL still hardcodes a placement key. The default belongs on the INPUT, where "
+        "a caller can override it; hardcoded, every consumer shares one marker again."
+    )
+    assert "PLACEMENT_KEY: ${{ inputs.placement-key }}" in SRC, (
+        "the render step does not receive the input"
+    )
+
+
+def test_the_guard_refuses_the_sibling_prefix_the_module_names():
+    """The literal in the guard must be the module's, not a second copy of it.
+
+    `provenance.SIBLING_REAPED_PREFIX` exists so this repo can assert it never collides
+    with the sibling. A hand-typed copy in the workflow drifts from it silently, and the
+    failure is a pool the sibling's scheduled sweeper closes mid-CI.
+    """
+    from just_akash.provenance import SIBLING_REAPED_PREFIX
+
+    guard = _code(_step("Render runner SDL")["run"])
+    assert f"{SIBLING_REAPED_PREFIX}*)" in guard, (
+        f"the guard does not refuse {SIBLING_REAPED_PREFIX!r} — stamping the sibling's "
+        "prefix hands our pool to their reaper"
+    )
+
+
+@pytest.mark.parametrize(
+    "key,accepted",
+    [
+        ("just-akash-runner", True),
+        ("just-akash-runner.", True),  # the register's own form, with the dot
+        ("ci-blazing-pool", True),
+        ("", False),
+        ("   ", False),
+        ("dcloud", False),
+        # ⛔ WHITESPACE IS NOT COSMETIC HERE. `dcloud ` does not match the `dcloud` pattern,
+        # so an unnormalised value walks past the reserved-key check and is then written
+        # into the SDL, where YAML swallows the space and the deployment is stamped
+        # `dcloud` after all. Raised by CodeRabbit on the PR that added this input.
+        ("dcloud ", False),
+        (" dcloud ", False),
+        ("dfci-infra-runner", False),
+        # ⛔ THE KEY IS INTERPOLATED INTO A YAML HEREDOC, so a value carrying `:` or a
+        # newline does not make a bad key — it makes a DIFFERENT DOCUMENT.
+        ("a: b", False),
+        ("x\ny", False),
+        ("-leading-dash", False),
+        (".leading-dot", False),
+    ],
+)
+def test_the_guard_actually_runs_and_decides(key, accepted, tmp_path):
+    """Executed, not read. A `case` that never matches looks identical to one that does.
+
+    `dcloud` is the Akash-wide DEFAULT placement name, used by most SDLs on the network
+    and owned by nobody, so a reaper aimed at it matches strangers' deployments; the empty
+    key cannot be written to chain at all; the sibling's prefix is actively reaped.
+    """
+    render = _step("Render runner SDL")["run"]
+    script = tmp_path / "render.sh"
+    script.write_text(render, encoding="utf-8")
+    env = {
+        **os.environ,
+        "GH_RUNNER_PAT": "x",
+        "ORG": "o",
+        "RUNNER_LABEL": "l",
+        "POOL_SIZE": "1",
+        "CPU": "1",
+        "MEMORY": "1Gi",
+        "STORAGE": "1Gi",
+        "EPHEMERAL": "true",
+        "PLACEMENT_KEY": key,
+        # The step sets this from `github.run_id` for the attribution stamp (#311). The
+        # harness must supply what the real step supplies, or it tests a different script.
+        "GH_RUN_ID": "34228480597",
+        "GITHUB_OUTPUT": str(tmp_path / "output"),
+    }
+    proc = subprocess.run(["bash", "-e", str(script)], env=env, capture_output=True, text=True)
+    if accepted:
+        assert proc.returncode == 0, f"{key!r} was refused: {proc.stdout} {proc.stderr}"
+    else:
+        assert proc.returncode == 2, f"{key!r} was ACCEPTED (rc={proc.returncode})"
+        assert "::error" in (proc.stdout + proc.stderr), "refused without saying why"
+
+
+@pytest.mark.parametrize("n", [3999, 4000, 4001])
+def test_resume_token_survives_an_exact_4000_byte_body(n, tmp_path):
+    """⛔ The ONE body length at which the CWE-117 guard never turns itself back off.
+
+    `head -c` cuts by BYTES and `<<<` appends exactly one newline, so at a body of
+    EXACTLY 4000 the cut keeps the payload and discards that newline, leaving the
+    cursor mid-line. `::<token>::` is honoured only at the start of a line, so the
+    resume never registers and `::stop-commands::` stays active for the REST OF THE JOB
+    — `pool` runs to ~line 1246 and contains the `::add-mask::` on the minted verdict
+    token. So this fails OPEN on secret masking, not closed on injection.
+
+    3999 and 4001 both work. Only 4000 does not, which is why this is pinned to the
+    exact bound: a test at "a large body" cannot express it, and neither can one at
+    3999 or 4001.
+
+    The fragment is read FROM the workflow rather than restated here, so an edit to the
+    emit sequence is tested rather than diverged from.
+    """
+    m = re.search(
+        r"head -c 4000 <<< \"\$RESP\".*?echo \"::\$\{RESP_TOKEN\}::\"",
+        SRC,
+        re.S,
+    )
+    assert m, "the bounded-echo fragment moved — re-anchor this test rather than deleting it"
+    body = "\n".join(
+        line.strip() for line in m.group(0).splitlines() if not line.strip().startswith("#")
+    )
+
+    script = tmp_path / "emit.sh"
+    script.write_text(body, encoding="utf-8")
+    proc = subprocess.run(
+        ["bash", "-e", str(script)],
+        env={**os.environ, "RESP": "A" * n, "RESP_TOKEN": "TESTTOKEN"},
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert any(line == "::TESTTOKEN::" for line in proc.stdout.splitlines()), (
+        f"at {n} bytes the resume token is not at the start of a line, so "
+        "::stop-commands:: is never lifted and stays active for the rest of the job"
+    )
+
+
+def test_a_huge_unexpected_body_does_not_kill_the_step(tmp_path):
+    """⛔ The bounded echo must not SIGPIPE the step it is protecting.
+
+    `printf ... | head -c 4000` sends printf SIGPIPE once the body exceeds the PIPE
+    BUFFER. This step opens `set -uo pipefail`, and Actions runs `run:` under
+    `bash -e`, so the pipeline's 141 killed the step outright — before the resume
+    token, before ::endgroup::, and before `failure_reason` was written, which is
+    the entire purpose of #253. Workflow commands then stay disabled for the rest
+    of `jobs.pool`, including the ::add-mask:: ~700 lines later.
+
+    ⚠ NOT a >4000 problem, which is why this test uses 512 KiB. Measured on macOS:
+    130000 bytes survives, 150000 dies; a Linux runner's 64 KiB buffer trips
+    earlier. A test at 8000 bytes PASSES against the broken code and proves
+    nothing — the same "near the bound is not the bound" trap as the 4000 case,
+    one level up.
+
+    Drives the real step under errexit + pipefail, which is the configuration the
+    fragment-level test could not express.
+    """
+    run = _step("Preflight")["run"]
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    # 418 falls to the `*)` arm. NOT 5xx or "" — those have their own arms and never
+    # reach the echo block, which is what this test is about.
+    (bindir / "gh").write_text(
+        "#!/usr/bin/env bash\n"
+        "printf 'HTTP/2 418\\n\\n'\n"
+        "python3 -c \"print('A'*524288, end='')\"\n"
+        # non-zero: the unexpected-status arm is gated on `RC -ne 0`
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    (bindir / "gh").chmod(0o755)
+
+    script = tmp_path / "preflight.sh"
+    script.write_text(run, encoding="utf-8")
+    out_file = tmp_path / "gh_output"
+    out_file.touch()
+    proc = subprocess.run(
+        ["bash", "-e", str(script)],
+        env={
+            **os.environ,
+            "PATH": f"{bindir}:{os.environ['PATH']}",
+            "GH_TOKEN": "x",
+            "ORG": "o",
+            "GITHUB_OUTPUT": str(out_file),
+            "GITHUB_STEP_SUMMARY": str(tmp_path / "summary"),
+        },
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode != 141, (
+        "the step died on SIGPIPE — pipefail promoted head's early close to 141 and "
+        "bash -e aborted before anything below the echo ran"
+    )
+    token = re.search(r"::stop-commands::([0-9a-f]{32})", proc.stdout)
+    assert token, "stop-commands was never emitted"
+    assert any(line == f"::{token.group(1)}::" for line in proc.stdout.splitlines()), (
+        "the resume token is missing or not at the start of a line, so workflow "
+        "commands stay disabled for the rest of the job"
+    )
+    assert "[truncated at 4000 bytes]" in proc.stdout, "the truncation notice never ran"
+    assert "::endgroup::" in proc.stdout, "the group was never closed"
+    assert "failure_reason=GITHUB_API_UNAVAILABLE" in out_file.read_text(encoding="utf-8"), (
+        "failure_reason was never written — the step reported nothing, which is the "
+        "defect #253 exists to fix"
+    )
+
+
+def test_no_guard_is_satisfied_by_prose(tmp_path):
+    """Re-run every guard against a workflow with ALL comments stripped, and require green.
+
+    ⛔ These guards assert on the shell body, and a body contains its own explanation.
+    A PRESENCE assertion against the raw text can therefore be satisfied by the comment
+    describing the construct rather than the construct — it reports that a behaviour
+    exists when only its description does, and it keeps passing after the behaviour is
+    deleted. `_code()` exists for this, but nothing required its use, so one assertion
+    drifted onto the raw body and went unnoticed.
+
+    This is the complement of test_the_guards_are_not_vacuous: that one breaks the CODE
+    and demands red, this one removes the PROSE and demands green. Between them a guard
+    must depend on the code and only on the code.
+    """
+    # ⛔ RUN ONCE, AGAINST THE REAL WORKFLOW. test_the_guards_are_not_vacuous spawns an
+    # inner pytest of this whole file per mutation with no -k filter, so without this
+    # skip each of those ~29 runs would spawn ANOTHER full suite from here — roughly
+    # tripling CI time to re-answer a question about the committed workflow that only
+    # has one answer. RUNNER_POOL_WF is set exactly when we are that inner run.
+    if os.environ.get("RUNNER_POOL_WF"):
+        pytest.skip("inner run of the mutation harness; this guard runs once, outermost")
+
+    stripped = "\n".join(ln for ln in SRC.splitlines() if not ln.lstrip().startswith("#"))
+    assert stripped != SRC, "no comments were stripped — this guard would be vacuous"
+    copy = tmp_path / "runner-pool.yml"
+    copy.write_text(stripped + "\n", encoding="utf-8")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            __file__,
+            "-q",
+            "--no-header",
+            "-p",
+            "no:cacheprovider",
+            "--no-cov",
+            "-k",
+            "not vacuous and not prose",
+        ],
+        env={**os.environ, "RUNNER_POOL_WF": str(copy)},
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, (
+        "a guard passes on the commented workflow and fails without comments, so it is "
+        "asserting on prose rather than on code:\n" + proc.stdout[-3000:]
+    )
+
+
 MUTATIONS = [
     (
-        '"default" not in tag-prefix',
+        "the bounded echo does not go through a pipe",
+        # Restores the SIGPIPE-able pipeline; the >4000 test must go red.
         lambda s: s.replace(
-            "        required: true\n        type: string\n      just-akash-ref:",
-            "        required: true\n        type: string\n"
-            "        default: 'ci-shared'\n      just-akash-ref:",
+            'head -c 4000 <<< "$RESP"',
+            "printf '%s\\n' \"$RESP\" | head -c 4000",
         ),
     ),
     (
-        "destroy stays narrow",
-        lambda s: s.replace('"${JA[@]}" destroy --dseq "$DSEQ" -y', '"${JA[@]}" destroy --all -y'),
+        "the resume token is unconditionally at line start",
+        # Removes the unconditional newline, restoring the exact-4000-byte hole.
+        lambda s: s.replace(
+            "                printf '\\n'\n"
+            '                if [ "$(printf \'%s\' "$RESP" | wc -c)" -gt 4000 ]; then\n'
+            "                  printf '[truncated at 4000 bytes]\\n'",
+            '                if [ "$(printf \'%s\' "$RESP" | wc -c)" -gt 4000 ]; then\n'
+            "                  printf '\\n[truncated at 4000 bytes]\\n'",
+        ),
+    ),
+    (
+        "placement-key keeps its default",
+        lambda s: s.replace(
+            "        required: false\n        default: just-akash-runner",
+            "        required: true",
+        ),
+    ),
+    (
+        "SDL takes the key from the input",
+        lambda s: s.replace("${PLACEMENT_KEY}:", "just-akash-runner:"),
+    ),
+    (
+        "the guard still refuses the network default",
+        lambda s: s.replace("            dcloud|dcloud-*)", "            never-matches-me)"),
+    ),
+    (
+        '"default" not in tag-prefix',
+        # ⚠ ANCHORED ON WHAT FOLLOWS tag-prefix, WHICH MOVED. This mutation used to end
+        # at `just-akash-ref:`; adding `placement-key:` between the two silently stopped
+        # it matching, and the harness caught that by refusing a mutation that no longer
+        # changes the text. Re-anchor rather than loosen: a mutation that matches the
+        # wrong block tests the wrong guard.
+        lambda s: s.replace(
+            "        required: true\n        type: string\n      placement-key:",
+            "        required: true\n        type: string\n"
+            "        default: 'ci-shared'\n      placement-key:",
+        ),
+    ),
+    (
+        "destroy stays owner-bound and narrow",
+        lambda s: s.replace(
+            '"${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" '
+            '--expected-group "$DEPLOYMENT_GROUP" -y',
+            '"${JA[@]}" destroy --all -y',
+        ),
     ),
     ("discard uses MIN_POOL", lambda s: s.replace('-lt "${MIN_POOL}"', '-lt "${POOL_SIZE}"')),
     ("min-pool clamp", lambda s: s.replace('[ "$MIN_POOL" -ge 1 ]', '[ "$MIN_POOL" -ge 0 ]')),
@@ -670,12 +2128,16 @@ MUTATIONS = [
         "402 is distinct",
         lambda s: s.replace("failure_reason=WALLET_UNDERFUNDED", "failure_reason=INFRA"),
     ),
-    ("sdl token redacted", lambda s: s.replace("grep -vE 'ACCESS_TOKEN'", "cat")),
+    ("sdl token redacted", lambda s: s.replace("grep -vE 'RUNNER_TOKEN'", "cat")),
     (
         "pool image matches the probe",
         lambda s: s.replace(
-            "github-runner@sha256:7509763af8209796f3e7fde5fb536c742075ec1a59ad1b36e3c9c27bc3bafc67",
-            "github-runner:latest",
+            "df-akash-runner@sha256:aaf3799b5e138abef0831bb8467ded7325164316f0cfde5c183fe6e129eae79e",
+            # ⚠ SAME repository, de-pinned. Replacing with "github-runner:latest" left the
+            # `ghcr.io/digital-frontier-lda/` prefix intact and produced a DIFFERENT repo,
+            # so the mutation tested "wrong image" rather than the "`:latest` can move
+            # between qualification and use" hazard the guard is actually about.
+            "df-akash-runner:latest",
         ),
     ),
     # The count must survive a multi-page org. Both shapes below are what a reader
@@ -750,6 +2212,101 @@ MUTATIONS = [
 ]
 
 
+# pytest's own exit codes. Only 0 and 1 mean "the suite RAN and produced a verdict":
+#   0 all passed   1 tests failed   2 interrupted
+#   3 internal error   4 USAGE ERROR   5 no tests collected
+# 2-5 all exit non-zero while proving nothing about any guard.
+_INNER_RAN = frozenset({0, 1})
+
+
+def _classify_inner_run(returncode: int, out: str) -> tuple[str, str]:
+    """RAN, or UNREADABLE with the reason. Never a verdict about the guard.
+
+    ⛔ THE DISTINCTION THIS FUNCTION EXISTS FOR. "The mutation survived" and "the
+    instrument did not run" are different findings, and only the first says anything
+    about the guard under test. Collapsing them is how this harness told a maintainer
+    that 27 WORKING guards were "decorative" — measured 2026-09-05: the inner run
+    inherited `addopts = --cov=just_akash` from pyproject, the interpreter had no
+    `pytest_cov`, and pytest exited 4 with `unrecognized arguments`. No "N failed"
+    appeared, so every mutation read as survived.
+
+    ⚠ THAT IS WORSE THAN FAILING OPEN. A gate that fails open loses a check. A harness
+    that fails into a FALSE ACCUSATION invites someone to delete 27 real controls
+    because it told them they were decorative.
+
+    The old code guarded exactly one of the modes its own comment names -- "a collection
+    error, an import failure or a crash all exit non-zero while proving nothing" -- and
+    a usage error is the sibling it names in principle and misses in code. So this
+    requires POSITIVE evidence of execution rather than the absence of one known
+    failure: a zero proves neither that the suite ran nor that the guard held.
+    """
+    if "error during collection" in out or "errors during collection" in out:
+        return "UNREADABLE", "the inner run failed to COLLECT, so no guard was evaluated"
+    if returncode not in _INNER_RAN:
+        return "UNREADABLE", (
+            f"pytest exited {returncode} (not 0/1), which means it did not run the suite "
+            f"— usage error, internal error, interruption, or nothing collected"
+        )
+    # ⚠ `errors?` BELONGS HERE. A test that ERRORS (a fixture raising, say) is a test
+    # that was collected and attempted — the suite demonstrably ran. Measured 2026-09-05:
+    # a fixture raising RuntimeError gives exit 1 and a summary of "1 warning, 1 error in
+    # 0.21s" with no passed/failed/skipped/xfailed anywhere, so the old regex called a
+    # genuine run UNREADABLE. That direction is safe here (the caller asserts RAN, so it
+    # fails loudly rather than silently) but it is still a false alarm on a real result.
+    #
+    # This does NOT re-admit collection errors: those are caught above by name and again
+    # by exit code 2, which is not in _INNER_RAN. Both guards still stand in front.
+    if not re.search(r"\d+ (?:passed|failed|skipped|xfailed|errors?)", out):
+        return "UNREADABLE", (
+            "the inner run reported no test outcomes at all, so nothing was evaluated"
+        )
+    return "RAN", ""
+
+
+# ⛔ REAL pytest summary lines, captured 2026-09-05 by actually running each shape rather
+# than by writing down what pytest is believed to print. The fixture-error row is the one
+# the classifier used to get wrong: exit 1, a genuine run, and not one of
+# passed/failed/skipped/xfailed anywhere in the summary.
+_CLASSIFY_CASES = [
+    (
+        "fixture error is a RUN",
+        1,
+        "ERROR test_x.py::test_a - RuntimeError: boom\n"
+        "========== 1 warning, 1 error in 0.21s ==========",
+        "RAN",
+    ),
+    (
+        "collection error is not",
+        2,
+        "ERROR test_x.py\n"
+        "!!!!! Interrupted: 1 error during collection !!!!!\n"
+        "========== 1 error in 0.09s ==========",
+        "UNREADABLE",
+    ),
+    ("ordinary failure", 1, "========== 1 failed, 2 passed in 0.30s ==========", "RAN"),
+    ("all green", 0, "========== 27 passed in 1.10s ==========", "RAN"),
+    (
+        "usage error — the original incident",
+        4,
+        "ERROR: unrecognized arguments: --cov=just_akash",
+        "UNREADABLE",
+    ),
+    ("no outcomes at all", 1, "some stray output with no summary line", "UNREADABLE"),
+]
+
+
+@pytest.mark.parametrize("label,rc,out,want", _CLASSIFY_CASES, ids=[c[0] for c in _CLASSIFY_CASES])
+def test_classify_inner_run_separates_a_run_from_an_instrument_failure(label, rc, out, want):
+    """★ Pinned in BOTH directions: what must read as RAN, and what must not.
+
+    A classifier tested only on the failures it was written for will happily
+    misread a success — which is how a fixture error, exit 1 and unmistakably a
+    real run, came back as "the instrument did not run".
+    """
+    verdict, _why = _classify_inner_run(rc, out)
+    assert verdict == want, f"{label}: expected {want}, got {verdict}"
+
+
 @pytest.mark.skipif(
     os.environ.get("RUNNER_POOL_WF") is not None,
     reason="inner mutation run — must not recurse",
@@ -767,7 +2324,7 @@ def test_the_guards_are_not_vacuous(label, mutate, tmp_path):
     assert mutated != SRC, f"mutation {label!r} no longer matches the workflow text"
 
     broken = tmp_path / "runner-pool.yml"
-    broken.write_text(mutated)
+    broken.write_text(mutated, encoding="utf-8")
     proc = subprocess.run(
         [
             sys.executable,
@@ -778,6 +2335,14 @@ def test_the_guards_are_not_vacuous(label, mutate, tmp_path):
             "--no-header",
             "-p",
             "no:cacheprovider",
+            # ⚠ THE PROXIMATE CAUSE, and it must be explicit. Without this the inner run
+            # inherits `addopts = --cov=just_akash --cov-report=term-missing` from
+            # pyproject.toml, so on any interpreter without `pytest_cov` it dies with a
+            # usage error before running a single test. The harness then has no outcomes
+            # to read and — before the classification below — called that a surviving
+            # mutation. This makes the inner run independent of the outer environment.
+            "-o",
+            "addopts=",
         ],
         env={**os.environ, "RUNNER_POOL_WF": str(broken)},
         capture_output=True,
@@ -785,12 +2350,13 @@ def test_the_guards_are_not_vacuous(label, mutate, tmp_path):
     )
     out = proc.stdout + proc.stderr
 
-    # A non-zero exit is NOT enough. A collection error, an import failure or a crash all
-    # exit non-zero while proving nothing about the guard — that is precisely how this
-    # harness sat green while checking nothing. Require an actual test FAILURE.
-    assert "error during collection" not in out and "errors during collection" not in out, (
-        f"mutation {label!r}: the inner run failed to COLLECT, so no guard was "
-        f"evaluated.\n{out[-1500:]}"
+    # A non-zero exit is NOT enough, and neither is the absence of one known failure
+    # mode. Establish that the instrument RAN before reading anything as a verdict
+    # about the guard — see `_classify_inner_run`.
+    verdict, why = _classify_inner_run(proc.returncode, out)
+    assert verdict == "RAN", (
+        f"mutation {label!r}: UNREADABLE — {why}. This says NOTHING about the guard; "
+        f"do not read it as 'the guard is decorative'.\n{out[-1500:]}"
     )
     assert re.search(r"\d+ failed", out), (
         f"mutation {label!r} left the suite GREEN — the guard for it is decorative.\n{out[-1500:]}"
@@ -808,35 +2374,32 @@ def test_the_guards_are_not_vacuous(label, mutate, tmp_path):
 # `assert proc.returncode != 0` was satisfied by the import error for every mutation,
 # including ones whose guard checks nothing. The anti-vacuity harness was itself vacuous.
 TD_PATH = Path(__file__).resolve().parents[1] / ".github/workflows/runner-teardown.yml"
-TD_SRC = TD_PATH.read_text()
+TD_SRC = TD_PATH.read_text(encoding="utf-8")
 TD = yaml.safe_load(TD_SRC)
 TD_STEPS = TD["jobs"]["teardown"]["steps"]
 TD_CLOSE = next(s for s in TD_STEPS if s.get("id") == "close")
 TD_DEREG = next(s for s in TD_STEPS if s.get("id") == "dereg")
 
 
-def test_teardown_verifies_the_close_instead_of_trusting_the_exit_code():
-    """`just-akash destroy` exits non-zero while printing 'Deployment closed', and a
-    zero exit is not proof either. Reporting a success we did not achieve is how
-    leases accumulate for weeks while every run looks green."""
-    body = TD_CLOSE["run"]
-    assert '"${JA[@]}" status' in body and ".get('state'" in body.replace('"', "'")
-    assert body.index('"${JA[@]}" destroy') < body.rindex('"${JA[@]}" status'), (
-        "must read state back AFTER destroying"
-    )
+def test_teardown_verifies_the_close_instead_of_trusting_the_exit_code(tmp_path):
+    from tests.test_runner_teardown_shell_probes import test_real_close_step
+
+    test_real_close_step(tmp_path, "console_closed_chain_active")
 
 
-def test_an_already_closed_lease_is_a_success():
-    assert re.search(r"Deployment closed\|already closed\|not found", TD_CLOSE["run"])
+def test_an_already_closed_lease_is_a_success(tmp_path):
+    from tests.test_runner_teardown_shell_probes import test_real_close_step
+
+    test_real_close_step(tmp_path, "agreeing_terminal")
 
 
-def test_an_unclosed_lease_fails_loudly_and_says_what_it_will_break():
-    """A silently-leaked lease makes the NEXT run's funding failure look like a market
-    outage — which is the misdiagnosis this whole effort exists to remove."""
-    body = TD_CLOSE["run"]
-    assert "closed=false" in body
-    assert "::error title=" in body and "escrow" in body.lower()
-    assert "just-akash destroy --dseq" in body, "must tell the operator how to fix it by hand"
+def test_an_unclosed_lease_fails_loudly_and_says_what_it_will_break(tmp_path):
+    from tests.test_runner_teardown_shell_probes import test_real_close_step
+
+    test_real_close_step(tmp_path, "active")
+    assert "::error title=" in TD_CLOSE["run"]
+    assert "escrow" in TD_CLOSE["run"]
+    assert "just-akash verify-closed --dseq" in TD_CLOSE["run"]
 
 
 def test_no_dseq_is_a_noop_not_a_failure():
@@ -895,7 +2458,15 @@ def test_wallet_policy_is_not_reimplemented_in_workflow_shell():
     code = _code(PROVISION["run"]) + _code(TD_CLOSE["run"])
     assert "RUN_ID %" not in code
     assert "mapfile -t KEYS" not in code
-    assert "richest funded account" in PROVISION["run"]
+    # ⛔ ON _code(), NOT THE RAW BODY. This asserted "richest funded account", which
+    # appears ONLY in the comment above the delegation — so it passed by reading prose
+    # and would have kept passing with the delegation deleted. Its two siblings above
+    # already use _code(); this line did not, and that asymmetry is the whole bug.
+    # (Found by test_no_guard_is_satisfied_by_prose. Reported by CodeRabbit on #253.)
+    assert "JA=(uv run --with . just-akash)" in _code(PROVISION["run"]), (
+        "wallet selection must be DELEGATED — the workflow invokes just-akash rather "
+        "than ranking balances in shell"
+    )
 
 
 def test_the_wallet_key_never_leaves_via_an_output():
@@ -910,7 +2481,9 @@ def test_pool_and_teardown_pass_the_complete_wallet_pool_to_just_akash():
     assert PROVISION["env"]["AKASH_API_KEYS"]
     assert TD_CLOSE["env"]["AKASH_API_KEYS"]
     assert '"${JA[@]}" deploy' in _code(PROVISION["run"])
-    assert '"${JA[@]}" destroy --dseq "$DSEQ"' in _code(TD_CLOSE["run"])
+    teardown_code = _code(TD_CLOSE["run"])
+    assert 'DESTROY_ARGS=(--dseq "$DSEQ" -y)' in teardown_code
+    assert '"${JA[@]}" destroy "${DESTROY_ARGS[@]}"' in teardown_code
 
 
 def test_required_deposit_drives_native_wallet_funding_floor():
@@ -927,17 +2500,23 @@ def test_a_single_key_behaves_exactly_as_before():
 
 
 def test_teardown_routes_by_dseq_instead_of_wallet_position():
-    """The CLI must receive the DSEQ and full pool; it resolves the owner internally."""
-    body = TD_CLOSE["run"]
-    assert "positively reads" in body
-    assert '"${JA[@]}" destroy --dseq "$DSEQ"' in body
+    """The resolver and mutating process must receive the same DSEQ and bound owner."""
+    body = _code(TD_CLOSE["run"])
+    assert 'DESTROY_ARGS=(--dseq "$DSEQ" -y)' in body
+    assert 'DESTROY_ARGS+=(--expected-owner "$OWNER")' in body
+    assert '"${JA[@]}" destroy "${DESTROY_ARGS[@]}"' in body
     assert "WANT_ADDR" not in body
 
 
-def test_wallet_address_is_optional_compatibility_data_not_a_safety_dependency():
+def test_wallet_address_is_optional_but_has_a_bound_owner_safety_path():
     td_call = (TD.get("on") or TD.get(True))["workflow_call"]
     assert td_call["inputs"]["wallet-address"]["required"] is False
-    assert "Deprecated compatibility" in td_call["inputs"]["wallet-address"]["description"]
+    description = td_call["inputs"]["wallet-address"]["description"]
+    assert "configured Console credential" in description
+    assert "exact owner/DSEQ chain read" in description
+    body = TD_CLOSE["run"]
+    assert body.count('RESOLVE_ARGS+=(--expected-owner "$WALLET_ADDRESS")') == 1
+    assert body.count('DESTROY_ARGS+=(--expected-owner "$OWNER")') == 1
 
 
 def test_teardown_does_not_claim_an_ownership_check_it_cannot_perform():
@@ -978,20 +2557,10 @@ def test_a_dseq_without_a_provider_is_still_closed():
     assert '"${JA[@]}" destroy --dseq "$DSEQ"' in orphan[:900], "an orphan dseq must be destroyed"
 
 
-def test_an_unreadable_state_is_not_reported_as_closed():
-    """An empty STATE means we could not READ it — a transient API error, a non-zero
-    exit, unparseable JSON. Reporting closed=true there is a success we did not achieve,
-    which is the precise failure this step exists to prevent."""
-    body = TD_CLOSE["run"]
-    assert "closed=unknown" in body, "an unverifiable close must not report success"
-    import re as _re
+def test_an_unreadable_state_is_not_reported_as_closed(tmp_path):
+    from tests.test_runner_teardown_shell_probes import test_real_close_step
 
-    m = _re.search(r'case "\$STATE" in\s*\n\s*([^\n)]*)\)', body)
-    assert m and m.group(1).strip() == "closed", (
-        f"the first case arm must be 'closed' alone, not {m.group(1) if m else None!r} — "
-        "sharing it with '' is how an unreadable state reported success"
-    )
-    assert "already closed|not found" in body, "only a provably-gone deployment may pass on ''"
+    test_real_close_step(tmp_path, "destroy_closed_chain_unavailable")
 
 
 # --------------------------------------------------------------------------
@@ -1013,12 +2582,124 @@ def test_the_pat_is_validated_before_provisioning():
 
 def test_an_expired_pat_is_not_reported_as_a_provider_failure():
     body = _step("PAT must still be valid")["run"]
-    assert "failure_reason=RUNNER_PAT_INVALID" in body
+    assert "REASON=RUNNER_PAT_INVALID" in body
     assert "RUNNER_NEVER_REGISTERED" in body, (
         "the message must name the symptom it prevents, or the next reader will not "
         "connect a 15-minute timeout to a credential"
     )
     assert "not a provider" in body.lower() and "rotate" in body.lower()
+
+
+# ⛔ TEXT ASSERTIONS COULD NOT SEE THE DEFECT ABOVE.
+# The original test asserted that the string "failure_reason=RUNNER_PAT_INVALID"
+# appeared in the step. It does — and it appeared for 401, 403, 404, 429, 5xx AND a
+# transport failure with no HTTP response at all, because every nonzero exit took the
+# same branch. "A 401 maps to PAT_INVALID" and "EVERYTHING maps to PAT_INVALID" are
+# indistinguishable to a substring check, so the collapse the preflight exists to
+# prevent shipped inside the preflight, past a green test.
+#
+# These run the actual shell against a stubbed `gh`, because the only assertion that
+# can tell those two apart is one that varies the input.
+
+_CASES = [
+    ("HTTP/2.0 401 Unauthorized", "RUNNER_PAT_INVALID", "an expired or revoked PAT"),
+    ("HTTP/2.0 403 Forbidden", "RUNNER_PAT_INVALID", "403 without rate-limit evidence"),
+    (
+        "HTTP/2.0 403 Forbidden\nx-ratelimit-remaining: 0",
+        "GITHUB_API_UNAVAILABLE",
+        "403 that IS a rate limit",
+    ),
+    ("HTTP/2.0 404 Not Found", "RUNNER_PAT_INVALID", "an org the token cannot see"),
+    ("HTTP/2.0 429 Too Many Requests", "GITHUB_API_UNAVAILABLE", "rate limiting"),
+    ("HTTP/2.0 503 Service Unavailable", "GITHUB_API_UNAVAILABLE", "a GitHub outage"),
+    ("dial tcp: lookup api.github.com: i/o timeout", "GITHUB_API_UNAVAILABLE", "no response"),
+]
+
+
+def _run_preflight(tmp_path, response: str, rc: int, org: str = "testorg") -> tuple[str, str]:
+    """Execute the preflight's classification half with `gh` stubbed out."""
+
+    body = _step("PAT must still be valid")["run"]
+    script = tmp_path / "preflight.sh"
+    out, summary = tmp_path / "out.txt", tmp_path / "sum.txt"
+    script.write_text(
+        f"set -uo pipefail\nORG={shlex.quote(org)}\n"
+        f'GITHUB_OUTPUT="{out}"\nGITHUB_STEP_SUMMARY="{summary}"\n' + body[body.index("RC=0") :],
+        encoding="utf-8",
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text(
+        '#!/usr/bin/env bash\nprintf "%s\\n" "$FAKE_RESP"\nexit "$FAKE_RC"\n',
+        encoding="utf-8",
+    )
+    (fake_bin / "gh").chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        "FAKE_RESP": response,
+        "FAKE_RC": str(rc),
+    }
+    # ⛔ `-e` IS THE POINT, NOT A DETAIL. Actions runs this step as `bash -e {0}`,
+    # and the regression being guarded — a bare `RESP=$(gh ...)` followed by
+    # `RC=$?` — only misbehaves under `-e`, where the failing assignment kills the
+    # shell before RC is ever read. A harness without `-e` cannot reproduce it, so
+    # it would pass forever INCLUDING on the exact regression it exists to stop.
+    proc = subprocess.run(["bash", "-e", str(script)], env=env, capture_output=True, check=False)
+    # Captured so the fallback arm's emitted response can be asserted; without it
+    # a test can only check that the guidance MENTIONS output, never that it exists.
+    (tmp_path / "stdout.txt").write_bytes(proc.stdout + proc.stderr)
+    # ⛔ A block that is not valid bash produces NO output — which every
+    # absence-assertion in this file is trivially satisfied by. Fail here instead.
+    assert b"unexpected EOF" not in proc.stderr, (
+        f"the extracted preflight is not valid bash:\n{proc.stderr.decode()}"
+    )
+    return (
+        out.read_text(encoding="utf-8") if out.exists() else "",
+        summary.read_text(encoding="utf-8") if summary.exists() else "",
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize(("response", "expected", "label"), _CASES)
+def test_each_failure_cause_is_classified_not_collapsed(tmp_path, response, expected, label):
+    out, _ = _run_preflight(tmp_path, response, rc=1)
+    assert f"failure_reason={expected}" in out, (
+        f"{label} must classify as {expected}; a preflight whose purpose is saying "
+        "WHY it failed cannot report five causes as one"
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_a_transport_failure_does_not_invent_an_http_status(tmp_path):
+    """⛔ `${CODE:-401}` ASSERTED a 401 that was never received. Reporting a status
+    the server never sent is worse than reporting none: it is a fabricated fact that
+    sends the reader to rotate a credential which may be perfectly valid."""
+
+    out, summary = _run_preflight(tmp_path, "dial tcp: i/o timeout", rc=1)
+    assert "401" not in summary, "a status was invented for a response that never arrived"
+    assert "none received" in summary
+    assert "failure_reason=GITHUB_API_UNAVAILABLE" in out
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_a_valid_pat_emits_no_failure_reason(tmp_path):
+    """The success path must stay silent — a reason emitted on success would make
+    every run look like a fallback.
+
+    ⛔ AN ABSENCE ASSERTION NEEDS A VALIDITY PRECONDITION. "no failure_reason" is
+    also what an EMPTY output file says, so this passed if the step exited before
+    reaching the success path at all — a moved slice anchor, or the missing-PAT
+    branch firing. An absence is evidence only once the code that would produce a
+    presence is shown to have run.
+    """
+
+    out, _ = _run_preflight(tmp_path, "HTTP/2.0 200 OK", rc=0)
+    log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
+    assert "runner PAT valid for" in log, (
+        "the success path never ran, so 'no failure_reason' proves nothing"
+    )
+    assert "failure_reason=" not in out
 
 
 def test_a_missing_pat_is_distinct_from_an_invalid_one():
@@ -1031,3 +2712,761 @@ def test_a_missing_pat_is_distinct_from_an_invalid_one():
 def test_the_pat_failure_reason_reaches_the_caller():
     assert "steps.pat.outputs.failure_reason" in DOC["jobs"]["pool"]["outputs"]["failure_reason"]
     assert "RUNNER_PAT_INVALID" in OUTPUTS["failure_reason"]["description"]
+
+
+# ── cross-repo callability ───────────────────────────────────────────────────
+
+
+def test_no_job_in_this_reusable_uses_a_bare_local_path():
+    """⛔ `./` IN A REUSABLE RESOLVES IN THE CALLER'S TREE, NOT OURS.
+
+    A reusable workflow's job runs in the caller's context, so `uses: ./…` is looked up
+    in the CONSUMER's repository — where the file does not exist. The job cannot be
+    created, the graph cannot be built, and the consumer's run dies with `jobs=0`: a
+    startup_failure rendered as a generic "workflow file issue" against THEIR workflow.
+
+    ⚠ IT PASSES IN THIS REPO'S OWN CI EITHER WAY, which is why it shipped — here the
+    caller IS just-akash. A reusable workflow cannot test its own cross-repo callability
+    from inside its own repo, so this static check is the only thing that can.
+
+    Measured 2026-09-03 (just-akash#247): Borduas-Holdings/blazing bumped past #243 and
+    both of its Akash workflows returned startup_failure with zero jobs. And it is a
+    recurrence — akash-github-runner#149 was the same bug with the same signature, one
+    repo over.
+    """
+    for job_name, job in DOC["jobs"].items():
+        uses = str(job.get("uses") or "")
+        if not uses:
+            continue
+        assert re.fullmatch(REUSABLE_WORKFLOW_REF, uses), (
+            f"job {job_name!r} calls {uses!r}. From a consumer, anything but the full "
+            "owner/repo path resolves in THEIR tree. Use "
+            "<owner>/<repo>/.github/workflows/<file>.yml@<40-hex sha>."
+        )
+
+
+LOCAL_FORMS_THAT_MUST_BE_REJECTED = [
+    "./.github/workflows/runner-teardown.yml@" + "a" * 40,
+    "././.github/workflows/runner-teardown.yml@" + "a" * 40,
+    "../.github/workflows/runner-teardown.yml@" + "a" * 40,
+    "../../.github/workflows/runner-teardown.yml@" + "a" * 40,
+    ".github/workflows/runner-teardown.yml@" + "a" * 40,
+    "runner-teardown.yml@" + "a" * 40,
+    "Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@main",
+]
+
+
+@pytest.mark.parametrize("uses", LOCAL_FORMS_THAT_MUST_BE_REJECTED)
+def test_every_caller_relative_or_unpinned_form_is_rejected(uses):
+    """`not uses.startswith("./")` was the whole guard, and it let five of these through.
+
+    Reported by Copilot review on just-akash#248. `.github/workflows/…`, `../…` and a
+    bare filename all resolve in the CONSUMER's tree exactly as `./` does — the guard
+    would have gone green on a recurrence of just-akash#247. The last case is unpinned:
+    a moving ref lets the close logic change under a consumer that changed nothing.
+    """
+    assert not re.fullmatch(REUSABLE_WORKFLOW_REF, uses)
+
+
+def test_the_real_reference_is_accepted():
+    """Known-negative: the reference runner-pool.yml actually carries must still pass.
+
+    Read from the workflow rather than written out here. A literal 40-hex SHA in a test
+    is flagged by detect-secrets as a high-entropy string (it was, on this PR), and a
+    pasted pin also goes stale the moment the real one is bumped.
+    """
+    assert re.fullmatch(REUSABLE_WORKFLOW_REF, str(DOC["jobs"]["teardown"]["uses"]))
+
+
+def _self_pins_and_root():
+    """Every nested self-pin, discovered by parsing every workflow (just-akash#364).
+
+    ⚠ runner-pool.yml comes from DOC, not disk: the anti-vacuity harness re-runs this module
+    against a mutated copy through RUNNER_POOL_WF, and the guard must see that copy.
+    """
+    from tests.nested_self_pins import discover_self_pins
+
+    # ⚠ From __file__, never from WF_PATH: the mutation harness points WF_PATH at /tmp.
+    root = pathlib.Path(__file__).resolve().parents[1]
+    workflows = {
+        path.name: yaml.safe_load(path.read_text(encoding="utf-8"))
+        for path in sorted((root / ".github/workflows").glob("*.y*ml"))
+    }
+    workflows["runner-pool.yml"] = DOC
+    pins = discover_self_pins(workflows)
+    # Measured 2026-09-14: one nested self-pin (runner-pool.yml -> runner-teardown.yml). A floor on
+    # the DISCOVERED population, so a parser that finds nothing cannot report a clean audit.
+    assert len(workflows) >= 10, f"workflow population collapsed: {sorted(workflows)}"
+    assert len(pins) >= 1, "no nested self-pin discovered; the parser is blind"
+    return root, pins
+
+
+def _prepared_reference(root, pins):
+    """The ref to judge against, with history proven complete; skips only off CI."""
+    from tests.nested_self_pins import ShallowHistory, base_branch, prepare_history
+
+    try:
+        return prepare_history(root, base_branch(), pins)
+    except (ShallowHistory, LookupError) as exc:
+        # ⛔ MUST NOT SKIP IN CI — that is the surface this protects.
+        assert not os.environ.get("CI"), f"cannot decide nested-pin ancestry under CI: {exc}"
+        pytest.skip(f"nested-pin ancestry undecidable locally: {exc}")
+
+
+def test_the_nested_teardown_pin_matches_the_file_it_calls():
+    """Every nested self-pin calls a file byte-identical to the one it should.
+
+    Referencing by pin means callers run the called workflow as it was at that ref: harmless while
+    the copies agree, silent drift the moment they do not.
+
+    ⛔ THE COMPARISON TARGET DEPENDS ON THE EVENT (just-akash#364). On a pull request the pin must
+    sit on the BASE branch (see the reachability guard), so it is compared with the BASE's copy:
+    a PR that edits the called file keeps the pin at base and repins after merge. Everywhere else
+    it is compared with the working copy, so a merged edit goes red on main naming the one-line
+    repin. Forcing the bump into the same PR is impossible under a squash merge — the only commit
+    holding the new bytes mid-PR is a branch commit, which the merge destroys (#308, #348).
+
+    ⚠ ON A PULL REQUEST IDENTITY IS SCOPED TO PINS THE PR TOUCHES (the called file or the pin
+    line). Otherwise one teardown-editing merge would turn every open PR red until main's repin
+    lands; those PRs skip identity with a warning naming the pending repin. Main stays red.
+
+    ⚠ NOT "lags by exactly one commit": commit distance is not enforceable; identity is.
+    """
+    import warnings
+
+    from tests.nested_self_pins import (
+        identity_scope,
+        identity_target,
+        identity_violations,
+        pin_format_violations,
+    )
+
+    root, pins = _self_pins_and_root()
+    assert pin_format_violations(pins) == []
+    reference = _prepared_reference(root, pins)
+    checked, notes = identity_scope(root, pins, reference)
+    for note in notes:
+        warnings.warn(note, stacklevel=1)  # surfaces in the CI log's warnings summary
+    assert identity_violations(root, checked, identity_target(reference)) == []
+
+
+def test_the_nested_teardown_pin_is_reachable_from_main():
+    """Every nested self-pin is an ancestor of the BASE branch — main, or the PR's base.
+
+    ⛔ THE FAILURE THIS EXISTS TO PREVENT, MEASURED TWICE. #308 was squash-merged leaving
+    the pin at d5e64da8 (`compare d5e64da8...main` -> "diverged"); #348 → 16be7deb left it
+    at 1ad3913b. Once orphaned, Actions cannot resolve the nested `uses:` while building the
+    job graph and every caller dies as a STARTUP FAILURE: zero jobs, no logs, nothing naming
+    the missing ref.
+
+    ⛔ THERE IS NO ESCAPE FOR ANCESTORS OF HEAD (just-akash#364). This guard used to return early
+    when the pin was on the current branch, reasoning that a PR's own commit is legitimately not
+    yet on main. That early return IS the hole: a PR-only commit is always an ancestor of HEAD, so
+    the guard went green for the whole PR and red on main only after the squash destroyed it. The
+    pin must already be on the base before merge.
+
+    ⚠ A shallow walk reports a genuine ancestor as orphaned, so history is fetched explicitly and
+    proven not shallow before any verdict.
+    """
+    from tests.nested_self_pins import pin_format_violations, reachability_violations
+
+    root, pins = _self_pins_and_root()
+    assert pin_format_violations(pins) == []
+    reference = _prepared_reference(root, pins)
+    assert reachability_violations(root, pins, reference) == []
+
+
+# ==========================================================================
+# The harness's own harness.
+#
+# `test_the_guards_are_not_vacuous` renders a verdict about 27 real guards. On
+# 2026-09-05 it rendered the WRONG one: the inner run inherited
+# `addopts = --cov=just_akash` from pyproject, the interpreter had no
+# `pytest_cov`, pytest exited 4 with `unrecognized arguments`, no "N failed"
+# appeared, and every mutation was reported as "the guard for it is decorative".
+#
+# ⛔ THAT IS WORSE THAN FAILING OPEN, which is why these tests exist. A gate that
+# fails open loses a check. A harness that fails into a FALSE ACCUSATION invites
+# a maintainer to DELETE 27 working controls because it told them to.
+#
+# Both error rates are pinned below. A classifier that returns UNREADABLE for
+# everything would satisfy the first half and destroy the harness — it is the
+# same defect wearing the safe colour.
+# ==========================================================================
+
+
+@pytest.mark.parametrize(
+    "returncode,out,reason_fragment",
+    [
+        (
+            4,
+            "ERROR: usage: pytest [options]\nunrecognized arguments: --cov=just_akash\n",
+            "exited 4",
+        ),
+        (5, "no tests ran in 0.01s\n", "exited 5"),
+        (3, "INTERNALERROR> Traceback\n", "exited 3"),
+        (2, "!!! KeyboardInterrupt !!!\n", "exited 2"),
+        (1, "ERROR tests/x.py\n1 errors during collection\n", "COLLECT"),
+        (0, "", "no test outcomes"),
+    ],
+    ids=[
+        "usage-error",
+        "nothing-collected",
+        "internal-error",
+        "interrupted",
+        "collection-error",
+        "silent-success",
+    ],
+)
+def test_an_inner_run_that_did_not_execute_is_UNREADABLE_not_a_verdict(
+    returncode, out, reason_fragment
+):
+    """★ THE FALSE-ACCUSATION SIDE.
+
+    None of these say anything about a guard. Reporting any of them as "the guard
+    is decorative" is an accusation the evidence cannot support — and the usage-error
+    row is the one that actually fired.
+    """
+    verdict, why = _classify_inner_run(returncode, out)
+    assert verdict == "UNREADABLE", f"rc={returncode} was read as a verdict about the guard"
+    assert reason_fragment in why, f"the reason must name what happened, got: {why!r}"
+
+
+@pytest.mark.parametrize(
+    "returncode,out",
+    [
+        (1, "F....\n1 failed, 4 passed in 0.30s\n"),
+        (0, ".....\n5 passed in 0.20s\n"),
+        (1, "5 failed, 92 passed in 5.91s\n"),
+        (0, "3 passed, 1 skipped in 0.10s\n"),
+    ],
+    ids=["one-failure", "all-passed", "many-failures", "passed-with-skips"],
+)
+def test_a_run_that_really_executed_is_RAN(returncode, out):
+    """★ THE ANTI-VACUITY SIDE, and it is the half that keeps the harness alive.
+
+    A classifier returning UNREADABLE for everything would pass every test above
+    and silently disable all 27 guard checks — the same defect in the safe colour.
+    These are the shapes that MUST still reach a verdict.
+    """
+    verdict, why = _classify_inner_run(returncode, out)
+    assert verdict == "RAN", f"a real run (rc={returncode}) was suppressed as UNREADABLE: {why}"
+
+
+def test_the_surviving_mutation_verdict_still_reaches_its_conclusion():
+    """A genuinely-surviving mutation must still be reported as decorative.
+
+    The point of the UNREADABLE state is to remove FALSE accusations, not to remove
+    the harness's ability to accuse at all. An inner run that executed and reported
+    zero failures is exactly the case the harness exists to catch.
+    """
+    out = ".....\n5 passed in 0.20s\n"
+    verdict, _ = _classify_inner_run(0, out)
+    assert verdict == "RAN", "an executed run must be judgeable"
+    assert not re.search(r"\d+ failed", out), "and this one legitimately shows no failures"
+
+
+# ⛔ BOTH DIRECTIONS, including the case the substring form got wrong. The old check
+# would have PASSED "separated" below — `-o` present, `addopts=` present, but the inner
+# run still inheriting addopts because they were never a pair.
+_ADDOPTS_CASES = [
+    ("adjacent", ["-m", "pytest", "-o", "addopts=", "-q"], True),
+    ("adjacent at end", ["-m", "pytest", "-o", "addopts="], True),
+    ("separated", ["-o", "cov=x", "-q", "addopts=", "-p"], False),
+    ("reversed", ["addopts=", "-o"], False),
+    ("-o with another value", ["-o", "cache_dir=/tmp", "-q"], False),
+    ("absent entirely", ["-m", "pytest", "-q"], False),
+    ("non-literal in the slot", ["-o", None, "addopts="], False),
+]
+
+
+@pytest.mark.parametrize("label,argv,want", _ADDOPTS_CASES, ids=[c[0] for c in _ADDOPTS_CASES])
+def test_the_addopts_matcher_requires_adjacency(label, argv, want):
+    """★ The pin's own control. A matcher tested only on the passing case cannot see
+    the arrangement that satisfies it while the behaviour is absent."""
+    assert _passes_o_addopts(argv) is want, f"{label}: expected {want}"
+
+
+def _inner_pytest_argv(source: str) -> list[str | None]:
+    """The literal argv list handed to `subprocess.run` inside the mutation harness.
+
+    ⚠ PARSED, NOT GREPPED. The previous version substring-matched `\'"-o",\'` and
+    `\'"addopts=",\'` in the source text, which was wrong in two directions:
+
+      * it hard-coded DOUBLE quotes, so a formatter flipping quote style would fail a
+        test whose behaviour had not changed (cries wolf), and
+      * it never checked ADJACENCY, so `"-o", "something-else"` plus the string
+        `"addopts="` anywhere else in the window — a comment, another argument — would
+        satisfy it while the inner run still inherited addopts (fails OPEN).
+
+    Non-literal elements come back as None so they cannot accidentally satisfy a pair.
+    """
+    tree = ast.parse(source)
+    fn = next(
+        (
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "test_the_guards_are_not_vacuous"
+        ),
+        None,
+    )
+    assert fn is not None, "the mutation harness function was renamed — this pin is stale"
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        target = node.func
+        name = target.attr if isinstance(target, ast.Attribute) else getattr(target, "id", "")
+        if name != "run" or not node.args or not isinstance(node.args[0], ast.List):
+            continue
+        return [
+            e.value if isinstance(e, ast.Constant) and isinstance(e.value, str) else None
+            for e in node.args[0].elts
+        ]
+    raise AssertionError("no subprocess.run([...]) call found in the mutation harness")
+
+
+def _passes_o_addopts(argv: list) -> bool:
+    """`-o` immediately followed by `addopts=` — adjacency is the whole point."""
+    # strict=False is correct and deliberate: the two sequences differ in length by
+    # construction (pairwise over a single list), so strict=True would always raise.
+    return any(a == "-o" and b == "addopts=" for a, b in zip(argv, argv[1:], strict=False))
+
+
+def test_the_inner_run_does_not_inherit_addopts():
+    """The proximate cause, pinned at the call site.
+
+    Without an explicit `-o addopts=` the inner pytest picks up
+    `--cov=just_akash --cov-report=term-missing` from pyproject.toml and dies with a
+    usage error on any interpreter lacking `pytest_cov`. The UNREADABLE verdict now
+    stops that from becoming an accusation; this stops it from happening at all.
+    """
+    argv = _inner_pytest_argv(pathlib.Path(__file__).read_text(encoding="utf-8"))
+    assert _passes_o_addopts(argv), (
+        "the inner pytest invocation must pass `-o addopts=` as ADJACENT arguments so it "
+        f"does not inherit pyproject's addopts. Parsed argv: {argv}"
+    )
+
+
+class TestTheFallbackArmPrintsWhatItPromises:
+    """⛔ THE DEFAULT ARM IS WHERE A FIX'S OWN DEFECT HIDES.
+
+    The `*)` branch fires when the status is UNRECOGNISED — precisely when the
+    operator has least to go on. Its fix text said "read the response below",
+    and `RESP` was captured, parsed twice, and never emitted. So the one arm
+    that exists for the unexplained case sent the reader to output that did not
+    exist, in a PR whose entire subject is a preflight that could not report why
+    it failed.
+
+    It is the branch least likely to have been exercised, which is exactly why
+    it was the one still broken. Check the default arm first, not last.
+    """
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_an_unexpected_status_emits_the_response(self, tmp_path):
+        out, summary = _run_preflight(tmp_path, "HTTP/2.0 418 I'm a teapot\nx-trace: abc123", rc=1)
+        log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
+        assert "::group::Unexpected preflight response" in log
+        assert "x-trace: abc123" in log, "the guidance names a response that must be printed"
+        assert "log" in summary, "the summary must say WHERE the response is"
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_the_echoed_response_cannot_forge_a_workflow_command(self, tmp_path):
+        """⛔ CWE-117 again. A response body echoed raw into an Actions log can
+        forge commands — `::error::` at line start is a COMMAND, not text. Same
+        shape as just-akash#252, reached by a different route: there the payload
+        arrived in an exception message, here in an HTTP body.
+
+        Asserted as the property that matters — the payload IS printed (the
+        operator needs it) but is wrapped in `::stop-commands::`, which is
+        GitHub's documented neutraliser. Deleting the payload would trade one
+        blind spot for another.
+        """
+        forged = "HTTP/2.0 418 Teapot\n::error title=forged::a provider is down"
+        _out, _summary = _run_preflight(tmp_path, forged, rc=1)
+        log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
+
+        assert "::error title=forged::" in log, "the evidence must still reach the operator"
+        stop = re.search(r"::stop-commands::([0-9a-f]{32})", log)
+        assert stop, "untrusted output was echoed without ::stop-commands::"
+        token = stop.group(1)
+        body_start = log.index(f"::stop-commands::{token}")
+        body_end = log.index(f"::{token}::")
+        assert body_start < log.index("::error title=forged::") < body_end, (
+            "the forged command fell outside the neutralised block"
+        )
+        assert log.index(f"::{token}::") < log.index("::endgroup::"), (
+            "commands must be resumed BEFORE ::endgroup::, or the group never closes"
+        )
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_a_recognised_status_does_not_dump_the_response(self, tmp_path):
+        """401 has specific guidance and does not promise the raw body — dumping
+        it for every failure would bury the named diagnosis this PR added."""
+        _run_preflight(tmp_path, "HTTP/2.0 401 Unauthorized\nx-trace: nope", rc=1)
+        log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
+        assert "::group::Unexpected preflight response" not in log
+
+
+class TestTheAnnotationCannotBeSplitByCallerInput:
+    """⛔ `${ORG}` IS A CALLER-SUPPLIED `workflow_call` INPUT.
+
+    It flows into TITLE, which is interpolated into `::error title=...::`. A CR
+    or LF in it ends that line, and whatever follows starts a NEW workflow
+    command — forging annotations, or `::stop-commands::` to switch command
+    processing off entirely.
+
+    Third entry point for this class in one day: an exception message
+    (just-akash#252), an HTTP response body (this PR's fallback arm), and now a
+    workflow input. Same defect, three doors.
+    """
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_a_newline_in_the_org_cannot_start_a_second_command(self, tmp_path):
+        _run_preflight(
+            tmp_path,
+            # ⛔ 404, NOT 401. Only the 404 arm interpolates ${ORG} into TITLE
+            # ("org ${ORG} is not visible..."); 401's TITLE is a fixed string. With
+            # 401 this test passed with the flattening REMOVED — the fixture could
+            # not carry the tainted value into the sink, so it proved nothing.
+            "HTTP/2.0 404 Not Found",
+            rc=1,
+            org="evil\n::error title=forged::a provider is down",
+        )
+        log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
+        annotations = [ln for ln in log.splitlines() if ln.startswith("::error")]
+        assert annotations, "the step emitted no annotation at all"
+        assert len(annotations) == 1, (
+            f"one failure must produce ONE annotation, got {len(annotations)}"
+        )
+        line = annotations[0]
+        # ⛔ ASSERT THE PROPERTY, NOT THE OLD PROXY. This used to read
+        # `"forged" not in ln.split("::")[1]`, which worked only because a RAW '::'
+        # split the line into pieces. Now that ':' is escaped, the forged text sits
+        # inert inside the title and that proxy fires on CORRECT behaviour. What
+        # actually matters is that no second command is emitted and that the caller's
+        # '::' cannot escape the property it was placed in.
+        assert "::error title=forged" not in line, "caller input started its own workflow command"
+        assert "%3A%3A" in line, (
+            "the caller's '::' was left raw inside a command property, so it truncates "
+            "the property list instead of being carried as text"
+        )
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_a_percent_escape_cannot_smuggle_a_newline_past_the_flattener(self, tmp_path):
+        """⛔ `tr -d` SEES LITERAL CONTROL CHARACTERS; THE RUNNER DECODES ESCAPES.
+
+        A caller who sends the four ordinary text characters `%0A` walks through the
+        flattener untouched — there is no control character there to delete — and an
+        unescaped `%` then leaves the runner free to decode them back into a newline
+        when it reads the property. Same for `::`, which truncates the property list,
+        and `,`, which appends a property (`file=...` re-points the annotation at a
+        file of the caller's choosing). (Reported by Copilot on #253.)
+
+        ⚠ The stdout-line assertions in the sibling test above cannot express this:
+        `%0A` produces ONE line either way, so `len(annotations) == 1` stays true with
+        the escaping removed. This asserts on the EMITTED ENCODING instead.
+        """
+        _run_preflight(
+            tmp_path,
+            "HTTP/2.0 404 Not Found",
+            rc=1,
+            org="evil%0A::error title=forged::x,file=/etc/passwd",
+        )
+        log = (tmp_path / "stdout.txt").read_text(encoding="utf-8")
+        annotations = [ln for ln in log.splitlines() if ln.startswith("::error")]
+        assert len(annotations) == 1, f"expected ONE annotation, got {len(annotations)}"
+        line = annotations[0]
+
+        assert "%250A" in line, (
+            "the '%' was left raw, so the runner decodes '%0A' into a newline inside "
+            "the annotation property"
+        )
+        assert ",file=" not in line, (
+            "an unescaped ',' injected a further command property — the annotation can "
+            "be re-pointed at an arbitrary file"
+        )
+        title = line.split("::", 2)[1]
+        assert "%3A%3A" in title, (
+            "an embedded '::' was left raw and truncates the property list early"
+        )
+        # ⛔ ORDERING PIN. Escaping ':' before '%' re-escapes the '%' in the '%3A' just
+        # written, so every value double-encodes and the annotation renders '%3A'
+        # instead of ':'. This fixture carries no literal '%3A', so the sequence can
+        # only appear if the sed expressions were reordered.
+        assert "%253A" not in line, (
+            "':' was escaped before '%': the '%' in '%3A' got escaped again, so every "
+            "value is double-encoded"
+        )
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_a_carriage_return_from_the_response_cannot_reach_the_annotation(self, tmp_path):
+        """⛔ CODE_TEXT's `tr -d` was the only guard on it, and nothing tested it.
+
+        Found by mutating `tr -d` off each variable in turn: TITLE is caught by the
+        test above, CLASS is two string literals and cannot be tainted at all, and
+        this one survived the ENTIRE file. Two guards over one value hid it — once ':'
+        is escaped, an injected '::' is neutralised whether or not the CR survived, so
+        only the variable where `tr -d` stands ALONE can fail for its own reason.
+
+        `CODE` is `awk 'NR==1 && $1 ~ /^HTTP/ {print $2}'` over the response. An awk
+        FIELD cannot span a newline — records are newline-delimited — so LF genuinely
+        cannot arrive here and no test could show it. `\r` is NOT a field separator,
+        so it can: a first line of `HTTP/2.0 403\rforged Forbidden` yields
+        CODE=`403\rforged`.
+
+        A lone CR does not end a line, so this is not command injection. It is log
+        SPOOFING — the CR returns the cursor to column 0 and what follows overwrites
+        the rendered line. That is the other half of CWE-117 and the half that
+        survives once the newline path is closed.
+        """
+        _run_preflight(tmp_path, "HTTP/2.0 403\rforged Forbidden", rc=1)
+        # ⛔ newline="" AND split("\n"). TWO separate ways this fixture destroys the very
+        # character it exists to detect, and the first one is invisible:
+        #   - `read_text()` applies UNIVERSAL NEWLINE TRANSLATION, silently rewriting the
+        #     \r to \n before any assertion sees it. Measured: with the guard mutated
+        #     off, the CR still never reached the test — the fixture, not the workflow,
+        #     was cleaning the input.
+        #   - `splitlines()` then breaks on \r as well, consuming whatever survived.
+        # A test for a control character has to read bytes the way the runner would.
+        with open(tmp_path / "stdout.txt", encoding="utf-8", newline="") as fh:
+            log = fh.read()
+        annotations = [ln for ln in log.split("\n") if ln.startswith("::error")]
+        assert annotations, "the step emitted no annotation at all"
+        assert not any("\r" in ln for ln in annotations), (
+            "a CR from the HTTP response reached the annotation: it returns the cursor "
+            "to column 0, so following text overwrites what was rendered"
+        )
+
+
+# ── #260: the probes must exercise the verb the containers use ──────────
+
+
+def _verdict_script(tmp_path, response: str) -> tuple[str, str]:
+    """Run the verdict step's credential re-check with `gh` stubbed.
+
+    Extracted rather than run whole: the block lives inside a 501-line `run:`
+    scalar. The slice is delimited by the VERDICT_RESP capture and the
+    RUNNER_NEVER_REGISTERED line that follows the case, so a restructure that
+    moves either one fails here rather than silently testing nothing.
+    """
+
+    body = _step("Provision")["run"]
+    start = body.index("VERDICT_RESP=")
+    # Cut at the LINE boundary, not the substring: ending mid-`echo "..."` leaves
+    # an unterminated quote and bash dies at EOF with an empty output file — which
+    # a test asserting "X not in out" would read as PASSING. An extractor that
+    # produces a broken script fails the wrong way round.
+    end = body.rindex("\n", 0, body.index("failure_reason=RUNNER_NEVER_REGISTERED")) + 1
+    block = textwrap.dedent(body[start:end])
+    tail = 'echo "failure_reason=RUNNER_NEVER_REGISTERED" >> "$GITHUB_OUTPUT"\n'
+
+    out = tmp_path / "out.txt"
+    script = tmp_path / "verdict.sh"
+    script.write_text(
+        f'set -uo pipefail\nORG=testorg\nGITHUB_OUTPUT="{out}"\n: > "{out}"\n' + block + tail,
+        encoding="utf-8",
+    )
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "gh").write_text(
+        '#!/usr/bin/env bash\nprintf "%s\\n" "$FAKE_RESP"\nexit "$FAKE_RC"\n', encoding="utf-8"
+    )
+    (fake / "gh").chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{fake}{os.pathsep}{os.environ['PATH']}",
+        "FAKE_RESP": response,
+        "FAKE_RC": "0" if response.split()[1:2] in (["200"], ["201"]) else "1",
+    }
+    proc = subprocess.run(["bash", "-e", str(script)], env=env, capture_output=True, check=False)
+    combined = (proc.stdout + proc.stderr).decode()
+    # ⛔ VACUITY GUARD. Every test here asserts a reason is ABSENT, and absence is
+    # what a broken extractor produces: a slice ending mid-`echo "..."` leaves an
+    # unterminated quote, bash dies at EOF, and the output file is empty — so
+    # `"RUNNER_NEVER_REGISTERED" not in out` passes while proving nothing. Measured:
+    # that is exactly what happened on the first cut of this harness.
+    assert "unexpected EOF" not in combined, f"the extracted block is not valid bash:\n{combined}"
+    # ⛔ CONTENT, not existence. `out.exists()` was ALWAYS true: the generated script
+    # runs `: > "$out"` on its 4th line, before the extracted block, so the file is
+    # created on every invocation. `combined.strip() or out.exists()` was therefore
+    # `<anything> or True` — a guard that could not fail on any input ever given to it.
+    #
+    # ⚠ AND IT PROTECTS NOTHING TODAY. Measured, not assumed. The comment this replaces
+    # asserted "Every test here asserts a reason is ABSENT"; that is false. All six
+    # callers also assert a PRESENCE — "runner_deny" in log, RUNNER_PAT_INVALID in out,
+    # RUNNER_NEVER_REGISTERED in out, INDETERMINATE in out (x2), "no status" in log —
+    # and a presence assertion already fails on empty output. Mutating the extractor to
+    # emit nothing turns all six red with this line or without it.
+    #
+    # So this is a net for a caller that does not exist yet: an absence-ONLY one, which
+    # the false premise above claims is the normal case here. Worth keeping correct
+    # rather than deleting, because a guard that cannot fire advertises a protection
+    # nothing provides — but do not credit it with catching anything that ships today.
+    #
+    # (Reported by Copilot on #253. See line 1257: the anti-vacuity harness for
+    # runner-teardown was itself vacuous as well, for an unrelated reason. Twice.)
+    produced = out.read_text(encoding="utf-8") if out.exists() else ""
+    assert combined.strip() or produced.strip(), "the verdict block produced no output at all"
+    return (produced, combined)
+
+
+class TestBothProbesUseTheWriteVerb:
+    """⛔ THE PREFLIGHT TESTED A READ; EVERY CONTAINER DOES A WRITE.
+
+    `gh api orgs/{org}/actions/runners` is a GET — it proves the PAT can LIST
+    runners. Each container gets `ACCESS_TOKEN=${GH_RUNNER_PAT}` and the image
+    exchanges it via POST .../actions/runners/registration-token, once per
+    replica because of `count: ${POOL_SIZE}`. So a PAT with read but not write
+    passed the gate and 403'd in all N replicas — the exact failure the gate
+    exists to prevent (#260).
+    """
+
+    def test_both_sites_post_a_registration_token(self):
+        preflight = _step("PAT must still be valid")["run"]
+        provision = _step("Provision")["run"]
+        for label, body in (("preflight", preflight), ("verdict", provision)):
+            assert "actions/runners/registration-token" in body, f"{label} still reads"
+            assert "--method POST" in body, f"{label} is not using the write verb"
+
+    def test_the_preflight_no_longer_probes_with_a_bare_list_read(self):
+        body = _step("PAT must still be valid")["run"]
+        assert "actions/runners?per_page=1" not in body, (
+            "a GET proves only that the PAT can LIST runners; the workload mints"
+        )
+
+
+class TestTheVerdictDoesNotBlameAProviderForOurCredential:
+    """⛔ THE MORE SERIOUS SITE. This step decides whether to accuse a PROVIDER.
+
+    Its own 401 text already said the container "mints its registration token
+    with this same credential" — it NAMED the write path while testing a read.
+    So a PAT that could list but not mint returned 200 here, the check fell
+    through, and the run blamed a host that did nothing wrong.
+
+    A preflight failing a run is recoverable and self-evident. A fabricated
+    provider fault is somebody else's reputation, decided by a check that was
+    asking the wrong question.
+    """
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_a_write_403_does_NOT_produce_a_provider_verdict(self, tmp_path):
+        out, log = _verdict_script(tmp_path, "HTTP/2.0 403 Forbidden")
+        assert "failure_reason=RUNNER_NEVER_REGISTERED" not in out, (
+            "the credential was the fault and the run accused a provider"
+        )
+        assert "runner_deny" in log.lower()
+        assert "do not runner_deny" in log.lower(), (
+            "the operator must be told explicitly not to act on this"
+        )
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_a_write_401_does_NOT_produce_a_provider_verdict(self, tmp_path):
+        out, _log = _verdict_script(tmp_path, "HTTP/2.0 401 Unauthorized")
+        assert "failure_reason=RUNNER_PAT_INVALID" in out
+        assert "failure_reason=RUNNER_NEVER_REGISTERED" not in out
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_201_is_success_so_a_healthy_credential_is_not_INDETERMINATE(self, tmp_path):
+        """⛔ 201, NOT 200. A successful mint is `201 Created`. Leaving the case
+        arm at 200 would send every HEALTHY credential to the `*)` arm and
+        report INDETERMINATE — 'the credential could not be re-checked' — on a
+        run where it was re-checked and was fine. That is not a safe default:
+        it converts a real provider fault into 'no evidence either way' and the
+        provider is never qualified."""
+
+        out, _log = _verdict_script(tmp_path, "HTTP/2.0 201 Created")
+        assert "failure_reason=INDETERMINATE" not in out
+        assert "failure_reason=RUNNER_NEVER_REGISTERED" in out, (
+            "with the credential proven healthy, the provider verdict must stand"
+        )
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_an_unreadable_check_still_refuses_to_accuse(self, tmp_path):
+        out, _log = _verdict_script(tmp_path, "dial tcp: i/o timeout")
+        assert "failure_reason=INDETERMINATE" in out
+        assert "failure_reason=RUNNER_NEVER_REGISTERED" not in out
+
+
+class TestTheVerdictCannotFabricateAStatus:
+    """⛔ A NON-HTTP FIRST LINE MUST NOT BECOME A STATUS CODE.
+
+    `awk 'NR==1{print $2}'` takes the second WORD of whatever the first line is.
+    A transport failure emits a plain error string, so `dial tcp: lookup ...
+    i/o timeout` yields `tcp:` — and that word then SELECTS A CASE ARM in the
+    step that decides whether to accuse a provider.
+
+    ⚠ It matters more here than at the preflight, which captures `|| RC=$?` and
+    branches on it. This capture ends `|| true`, so the status line is the ONLY
+    evidence — an unguarded parse is the whole input, not one input of two.
+    """
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    @pytest.mark.parametrize(
+        "junk",
+        [
+            "dial tcp: lookup api.github.com: i/o timeout",
+            "error: 403 something",
+            "gh: command failed",
+        ],
+    )
+    def test_a_non_http_first_line_reaches_no_accusatory_arm(self, tmp_path, junk):
+        out, log = _verdict_script(tmp_path, junk)
+        assert "failure_reason=INDETERMINATE" in out, (
+            f"{junk!r} was parsed into a status instead of being rejected"
+        )
+        assert "failure_reason=RUNNER_NEVER_REGISTERED" not in out
+        assert "do not runner_deny" in log.lower()
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_the_word_that_would_have_been_taken_is_not_reported_as_a_status(self, tmp_path):
+        """`error: 403 something` has `403` as its second word. Unguarded, that
+        selects the rate-limit arm and reports a status the server never sent —
+        a fabricated fact presented as a measurement."""
+
+        _out, log = _verdict_script(tmp_path, "error: 403 something")
+        assert "HTTP 403" not in log, "a status was invented from an error string"
+        assert "no status" in log.lower()
+
+
+# ⛔ AN ASSIGNMENT IS NOT A LINE. `re.match(r"\s*GONE=", ln)` — what this file used first —
+# is a text matcher pointed at shell: it MISSES `then GONE=no`, `cmd; GONE=no` and
+# `export GONE=no`, and it ACCEPTS `echo "GONE=yes"`, which assigns nothing. CodeRabbit
+# caught it on just-akash#308. It is the same instrument-shape error as a `head -6` that
+# made four build sites look like three, and a line scan that cannot see a multi-line
+# call: a text instrument aimed at a structured artefact. Match the assignment TOKEN —
+# at a command position, and never inside an echo/printf argument.
+_CMD_POS = r"(?:^|[;&|]|\b(?:then|do|else|elif|export|local|declare|readonly)\s+)\s*"
+
+
+def _assigns(var: str, text: str) -> list[str]:
+    """Lines of `text` that actually ASSIGN `var` (not merely mention it)."""
+    out = []
+    for ln in text.splitlines():
+        # ⚠ STOP AT THE COMMAND SEPARATOR. `\b(?:echo|printf)\b.*$` swallowed the rest of
+        # the line, so a REAL assignment after an echo — `echo hi; GONE=yes` — vanished
+        # with it, reintroducing the false negative this helper exists to remove.
+        stripped = re.sub(r"\b(?:echo|printf)\b[^;&|]*", "", ln)
+        if re.search(_CMD_POS + re.escape(var) + r"=", stripped):
+            out.append(ln)
+    return out
+
+
+def test_the_verification_settles_before_it_calls_a_lease_open():
+    from tests.test_verify_closed_cli import (
+        test_cli_subprocess_active_first_then_closed_closes_via_retry,
+    )
+
+    test_cli_subprocess_active_first_then_closed_closes_via_retry()
+
+
+def test_the_teardown_error_does_not_assert_a_count_it_never_made():
+    code = _code(TD_CLOSE["run"])
+    err = next(ln for ln in code.splitlines() if "::error title=Could not VERIFY" in ln)
+    assert "after 3 destroy attempts" not in err
+    assert "$REASON" in err and "$VERIFY_RC" in err
+
+
+def test_the_read_loops_observation_survives_to_the_classifier(tmp_path):
+    from tests.test_runner_teardown_shell_probes import test_real_close_step
+
+    test_real_close_step(tmp_path, "verifier_true_nonzero")

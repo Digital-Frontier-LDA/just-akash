@@ -10,7 +10,8 @@
 #         tag-prefix:     ci-myrepo
 #         runner-label:   fast-pool-${{ github.run_id }}
 #         github-org:     my-org
-#         wallet-address: ${{ needs.pool.outputs.wallet_address }}   # optional audit data
+#         wallet-address: ${{ needs.pool.outputs.wallet_address }}   # create-time owner candidate
+#         deployment-group: ${{ needs.pool.outputs.deployment_group }} # final group_spec.name
 #       secrets:
 #         AKASH_API_KEY:  ${{ secrets.AKASH_API_KEY }}
 #         AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}              # only with a pool
@@ -29,10 +30,10 @@
 #    job; it does nothing for one that registered and was never used.
 #
 # ── WHY IT VERIFIES INSTEAD OF TRUSTING THE EXIT CODE ───────────────────────────
-# "Deployment closed" on stderr with a non-zero exit is a SUCCESS, and a zero exit is
-# not proof the lease is gone. This reads the deployment's state back and reports
-# `closed` on that, because a teardown that reports success it did not achieve is how
-# leases accumulate silently for weeks.
+# Neither destroy text nor its exit code proves closure. Two distinct chain hosts
+# must agree on the complete owner-scoped lease population, with every lease terminal,
+# and positively read both deployment and escrow closed.
+# Unreadable, empty, partial, active, or disagreeing populations remain unverified.
 name: Akash runner teardown
 
 on:
@@ -57,7 +58,25 @@ on:
         default: 'Digital-Frontier-LDA/just-akash'
         type: string
       dseq:
-        description: 'Deployment to close. Empty is a no-op, not an error.'
+        description: >-
+          Deployment to close. Empty is a no-op only with an authoritative
+          no-deployment outcome; an unknown create outcome is HELD.
+        required: false
+        type: string
+        default: ''
+      deployment-outcome:
+        description: >-
+          Create-side effect classification. Pass unknown when a create request may have
+          committed without returning an identity; teardown then fails HELD instead of
+          reporting a clean no-op. Defaults to no-deployment for legacy explicit no-op calls.
+        required: false
+        type: string
+        default: 'no-deployment'
+      create-ambiguous:
+        description: >-
+          'true' when a later create may have committed without returning an identity.
+          The known dseq is still closed and proven, then the job fails HELD with
+          CREATE_OUTCOME_AMBIGUOUS, because a second deployment may exist.
         required: false
         type: string
         default: ''
@@ -73,14 +92,33 @@ on:
         required: false
         type: string
         default: ''
+      runner-ids:
+        description: >-
+          JSON array of exact runner IDs created by the pool. When present, teardown
+          removes these identities regardless of transient status; an empty array uses
+          the operation-label fallback and holds online or busy runners.
+        required: false
+        type: string
+        default: '[]'
       github-org:
         required: false
         type: string
         default: ''
       wallet-address:
         description: >-
-          Deprecated compatibility/audit input. just-akash now locates the DSEQ owner by
-          positive read-back across the configured wallet pool before destroying it.
+          Create-time owner candidate emitted by runner-pool. When present, teardown
+          requires both a configured Console credential that reports this exact owner
+          and a complete exact owner/DSEQ chain read before destroying. Empty preserves
+          the legacy Console deployment-read path for older callers.
+        required: false
+        type: string
+        default: ''
+      deployment-group:
+        description: >-
+          Final submitted group_spec.name emitted by runner-pool. When present, teardown
+          accepts the owner/DSEQ chain identity only when its complete group population is
+          exactly this singleton. Valid only with wallet-address. Empty preserves the legacy
+          owner-bound check for older callers.
         required: false
         type: string
         default: ''
@@ -99,6 +137,19 @@ on:
       closed:
         description: "'true' only when the lease was READ BACK as closed."
         value: ${{ jobs.teardown.outputs.closed }}
+      held_reason:
+        description: >-
+          Non-empty when the close was HELD without closure authority, so the lease may
+          still be live and holding escrow. OWNER_UNKNOWN: the pool published a DSEQ
+          and group with no create-time owner, and no exhaustive owner registry exists
+          to recover one. The job fails; held_dseq and held_deployment_group locate it.
+        value: ${{ jobs.teardown.outputs.held_reason }}
+      held_dseq:
+        description: 'The exact DSEQ of a HELD lease; empty unless held_reason is set.'
+        value: ${{ jobs.teardown.outputs.held_dseq }}
+      held_deployment_group:
+        description: 'The expected group of a HELD lease; empty unless held_reason is set.'
+        value: ${{ jobs.teardown.outputs.held_deployment_group }}
       deregistered:
         description: 'Offline runner registrations removed.'
         value: ${{ jobs.teardown.outputs.deregistered }}
@@ -120,8 +171,16 @@ jobs:
   teardown:
     name: Close lease and de-register runners
     runs-on: ubuntu-latest
+    # ⛔ MUST EXCEED the owner-lookup deadline + close/audit margin (see
+    # just_akash/owner_lookup.py: 10 + 4 = 14 min at the time of writing), pinned by
+    # tests/test_owner_lookup_deadline.py. A job killed mid-cleanup by its own
+    # timeout is the failure #370 exists to prevent.
+    timeout-minutes: 30
     outputs:
       closed: ${{ steps.close.outputs.closed }}
+      held_reason: ${{ steps.close.outputs.held_reason }}
+      held_dseq: ${{ steps.close.outputs.held_dseq }}
+      held_deployment_group: ${{ steps.close.outputs.held_deployment_group }}
       deregistered: ${{ steps.dereg.outputs.deregistered }}
       deregister_failed: ${{ steps.dereg.outputs.deregister_failed }}
     defaults:
@@ -147,6 +206,10 @@ jobs:
           AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
           AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}
           DSEQ: ${{ inputs.dseq }}
+          WALLET_ADDRESS: ${{ inputs.wallet-address }}
+          DEPLOYMENT_GROUP: ${{ inputs.deployment-group }}
+          DEPLOYMENT_OUTCOME: ${{ inputs.deployment-outcome }}
+          CREATE_AMBIGUOUS: ${{ inputs.create-ambiguous }}
           TAG_PREFIX: ${{ inputs.tag-prefix }}
         run: |
           set -uo pipefail
@@ -154,11 +217,38 @@ jobs:
           # An ARRAY: the command is multiple words, so a quoted string breaks it and an
           # unquoted one is SC2086.
           JA=(uv run --with . just-akash)
+          # ⛔ ONE lookup budget for the WHOLE STEP (#378): every resolve-owner/destroy in
+          # this step — including each retry — shares this absolute ceiling (epoch
+          # seconds); just-akash honours it as min(own budget, ceiling).
+          export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
+
+
+          if [ -z "${DSEQ}" ] && { [ "${DEPLOYMENT_OUTCOME:-unknown}" != "no-deployment" ] || [ "${CREATE_AMBIGUOUS:-}" = "true" ]; }; then
+            HELD_GROUP=""
+            [[ "${DEPLOYMENT_GROUP:-}" =~ ^[A-Za-z0-9._-]+$ ]] && HELD_GROUP="$DEPLOYMENT_GROUP"
+            {
+              echo "closed=unknown"
+              echo "held_reason=CREATE_OUTCOME_AMBIGUOUS"
+              echo "held_dseq="
+              echo "held_deployment_group=$HELD_GROUP"
+            } >> "$GITHUB_OUTPUT"
+            echo "::error title=HELD: create outcome ambiguous, no teardown identity::The create request may have committed but returned no DSEQ. Nothing can be closed automatically; reconcile the create receipt or owner-scoped chain population before another create. group=${HELD_GROUP:-<unknown>}"
+            exit 1
+          fi
 
           if [ -z "${DSEQ}" ]; then
             echo "closed=noop" >> "$GITHUB_OUTPUT"
             echo "no dseq supplied — the pool never took a lease, nothing to close"
             exit 0
+          fi
+
+          # DSEQ is a workflow input and is later interpolated into GitHub
+          # workflow-command annotations. Accept only the canonical decimal
+          # representation so control characters cannot inject a command.
+          if [[ ! "${DSEQ}" =~ ^[0-9]+$ ]]; then
+            echo "::error title=Invalid DSEQ::dseq must contain digits only"
+            echo "closed=unknown" >> "$GITHUB_OUTPUT"
+            exit 1
           fi
 
           # DSEQ ownership is resolved inside just-akash. It positively reads the
@@ -189,45 +279,189 @@ jobs:
           # and it cannot have one for the same reason. So the sweeper for leaked pools is
           # OPT-IN, not inference: `python -m just_akash.cleanup_stale --reap-runners`,
           # where the operator asserts the account hosts nothing but their own pools.
+          # ⛔ AN OWNER-LESS RECEIPT IS HELD, NEVER RESOLVED BY PROBING (#348). The
+          # destructive identity is the pair (owner, dseq); a DSEQ alone is not globally
+          # queryable and can collide across owners. Recovering the owner needs the
+          # complete registered owner population read through each independent chain
+          # observer with exactly one agreeing match (df-wiki ownership standard), and
+          # just-akash has no such registry. Trying configured accounts until one reads
+          # the DSEQ is forbidden: it can select a foreign owner. resolve-owner also
+          # refuses --expected-group without --expected-owner. So: no resolve, no
+          # destroy, a FAILED job, and outputs that locate the still-live lease.
+          if [ -z "${WALLET_ADDRESS:-}" ]; then
+            # The group is echoed into GITHUB_OUTPUT and an annotation, so only the
+            # canonical group-name shape is published (DSEQ is digits-only above).
+            HELD_GROUP=""
+            [[ "$DEPLOYMENT_GROUP" =~ ^[A-Za-z0-9._-]+$ ]] && HELD_GROUP="$DEPLOYMENT_GROUP"
+            {
+              echo "closed=unknown"
+              echo "held_reason=OWNER_UNKNOWN"
+              echo "held_dseq=$DSEQ"
+              echo "held_deployment_group=$HELD_GROUP"
+            } >> "$GITHUB_OUTPUT"
+            echo "::error title=HELD: lease owner unknown, no closure authority::dseq=$DSEQ group=${HELD_GROUP:-<non-canonical>} was published without its create-time owner. Nothing was resolved or closed; the lease may still be live and holding escrow. Recover the owner from the exhaustive owner registry (just-akash#351) or an operator, then close the exact (owner, dseq)."
+            exit 1
+          fi
+
           echo "closing dseq=$DSEQ (created by this run; tagged ${TAG_PREFIX}-*)"
 
+          # ⛔ RESOLVE OWNER BEFORE DESTROY. After destroy the Console API may
+          # 404 — the deployment is gone, the wallet pool read returns empty,
+          # and a verify-closed call that depends on resolving the owner at
+          # verify-time will fail precisely when it matters. Capture the
+          # positively-owning account now while the deployment still reads.
+          # ⛔ bash `-e` is the DEFAULT (set -uo pipefail does not disable it);
+          # an unguarded non-zero exit from resolve-owner would terminate the
+          # script BEFORE OWNER_RC is captured and BEFORE closed=unknown is
+          # written — the harness reproduces this as empty GITHUB_OUTPUT.
+          # `|| OWNER_RC=$?` makes the failure non-fatal so we can branch on
+          # it below. Same pattern applies to verify-closed below.
+          RESOLVE_ARGS=(--dseq "$DSEQ" --json)
+          if [ -n "${WALLET_ADDRESS:-}" ]; then
+            RESOLVE_ARGS+=(--expected-owner "$WALLET_ADDRESS")
+          fi
+          if [ -n "${DEPLOYMENT_GROUP:-}" ]; then
+            RESOLVE_ARGS+=(--expected-group "$DEPLOYMENT_GROUP")
+          fi
+          "${JA[@]}" resolve-owner "${RESOLVE_ARGS[@]}" >/tmp/owner.json 2>/tmp/owner.err || OWNER_RC=$?
+          OWNER_RC=${OWNER_RC:-0}
+          # ⛔ THE STDERR IS THE WHOLE DIAGNOSIS, AND IT USED TO BE THROWN AWAY.
+          # resolve-owner's stderr was captured to /tmp/owner.err on the line
+          # above and then read by NOTHING — the two failure branches below
+          # reported only the exit code. Six teardown failures across
+          # Borduas-Holdings/blazing on 2026-09-10 said exactly
+          # "resolve-owner exited 1" and nothing else, so whether the cause was
+          # a resolver bug, a wallet_pool multi-key case or an endpoint outage
+          # could not be told from any log — diagnosing it meant re-deriving by
+          # hand what this step had already been told.
+          #
+          # ⇒ An error that says a thing could not be done, while discarding the
+          # reason it could not, costs every future reader the same
+          # investigation. One line into the annotation, the full text into the
+          # step log.
+          #
+          # ⚠ Newlines are folded and the annotation excerpt is capped: `::error`
+          # is a SINGLE-LINE protocol, and a multi-line value silently truncates
+          # at the first newline — which would drop exactly the detail this adds.
+          OWNER_ERR=""
+          if [ -s /tmp/owner.err ]; then
+            OWNER_ERR=$(tr '\n' ' ' < /tmp/owner.err | cut -c1-400)
+          fi
+          if [ "$OWNER_RC" -ne 0 ]; then
+            echo "::error title=Could not resolve owner before destroy::dseq=$DSEQ — resolve-owner exited $OWNER_RC. Without a captured owner, closure verification cannot proceed safely after destroy. stderr: ${OWNER_ERR:-<empty>}"
+            echo "--- resolve-owner stderr (dseq=$DSEQ) ---" >&2
+            sed -e 's/^/    /' /tmp/owner.err >&2 || true
+            echo "closed=unknown" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          OWNER=$(python3 -c "import json,sys;print(json.load(sys.stdin).get('owner',''))" \
+                  </tmp/owner.json 2>/dev/null || echo "")
+          if [ -z "$OWNER" ]; then
+            # ⚠ EXIT 0 WITH NO OWNER IS THE QUIETER HALF OF THE SAME FAULT: the
+            # resolver succeeded and returned nothing usable, so there is no exit
+            # code to report and the stderr is the only evidence there is.
+            echo "::error title=No owner captured::dseq=$DSEQ — resolve-owner exited 0 but returned an empty owner. stderr: ${OWNER_ERR:-<empty>}"
+            echo "--- resolve-owner stderr (dseq=$DSEQ) ---" >&2
+            sed -e 's/^/    /' /tmp/owner.err >&2 || true
+            echo "closed=unknown" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "captured owner=$OWNER"
+
+          DESTROY_ARGS=(--dseq "$DSEQ" -y)
+          if [ -n "${WALLET_ADDRESS:-}" ]; then
+            DESTROY_ARGS+=(--expected-owner "$OWNER")
+          fi
+          if [ -n "${DEPLOYMENT_GROUP:-}" ]; then
+            DESTROY_ARGS+=(--expected-group "$DEPLOYMENT_GROUP")
+          fi
+
+          # ⛔ THE RETRY BUDGET WAS ON THE WRONG OPERATION. This loop retries the
+          # DESTROY three times; the verification below used to get exactly one
+          # immediate read. On blazing#920 (run 34138613280) destroy SUCCEEDED on
+          # attempt 1 — it printed "Deployment 1788795018717 destroyed." — and the
+          # read ~4s later still returned 'active', so the step failed with "Lease
+          # may still be OPEN and holding escrow". The lease was closed: the stale
+          # sweep 26 minutes later enumerated every live deployment and that dseq was
+          # not among them. The close was accepted and had not yet propagated. It is
+          # the OBSERVATION that needed patience, not the action.
+          DESTROY_TRIES=0
+          # ⛔ FRESH ceiling for THIS close window (#378 repair): resolve-owner above
+          # spent wall time against the step-start ceiling; the destroy retries get
+          # their own, so the window never inherits a stale one.
+          export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
           for _try in 1 2 3; do
-            "${JA[@]}" destroy --dseq "$DSEQ" -y 2>&1 | tee /tmp/destroy.log && break
+            DESTROY_TRIES=$_try
+            DESTROY_RC=0
+            "${JA[@]}" destroy "${DESTROY_ARGS[@]}" 2>&1 | tee /tmp/destroy.log || DESTROY_RC=${PIPESTATUS[0]}
+            # ⛔ 75 = OWNER_LOOKUP_UNREACHABLE (owner_lookup.OWNER_LOOKUP_UNREACHABLE_EXIT_CODE):
+            # the step's shared lookup budget is exhausted — retrying re-spends a dead budget.
+            [ "$DESTROY_RC" -eq 75 ] && break
+            [ "$DESTROY_RC" -eq 0 ] && break
             # A non-zero exit whose output says the deployment is already closed IS a
             # success. Treating it as a failure sends the next reader looking for an
             # outage that never happened.
-            grep -qiE "Deployment closed|already closed|not found" /tmp/destroy.log && break
+            # ⛔ Match just-akash's CONTRACT strings only — "Deployment closed" and
+            # "already closed". "not found" is a generic substring that false-greens on
+            # any error message containing those words ("credentials file not found",
+            # missing config file, etc.) and would exit this loop on a destroy that
+            # never actually closed the lease.
+            grep -qiE "Deployment closed|already closed" /tmp/destroy.log && break
             sleep 5
           done
 
-          # Verify rather than trust: read the state back.
-          STATE=$("${JA[@]}" status --dseq "$DSEQ" --json 2>/dev/null \
-                  | python3 -c "import json,sys;print((json.load(sys.stdin) or {}).get('state',''))" 2>/dev/null || true)
-          # "" means we could NOT READ the state — a transient API error, a non-zero
-          # exit, unparseable JSON. Reporting closed=true on that is the exact failure
-          # this step exists to prevent: a success we did not achieve, with the lease
-          # still holding escrow. Only a deployment the destroy said is GONE may pass on
-          # an empty read.
-          GONE=no
-          grep -qiE "already closed|not found" /tmp/destroy.log 2>/dev/null && GONE=yes
-          case "$STATE" in
-            closed)
-              echo "closed=true" >> "$GITHUB_OUTPUT"
-              echo "lease $DSEQ confirmed closed" ;;
-            "")
-              if [ "$GONE" = yes ]; then
-                echo "closed=true" >> "$GITHUB_OUTPUT"
-                echo "lease $DSEQ no longer exists — treating as closed"
-              else
-                echo "closed=unknown" >> "$GITHUB_OUTPUT"
-                echo "::error title=Could not VERIFY the lease is closed::dseq=$DSEQ — the destroy ran but the state read back empty, so this is 'unverified', not 'closed'. If it is still open it holds escrow against the grant the next run spends from. Check: just-akash status --dseq $DSEQ"
-                exit 1
-              fi ;;
-            *)
-              echo "closed=false" >> "$GITHUB_OUTPUT"
-              echo "::error title=Lease may still be OPEN and holding escrow::dseq=$DSEQ reads state='$STATE' after 3 destroy attempts. It will keep escrow locked against the grant the next run spends from, so the next run's funding failure will look like a market outage. Close it manually: just-akash destroy --dseq $DSEQ -y"
-              exit 1 ;;
-          esac
+          # ⛔ CLOSURE PROOF MUST COME FROM TWO-ENDPOINT CHAIN AGREEMENT, NOT FROM
+          # THIS STEP'S OWN OBSERVATIONS. A single Console API read, a destroy text
+          # match, or a partial read can all read as success over an OPEN lease (the
+          # exact failure #952 reproduced 2026-09-09: Console GET 404 with the chain
+          # still showing state=active). The verify-closed subcommand paginates the
+          # owner/dseq intersection from two distinct HTTPS chain origins and only
+          # returns closed=true when BOTH return the SAME complete identity map and
+          # every entry's state is terminal. The owner is the one captured by
+          # resolve-owner BEFORE destroy, so a Console 404 at verify-time does not
+          # blind the verifier.
+          # ⛔ `|| VERIFY_RC=$?` so a verify-closed exit 1 does not abort the
+          # script under bash `-e` (set -uo pipefail does not disable -e).
+          # Without this, a non-zero exit skips VERIFY_RC capture and the
+          # closed=unknown branch below — reproducing the empty-GITHUB_OUTPUT
+          # failure mode the harness exercises.
+          "${JA[@]}" verify-closed --dseq "$DSEQ" --owner "$OWNER" --json \
+            >/tmp/verify.json 2>/tmp/verify.err || VERIFY_RC=$?
+          VERIFY_RC=${VERIFY_RC:-0}
+          # ⛔ Typed check: only Python's literal True counts as "closed". The
+          # JSON `closed: true` is a Python True; the JSON `closed: false` is
+          # a Python False; anything else (None, missing, string) is unknown.
+          # Using `is True` here — and echoing `True`/`False` to bash — means
+          # a future JSON shape like `closed: "True"` (string) cannot pass.
+          VERDICT=$(python3 -c "import json,sys;print(json.load(sys.stdin).get('closed') is True)" \
+                    </tmp/verify.json 2>/dev/null || echo "False")
+          REASON=$(python3 -c "import json,sys;print(json.load(sys.stdin).get('reason',''))" \
+                   </tmp/verify.json 2>/dev/null || echo "")
+          echo "verify: destroy attempts=$DESTROY_TRIES, chain verdict=$VERDICT reason=$REASON"
+          # ⛔ BOTH the typed closed=True AND a zero exit are required. stdout True
+          # alone must not override a non-zero exit.
+          if [ "$VERIFY_RC" -eq 0 ] && [ "$VERDICT" = "True" ]; then
+            echo "closed=true" >> "$GITHUB_OUTPUT"
+            echo "lease $DSEQ closed; verifier returned terminal states across two endpoints"
+            # ⛔ THE KNOWN LEASE IS CLOSED, BUT A LATER CREATE MAY HAVE LANDED (#348).
+            # Closing the last known dseq cannot prove there is no second deployment, so
+            # an ambiguous create still fails HELD rather than reporting a clean close.
+            if [ "${CREATE_AMBIGUOUS:-}" = "true" ]; then
+              HELD_GROUP=""
+              [[ "${DEPLOYMENT_GROUP:-}" =~ ^[A-Za-z0-9._-]+$ ]] && HELD_GROUP="$DEPLOYMENT_GROUP"
+              {
+                echo "held_reason=CREATE_OUTCOME_AMBIGUOUS"
+                echo "held_dseq="
+                echo "held_deployment_group=$HELD_GROUP"
+              } >> "$GITHUB_OUTPUT"
+              echo "::error title=HELD: a later create outcome is ambiguous::Known lease $DSEQ is closed and proven, but a later create may have committed without returning a DSEQ. Reconcile the create receipt or the owner-scoped chain population before another create. group=${HELD_GROUP:-<unknown>}"
+              exit 1
+            fi
+            exit 0
+          fi
+          echo "closed=unknown" >> "$GITHUB_OUTPUT"
+          echo "::error title=Could not VERIFY the lease is closed::dseq=$DSEQ verifier said '$REASON' (rc=$VERIFY_RC). The destroy ran but the chain did not agree on a terminal state across two endpoints. If it is still open it holds escrow against the grant the next run spends from. Check: just-akash verify-closed --dseq $DSEQ --owner $OWNER"
+          exit 1
 
       # Separate step, and always: the registration outlives the pod, so it must be
       # cleaned even when the lease close failed.
@@ -239,6 +473,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_RUNNER_PAT }}
           ORG: ${{ inputs.github-org }}
           RUNNER_LABEL: ${{ inputs.runner-label }}
+          RUNNER_IDS_JSON: ${{ inputs.runner-ids }}
         run: |
           set -uo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
@@ -266,17 +501,46 @@ jobs:
           # the filter lets a `"` or `\` build an invalid jq program whose non-zero exit
           # this step now (correctly) reads as an unreadable listing — turning a bad
           # input into "the API is down". See the same note in runner-pool.yml.
-          IDS=$(gh api --paginate "orgs/${ORG}/actions/runners?per_page=100" 2>/tmp/gh-dereg.err \
-                | jq -r --arg L "$RUNNER_LABEL" \
-                  '.runners[] | select(.status=="offline") | select(any(.labels[].name; .==$L)) | .id')
-          GH_RC=$?
-          if [ "$GH_RC" -ne 0 ]; then
-            {
-              echo "deregistered=unmeasured"
-              echo "deregister_failed=unmeasured"
-            } >> "$GITHUB_OUTPUT"
-            echo "::warning title=Could not read the runner listing — de-registration did NOT run::gh rc=${GH_RC}: $(tail -1 /tmp/gh-dereg.err 2>/dev/null). Offline registrations for ${RUNNER_LABEL} are still in the org, and every pool's poll pages through them. Re-run this teardown once the API budget recovers."
-            exit 0
+          if [ -n "${RUNNER_IDS_JSON:-}" ] && [ "$RUNNER_IDS_JSON" != "[]" ]; then
+            IDS_RC=0
+            IDS=$(printf '%s' "$RUNNER_IDS_JSON" | jq -er \
+              'if type=="array" and length>0 and all(.[]; type=="number" and .>0 and floor==.) and (unique|length)==length then .[] else error("invalid exact runner ids") end') || IDS_RC=$?
+            VERIFIED_IDS=''
+            if [ "$IDS_RC" -eq 0 ]; then
+              for id in $IDS; do
+                RUNNER_RC=0
+                RUNNER=$(gh api "orgs/${ORG}/actions/runners/${id}" 2>/tmp/gh-dereg.err) || RUNNER_RC=$?
+                if [ "$RUNNER_RC" -ne 0 ] || ! printf '%s' "$RUNNER" | jq -e \
+                    --argjson ID "$id" --arg L "$RUNNER_LABEL" \
+                    '.id==$ID and (.name|type=="string" and startswith("just-akash-")) and any(.labels[].name; .==$L) and any(.labels[].name; .=="self-hosted") and any(.labels[].name; .=="akash")' >/dev/null; then
+                  IDS_RC=1
+                  break
+                fi
+                VERIFIED_IDS="${VERIFIED_IDS}${id}\n"
+              done
+            fi
+            if [ "$IDS_RC" -ne 0 ]; then
+              {
+                echo "deregistered=0"
+                echo "deregister_failed=unmeasured"
+              } >> "$GITHUB_OUTPUT"
+              echo "::warning title=Exact runner identity could not be bound — de-registration did NOT run::Every requested ID must read back with the exact operation label plus self-hosted and akash labels. No runner was deleted. $(tail -1 /tmp/gh-dereg.err 2>/dev/null)"
+              exit 0
+            fi
+            IDS=$(printf '%b' "$VERIFIED_IDS")
+          else
+            IDS=$(gh api --paginate "orgs/${ORG}/actions/runners?per_page=100" 2>/tmp/gh-dereg.err \
+                  | jq -r --arg L "$RUNNER_LABEL" \
+                    '.runners[] | select(.status=="offline") | select(.busy==false) | select(any(.labels[].name; .==$L)) | .id')
+            GH_RC=$?
+            if [ "$GH_RC" -ne 0 ]; then
+              {
+                echo "deregistered=unmeasured"
+                echo "deregister_failed=unmeasured"
+              } >> "$GITHUB_OUTPUT"
+              echo "::warning title=Could not read the runner listing — de-registration did NOT run::gh rc=${GH_RC}: $(tail -1 /tmp/gh-dereg.err 2>/dev/null). Offline registrations for ${RUNNER_LABEL} are still in the org, and every pool's poll pages through them. Re-run this teardown once the API budget recovers."
+              exit 0
+            fi
           fi
 
           # A DELETE costs 5 points against GitHub's 900-points-per-minute secondary

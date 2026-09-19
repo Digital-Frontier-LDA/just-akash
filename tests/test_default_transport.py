@@ -20,9 +20,11 @@ def _mock_client(dseq="99999"):
     """Return a mock AkashConsoleAPI with lease data (lease-shell available)."""
     client = MagicMock()
     client.api_key = fake_api_key()
-    client.list_deployments.return_value = [{"deployment": {"dseq": dseq, "state": "active"}}]
+    client.list_deployments.return_value = [
+        {"deployment": {"id": {"dseq": dseq}, "state": "active"}}
+    ]
     client.get_deployment.return_value = {
-        "deployment": {"dseq": dseq, "state": "active"},
+        "deployment": {"id": {"dseq": dseq}, "state": "active"},
         "leases": [
             {
                 "provider": {
@@ -39,9 +41,11 @@ def _mock_client_no_lease(dseq="99999"):
     """Return a mock client whose deployment has NO active lease (fallback trigger)."""
     client = MagicMock()
     client.api_key = fake_api_key()
-    client.list_deployments.return_value = [{"deployment": {"dseq": dseq, "state": "active"}}]
+    client.list_deployments.return_value = [
+        {"deployment": {"id": {"dseq": dseq}, "state": "active"}}
+    ]
     client.get_deployment.return_value = {
-        "deployment": {"dseq": dseq, "state": "active"},
+        "deployment": {"id": {"dseq": dseq}, "state": "active"},
         "leases": [],  # No lease → validate() returns False
     }
     return client

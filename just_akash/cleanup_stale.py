@@ -9,6 +9,10 @@ smoke's sweep only reaps service-set ``{probe}`` deployments; e2e leftovers
 (service ``backtest``) and older leaks accumulate with no reaper. This is that
 reaper, as an on-demand maintenance command.
 
+Service/age classification finds candidates only. Every close additionally requires
+an explicit ownership register, agreeing all-group chain identity and fresh same-attempt
+completed CI run evidence. Legacy/unclassified, staging and production remain HELD.
+
 Classification is deliberately conservative — close ONLY what is unambiguously
 disposable test residue; when in doubt, leave it and say so:
 
@@ -43,11 +47,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
+from dataclasses import dataclass
 
-from . import chain
+from . import _lease_verification, chain, cleanup_identity
 from .api import AkashConsoleAPI, _extract_dseq, escrow_locked
 from .provenance import PLACEMENT_PREFIX
 from .smoke_providers import (
@@ -56,6 +62,9 @@ from .smoke_providers import (
     _deployment_service_names,
     _probe_age_seconds,
 )
+from .wallet_pool import configured_api_keys
+
+CleanupIntent = cleanup_identity.CleanupIntent
 
 # e2e (test_shell_e2e / test_secrets_e2e / smoke SSH checks) deploys the
 # cpu-backtest-ssh SDL, whose sole service is `backtest`, and destroys it
@@ -96,6 +105,67 @@ STALE_OWNED_AGE_SECONDS = 48 * 3600
 RUNNER_SERVICE = "runner"
 STALE_RUNNER_AGE_SECONDS = 6 * 3600
 
+# ── EXECUTE-PATH RAILS (#250) ────────────────────────────────────────────
+#
+# These bind ONLY when --execute is passed. A dry run reports whatever it finds;
+# the rails exist because closing is irreversible and spends escrow on a shared
+# wallet. Every one of them REFUSES LOUDLY and exits non-zero — a rail that
+# declines quietly reproduces the exact defect #250 is about, where a green run
+# and a run that did nothing are indistinguishable.
+
+# Bounded blast radius. If more than this is closable, close the OLDEST
+# MAX_CLOSE_PER_RUN and say plainly that the run stopped short, so the operator
+# sees progress AND sees that it is incomplete. Sized above a normal day's
+# residue (the observed range over 56 scheduled runs is 0-55) and far below the
+# whole active set, so a classification fault cannot drain the account in one
+# pass while a genuine backlog still drains over a few runs.
+MAX_CLOSE_PER_RUN = 25
+
+# Tripwire on the SHAPE of the verdict table rather than on any single row. On
+# 2026-09-04 the split was 55 stale of 154 audited = 36%. A classification bug
+# that made everything look closable would spike this fraction, and the right
+# response to "suddenly almost everything is garbage" is to stop and be looked
+# at, not to act on it faster.
+MAX_STALE_FRACTION = 0.75
+
+# ...but ONLY once there is enough population for a fraction to mean anything.
+# Caught by the existing suite: a fixture with two deployments, both genuinely
+# stale, is 100% — and refusing there is simply wrong. A small account whose
+# every deployment IS test residue is the normal case, not the alarming one, so
+# an unguarded fraction rail would deadlock exactly the accounts it should be
+# draining. The tripwire is a signal about a POPULATION; below this it has no
+# population to be a signal about.
+MIN_AUDITED_FOR_FRACTION_RAIL = 20
+
+# Every verdict classify() can return. The execute path REFUSES on anything not
+# in this set: an unrecognised verdict means the classifier has learned a
+# category this reaper has never been taught to reason about, and closing on a
+# label you do not understand is how a reaper starts closing the wrong thing.
+# Pinned against the source by tests/test_cleanup_stale_rails.py so adding a
+# verdict without updating this fails the suite rather than the fleet.
+KNOWN_VERDICTS = frozenset(
+    {
+        "STALE-probe",
+        "STALE-e2e",
+        "STALE-runner",
+        "STALE-owned",
+        "STALE-provider-closed",
+        "LEAVE-not-ours",
+        "LEAVE-not-ours-provider-closed",
+        "LEAVE-real-or-unknown",
+        "LEAVE-recent-backtest",
+        "LEAVE-recent-owned",
+        "LEAVE-recent-runner",
+        "LEAVE-unclassifiable",
+        "LEAVE-unverified-owned",
+        "LEAVE-unverified-provider-closed",
+        "LEAVE-unverified-runner",
+        "LEAVE-young-or-unaged-probe",
+        "LEAVE-young-or-unaged-provider-closed",
+    }
+)
+
+
 STALE_VERDICTS = (
     "STALE-probe",
     "STALE-e2e",
@@ -103,6 +173,14 @@ STALE_VERDICTS = (
     "STALE-owned",
     "STALE-provider-closed",
 )
+
+_INTENT_BY_VERDICT = {
+    "STALE-probe": CleanupIntent.PROBE,
+    "STALE-e2e": CleanupIntent.BACKTEST,
+    "STALE-runner": CleanupIntent.RUNNER,
+    "STALE-owned": CleanupIntent.OWNED_CI,
+    "STALE-provider-closed": CleanupIntent.PROVIDER_CLOSED_CI,
+}
 
 
 # ⛔ DEPLOYMENTS THAT MUST NEVER BE CLOSED, WHATEVER THE CLASSIFIER SAYS.
@@ -132,13 +210,21 @@ PROTECTED_DSEQS = frozenset(
 )
 
 
-def _wants_owned_provenance(detail: dict, dseq: str, now: float | None = None) -> bool:
-    """True when `classify`'s reap_owned branch would actually consult ``group_names``.
+def _all_groups_owned(group_names: list[str] | None, placement_prefix: str) -> bool:
+    """True only for a nonempty, wholly readable, wholly owned population."""
 
-    ⛔ MIRRORS classify's EARLY RETURNS and must be kept in step with them. {probe},
-    {backtest} and {runner} return before the reap_owned branch, so reading their
-    provenance spends a chain round-trip on a value nothing looks at.
-    `test_provenance_is_skipped_where_classify_ignores_it` pins the pairing.
+    return bool(group_names) and all(
+        isinstance(name, str) and bool(name) and name.startswith(placement_prefix)
+        for name in group_names or []
+    )
+
+
+def _wants_owned_provenance(detail: dict, dseq: str, now: float | None = None) -> bool:
+    """True when `classify`'s reap_owned branch would consult group identity.
+
+    Probe, backtest and runner are only candidate selectors here.  They still
+    require the independent typed cleanup policy before any close, but their
+    service/age classifier does not consume the names itself.
 
     The EMPTY set is judged by the reap_owned branch too (provider-closed), but at the
     PROBE floor rather than the owned floor — see classify for why the two floors differ.
@@ -205,7 +291,7 @@ def classify(
             # deployment may have closed under us. Destroying on a failed read is the
             # same class of error as destroying on a guess.
             return "LEAVE-unverified-runner", services, age
-        if not any(n.startswith(placement_prefix) for n in group_names):
+        if not _all_groups_owned(group_names, placement_prefix):
             return "LEAVE-not-ours", services, age
         if age is not None and age >= STALE_RUNNER_AGE_SECONDS:
             return "STALE-runner", services, age
@@ -232,7 +318,7 @@ def classify(
                 # UNREADABLE is not UNOWNED, and here it is not CLASSIFIABLE either: a
                 # failed chain read leaves this exactly where the safe default found it.
                 return "LEAVE-unverified-provider-closed", services, age
-            if not any(n.startswith(placement_prefix) for n in group_names):
+            if not _all_groups_owned(group_names, placement_prefix):
                 # Another project's naming scheme, or a bare unattributable group
                 # (dcloud / akash1...): not ours to close, however stranded it looks.
                 return "LEAVE-not-ours-provider-closed", services, age
@@ -249,7 +335,7 @@ def classify(
     if reap_owned:
         if not group_names:
             return "LEAVE-unverified-owned", services, age
-        if not any(n.startswith(placement_prefix) for n in group_names):
+        if not _all_groups_owned(group_names, placement_prefix):
             return "LEAVE-not-ours", services, age
         if age is not None and age >= STALE_OWNED_AGE_SECONDS:
             return "STALE-owned", services, age
@@ -271,6 +357,176 @@ def _credit_line(client: AkashConsoleAPI, address: str) -> str:
     )
 
 
+@dataclass(frozen=True)
+class ExecutionPlan:
+    """What ``--execute`` WOULD do, decided without doing any of it.
+
+    ⛔ THE DRY RUN WAS NOT A PREVIEW OF THE EXECUTE RUN. It printed
+    ``stale (closable): N`` and returned BEFORE every rail — so the number an
+    operator reviewed was the CLASSIFICATION, never the outcome. With the cap,
+    "55 closable" means 25 will close; above the fraction tripwire it means
+    ZERO and a refusal. The documented protocol is "dispatch dry-run, review the
+    verdict table, then dispatch execute=true", and the review step was reading
+    a figure that does not predict the step it authorises (#250).
+
+    Both paths now decide here, so the preview and the act cannot disagree:
+    a dry run reports this, an execute performs it.
+    """
+
+    refusal: str | None
+    to_close: list[str]
+    closable: int
+    capped: bool
+    cap: int
+
+    @property
+    def would_close(self) -> int:
+        return 0 if self.refusal else len(self.to_close)
+
+
+def _execution_plan(
+    *,
+    stale: list[str],
+    stale_ages: dict[str, float],
+    seen_verdicts: set[str],
+    classified: int,
+    enumerated: int,
+    max_close: int,
+    no_dseq: int = 0,
+    unreadable: int = 0,
+) -> ExecutionPlan:
+    """Evaluate every execute-path rail WITHOUT acting on any of them.
+
+    Rail order is preserved exactly: unknown verdict, then shape tripwire, then
+    the cap. Order is load-bearing — an unknown verdict means the classifier
+    grew a category, which makes the fraction itself untrustworthy, so it must
+    refuse first.
+    """
+
+    # RAIL 1 — unrecognised verdict.
+    unknown = sorted(seen_verdicts - KNOWN_VERDICTS)
+    if unknown:
+        return ExecutionPlan(
+            refusal=(
+                f"classify() returned {len(unknown)} verdict(s) this reaper does not "
+                f"know: {', '.join(unknown)}.\n"
+                # Worded to avoid ruff S608, and NOT suppressed with a noqa. The
+                # trigger is "Update ... set" parsing as `UPDATE ... SET` — measured;
+                # the previous noqa here blamed the word "EXECUTE", which does NOT
+                # fire it, so anyone rewording around that would have been baffled.
+                # A suppression would also blind this string to a real finding later.
+                "  The classifier has a category the close path was never taught to "
+                "reason about. Extend KNOWN_VERDICTS deliberately after deciding "
+                "whether each new verdict is closable — never widen it just to make "
+                "this pass."
+            ),
+            to_close=[],
+            closable=len(stale),
+            capped=False,
+            cap=max_close,
+        )
+
+    # RAIL 2 — shape tripwire.
+    if classified >= MIN_AUDITED_FOR_FRACTION_RAIL:
+        fraction = len(stale) / classified
+        if fraction > MAX_STALE_FRACTION:
+            return ExecutionPlan(
+                refusal=(
+                    f"{len(stale)}/{classified} = {fraction:.0%} of CLASSIFIED "
+                    f"deployments closable, above the {MAX_STALE_FRACTION:.0%} "
+                    f"tripwire. ({enumerated} enumerated; {unreadable} unreadable, "
+                    f"{no_dseq} without a dseq, both excluded from the "
+                    "denominator.)\n"
+                    "  A share this high is more likely a classification fault than a "
+                    "real backlog. Investigate the verdict table above before closing "
+                    "anything."
+                ),
+                to_close=[],
+                closable=len(stale),
+                capped=False,
+                cap=max_close,
+            )
+
+    # RAIL 3 — cap.
+    if max_close < 1:
+        return ExecutionPlan(
+            refusal=(
+                f"--max-close must be >= 1, got {max_close}.\n"
+                "  A non-positive cap does not narrow this run, it inverts the rail: a "
+                "negative value slices from the END and would close nearly everything."
+            ),
+            to_close=[],
+            closable=len(stale),
+            capped=False,
+            cap=max_close,
+        )
+
+    oldest_first = sorted(stale, key=lambda d: stale_ages.get(d, -1.0), reverse=True)
+    capped = len(oldest_first) > max_close
+    return ExecutionPlan(
+        refusal=None,
+        to_close=oldest_first[:max_close] if capped else oldest_first,
+        closable=len(oldest_first),
+        capped=capped,
+        cap=max_close,
+    )
+
+
+def _report_plan(plan: ExecutionPlan, *, execute: bool) -> None:
+    """Say what execute WOULD do, on stdout and in the job summary.
+
+    ⛔ "NOTHING CLOSED" READ THE SAME AT 0 CLOSABLE AND AT 55. The scheduled
+    job is report-only BY DESIGN (CLEANUP_AUTO_EXECUTE=false, and a cron
+    supplies no inputs), which is a defensible choice for something that spends
+    escrow on a shared wallet. But its job summary named only the MODE, so four
+    green runs a day carried no information and a growing backlog looked
+    exactly like an empty one (#250).
+
+    ⚠ THIS DOES NOT FAIL THE RUN, DELIBERATELY. #250 proposes failing the cron
+    above a threshold. A scheduled job that goes red for a condition only a
+    human can clear, and that stays true until they do, is permanently red —
+    which trains people to ignore red exactly as green-by-default trained them
+    to ignore green. Same defect, colour inverted. A warning annotation is
+    visible in the run list without spending that signal.
+    """
+
+    if plan.refusal:
+        headline = f"would REFUSE to execute — {plan.refusal.splitlines()[0]}"
+    elif plan.capped:
+        headline = (
+            # ⛔ plan.cap, NOT the module constant. The plan is computed with the
+            # CALLER's max_close, so reading MAX_CLOSE_PER_RUN here made
+            # `--max-close 5` report "cap 25" while closing 5 — this PR's own
+            # defect, reproduced inside the report it exists to make accurate.
+            f"{plan.closable} closable; --execute would close "
+            f"{plan.would_close} (cap {plan.cap}), "
+            f"{plan.closable - plan.would_close} would remain"
+        )
+    elif plan.closable:
+        headline = f"{plan.closable} closable; --execute would close all {plan.would_close}"
+    else:
+        headline = "0 closable — nothing to do"
+
+    if not execute:
+        print(f"WOULD EXECUTE: {headline}")
+
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "").strip()
+    if summary_path:
+        try:
+            with open(summary_path, "a", encoding="utf-8") as fh:
+                fh.write(f"- {'closing' if execute else 'dry run'}: {headline}\n")
+        except OSError as exc:  # noqa: BLE001 — a summary failure must not stop the sweep
+            print(f"(could not write job summary: {exc})", file=sys.stderr)
+
+    # A backlog is worth an annotation, not a red run. Only on the reporting
+    # path: during an execute the closing output is itself the signal.
+    if not execute and plan.closable and not plan.refusal:
+        print(
+            f"::warning title=Stale deployments awaiting the human execute step::"
+            f"{headline}. Dispatch cleanup-stale with execute=true to drain."
+        )
+
+
 def run(
     *,
     execute: bool = False,
@@ -279,6 +535,9 @@ def run(
     only_service: str | None = None,
     placement_prefix: str = PLACEMENT_PREFIX,
     reap_owned: bool = False,
+    api_key: str | None = None,
+    max_close: int = MAX_CLOSE_PER_RUN,
+    ownership_register: dict | None = None,
 ) -> int:
     """Audit (and optionally close) stale test deployments.
 
@@ -311,7 +570,9 @@ def run(
         )
         return 2
 
-    api_key = os.environ.get("AKASH_API_KEY")
+    # Passed in by run_all_wallets(); the env read is the single-wallet path
+    # kept so this function still works standalone and in tests.
+    api_key = api_key or os.environ.get("AKASH_API_KEY")
     if not api_key:
         print("Error: AKASH_API_KEY not set.", file=sys.stderr)
         return 2
@@ -355,31 +616,49 @@ def run(
     print(f"ownership prefix: {placement_prefix!r}\n")
 
     stale: list[str] = []
+    stale_intents: dict[str, CleanupIntent] = {}
     protected: list[str] = []
+    # Rail inputs. `seen_verdicts` feeds the unrecognised-verdict refusal;
+    # `stale_ages` lets a capped run close the OLDEST first, so a partial pass
+    # frees the escrow that has been locked longest rather than an arbitrary
+    # slice. Both are gathered on every run, including dry ones, so the report
+    # shows what the execute path WOULD have refused on.
+    seen_verdicts: set[str] = set()
+    stale_ages: dict[str, float] = {}
+    # Counted, not inferred from len(deployments): rows with no dseq, or whose
+    # detail read failed, are `continue`d before classify() ever sees them. Using
+    # the enumerated count as the tripwire denominator understates the stale
+    # FRACTION, so a provider having a bad day would silently loosen the safety
+    # margin — read failures making a rail LESS likely to fire is backwards.
+    identity_held = 0
+    classified = 0
+    no_dseq = 0
+    unreadable = 0
     for d in deployments:
         dseq = _extract_dseq(d)
         if not dseq:
+            # ⛔ COUNTED SEPARATELY, because the refusal message used to call the
+            # whole shortfall "unreadable". That word names a CAUSE; the
+            # subtraction only measured "did not reach classified", which spans
+            # this skip too. Two counters cost nothing; a guessed proportion
+            # costs the operator's trust at the exact moment they are debugging
+            # a refusal.
+            no_dseq += 1
             continue
         try:
             detail = client.get_deployment(dseq)
         except Exception as exc:  # noqa: BLE001 — one unreadable deployment must not stop the audit
             print(f"  {dseq}  ERROR reading detail: {exc} -> LEAVE")
+            unreadable += 1
             continue
-        # Read provenance ONLY for the candidates it can decide, so a sweep does not
-        # spend a chain round-trip per deployment on an account of hundreds.
+        # This read only classifies a candidate.  The typed cleanup policy below
+        # performs its own complete two-source all-group read before the DSEQ can
+        # enter the close plan.
         names: list[str] | None = None
-        if reap_runners and _deployment_service_names(detail) == {RUNNER_SERVICE}:
+        services_for_read = _deployment_service_names(detail)
+        if reap_runners and services_for_read == {RUNNER_SERVICE}:  # noqa: SIM114
             names = chain.deployment_group_names(address, dseq)
         elif reap_owned and _wants_owned_provenance(detail, dseq, now):
-            # ⛔ reap_owned DECIDES ON PROVENANCE, so it must READ provenance — for the
-            # services `classify` will actually consult it for. Without the read the flag is
-            # inert in the worst way: `classify` returns LEAVE-unverified-owned for everything
-            # and the sweep reports a clean account it never judged.
-            #
-            # ⚠ NARROWED, because the naive form paid a chain round-trip for EVERY deployment
-            # — including {probe}, {backtest} and {runner}, whose branches return before
-            # `group_names` is ever read. On an account of hundreds that is hundreds of wasted
-            # reads for a value nothing consults.
             names = chain.deployment_group_names(address, dseq)
         verdict, services, age = classify(
             detail, dseq, now, reap_runners, names, placement_prefix, reap_owned=reap_owned
@@ -392,36 +671,324 @@ def run(
         # an uncheckable claim (#1763 wants per-deployment proof in the report itself).
         prov = f"  group={','.join(names) or '?'}" if names is not None else ""
         print(f"  {dseq}  age={age_str}  services={services or '-'}{prov}  -> {verdict}{suffix}")
+        classified += 1
+        seen_verdicts.add(verdict)
         if verdict in STALE_VERDICTS and dseq in PROTECTED_DSEQS:
             print(f"    ^ PROTECTED-DSEQ: on the never-close list, {verdict} overridden")
             protected.append(dseq)
             continue
         if verdict in STALE_VERDICTS and not filtered:
+            intent = _INTENT_BY_VERDICT[verdict]
+            allowed, reason = cleanup_identity.eligible(
+                address, str(dseq), placement_prefix, ownership_register, intent
+            )
+            if not allowed:
+                identity_held += 1
+                print(f"  {dseq} HELD: {reason}")
+                continue
             stale.append(dseq)
+            stale_intents[dseq] = intent
+            # -1.0 sorts an unaged deployment LAST, never first: an unknown age
+            # must not win a race to be closed under a cap.
+            stale_ages[dseq] = age if age is not None else -1.0
 
+    print(f"identity HELD: {identity_held} (unclassified is not non-production)")
     if protected:
         print(f"\nPROTECTED (never-close list): {len(protected)} -> {', '.join(protected)}")
     print(f"\nstale (closable): {len(stale)}")
-    if not execute:
-        print("DRY RUN — nothing closed. Re-run with --execute to close the stale set.")
-        return 0
 
-    closed, failed = 0, 0
+    # ⛔ DECIDE ONCE, FOR BOTH PATHS. The dry run used to return here, before
+    # every rail — so the figure an operator reviewed was the CLASSIFICATION,
+    # not the outcome, and the promotion protocol ("review the table, then
+    # dispatch execute=true") authorised a step the review could not predict.
+    plan = _execution_plan(
+        stale=stale,
+        stale_ages=stale_ages,
+        seen_verdicts=seen_verdicts,
+        classified=classified,
+        enumerated=len(deployments),
+        max_close=max_close,
+        no_dseq=no_dseq,
+        unreadable=unreadable,
+    )
+    _report_plan(plan, execute=execute)
+
+    if not execute:
+        # ⛔ THIS LINE CONTRADICTED THE ONE ABOVE IT. `_report_plan` prints
+        # "would REFUSE to execute — ..." and then this printed "Re-run with
+        # --execute to close the stale set" unconditionally — two consecutive
+        # lines of the same output disagreeing about whether execute is even
+        # available. This PR exists BECAUSE the dry run did not predict the
+        # execute run; routing both paths through _execution_plan() and then
+        # leaving the closing instruction unconditional reproduced the defect
+        # inside its own fix.
+        #
+        # ⚠ The refusal case is the RARE arm, which is why it survived review
+        # here and in two sibling PRs today. Read it from the plan like
+        # everything else: one decision, every consumer reads it.
+        if plan.refusal:
+            print(
+                "DRY RUN — nothing closed, and --execute would REFUSE for the reason "
+                "above. Fix that first; re-running with --execute will not close "
+                "anything."
+            )
+        elif plan.closable:
+            print(
+                f"DRY RUN — nothing closed. Re-run with --execute to close "
+                f"{plan.would_close} of them."
+            )
+        else:
+            print("DRY RUN — nothing closed, and nothing is closable.")
+        return 2 if identity_held else 0
+
+    if plan.refusal:
+        print(f"\nREFUSING TO EXECUTE: {plan.refusal}", file=sys.stderr)
+        return 2
+
+    if plan.capped:
+        print(
+            f"\nCAP: {plan.closable} closable, closing the {len(plan.to_close)} oldest "
+            f"this run. {plan.closable - len(plan.to_close)} will remain — re-run to "
+            "continue draining."
+        )
+    stale = plan.to_close
+    capped = plan.capped
+
+    closed, failed, unverified = 0, 0, 0
     for dseq in stale:
+        intent = stale_intents[dseq]
+        allowed, reason = cleanup_identity.eligible(
+            address, str(dseq), placement_prefix, ownership_register, intent
+        )
+        if not allowed:
+            identity_held += 1
+            print(f"  {dseq} HELD before close: {reason}")
+            continue
         try:
             client.close_deployment(dseq)
-            closed += 1
-            print(f"  closed {dseq}")
         except Exception as exc:  # noqa: BLE001 — keep reaping; report failures at the end
             failed += 1
             print(f"  FAILED to close {dseq}: {exc}")
+            continue
+        try:
+            # DELETE acceptance is not closure proof. Read fresh chain evidence after
+            # the write; the authorization reads above describe the pre-close state.
+            result = _lease_verification.verdict(
+                str(dseq),
+                address,
+                chain.rest_urls(),
+                lambda url: chain._lcd_get("", base=url),
+                retries=5,
+                retry_sleep_s=2.0,
+            )
+            verified = result.get("closed") is True
+            reason = result.get("reason", "missing closure verdict")
+        except Exception as exc:  # noqa: BLE001 — failed observation is never success
+            verified, reason = False, str(exc)
+        if not verified:
+            unverified += 1
+            print(f"  UNVERIFIED close {dseq}: {reason}")
+            continue
+        closed += 1
+        print(f"  closed {dseq}")
 
-    print(f"\nclosed={closed} failed={failed}")
+    remaining = " (CAPPED — more remain, re-run to continue)" if capped else ""
+    print(f"\nclosed={closed} failed={failed} unverified={unverified}{remaining}")
     # Escrow settlement can lag a block or two; read after a short pause so the
     # AFTER line reflects the releases.
     time.sleep(10)
     print(f"credit AFTER:  {_credit_line(client, address)}")
-    return 0 if failed == 0 else 1
+    return 1 if failed or unverified else 2 if identity_held else 0
+
+
+def _resolve_distinct_accounts(
+    keys: list[str],
+) -> tuple[list[tuple[str, str]], list[int]]:
+    """Collapse configured keys onto the DISTINCT accounts they actually reach.
+
+    ⛔ A KEY IS NOT A WALLET. This repo supports several keys resolving to one
+    account (`test_duplicate_keys_for_one_account_are_one_wallet`), and the
+    deploy path already models the difference — `WalletClientSelection` carries
+    `configured_keys` AND `distinct_accounts` as separate fields. Counting keys
+    here would reproduce the exact silent shortfall this guard exists to catch:
+    two aliases for one wallet satisfy AKASH_WALLETS_EXPECTED=2 while the pool
+    is one wallet.
+
+    ⛔ AND IT IS NOT ONLY THE COUNT. `run()` enumerates from the chain by
+    `address`, so two keys for one account walk the IDENTICAL deployment set
+    twice — with `max_close` applied per call. A cap of 25 becomes 50. That is
+    the blast-radius rail inverting again, by a different route than #256.
+
+    Returns ``(wallets, unresolved)`` — ``wallets`` is ``(account, key)`` in
+    first-seen order, one entry per account; ``unresolved`` is the 1-based
+    POSITIONS of keys whose account could not be read (never the keys).
+    """
+
+    wallets: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    unresolved: list[int] = []
+    for position, key in enumerate(keys, start=1):
+        try:
+            account = AkashConsoleAPI(key).account_address()
+        except Exception:  # noqa: BLE001 — an unidentifiable key is reported, never guessed
+            unresolved.append(position)
+            continue
+        if account in seen:
+            continue
+        seen.add(account)
+        wallets.append((account, key))
+    return wallets, unresolved
+
+
+def run_all_wallets(**kwargs) -> int:
+    """Audit (and optionally close) across EVERY configured Console wallet.
+
+    #250: the deploy path is pool-aware (`wallet_pool`, used by deploy.py and
+    cli.py) and the reap path was not — it read the singular AKASH_API_KEY and
+    audited one account. A reaper structurally unable to see wallets B and C
+    reports green about them forever, and cannot distinguish "no stale
+    deployments on wallet B" from "wallet B was never in scope". That is the
+    same not-measured-vs-measured-clean defect the issue is about, one level up.
+
+    Backward compatible BY CONSTRUCTION, not by a flag: `configured_api_keys()`
+    appends the singular AKASH_API_KEY as a fallback, so with today's CI config
+    this resolves to exactly one key and behaves identically to before.
+
+    Each wallet is enumerated from the CHAIN under its own address — the Console
+    listing does not scope by API key (see the comment in run(); three distinct
+    keys returned byte-identical bodies), so per-wallet isolation has to come
+    from the chain query, not from the credential.
+
+    Returns the WORST exit code across wallets: one wallet refusing on a rail,
+    or failing to close, must not be masked by another's success.
+    """
+    keys = configured_api_keys()
+
+    # ⛔ FAIL LOUD WHEN A POOL WAS INTENDED AND DID NOT ARRIVE.
+    #
+    # just-akash#167: a caller pinning a tag that predates the pool feature has
+    # `AKASH_API_KEYS` read as NOTHING, silently — the job then audits one
+    # wallet and reports green about the others, which is indistinguishable
+    # from a healthy single-wallet run. That is the same green-because-it-never-
+    # ran defect this repo keeps finding, and a plural that quietly degrades to
+    # a singular is exactly its shape.
+    #
+    # The receiver cannot infer intent from an empty variable, so intent is
+    # declared: set AKASH_WALLETS_EXPECTED=N alongside the keys and a mismatch
+    # is a hard error instead of a quiet downgrade. Unset means no assertion —
+    # today's single-wallet config stays valid without ceremony.
+    #
+    # N counts WALLETS, so it is compared against resolved accounts, not keys.
+    expected: int | None = None
+    expected_raw = os.environ.get("AKASH_WALLETS_EXPECTED", "").strip()
+    if expected_raw:
+        try:
+            expected = int(expected_raw)
+        except ValueError:
+            print(
+                f"Error: AKASH_WALLETS_EXPECTED must be an integer, got {expected_raw!r}.",
+                file=sys.stderr,
+            )
+            return 2
+
+    # Resolution is EAGER — before auditing, and before closing anything. A
+    # guard that fires after the sweep is a post-mortem, and this function has
+    # no "selection" step to assert after: it iterates every wallet and closes
+    # as it goes. The cost is one JWT mint per key, on the multi-key path only.
+    # `run()` still derives its own address from its own key rather than taking
+    # one from here, because "the key does not scope the response, the chain
+    # query does" is the invariant this whole file rests on — a path where the
+    # address and the key could disagree is not worth saving a round trip.
+    if len(keys) <= 1:
+        wallets = [(None, key) for key in keys]
+        unresolved: list[int] = []
+    else:
+        wallets, unresolved = _resolve_distinct_accounts(keys)
+
+    if unresolved:
+        # An unmeasurable wallet is not an absent one. With a key we cannot
+        # identify we cannot say whether the next step audits three wallets or
+        # one wallet three times, and one of those closes 3x the cap.
+        print(
+            f"Error: could not resolve the account behind Console key(s) at position(s) "
+            f"{', '.join(str(p) for p in unresolved)} of {len(keys)}.\n"
+            "  A key that cannot be identified makes the wallet set unknowable: "
+            "duplicate aliases cannot be told from distinct wallets, and the "
+            "per-run close cap is applied once per DISTINCT account. Refusing to sweep.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if expected is not None and len(wallets) != expected:
+        # Deliberately BEFORE the not-keys check below. Reordering would report
+        # a declared pool that did not arrive as an ordinary unconfigured run,
+        # dropping the fact that N wallets were expected — which IS the #167
+        # scenario. So the zero-key case names both facts here instead.
+        no_credential = (
+            "  Neither AKASH_API_KEY nor AKASH_API_KEYS is set, so no credential arrived at all.\n"
+            if not keys
+            else ""
+        )
+        print(
+            f"Error: AKASH_WALLETS_EXPECTED={expected} but "
+            f"{len(wallets)} Console wallet(s) resolved from {len(keys)} key(s).\n"
+            f"{no_credential}"
+            "  A pool was intended and did not arrive. The usual cause is a "
+            "caller pinned to a ref that predates the pool, where "
+            "AKASH_API_KEYS reads as empty and this would otherwise audit "
+            "one wallet and report green about the rest (just-akash#167). "
+            "Several keys resolving to ONE account counts as one wallet.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if not keys:
+        print("Error: neither AKASH_API_KEY nor AKASH_API_KEYS is set.", file=sys.stderr)
+        return 2
+
+    # Say how many wallets are in scope BEFORE auditing any. "1 wallet, clean"
+    # and "3 wallets, only 1 audited" must never render the same way.
+    if len(wallets) != len(keys):
+        print(
+            f"Console wallets configured: {len(wallets)} "
+            f"({len(keys)} keys, {len(keys) - len(wallets)} alias(es) of an account "
+            "already in scope)\n"
+        )
+    else:
+        print(f"Console wallets configured: {len(wallets)}\n")
+    worst = 0
+    for index, (account, key) in enumerate(wallets, start=1):
+        label = f" ({account})" if account else ""
+        print(f"===== wallet {index}/{len(wallets)}{label} =====")
+        rc = run(api_key=key, **kwargs)
+        worst = max(worst, rc)
+        print()
+    if len(wallets) > 1:
+        print(f"audited {len(wallets)} wallet(s); worst exit code {worst}")
+    return worst
+
+
+def _positive_cap(value: str) -> int:
+    """argparse type for --max-close: a cap must be at least 1.
+
+    Rejected HERE as well as on the execute path because the two failures are
+    different. This one turns `--max-close -1` into a usage error the operator
+    sees immediately; the execute-path check catches an in-process caller that
+    never goes through argparse. A rail that bounds blast radius must not be
+    invertible from either direction — `stale[:-1]` closes all but one.
+    """
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--max-close must be an integer, got {value!r}"
+        ) from None
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(
+            f"--max-close must be >= 1, got {parsed}. A non-positive cap does not narrow "
+            "the run — a negative value slices from the end and would close nearly everything."
+        )
+    return parsed
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -430,6 +997,17 @@ def main(argv: list[str] | None = None) -> int:
         "--execute",
         action="store_true",
         help="Actually close the stale deployments (default: dry-run report only).",
+    )
+    ap.add_argument(
+        "--max-close",
+        type=_positive_cap,
+        default=MAX_CLOSE_PER_RUN,
+        metavar="N",
+        help=(
+            f"Close at most N deployments per wallet per run (default {MAX_CLOSE_PER_RUN}); "
+            "the OLDEST first, so a capped pass frees the escrow locked longest. Bounds "
+            "the blast radius of a classification fault without stalling a real backlog."
+        ),
     )
     ap.add_argument(
         "--reap-runners",
@@ -475,9 +1053,20 @@ def main(argv: list[str] | None = None) -> int:
             "STAMPED. A blank value is refused — it would match everything."
         ),
     )
+    ap.add_argument(
+        "--ownership-register",
+        type=json.loads,
+        default=None,
+        help=(
+            "Explicit JSON mapping of registered placement prefixes to owning GitHub "
+            "repositories; absent means HELD"
+        ),
+    )
     args = ap.parse_args(argv)
-    return run(
+    return run_all_wallets(
         execute=args.execute,
+        ownership_register=args.ownership_register,
+        max_close=args.max_close,
         reap_runners=args.reap_runners,
         reap_owned=args.reap_owned,
         placement_prefix=args.placement_prefix,

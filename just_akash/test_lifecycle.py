@@ -24,7 +24,13 @@ from ._e2e import (
     assert_provider_in_tiers,
     install_signal_cleanup,
     resolve_tiers,
-    robust_destroy,
+)
+from .paid_create import (
+    receipt_environment,
+    receipt_identity,
+    reconcile_receipt,
+    run_process_group,
+    verified_cleanup,
 )
 
 GREEN = "\033[92m"
@@ -52,10 +58,22 @@ def log_info(msg):
     print(f"  {YELLOW}INFO{RESET} {msg}")
 
 
-def run(cmd: str, timeout: int = 60, input_text: str | None = None) -> subprocess.CompletedProcess:
+def run(
+    argv: list[str], timeout: int = 60, input_text: str | None = None
+) -> subprocess.CompletedProcess:
+    """Run one command as an argv list, never through a shell (#371).
+
+    Values reaching these commands (DSEQs, provider-returned data, temp paths) come from
+    external answers. Through a shell, a value such as `1; touch /tmp/pwned` would run as a
+    second command in a job that holds wallet API credentials; as an argv element it is one
+    literal argument. A string is refused rather than split, so no call site can regress to
+    an interpolated command line.
+    """
+    if not isinstance(argv, list) or not all(isinstance(part, str) for part in argv):
+        raise TypeError("run() takes an argv list of strings, never a shell command string")
     return subprocess.run(
-        cmd,
-        shell=True,
+        argv,
+        shell=False,
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -104,10 +122,12 @@ def main():
     # Install SIGINT/SIGTERM handlers BEFORE we create the deployment so
     # interrupts during `just up` also trigger cleanup.
     install_signal_cleanup(dseq_ref)
+    receipt_path, operation_id, receipt_env = receipt_environment("e2e-lifecycle")
+    dseq_ref["receipt_path"] = receipt_path
 
     log_step(2, "just list — check initial state")
 
-    r = run("just list")
+    r = run(["just", "list"])
     if r.returncode != 0:
         log_fail(f"just list failed: {r.stderr.strip()}")
         sys.exit(1)
@@ -116,30 +136,61 @@ def main():
 
     log_step(3, "just up — deploy SSH instance")
 
-    r = run("just up", timeout=300)
+    started_at = time.time()
+    try:
+        r, timed_out = run_process_group(
+            ["just", "up"], env={**os.environ, **receipt_env}, timeout=300
+        )
+    except BaseException:
+        try:
+            receipt, receipt_dseq = receipt_identity(receipt_path, operation_id)
+            dseq_ref.update(
+                dseq=receipt_dseq,
+                owner=receipt["expected_owner"],
+                groups=receipt["group_population"],
+                credential=receipt.get("credential_binding"),
+            )
+            if receipt_dseq:
+                verified_cleanup(dseq_ref)
+            elif receipt["state"] == "submitting":
+                reconcile_receipt(receipt_path, operation_id, started_at, dseq_ref)
+        except Exception as exc:  # noqa: BLE001 - preserve unresolved receipt
+            log_fail(f"HELD: interrupted create receipt could not be reconciled ({exc})")
+        raise
     output = r.stdout + r.stderr
     print(output)
 
-    # Try to recover DSEQ even on failure so cleanup can run.
-    m = re.search(r"DSEQ[:\s]+(\d+)", output)
-    if m:
-        dseq_ref["dseq"] = m.group(1)
+    try:
+        receipt, receipt_dseq = receipt_identity(receipt_path, operation_id)
+        dseq_ref.update(
+            owner=receipt["expected_owner"],
+            groups=receipt["group_population"],
+            credential=receipt.get("credential_binding"),
+        )
+        dseq_ref["dseq"] = receipt_dseq
+        if receipt_dseq is None:
+            reconcile_receipt(receipt_path, operation_id, started_at, dseq_ref)
+    except Exception as exc:  # noqa: BLE001 - output alone has no close authority
+        receipt, receipt_dseq = None, None
+        log_fail(f"HELD: create receipt unreadable ({exc})")
 
-    if r.returncode != 0:
+    if timed_out or r.returncode != 0:
         log_fail("just up failed")
         failures.append(f"up: exit {r.returncode}")
         if dseq_ref["dseq"]:
-            robust_destroy(dseq_ref["dseq"])
+            verified_cleanup(dseq_ref)
         _summary(failures)
         sys.exit(1)
 
-    if not dseq_ref["dseq"]:
+    if not receipt_dseq:
+        if dseq_ref["dseq"]:
+            verified_cleanup(dseq_ref)
         log_fail("Could not parse DSEQ from 'just up' output")
         failures.append("up: no dseq in output")
         _summary(failures)
         sys.exit(1)
 
-    dseq = dseq_ref["dseq"]
+    dseq = receipt_dseq
     log_pass(f"Deployed: DSEQ={dseq}")
 
     # Wrap all post-deploy work in try/finally so the deployment is destroyed
@@ -154,12 +205,12 @@ def main():
         import contextlib
 
         provider_addr = None
-        rj = run(f"uv run just-akash status --dseq {dseq} --json", timeout=30)
+        rj = run(["uv", "run", "just-akash", "status", "--dseq", str(dseq), "--json"], timeout=30)
         if rj.returncode == 0:
             with contextlib.suppress(json.JSONDecodeError, AttributeError):
                 provider_addr = json.loads(rj.stdout).get("provider")
 
-        r = run(f"just status {dseq}")
+        r = run(["just", "status", str(dseq)])
         status_output = r.stdout
         print(status_output)
 
@@ -187,7 +238,7 @@ def main():
         if not ssh_match:
             log_info("Retrying status for SSH details...")
             time.sleep(5)
-            r = run(f"just status {dseq}")
+            r = run(["just", "status", str(dseq)])
             status_output = r.stdout
             ssh_match = re.search(r"ssh -p (\d+) root@(\S+)", status_output)
 
@@ -241,13 +292,11 @@ def main():
                 failures.append(f"connect: SSH failed to {ssh_host}:{ssh_port}")
     finally:
         log_step(6, f"Cleanup: destroy {dseq}")
-        if not robust_destroy(dseq):
+        if not verified_cleanup(dseq_ref):
             failures.append("cleanup: destroy or audit failed")
-        # Once destroyed, drop the ref so the SIGINT handler doesn't double-destroy.
-        dseq_ref["dseq"] = None
 
     log_step(7, "just list — final audit")
-    r = run("just list")
+    r = run(["just", "list"])
     # Word-boundary match: don't false-positive when our dseq is a substring
     # of another active deployment (e.g. "123" inside "12345").
     if not re.search(rf"(?<!\d){re.escape(dseq)}(?!\d)", r.stdout):

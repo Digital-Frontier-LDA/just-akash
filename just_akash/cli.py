@@ -32,6 +32,9 @@ import os
 import shlex
 import subprocess
 import sys
+from typing import Any, cast
+
+from .owner_lookup import OwnerLookupUnresolved
 
 NO_SSH_MSG = (
     "No SSH port found on this deployment.\n"
@@ -118,14 +121,36 @@ def _resolve_deployment(client, dseq_arg):
     return dseq
 
 
-def _resolve_deployment_client(dseq_arg):
-    """Resolve a DSEQ and the configured Console wallet that positively owns it."""
+def _resolve_deployment_client(
+    dseq_arg: Any,
+    expected_owner: str | None = None,
+    expected_group: str | None = None,
+) -> tuple[Any, str]:
+    """Resolve legacy Console ownership or collect owner-bound containment evidence."""
 
     from .api import AkashConsoleAPI, _extract_dseq, _interactive_pick, _resolve_dseq
-    from .wallet_pool import configured_api_keys, select_client_for_dseq
+    from .wallet_pool import (
+        configured_api_keys,
+        select_client_for_bound_owner,
+        select_client_for_dseq,
+    )
 
     dseq = _resolve_dseq(dseq_arg)
+    if expected_group is not None and not expected_owner:
+        raise RuntimeError("--expected-group requires --expected-owner")
+    if expected_owner and not dseq:
+        raise RuntimeError("--expected-owner requires an explicit --dseq")
+    if expected_owner and not expected_group:
+        raise RuntimeError("--expected-owner requires --expected-group")
     if dseq:
+        if expected_owner:
+            client = select_client_for_bound_owner(
+                dseq,
+                expected_owner,
+                cast(str, expected_group),
+                client_factory=AkashConsoleAPI,
+            )
+            return client, dseq
         return select_client_for_dseq(dseq, client_factory=AkashConsoleAPI), dseq
 
     deployments = []
@@ -364,6 +389,14 @@ def main():
         help="Escrow deposit in USD (default: 5.0). Unused escrow is refunded "
         "when the deployment closes; size it to outlast the workload.",
     )
+    deploy_p.add_argument(
+        "--receipt-path",
+        help="Absolute path in a private (0700) directory for the crash-durable create receipt",
+    )
+    deploy_p.add_argument(
+        "--receipt-operation-id",
+        help="Caller lifecycle/run identifier stored in every local receipt state",
+    )
 
     # ── update ─────────────────────────────────────────
     update_p = subparsers.add_parser(
@@ -589,7 +622,120 @@ def main():
     # ── destroy ────────────────────────────────────────
     destroy_p = subparsers.add_parser("destroy", help="Destroy a deployment")
     destroy_p.add_argument("--dseq", default="")
+    destroy_p.add_argument(
+        "--expected-owner",
+        default="",
+        help=(
+            "Create-time owner candidate. Requires the configured credential and exact "
+            "owner-bound containment evidence; it does not authorize closing."
+        ),
+    )
+    destroy_p.add_argument(
+        "--expected-group",
+        default=None,
+        help=(
+            "Create-time group_spec.name. Valid only with --expected-owner; the complete "
+            "chain group population must equal this singleton before closing."
+        ),
+    )
     destroy_p.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompts")
+
+    # ── verify-closed ──────────────────────────────────
+    verify_closed_p = subparsers.add_parser(
+        "verify-closed",
+        help=(
+            "Verify a lease is closed by owner-scoped agreement across TWO distinct chain "
+            "endpoints. Returns {closed: bool, sources: [...], reason: ...}. closed=true "
+            "ONLY when both endpoints return the SAME complete (owner/dseq/gseq/oseq/"
+            "bseq/provider) identity map AND every entry's state is terminal "
+            "(closed or insufficient_funds), with deployment and escrow both closed. "
+            "A single Console read, a destroy text match, "
+            "or a partial chain read is never sufficient proof."
+        ),
+    )
+    verify_closed_p.add_argument("--dseq", required=True, help="Deployment sequence to verify")
+    verify_closed_p.add_argument(
+        "--owner",
+        required=False,
+        default=None,
+        help=(
+            "Owner Akash address (akash1...). If omitted, derived from the configured "
+            "Console wallet pool via _resolve_deployment_client — same path destroy uses."
+        ),
+    )
+    verify_closed_p.add_argument(
+        "--endpoint",
+        action="append",
+        dest="endpoints",
+        default=None,
+        metavar="URL",
+        help=(
+            "Chain endpoint to consult (repeatable). Two distinct HTTPS origins are "
+            "required for a positive verdict. Defaults to the proven Akash REST endpoints "
+            "(Polkachu + cosmos.directory/akash)."
+        ),
+    )
+    verify_closed_p.add_argument(
+        "--retries",
+        type=int,
+        default=5,
+        help="Bounded retries for chain-lag propagation (default: 5).",
+    )
+    verify_closed_p.add_argument(
+        "--retry-sleep",
+        dest="retry_sleep_s",
+        type=float,
+        default=2.0,
+        help=(
+            "Seconds to sleep between retry attempts when the chain still "
+            "shows an active lease or an endpoint is unreadable (default: 2). "
+            "Set to 0 to disable the delay (the close step's destroy loop "
+            "already has its own retry patience; this is the observation-side "
+            "counterpart for chain-propagation lag)."
+        ),
+    )
+    verify_closed_p.add_argument(
+        "--json",
+        action="store_true",
+        default=True,
+        help="Emit JSON verdict (default; preserved for explicitness).",
+    )
+
+    # ── resolve-owner ───────────────────────────────────
+    resolve_owner_p = subparsers.add_parser(
+        "resolve-owner",
+        help=(
+            "Resolve the Akash account that positively owns a DSEQ by walking the "
+            "configured Console wallet pool. Read-only: emits JSON {owner, dseq, source} "
+            "and exits 0; exits 1 when no wallet in the pool claims the DSEQ. Used by "
+            "the close step BEFORE destroy so closure verification has a captured owner "
+            "even after the deployment has closed/Console404."
+        ),
+    )
+    resolve_owner_p.add_argument("--dseq", default="")
+    resolve_owner_p.add_argument(
+        "--expected-owner",
+        default="",
+        help=(
+            "Create-time owner candidate. It is accepted only when a configured Console "
+            "credential reports it and registered chain sources produce owner-bound "
+            "containment evidence. It is not fresh/finalized close authority."
+        ),
+    )
+    resolve_owner_p.add_argument(
+        "--expected-group",
+        default=None,
+        help=(
+            "Create-time group_spec.name. Valid only with --expected-owner; the complete "
+            "chain group population must equal this singleton."
+        ),
+    )
+    resolve_owner_p.add_argument(
+        "--json",
+        action="store_true",
+        default=True,
+        help="Emit JSON {owner, dseq, source: 'wallet_pool'} (default).",
+    )
 
     # ── destroy-all ────────────────────────────────────
     destroy_all_p = subparsers.add_parser("destroy-all", help="Destroy all deployments")
@@ -784,6 +930,8 @@ def main():
                 deposit=args.deposit,
                 select=args.select,
                 already_selected=args.already_selected,
+                receipt_path=args.receipt_path,
+                receipt_operation_id=args.receipt_operation_id,
             )
             sys.exit(0)
         except RuntimeError as e:
@@ -1742,20 +1890,147 @@ def main():
         )
 
         try:
-            client, dseq = _resolve_deployment_client(args.dseq)
+            client, dseq = _resolve_deployment_client(
+                args.dseq,
+                args.expected_owner or None,
+                args.expected_group,
+            )
             tag = _get_tag(dseq)
             label = f"{dseq} ({tag})" if tag else dseq
             if _confirm(f"Destroy deployment {label}? (y/N) ", yes=args.yes):
-                client.close_deployment(dseq)
+                if args.expected_owner:
+                    import json as _json
+
+                    from .wallet_pool import (
+                        authorize_client_for_bound_owner,
+                    )
+
+                    closer, evidence = authorize_client_for_bound_owner(
+                        dseq,
+                        args.expected_owner,
+                        args.expected_group,
+                    )
+                    print(
+                        "owner-close-evidence=" + _json.dumps(evidence, sort_keys=True),
+                        file=sys.stderr,
+                    )
+                    closer.close_deployment(dseq)
+                else:
+                    client.close_deployment(dseq)
                 tags = _load_tags()
                 tags.pop(dseq, None)
                 _save_tags(tags)
                 print(f"Deployment {label} destroyed.")
             else:
                 print("Cancelled.")
+        except OwnerLookupUnresolved as e:
+            # ⛔ UNREACHABLE IS ITS OWN EXIT CODE (#378): a retry loop must be able to
+            # tell "the shared budget is gone — retrying is waste" from "failed, try
+            # again". Every other verdict stays exit 1.
+            from .owner_lookup import (
+                OWNER_LOOKUP_UNREACHABLE,
+                OWNER_LOOKUP_UNREACHABLE_EXIT_CODE,
+            )
+
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(
+                OWNER_LOOKUP_UNREACHABLE_EXIT_CODE if e.verdict == OWNER_LOOKUP_UNREACHABLE else 1
+            )
         except RuntimeError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
+
+    # ── verify-closed ──────────────────────────────────
+    elif args.command == "verify-closed":
+        import json as _json
+        from urllib import request as _urlrequest
+
+        from ._lease_verification import DEFAULT_ENDPOINTS
+        from ._lease_verification import verdict as _verdict
+        from .api import AkashConsoleAPI
+
+        owner = args.owner
+        if not owner:
+            # ⇒ Derive owner via the SAME machinery destroy uses —
+            # _resolve_deployment_client walks the configured Console wallet pool
+            # and returns the client that positively owns the DSEQ. The client's
+            # account_address is read from the JWT iss claim (a side-effect-free
+            # identity probe). This is the owner the chain is queried against.
+            client, dseq = _resolve_deployment_client(args.dseq)
+            owner = client.account_address()
+            if args.dseq and args.dseq != dseq:
+                print(
+                    f"::warning --dseq {args.dseq} did not match the resolved {dseq}",
+                    file=sys.stderr,
+                )
+
+        endpoints = args.endpoints or list(DEFAULT_ENDPOINTS)
+
+        def _get(url: str):
+            req = _urlrequest.Request(  # noqa: S310 — consensus admits HTTPS endpoints only
+                url,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "just-akash-verify-closed/1.0",
+                },
+            )
+            with _urlrequest.urlopen(req, timeout=15) as resp:  # noqa: S310 — HTTPS only
+                return _json.loads(resp.read().decode("utf-8"))
+
+        # ⇒ Bounded retries cover chain-lag propagation — the same patience
+        # the destroy retry loop has, on the observation side. Default
+        # retry-sleep is non-zero so an active observation right after
+        # destroy is given a chance to propagate before being declared
+        # permanent.
+        result = _verdict(
+            args.dseq,
+            owner,
+            endpoints,
+            _get,
+            retries=max(1, args.retries),
+            retry_sleep_s=max(0.0, args.retry_sleep_s),
+        )
+        print(_json.dumps(result))
+        # ⛔ BOTH the typed closed=True AND a zero exit are required.
+        # Stdout True alone must not override a non-zero exit (the harness's
+        # endpoint-disagreement case proves this — the verifier writes
+        # closed=false on disagreement, and the workflow must NOT report
+        # closed=true over an unverified verdict).
+        if result.get("closed") is not True:
+            sys.exit(1)
+
+    # ── resolve-owner ──────────────────────────────────
+    elif args.command == "resolve-owner":
+        import json as _json
+
+        try:
+            if args.expected_owner:
+                client, dseq = _resolve_deployment_client(
+                    args.dseq,
+                    args.expected_owner,
+                    args.expected_group,
+                )
+            else:
+                client, dseq = _resolve_deployment_client(
+                    args.dseq,
+                    expected_group=args.expected_group,
+                )
+            owner = client.account_address()
+        except OwnerLookupUnresolved as e:
+            from .owner_lookup import (
+                OWNER_LOOKUP_UNREACHABLE,
+                OWNER_LOOKUP_UNREACHABLE_EXIT_CODE,
+            )
+
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(
+                OWNER_LOOKUP_UNREACHABLE_EXIT_CODE if e.verdict == OWNER_LOOKUP_UNREACHABLE else 1
+            )
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        source = "owner_bound_containment" if args.expected_owner else "wallet_pool"
+        print(_json.dumps({"owner": owner, "dseq": dseq, "source": source}))
 
     # ── destroy-all ────────────────────────────────────
     elif args.command == "destroy-all":
