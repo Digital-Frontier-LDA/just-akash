@@ -207,3 +207,42 @@ def test_workflow_is_readable_under_a_non_utf8_locale():
     assert 'encoding="utf-8"' in Path(__file__).read_text(encoding="utf-8"), (
         "this suite must pin the encoding when reading the workflow"
     )
+
+
+def test_the_capacity_gate_covers_every_gpu_shaped_scenario():
+    """⛔ THE GATE WAS AN EXACT NAME MATCH, AND A SECOND GPU SCENARIO WALKED PAST IT.
+
+    `probe_pair` read `scenario.name == "gpu"`, so adding `gpu-supply` bypassed the capacity
+    check entirely. The failure that produces is the precise one this module exists to
+    prevent: with no free GPU the provider returns a CORRECT `insufficient capacity` decline,
+    the probe scores it as a provider NO-BID, and the fleet pages for an outage that never
+    happened -- "couldn't test" recorded as "failed". (Copilot, review of #399.)
+
+    ⭐ The set is DERIVED FROM THE SDL rather than hand-listed, so a future GPU scenario joins
+    it by asking for a GPU. This test pins that derivation, not the current membership.
+    """
+    from just_akash.bid_probe import GPU_SCENARIOS, SCENARIOS, _scenario_requests_a_gpu
+
+    for name, scenario in SCENARIOS.items():
+        asks_for_a_gpu = _scenario_requests_a_gpu(scenario.sdl)
+        assert (name in GPU_SCENARIOS) == asks_for_a_gpu, (
+            f"scenario {name!r} asks for a GPU={asks_for_a_gpu} but is "
+            f"{'in' if name in GPU_SCENARIOS else 'absent from'} GPU_SCENARIOS"
+        )
+    assert {"gpu", "gpu-supply"} <= GPU_SCENARIOS, (
+        "a GPU-shaped scenario is outside the capacity gate, so an unservable order will be "
+        "recorded as a provider outage"
+    )
+
+
+def test_the_capacity_gate_is_actually_consulted_for_each_of_them():
+    """The set is worthless if `probe_pair` still branches on a literal name."""
+    import inspect
+
+    from just_akash import bid_probe
+
+    source = inspect.getsource(bid_probe.probe_pair)
+    assert 'scenario.name == "gpu"' not in source, (
+        "probe_pair still gates on the literal name, so only one GPU scenario is covered"
+    )
+    assert "GPU_SCENARIOS" in source, "probe_pair no longer consults the derived GPU set"

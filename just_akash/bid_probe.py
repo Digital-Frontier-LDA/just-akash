@@ -45,6 +45,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
+import yaml
+
 # ---------------------------------------------------------------------------
 # Scenarios — ported from DePIN-LiveAutobidder src/synthetic_probe_scenarios.py
 #
@@ -359,6 +361,33 @@ SCENARIOS: dict[str, Scenario] = {
 }
 
 
+def _scenario_requests_a_gpu(sdl: str) -> bool:
+    """Does this order ask for a GPU? Read from the SDL, never from the name."""
+    document = yaml.safe_load(sdl) or {}
+    profiles = ((document.get("profiles") or {}).get("compute") or {}).values()
+    for profile in profiles:
+        gpu = ((profile or {}).get("resources") or {}).get("gpu") or {}
+        if int(gpu.get("units") or 0) > 0:
+            return True
+    return False
+
+
+#: Every scenario whose order asks for a GPU, and therefore every scenario the capacity
+#: gate below must cover.
+#:
+#: ⛔ DERIVED FROM THE SDL, NOT FROM THE NAME, AND THAT IS THE WHOLE POINT. The gate read
+#: `scenario.name == "gpu"` -- an exact match -- so the moment a second GPU-shaped scenario
+#: was added (`gpu-supply`) it walked straight past the check. The consequence is the exact
+#: fault this module exists to prevent: with no free GPU the provider returns a CORRECT
+#: `insufficient capacity` decline, the probe scores it as a provider NO-BID, and the fleet
+#: pages for an outage that never happened. (Copilot, review of #399.)
+#: ⚠ A name-based list would have to be remembered; this cannot be forgotten, because a new
+#: GPU scenario joins it by asking for a GPU.
+GPU_SCENARIOS: frozenset[str] = frozenset(
+    name for name, scenario in SCENARIOS.items() if _scenario_requests_a_gpu(scenario.sdl)
+)
+
+
 @dataclass(frozen=True)
 class ProviderTarget:
     """One of our providers, and the order shapes it is expected to bid on.
@@ -402,7 +431,9 @@ PROVIDERS: tuple[ProviderTarget, ...] = (
     ProviderTarget(
         cluster="onidc",
         wallet="akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",  # pragma: allowlist secret
-        capabilities=frozenset({"cpu", "gpu", "gpu-supply", "persistent-beta3", "ip-lease", "nodeport"}),
+        capabilities=frozenset(
+            {"cpu", "gpu", "gpu-supply", "persistent-beta3", "ip-lease", "nodeport"}
+        ),
         attributes={
             "region": "eu-west",
             "organization": "digital frontier",
@@ -668,7 +699,7 @@ def probe_pair(
     ts = now if now is not None else time.time()
     # Ask only questions this provider can answer. See _gpu_probe_is_answerable:
     # an unservable GPU probe earns a correct decline that would page as a fault.
-    if scenario.name == "gpu":
+    if scenario.name in GPU_SCENARIOS:
         answerable, why = _gpu_probe_is_answerable(client, target)
         if not answerable:
             return ProbeRecord(
