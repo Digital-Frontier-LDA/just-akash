@@ -62,7 +62,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           enable-cache: true
 
@@ -106,6 +106,7 @@ jobs:
           # is non-gating: a benchmark failure never reddens the smoke. Accrued to the
           # telemetry branch as smoke-benchmark.jsonl for the quality analyzer.
           SMOKE_BENCHMARK_FILE: ${{ github.workspace }}/smoke-benchmark.jsonl
+          RUN_ALL_PROVIDERS: ${{ inputs.all }}
         run: |
           # ⛔ THE STEP'S END, NOT A LOOKUP BUDGET (#378). The smoke loops every provider in one
           # process (557–717s measured), so a 600s ceiling exported here went stale and every
@@ -113,7 +114,11 @@ jobs:
           # ceiling, min(now + 600s, this deadline). start + timeout-minutes (40) x 60 - 240s
           # of close/audit margin; tests/test_owner_lookup_deadline.py pins the literal.
           export OWNER_LOOKUP_STEP_DEADLINE_AT=$(( $(date +%s) + 40 * 60 - 240 ))
-          uv run python -m just_akash.smoke_providers ${{ inputs.all && '--all' || '' }}
+          if [ "$RUN_ALL_PROVIDERS" = "true" ]; then
+            uv run python -m just_akash.smoke_providers --all
+          else
+            uv run python -m just_akash.smoke_providers
+          fi
 
       # Snapshot the remaining deploy credit HERE, in the one job that holds the
       # API key — the accrue job (which renders the Prometheus metrics) deliberately
