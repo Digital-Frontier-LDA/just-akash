@@ -307,6 +307,13 @@ jobs:
           # `git ls-remote origin HEAD` returns whatever the remote's HEAD
           # points to -- it is a mislabel to log that as "main tip" when the
           # CI can run against any base ref. The label must match the lookup.
+          # SAFETY: ${{ github.event.pull_request.base.ref }} is interpolated
+          # into the `git ls-remote` arg below. Safe ONLY because
+          # `on.pull_request.branches: [main]` constrains the trigger -- git
+          # ref names allow `;`, `$`, `` ` ``, `&`, `|`; widening `branches:`
+          # live-wires shell injection. If widening, switch to
+          # `env: BASE_REF: ${{ github.event.pull_request.base.ref }}` and
+          # use `"$BASE_REF"` so the runner's env layer shell-quotes it.
           current_base_sha="$(git ls-remote origin "refs/heads/${{ github.event.pull_request.base.ref }}" | awk '{print $1}')"
           echo "remote origin ${{ github.event.pull_request.base.ref }} tip (now): $current_base_sha"
       - name: Run symbol-presence check (script from base, content from head)
