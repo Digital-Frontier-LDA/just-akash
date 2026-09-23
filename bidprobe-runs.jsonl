@@ -318,3 +318,4 @@
 {"run_id":"35841472773","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-09-23T09:11:40Z","attempt":"1","accrued_at":"2026-09-23T09:20:12Z","published":true}
 {"run_id":"35859425367","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-09-23T12:16:15Z","attempt":"1","accrued_at":"2026-09-23T12:27:18Z","published":true}
 {"run_id":"35879589332","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-09-23T15:10:26Z","attempt":"1","accrued_at":"2026-09-23T15:21:21Z","published":true}
+{"run_id":"35901071477","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-09-23T18:15:01Z","attempt":"1","accrued_at":"2026-09-23T18:23:37Z","published":true}
