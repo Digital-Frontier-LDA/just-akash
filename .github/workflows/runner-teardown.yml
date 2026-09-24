@@ -323,8 +323,51 @@ jobs:
           if [ -n "${DEPLOYMENT_GROUP:-}" ]; then
             RESOLVE_ARGS+=(--expected-group "$DEPLOYMENT_GROUP")
           fi
-          "${JA[@]}" resolve-owner "${RESOLVE_ARGS[@]}" >/tmp/owner.json 2>/tmp/owner.err || OWNER_RC=$?
-          OWNER_RC=${OWNER_RC:-0}
+          # ⛔ UNREACHABLE WAS A HARD ONE-SHOT FAILURE (#404). When a single
+          # chain source returned [] or timed out, wallet_pool surfaced an
+          # OWNER_LOOKUP_UNREACHABLE verdict and the CLI exited 75; the step
+          # captured OWNER_RC=75 and exited 1 — leaving the lease ACTIVE and
+          # not retrying. With chain.py now retrying within a per-call Deadline
+          # AND each call failing fast for transient transport errors, an exit
+          # 75 here means the source is durably down for THIS run and a fresh
+          # attempt with backoff is the right move (it costs ~5–60 s of wall
+          # clock, well inside the step's 1 h default and the 10 m budget the
+          # destroy loop sets below). The retry budget is bounded so a real
+          # outage still aborts the step with the same ::error surface as
+          # before — only with one more attempt's worth of evidence in the
+          # log.
+          OWNER_RC=0
+          RESOLVE_TRIES=0
+          RESOLVE_TRIES_MAX=3
+          RESOLVE_BACKOFFS=(1 4 16)
+          while [ "$RESOLVE_TRIES" -lt "$RESOLVE_TRIES_MAX" ]; do
+            RESOLVE_TRIES=$((RESOLVE_TRIES + 1))
+            # ⛔ RESET OWNER_RC INSIDE THE LOOP (#404 review). `|| OWNER_RC=$?`
+            # only fires when the command FAILS. On a successful attempt the
+            # ``||`` is skipped and OWNER_RC keeps its previous value (often 75
+            # from an earlier transient outage), so `[ "$OWNER_RC" -eq 0 ]` is
+            # `[ 75 -eq 0 ]`, never true, and the loop burns every try of the
+            # budget on what was actually a transient-then-recovers case.
+            OWNER_RC=0
+            : >/tmp/owner.json
+            : >/tmp/owner.err
+            "${JA[@]}" resolve-owner "${RESOLVE_ARGS[@]}" >/tmp/owner.json 2>/tmp/owner.err || OWNER_RC=$?
+            # Exit 0 → resolve-owner succeeded; we have the JSON we need.
+            [ "$OWNER_RC" -eq 0 ] && break
+            # Exit 75 (OWNER_LOOKUP_UNREACHABLE) → retry unless we've burned
+            # the budget. Stderr on the final attempt is preserved verbatim
+            # below for the ::error annotation.
+            if [ "$OWNER_RC" -eq 75 ] && [ "$RESOLVE_TRIES" -lt "$RESOLVE_TRIES_MAX" ]; then
+              backoff="${RESOLVE_BACKOFFS[$((RESOLVE_TRIES - 1))]}"
+              echo "::warning title=resolve-owner unreachable, retrying::dseq=$DSEQ — attempt ${RESOLVE_TRIES}/${RESOLVE_TRIES_MAX} returned exit 75 (OWNER_LOOKUP_UNREACHABLE); sleeping ${backoff}s before the next try. stderr: $(tr '\n' ' ' </tmp/owner.err | cut -c1-300)"
+              sleep "$backoff"
+              continue
+            fi
+            # Any other exit code (1, real disagreement / wrong group /
+            # unknown). Step-time fail-fast — the loop below logs the rc and
+            # exits 1 unchanged.
+            break
+          done
           # ⛔ THE STDERR IS THE WHOLE DIAGNOSIS, AND IT USED TO BE THROWN AWAY.
           # resolve-owner's stderr was captured to /tmp/owner.err on the line
           # above and then read by NOTHING — the two failure branches below

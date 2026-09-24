@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import re
+import time
 import urllib.parse
 from unittest.mock import MagicMock
 
@@ -317,6 +318,9 @@ def test_malformed_sibling_invalidates_the_whole_population(mutate):
 
 
 def _mutated_consensus(source: str):
+    initial = chain._CHAIN_BORROBORATION_RETRY_INITIAL_BACKOFF_SECONDS
+    backoff_max = chain._CHAIN_BORROBORATION_RETRY_MAX_BACKOFF_SECONDS
+    attempts = chain._CHAIN_BORROBORATION_RETRY_MAX_ATTEMPTS
     namespace = {
         "cast": chain.cast,
         "_DEPLOYMENT_API": "/akash/deployment/v1beta4",
@@ -325,6 +329,14 @@ def _mutated_consensus(source: str):
         "rest_urls": chain.rest_urls,
         "re": re,
         "urllib": urllib,
+        "Deadline": Deadline,
+        "bounded_call": chain.bounded_call,
+        "_CHAIN_BORROBORATION_RETRY_INITIAL_BACKOFF_SECONDS": initial,
+        "_CHAIN_BORROBORATION_RETRY_MAX_BACKOFF_SECONDS": backoff_max,
+        "_CHAIN_BORROBORATION_RETRY_MAX_ATTEMPTS": attempts,
+        "ChainResponseError": chain.ChainResponseError,
+        "ChainCorroborationUnreachable": ChainCorroborationUnreachable,
+        "time": time,
     }
     exec("from __future__ import annotations\n" + source, namespace)  # noqa: S102
     return namespace["_corroborated_deployment_group_names"]
@@ -475,3 +487,281 @@ def test_bound_owner_destructive_selection_holds_after_positive_containment(monk
         )
     evidence.assert_called_once_with(OWNER, DSEQ, "runner")
     client.close_deployment.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Deadline-bounded path (#404). A destructive-path caller must distinguish
+# "the chain sources kept failing in transport" (raise ChainCorroborationUnreachable)
+# from "sources answered but disagreed / returned bad data" (return []).
+# Tests below exercise the deadline-bounded branch in _corroborated_deployment_group_names.
+# They pass deadline=Deadline(budget=0.1) so retries can't run away, and inject a
+# no-op sleep so the test isn't gated on real wall-clock backoff.
+# ---------------------------------------------------------------------------
+
+from just_akash.chain import ChainCorroborationUnreachable  # noqa: E402
+from just_akash.owner_lookup import Deadline  # noqa: E402
+
+
+def _fast_deadline() -> Deadline:
+    """A generous Deadline; the attempt cap and _no_sleep keep the loop fast."""
+    return Deadline(budget=5.0)
+
+
+def _no_sleep(_seconds: float) -> None:
+    """Skip real backoff sleeps so the test isn't gated on wall-clock time."""
+
+
+def test_one_answer_one_unreachable_raises_chain_corroboration_unreachable():
+    """One source answers, the other fails in transport — the partial vote is not authority.
+
+    ⛔ The destructive path must NOT silently swallow this as ``[]`` — that would
+    let an outage look like disagreement. The CLI maps
+    :class:`ChainCorroborationUnreachable` to exit code 75 so a retry loop can
+    distinguish "retrying is waste — the budget is gone" from "the destroy failed".
+    """
+    reader = _reader_for(
+        {
+            ENDPOINTS[0]: _info((1, "runner")),
+            ENDPOINTS[1]: RuntimeError("connection reset"),
+        }
+    )
+    with pytest.raises(ChainCorroborationUnreachable) as excinfo:
+        chain._corroborated_deployment_group_names(
+            OWNER,
+            DSEQ,
+            sources=SOURCES,
+            reader=reader,
+            deadline=_fast_deadline(),
+            sleep=_no_sleep,
+        )
+    # The unreachable dict is keyed by ``source_id`` (not URL) so the operator
+    # can map each failure back to its registered operator + gateway.
+    assert excinfo.value.unreachable == {
+        "source-1": "RuntimeError: connection reset",
+    }
+
+
+def test_both_unreachable_raises_with_both_reasons():
+    """Both sources fail in transport — both reasons surface in the exception."""
+    reader = _reader_for(
+        {
+            ENDPOINTS[0]: RuntimeError("connection refused"),
+            ENDPOINTS[1]: RuntimeError("dns timeout"),
+        }
+    )
+    with pytest.raises(ChainCorroborationUnreachable) as excinfo:
+        chain._corroborated_deployment_group_names(
+            OWNER,
+            DSEQ,
+            sources=SOURCES,
+            reader=reader,
+            deadline=_fast_deadline(),
+            sleep=_no_sleep,
+        )
+    assert excinfo.value.unreachable == {
+        "source-0": "RuntimeError: connection refused",
+        "source-1": "RuntimeError: dns timeout",
+    }
+
+
+def test_retry_then_succeed_within_deadline_returns_consensus():
+    """Source fails once in transport, then answers — consensus succeeds.
+
+    Proves the retry loop RECOVERS from a transient outage instead of
+    marking the source unreachable. Within a 0.1s budget, exponential
+    backoff at 0.25s is clamped by ``deadline.remaining()`` so a single
+    retry is the entire budget's worth of attempts.
+    """
+    call_counts: dict[str, int] = {ENDPOINTS[0]: 0, ENDPOINTS[1]: 0}
+
+    def flaky(_path: str, *, base: str) -> object:
+        call_counts[base] += 1
+        if base == ENDPOINTS[0] and call_counts[base] == 1:
+            raise RuntimeError("transient outage")
+        return _info((1, "runner"))
+
+    assert chain._corroborated_deployment_group_names(
+        OWNER,
+        DSEQ,
+        sources=SOURCES,
+        reader=flaky,
+        deadline=_fast_deadline(),
+        sleep=_no_sleep,
+    ) == ["runner"]
+    assert call_counts[ENDPOINTS[0]] >= 2  # the failing source was retried
+
+
+def test_chain_response_error_returns_empty_not_unreachable():
+    """A 4xx/parse failure (ChainResponseError) is DATA BAD, not an outage.
+
+    ⛔ Retrying a 4xx is pointless — the registry has told us this source
+    cannot answer THIS read. The function must return ``[]`` (consensus
+    fails) and NOT mark the source unreachable.
+    """
+    from just_akash.chain import ChainResponseError
+
+    reader = _reader_for(
+        {
+            ENDPOINTS[0]: _info((1, "runner")),
+            ENDPOINTS[1]: ChainResponseError("404 not found"),
+        }
+    )
+    assert (
+        chain._corroborated_deployment_group_names(
+            OWNER,
+            DSEQ,
+            sources=SOURCES,
+            reader=reader,
+            deadline=_fast_deadline(),
+            sleep=_no_sleep,
+        )
+        == []
+    )
+
+
+def test_deadline_already_expired_yields_unreachable_without_retrying():
+    """A deadline that starts exhausted forces the retry loop to exit on attempt 1.
+
+    Proves the loop honours ``deadline.expired`` after each failed attempt — a
+    zero-budget deadline cannot spend its full retry allowance.
+    """
+    reader = _reader_for(
+        {
+            ENDPOINTS[0]: _info((1, "runner")),
+            ENDPOINTS[1]: RuntimeError("connection refused"),
+        }
+    )
+    # A Deadline constructed with budget=0 has zero remaining time on the
+    # very first check — the retry loop sees ``expired`` immediately.
+    with pytest.raises(ChainCorroborationUnreachable):
+        chain._corroborated_deployment_group_names(
+            OWNER,
+            DSEQ,
+            sources=SOURCES,
+            reader=reader,
+            deadline=Deadline(budget=0.0),
+            sleep=_no_sleep,
+        )
+
+
+def test_deadline_expires_during_request_is_classified_unreachable():
+    """A request that runs past the deadline is recorded as unreachable, not retried.
+
+    ⛔ #404 CodeRabbit review: ``get(path, base=base)`` can block longer than
+    ``deadline.remaining()`` (the injected reader's own 15s socket timeout is
+    not the deadline). ``bounded_call`` joins on the wall clock and the worker
+    is dropped from the JOIN on expiry, but a request that joins-past must be
+    classified the same as a request that the socket refused — "the budget ran
+    out before this source answered" — so the consensus step can record the
+    source as unreachable rather than letting it disappear silently.
+    """
+    # Reader whose payload is a callable that sleeps past the deadline. The
+    # chain retry loop invokes ``lambda: get(path, base=base)`` once per
+    # attempt under bounded_call; we hand the reader a callable that sleeps
+    # long enough to outlive the budget on EVERY attempt, so the loop budget
+    # runs out before the first attempt worker ever finishes.
+    deadline = Deadline(budget=0.05)
+
+    def slow_reader(_path: str, *, base: str) -> dict:
+        time.sleep(0.5)  # outlive the 0.05s deadline
+        return _info((1, "runner"))
+
+    with pytest.raises(ChainCorroborationUnreachable) as ei:
+        chain._corroborated_deployment_group_names(
+            OWNER,
+            DSEQ,
+            sources=SOURCES,
+            reader=slow_reader,
+            deadline=deadline,
+            sleep=_no_sleep,
+        )
+    # Both endpoints should be recorded as unreachable — bounded_call joins
+    # past the deadline on every attempt, so source-0 hits the cap and the
+    # already-exhausted deadline classifies source-1 first attempt the same
+    # way. Two unreachable sources ⇒ ChainCorroborationUnreachable.
+    assert "source-0" in ei.value.unreachable, (
+        f"slow source must be classified unreachable, not silently skipped. "
+        f"Got: {ei.value.unreachable!r}"
+    )
+    assert "source-1" in ei.value.unreachable, (
+        f"second source must also be classified unreachable once the budget "
+        f"is exhausted. Got: {ei.value.unreachable!r}"
+    )
+    # And the reason must be the bounded_call verdict, not a generic timeout.
+    assert "deadline" in ei.value.unreachable["source-0"].lower(), (
+        f"unreachable reason must mention the deadline, not a socket-level "
+        f"timeout. Got: {ei.value.unreachable['source-0']!r}"
+    )
+
+
+def test_effect_mutation_collapsing_unreachable_to_empty_must_go_red():
+    """A mutation that drops the unreachable branch and returns [] is the regression.
+
+    ⛔ The destructive-path caller needs to TELL unreachable from disagreement. A
+    mutation that collapses the ``raise ChainCorroborationUnreachable`` branch
+    into ``return []`` would silently re-introduce the BB#2188-style "an outage
+    is not ownership evidence" defect. This test proves the mutation is wired
+    to the assertion by checking the function source code shape.
+    """
+    source = inspect.getsource(chain._corroborated_deployment_group_names)
+    target = "raise ChainCorroborationUnreachable(unreachable)"
+    assert source.count(target) == 1, (
+        "the unreachable branch must appear exactly once — a collapse-to-empty "
+        "mutation must be detectable by removing this exact line"
+    )
+    # The mutant: replace the unreachable raise with the disagree path's return.
+    mutant_source = source.replace(
+        target,
+        "return []",
+        1,
+    )
+    mutant = _mutated_consensus(mutant_source)
+    reader = _reader_for(
+        {
+            ENDPOINTS[0]: _info((1, "runner")),
+            ENDPOINTS[1]: RuntimeError("connection reset"),
+        }
+    )
+    # The real function still raises — the destructive verdict survives.
+    with pytest.raises(ChainCorroborationUnreachable):
+        chain._corroborated_deployment_group_names(
+            OWNER,
+            DSEQ,
+            sources=SOURCES,
+            reader=reader,
+            deadline=_fast_deadline(),
+            sleep=_no_sleep,
+        )
+    # The mutant silently swallows the unreachable as disagreement — the bug.
+    assert (
+        mutant(
+            OWNER,
+            DSEQ,
+            sources=SOURCES,
+            reader=reader,
+            deadline=_fast_deadline(),
+            sleep=_no_sleep,
+        )
+        == []
+    )
+
+
+def test_legacy_deadline_none_path_is_unchanged_by_deadline_bounded_path():
+    """A caller that does not pass a deadline gets the ORIGINAL single-shot semantics.
+
+    Proves the legacy path survives — transport failures are silently skipped,
+    not retried, and an outage does NOT raise ChainCorroborationUnreachable.
+    """
+    reader = _reader_for(
+        {
+            ENDPOINTS[0]: _info((1, "runner")),
+            ENDPOINTS[1]: RuntimeError("connection refused"),
+        }
+    )
+    # No deadline kwarg ⇒ legacy path. Surviving source votes; consensus is 1
+    # snapshot (one unreadable source, which is the legacy semantics). Returns
+    # ``[]`` because the consensus requires 2 voters.
+    assert (
+        chain._corroborated_deployment_group_names(OWNER, DSEQ, sources=SOURCES, reader=reader)
+        == []
+    )
