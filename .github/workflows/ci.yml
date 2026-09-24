@@ -108,7 +108,7 @@ jobs:
     name: Unit tests
     runs-on: ubuntu-latest
     # Bound the job: a hung test otherwise holds a billed runner for the 6 h default and
-    # hides its log (logs only publish at job end). The suite takes ~6-8 min.
+    # hides its REST job log (GET /actions/jobs/{id}/logs 404s until the job ends). The suite takes ~6-8 min.
     timeout-minutes: 20
     steps:
       - name: Checkout
