@@ -21,11 +21,23 @@ import hashlib
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any, cast
+
+from .owner_lookup import Deadline, bounded_call
+
+# 🐢 #404 unreachability retry budget. Exponential backoff initial/milli-second-of-CPU
+# at most, capped per step. The defaults match what runner-teardown.yml's outer loop
+# already accepts: a handful of attempts inside a 30s wallet step, so an outage is
+# recovered by the source itself rather than by a caller re-running the resolve.
+_CHAIN_BORROBORATION_RETRY_INITIAL_BACKOFF_SECONDS = 0.25
+_CHAIN_BORROBORATION_RETRY_MAX_BACKOFF_SECONDS = 4.0
+_CHAIN_BORROBORATION_RETRY_MAX_ATTEMPTS = 5
 
 # Companion to the default AKASH_NODE (akash-rpc.publicnode.com): the same provider's
 # REST/LCD host. A public default matches how AKASH_NODE already defaults.
@@ -127,6 +139,25 @@ _DENOM_META = {
 
 class ChainResponseError(RuntimeError):
     """A chain endpoint answered, but its response cannot support the requested read."""
+
+
+class ChainCorroborationUnreachable(RuntimeError):
+    """One or more registered chain sources did not answer within the deadline
+    (#404). Distinct from disagreement or "answered-but-bad-data" — every
+    unreachability here is a transport-level failure or a transport-shaped
+    error code after the deadline expired.
+
+    Carries the unreachability map ``{source_id: reason}`` so callers can report
+    which host failed and why without re-querying. A ``RuntimeError`` subclass
+    so an existing ``except RuntimeError`` handler still traps the call.
+    """
+
+    def __init__(self, unreachable: dict[str, str]) -> None:
+        super().__init__(
+            "registered chain sources did not answer within the deadline: "
+            + ", ".join(f"{sid}: {reason}" for sid, reason in unreachable.items())
+        )
+        self.unreachable = unreachable
 
 
 def rest_url() -> str:
@@ -438,6 +469,8 @@ def _corroborated_deployment_group_names(
     reader,
     expected_group: str | None = None,
     expected_population: tuple[tuple[str, str], ...] | None = None,
+    deadline: Deadline | None = None,
+    sleep: Callable[[float], Any] | None = None,
 ) -> list[str]:
     """Return all group names only when two independent chain sources agree.
 
@@ -450,6 +483,16 @@ def _corroborated_deployment_group_names(
 
     A malformed, truncated, missing, single-source, or disagreeing population is
     unknown and returns ``[]``. Console is not a vote in this consensus.
+
+    ⛔ AN UNREACHABLE SOURCE IS NOT AN EMPTY VOTE (#404). With ``deadline=None``
+    the function preserves its legacy behaviour: every transport-level failure is
+    silently skipped and a deadline-less single-vote consensus still returns ``[]``
+    for downstream `RuntimeError`. With a ``Deadline`` (wall-clock budget) each
+    unreachable source is retried within the budget with exponential backoff and,
+    if it still has not answered when the budget expires, the function raises
+    :class:`ChainCorroborationUnreachable` carrying the per-host reason. ``[]``
+    after retries is reserved for the case where sources DID answer but disagreed
+    or returned bad data — never for "we couldn't reach them".
     """
 
     if not owner or not dseq:
@@ -466,6 +509,9 @@ def _corroborated_deployment_group_names(
     operators: set[str] = set()
     ancestries: set[str] = set()
     cache_ancestries: set[str] = set()
+    # Per (source_id, reason). Filled by the unreachable branch ONLY; the disagreement
+    # branch never reaches here because disagreements use snapshots == [] differently.
+    unreachable: dict[str, str] = {}
     for source in candidates:
         if not isinstance(source, dict):
             return []
@@ -520,6 +566,78 @@ def _corroborated_deployment_group_names(
         operators.add(cast(str, operator))
         ancestries.add(cast(str, ancestry))
         cache_ancestries.add(cast(str, cache_ancestry))
+        # ⛔ A LEGACY CALLER (deadline=None) keeps the original semantics: one
+        # attempt per source, transport failures silently skipped, the function
+        # returns ``[]`` for downstream disagreement detection. The retry +
+        # raise path lives strictly behind the deadline-bounded branch.
+        if deadline is not None:
+            # Deadline-bounded path. One source, multiple attempts, exponential
+            # backoff, retries stop the moment the deadline expires (a
+            # zero-budget deadline still makes exactly one attempt). Same
+            # per-source classification as legacy, but "the source kept failing"
+            # is now an explicit verdict rather than a silent skip.
+            source_answered = False
+            source_data_bad = False
+            source_unreachable_reason: str | None = None
+            backoff_local = _CHAIN_BORROBORATION_RETRY_INITIAL_BACKOFF_SECONDS
+            for attempt in range(1, _CHAIN_BORROBORATION_RETRY_MAX_ATTEMPTS + 1):
+                # A zero-budget deadline still permits one bounded attempt so callers
+                # can classify the source; no retry may begin after the budget expires.
+                if attempt > 1 and deadline.expired:
+                    break
+                try:
+                    # ⛔ Capture ``base`` by argument default — a closure over the
+                    # loop variable would be B023 and would alias the WRONG
+                    # ``base`` once the for-loop reassigned it for the next source.
+                    answered, data = bounded_call(
+                        lambda _base=base: get(path, base=_base), deadline
+                    )
+                    if not answered:
+                        source_unreachable_reason = "deadline expired during request"
+                        break
+                except ChainResponseError:
+                    # "Source answered, data is bad" - a 4xx/parse/pinned-height
+                    # failure. This is NOT an outage: the registry has told us
+                    # we cannot trust this source for THIS read, and retrying
+                    # the same query is pointless. Record a permanent rebuttal
+                    # and let the consensus step decide (return [] -> downstream
+                    # RuntimeError).
+                    source_data_bad = True
+                    break
+                except Exception as exc:  # noqa: BLE001 - outage; classify below
+                    source_unreachable_reason = (f"{type(exc).__name__}: {exc}")[:240]
+                    if attempt >= _CHAIN_BORROBORATION_RETRY_MAX_ATTEMPTS or deadline.expired:
+                        break
+                    wait = min(backoff_local, deadline.remaining())
+                    if wait > 0:
+                        if sleep is not None:
+                            sleep(wait)
+                        else:
+                            time.sleep(wait)
+                    backoff_local = min(
+                        backoff_local * 2,
+                        _CHAIN_BORROBORATION_RETRY_MAX_BACKOFF_SECONDS,
+                    )
+                    continue
+                # Success path: parse and validate.
+                if not isinstance(data, dict):
+                    source_data_bad = True
+                    break
+                snapshot = _deployment_group_snapshot(data, owner, dseq)
+                if snapshot is None:
+                    source_data_bad = True
+                    break
+                snapshots.append(snapshot)
+                source_answered = True
+                break
+            if source_data_bad:
+                return []
+            if not source_answered:
+                # Loop exited via deadline/attempt cap and this source never answered.
+                if source_unreachable_reason is None:  # invariant: caught above
+                    return []
+                unreachable[cast(str, source_id)] = source_unreachable_reason
+            continue
         try:
             data = get(path, base=base)
         except ChainResponseError:
@@ -533,6 +651,12 @@ def _corroborated_deployment_group_names(
             return []
         snapshots.append(snapshot)
     if len(snapshots) < 2:
+        if unreachable:
+            # ⛔ Two-and-more unanswered is the destructive-path unreachability
+            # verdict. The CLI maps this to OWNER_LOOKUP_UNREACHABLE_EXIT_CODE so
+            # callers can distinguish it from "sources disagreed" (which still
+            # surfaces as ``[]`` → wallet_pool RuntimeError → exit 1).
+            raise ChainCorroborationUnreachable(unreachable)
         return []
     if any(snapshot != snapshots[0] for snapshot in snapshots[1:]):
         return []
@@ -543,8 +667,21 @@ def _corroborated_deployment_group_names(
     return [name for _gseq, name in snapshots[0]]
 
 
-def corroborated_deployment_group_names(owner: str, dseq: str, expected_group: str) -> list[str]:
-    """Closed-registry containment evidence; it is not fresh/finalized authority."""
+def corroborated_deployment_group_names(
+    owner: str,
+    dseq: str,
+    expected_group: str,
+) -> list[str]:
+    """Closed-registry containment evidence; it is not fresh/finalized authority.
+
+    The destructive-path callers (wallet_pool + runner-teardown.yml #404) need to
+    distinguish a half-answered consensus from a disagreeing one. This wrapper
+    always passes a default ``Deadline()`` so unreachable sources surface as
+    :class:`ChainCorroborationUnreachable` rather than the legacy bare ``[]``
+    that the old wrapper returned for both outcomes. Tests that need to
+    override the deadline pass it through ``_corroborated_deployment_group_names``
+    directly (keyword-only).
+    """
     if not re.fullmatch(r"[1-9][0-9]{0,19}", dseq) or int(dseq) > 2**64 - 1:
         return []
     if os.environ.get("AKASH_REST_URL") is not None:
@@ -554,12 +691,14 @@ def corroborated_deployment_group_names(owner: str, dseq: str, expected_group: s
         != OWNER_CORROBORATION_REGISTRY_SHA256
     ):
         return []
+
     return _corroborated_deployment_group_names(
         owner,
         dseq,
         sources=OWNER_CORROBORATION_SOURCES_V2,
         reader=_lcd_get,
         expected_group=expected_group,
+        deadline=Deadline(),
     )
 
 

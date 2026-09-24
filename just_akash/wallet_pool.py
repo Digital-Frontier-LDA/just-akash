@@ -18,8 +18,10 @@ from akash_lease_core import WalletCandidate, WalletPolicy, rank_wallets
 
 from . import chain
 from .api import AkashConsoleAPI, _extract_dseq
+from .chain import ChainCorroborationUnreachable
 from .owner_lookup import (
     OWNER_LOOKUP_DEADLINE_SECONDS,
+    OWNER_LOOKUP_UNREACHABLE,
     Deadline,
     OwnerLookupUnresolved,
     ask,
@@ -431,7 +433,23 @@ def _raw_client_for_bound_owner(
                 else "(every credential lookup failed for a non-transport reason)"
             ),
         )
-    names = chain.corroborated_deployment_group_names(expected_owner, dseq, expected_group)
+    try:
+        names = chain.corroborated_deployment_group_names(expected_owner, dseq, expected_group)
+    except ChainCorroborationUnreachable as unreachable:
+        # ⛔ REPUBLISH AS A CONSUMER-RESOLVABLE VERDICT (#404). The chain module
+        # deliberately does not import owner_lookup's verdict table (it would
+        # couple a read-only chain helper to the Console-aware typology); the
+        # translation lives at the destructive boundary instead, where the
+        # caller already has the lexicon and the exit-code mapping. The
+        # resolved owner at this point is "no configured Console credential was
+        # proven to be the expected owner": the consensus half read, the other
+        # half did not, and the gate has the receipt of which source failed.
+        sources = ", ".join(f"{sid}: {reason}" for sid, reason in unreachable.unreachable.items())
+        raise OwnerLookupUnresolved(
+            OWNER_LOOKUP_UNREACHABLE,
+            f"chain corroboration did not prove the expected group because one or "
+            f"more registered sources did not answer within its budget ({sources})",
+        ) from unreachable
     if names != [expected_group]:
         raise RuntimeError("owner-bound containment did not prove exact gseq=1 singleton")
     return matching[0]
