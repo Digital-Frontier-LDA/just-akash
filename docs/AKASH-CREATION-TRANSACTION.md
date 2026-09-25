@@ -224,7 +224,7 @@ not the authoritative sink.
 | State | Meaning | May report success? | Recovery action |
 |---|---|---:|---|
 | `prepared` | Signer, backend, intent, atomically allocated ordinal, and all groups are durable; create may not have been attempted | No | Reconcile the exact owner and complete identity candidate set before retrying |
-| `create_outcome_unknown` | Create transport failed without proving non-commit | No | Scan the exact owner and complete identity; multiple candidates remain unresolved |
+| `create_outcome_unknown` | Create transport failed without proving non-commit | No | Reconcile only after a bounded, complete owner-and-identity query has converged across chain/indexer, confirms there are no pending transactions or pages left to read, and finds no candidate; otherwise keep unresolved and prohibit retry |
 | `created` | Response DSEQ/transaction evidence and direct-chain owner/DSEQ/group binding agree; `DeploymentKey` is durable | No | Continue or compensate with creator capability |
 | `handed_off` | Caller received a bound deployment/lease | Yes, for creation only | Later lifecycle authority owns cleanup |
 | `compensation_requested` | Pre-handoff failure requires close | No | Close through creator capability, then prove |
