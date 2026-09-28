@@ -286,3 +286,13 @@ def test_a_single_page_after_a_multi_page_pass_must_match_it(monkeypatch):
     out = _client(shrinking, monkeypatch).list_deployments(active_only=False)
     assert len(out) == 42
     assert _skips(fake) == [0, 100, 0, 0]
+
+
+def test_a_paged_listing_cannot_end_on_a_page_without_pagination(monkeypatch):
+    """CodeRabbit: page 1 is full and says total=150; page 2 comes back empty with no
+    pagination. With no total to check, two identical passes returned 100 of 150."""
+    rows = [_row(i) for i in range(150)]
+    bare_end = {"data": {"deployments": []}}
+    fake = FakeConsole(rows, has_more=False, script={n: bare_end for n in (2, 4, 6)})
+    with pytest.raises(RuntimeError, match="no pagination to confirm the end"):
+        _client(fake, monkeypatch).list_deployments(active_only=False)
