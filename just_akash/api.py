@@ -196,7 +196,8 @@ class AkashConsoleAPI:
     # `len(deployments) >= LIST_LIMIT` warning was effectively unreachable at 1000 and
     # reachable at 100. Since 2026-09-28 a full page fetches the next page instead.
     LIST_LIMIT = 100
-    # A listing that cannot be made consistent in this many whole passes RAISES.
+    # This many INCONSISTENT whole passes RAISE (a multi-page listing also needs a
+    # second, identical pass before it is trusted).
     LIST_ATTEMPTS = 3
     LIST_RETRY_SLEEP_S = 2.0
     # 50 pages x 100 = 5000 deployments; past that, a server ignoring `skip` is likelier.
@@ -356,9 +357,16 @@ class AkashConsoleAPI:
           * fetches the next page whenever a page is FULL or `hasMore` is true, so it
             completes whether or not the server's `hasMore` is truthful;
           * treats a page as inconsistent when it is empty while `hasMore` is true, or
-            is the last page while `total` agrees with neither `skip + rows` nor `rows`
-            (the silent-empty page reads `total=1`), or repeats a dseq already seen
-            (the set moved under `skip`, or `skip` was ignored);
+            is the last page while `total != skip + rows` (the silent-empty page reads
+            `total=1`; a short last page reporting only its own size is refused too), or
+            repeats a dseq already seen (the set moved under `skip`, or `skip` was
+            ignored);
+          * accepts a MULTI-page listing only when a second whole pass returns the same
+            dseqs in the same order: a deployment closed between page reads shifts a
+            live row onto a page already read, and `total` shrinks with it, so no
+            single pass can see the loss;
+          * warns when a page carries no pagination at all (every check above is then
+            blind; the live Console sends `data.pagination`);
           * on any inconsistency restarts the WHOLE pass (a page retried alone cannot
             repair rows that shifted between pages) and raises after LIST_ATTEMPTS;
           * raises past LIST_MAX_PAGES rather than looping on a server that ignores skip.
@@ -369,24 +377,36 @@ class AkashConsoleAPI:
         chain.list_active_deployments) is independent of the Console.
         `active_only` is still filtered here, client side, after the complete listing.
         """
-        why = ""
-        for attempt in range(1, self.LIST_ATTEMPTS + 1):
-            deployments, why = self._list_deployments_pass()
-            if deployments is not None:
+        confirmed: list[str | None] | None = None
+        failures = 0
+        while True:
+            rows, why, pages = self._list_deployments_pass()
+            if rows is not None and pages == 1:
+                deployments = rows
                 break
-            if attempt < self.LIST_ATTEMPTS:
-                print(
-                    f"WARNING: list_deployments pass {attempt}/{self.LIST_ATTEMPTS} was "
-                    f"inconsistent ({why}); restarting the listing.",
-                    file=sys.stderr,
+            if rows is not None:
+                seq = [_extract_dseq(d) for d in rows]
+                if seq == confirmed:
+                    deployments = rows
+                    break
+                if confirmed is None:
+                    confirmed = seq  # a multi-page listing is only trusted twice over
+                    continue
+                confirmed = seq
+                why = "a multi-page listing changed between two passes"
+            failures += 1
+            if failures >= self.LIST_ATTEMPTS:
+                raise RuntimeError(
+                    f"list_deployments: the Console listing stayed inconsistent across "
+                    f"{self.LIST_ATTEMPTS} passes ({why}). Refusing to report a possibly "
+                    "partial account — a missing row must not look like 'nothing to do'."
                 )
-                time.sleep(self.LIST_RETRY_SLEEP_S)
-        else:
-            raise RuntimeError(
-                f"list_deployments: the Console listing stayed inconsistent across "
-                f"{self.LIST_ATTEMPTS} passes ({why}). Refusing to report a possibly "
-                "partial account — a missing row must not look like 'nothing to do'."
+            print(
+                f"WARNING: list_deployments pass was inconsistent ({why}); "
+                f"restarting the listing ({failures}/{self.LIST_ATTEMPTS}).",
+                file=sys.stderr,
             )
+            time.sleep(self.LIST_RETRY_SLEEP_S)
         if active_only:
             result = []
             for d in deployments:
@@ -429,33 +449,41 @@ class AkashConsoleAPI:
         rows = [d for d in raw if isinstance(d, dict)]
         return rows, len(raw), pagination if isinstance(pagination, dict) else {}
 
-    def _list_deployments_pass(self) -> tuple[list[dict[str, Any]] | None, str]:
-        """One whole listing from skip=0: (rows, "") or (None, why it is inconsistent)."""
+    def _list_deployments_pass(self) -> tuple[list[dict[str, Any]] | None, str, int]:
+        """One whole listing from skip=0: (rows, "", pages) or (None, why, pages)."""
         rows_out: list[dict[str, Any]] = []
         seen: set[str] = set()
         skip = 0
-        for _ in range(self.LIST_MAX_PAGES):
+        for page_no in range(1, self.LIST_MAX_PAGES + 1):
             rows, n_raw, pg = self._list_deployments_page(skip)
+            if not pg:
+                print(
+                    f"WARNING: list_deployments page at skip={skip} carries no pagination; "
+                    "its completeness cannot be checked.",
+                    file=sys.stderr,
+                )
             has_more = pg.get("hasMore") is True
             total = pg.get("total")
             total = total if isinstance(total, int) and not isinstance(total, bool) else None
             if n_raw == 0 and has_more:
-                return None, f"empty page at skip={skip} with hasMore=true"
+                return None, f"empty page at skip={skip} with hasMore=true", page_no
             for d in rows:
                 dseq = _extract_dseq(d)
                 if dseq is not None:
                     if dseq in seen:
-                        return None, f"dseq {dseq} repeated at skip={skip}"
+                        return None, f"dseq {dseq} repeated at skip={skip}", page_no
                     seen.add(dseq)
                 rows_out.append(d)
             if has_more or n_raw >= self.LIST_LIMIT:
                 skip += n_raw
                 continue
-            if total is not None and total not in (skip + n_raw, n_raw):
-                return None, (
-                    f"last page at skip={skip} has {n_raw} rows but reports total={total}"
+            if total is not None and total != skip + n_raw:
+                return (
+                    None,
+                    (f"last page at skip={skip} has {n_raw} rows but reports total={total}"),
+                    page_no,
                 )
-            return rows_out, ""
+            return rows_out, "", page_no
         raise RuntimeError(
             f"list_deployments: still paging after {self.LIST_MAX_PAGES} pages of "
             f"{self.LIST_LIMIT}; refusing to guess (is the server ignoring skip?)."

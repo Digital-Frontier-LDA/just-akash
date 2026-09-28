@@ -65,23 +65,73 @@ def test_an_account_larger_than_one_page_is_listed_completely(monkeypatch):
     fake = FakeConsole([_row(i) for i in range(250)])
     out = _client(fake, monkeypatch).list_deployments(active_only=False)
     assert [d["dseq"] for d in out] == [str(i) for i in range(250)]
-    assert _skips(fake) == [0, 100, 200]
+    # A multi-page listing is read twice and trusted only when both passes agree.
+    assert _skips(fake) == [0, 100, 200, 0, 100, 200]
 
 
 def test_paging_does_not_trust_hasmore(monkeypatch):
-    """An older live reading had `hasMore` always false and `total` = the page size.
-    A FULL page must still fetch the next one, or that server truncates silently."""
-    fake = FakeConsole([_row(i) for i in range(150)], has_more=False, total="rows")
+    """An older live reading had `hasMore` always false. A FULL page must still fetch
+    the next one, or such a server truncates silently."""
+    fake = FakeConsole([_row(i) for i in range(150)], has_more=False)
     out = _client(fake, monkeypatch).list_deployments(active_only=False)
     assert len(out) == 150
-    assert _skips(fake) == [0, 100]
+    assert _skips(fake) == [0, 100, 0, 100]
 
 
 def test_exactly_one_full_page_ends_on_an_empty_page(monkeypatch):
-    fake = FakeConsole([_row(i) for i in range(100)], has_more=False, total="rows")
+    fake = FakeConsole([_row(i) for i in range(100)], has_more=False)
     out = _client(fake, monkeypatch).list_deployments(active_only=False)
     assert len(out) == 100
-    assert _skips(fake) == [0, 100]
+    assert _skips(fake) == [0, 100, 0, 100]
+
+
+def test_a_server_whose_total_is_the_page_size_cannot_confirm_page_two(monkeypatch):
+    """The older reading also had `total` = the returned page size. Past page 1 that
+    cannot tell a complete list from a truncated one, so it is refused, not trusted."""
+    fake = FakeConsole([_row(i) for i in range(150)], has_more=False, total="rows")
+    with pytest.raises(RuntimeError, match="reports total=50"):
+        _client(fake, monkeypatch).list_deployments(active_only=False)
+
+
+def test_a_short_last_page_reporting_only_its_own_size_is_refused(monkeypatch):
+    """Review probe: 100 rows (total=142, hasMore) then 1 row reporting total=1. The
+    old `total == rows` allowance returned 101 of 142 with no error."""
+    rows = [_row(i) for i in range(142)]
+    short = {
+        "data": {
+            "deployments": rows[100:101],
+            "pagination": {"total": 1, "skip": 100, "limit": 100, "hasMore": False},
+        }
+    }
+    fake = FakeConsole(rows, script={n: short for n in (2, 4, 6)})
+    with pytest.raises(RuntimeError, match="reports total=1"):
+        _client(fake, monkeypatch).list_deployments(active_only=False)
+
+
+def test_a_deployment_closed_between_page_reads_is_not_lost(monkeypatch):
+    """Review probe: 142 rows; dseq 5 closes after page 1 is read. Every later row shifts
+    up one, so live dseq 100 lands on page 1 (already read) and `total` drops to 141:
+    one pass is self-consistent and silently misses dseq 100. The second, identical
+    pass is what notices."""
+    fake = FakeConsole([_row(i) for i in range(142)])
+
+    def closing(method, path, *a, **kw):
+        out = fake(method, path, *a, **kw)
+        if len(fake.calls) == 1:
+            del fake.rows[5]
+        return out
+
+    out = _client(closing, monkeypatch).list_deployments(active_only=False)
+    got = [d["dseq"] for d in out]
+    assert "100" in got and "5" not in got
+    assert got == [str(i) for i in range(142) if i != 5]
+
+
+def test_a_page_without_pagination_warns(monkeypatch, capsys):
+    """Review probe: with no pagination every check is blind, so say so."""
+    fake = FakeConsole([], script={1: {"data": {"deployments": []}}})
+    assert _client(fake, monkeypatch).list_deployments() == []
+    assert "carries no pagination" in capsys.readouterr().err
 
 
 def test_a_short_first_page_is_one_request(monkeypatch):
@@ -143,7 +193,7 @@ def test_an_empty_page_that_claims_more_restarts_the_listing(monkeypatch):
     fake = FakeConsole(rows, script={2: empty_more})
     out = _client(fake, monkeypatch).list_deployments(active_only=False)
     assert len(out) == 150
-    assert _skips(fake) == [0, 100, 0, 100]
+    assert _skips(fake) == [0, 100, 0, 100, 0, 100]
 
 
 def test_a_last_page_short_of_total_restarts_the_listing(monkeypatch):
