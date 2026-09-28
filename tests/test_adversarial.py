@@ -901,7 +901,7 @@ class TestListDeploymentsFailsLoud:
         ]
         # Two pages, read twice: a multi-page listing is trusted only when repeated.
         mock_req.side_effect = [
-            {"data": {"deployments": rows}},
+            {"data": {"deployments": rows, "pagination": {"total": 101, "hasMore": True}}},
             {"data": {"deployments": [{"deployment": {"state": "active"}, "dseq": "extra"}]}},
         ] * 2
         result = AkashConsoleAPI("key").list_deployments(active_only=False)
@@ -2689,7 +2689,8 @@ class TestVeryLargeJsonResponse:
             ]
         }
         # A page past the ceiling fetches the next one (#408); answer it with the end.
-        mock_req.side_effect = [large_response, {"data": []}] * 2
+        paged = {**large_response, "pagination": {"total": 10000, "hasMore": False}}
+        mock_req.side_effect = [paged, {"data": []}] * 2
         client = AkashConsoleAPI("key")
         result = client.list_deployments()
         assert len(result) == 10000

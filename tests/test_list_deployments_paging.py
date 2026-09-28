@@ -30,7 +30,7 @@ class FakeConsole:
         self.calls.append(path)
         if len(self.calls) in self.script:
             return self.script[len(self.calls)]
-        limit = int(re.search(r"[?&]limit=(\d+)", path).group(1))
+        limit = int(_q(path, "limit"))
         m = re.search(r"[?&]skip=(\d+)", path)
         skip = int(m.group(1)) if m else 0
         page = self.rows[skip : skip + limit]
@@ -56,8 +56,14 @@ def _client(fake, monkeypatch):
     return c
 
 
+def _q(path, name):
+    m = re.search(rf"[?&]{name}=(\d+)", path)
+    assert m is not None, f"{name} missing from {path!r}"
+    return m.group(1)
+
+
 def _skips(fake):
-    return [int(re.search(r"skip=(\d+)", p).group(1)) for p in fake.calls]
+    return [int(_q(p, "skip")) for p in fake.calls]
 
 
 def test_an_account_larger_than_one_page_is_listed_completely(monkeypatch):
@@ -214,7 +220,7 @@ def test_a_last_page_short_of_total_restarts_the_listing(monkeypatch):
 def test_a_server_ignoring_skip_raises_instead_of_duplicating(monkeypatch):
     """Every page repeats the first: a dseq seen twice. Never returns 200 rows of 100."""
     rows = [_row(i) for i in range(100)]
-    same = {"data": {"deployments": rows}}
+    same = {"data": {"deployments": rows, "pagination": {"total": 200, "hasMore": True}}}
     fake = FakeConsole(rows, script={n: same for n in range(1, 20)})
     with pytest.raises(RuntimeError, match="repeated"):
         _client(fake, monkeypatch).list_deployments(active_only=False)
@@ -246,7 +252,7 @@ def test_paging_is_capped(monkeypatch):
         return {
             "data": {
                 "deployments": [_row(base + i) for i in range(100)],
-                "pagination": {"hasMore": True},
+                "pagination": {"total": 10**6, "hasMore": True},
             }
         }
 
@@ -254,3 +260,29 @@ def test_paging_is_capped(monkeypatch):
     with pytest.raises(RuntimeError, match="still paging"):
         c.list_deployments()
     assert counter["n"] == AkashConsoleAPI.LIST_MAX_PAGES
+
+
+def test_a_full_page_without_pagination_does_not_extend_the_listing(monkeypatch):
+    """CodeRabbit: continuing past a full page with no `total`/`hasMore` builds a
+    multi-page listing nothing can check. Refused, then raised."""
+    rows = [_row(i) for i in range(100)]
+    bare = {"data": {"deployments": rows}}
+    fake = FakeConsole(rows, script={n: bare for n in range(1, 10)})
+    with pytest.raises(RuntimeError, match="without an integer total"):
+        _client(fake, monkeypatch).list_deployments(active_only=False)
+
+
+def test_a_single_page_after_a_multi_page_pass_must_match_it(monkeypatch):
+    """CodeRabbit: 150 rows over two pages, then 42 on one page. The one-page pass is
+    self-consistent but contradicts the pass before it, so it needs confirming too."""
+    fake = FakeConsole([_row(i) for i in range(150)])
+
+    def shrinking(method, path, *a, **kw):
+        out = fake(method, path, *a, **kw)
+        if len(fake.calls) == 2:
+            del fake.rows[42:]
+        return out
+
+    out = _client(shrinking, monkeypatch).list_deployments(active_only=False)
+    assert len(out) == 42
+    assert _skips(fake) == [0, 100, 0, 0]

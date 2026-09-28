@@ -365,8 +365,9 @@ class AkashConsoleAPI:
             dseqs in the same order: a deployment closed between page reads shifts a
             live row onto a page already read, and `total` shrinks with it, so no
             single pass can see the loss;
-          * warns when a page carries no pagination at all (every check above is then
-            blind; the live Console sends `data.pagination`);
+          * refuses to CONTINUE past a page lacking an integer `total` and a boolean
+            `hasMore`, and warns when a short page carries no pagination at all (its
+            checks are then blind; the live Console sends `data.pagination`);
           * on any inconsistency restarts the WHOLE pass (a page retried alone cannot
             repair rows that shifted between pages) and raises after LIST_ATTEMPTS;
           * raises past LIST_MAX_PAGES rather than looping on a server that ignores skip.
@@ -381,7 +382,9 @@ class AkashConsoleAPI:
         failures = 0
         while True:
             rows, why, pages = self._list_deployments_pass()
-            if rows is not None and pages == 1:
+            # One page is self-checked, unless a multi-page pass was already seen: then a
+            # sudden single page must match it like any other pass.
+            if rows is not None and pages == 1 and confirmed is None:
                 deployments = rows
                 break
             if rows is not None:
@@ -475,6 +478,15 @@ class AkashConsoleAPI:
                     seen.add(dseq)
                 rows_out.append(d)
             if has_more or n_raw >= self.LIST_LIMIT:
+                if not isinstance(pg.get("hasMore"), bool) or total is None:
+                    return (
+                        None,
+                        (
+                            f"page at skip={skip} continues the listing without an integer "
+                            "total and a boolean hasMore"
+                        ),
+                        page_no,
+                    )
                 skip += n_raw
                 continue
             if total is not None and total != skip + n_raw:
