@@ -13,6 +13,7 @@ import contextlib
 import json
 import logging
 import os
+import secrets
 import sys
 import tempfile
 import time
@@ -224,6 +225,13 @@ class AkashConsoleAPI:
         data: dict[str, Any] | None = None,
     ) -> Any:
         url = f"{self.base_url}{endpoint}"
+        if method.upper() == "GET":
+            # A cache in front of the Console API can answer a GET from an earlier
+            # response to the same URL (measured: cf-cache-status HIT, max-age=30), so a
+            # read may be stale. A per-request unique parameter keeps every read fresh;
+            # a `Cache-Control: no-cache` request header was measured NOT to prevent it.
+            sep = "&" if "?" in endpoint else "?"
+            url = f"{url}{sep}_cb={secrets.token_hex(8)}"
 
         logger.debug(
             f"[{_ts()}] API {method} {endpoint} data={json.dumps(data) if data else 'none'}"
