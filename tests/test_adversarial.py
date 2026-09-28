@@ -891,26 +891,34 @@ class TestListDeploymentsFailsLoud:
         )
 
     @patch.object(AkashConsoleAPI, "_request")
-    def test_hitting_the_ceiling_warns(self, mock_req, capsys):
-        """At the ceiling, truncated and complete are indistinguishable — say so.
-
-        This warning was effectively unreachable at LIST_LIMIT=1000 and is reachable
-        at 100, so it is now load-bearing rather than decorative.
-        """
+    def test_hitting_the_ceiling_fetches_the_next_page(self, mock_req, capsys):
+        """At the ceiling the old code could only WARN that the list may be truncated.
+        It now asks for the next page (#408); tests/test_list_deployments_paging.py
+        covers the paging rules in full."""
         rows = [
             {"deployment": {"state": "active"}, "dseq": str(i)}
             for i in range(AkashConsoleAPI.LIST_LIMIT)
         ]
-        mock_req.return_value = {"data": {"deployments": rows}}
-        AkashConsoleAPI("key").list_deployments(active_only=False)
-        assert "may be TRUNCATED" in capsys.readouterr().err
+        # Two pages, read twice: a multi-page listing is trusted only when repeated.
+        mock_req.side_effect = [
+            {"data": {"deployments": rows, "pagination": {"total": 101, "hasMore": True}}},
+            {
+                "data": {
+                    "deployments": [{"deployment": {"state": "active"}, "dseq": "extra"}],
+                    "pagination": {"total": 101, "hasMore": False},
+                }
+            },
+        ] * 2
+        result = AkashConsoleAPI("key").list_deployments(active_only=False)
+        assert len(result) == AkashConsoleAPI.LIST_LIMIT + 1
+        assert f"skip={AkashConsoleAPI.LIST_LIMIT}" in mock_req.call_args_list[1][0][1]
+        assert "TRUNCATED" not in capsys.readouterr().err
 
     @patch.object(AkashConsoleAPI, "_request")
-    def test_one_below_the_ceiling_does_not_warn(self, mock_req, capsys):
-        """THE OTHER HALF. Without this, a warning that fires ALWAYS also passes.
+    def test_one_below_the_ceiling_is_one_request(self, mock_req, capsys):
+        """THE OTHER HALF. A short page is the last page: no second request.
 
-        `test_hitting_the_ceiling_warns` alone cannot tell a correct boundary from a
-        `>= 0` comparison, so it cannot detect an off-by-one in either direction.
+        Without this, a loop that ALWAYS fetches another page also passes the test above.
         """
         rows = [
             {"deployment": {"state": "active"}, "dseq": str(i)}
@@ -919,9 +927,9 @@ class TestListDeploymentsFailsLoud:
         mock_req.return_value = {"data": {"deployments": rows}}
         result = AkashConsoleAPI("key").list_deployments(active_only=False)
 
-        # NON-VACUITY: if the rows were dropped, "no warning" would be trivially true.
+        # NON-VACUITY: if the rows were dropped, "one request" would be trivially true.
         assert len(result) == AkashConsoleAPI.LIST_LIMIT - 1
-        assert "may be TRUNCATED" not in capsys.readouterr().err
+        assert mock_req.call_count == 1
 
     @patch.object(AkashConsoleAPI, "_request")
     def test_a_limit_validation_400_raises_rather_than_reporting_an_empty_account(self, mock_req):
@@ -2685,7 +2693,10 @@ class TestVeryLargeJsonResponse:
                 for i in range(10000)  # 10k deployments
             ]
         }
-        mock_req.return_value = large_response
+        # A page past the ceiling fetches the next one (#408); answer it with the end.
+        paged = {**large_response, "pagination": {"total": 10000, "hasMore": False}}
+        end = {"data": [], "pagination": {"total": 10000, "hasMore": False}}
+        mock_req.side_effect = [paged, end] * 2
         client = AkashConsoleAPI("key")
         result = client.list_deployments()
         assert len(result) == 10000
