@@ -15,6 +15,7 @@ import logging
 import os
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -173,8 +174,8 @@ class AkashAPIError(RuntimeError):
 
 
 class AkashConsoleAPI:
-    # Ceiling for list_deployments. See that method's docstring: the server's
-    # hasMore/total cannot detect truncation, so we over-ask and warn at the ceiling.
+    # PAGE SIZE for list_deployments, which pages with `skip` until the listing is
+    # complete (see that method's docstring; it no longer stops at one page).
     #
     # ⛔ 100 IS THE SERVER'S MAXIMUM, NOT A PREFERENCE. This was 1000 until
     # 2026-09-18, when the Console API began rejecting it outright and naming the
@@ -192,9 +193,14 @@ class AkashConsoleAPI:
     #
     # The "over-ask" design survives intact: observed holdings are 15-27
     # deployments, so 100 still keeps ~4x headroom. What DID change is that the
-    # `len(deployments) >= LIST_LIMIT` warning below was effectively unreachable at
-    # 1000 and is reachable at 100 — it is now load-bearing, and tested as such.
+    # `len(deployments) >= LIST_LIMIT` warning was effectively unreachable at 1000 and
+    # reachable at 100. Since 2026-09-28 a full page fetches the next page instead.
     LIST_LIMIT = 100
+    # A listing that cannot be made consistent in this many whole passes RAISES.
+    LIST_ATTEMPTS = 3
+    LIST_RETRY_SLEEP_S = 2.0
+    # 50 pages x 100 = 5000 deployments; past that, a server ignoring `skip` is likelier.
+    LIST_MAX_PAGES = 50
 
     """Client for Akash Console API (https://console-api.akash.network)"""
 
@@ -323,7 +329,7 @@ class AkashConsoleAPI:
             raise RuntimeError(f"Connection error: {e}") from e
 
     def list_deployments(self, active_only: bool = True) -> list[dict[str, Any]]:
-        """Active deployments for this API key.
+        """Deployments for this API key, EVERY page of them.
 
         An empty list means "the account is empty" and NEVER "the request went wrong".
         Two DELETING consumers treat a falsy result as "nothing to do":
@@ -333,48 +339,53 @@ class AkashConsoleAPI:
         7 of 25 runs of the first logged "Listed 0 active deployment(s)" against a
         wallet on-chain holding 15-27, and exited 0 as "Nothing to do."
 
-        Raises RuntimeError on an unrecognised envelope. A loud break in two downstream
+        Raises RuntimeError on an unrecognised envelope, and on a listing that stays
+        inconsistent after LIST_ATTEMPTS whole passes. A loud break in two downstream
         repos beats a silent misinterpretation in a path that deletes infrastructure.
         Individual malformed ROWS are still dropped — only the envelope is fatal.
 
-        ⚠ `limit` is not cosmetic. The server's pagination metadata cannot detect
-        truncation — VERIFIED live: `?limit=1` returns `total=1, hasMore=false` while
-        15+ deployments exist, i.e. `total` is the RETURNED PAGE SIZE and `hasMore` is
-        always false. Do NOT replace this with a page-until-short-page loop: that is an
-        undocumented guess about server semantics, and the metadata that would justify
-        it is known-wrong. Asking for more than we ever expect to hold, and warning when
-        we hit the ceiling, is the only defence available.
+        PAGING (#408). This used to send ONE `?limit=100` request and only warn at the
+        ceiling, on the strength of an older live reading that `hasMore` was always
+        false. Measured against the live Console 2026-09-28 (42 deployments):
+          * `?limit=30&skip=0`  -> 30 rows, hasMore=true, total=38
+          * `?limit=30&skip=30` -> 12 rows, hasMore=false, total=42 (42 distinct, no overlap)
+          * `?limit=100` -> 0 rows with `{"total": 1, "hasMore": false}`, TWICE, and 42
+            rows on a later call. An intermittent SILENT EMPTY page.
+        So `skip` works, `total` moves between calls, and one page can come back empty
+        while claiming otherwise. The loop below therefore:
+          * fetches the next page whenever a page is FULL or `hasMore` is true, so it
+            completes whether or not the server's `hasMore` is truthful;
+          * treats a page as inconsistent when it is empty while `hasMore` is true, or
+            is the last page while `total` agrees with neither `skip + rows` nor `rows`
+            (the silent-empty page reads `total=1`), or repeats a dseq already seen
+            (the set moved under `skip`, or `skip` was ignored);
+          * on any inconsistency restarts the WHOLE pass (a page retried alone cannot
+            repair rows that shifted between pages) and raises after LIST_ATTEMPTS;
+          * raises past LIST_MAX_PAGES rather than looping on a server that ignores skip.
+        ⚠ What it CANNOT catch: an empty page that says `total=0` is self-consistent, and
+        is indistinguishable here from an empty account. Seen live 2026-09-28 13:01Z for
+        ~30 s while a fleet lane closed one deployment and created the next; the next
+        reading matched the chain (1 active). Only a chain cross-check (orphan_detect,
+        chain.list_active_deployments) is independent of the Console.
+        `active_only` is still filtered here, client side, after the complete listing.
         """
-        response = self._request("GET", f"/v1/deployments?limit={self.LIST_LIMIT}")
-        if not isinstance(response, dict):
-            raise RuntimeError(
-                f"list_deployments: unexpected response type {type(response).__name__} "
-                "(expected a JSON object). Refusing to report an empty account — a "
-                "malformed response must not look like 'nothing to do' to a sweeper."
-            )
-        data = response.get("data", response)
-        if isinstance(data, list):
-            deployments = [d for d in data if isinstance(d, dict)]
-        elif isinstance(data, dict):
-            raw = data.get("deployments", [])
-            if not isinstance(raw, list):
-                raise RuntimeError(
-                    f"list_deployments: data.deployments is {type(raw).__name__}, expected "
-                    "a list. Refusing to report an empty account."
+        why = ""
+        for attempt in range(1, self.LIST_ATTEMPTS + 1):
+            deployments, why = self._list_deployments_pass()
+            if deployments is not None:
+                break
+            if attempt < self.LIST_ATTEMPTS:
+                print(
+                    f"WARNING: list_deployments pass {attempt}/{self.LIST_ATTEMPTS} was "
+                    f"inconsistent ({why}); restarting the listing.",
+                    file=sys.stderr,
                 )
-            deployments = [d for d in raw if isinstance(d, dict)]
+                time.sleep(self.LIST_RETRY_SLEEP_S)
         else:
             raise RuntimeError(
-                f"list_deployments: data envelope is {type(data).__name__}, expected a list "
-                "or an object. Refusing to report an empty account."
-            )
-        if len(deployments) >= self.LIST_LIMIT:
-            # At the ceiling we cannot distinguish "exactly this many" from "truncated",
-            # because hasMore is always false. Say so rather than silently under-report.
-            print(
-                f"WARNING: list_deployments hit the limit of {self.LIST_LIMIT}; the result may be "
-                "TRUNCATED and the server's hasMore/total cannot confirm either way.",
-                file=sys.stderr,
+                f"list_deployments: the Console listing stayed inconsistent across "
+                f"{self.LIST_ATTEMPTS} passes ({why}). Refusing to report a possibly "
+                "partial account — a missing row must not look like 'nothing to do'."
             )
         if active_only:
             result = []
@@ -388,6 +399,67 @@ class AkashConsoleAPI:
                     result.append(d)
             deployments = result
         return deployments
+
+    def _list_deployments_page(self, skip: int) -> tuple[list[dict[str, Any]], int, dict]:
+        """One page: (dict rows, raw row count, pagination). Raises on a bad envelope."""
+        response = self._request("GET", f"/v1/deployments?limit={self.LIST_LIMIT}&skip={skip}")
+        if not isinstance(response, dict):
+            raise RuntimeError(
+                f"list_deployments: unexpected response type {type(response).__name__} "
+                "(expected a JSON object). Refusing to report an empty account — a "
+                "malformed response must not look like 'nothing to do' to a sweeper."
+            )
+        data = response.get("data", response)
+        pagination: Any = response.get("pagination")
+        if isinstance(data, list):
+            raw = data
+        elif isinstance(data, dict):
+            raw = data.get("deployments", [])
+            if not isinstance(raw, list):
+                raise RuntimeError(
+                    f"list_deployments: data.deployments is {type(raw).__name__}, expected "
+                    "a list. Refusing to report an empty account."
+                )
+            pagination = data.get("pagination", pagination)
+        else:
+            raise RuntimeError(
+                f"list_deployments: data envelope is {type(data).__name__}, expected a list "
+                "or an object. Refusing to report an empty account."
+            )
+        rows = [d for d in raw if isinstance(d, dict)]
+        return rows, len(raw), pagination if isinstance(pagination, dict) else {}
+
+    def _list_deployments_pass(self) -> tuple[list[dict[str, Any]] | None, str]:
+        """One whole listing from skip=0: (rows, "") or (None, why it is inconsistent)."""
+        rows_out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        skip = 0
+        for _ in range(self.LIST_MAX_PAGES):
+            rows, n_raw, pg = self._list_deployments_page(skip)
+            has_more = pg.get("hasMore") is True
+            total = pg.get("total")
+            total = total if isinstance(total, int) and not isinstance(total, bool) else None
+            if n_raw == 0 and has_more:
+                return None, f"empty page at skip={skip} with hasMore=true"
+            for d in rows:
+                dseq = _extract_dseq(d)
+                if dseq is not None:
+                    if dseq in seen:
+                        return None, f"dseq {dseq} repeated at skip={skip}"
+                    seen.add(dseq)
+                rows_out.append(d)
+            if has_more or n_raw >= self.LIST_LIMIT:
+                skip += n_raw
+                continue
+            if total is not None and total not in (skip + n_raw, n_raw):
+                return None, (
+                    f"last page at skip={skip} has {n_raw} rows but reports total={total}"
+                )
+            return rows_out, ""
+        raise RuntimeError(
+            f"list_deployments: still paging after {self.LIST_MAX_PAGES} pages of "
+            f"{self.LIST_LIMIT}; refusing to guess (is the server ignoring skip?)."
+        )
 
     def get_deployment(self, dseq: str) -> dict[str, Any]:
         response = self._request("GET", f"/v1/deployments/{dseq}")
