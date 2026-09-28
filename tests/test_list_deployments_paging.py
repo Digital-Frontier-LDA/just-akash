@@ -288,11 +288,19 @@ def test_a_single_page_after_a_multi_page_pass_must_match_it(monkeypatch):
     assert _skips(fake) == [0, 100, 0, 0]
 
 
-def test_a_paged_listing_cannot_end_on_a_page_without_pagination(monkeypatch):
-    """CodeRabbit: page 1 is full and says total=150; page 2 comes back empty with no
-    pagination. With no total to check, two identical passes returned 100 of 150."""
+@pytest.mark.parametrize(
+    "end_pagination",
+    [None, {"hasMore": False}, {"total": "150", "hasMore": False}, {"total": None}],
+    ids=["no-pagination", "no-total", "string-total", "null-total"],
+)
+def test_a_paged_listing_cannot_end_without_an_integer_total(monkeypatch, end_pagination):
+    """CodeRabbit + review: page 1 is full and says total=150; page 2 comes back empty
+    with no usable total. Nothing can check the end, and two identical passes returned
+    100 of 150. Only the page that ends the listing must state its own total."""
     rows = [_row(i) for i in range(150)]
-    bare_end = {"data": {"deployments": []}}
-    fake = FakeConsole(rows, has_more=False, script={n: bare_end for n in (2, 4, 6)})
-    with pytest.raises(RuntimeError, match="no pagination to confirm the end"):
+    end: dict = {"data": {"deployments": []}}
+    if end_pagination is not None:
+        end["data"]["pagination"] = end_pagination
+    fake = FakeConsole(rows, has_more=False, script={n: end for n in (2, 4, 6)})
+    with pytest.raises(RuntimeError, match="no integer total to confirm the end"):
         _client(fake, monkeypatch).list_deployments(active_only=False)

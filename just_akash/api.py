@@ -366,7 +366,7 @@ class AkashConsoleAPI:
             live row onto a page already read, and `total` shrinks with it, so no
             single pass can see the loss;
           * refuses to CONTINUE past a page lacking an integer `total` and a boolean
-            `hasMore`, and to END a paged listing on a page with no pagination; a
+            `hasMore`, and to END a paged listing on a page without an integer `total`; a
             single short page without pagination only warns (its checks are then
             blind; the live Console sends `data.pagination`);
           * on any inconsistency restarts the WHOLE pass (a page retried alone cannot
@@ -490,11 +490,11 @@ class AkashConsoleAPI:
                     )
                 skip += n_raw
                 continue
-            if not pg and skip > 0:
-                # An earlier page advertised more; this one cannot say the listing ends.
+            if skip > 0 and total is None:
+                # An earlier page advertised more; only a stated total can end the listing.
                 return (
                     None,
-                    (f"last page at skip={skip} carries no pagination to confirm the end"),
+                    f"last page at skip={skip} carries no integer total to confirm the end",
                     page_no,
                 )
             if total is not None and total != skip + n_raw:
