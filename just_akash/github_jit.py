@@ -287,6 +287,14 @@ def mint_jit(
             or any(not isinstance(value, str) or not value for value in decoded.values())
         ):
             raise ValueError("invalid JIT configuration")
+        # Runner.Listener decodes each map value into a file under its root.
+        # Validate both encoding layers and keep each path within that root.
+        for filename, content in decoded.items():
+            if re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", filename) is None or filename in {".", ".."}:
+                raise ValueError("invalid JIT configuration path")
+            file_bytes = base64.b64decode(content, validate=True)
+            if not file_bytes or base64.b64encode(file_bytes).decode() != content:
+                raise ValueError("invalid JIT configuration file encoding")
         return JitHandoff(
             runner["id"], runner_name, policy.group_id, policy.revision, labels, config
         )

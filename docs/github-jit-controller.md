@@ -23,7 +23,7 @@ private repository; public/fork and broader populations require separate policy.
 
 All requests use the fixed `https://api.github.com` organization origin, refuse
 redirects, cap individual calls at 20 seconds and bound response size at 1 MiB.
-JSON duplicate keys and non-finite numbers are refused. There is no automatic
+JSON duplicate keys and non-finite numbers are refused. The outer configuration and every file value must be canonical base64, and each filename must remain within the runner root. There is no automatic
 mutation retry. HTTP, transport, decoding or response-binding failure after POST
 raises `JitMintUnknown`; the caller retains the prior durable slot intent and
 reconciles the exact runner name before any replacement. Error messages suppress

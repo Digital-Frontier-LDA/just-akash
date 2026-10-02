@@ -16,7 +16,14 @@ WORKFLOW = REPO + "/.github/workflows/ci-observability.yml@" + "a" * 40
 POLICY = jit.JitPolicy("b" * 40, 37, 123, REPO, (WORKFLOW,))
 NAME = "dfci-grafana-123-1-rules-0"
 LABELS = (NAME, "linux", "akash")
-CONFIG = base64.b64encode(b'{"fixture":"single-job-only"}').decode()
+CONFIG = base64.b64encode(
+    json.dumps(
+        {
+            ".runner": base64.b64encode(b'{"agentId":789}').decode(),
+            ".credentials": base64.b64encode(b"one-job-fixture").decode(),
+        }
+    ).encode()
+).decode()
 
 
 class GitHub:
@@ -352,6 +359,28 @@ def test_invalid_readonly_probe_never_requests(policy, token):
 def test_noncanonical_base64_padding_is_unknown():
     github = GitHub()
     github.result["encoded_jit_config"] = "eyJ4IjoiYWIifR=="
+    with pytest.raises(jit.JitMintUnknown):
+        mint(github)
+    assert sum(call[0] == "POST" for call in github.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "filename,content",
+    [
+        (".runner", "not base64!"),
+        (".runner", "Zh=="),
+        ("../.runner", "Zg=="),
+        ("/tmp/.runner", "Zg=="),
+        (".", "Zg=="),
+        ("..", "Zg=="),
+        ("path/.runner", "Zg=="),
+    ],
+)
+def test_nested_jit_file_corruption_or_root_escape_is_unknown(filename, content):
+    github = GitHub()
+    github.result["encoded_jit_config"] = base64.b64encode(
+        json.dumps({filename: content}).encode()
+    ).decode()
     with pytest.raises(jit.JitMintUnknown):
         mint(github)
     assert sum(call[0] == "POST" for call in github.calls) == 1
