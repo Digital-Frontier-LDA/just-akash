@@ -463,6 +463,16 @@ def test_public_boundary_rejects_endpoint_override_without_queries(monkeypatch):
     assert reads == []
 
 
+def test_public_boundary_stops_queries_when_collection_deadline_exhausted(monkeypatch):
+    reads = []
+    monkeypatch.delenv("AKASH_REST_URL", raising=False)
+    monkeypatch.setattr(adapter, "Deadline", lambda **_kw: MagicMock(remaining=lambda: 0))
+    monkeypatch.setattr(chain, "_lcd_get", lambda *a, **k: reads.append((a, k)))
+    with pytest.raises(adapter.ClosureUnverified):
+        adapter.observe_finalized_closure("op-1", SUBJECT, GROUPS, TXHASH)
+    assert reads == []
+
+
 @pytest.mark.parametrize("operation", ["", "x" * 129, " x", "x ", "é"])
 def test_invalid_operation_rejected_before_network(reader_factory, operation):
     reader, calls = reader_factory()

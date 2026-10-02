@@ -25,6 +25,7 @@ from akash_lease_core.create_journal import (
 )
 
 from . import chain
+from .owner_lookup import Deadline
 
 _CLOSE_TYPE = "/akash.deployment.v1beta4.MsgCloseDeployment"
 _PAGE_SIZE = 200
@@ -319,8 +320,15 @@ def observe_finalized_closure(
     ):
         raise ClosureUnverified("closure requires the pinned source registry")
 
+    deadline = Deadline(budget=30.0)
+
     def registered_read(path, *, base, height=None):
-        return chain._lcd_get(path, base=base, height=height, follow_redirects=False)
+        remaining = deadline.remaining()
+        if remaining <= 0:
+            raise ClosureUnverified("closure observation deadline exhausted")
+        return chain._lcd_get(
+            path, timeout=min(15.0, remaining), base=base, height=height, follow_redirects=False
+        )
 
     try:
         return _observe(

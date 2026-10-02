@@ -26,6 +26,8 @@ No Console key or signer is needed. There is no endpoint override. Explicitly se
 `AKASH_REST_URL`, even to an empty string, refuses this path. The existing immutable
 source registry identifies operators, gateway/cache ancestry, chain ID, tip-minus-two
 finality, freshness and height skew. Redirects are refused for every observation.
+A 30-second collection deadline refuses further requests after exhaustion, and
+each request timeout is capped at the remaining budget or 15 seconds.
 
 The adapter first runs the existing complete signed-creation proof. That establishes
 the complete GSEQ/name population, agreeing fresh common block and exact creation

@@ -203,7 +203,7 @@ class _NoChainRedirect(urllib.request.HTTPRedirectHandler):
 
 def _lcd_get(
     path: str,
-    timeout: int = 15,
+    timeout: int | float = 15,
     base: str | None = None,
     height: int | None = None,
     *,
