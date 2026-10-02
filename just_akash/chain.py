@@ -217,13 +217,12 @@ def _lcd_get(
     if height is not None:
         headers["x-cosmos-block-height"] = str(height)
     req = urllib.request.Request(url, headers=headers)  # noqa: S310 — fixed base
-    open_url = (
-        urllib.request.urlopen
-        if follow_redirects
-        else urllib.request.build_opener(_NoChainRedirect()).open
-    )
     try:
-        with open_url(req, timeout=timeout) as resp:
+        if follow_redirects:
+            response = urllib.request.urlopen(req, timeout=timeout)  # noqa: S310 — fixed base
+        else:
+            response = urllib.request.build_opener(_NoChainRedirect()).open(req, timeout=timeout)
+        with response as resp:
             raw_body = resp.read()
             echoed = getattr(resp, "headers", {}).get("x-cosmos-block-height")
     except urllib.error.HTTPError as e:
