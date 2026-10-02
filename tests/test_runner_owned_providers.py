@@ -1,4 +1,5 @@
 """Ownership is independent of cheap/proven/preferred third-party fallback."""
+
 from __future__ import annotations
 
 import json
@@ -12,11 +13,14 @@ import yaml
 from just_akash import runner_candidates as rc
 
 OWNED = "akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z"
-FOREIGN = "akash15tl6v6gd0nte0syyxnv57zmmspgju4c3xfmdhk"
-FLEET = json.dumps([
-    {"address": OWNED, "preferred": False},
-    {"address": FOREIGN, "preferred": True, "runner_host": True},
-])
+# Public Akash provider address, also present in test_runner_candidates.py.
+FOREIGN = "akash15tl6v6gd0nte0syyxnv57zmmspgju4c3xfmdhk"  # pragma: allowlist secret
+FLEET = json.dumps(
+    [
+        {"address": OWNED, "preferred": False},
+        {"address": FOREIGN, "preferred": True, "runner_host": True},
+    ]
+)
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -58,10 +62,18 @@ def test_effective_workflow_step_filters_both_auction_tiers(tmp_path, owned, suc
     shim.chmod(0o755)
     output = tmp_path / "output"
     result = subprocess.run(
-        ["bash", "-e", "-c", step["run"]], cwd=ROOT, capture_output=True, text=True,
-        env={**os.environ, "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
-             "PYTHONPATH": str(ROOT), "GITHUB_OUTPUT": str(output),
-             "AKASH_PROVIDERS_SPEC": FLEET, "AKASH_OWNED_PROVIDERS": owned},
+        ["bash", "-e", "-c", step["run"]],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+            "PYTHONPATH": str(ROOT),
+            "GITHUB_OUTPUT": str(output),
+            "AKASH_PROVIDERS_SPEC": FLEET,
+            "AKASH_OWNED_PROVIDERS": owned,
+        },
     )
     values = dict(line.split("=", 1) for line in output.read_text().splitlines())
     assert (result.returncode == 0) == success, result.stdout + result.stderr
