@@ -1,0 +1,158 @@
+{
+  "execution_closed": true,
+  "settlement_proven": false,
+  "closure": {
+    "$type": "ExecutionClosure",
+    "chain_id": "akashnet-2",
+    "close_transaction_height": 28886415,
+    "common_finality_height": 28888641,
+    "evidence_digest": "89f728fcd29a8449783347c6cdc915fbe1feeb51183e9a9413b726c3e4143e7f",
+    "group_population_digest": "2775efd5d8ccbd99f35ed721ac72dcb6d7234471182273069cdcf9a67e741714",
+    "lease_population_digest": "2d2c706bba0cc6384737eba4f7328fa24990501a940c1da7c31d49f520bcac50",
+    "observed_at": 1790963032,
+    "operation_id": "reference-run-37014155266",
+    "operator_identity_a": "quad",
+    "operator_identity_b": "c29r3",
+    "operator_independence_verified": true,
+    "proof_mode": "exact_finalized_height",
+    "source_a": "quad",
+    "source_a_height": 28888641,
+    "source_b": "c29r3",
+    "source_b_height": 28888641,
+    "subject": {
+      "$type": "DeploymentKey",
+      "dseq": "1790948285830",
+      "owner": "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee"
+    },
+    "trust_path_a": "direct-88.198.50.175",
+    "trust_path_b": "direct-65.21.234.82"
+  },
+  "evidence": {
+    "schema": "just-akash-finalized-execution-closure/v1",
+    "operation_id": "reference-run-37014155266",
+    "identity": {
+      "evidence_version": 2,
+      "registry_version": 2,
+      "registry_digest": "a457c9bf67e0e0b51b1ba35562805282337baa92c6530b2ec2a5801b8fdf2914",
+      "registry_provenance": "https://github.com/cosmos/chain-registry/blob/c67c94a5f5c41ad1b116b1b847ef8b5f196b6405/akash/chain.json",
+      "registry_provenance_digest": "071d561eccb4a26ac4e3404b58ce1d1fb2b881c230e4468f78b44d92b8c5cd51",
+      "chain_id": "akashnet-2",
+      "source_ids": [
+        "quad",
+        "c29r3"
+      ],
+      "height": 28888641,
+      "block_hash": "6085438bfcd0cb6b011719713b913402e3fc8980ca3add148a8d5ff948c0f4d5",
+      "block_time": "2026-10-02T17:43:24.027727+00:00",
+      "creation_height": 28886141,
+      "creation_block_hash": "1ac83316d23473d0999fe311583a533288a2179c828986a76e33dac58272b81e",
+      "creation_block_time": "2026-10-02T13:38:04.783838+00:00",
+      "creation_txhash": "74577ECCB766A5563C2C8D1B48F0512E1F5FC38D1021C9A2DCAC05AE79B44177",
+      "creation_tx_index": 0,
+      "owner": "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee",
+      "dseq": "1790948285830",
+      "gseq": "1",
+      "group": "borduas-runner-run-37014155266-end",
+      "groups": [
+        {
+          "gseq": 1,
+          "name": "borduas-runner-run-37014155266-end"
+        }
+      ],
+      "population_count": 1,
+      "population_digest": "93076970bfcf1a09be49b527d4a65bb8391f8c485f13a16f6fa4afb5f31ac1cd",
+      "observed_at": "2026-10-02T17:43:41.825373+00:00",
+      "evaluated_at": "2026-10-02T17:43:41.825373+00:00",
+      "expires_at": "2026-10-02T17:44:11.825373+00:00"
+    },
+    "observations": [
+      {
+        "source_id": "quad",
+        "close": {
+          "height": 28886415,
+          "txhash": "192D03566048DAE8E30E3DAC03A10EC46C71D89BC94671AC579C7E964217756F",
+          "block_hash": "fdc998f4f087a6a25ce1fa68d6adf039e9f1f41b9ec93dffb0497e7833f32975",
+          "block_time": "2026-10-02T14:04:59.317540+00:00",
+          "transaction_digest": "5923cfa3d88d204d5f317a897159169a5538bbb814cc944ff0968463dae73775",
+          "block_population": [
+            "B839D4D38ADCC2329342268181C204EE5F5405E8A40B3796B30F4652902039A4",
+            "7D988A782F2D1D0699D211570FE2D29EE70B21C734063F068D3F5ECBBDCD918E",
+            "EDCCCA3B7E05A510E199244CEAFA44B13CFA9E6BD597441E2D9BA07BF907EF15",
+            "192D03566048DAE8E30E3DAC03A10EC46C71D89BC94671AC579C7E964217756F",
+            "1FB2913FCF72A966CD8F2ABD2B867A666DD9B8C245A4722B75FF85FC9F54E83A"
+          ]
+        },
+        "leases": [
+          [
+            "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee",
+            "1790948285830",
+            "1",
+            "1",
+            "0",
+            "akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",
+            "closed"
+          ]
+        ],
+        "escrow_state": "closed",
+        "deployment_digest": "03a0149d0bc9ec94b994f58ae687ad41bcab0474607da2eeac662b510a70c288"
+      },
+      {
+        "source_id": "c29r3",
+        "close": {
+          "height": 28886415,
+          "txhash": "192D03566048DAE8E30E3DAC03A10EC46C71D89BC94671AC579C7E964217756F",
+          "block_hash": "fdc998f4f087a6a25ce1fa68d6adf039e9f1f41b9ec93dffb0497e7833f32975",
+          "block_time": "2026-10-02T14:04:59.317540+00:00",
+          "transaction_digest": "5923cfa3d88d204d5f317a897159169a5538bbb814cc944ff0968463dae73775",
+          "block_population": [
+            "B839D4D38ADCC2329342268181C204EE5F5405E8A40B3796B30F4652902039A4",
+            "7D988A782F2D1D0699D211570FE2D29EE70B21C734063F068D3F5ECBBDCD918E",
+            "EDCCCA3B7E05A510E199244CEAFA44B13CFA9E6BD597441E2D9BA07BF907EF15",
+            "192D03566048DAE8E30E3DAC03A10EC46C71D89BC94671AC579C7E964217756F",
+            "1FB2913FCF72A966CD8F2ABD2B867A666DD9B8C245A4722B75FF85FC9F54E83A"
+          ]
+        },
+        "leases": [
+          [
+            "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee",
+            "1790948285830",
+            "1",
+            "1",
+            "0",
+            "akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",
+            "closed"
+          ]
+        ],
+        "escrow_state": "closed",
+        "deployment_digest": "03a0149d0bc9ec94b994f58ae687ad41bcab0474607da2eeac662b510a70c288"
+      }
+    ],
+    "observed_at": "2026-10-02T17:43:52.342198+00:00",
+    "registry": [
+      {
+        "source_id": "quad",
+        "url": "https://akash.rpc.uquad.org:443",
+        "chain_id": "akashnet-2",
+        "operator": "quad",
+        "gateway_ancestry": "direct-88.198.50.175",
+        "cache_ancestry": "none-direct-88.198.50.175",
+        "proof_mode": "fresh-common-height-and-complete-creation-block",
+        "finality_rule": "committed-tip-minus-2",
+        "max_age_seconds": 180,
+        "max_height_skew": 5
+      },
+      {
+        "source_id": "c29r3",
+        "url": "https://akash.c29r3.xyz:443/api",
+        "chain_id": "akashnet-2",
+        "operator": "c29r3",
+        "gateway_ancestry": "direct-65.21.234.82",
+        "cache_ancestry": "none-direct-65.21.234.82",
+        "proof_mode": "fresh-common-height-and-complete-creation-block",
+        "finality_rule": "committed-tip-minus-2",
+        "max_age_seconds": 180,
+        "max_height_skew": 5
+      }
+    ]
+  }
+}

@@ -194,8 +194,20 @@ def rest_urls() -> list[str]:
     return [DEFAULT_REST_URL, *DEFAULT_REST_FALLBACKS]
 
 
+class _NoChainRedirect(urllib.request.HTTPRedirectHandler):
+    """Keep a registered observation on the selected operator's exact endpoint."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def _lcd_get(
-    path: str, timeout: int = 15, base: str | None = None, height: int | None = None
+    path: str,
+    timeout: int = 15,
+    base: str | None = None,
+    height: int | None = None,
+    *,
+    follow_redirects: bool = True,
 ) -> dict[str, Any]:
     """GET a Cosmos REST path and return parsed JSON. Raises RuntimeError on any
     transport/HTTP/parse failure, with the endpoint in the message so a dead LCD is
@@ -205,8 +217,13 @@ def _lcd_get(
     if height is not None:
         headers["x-cosmos-block-height"] = str(height)
     req = urllib.request.Request(url, headers=headers)  # noqa: S310 — fixed base
+    open_url = (
+        urllib.request.urlopen
+        if follow_redirects
+        else urllib.request.build_opener(_NoChainRedirect()).open
+    )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+        with open_url(req, timeout=timeout) as resp:
             raw_body = resp.read()
             echoed = getattr(resp, "headers", {}).get("x-cosmos-block-height")
     except urllib.error.HTTPError as e:
