@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- Read-only `verify-finalized-closed` adapter for the pinned core execution-closure
+  envelope: complete creation identity, successful exact close transaction inclusion,
+  common finalized state height and complete agreeing deployment/group/lease populations.
+  Registered observations refuse redirects and missing height echoes. Financial
+  settlement remains separate; runner migration and durable broker wiring remain gated.
+
 ## [1.43.1] — 2026-08-22
 
 ### Fixed

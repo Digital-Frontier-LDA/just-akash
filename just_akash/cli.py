@@ -701,6 +701,21 @@ def main():
         help="Emit JSON verdict (default; preserved for explicitness).",
     )
 
+    # ── verify-finalized-closed ─────────────────────────
+    finalized_p = subparsers.add_parser(
+        "verify-finalized-closed",
+        help="Read-only finalized execution-closure observation; does not prove settlement.",
+    )
+    finalized_p.add_argument("--owner", required=True)
+    finalized_p.add_argument("--dseq", required=True)
+    finalized_p.add_argument("--operation-id", required=True)
+    finalized_p.add_argument("--close-tx-hash", required=True)
+    finalized_p.add_argument(
+        "--groups-json",
+        required=True,
+        help='Complete ordered creation population: [{"gseq":1,"name":"..."}, ...].',
+    )
+
     # ── resolve-owner ───────────────────────────────────
     resolve_owner_p = subparsers.add_parser(
         "resolve-owner",
@@ -1998,6 +2013,42 @@ def main():
         # closed=true over an unverified verdict).
         if result.get("closed") is not True:
             sys.exit(1)
+
+    # ── verify-finalized-closed ─────────────────────────
+    elif args.command == "verify-finalized-closed":
+        import json as _json
+
+        from akash_lease_core.chain_identity import DeploymentKey
+        from akash_lease_core.create_journal import PreparedGroup
+
+        from .finalized_closure import ClosureUnverified, observe_finalized_closure
+
+        try:
+            if len(args.groups_json) > 1_048_576:
+                raise ValueError("group population input exceeds limit")
+            population = _json.loads(args.groups_json)
+            if not isinstance(population, list) or any(
+                not isinstance(row, dict) or set(row) != {"gseq", "name"} for row in population
+            ):
+                raise ValueError("complete ordered group population required")
+            result = observe_finalized_closure(
+                args.operation_id,
+                DeploymentKey(args.owner, args.dseq),
+                tuple(PreparedGroup(row["gseq"], row["name"]) for row in population),
+                args.close_tx_hash,
+            )
+        except (ValueError, ClosureUnverified):
+            print(
+                _json.dumps(
+                    {
+                        "execution_closed": False,
+                        "settlement_proven": False,
+                        "reason": "finalized execution closure remains unverified",
+                    }
+                )
+            )
+            sys.exit(1)
+        print(_json.dumps(result))
 
     # ── resolve-owner ──────────────────────────────────
     elif args.command == "resolve-owner":
