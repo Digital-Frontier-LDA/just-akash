@@ -9,6 +9,9 @@
 #         runner-label: fast-pool-${{ github.run_id }}
 #         tag-prefix:   ci-myrepo          # REQUIRED, must name YOUR repo — see below
 #         github-org:   my-org
+#         owned-providers: 'akash1...owned-provider-address...'
+#           # Explicit ownership policy for zero-incremental-cost internal CI.
+#           # Both auction tiers are restricted; this does not qualify the image/provider.
 #         pool-size:    '4'
 #         min-pool-size: '2'
 #       secrets:
@@ -149,6 +152,16 @@ on:
           No default on purpose: the markers only mean anything against a specific
           fleet's measurements, and a shared list would make one operator's trust
           decision everyone's. Qualify your own with `just-akash runner-probe`.
+        required: false
+        type: string
+        default: ''
+      owned-providers:
+        description: >-
+          Optional explicit ownership allowlist (JSON array or comma-separated Akash
+          addresses). When supplied, both preferred and backup candidates are restricted
+          to these addresses; no third-party bid fallback is allowed. An empty JSON array,
+          malformed list, or no eligible intersection fails before deployment. Preference
+          and runner_host markers do not prove ownership. Qualification remains required.
         required: false
         type: string
         default: ''
@@ -690,10 +703,12 @@ jobs:
         id: candidates
         env:
           AKASH_PROVIDERS_SPEC: ${{ inputs.providers }}
+          AKASH_OWNED_PROVIDERS: ${{ inputs.owned-providers }}
         run: |
           set -uo pipefail
           if ! uv run --with . python -m just_akash.runner_candidates \
-                 --providers "${AKASH_PROVIDERS_SPEC:-}" --github-output; then
+                 --providers "${AKASH_PROVIDERS_SPEC:-}" \
+                 --owned-providers "${AKASH_OWNED_PROVIDERS:-}" --github-output; then
             echo "failure_reason=NO_ELIGIBLE_BIDDER" >> "$GITHUB_OUTPUT"
             exit 1
           fi

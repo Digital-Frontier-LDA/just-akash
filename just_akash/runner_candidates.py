@@ -158,6 +158,24 @@ def select_candidates(providers: list[dict]) -> tuple[list[dict], list[dict]]:
     return ordered, denied
 
 
+def restrict_to_owned(providers: list[dict], raw: str) -> list[dict]:
+    """Apply the caller's ownership allowlist independently of preference markers.
+
+    Empty means the legacy policy. An explicitly supplied but empty/invalid list
+    fails closed: it must never enable marketplace defaults or third-party backup.
+    This is an operator ownership declaration, not provider qualification evidence.
+    """
+    if not raw:
+        return providers
+    owned = {entry["address"] for entry in parse_providers(raw)}
+    if not owned:
+        raise ProviderSpecError("owned-providers must contain at least one Akash address")
+    retained = [entry for entry in providers if entry["address"] in owned]
+    if not any(not entry.get("runner_deny") for entry in retained):
+        raise ProviderSpecError("owned-providers leaves no eligible supplied provider")
+    return retained
+
+
 def proven_host_count(providers: list[dict]) -> int:
     """How many providers are PROVEN runner hosts, ignoring denied ones.
 
@@ -211,17 +229,23 @@ def render_report(ordered: list[dict], denied: list[dict], min_hosts: int = 3) -
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--providers", default=os.environ.get("AKASH_PROVIDERS_SPEC", ""))
+    ap.add_argument("--owned-providers", default=os.environ.get("AKASH_OWNED_PROVIDERS", ""))
     ap.add_argument("--min-hosts", type=int, default=3)
     ap.add_argument("--github-output", action="store_true")
     args = ap.parse_args(argv)
 
     try:
         providers = parse_providers(args.providers)
+        before = len(providers)
+        providers = restrict_to_owned(providers, args.owned_providers)
     except ProviderSpecError as e:
         # Hard error: falling through to just-akash's defaults would ignore every
         # runner_deny the operator recorded.
         print(f"::error title=Bad provider spec::{e}", file=sys.stderr)
         return 2
+
+    if args.owned_providers:
+        print(f"owned-provider policy: {before - len(providers)} supplied candidates excluded")
 
     ordered, denied = select_candidates(providers)
     for line in render_report(ordered, denied, args.min_hosts):
