@@ -1,0 +1,13 @@
+{
+  "observed_at": "2026-10-02T20:02:20.732481+00:00",
+  "app": "sentinel-by-digital-frontier",
+  "installation_id": 144391670,
+  "controller_repository_id": 1285006023,
+  "group_id": 5,
+  "repository_id": 1283916135,
+  "source_workflow_revision": "a7265393670a7d9c8042a2e997a3624a9e5ac85d",
+  "runner_created": false,
+  "lease_created": false,
+  "read_only_policy_verification": "passed",
+  "temporary_installation_token_revoked": true
+}
