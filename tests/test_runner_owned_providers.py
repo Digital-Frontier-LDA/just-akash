@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import yaml
@@ -87,3 +89,63 @@ def test_effective_workflow_step_filters_both_auction_tiers(tmp_path, owned, suc
     else:
         assert values["preferred_candidates"] == FOREIGN
         assert values["fallback_candidates"] == OWNED
+
+
+@pytest.mark.parametrize(
+    "preferred,fallback,excluded,expected_preferred,expected_backup",
+    [
+        (OWNED, "", "", [OWNED], []),
+        ("", OWNED, "", [], [OWNED]),
+        (OWNED, FOREIGN, FOREIGN, [OWNED], []),
+        (OWNED, FOREIGN, "", [OWNED], [FOREIGN]),
+    ],
+)
+def test_effective_deploy_argv_cannot_restore_inherited_tiers(
+    tmp_path, monkeypatch, preferred, fallback, excluded, expected_preferred, expected_backup
+):
+    from just_akash.cli import main
+    from just_akash.deploy import _resolve_tier
+
+    document = yaml.safe_load((ROOT / ".github/workflows/runner-pool.yml").read_text())
+    step = next(s for s in document["jobs"]["pool"]["steps"] if s.get("id") == "provision")
+    body = step["run"]
+    selection = body[body.index("PROV_ARGS=()") : body.index("SELECT_ARGS=()")]
+    # Execute the workflow's real assignment + deploy invocation. Only the deploy
+    # transport is replaced; the real CLI parses the resulting argv below.
+    start = body.index("AKASH_PROVIDERS='' ")
+    invocation = body[start : body.index("rm -f /tmp/runner-sdl.minted.yaml", start)]
+    shim = tmp_path / "record"
+    shim.write_text(
+        "#!/usr/bin/env python3\nimport json,os,sys\n"
+        "print(json.dumps({'argv':sys.argv[1:],"
+        "'preferred':os.environ['AKASH_PROVIDERS'],"
+        "'backup':os.environ['AKASH_PROVIDERS_BACKUP']}))\n"
+    )
+    shim.chmod(0o755)
+    script = selection + '\nJA=("$RECORDER")\nSELECT_ARGS=()\n' + invocation
+    result = subprocess.run(
+        ["bash", "-e", "-c", script],
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "RECORDER": str(shim),
+            "PREFERRED_CANDIDATES": preferred,
+            "FALLBACK_CANDIDATES": fallback,
+            "EXCLUDED": excluded,
+            "REQUIRED_DEPOSIT_USD": "5",
+            "AKASH_PROVIDERS": FOREIGN,
+            "AKASH_PROVIDERS_BACKUP": FOREIGN,
+        },
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    recorded = json.loads(result.stdout)
+    monkeypatch.setenv("AKASH_PROVIDERS", recorded["preferred"])
+    monkeypatch.setenv("AKASH_PROVIDERS_BACKUP", recorded["backup"])
+    monkeypatch.setattr(sys, "argv", ["just-akash", *recorded["argv"]])
+    with patch("just_akash.deploy.deploy") as deploy, pytest.raises(SystemExit) as exit_info:
+        main()
+    assert exit_info.value.code == 0
+    kwargs = deploy.call_args.kwargs
+    assert _resolve_tier(kwargs["preferred_providers"], "AKASH_PROVIDERS") == expected_preferred
+    assert _resolve_tier(kwargs["backup_providers"], "AKASH_PROVIDERS_BACKUP") == expected_backup

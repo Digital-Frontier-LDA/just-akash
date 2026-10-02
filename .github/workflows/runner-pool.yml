@@ -1146,6 +1146,7 @@ jobs:
           for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
             echo "::group::provision attempt $attempt/$MAX_ATTEMPTS"
             PROV_ARGS=()
+            BACKUP_COUNT=0
             # Keep operator-preferred and measured runner hosts in the auction's
             # preferred tier. Merely
             # sorting one --provider list is ineffective: the shared auction chooses
@@ -1159,6 +1160,7 @@ jobs:
             for p in $FALLBACK_CANDIDATES; do
               case " $EXCLUDED " in *" $p "*) continue ;; esac
               PROV_ARGS+=(--backup-provider "$p")
+              BACKUP_COUNT=$((BACKUP_COUNT + 1))
             done
 
             # Never degrade an exhausted/denied allowlist into unrestricted
@@ -1168,6 +1170,11 @@ jobs:
               echo "failure_reason=NO_ELIGIBLE_BIDDER" >> "$GITHUB_OUTPUT"
               echo "::error title=No eligible provider remains::All configured preferred and fallback providers are standing-denied or failed during this run."
               echo "::endgroup::"; exit 1
+            fi
+            # An omitted tier otherwise reads the inherited AKASH_PROVIDERS* env.
+            # Keep the selected list authoritative even after runtime exclusions.
+            if [ "$BACKUP_COUNT" -eq 0 ]; then
+              PROV_ARGS+=(--no-backup-fallback)
             fi
 
             # --select reaches the CLI ONLY when the consumer chose a policy: an empty
@@ -1234,7 +1241,7 @@ jobs:
             fi
             rm -f /tmp/ja.log
             DEPLOY_RC=0
-            "${JA[@]}" deploy --sdl /tmp/runner-sdl.minted.yaml --deposit "$REQUIRED_DEPOSIT_USD" --bid-wait 60 \
+            AKASH_PROVIDERS='' AKASH_PROVIDERS_BACKUP='' "${JA[@]}" deploy --sdl /tmp/runner-sdl.minted.yaml --deposit "$REQUIRED_DEPOSIT_USD" --bid-wait 60 \
               --bid-wait-retry 120 "${SELECT_ARGS[@]}" "${PROV_ARGS[@]}" 2>&1 | tee /tmp/ja.log || DEPLOY_RC=${PIPESTATUS[0]}
             rm -f /tmp/runner-sdl.minted.yaml
             # ⛔ A FAILED LEASE STILL HOLDS A DEPLOYMENT (#348). just-akash prints the
