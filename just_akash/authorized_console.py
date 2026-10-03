@@ -107,11 +107,11 @@ class AuthorizedConsoleCreate(CIConsoleAPI):
         ):
             raise CreateHeld("Trusted in-process create authority is required")
         self._binding = request, permit, authorization
-        self._validate(body)
-        # A fresh authenticated account read uses this same fixed-origin key.
-        if self.account_address() != self._owner:
-            raise CreateHeld("Console credential owner differs from the prepared owner")
         try:
+            self._validate(body)
+            # A fresh authenticated account read uses this same fixed-origin key.
+            if self.account_address() != self._owner:
+                raise CreateHeld("Console credential owner differs from the prepared owner")
             response = super().create_deployment(sdl_content, deposit)
             dseq = response.get("dseq")
             if (
@@ -121,12 +121,14 @@ class AuthorizedConsoleCreate(CIConsoleAPI):
             ):
                 raise CreateUnknown("Console create response needs exact reconciliation")
             return response
-        except Exception:
+        except Exception as error:
             if self._dispatched:
                 raise CreateUnknown(
                     "Console create outcome requires exact reconciliation"
                 ) from None
-            raise
+            if isinstance(error, CreateHeld):
+                raise
+            raise CreateHeld("Console create preconditions could not be established") from None
         finally:
             self._binding = None
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import urllib.request
 from dataclasses import replace
 from unittest.mock import MagicMock
 
@@ -304,4 +305,31 @@ def test_inherited_unguarded_create_is_refused(client, monkeypatch):
     opener = transport(monkeypatch)
     with pytest.raises(CreateHeld, match="durably redeemed"):
         client.create_deployment(SDL)
+    opener.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["owner-read", "malformed-sdl"])
+def test_preflight_failure_is_held_and_removes_transport_authority(client, monkeypatch, failure):
+    opener = transport(monkeypatch)
+    args = authority()
+    if failure == "owner-read":
+
+        def unavailable_owner():
+            raise TimeoutError("synthetic-secret-echo")
+
+        monkeypatch.setattr(client, "account_address", unavailable_owner)
+    else:
+        args["sdl_content"] = "{}"
+    with pytest.raises(CreateHeld) as caught:
+        client.submit(**args)
+    assert "synthetic-secret-echo" not in str(caught.value)
+    # An abandoned binding must not license a later POST at the lower boundary.
+    with pytest.raises(CreateHeld, match="No bound"):
+        client._open_request(
+            urllib.request.Request(
+                "https://console-api.akash.network/v1/deployments",
+                data=create_body(SDL, 0.5),
+                method="POST",
+            )
+        )
     opener.assert_not_called()
