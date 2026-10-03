@@ -1072,6 +1072,15 @@ def deploy(
         deployment_response = client.create_deployment(sdl_content, deposit=deposit)
     except RuntimeError as e:
         if "already exists" in str(e).lower():
+            if prepared_receipt is not None:
+                # Receipt-mode CI shares its wallet with other runs and purposes.
+                # This response proves neither which create committed nor which
+                # older deployment may be closed. Preserve the submitting receipt
+                # for exact reconciliation; do not sweep or send a second create.
+                raise RuntimeError(
+                    "Receipt-bound create already exists; reconcile the recorded "
+                    "operation before retrying"
+                ) from e
             _log(
                 logging.WARNING,
                 "Deployment already exists — closing stale deployments and retrying...",

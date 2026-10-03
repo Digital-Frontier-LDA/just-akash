@@ -343,6 +343,35 @@ def _receipt_arguments(sdl: str, receipt: Path) -> dict[str, Any]:
 
 
 @patch("just_akash.deploy.AkashConsoleAPI")
+def test_receipt_create_conflict_never_sweeps_shared_wallet_or_reposts(
+    mock_api, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AKASH_API_KEY", "test-key")
+    monkeypatch.delenv("AKASH_PROVIDERS", raising=False)
+    monkeypatch.setattr(deploy_module, "_RUN_ID", RUN_ID)
+    sdl_path = tmp_path / "sdl.yaml"
+    sdl_path.write_text(SDL)
+    parent = _private_dir(tmp_path / "private")
+    receipt = parent / "receipt.json"
+    client = mock_api.return_value
+    client.account_address.return_value = OWNER
+    client.create_deployment.side_effect = RuntimeError("Deployment already exists")
+
+    with patch("just_akash.deploy._close_stale_for_retry") as sweep:
+        with pytest.raises(RuntimeError, match="reconcile the recorded operation"):
+            deploy_module.deploy(sdl_path=str(sdl_path), **_receipt_arguments(SDL, receipt))
+        sweep.assert_not_called()
+
+    assert client.create_deployment.call_count == 1
+    client.close_deployment.assert_not_called()
+    client.create_lease.assert_not_called()
+    durable = decode_receipt(receipt.read_bytes())
+    assert durable["state"] == "submitting"
+    assert durable["operation_id"] == "github-run-123-attempt-2"
+    assert "dseq" not in durable
+
+
+@patch("just_akash.deploy.AkashConsoleAPI")
 def test_early_post_create_failure_leaves_recovery_capable_dseq(
     mock_api, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

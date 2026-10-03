@@ -33,6 +33,12 @@ logger = logging.getLogger("akash.api")
 # 524 at 125s (deploy.py `_report_suspected_orphans` records the shape). Cutting inside
 # that envelope would turn answers we currently get — and can classify — into unknowns.
 CONSOLE_HTTP_TIMEOUT = 180.0
+CI_CONSOLE_ORIGIN = "https://console-api.akash.network"
+
+
+class _NoConsoleRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def _ts() -> str:
@@ -132,6 +138,8 @@ class AkashAPIError(RuntimeError):
     do — `"already exists" in str(e).lower()` in deploy.py, `_is_credit_error` in
     cleanup_stale. The structured fields are added BESIDE the message, never
     inside it, so no substring match can shift underneath those callers.
+    This compatibility contract applies to AkashConsoleAPI; the opt-in
+    CIConsoleAPI deliberately omits response details that can echo runtime secrets.
     """
 
     def __init__(
@@ -175,6 +183,7 @@ class AkashAPIError(RuntimeError):
 
 
 class AkashConsoleAPI:
+    _protect_runtime_payloads = False
     # PAGE SIZE for list_deployments, which pages with `skip` until the listing is
     # complete (see that method's docstring; it no longer stops at one page).
     #
@@ -233,11 +242,13 @@ class AkashConsoleAPI:
             sep = "&" if "?" in endpoint else "?"
             url = f"{url}{sep}_cb={secrets.token_hex(8)}"
 
-        logger.debug(
-            f"[{_ts()}] API {method} {endpoint} data={json.dumps(data) if data else 'none'}"
-        )
-
         request_body = json.dumps(data).encode("utf-8") if data else None
+        # SDLs can contain a short-lived JIT configuration. Log the actual byte
+        # population rather than request values, even on the legacy client.
+        log_endpoint = "<CI Console endpoint>" if self._protect_runtime_payloads else endpoint
+        logger.debug(
+            f"[{_ts()}] API {method} {log_endpoint} body_bytes={len(request_body or b'')}"
+        )
 
         # S310: the URL is built from base_url, which defaults to the https
         # Console API and is operator-set (env var), not external/attacker input.
@@ -250,8 +261,9 @@ class AkashConsoleAPI:
 
         try:
             t0 = datetime.now(timezone.utc)
-            with urllib.request.urlopen(req, timeout=CONSOLE_HTTP_TIMEOUT) as response:  # noqa: S310
-                response_data = response.read().decode("utf-8")
+            with self._open_request(req) as response:
+                response_bytes = response.read()
+                response_data = response_bytes.decode("utf-8")
                 elapsed_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
                 if response_data:
                     try:
@@ -263,17 +275,15 @@ class AkashConsoleAPI:
                 else:
                     result = {}
                 logger.debug(
-                    f"[{_ts()}] API {method} {endpoint} -> "
-                    f"{response.status} ({elapsed_ms}ms) keys="
-                    f"{list(result.keys()) if isinstance(result, dict) else type(result).__name__}"
+                    f"[{_ts()}] API {method} {log_endpoint} -> "
+                    f"{response.status} ({elapsed_ms}ms) response_bytes={len(response_bytes)}"
                 )
                 return result
         except urllib.error.HTTPError as e:
             error_body = e.read().decode("utf-8")
             elapsed_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
             logger.error(
-                f"[{_ts()}] API {method} {endpoint} -> HTTP {e.code} ({elapsed_ms}ms) "
-                f"body={error_body[:500]}"
+                f"[{_ts()}] API {method} {log_endpoint} -> HTTP {e.code} ({elapsed_ms}ms)"
             )
             error_json: Any = None
             try:
@@ -310,6 +320,15 @@ class AkashConsoleAPI:
                 )
                 raw_name = error_json.get("error_name")
                 error_name = raw_name if isinstance(raw_name, str) else ""
+            if self._protect_runtime_payloads:
+                # The mediator can echo the submitted SDL anywhere in its error.
+                # CI callers must not expose it through logs, str/repr, body, or
+                # formatted tracebacks. Keep status and typed timeout metadata.
+                error_msg = "CI runtime response omitted; reconcile create outcome"
+                error_body = ""
+                error_name = (
+                    "origin_response_timeout" if error_name == "origin_response_timeout" else ""
+                )
             raise AkashAPIError(
                 f"API Error ({e.code}): {error_msg}",
                 status=e.code,
@@ -317,8 +336,8 @@ class AkashConsoleAPI:
                 retryable=retryable,
                 retry_after=retry_after,
                 error_name=error_name,
-            ) from e
-        except TimeoutError as e:
+            ) from (None if self._protect_runtime_payloads else e)
+        except TimeoutError:
             # ⛔ TRANSPORT, UNKNOWN OUTCOME (#368). The endpoint connected and then
             # went silent past CONSOLE_HTTP_TIMEOUT: whether the request was applied
             # is as unknown as with a dropped connection, and raising AkashAPIError
@@ -331,11 +350,19 @@ class AkashConsoleAPI:
             # elapsed-time log; deleting it would silence the timeout, not
             # re-classify it.
             elapsed_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
-            logger.error(f"[{_ts()}] API {method} {endpoint} -> TIMEOUT after {elapsed_ms}ms: {e}")
+            logger.error(f"[{_ts()}] API {method} {log_endpoint} -> TIMEOUT after {elapsed_ms}ms")
+            if self._protect_runtime_payloads:
+                raise TimeoutError("Console request timed out; reconcile create outcome") from None
             raise
         except urllib.error.URLError as e:
-            logger.error(f"[{_ts()}] API {method} {endpoint} -> URLError: {e}")
+            logger.error(f"[{_ts()}] API {method} {log_endpoint} -> URLError")
+            if self._protect_runtime_payloads:
+                raise RuntimeError("Connection error: Console request failed") from None
             raise RuntimeError(f"Connection error: {e}") from e
+
+    def _open_request(self, request: urllib.request.Request) -> Any:
+        # S310: the URL is built from the operator-configured Console origin.
+        return urllib.request.urlopen(request, timeout=CONSOLE_HTTP_TIMEOUT)  # noqa: S310
 
     def list_deployments(self, active_only: bool = True) -> list[dict[str, Any]]:
         """Deployments for this API key, EVERY page of them.
@@ -794,6 +821,8 @@ class AkashConsoleAPI:
             token = data["token"]
             if isinstance(token, str) and token:
                 return token
+        if self._protect_runtime_payloads:
+            raise RuntimeError("JWT token not found in CI runtime response")
         raise RuntimeError(f"JWT token not found in response: {response}")
 
     def account_address(self) -> str:
@@ -867,7 +896,38 @@ class AkashConsoleAPI:
             token = data["token"]
             if isinstance(token, str) and token:
                 return token
+        if self._protect_runtime_payloads:
+            raise RuntimeError("JWT token not found in CI runtime response")
         raise RuntimeError(f"JWT token not found in response: {response}")
+
+
+class CIConsoleAPI(AkashConsoleAPI):
+    """Controller-side client for one-job CI runtime payloads.
+
+    Mediator error messages/bodies and transport exception details are withheld
+    because they may echo the SDL/JIT configuration. HTTP status and typed
+    timeout metadata remain available; no outcome becomes safe to retry.
+    Requests use the fixed Console HTTPS origin and never follow redirects.
+    This client is not admission authority, and existing consumers do not use it.
+    """
+
+    _protect_runtime_payloads = True
+
+    def __init__(self, api_key: str):
+        if (
+            not isinstance(api_key, str)
+            or not api_key
+            or any(not 33 <= ord(char) <= 126 for char in api_key)
+        ):
+            raise ValueError("Invalid CI Console API key")
+        super().__init__(api_key, base_url=CI_CONSOLE_ORIGIN)
+
+    def _open_request(self, request: urllib.request.Request) -> Any:
+        # A redirect can copy x-api-key to another origin. Every redirect is an
+        # HTTP error requiring reconciliation; never follow or repeat a create.
+        return urllib.request.build_opener(_NoConsoleRedirect()).open(
+            request, timeout=CONSOLE_HTTP_TIMEOUT
+        )
 
 
 def _extract_dseq(deployment: dict[str, Any]) -> str | None:

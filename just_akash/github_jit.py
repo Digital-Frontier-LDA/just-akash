@@ -117,6 +117,8 @@ class JitPolicy:
     repository_id: int
     repository_name: str
     workflows: tuple[str, ...]
+    non_reusable_workflow: bool = False
+    source_workflow_revision: str | None = None
 
     def __post_init__(self):
         if (
@@ -129,15 +131,30 @@ class JitPolicy:
             or type(self.workflows) is not tuple
             or not self.workflows
             or len(self.workflows) > 100
+            or type(self.non_reusable_workflow) is not bool
         ):
             raise JitHold("invalid immutable JIT policy")
+        if self.non_reusable_workflow:
+            # GitHub group restrictions pin non-reusable workflows to a branch.
+            # Bind the pilot to main and retain its separately approved source SHA.
+            if (
+                len(self.workflows) != 1
+                or not isinstance(self.source_workflow_revision, str)
+                or re.fullmatch(r"[0-9a-f]{40}", self.source_workflow_revision) is None
+            ):
+                raise JitHold("non-reusable pilot needs one workflow and its source SHA")
+            suffix = r"refs/heads/main"
+        else:
+            if self.source_workflow_revision is not None:
+                raise JitHold("branch source binding requires non-reusable workflow policy")
+            suffix = r"[0-9a-f]{40}"
         prefix = re.escape(self.repository_name) + r"/\.github/workflows/"
         for workflow in self.workflows:
             if (
                 not isinstance(workflow, str)
-                or re.fullmatch(prefix + r"[A-Za-z0-9_-]+\.ya?ml@[0-9a-f]{40}", workflow) is None
+                or re.fullmatch(prefix + r"[A-Za-z0-9_-]+\.ya?ml@" + suffix, workflow) is None
             ):
-                raise JitHold("workflow policy must pin this repository at an immutable SHA")
+                raise JitHold("workflow restriction differs from the pilot reference policy")
         if len(set(self.workflows)) != len(self.workflows):
             raise JitHold("duplicate workflow policy")
 
@@ -227,12 +244,16 @@ def mint_jit(
     installation_token: str,
     *,
     request: Callable[..., dict] = github_request,
+    producer_workflow_revision: str | None = None,
 ) -> JitHandoff:
     """Verify current exact policy and mint one slot, never retrying a mutation.
 
     Caller must persist unique slot intent first and call only after admission.
     A JitMintUnknown blocks replacement and requires exact-name reconciliation.
     Handoff stays in memory and must never enter a journal/log/output/artifact.
+    For a non-reusable workflow the trusted caller supplies the source revision
+    from its authenticated producer. Equality here binds that revision to policy;
+    it does not authenticate caller-supplied strings or replace admission.
     """
     if (
         not isinstance(policy, JitPolicy)
@@ -251,6 +272,11 @@ def mint_jit(
         or re.search(r"[\r\n]", installation_token)
     ):
         raise JitHold("invalid JIT delivery slot")
+    if policy.non_reusable_workflow:
+        if producer_workflow_revision != policy.source_workflow_revision:
+            raise JitHold("producer workflow source differs from the approved revision")
+    elif producer_workflow_revision is not None:
+        raise JitHold("unexpected branch source binding for reusable workflow policy")
 
     def call(method: str, path: str, body: dict | None = None) -> dict:
         return request(method, path, installation_token, body)
