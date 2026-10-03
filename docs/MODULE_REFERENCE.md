@@ -51,10 +51,12 @@ deposit=...)` from a trusted in-process controller. The controller must durably
 redeem the permit before calling it. JSON supplied to an HTTP route is not create
 authority; the public core confirmation APIs produce the authority objects.
 
-The transport checks the authenticated credential owner, fixed Console origin,
+The transport obtains the credential owner through an exact fixed-origin,
+30-second status-only JWT request, then checks that mediated owner, Console origin,
 exact request and SDL digests, complete ordered group population, backend policy,
 broker and presenter bindings, and the fresh redemption deadline. It checks
-again immediately before the real deployment POST and consumes that client
+again immediately before the real deployment POST, serializes concurrent submits
+and consumes that client
 before opening the socket. A timeout or malformed response leaves the outcome
 unknown and never permits another POST from that client. Global replay
 prevention and crash recovery belong to the controller's durable store.

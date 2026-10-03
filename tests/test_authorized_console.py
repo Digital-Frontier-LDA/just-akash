@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import threading
 import urllib.request
@@ -363,3 +364,36 @@ def test_concurrent_submit_cannot_cross_the_same_pending_opener(client, monkeypa
             release.set()
         assert first.result(timeout=5) == {"dseq": "123"}
     opener.assert_called_once()
+
+
+def test_real_owner_probe_uses_only_status_scope_before_the_exact_create(client, monkeypatch):
+    monkeypatch.delattr(client, "account_address")
+    claim = base64.urlsafe_b64encode(json.dumps({"iss": OWNER}).encode()).decode().rstrip("=")
+    token = "synthetic-header." + claim + ".synthetic-signature"
+    paths = []
+
+    def response_for(request, **_kwargs):
+        paths.append(request.full_url)
+        if request.full_url.endswith("/create-jwt-token"):
+            assert json.loads(request.data) == {
+                "data": {"ttl": 30, "leases": {"access": "scoped", "scope": ["status"]}}
+            }
+            data = {"token": token}
+        else:
+            assert request.full_url.endswith("/v1/deployments")
+            data = {"dseq": "123"}
+        response = MagicMock()
+        response.read.return_value = json.dumps({"data": data}).encode()
+        response.__enter__.return_value = response
+        return response
+
+    opener = MagicMock(side_effect=response_for)
+    monkeypatch.setattr("urllib.request.OpenerDirector.open", opener)
+    assert client.submit(**authority()) == {"dseq": "123"}
+    assert paths == [
+        "https://console-api.akash.network/v1/create-jwt-token",
+        "https://console-api.akash.network/v1/deployments",
+    ]
+    with pytest.raises(CreateHeld):
+        client.submit(**authority())
+    assert len(paths) == 2
