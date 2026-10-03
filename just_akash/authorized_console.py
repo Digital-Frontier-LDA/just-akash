@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import threading
 import time
 import urllib.request
 from typing import Any
@@ -76,6 +77,7 @@ class AuthorizedConsoleCreate(CIConsoleAPI):
             raise CreateHeld("Invalid trusted Console create policy")
         super().__init__(api_key)
         self._owner, self._policy_revision, self._broker = owner, policy_revision, broker
+        self._submit_lock = threading.Lock()
         self._used = False
         self._dispatched = False
         self._binding: (
@@ -86,6 +88,28 @@ class AuthorizedConsoleCreate(CIConsoleAPI):
         raise CreateHeld("Use submit with a durably redeemed create authorization")
 
     def submit(
+        self,
+        *,
+        request: AdmissionRequest,
+        permit: CreatePermit,
+        authorization: CreateSubmissionAuthorization,
+        sdl_content: str,
+        deposit: float,
+    ) -> dict[str, Any]:
+        if not self._submit_lock.acquire(blocking=False):
+            raise CreateHeld("Console create submission is already in progress")
+        try:
+            return self._submit(
+                request=request,
+                permit=permit,
+                authorization=authorization,
+                sdl_content=sdl_content,
+                deposit=deposit,
+            )
+        finally:
+            self._submit_lock.release()
+
+    def _submit(
         self,
         *,
         request: AdmissionRequest,

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import threading
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from unittest.mock import MagicMock
 
@@ -333,3 +335,31 @@ def test_preflight_failure_is_held_and_removes_transport_authority(client, monke
             )
         )
     opener.assert_not_called()
+
+
+def test_concurrent_submit_cannot_cross_the_same_pending_opener(client, monkeypatch):
+    opener = transport(monkeypatch)
+    args = authority()
+    entered, release = threading.Event(), threading.Event()
+    validate = client._validate
+    calls = 0
+
+    def pending_opener(body):
+        nonlocal calls
+        calls += 1
+        validate(body)
+        if calls == 2:
+            entered.set()
+            assert release.wait(timeout=5)
+
+    monkeypatch.setattr(client, "_validate", pending_opener)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(client.submit, **args)
+        try:
+            assert entered.wait(timeout=5)
+            with pytest.raises(CreateHeld):
+                client.submit(**args)
+        finally:
+            release.set()
+        assert first.result(timeout=5) == {"dseq": "123"}
+    opener.assert_called_once()
