@@ -21,6 +21,27 @@ duplicate identities, then reads the group again to detect policy changes during
 pagination. The POST uses that same group ID. This first profile permits one
 private repository; public/fork and broader populations require separate policy.
 
+For a direct, non-reusable main workflow, set `non_reusable_workflow=True` and
+pin `source_workflow_revision` separately. The group's selected workflow is the
+exact repository/path at `refs/heads/main`, matching GitHub's supported branch
+restriction. The trusted caller must pass the authenticated producer workflow
+revision to `mint_jit`; a different or missing revision prevents the POST.
+This comparison does not authenticate caller-supplied text. Reusable profiles
+continue requiring an immutable workflow SHA and reject this branch-source input.
+
+`just_akash.api.CIConsoleAPI` is the controller-side transport for secret SDL/JIT
+payloads. It fixes the Console HTTPS origin, refuses redirects, omits runtime
+payload logging and suppresses response/exception details that can echo secrets.
+It preserves status/timeout metadata for reconciliation; it supplies neither
+admission nor retry authority. Legacy callers retain their error contract.
+
+The owner authorizes Console accounts shared across CI, production and other
+purposes. Track each CI operation's exact run, create receipt, deployment/lease,
+runner and attributable costs independently. Receipt-mode `deploy` retains an
+`already exists` response as unresolved: it neither sweeps older deployments nor
+sends a second create. Reconcile that receipt before retrying. Broad account or
+service/age sweeps are not a CI cleanup path on a shared account.
+
 All requests use the fixed `https://api.github.com` organization origin, refuse
 redirects, cap individual calls at 20 seconds and bound response size at 1 MiB.
 JSON duplicate keys and non-finite numbers are refused. The outer configuration and every file value must be canonical base64, and each filename must remain within the runner root. There is no automatic
