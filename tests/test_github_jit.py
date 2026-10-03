@@ -65,6 +65,78 @@ def mint(github):
     return jit.mint_jit(POLICY, NAME, LABELS, "installation-fixture", request=github)
 
 
+def branch_policy():
+    return jit.JitPolicy(
+        "b" * 40,
+        37,
+        123,
+        REPO,
+        (REPO + "/.github/workflows/ci-observability.yml@refs/heads/main",),
+        non_reusable_workflow=True,
+        source_workflow_revision="a" * 40,
+    )
+
+
+def test_non_reusable_group_branch_and_separate_source_binding_at_actual_mint():
+    github = GitHub()
+    policy = branch_policy()
+    github.group["selected_workflows"] = list(policy.workflows)
+    handoff = jit.mint_jit(
+        policy,
+        NAME,
+        LABELS,
+        "installation-fixture",
+        request=github,
+        producer_workflow_revision="a" * 40,
+    )
+    assert handoff.runner_id == 789
+    assert sum(call[0] == "POST" for call in github.calls) == 1
+
+
+@pytest.mark.parametrize("revision", [None, "c" * 40, "main", False])
+def test_branch_group_does_not_replace_approved_producer_source(revision):
+    github = GitHub()
+    with pytest.raises(jit.JitHold):
+        jit.mint_jit(
+            branch_policy(),
+            NAME,
+            LABELS,
+            "installation-fixture",
+            request=github,
+            producer_workflow_revision=revision,
+        )
+    assert not github.calls
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("workflows", (WORKFLOW,)),
+        ("workflows", (REPO + "/.github/workflows/ci.yml@refs/heads/other",)),
+        ("source_workflow_revision", None),
+        ("source_workflow_revision", "main"),
+        ("non_reusable_workflow", 1),
+    ],
+)
+def test_non_reusable_policy_rejects_unsupported_or_missing_bindings(field, value):
+    with pytest.raises(jit.JitHold):
+        replace(branch_policy(), **{field: value})
+
+
+def test_old_sha_group_is_held_for_a_non_reusable_branch_policy():
+    github = GitHub()
+    with pytest.raises(jit.JitHold):
+        jit.mint_jit(
+            branch_policy(),
+            NAME,
+            LABELS,
+            "installation-fixture",
+            request=github,
+            producer_workflow_revision="a" * 40,
+        )
+    assert not any(call[0] == "POST" for call in github.calls)
+
+
 def test_exact_verified_group_bound_at_real_mutation_once_and_secret_repr_redacted():
     github = GitHub()
     handoff = mint(github)
