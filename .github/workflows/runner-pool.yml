@@ -75,6 +75,21 @@ on:
         description: 'Unique label for this pool; carries run identity into runs-on.'
         required: true
         type: string
+      runner-image:
+        description: 'Optional private mirror reference. Must retain the qualified runner image digest.'
+        required: false
+        type: string
+        default: ''
+      runner-registry-host:
+        description: 'HTTPS registry credential host for the private runner mirror.'
+        required: false
+        type: string
+        default: ''
+      runner-registry-username:
+        description: 'Read-only registry credential username for the private runner mirror.'
+        required: false
+        type: string
+        default: ''
       tag-prefix:
         description: >-
           REQUIRED, no default. Deployments are tagged `<tag-prefix>-<run_id>` and a
@@ -303,6 +318,9 @@ on:
       GH_RUNNER_PAT:
         required: true
         description: 'Registers runners into the org and polls their status.'
+      RUNNER_REGISTRY_PASSWORD:
+        required: false
+        description: 'Read-only registry pull token or base64 service-account key. Never pass the org runner PAT.'
     outputs:
       dseq:
         description: 'Deployment sequence number; empty when no lease survived.'
@@ -985,6 +1003,14 @@ jobs:
       #     1.5.0 flags the literal as a Base64 high-entropy string (just-akash#384 Secret Scan).
       #   * UNCLASSIFIED_ATTEMPT: an attempt that fell into the unclassified `continue` may have
       #     broadcast a create with no DSEQ, so no later refusal narrows the outcome to no-deployment.
+      - name: Configure the qualified private runner mirror
+        env:
+          RUNNER_IMAGE: ${{ inputs.runner-image }}
+          RUNNER_REGISTRY_HOST: ${{ inputs.runner-registry-host }}
+          RUNNER_REGISTRY_USERNAME: ${{ inputs.runner-registry-username }}
+          RUNNER_REGISTRY_PASSWORD: ${{ secrets.RUNNER_REGISTRY_PASSWORD }}
+        run: python3 just_akash/runner_image.py --sdl /tmp/runner-sdl.yaml
+
       - name: Provision (retry down candidates, tag before waiting)
         id: provision
         env:
