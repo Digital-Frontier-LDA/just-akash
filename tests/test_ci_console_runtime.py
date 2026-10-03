@@ -5,6 +5,7 @@ import json
 import logging
 import traceback
 import urllib.error
+import urllib.response
 from email.message import Message
 from unittest.mock import MagicMock
 
@@ -15,6 +16,10 @@ from just_akash.api import CONSOLE_HTTP_TIMEOUT, AkashAPIError, AkashConsoleAPI,
 JIT = "synthetic-jit-config-DO-NOT-LOG"
 KEY = "synthetic-controller-key-DO-NOT-LOG"
 SDL = f"services:\n  runner:\n    env:\n      - RUNNER_JIT_CONFIG={JIT}\n"
+
+
+class HTTPResponse(urllib.response.addinfourl):
+    msg = "OK"
 
 
 def assert_private(caplog, error=None):
@@ -34,7 +39,7 @@ def test_create_sends_exact_runtime_payload_without_logging_values(monkeypatch, 
     response.read.return_value = json.dumps({"data": {"dseq": "123", JIT: KEY}}).encode()
     response.__enter__.return_value = response
     transport = MagicMock(return_value=response)
-    monkeypatch.setattr("urllib.request.urlopen", transport)
+    monkeypatch.setattr("urllib.request.OpenerDirector.open", transport)
 
     result = CIConsoleAPI(KEY).create_deployment(SDL, deposit=0.5)
 
@@ -67,7 +72,7 @@ def test_echoed_http_errors_are_safe_to_report_without_retry(monkeypatch, caplog
             f"https://console.invalid/{JIT}", 502, KEY, Message(), io.BytesIO(body.encode())
         )
     )
-    monkeypatch.setattr("urllib.request.urlopen", transport)
+    monkeypatch.setattr("urllib.request.OpenerDirector.open", transport)
 
     with pytest.raises(AkashAPIError) as caught:
         CIConsoleAPI(KEY).create_deployment(SDL)
@@ -96,7 +101,7 @@ def test_timeout_metadata_survives_redaction_without_authorizing_retry(monkeypat
             "https://console.invalid", 500, KEY, Message(), io.BytesIO(body.encode())
         )
     )
-    monkeypatch.setattr("urllib.request.urlopen", transport)
+    monkeypatch.setattr("urllib.request.OpenerDirector.open", transport)
     with pytest.raises(AkashAPIError) as caught:
         CIConsoleAPI(KEY).create_deployment(SDL)
     assert caught.value.status == 500
@@ -114,7 +119,7 @@ def test_timeout_metadata_survives_redaction_without_authorizing_retry(monkeypat
 def test_transport_error_details_do_not_escape(monkeypatch, caplog, failure, exception_type):
     caplog.set_level(logging.DEBUG, logger="akash.api")
     transport = MagicMock(side_effect=failure)
-    monkeypatch.setattr("urllib.request.urlopen", transport)
+    monkeypatch.setattr("urllib.request.OpenerDirector.open", transport)
     with pytest.raises(exception_type) as caught:
         CIConsoleAPI(KEY).create_deployment(SDL)
     assert not isinstance(caught.value, AkashAPIError)
@@ -129,7 +134,7 @@ def test_missing_jwt_does_not_echo_response(monkeypatch, caplog, provider):
     response.status = 200
     response.read.return_value = json.dumps({"data": {"echo": KEY + JIT}}).encode()
     response.__enter__.return_value = response
-    monkeypatch.setattr("urllib.request.urlopen", MagicMock(return_value=response))
+    monkeypatch.setattr("urllib.request.OpenerDirector.open", MagicMock(return_value=response))
     client = CIConsoleAPI(KEY)
     with pytest.raises(RuntimeError, match="JWT token not found") as caught:
         if provider:
@@ -156,3 +161,69 @@ def test_legacy_error_contract_is_preserved_but_payload_logging_is_removed(monke
     assert str(caught.value) == f"API Error (409): already exists {JIT}"
     assert caught.value.body == body
     assert_private(caplog)
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_redirect_never_sends_controller_key_to_another_origin(monkeypatch, caplog, status):
+    caplog.set_level(logging.DEBUG, logger="akash.api")
+    calls = []
+
+    def https_open(_handler, request):
+        calls.append(request)
+        headers = Message()
+        headers["Location"] = "https://another.invalid/" + JIT
+        response = HTTPResponse(
+            io.BytesIO((KEY + JIT).encode()), headers, request.full_url, status
+        )
+        response.msg = "Redirect"
+        return response
+
+    # Run actual OpenerDirector/HTTPErrorProcessor/redirect handlers; only the
+    # socket boundary is replaced. No Console or other-origin traffic occurs.
+    monkeypatch.setattr("urllib.request.HTTPSHandler.https_open", https_open)
+    with pytest.raises(AkashAPIError) as caught:
+        CIConsoleAPI(KEY).create_deployment(SDL)
+
+    assert caught.value.status == status
+    assert len(calls) == 1
+    assert calls[0].full_url == "https://console-api.akash.network/v1/deployments"
+    assert calls[0].get_header("X-api-key") == KEY
+    assert json.loads(calls[0].data) == {"data": {"sdl": SDL, "deposit": 5.0}}
+    assert_private(caplog, caught.value)
+
+
+def test_default_redirect_positive_control_forwards_the_key(monkeypatch):
+    calls = []
+
+    def https_open(_handler, request):
+        calls.append(request)
+        headers = Message()
+        status = 200 if len(calls) > 1 else 302
+        if status == 302:
+            headers["Location"] = "https://another.invalid/"
+        response = HTTPResponse(
+            io.BytesIO(b'{"data":{"dseq":"123"}}'), headers, request.full_url, status
+        )
+        response.msg = "OK"
+        return response
+
+    monkeypatch.setattr("urllib.request.HTTPSHandler.https_open", https_open)
+    assert AkashConsoleAPI(KEY).create_deployment(SDL) == {"dseq": "123"}
+    assert len(calls) == 2
+    assert calls[1].full_url == "https://another.invalid/"
+    assert calls[1].get_header("X-api-key") == KEY
+
+
+def test_ci_origin_is_not_selected_by_ambient_environment(monkeypatch):
+    monkeypatch.setenv("AKASH_CONSOLE_URL", "https://another.invalid")
+    assert CIConsoleAPI(KEY).base_url == "https://console-api.akash.network"
+    assert AkashConsoleAPI(KEY).base_url == "https://another.invalid"
+
+
+@pytest.mark.parametrize("key", ["", "a\nb", "a\rb", "a b", "é", None])
+def test_invalid_ci_key_is_rejected_before_transport(monkeypatch, key):
+    transport = MagicMock()
+    monkeypatch.setattr("urllib.request.OpenerDirector.open", transport)
+    with pytest.raises(ValueError, match="Invalid CI Console API key"):
+        CIConsoleAPI(key)
+    transport.assert_not_called()

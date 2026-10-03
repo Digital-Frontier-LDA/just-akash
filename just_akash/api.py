@@ -33,6 +33,12 @@ logger = logging.getLogger("akash.api")
 # 524 at 125s (deploy.py `_report_suspected_orphans` records the shape). Cutting inside
 # that envelope would turn answers we currently get — and can classify — into unknowns.
 CONSOLE_HTTP_TIMEOUT = 180.0
+CI_CONSOLE_ORIGIN = "https://console-api.akash.network"
+
+
+class _NoConsoleRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def _ts() -> str:
@@ -255,7 +261,7 @@ class AkashConsoleAPI:
 
         try:
             t0 = datetime.now(timezone.utc)
-            with urllib.request.urlopen(req, timeout=CONSOLE_HTTP_TIMEOUT) as response:  # noqa: S310
+            with self._open_request(req) as response:
                 response_bytes = response.read()
                 response_data = response_bytes.decode("utf-8")
                 elapsed_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
@@ -353,6 +359,10 @@ class AkashConsoleAPI:
             if self._protect_runtime_payloads:
                 raise RuntimeError("Connection error: Console request failed") from None
             raise RuntimeError(f"Connection error: {e}") from e
+
+    def _open_request(self, request: urllib.request.Request) -> Any:
+        # S310: the URL is built from the operator-configured Console origin.
+        return urllib.request.urlopen(request, timeout=CONSOLE_HTTP_TIMEOUT)  # noqa: S310
 
     def list_deployments(self, active_only: bool = True) -> list[dict[str, Any]]:
         """Deployments for this API key, EVERY page of them.
@@ -897,10 +907,27 @@ class CIConsoleAPI(AkashConsoleAPI):
     Mediator error messages/bodies and transport exception details are withheld
     because they may echo the SDL/JIT configuration. HTTP status and typed
     timeout metadata remain available; no outcome becomes safe to retry.
+    Requests use the fixed Console HTTPS origin and never follow redirects.
     This client is not admission authority, and existing consumers do not use it.
     """
 
     _protect_runtime_payloads = True
+
+    def __init__(self, api_key: str):
+        if (
+            not isinstance(api_key, str)
+            or not api_key
+            or any(not 33 <= ord(char) <= 126 for char in api_key)
+        ):
+            raise ValueError("Invalid CI Console API key")
+        super().__init__(api_key, base_url=CI_CONSOLE_ORIGIN)
+
+    def _open_request(self, request: urllib.request.Request) -> Any:
+        # A redirect can copy x-api-key to another origin. Every redirect is an
+        # HTTP error requiring reconciliation; never follow or repeat a create.
+        return urllib.request.build_opener(_NoConsoleRedirect()).open(
+            request, timeout=CONSOLE_HTTP_TIMEOUT
+        )
 
 
 def _extract_dseq(deployment: dict[str, Any]) -> str | None:
