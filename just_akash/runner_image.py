@@ -6,9 +6,58 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
+
+
+def read_pull_credentials(path: Path, *, username: str, password: str) -> tuple[str, str]:
+    """Decrypt only the caller's pull bundle, without exporting credentials to the job."""
+    if password or not username or not os.environ.get("SOPS_AGE_KEY"):
+        raise ValueError("SOPS mode requires an age key, explicit username and no direct password")
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("Pull bundle must be a regular file")
+    child_env = {
+        key: os.environ[key]
+        for key in ("PATH", "LANG", "LC_ALL", "TMPDIR", "SOPS_AGE_KEY")
+        if key in os.environ
+    }
+    try:
+        result = subprocess.run(  # noqa: S603 - fixed argv, bounded trusted SOPS binary
+            ["sops", "decrypt", "--input-type", "dotenv", "--output-type", "dotenv", str(path)],  # noqa: S607
+            env=child_env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError("Pull bundle decryption failed") from exc
+    if result.returncode or len(result.stdout) > 16384:
+        raise ValueError("Pull bundle decryption failed")
+    values: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        key, separator, value = line.partition("=")
+        if (
+            not separator
+            or key not in {"DOCKERHUB_PULL_USERNAME", "DOCKERHUB_PULL_TOKEN"}
+            or key in values
+            or not value
+            or "\r" in value
+        ):
+            raise ValueError("Pull bundle contains invalid credentials")
+        values[key] = value
+    if set(values) != {"DOCKERHUB_PULL_USERNAME", "DOCKERHUB_PULL_TOKEN"}:
+        raise ValueError("Pull bundle must contain exactly the reader credentials")
+    if values["DOCKERHUB_PULL_USERNAME"] != username:
+        raise ValueError("Pull identity does not match the configured registry username")
+    token = values["DOCKERHUB_PULL_TOKEN"]
+    # Actions command escaping prevents '%' in a token becoming a command escape.
+    print("::add-mask::" + token.replace("%", "%25"))
+    return username, token
 
 
 def configure(path: Path, *, image: str, host: str, username: str, password: str) -> None:
@@ -79,14 +128,21 @@ def configure(path: Path, *, image: str, host: str, username: str, password: str
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sdl", type=Path, required=True)
+    parser.add_argument("--sops-env-file", type=Path)
     args = parser.parse_args()
     try:
+        username = os.environ.get("RUNNER_REGISTRY_USERNAME", "")
+        password = os.environ.get("RUNNER_REGISTRY_PASSWORD", "")
+        if args.sops_env_file:
+            username, password = read_pull_credentials(
+                args.sops_env_file, username=username, password=password
+            )
         configure(
             args.sdl,
             image=os.environ.get("RUNNER_IMAGE", ""),
             host=os.environ.get("RUNNER_REGISTRY_HOST", ""),
-            username=os.environ.get("RUNNER_REGISTRY_USERNAME", ""),
-            password=os.environ.get("RUNNER_REGISTRY_PASSWORD", ""),
+            username=username,
+            password=password,
         )
     except (ValueError, OSError):
         print(
