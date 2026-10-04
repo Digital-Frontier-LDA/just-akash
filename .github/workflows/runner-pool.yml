@@ -87,6 +87,11 @@ on:
         required: false
         type: string
         default: ''
+      runner-registry-sops:
+        description: 'Decrypt the caller secrets/registry-pull.sops.env inside provisioning using the scoped reader age key.'
+        required: false
+        type: boolean
+        default: false
       tag-prefix:
         description: >-
           REQUIRED, no default. Deployments are tagged `<tag-prefix>-<run_id>` and a
@@ -308,6 +313,9 @@ on:
       RUNNER_REGISTRY_PASSWORD:
         required: false
         description: 'Read-only registry pull token or base64 service-account key. Never pass the org runner PAT.'
+      RUNNER_REGISTRY_AGE_KEY:
+        required: false
+        description: 'Scoped age key for the caller registry-pull.sops.env. Never pass the management age key.'
     outputs:
       dseq:
         description: 'Deployment sequence number; empty when no lease survived.'
@@ -485,6 +493,30 @@ jobs:
           ref: ${{ inputs.just-akash-ref }}
           path: .just-akash
           persist-credentials: false
+
+      - name: Check out the caller encrypted reader bundle
+        if: inputs.runner-registry-sops
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: .runner-registry-source
+          sparse-checkout: secrets/registry-pull.sops.env
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Install checksum-pinned SOPS for private runner pulls
+        if: inputs.runner-registry-sops
+        run: |
+          set -euo pipefail
+          task_dir=$(mktemp -d)
+          trap 'rm -rf "$task_dir"' EXIT
+          curl --fail --silent --show-error --location --retry 3 --max-time 120 \
+            https://github.com/getsops/sops/releases/download/v3.13.1/sops-v3.13.1.linux.amd64 \
+            --output "$task_dir/sops"
+          echo "620a9d7e3352ababeca6908cea24a6e8b14ce89a448ddbd3f94f1ef3398f470a  $task_dir/sops" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/runner-pull-bin"
+          install -m 0755 "$task_dir/sops" "$RUNNER_TEMP/runner-pull-bin/sops"
+          printf '%s\n' "$RUNNER_TEMP/runner-pull-bin" >> "$GITHUB_PATH"
 
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
 
@@ -989,12 +1021,25 @@ jobs:
       #   * UNCLASSIFIED_ATTEMPT: an attempt that fell into the unclassified `continue` may have
       #     broadcast a create with no DSEQ, so no later refusal narrows the outcome to no-deployment.
       - name: Configure the qualified private runner mirror
+        if: ${{ !inputs.runner-registry-sops }}
         env:
           RUNNER_IMAGE: ${{ inputs.runner-image }}
           RUNNER_REGISTRY_HOST: ${{ inputs.runner-registry-host }}
           RUNNER_REGISTRY_USERNAME: ${{ inputs.runner-registry-username }}
           RUNNER_REGISTRY_PASSWORD: ${{ secrets.RUNNER_REGISTRY_PASSWORD }}
         run: python3 just_akash/runner_image.py --sdl /tmp/runner-sdl.yaml
+
+      - name: Configure the qualified private runner mirror from SOPS
+        if: inputs.runner-registry-sops
+        env:
+          RUNNER_IMAGE: ${{ inputs.runner-image }}
+          RUNNER_REGISTRY_HOST: ${{ inputs.runner-registry-host }}
+          RUNNER_REGISTRY_USERNAME: ${{ inputs.runner-registry-username }}
+          RUNNER_REGISTRY_PASSWORD: ${{ secrets.RUNNER_REGISTRY_PASSWORD }}
+          SOPS_AGE_KEY: ${{ secrets.RUNNER_REGISTRY_AGE_KEY }}
+        run: >-
+          python3 just_akash/runner_image.py --sdl /tmp/runner-sdl.yaml
+          --sops-env-file ../.runner-registry-source/secrets/registry-pull.sops.env
 
       - name: Provision (retry down candidates, tag before waiting)
         id: provision
@@ -1217,6 +1262,7 @@ jobs:
               echo "::error title=Runner registration token not minted (HTTP ${CODE:-none received})::attempt $attempt: nothing deployed. The PAT preflight passed: a GitHub API condition, not a provider fault."
               echo "::endgroup::"; exit 1
             fi
+            umask 077
             if ! printf '%s\n' "${SDL_TEMPLATE//@@RUNNER_TOKEN@@/$RUNNER_TOKEN}" > /tmp/runner-sdl.minted.yaml \
               || grep -q '@@RUNNER_TOKEN@@' /tmp/runner-sdl.minted.yaml; then
               rm -f -- /tmp/runner-sdl.minted.yaml
@@ -1960,6 +2006,10 @@ jobs:
             rm -f /tmp/ja.log.*
           fi
           exit 1
+
+      - name: Remove task-owned credential-bearing runner templates
+        if: always()
+        run: rm -f -- /tmp/runner-sdl.yaml /tmp/runner-sdl.minted.yaml
 
   # ── ROLLBACK BEFORE SUCCESSFUL HANDOFF ────────────────────────────────────────
   # The reusable workflow must finish before caller consumer jobs can start.
