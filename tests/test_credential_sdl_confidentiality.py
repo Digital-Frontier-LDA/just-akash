@@ -8,6 +8,7 @@ import json
 import logging
 import traceback
 import urllib.error
+from email.message import Message
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -31,7 +32,7 @@ PRIVATE = SDL_YAML.replace(
 def _http(monkeypatch, body, status=400):
     def fail(*_args, **_kwargs):
         raise urllib.error.HTTPError(
-            "https://console.invalid", status, SECRET, {}, io.BytesIO(body)
+            "https://console.invalid", status, SECRET, Message(), io.BytesIO(body)
         )
 
     monkeypatch.setattr("urllib.request.urlopen", fail)
@@ -457,7 +458,9 @@ def test_main_ci_runtime_client_keeps_stronger_marker_free_protection(monkeypatc
     body = json.dumps({"message": f"already exists; no longer open; {SECRET}"}).encode()
 
     def fail(*_args, **_kwargs):
-        raise urllib.error.HTTPError("https://console.invalid", 409, SECRET, {}, io.BytesIO(body))
+        raise urllib.error.HTTPError(
+            "https://console.invalid", 409, SECRET, Message(), io.BytesIO(body)
+        )
 
     monkeypatch.setattr(client, "_open_request", fail)
     with pytest.raises(AkashAPIError) as caught:
@@ -494,3 +497,188 @@ def test_main_receipt_private_already_exists_refuses_replay_and_stale_sweep(
     cleanup.assert_not_called()
     assert json.loads(receipt.read_text())["state"] == "submitting"
     assert SECRET not in _visible(caught.value, caplog, capsys)
+
+
+@pytest.mark.parametrize("identity", [SECRET, "0", "01", "-1", "１２３", str(2**64), True, 42.0])
+def test_malformed_private_create_identity_stops_before_logs_poll_or_replay(
+    private_deploy, identity, caplog, capsys
+):
+    client, path = private_deploy
+    client.create_deployment.return_value = {"dseq": identity, "manifest": PRIVATE}
+    with pytest.raises(RuntimeError, match="NON-RETRYABLE CREATE OUTCOME AMBIGUOUS") as caught:
+        dp.deploy(path)
+    assert client.create_deployment.call_count == 1
+    client.get_bids.assert_not_called()
+    client.create_lease.assert_not_called()
+    client.close_deployment.assert_not_called()  # No guessed cleanup identity.
+    assert SECRET not in _visible(caught.value, caplog, capsys)
+
+
+def test_invalid_private_create_identity_keeps_submitting_receipt(
+    private_deploy, tmp_path, caplog, capsys
+):
+    client, path = private_deploy
+    Path(path).write_text(
+        SDL.replace("    image:", f"    credentials: {{password: {SECRET}}}\n    image:", 1)
+    )
+    parent = tmp_path / "receipt-dir"
+    parent.mkdir(mode=0o700)
+    receipt = parent / "receipt.json"
+    client.create_deployment.return_value = {"dseq": SECRET, "manifest": PRIVATE}
+    with pytest.raises(RuntimeError, match="NON-RETRYABLE CREATE OUTCOME AMBIGUOUS") as caught:
+        dp.deploy(path, receipt_path=str(receipt), receipt_operation_id="test-create-42")
+    assert client.create_deployment.call_count == 1
+    assert json.loads(receipt.read_text())["state"] == "submitting"
+    client.get_bids.assert_not_called()
+    assert SECRET not in _visible(caught.value, caplog, capsys)
+
+
+def test_invalid_private_redeploy_identity_is_not_logged_or_polled(private_deploy, caplog, capsys):
+    client, path = private_deploy
+    client.create_deployment.side_effect = [
+        {"dseq": "42", "manifest": PRIVATE},
+        {"dseq": SECRET, "manifest": PRIVATE},
+    ]
+    client.create_lease.side_effect = RuntimeError("no lease for deployment")
+    with pytest.raises(RuntimeError, match="NON-RETRYABLE CREATE OUTCOME AMBIGUOUS") as caught:
+        dp.deploy(path, bid_wait=2, bid_wait_retry=2)
+    assert client.create_deployment.call_count == 2
+    assert {call.args[0] for call in client.get_bids.call_args_list} == {"42"}
+    client.close_deployment.assert_called_once_with("42")
+    assert SECRET not in _visible(caught.value, caplog, capsys)
+
+
+def test_private_bid_and_final_metadata_echo_is_withheld_without_rewriting_transport(
+    private_deploy, caplog, capsys
+):
+    client, path = private_deploy
+    bid = _make_bid(SECRET, 100, denom=SECRET)
+    client.get_bids.return_value = [bid]
+    client.account_address.return_value = SECRET
+    result = dp.deploy(path, bid_wait=2, bid_wait_retry=2)
+    assert result["provider"] == SECRET
+    assert client.create_lease.call_args.kwargs["provider"] == SECRET
+    assert client.create_lease.call_args.kwargs["manifest"] == PRIVATE
+    assert bid["id"]["provider"] == SECRET and bid["price"]["denom"] == SECRET
+    assert SECRET not in caplog.text + str(capsys.readouterr())
+
+
+def test_private_foreign_bid_state_echo_is_withheld_even_before_tier_filtering(
+    private_deploy, caplog, capsys
+):
+    client, path = private_deploy
+    bid = _make_bid(SECRET, 100, denom=SECRET)
+    bid["state"] = SECRET
+    client.get_bids.return_value = [bid]
+    with pytest.raises(RuntimeError) as caught:
+        dp.deploy(path, bid_wait=2, bid_wait_retry=2, preferred_providers=[OWNER])
+    assert client.create_deployment.call_count == 1
+    assert SECRET not in _visible(caught.value, caplog, capsys)
+
+
+def test_private_bid_table_state_and_structured_diagnostic_context_do_not_echo(
+    tmp_path, caplog, capsys
+):
+    caplog.set_level(logging.DEBUG)
+    path = tmp_path / "private.yaml"
+    path.write_text(PRIVATE)
+    bid = _make_bid(SECRET, 100, denom=SECRET)
+    bid["state"] = SECRET
+
+    @sdl_operation
+    def describe(sdl_path):
+        dp._log_bid_table([bid], "TEST")
+        dp.emit(
+            "NO_DSEQ_RETURNED",
+            "error",
+            SECRET,
+            provider=SECRET,
+            account=SECRET,
+            dseq=SECRET,
+            states=[SECRET],
+        )
+
+    describe(str(path))
+    assert SECRET not in caplog.text + str(capsys.readouterr())
+    assert bid["state"] == SECRET
+
+
+def test_private_followup_endpoint_echo_is_hidden_without_rewriting_wire(
+    tmp_path, monkeypatch, caplog, capsys
+):
+    caplog.set_level(logging.DEBUG)
+    path = tmp_path / "private.yaml"
+    path.write_text(PRIVATE)
+    sent = []
+
+    def fail(request, **_kwargs):
+        sent.append(request.full_url)
+        raise urllib.error.HTTPError("url", 400, SECRET, Message(), io.BytesIO(SECRET.encode()))
+
+    monkeypatch.setattr("urllib.request.urlopen", fail)
+
+    @sdl_operation
+    def read(sdl_path):
+        return AkashConsoleAPI("fake-console-key")._request("GET", f"/v1/bids/{SECRET}")
+
+    with pytest.raises(AkashAPIError) as caught:
+        read(str(path))
+    assert SECRET in sent[0]
+    assert SECRET not in _visible(caught.value, caplog, capsys)
+
+
+def test_valid_private_metadata_stays_visible_and_public_metadata_remains_unchanged(
+    tmp_path, caplog, capsys
+):
+    from just_akash._confidential import canonical_dseq, display
+
+    assert canonical_dseq("18446744073709551615")
+    assert canonical_dseq(42)
+    assert not canonical_dseq("18446744073709551616")
+    path = tmp_path / "private.yaml"
+    path.write_text(PRIVATE)
+
+    @sdl_operation
+    def describe(sdl_path):
+        assert display("42", "dseq") == "42"
+        assert display(OWNER, "address") == OWNER
+        assert display("open", "state") == "open"
+        assert display("uact", "denom") == "uact"
+        dp.emit("LEASE_CREATE_FAILED", "error", "fixed", dseq="42", provider=OWNER)
+
+    describe(str(path))
+    output = capsys.readouterr().err
+    assert json.loads(output)["dseq"] == "42"
+    assert json.loads(output)["context"]["provider"] == OWNER
+    assert not active()
+    assert display(SECRET, "address") == SECRET
+    assert display(SECRET, "state") == SECRET
+    assert display(SECRET, "denom") == SECRET
+
+
+def test_private_and_public_auctions_keep_identical_selection_and_lease_wire(
+    private_deploy, monkeypatch, capsys
+):
+    client, path = private_deploy
+    candidates = [
+        "akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",
+        "akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z",
+    ]
+    client.get_bids.return_value = [
+        _make_bid(p, 100 + index) for index, p in enumerate(candidates)
+    ]
+    private_result = dp.deploy(path, bid_wait=2, bid_wait_retry=2, preferred_providers=candidates)
+    private_lease = dict(client.create_lease.call_args.kwargs)
+    assert client.create_deployment.call_count == 1
+    assert private_lease["manifest"] == PRIVATE
+    assert private_lease["provider"] in candidates
+    client.reset_mock()
+    monkeypatch.setattr(dp.time, "time", _time_mock())
+    Path(path).write_text(SDL_YAML)
+    public_result = dp.deploy(path, bid_wait=2, bid_wait_retry=2, preferred_providers=candidates)
+    assert public_result == private_result
+    assert client.create_lease.call_args.kwargs == private_lease
+    assert client.create_deployment.call_count == 1
+    client.close_deployment.assert_not_called()
+    assert not active()
+    capsys.readouterr()

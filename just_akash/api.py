@@ -250,7 +250,7 @@ class AkashConsoleAPI:
         request_body = json.dumps(data).encode("utf-8") if data else None
         # SDLs can contain a short-lived JIT configuration. Log the actual byte
         # population rather than request values, even on the legacy client.
-        log_endpoint = "<CI Console endpoint>" if self._protect_runtime_payloads else endpoint
+        log_endpoint = "<CI Console endpoint>" if confidential else endpoint
         logger.debug(
             f"[{_ts()}] API {method} {log_endpoint} body_bytes={len(request_body or b'')}"
         )

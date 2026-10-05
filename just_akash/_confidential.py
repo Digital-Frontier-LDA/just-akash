@@ -8,14 +8,18 @@ remote responses may escape or transform a credential before echoing it.
 from __future__ import annotations
 
 import inspect
+import math
+import re
 from contextlib import suppress
 from contextvars import ContextVar
 from functools import wraps
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import yaml
 from yaml.nodes import MappingNode, ScalarNode, SequenceNode
+
+from .address import is_canonical_akash_address
 
 _ACTIVE: ContextVar[bool] = ContextVar("akash_confidential_sdl", default=False)
 _READER_KEYS = ("DOCKERHUB_PULL_USERNAME", "DOCKERHUB_PULL_TOKEN")
@@ -69,6 +73,62 @@ def credential_content(content: str) -> bool:
         ):
             return True
     return False
+
+
+def canonical_dseq(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return False
+    text = str(value)
+    return re.fullmatch(r"[1-9][0-9]{0,19}", text) is not None and int(text) <= 2**64 - 1
+
+
+def display(value: object, kind: str) -> str:
+    """Private diagnostics expose only structurally verified lifecycle metadata.
+
+    This never rewrites the transport or auction data. A malformed remote field
+    may echo any part of a payload; printable string/type alone is insufficient.
+    """
+    if not active():
+        return str(value)
+    valid = False
+    if kind == "address_list":
+        return (
+            str([display(item, "address") for item in value])
+            if isinstance(value, list)
+            else "<withheld>"
+        )
+    if kind == "number":
+        valid = type(value) is int or type(value) is float and math.isfinite(value)
+    elif kind == "bool":
+        valid = type(value) is bool
+    elif kind == "dseq":
+        valid = canonical_dseq(value)
+    elif kind == "address":
+        valid = isinstance(value, str) and is_canonical_akash_address(value)
+    elif kind == "state":
+        valid = isinstance(value, str) and value in {"open", "active", "closed", "lost", "?"}
+    elif kind == "denom":
+        valid = isinstance(value, str) and value in {"uakt", "uact"}
+    return str(value) if valid else "<withheld>"
+
+
+def diagnostic_context(context: dict[str, object]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in context.items():
+        if key in {"dseq", "provider", "account"}:
+            kind = "dseq" if key == "dseq" else "address"
+            result[key] = display(value, kind)
+        elif (
+            isinstance(value, bool)
+            or value is None
+            or type(value) is int
+            or type(value) is float
+            and math.isfinite(value)
+        ):
+            result[key] = value
+        else:
+            result[key] = "<withheld>"
+    return result
 
 
 def protect_content(content: str) -> None:
@@ -128,14 +188,17 @@ def sanitize_exception(error: Exception) -> None:
         error.strerror = "details withheld" if error.errno is not None else None
         error.filename = None
         error.filename2 = None
+    # These optional fields belong to concrete exception subclasses. Keep this
+    # helper independent of api.py (which imports it), and guard every access.
+    mutable = cast(Any, error)
     if hasattr(error, "body"):
-        error.body = ""
-    if hasattr(error, "error_name") and error.error_name != "origin_response_timeout":
-        error.error_name = ""
+        mutable.body = ""
+    if hasattr(error, "error_name") and mutable.error_name != "origin_response_timeout":
+        mutable.error_name = ""
     error.__cause__ = None
     error.__context__ = None
     if hasattr(error, "__notes__"):
-        error.__notes__ = []
+        mutable.__notes__ = []
 
 
 def sdl_operation(function):
