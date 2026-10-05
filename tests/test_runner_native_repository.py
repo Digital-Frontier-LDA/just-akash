@@ -66,6 +66,11 @@ def test_all_pool_api_sites_and_rollback_share_fixed_scope():
     assert '"${RUNNER_COLLECTION}?per_page=100"' in provision
     assert "verify_native_reader_admission()" in provision
     rollback = doc["jobs"]["teardown"]["with"]
+    assert doc["jobs"]["teardown"]["uses"].endswith("@810e75fb5cd0963f80329d54d11e1b00cecf527f")
+    assert rollback["just-akash-ref"] == (
+        "${{ inputs.runner-native-pull-reader && '810e75fb5cd0963f80329d54d11e1b00cecf527f' "
+        "|| inputs.just-akash-ref }}"
+    )
     assert (
         rollback["github-repository"]
         == "${{ inputs.runner-native-repository-scope && 'Borduas-Holdings/blazing' || '' }}"

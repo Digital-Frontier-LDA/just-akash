@@ -3329,8 +3329,11 @@ class TestBothProbesUseTheWriteVerb:
     def test_both_sites_post_a_registration_token(self):
         preflight = _step("PAT must still be valid")["run"]
         provision = _step("Provision")["run"]
-        for label, body in (("preflight", preflight), ("verdict", provision)):
-            assert '"${RUNNER_COLLECTION}/registration-token"' in body, f"{label} still reads"
+        for label, body, endpoint in (
+            ("preflight", preflight, '"orgs/${ORG}/actions/runners/registration-token"'),
+            ("verdict", provision, '"${RUNNER_COLLECTION}/registration-token"'),
+        ):
+            assert endpoint in body, f"{label} still reads"
             assert 'RUNNER_COLLECTION="orgs/${ORG}/actions/runners"' in body
             assert "--method POST" in body, f"{label} is not using the write verb"
 
