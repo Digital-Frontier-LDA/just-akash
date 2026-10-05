@@ -1060,6 +1060,7 @@ jobs:
           SOPS_AGE_KEY: ${{ secrets.RUNNER_REGISTRY_AGE_KEY }}
           RUNNER_NATIVE_PULL_READER: ${{ inputs.runner-native-pull-reader }}
           NATIVE_READER_CALLER: ${{ github.repository }}
+          GH_TOKEN: ${{ inputs.runner-native-pull-reader && secrets.GH_RUNNER_PAT || '' }}
           NATIVE_READER_RUN_ID: ${{ github.run_id }}
           NATIVE_READER_RUN_ATTEMPT: ${{ github.run_attempt }}
           NATIVE_READER_SOURCE: ${{ inputs.just-akash-repository }}
@@ -1098,6 +1099,7 @@ jobs:
           REQUIRED_DEPOSIT_USD: ${{ inputs.required-deposit-usd }}
           PROVIDER_SELECT: ${{ inputs.provider-select }}
           DEPLOYMENT_GROUP: ${{ steps.render.outputs.deployment_group }}
+          RUNNER_NATIVE_PULL_READER: ${{ inputs.runner-native-pull-reader }}
         run: |
           set -uo pipefail
 
@@ -1290,6 +1292,21 @@ jobs:
               echo failure_reason=RUNNER_SDL_TEMPLATE_MISSING >> "$GITHUB_OUTPUT"
               echo "::error title=Runner SDL template missing, empty or without its token placeholder::attempt $attempt: nothing minted or deployed."
               echo "::endgroup::"; exit 1
+            fi
+            # Legacy registration uses the actual Default group. Recheck server
+            # policy before each mint; an earlier hosted observation is not admission.
+            if [ "${RUNNER_NATIVE_PULL_READER:-false}" = true ] && ! python3 - <<'PY'
+          from just_akash.runner_image import verify_native_reader_group
+          try:
+              verify_native_reader_group()
+          except (ValueError, OSError):
+              raise SystemExit('Native reader runner group authority was not verified')
+          PY
+            then
+              [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+              echo failure_reason=NATIVE_READER_GROUP_UNQUALIFIED >> "$GITHUB_OUTPUT"
+              echo '::error::Native reader Default group repository access was not verified; no new token or deployment submitted'
+              echo '::endgroup::'; exit 1
             fi
             RC=0
             RESP=$(gh api --method POST "orgs/${ORG}/actions/runners/registration-token" -i 2>&1) || RC=$?

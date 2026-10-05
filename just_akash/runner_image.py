@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import tempfile
+import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -22,6 +23,173 @@ NATIVE_READER_PROVIDERS = frozenset(
         "akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x",
     }
 )
+NATIVE_READER_REPOSITORIES = {
+    1074974924: "Borduas-Holdings/blazing",
+    1071436278: "Borduas-Holdings/Blazing-Back",
+}
+_GROUP_ROOT = "/orgs/Borduas-Holdings/actions/runner-groups"
+
+
+class NativeReaderGroupError(ValueError):
+    """Fixed hold stage for unverified hosted GitHub admission."""
+
+
+class _GroupNoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _native_group_request(path: str) -> dict:
+    """Fixed-origin hosted reads; neither bearer credentials nor remote prose escape."""
+    token = os.environ.get("GH_TOKEN", "")
+    valid_path = re.fullmatch(
+        re.escape(_GROUP_ROOT) + r"(?:\?per_page=100&page=[12]|/[1-9][0-9]{0,19}"
+        r"(?:/repositories\?per_page=100&page=[12])?)",
+        path,
+    )
+    if (
+        valid_path is None
+        or not token
+        or len(token) > 4096
+        or any(not 33 <= ord(c) < 127 for c in token)
+    ):
+        raise NativeReaderGroupError("Native reader GitHub group authority was not verified")
+    try:
+        request = urllib.request.Request(
+            "https://api.github.com" + path,
+            headers={
+                "Authorization": "Bearer " + token,
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "just-akash-native-reader-policy",
+            },
+            method="GET",
+        )
+        with urllib.request.build_opener(_GroupNoRedirect()).open(request, timeout=20) as response:
+            if response.status != 200:
+                raise ValueError("Unverified group response")
+            raw = response.read(1024 * 1024 + 1)
+        if len(raw) <= 1024 * 1024:
+            document = json.loads(raw, object_pairs_hook=_unique_object)
+            if isinstance(document, dict):
+                return document
+    except (OSError, ValueError, TypeError, RecursionError):
+        pass
+    # Raise outside the handler: HTTP bodies, URLs and tokens must not survive in a cause/context.
+    raise NativeReaderGroupError("Native reader GitHub group authority was not verified")
+
+
+def _group_identity(value: object) -> bool:
+    return type(value) is int and 0 < value <= 2**64 - 1
+
+
+def _group_policy(group: dict, group_id: int) -> tuple:
+    if (
+        group.get("id") != group_id
+        or not _group_identity(group.get("id"))
+        or group.get("default") is not True
+        or group.get("visibility") != "selected"
+        or group.get("allows_public_repositories") is not False
+        or group.get("restricted_to_workflows") is not False
+        or group.get("selected_workflows") != []
+    ):
+        raise NativeReaderGroupError("Native reader Default runner group policy was not verified")
+    return tuple(
+        group[key]
+        for key in (
+            "id",
+            "default",
+            "visibility",
+            "allows_public_repositories",
+            "restricted_to_workflows",
+        )
+    )
+
+
+def _native_group_repositories(path: str) -> dict[int, str]:
+    repositories: dict[int, str] = {}
+    count = None
+    for page in (1, 2):
+        document = _native_group_request(f"{path}/repositories?per_page=100&page={page}")
+        total, rows = document.get("total_count"), document.get("repositories")
+        if (
+            type(total) is not int
+            or total not in (1, 2)
+            or count is not None
+            and count != total
+            or not isinstance(rows, list)
+            or len(rows) > 2
+        ):
+            raise NativeReaderGroupError(
+                "Native reader selected repository population was not verified"
+            )
+        count = total
+        for repo in rows:
+            if (
+                not isinstance(repo, dict)
+                or not _group_identity(repo.get("id"))
+                or repo["id"] in repositories
+                or repo.get("full_name") != NATIVE_READER_REPOSITORIES.get(repo["id"])
+                or repo.get("private") is not True
+            ):
+                raise NativeReaderGroupError("Native reader repository access was not verified")
+            repositories[repo["id"]] = repo["full_name"]
+        if (page == 1 and len(repositories) != count) or (page == 2 and rows):
+            raise NativeReaderGroupError(
+                "Native reader selected repository population was not verified"
+            )
+    return repositories
+
+
+def verify_native_reader_group() -> None:
+    """Observe the actual legacy registration target; caller flags cannot grant access."""
+    groups: dict[int, dict] = {}
+    count = None
+    for page in (1, 2):
+        document = _native_group_request(f"{_GROUP_ROOT}?per_page=100&page={page}")
+        total, rows = document.get("total_count"), document.get("runner_groups")
+        if (
+            type(total) is not int
+            or not 1 <= total <= 100
+            or count is not None
+            and count != total
+            or not isinstance(rows, list)
+            or len(rows) > 100
+        ):
+            raise NativeReaderGroupError("Native reader runner group population was not verified")
+        count = total
+        for group in rows:
+            if (
+                not isinstance(group, dict)
+                or not _group_identity(group.get("id"))
+                or type(group.get("default")) is not bool
+                or group["id"] in groups
+            ):
+                raise NativeReaderGroupError(
+                    "Native reader runner group population was not verified"
+                )
+            groups[group["id"]] = group
+        if (page == 1 and len(groups) != count) or (page == 2 and rows):
+            raise NativeReaderGroupError("Native reader runner group population was not verified")
+    defaults = [group for group in groups.values() if group["default"]]
+    if len(defaults) != 1:
+        raise NativeReaderGroupError("Native reader Default runner group was not verified")
+    group_id = defaults[0]["id"]
+    path = f"{_GROUP_ROOT}/{group_id}"
+    first = _group_policy(_native_group_request(path), group_id)
+    if _group_policy(defaults[0], group_id) != first:
+        raise NativeReaderGroupError(
+            "Native reader runner group policy changed during observation"
+        )
+    repositories = _native_group_repositories(path)
+    if _native_group_repositories(path) != repositories:
+        raise NativeReaderGroupError("Native reader repository policy changed during observation")
+    if repositories.get(1074974924) != "Borduas-Holdings/blazing":
+        raise NativeReaderGroupError("Native reader caller repository access was not verified")
+    if _group_policy(_native_group_request(path), group_id) != first:
+        raise NativeReaderGroupError(
+            "Native reader runner group policy changed during observation"
+        )
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -251,6 +419,8 @@ def configure(
     label = (
         validate_native_reader_scope(reader_from_sops=reader_from_sops) if native_reader else ""
     )
+    if native_reader:
+        verify_native_reader_group()
     if native_reader and (
         image != NATIVE_READER_IMAGE
         or username != "jobordu"
@@ -335,6 +505,7 @@ def main() -> int:
         native_reader = native_mode == "true"
         if native_reader:
             validate_native_reader_scope(reader_from_sops=args.sops_env_file is not None)
+            verify_native_reader_group()
         username = os.environ.get("RUNNER_REGISTRY_USERNAME", "")
         password = os.environ.get("RUNNER_REGISTRY_PASSWORD", "")
         if args.sops_env_file:
@@ -353,6 +524,9 @@ def main() -> int:
             native_reader=native_reader,
             reader_from_sops=args.sops_env_file is not None,
         )
+    except NativeReaderGroupError:
+        print("Runner image configuration held: NATIVE_READER_GROUP_UNQUALIFIED")
+        return 1
     except (ValueError, OSError):
         print(
             "Runner image configuration failed; "

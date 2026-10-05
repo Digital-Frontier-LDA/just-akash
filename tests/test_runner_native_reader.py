@@ -21,6 +21,32 @@ TOKEN = 'fixture: \\"%#=reader'
 
 
 def scope(monkeypatch):
+    from just_akash import runner_image
+
+    group = {
+        "id": 1,
+        "default": True,
+        "visibility": "selected",
+        "allows_public_repositories": False,
+        "restricted_to_workflows": False,
+        "selected_workflows": [],
+    }
+
+    def request(path):
+        if "/repositories?" in path:
+            return {
+                "total_count": 1,
+                "repositories": []
+                if path.endswith("page=2")
+                else [
+                    {"id": 1074974924, "full_name": "Borduas-Holdings/blazing", "private": True}
+                ],
+            }
+        if "?per_page=" in path:
+            return {"total_count": 1, "runner_groups": [] if path.endswith("page=2") else [group]}
+        return group
+
+    monkeypatch.setattr(runner_image, "_native_group_request", request)
     values = {
         "RUNNER_NATIVE_PULL_READER": "true",
         "NATIVE_READER_CALLER": "Borduas-Holdings/blazing",
@@ -124,6 +150,7 @@ def test_native_sops_reader_is_quoted_and_only_two_fields_are_added(tmp_path, mo
     before = yaml.safe_load(path.read_text())
     for key, value in {
         "GH_RUNNER_PAT": "registration-admin-fixture",
+        "GH_TOKEN": "hosted-group-policy-fixture",
         "DOCKERHUB_MANAGEMENT_TOKEN": "registry-admin-fixture",
         "DOCKERHUB_WRITER_TOKEN": "registry-writer-fixture",
     }.items():
@@ -331,6 +358,12 @@ def test_registration_placeholder_in_native_reader_cannot_be_rewritten(tmp_path,
 
 
 def test_false_mode_retains_existing_private_payload_bytes(tmp_path, monkeypatch):
+    from just_akash import runner_image
+
+    def unexpected_group_query():
+        raise AssertionError("default-off mode must not query GitHub group authority")
+
+    monkeypatch.setattr(runner_image, "verify_native_reader_group", unexpected_group_query)
     monkeypatch.setenv("NATIVE_READER_CALLER", "foreign")
     one = template(tmp_path)
     two = tmp_path / "other.yaml"
@@ -414,6 +447,9 @@ def test_native_workflow_uses_only_scoped_hosted_sops_step():
     assert decrypt_step["env"]["NATIVE_READER_RUN_ID"] == "${{ github.run_id }}"
     assert decrypt_step["env"]["NATIVE_READER_RUN_ATTEMPT"] == "${{ github.run_attempt }}"
     assert decrypt_step["env"]["NATIVE_READER_OWNED_PROVIDERS"] == "${{ inputs.owned-providers }}"
+    assert decrypt_step["env"]["GH_TOKEN"] == (
+        "${{ inputs.runner-native-pull-reader && secrets.GH_RUNNER_PAT || '' }}"
+    )
     assert (
         "SOPS_AGE_KEY" not in next(s for s in pool["steps"] if s.get("id") == "provision")["env"]
     )
