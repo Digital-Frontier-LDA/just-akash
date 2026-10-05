@@ -1052,9 +1052,7 @@ jobs:
           RUNNER_REGISTRY_USERNAME: ${{ inputs.runner-registry-username }}
           RUNNER_REGISTRY_PASSWORD: ${{ secrets.RUNNER_REGISTRY_PASSWORD }}
           SOPS_AGE_KEY: ${{ secrets.RUNNER_REGISTRY_AGE_KEY }}
-        run: >-
-          python3 just_akash/runner_image.py --sdl /tmp/runner-sdl.yaml
-          --sops-env-file ../.runner-registry-source/secrets/registry-pull.sops.env
+        run: python3 just_akash/runner_image.py --sdl /tmp/runner-sdl.yaml --sops-env-file ../.runner-registry-source/secrets/registry-pull.sops.env
 
       - name: Provision (retry down candidates, tag before waiting)
         id: provision
