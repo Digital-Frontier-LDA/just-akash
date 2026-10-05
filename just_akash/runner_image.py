@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import json
 import os
 import re
@@ -38,6 +40,82 @@ _GROUP_ROOT = "/orgs/Borduas-Holdings/actions/runner-groups"
 
 class NativeReaderGroupError(ValueError):
     """Fixed hold stage for unverified hosted GitHub admission."""
+
+
+class NativeReaderRoleError(ValueError):
+    """Fixed hold stage when fresh Docker Hub issuer claims do not prove a reader."""
+
+
+def verify_native_reader_role(username: str, token: str) -> None:
+    """Read-only fresh TLS issuer proof; no underlying writer can enter native env."""
+    if username != "jobordu":
+        raise NativeReaderRoleError("Native reader Docker Hub role was not verified")
+    _verify_native_token(token)
+    try:
+        request = urllib.request.Request(
+            "https://hub.docker.com/v2/auth/token",
+            data=json.dumps({"identifier": username, "secret": token}).encode(),
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        with urllib.request.build_opener(_GroupNoRedirect()).open(request, timeout=20) as response:
+            if response.status != 200:
+                raise ValueError("Unverified Hub authentication response")
+            raw = response.read(65536 + 1)
+        if len(raw) > 65536:
+            raise ValueError("Unverified Hub authentication response")
+        document = json.loads(raw, object_pairs_hook=_unique_object)
+        if not isinstance(document, dict):
+            raise ValueError("Unverified Hub authentication response")
+        issued = document.get("access_token")
+        if not isinstance(issued, str) or len(issued) > 49154:
+            raise ValueError("Unverified Hub issuer token")
+        parts = issued.split(".")
+        if len(parts) != 3 or any(
+            not re.fullmatch(r"[A-Za-z0-9_-]{1,16384}", part) for part in parts
+        ):
+            raise ValueError("Unverified Hub issuer token")
+        decoded = [
+            base64.b64decode(part + "=" * (-len(part) % 4), altchars=b"-_", validate=True)
+            for part in parts
+        ]
+        header = json.loads(decoded[0], object_pairs_hook=_unique_object)
+        claims = json.loads(decoded[1], object_pairs_hook=_unique_object)
+        if (
+            not isinstance(header, dict)
+            or not isinstance(header.get("alg"), str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", header["alg"])
+            or header["alg"].lower() == "none"
+            or not decoded[2]
+            or not isinstance(claims, dict)
+        ):
+            raise ValueError("Unverified Hub issuer token")
+        # These are claims from this fresh trusted HTTPS response, not a claim of
+        # independently verifying the JWT signature or a pull-scoped registry grant.
+        scopes: set[str] = set()
+        for key in ("scope", "scopes", "access_token_scope"):
+            if key not in claims:
+                continue
+            value = claims[key]
+            if isinstance(value, str) and 0 < len(value) <= 256:
+                values = value.split()
+            elif isinstance(value, list) and 0 < len(value) <= 8:
+                values = value
+            else:
+                raise ValueError("Unverified Hub credential scope")
+            if not values or any(
+                not isinstance(item, str) or item not in {"repo:read", "repo:write", "repo:admin"}
+                for item in values
+            ):
+                raise ValueError("Unverified Hub credential scope")
+            scopes.update(values)
+        if scopes == {"repo:read"}:
+            return
+    except (OSError, HTTPException, ValueError, TypeError, RecursionError, binascii.Error):
+        pass
+    # Raised outside any handler: neither remote bodies nor the submitted token survive
+    # in a chained exception, formatted traceback or error message.
+    raise NativeReaderRoleError("Native reader Docker Hub role was not verified")
 
 
 class _GroupNoRedirect(urllib.request.HTTPRedirectHandler):
@@ -433,6 +511,7 @@ def read_pull_credentials(
     token = values["DOCKERHUB_PULL_TOKEN"]
     if native_reader:
         _verify_native_token(token)
+        verify_native_reader_role(username, token)
     # Actions command escaping prevents '%' in a token becoming a command escape.
     print("::add-mask::" + token.replace("%", "%25"))
     return username, token
@@ -460,6 +539,8 @@ def configure(
         or host != "https://index.docker.io/v1/"
     ):
         raise ValueError("Native reader mirror identity was not verified")
+    if native_reader:
+        verify_native_reader_role(username, password)
     if not any((image, host, username, password)):
         return
     if path.is_symlink():
@@ -558,6 +639,9 @@ def main() -> int:
             native_reader=native_reader,
             reader_from_sops=args.sops_env_file is not None,
         )
+    except NativeReaderRoleError:
+        print("Runner image configuration held: NATIVE_READER_ROLE_UNQUALIFIED")
+        return 1
     except NativeReaderRepositoryError:
         print("Runner image configuration held: NATIVE_READER_REPOSITORY_UNQUALIFIED")
         return 1

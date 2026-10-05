@@ -47,6 +47,7 @@ def scope(monkeypatch):
         return group
 
     monkeypatch.setattr(runner_image, "_native_group_request", request)
+    monkeypatch.setattr(runner_image, "verify_native_reader_role", lambda *_: None)
     values = {
         "RUNNER_NATIVE_PULL_READER": "true",
         "NATIVE_READER_CALLER": "Borduas-Holdings/blazing",
