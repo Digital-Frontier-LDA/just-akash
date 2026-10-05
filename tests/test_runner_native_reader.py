@@ -287,7 +287,10 @@ def test_native_reader_rejects_control_or_unbounded_tokens(tmp_path, monkeypatch
     assert path.read_bytes() == original
 
 
-@pytest.mark.parametrize("token", ["nul\x00fixture", "del\x7ffixture", "unicodeé", "x" * 4097])
+@pytest.mark.parametrize(
+    "token",
+    ["nul\x00fixture", "del\x7ffixture", "unicodeé", "x" * 4097, "prefix@@RUNNER_TOKEN@@suffix"],
+)
 def test_malformed_sops_native_token_is_rejected_before_mask_output(
     tmp_path, monkeypatch, capsys, token
 ):
@@ -302,6 +305,20 @@ def test_malformed_sops_native_token_is_rejected_before_mask_output(
     assert invoke(monkeypatch, path, cipher) == 1
     assert path.read_bytes() == original
     assert "::add-mask::" not in capsys.readouterr().out
+
+
+def test_registration_placeholder_in_native_reader_cannot_be_rewritten(tmp_path, monkeypatch):
+    scope(monkeypatch)
+    path = template(tmp_path)
+    original = path.read_bytes()
+    token = "prefix@@RUNNER_TOKEN@@suffix"
+    # The provisioning shell replaces every occurrence in the complete SDL.
+    assert token.replace("@@RUNNER_TOKEN@@", "registration-fixture") != token
+    with pytest.raises(ValueError, match="credential format"):
+        configure(
+            path, **(options() | {"password": token}), native_reader=True, reader_from_sops=True
+        )
+    assert path.read_bytes() == original
 
 
 def test_false_mode_retains_existing_private_payload_bytes(tmp_path, monkeypatch):

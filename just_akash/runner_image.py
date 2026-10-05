@@ -113,7 +113,12 @@ def validate_native_reader_scope(*, reader_from_sops: bool) -> str:
 
 
 def _verify_native_token(password: str) -> None:
-    if not password or len(password) > 4096 or any(not 32 <= ord(c) < 127 for c in password):
+    if (
+        not password
+        or len(password) > 4096
+        or any(not 32 <= ord(c) < 127 for c in password)
+        or "@@RUNNER_TOKEN@@" in password
+    ):
         raise ValueError("Native reader credential format was not verified")
 
 
