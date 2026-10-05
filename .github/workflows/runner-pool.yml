@@ -95,6 +95,11 @@ on:
         required: false
         type: boolean
         default: false
+      runner-native-repository-scope:
+        description: 'Opt-in fixed private Blazing repository registration; requires native pull reader.'
+        type: boolean
+        required: false
+        default: false
       runner-native-pull-reader:
         description: 'Opt-in fixed Blazing one-job tenant payload: expose only its hosted SOPS reader to native private-cache pulls.'
         required: false
@@ -578,6 +583,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_RUNNER_PAT }}
           ORG: ${{ inputs.github-org }}
+          RUNNER_NATIVE_PULL_READER: ${{ inputs.runner-native-pull-reader }}
+          RUNNER_NATIVE_REPOSITORY_SCOPE: ${{ inputs.runner-native-repository-scope }}
+          READER_SOPS: ${{ inputs.runner-registry-sops }}
+          CALLER: ${{ github.repository }}
         run: |
           set -uo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
@@ -585,6 +594,30 @@ jobs:
             echo "::error title=GH_RUNNER_PAT is not set::The pool cannot register runners without it. NOT a provider fault and NOT an Akash outage."
             exit 1
           fi
+          RUNNER_COLLECTION="orgs/${ORG}/actions/runners"
+          case "${RUNNER_NATIVE_REPOSITORY_SCOPE:-false}" in
+            false|'') ;;
+            true)
+              if [ "${RUNNER_NATIVE_PULL_READER:-false}" != true ] || [ "${READER_SOPS:-false}" != true ] \
+                || [ "${CALLER:-}" != Borduas-Holdings/blazing ] || [ "$ORG" != Borduas-Holdings ]; then
+                echo failure_reason=NATIVE_READER_REPOSITORY_UNQUALIFIED >> "$GITHUB_OUTPUT"
+                echo '::error::Native reader repository scope was not verified'; exit 1
+              fi
+              if ! python3 - <<'PYREPOSITORY'
+          from just_akash.runner_repository import verify_native_reader_repository
+          try:
+              verify_native_reader_repository()
+          except (ValueError, OSError):
+              raise SystemExit('Native reader private repository POST authority was not verified')
+          PYREPOSITORY
+              then
+                echo failure_reason=NATIVE_READER_REPOSITORY_UNQUALIFIED >> "$GITHUB_OUTPUT"
+                echo '::error::Native reader repository registration authority was not verified'; exit 1
+              fi
+              echo 'Fixed private repository registration POST authority verified'
+              exit 0 ;;
+            *) echo failure_reason=NATIVE_READER_REPOSITORY_UNQUALIFIED >> "$GITHUB_OUTPUT"; exit 1 ;;
+          esac
           # ONE request, not two. Two calls double latency and API spend and can
           # disagree: the status line could come from a call that succeeded while
           # the branch is taken on one that failed.
@@ -608,11 +641,15 @@ jobs:
           # the instant it is captured, BEFORE any branch can print it: this same step
           # now echoes the raw response in its unexpected-status arm (#253), so the verb
           # change and that arm would otherwise combine into a token in a public log.
-          # ⛔ `|| true` for the same reason as the BAD_PAGES assignment below: `| head -1`
+          # The conditional assignment handles the same SIGPIPE hazard as BAD_PAGES: `| head -1`
           # can SIGPIPE sed on a large enough match set, `pipefail` is on, and a non-zero
           # command substitution under `bash -e` aborts AT THE ASSIGNMENT — here that
           # would skip the ::add-mask:: on the very token this line exists to find.
-          MINTED=$(printf '%s' "$RESP" | sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p' | head -1) || true
+          if MINTED=$(printf '%s' "$RESP" | sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p' | head -1); then
+            :
+          else
+            echo '::warning::Registration token extraction returned a nonzero status; preflight status will decide admission'
+          fi
           [ -n "$MINTED" ] && echo "::add-mask::${MINTED}"
           # $1 ~ /^HTTP/ guards the no-response case: without it, awk prints the
           # second WORD of an arbitrary error string as though it were a status.
@@ -1048,7 +1085,8 @@ jobs:
           RUNNER_REGISTRY_USERNAME: ${{ inputs.runner-registry-username }}
           RUNNER_REGISTRY_PASSWORD: ${{ secrets.RUNNER_REGISTRY_PASSWORD }}
           RUNNER_NATIVE_PULL_READER: ${{ inputs.runner-native-pull-reader }}
-        run: python3 just_akash/runner_image.py --sdl /tmp/runner-sdl.yaml
+          RUNNER_NATIVE_REPOSITORY_SCOPE: ${{ inputs.runner-native-repository-scope }}
+        run: python3 -m just_akash.runner_image --sdl /tmp/runner-sdl.yaml
 
       - name: Configure the qualified private runner mirror from SOPS
         if: inputs.runner-registry-sops
@@ -1059,6 +1097,7 @@ jobs:
           RUNNER_REGISTRY_PASSWORD: ${{ secrets.RUNNER_REGISTRY_PASSWORD }}
           SOPS_AGE_KEY: ${{ secrets.RUNNER_REGISTRY_AGE_KEY }}
           RUNNER_NATIVE_PULL_READER: ${{ inputs.runner-native-pull-reader }}
+          RUNNER_NATIVE_REPOSITORY_SCOPE: ${{ inputs.runner-native-repository-scope }}
           NATIVE_READER_CALLER: ${{ github.repository }}
           GH_TOKEN: ${{ inputs.runner-native-pull-reader && secrets.GH_RUNNER_PAT || '' }}
           NATIVE_READER_RUN_ID: ${{ github.run_id }}
@@ -1074,9 +1113,7 @@ jobs:
           NATIVE_READER_LABEL: ${{ inputs.runner-label }}
           NATIVE_READER_PLACEMENT: ${{ inputs.placement-key }}
           NATIVE_READER_TAG_PREFIX: ${{ inputs.tag-prefix }}
-        run: >-
-          python3 just_akash/runner_image.py --sdl /tmp/runner-sdl.yaml
-          --sops-env-file ../.runner-registry-source/secrets/registry-pull.sops.env
+        run: python3 -m just_akash.runner_image --sdl /tmp/runner-sdl.yaml --sops-env-file ../.runner-registry-source/secrets/registry-pull.sops.env
 
       - name: Provision (retry down candidates, tag before waiting)
         id: provision
@@ -1100,9 +1137,32 @@ jobs:
           PROVIDER_SELECT: ${{ inputs.provider-select }}
           DEPLOYMENT_GROUP: ${{ steps.render.outputs.deployment_group }}
           RUNNER_NATIVE_PULL_READER: ${{ inputs.runner-native-pull-reader }}
+          RUNNER_NATIVE_REPOSITORY_SCOPE: ${{ inputs.runner-native-repository-scope }}
         run: |
           set -uo pipefail
 
+
+          RUNNER_COLLECTION="orgs/${ORG}/actions/runners"
+          case "${RUNNER_NATIVE_REPOSITORY_SCOPE:-false}" in
+            false|'') ;;
+            true)
+              if [ "${RUNNER_NATIVE_PULL_READER:-false}" != true ] || [ "$ORG" != Borduas-Holdings ]; then
+                echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+                echo failure_reason=NATIVE_READER_REPOSITORY_UNQUALIFIED >> "$GITHUB_OUTPUT"; exit 1
+              fi
+              RUNNER_COLLECTION='repos/Borduas-Holdings/blazing/actions/runners' ;;
+            *) echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"; exit 1 ;;
+          esac
+
+          verify_private_repository_identity() {
+            python3 - <<'PYIDENTITY'
+          from just_akash.runner_repository import verify_native_reader_repository_identity
+          try:
+              verify_native_reader_repository_identity()
+          except (ValueError, OSError):
+              raise SystemExit('Native reader private repository identity was not verified')
+          PYIDENTITY
+          }
 
           # Fail closed before the first possible submit. Every branch inherits UNKNOWN;
           # only the enumerated no-broadcast sites below may narrow it to no-deployment.
@@ -1293,34 +1353,53 @@ jobs:
               echo "::error title=Runner SDL template missing, empty or without its token placeholder::attempt $attempt: nothing minted or deployed."
               echo "::endgroup::"; exit 1
             fi
-            # Legacy registration uses the actual Default group. Recheck server
-            # policy before each mint; an earlier hosted observation is not admission.
+            # Recheck server admission before every mint. Org mode observes the
+            # actual Default group; repository mode proves fixed private identity
+            # and actual POST authority. An earlier observation is not admission.
             if [ "${RUNNER_NATIVE_PULL_READER:-false}" = true ] && ! python3 - <<'PY'
-          from just_akash.runner_image import verify_native_reader_group
+          from just_akash.runner_image import verify_native_reader_admission
           try:
-              verify_native_reader_group()
+              verify_native_reader_admission()
           except (ValueError, OSError):
-              raise SystemExit('Native reader runner group authority was not verified')
+              raise SystemExit('Native reader registration authority was not verified')
           PY
             then
               [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
-              echo failure_reason=NATIVE_READER_GROUP_UNQUALIFIED >> "$GITHUB_OUTPUT"
-              echo '::error::Native reader Default group repository access was not verified; no new token or deployment submitted'
+              if [ "${RUNNER_NATIVE_REPOSITORY_SCOPE:-false}" = true ]; then
+                echo failure_reason=NATIVE_READER_REPOSITORY_UNQUALIFIED >> "$GITHUB_OUTPUT"
+              else
+                echo failure_reason=NATIVE_READER_GROUP_UNQUALIFIED >> "$GITHUB_OUTPUT"
+              fi
+              echo '::error::Native reader registration authority was not verified; no new token or deployment submitted'
               echo '::endgroup::'; exit 1
             fi
             RC=0
-            RESP=$(gh api --method POST "orgs/${ORG}/actions/runners/registration-token" -i 2>&1) || RC=$?
+            RESP=$(gh api --method POST "${RUNNER_COLLECTION}/registration-token" -i 2>&1) || RC=$?
             RUNNER_TOKEN=""
             if [[ "$RESP" =~ \"token\"\ *:\ *\"([^\"]*)\" ]]; then RUNNER_TOKEN="${BASH_REMATCH[1]}"; fi
-            [ -n "$RUNNER_TOKEN" ] && echo "::add-mask::${RUNNER_TOKEN}"
+            if [ "${RUNNER_NATIVE_PULL_READER:-false}" != true ]; then
+              [ -n "$RUNNER_TOKEN" ] && echo "::add-mask::${RUNNER_TOKEN}"
+            fi
             CODE=$(printf '%s' "$RESP" | awk 'NR==1 && $1 ~ /^HTTP/ {print $2}')
+            if [ "${RUNNER_NATIVE_PULL_READER:-false}" = true ] && [[ ! "$CODE" =~ ^[1-5][0-9]{2}$ ]]; then
+              CODE=''
+            fi
             unset RESP
             case "${RC}:${CODE}:${RUNNER_TOKEN}" in 0:200:*[!A-Za-z0-9]*|0:201:*[!A-Za-z0-9]*) RUNNER_TOKEN="" ;; 0:200:?*|0:201:?*) ;; *) RUNNER_TOKEN="" ;; esac
+            if [ "${RUNNER_NATIVE_PULL_READER:-false}" = true ]; then
+              [ "${#RUNNER_TOKEN}" -le 4096 ] || RUNNER_TOKEN=""
+              [ -n "$RUNNER_TOKEN" ] && echo "::add-mask::${RUNNER_TOKEN}"
+            fi
             if [ -z "$RUNNER_TOKEN" ]; then
               [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
               echo "failure_reason=RUNNER_TOKEN_UNMINTED" >> "$GITHUB_OUTPUT"
               echo "::error title=Runner registration token not minted (HTTP ${CODE:-none received})::attempt $attempt: nothing deployed. The PAT preflight passed: a GitHub API condition, not a provider fault."
               echo "::endgroup::"; exit 1
+            fi
+            if [ "${RUNNER_NATIVE_REPOSITORY_SCOPE:-false}" = true ] && ! verify_private_repository_identity; then
+              [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+              echo failure_reason=NATIVE_READER_REPOSITORY_UNQUALIFIED >> "$GITHUB_OUTPUT"
+              echo '::error::Private repository identity changed around runner token mint; no new deployment submitted'; exit 1
             fi
             umask 077
             if ! printf '%s\n' "${SDL_TEMPLATE//@@RUNNER_TOKEN@@/$RUNNER_TOKEN}" > /tmp/runner-sdl.minted.yaml \
@@ -1623,8 +1702,16 @@ jobs:
               # worse (a throttled page would silently undercount and a healthy pool would
               # be discarded), so an error page is detected and routed to that branch.
               # Full incident: see the comment above this step.
+              if [ "${RUNNER_NATIVE_REPOSITORY_SCOPE:-false}" = true ] && ! verify_private_repository_identity; then
+                echo failure_reason=NATIVE_READER_REPOSITORY_UNQUALIFIED >> "$GITHUB_OUTPUT"
+                echo '::error::Private repository identity was not verified before runner poll; lease retained for teardown'; exit 1
+              fi
               GH_RC=0
-              RUNNER_PAGES=$(gh api --paginate "orgs/${ORG}/actions/runners?per_page=100" 2>/tmp/gh-runners.err) || GH_RC=$?
+              RUNNER_PAGES=$(gh api --paginate "${RUNNER_COLLECTION}?per_page=100" 2>/tmp/gh-runners.err) || GH_RC=$?
+              if [ "${RUNNER_NATIVE_REPOSITORY_SCOPE:-false}" = true ] && ! verify_private_repository_identity; then
+                echo failure_reason=NATIVE_READER_REPOSITORY_UNQUALIFIED >> "$GITHUB_OUTPUT"
+                echo '::error::Private repository identity changed around runner poll; lease retained for teardown'; exit 1
+              fi
               if [ "$GH_RC" -eq 0 ]; then
                 # `has("runners")` distinguishes a listing from an error object. An empty
                 # org returns {"total_count":0,"runners":[]} — has the key, counts as 0.
@@ -1643,8 +1730,33 @@ jobs:
                   # wrote that it was off; the awk I checked with had silently failed.
                   # Measuring the parsed step said otherwise.) `|| _why=""` makes any
                   # exit code survivable. (Reported by Copilot on PR #251.)
-                  _why=$(printf '%s' "$RUNNER_PAGES" | jq -r 'select(has("runners") | not) | .message // "no message field"' 2>/dev/null | head -1) || _why=""
+                  if [ "${RUNNER_NATIVE_PULL_READER:-false}" = true ]; then
+                    _why='GitHub runner listing response was not verified'
+                  else
+                    _why=$(printf '%s' "$RUNNER_PAGES" | jq -r 'select(has("runners") | not) | .message // "no message field"' 2>/dev/null | head -1) || _why=""
+                  fi
                   echo "  runner listing unreadable (${BAD_PAGES} error page(s)): ${_why:-unparseable}"
+                  sleep 15
+                  continue
+                fi
+              fi
+              if [ "${RUNNER_NATIVE_PULL_READER:-false}" = true ]; then
+                if [ "${#RUNNER_PAGES}" -gt 1048576 ] || ! printf '%s' "$RUNNER_PAGES" | jq -se '
+                  type=="array" and length>0 and length<=100
+                  and all(.[]; type=="object" and (.total_count|type=="number" and .>=0 and .<=10000 and floor==.) and (.runners|type=="array" and length<=100))
+                  and ([.[].total_count]|unique|length)==1
+                  and ([.[] | (.runners // [])[]]|length)==.[0].total_count
+                  and ([.[] | (.runners // [])[] | .id]|unique|length)==.[0].total_count
+                  and all(.[] | (.runners // [])[];
+                    (.id|type=="number" and .>0 and .<9007199254740992 and floor==.)
+                    and (.name|type=="string" and length>0 and length<=256)
+                    and (.status|.=="online" or .=="offline")
+                    and (.busy|type=="boolean")
+                    and (.labels|type=="array" and length<=100)
+                    and all(.labels[]; .name|type=="string" and length>0 and length<=256)
+                    and (.version==null or (.version|type=="string" and length<=32 and test("^[0-9]{1,4}\\.[0-9]{1,4}\\.[0-9]{1,4}$"))))
+                  ' >/dev/null 2>&1; then
+                  echo '  Private runner population was not verified'
                   sleep 15
                   continue
                 fi
@@ -1674,7 +1786,11 @@ jobs:
               if [ "$GH_RC" -ne 0 ]; then
                 # Deliberately NOT the 5s cadence: if this is the secondary limit (a
                 # per-MINUTE budget) then retrying at 5s spends the recovery window.
-                echo "  runner listing unreadable (gh rc=${GH_RC}): $(tail -1 /tmp/gh-runners.err 2>/dev/null)"
+                if [ "${RUNNER_NATIVE_PULL_READER:-false}" = true ]; then
+                  echo '  GitHub runner listing was not verified'
+                else
+                  echo "  runner listing unreadable (gh rc=${GH_RC}): $(tail -1 /tmp/gh-runners.err 2>/dev/null)"
+                fi
                 sleep 15
                 continue
               fi
@@ -1887,14 +2003,17 @@ jobs:
             # but cannot mint returned 200 here, the check fell through, and the run
             # accused a host that did nothing wrong. A preflight failing a run is
             # recoverable; a fabricated provider fault is somebody else's reputation.
-            VERDICT_RESP=$(gh api --method POST "orgs/${ORG}/actions/runners/registration-token" -i 2>&1) || true
+            VERDICT_RC=0
+            VERDICT_RESP=$(gh api --method POST "${RUNNER_COLLECTION}/registration-token" -i 2>&1) || VERDICT_RC=$?
             # Same live-credential masking as the preflight; this response body carries
             # a registration token on success.
             # ⛔ `|| true` — same SIGPIPE-under-pipefail hazard as MINTED above. This one
             # guards the VERDICT token's mask, so an abort here loses the masking of a
             # live credential AND kills the step.
             VERDICT_MINTED=$(printf '%s' "$VERDICT_RESP" | sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p' | head -1) || true
-            [ -n "$VERDICT_MINTED" ] && echo "::add-mask::${VERDICT_MINTED}"
+            if [ "${RUNNER_NATIVE_PULL_READER:-false}" != true ]; then
+              [ -n "$VERDICT_MINTED" ] && echo "::add-mask::${VERDICT_MINTED}"
+            fi
             # ⛔ THE SAME GUARD AS THE PREFLIGHT, AND IT MATTERS MORE HERE.
             # Without `$1 ~ /^HTTP/`, awk prints the second WORD of an arbitrary
             # error string as though it were a status: `dial tcp: lookup ... timeout`
@@ -1910,6 +2029,23 @@ jobs:
             # With the guard, no status line yields an EMPTY code, `${VERDICT_CODE:-000}`
             # sends it to `*)`, and the run reports INDETERMINATE and accuses nobody.
             VERDICT_CODE=$(printf '%s' "$VERDICT_RESP" | awk 'NR==1 && $1 ~ /^HTTP/ {print $2}')
+            if [ "${RUNNER_NATIVE_PULL_READER:-false}" = true ] && { [ "$VERDICT_RC" -ne 0 ] || [[ ! "$VERDICT_CODE" =~ ^[1-5][0-9]{2}$ ]]; }; then
+              VERDICT_CODE=''
+            fi
+            if [ "${RUNNER_NATIVE_PULL_READER:-false}" = true ]; then
+              case "${VERDICT_CODE}:${VERDICT_MINTED}" in
+                200:*[!A-Za-z0-9]*|201:*[!A-Za-z0-9]*) VERDICT_MINTED="" ;;
+                200:?*|201:?*) ;;
+                *) VERDICT_MINTED="" ;;
+              esac
+              [ "${#VERDICT_MINTED}" -le 4096 ] || VERDICT_MINTED=""
+              if [ -n "$VERDICT_MINTED" ]; then
+                echo "::add-mask::${VERDICT_MINTED}"
+              elif [ "$VERDICT_CODE" = 200 ] || [ "$VERDICT_CODE" = 201 ]; then
+                VERDICT_CODE=""
+              fi
+            fi
+            unset VERDICT_RESP
             case "${VERDICT_CODE:-000}" in
               # ⛔ 201, NOT 200. A successful mint is 201 Created. Leaving this as 200
               # would send every HEALTHY credential to the `*)` arm and report
@@ -2152,6 +2288,7 @@ jobs:
       # so the teardown MUST name the same org the registration used — guaranteed
       # consistent by reading the SAME input, not by reconstructing it from context.
       github-org: ${{ inputs.github-org }}
+      github-repository: ${{ inputs.runner-native-repository-scope && 'Borduas-Holdings/blazing' || '' }}
       # ⛔ REQUIRED BY THE CALLEE, WITH NO DEFAULT — and omitting it did not fail HERE.
       # runner-teardown.yml declares `just-akash-ref` required. A reusable call that
       # omits a required input cannot be turned into a job, so GitHub abandons the whole

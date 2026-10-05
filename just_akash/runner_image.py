@@ -9,18 +9,24 @@ import re
 import subprocess
 import tempfile
 import urllib.request
+from http.client import HTTPException
 from pathlib import Path
 from urllib.parse import urlparse
 
+from just_akash.runner_repository import (
+    NativeReaderRepositoryError,
+    verify_native_reader_repository,
+)
+
 NATIVE_READER_IMAGE = (
     "docker.io/digitalfrontierunipessoallda/akash-runner@sha256:"
-    "aaf3799b5e138abef0831bb8467ded7325164316f0cfde5c183fe6e129eae79e"
+    "aaf3799b5e138abef0831bb8467ded7325164316f0cfde5c183fe6e129eae79e"  # pragma: allowlist secret
 )
 NATIVE_READER_PROVIDERS = frozenset(
     {
         "akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",
         "akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z",
-        "akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x",
+        "akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x",  # pragma: allowlist secret
     }
 )
 NATIVE_READER_REPOSITORIES = {
@@ -73,7 +79,7 @@ def _native_group_request(path: str) -> dict:
             document = json.loads(raw, object_pairs_hook=_unique_object)
             if isinstance(document, dict):
                 return document
-    except (OSError, ValueError, TypeError, RecursionError):
+    except (OSError, HTTPException, ValueError, TypeError, RecursionError):
         pass
     # Raise outside the handler: HTTP bodies, URLs and tokens must not survive in a cause/context.
     raise NativeReaderGroupError("Native reader GitHub group authority was not verified")
@@ -190,6 +196,20 @@ def verify_native_reader_group() -> None:
         raise NativeReaderGroupError(
             "Native reader runner group policy changed during observation"
         )
+
+
+def native_repository_scope(*, native_reader: bool) -> bool:
+    value = os.environ.get("RUNNER_NATIVE_REPOSITORY_SCOPE", "false")
+    if value not in ("true", "false", "") or value == "true" and not native_reader:
+        raise NativeReaderRepositoryError("Native reader repository scope was not verified")
+    return value == "true"
+
+
+def verify_native_reader_admission() -> None:
+    if native_repository_scope(native_reader=True):
+        verify_native_reader_repository()
+    else:
+        verify_native_reader_group()
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -351,7 +371,19 @@ def _native_reader_env(text: str, indent: str, *, label: str, password: str) -> 
             ("DOCKERHUB_PULL_TOKEN", password),
         )
     )
-    return text[: match.end()] + lines + text[match.end() :]
+    updated = text[: match.end()] + lines + text[match.end() :]
+    if native_repository_scope(native_reader=True):
+        updated, count = re.subn(
+            r"^" + re.escape(indent) + r"  - RUNNER_SCOPE=org[ \t]*$",
+            indent + '  - "RUNNER_SCOPE=repo"\n' + indent + '  - "REPO_NAME=blazing"',
+            updated,
+            flags=re.MULTILINE,
+        )
+        if count != 1:
+            raise NativeReaderRepositoryError(
+                "Native reader repository environment was not verified"
+            )
+    return updated
 
 
 def read_pull_credentials(
@@ -419,8 +451,9 @@ def configure(
     label = (
         validate_native_reader_scope(reader_from_sops=reader_from_sops) if native_reader else ""
     )
+    native_repository_scope(native_reader=native_reader)
     if native_reader:
-        verify_native_reader_group()
+        verify_native_reader_admission()
     if native_reader and (
         image != NATIVE_READER_IMAGE
         or username != "jobordu"
@@ -503,9 +536,10 @@ def main() -> int:
         if native_mode not in ("true", "false", ""):
             raise ValueError("Native reader option was not verified")
         native_reader = native_mode == "true"
+        native_repository_scope(native_reader=native_reader)
         if native_reader:
             validate_native_reader_scope(reader_from_sops=args.sops_env_file is not None)
-            verify_native_reader_group()
+            verify_native_reader_admission()
         username = os.environ.get("RUNNER_REGISTRY_USERNAME", "")
         password = os.environ.get("RUNNER_REGISTRY_PASSWORD", "")
         if args.sops_env_file:
@@ -524,6 +558,9 @@ def main() -> int:
             native_reader=native_reader,
             reader_from_sops=args.sops_env_file is not None,
         )
+    except NativeReaderRepositoryError:
+        print("Runner image configuration held: NATIVE_READER_REPOSITORY_UNQUALIFIED")
+        return 1
     except NativeReaderGroupError:
         print("Runner image configuration held: NATIVE_READER_GROUP_UNQUALIFIED")
         return 1

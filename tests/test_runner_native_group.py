@@ -277,7 +277,7 @@ def test_mint_gate_is_native_only_and_preserves_monotonic_create_attribution():
     assert step["env"]["RUNNER_NATIVE_PULL_READER"] == "${{ inputs.runner-native-pull-reader }}"
     script = step["run"]
     marker = 'if [ "${RUNNER_NATIVE_PULL_READER:-false}" = true ]'
-    assert script.index(marker) < script.index("orgs/${ORG}/actions/runners/registration-token")
+    assert script.index(marker) < script.index("${RUNNER_COLLECTION}/registration-token")
     refusal = script[script.index(marker) : script.index("RC=0", script.index(marker))]
     assert '"$CREATED_DSEQ"' in refusal and '"$UNCLASSIFIED_ATTEMPT"' in refusal
     assert "NATIVE_READER_GROUP_UNQUALIFIED" in refusal and "exit 1" in refusal
@@ -313,7 +313,10 @@ def test_actual_mint_guard_fails_before_mint_and_keeps_prior_create_authority(
         timeout=10,
     )
     assert result.returncode == 1 and "should-not-mint" not in result.stdout
-    assert "failure_reason=NATIVE_READER_GROUP_UNQUALIFIED" in output.read_text()
+    assert (
+        "failure_reason=NATIVE_READER_GROUP_UNQUALIFIED"  # pragma: allowlist secret
+        in output.read_text()
+    )
     assert ("deployment_outcome=no-deployment" in output.read_text()) == (
         not created and unknown == "0"
     )
@@ -333,8 +336,8 @@ def test_actual_mint_guard_can_pass_a_positive_server_observation(tmp_path):
     # Replace only the server read at its import boundary; execute the real
     # heredoc/conditional and ensure a positive observation reaches the next phase.
     guard = guard.replace(
-        "from just_akash.runner_image import verify_native_reader_group",
-        "def verify_native_reader_group():\n    return None",
+        "from just_akash.runner_image import verify_native_reader_admission",
+        "def verify_native_reader_admission():\n    return None",
     )
     result = subprocess.run(
         ["/bin/bash", "-e", "-c", guard + "echo reached-next-phase"],
@@ -345,3 +348,30 @@ def test_actual_mint_guard_can_pass_a_positive_server_observation(tmp_path):
     )
     assert result.returncode == 0 and "reached-next-phase" in result.stdout
     assert not result.stderr
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_malformed_group_transport_withholds_partial_body_and_status_line(monkeypatch, partial):
+    from http.client import BadStatusLine, IncompleteRead
+
+    monkeypatch.setenv("GH_TOKEN", "PATCANARY")
+    failure = (
+        IncompleteRead(b'{"metadata":"PARTIALRESPONSECANARY"}', 100)
+        if partial
+        else BadStatusLine("PARTIALRESPONSECANARY")
+    )
+    opener = Mock()
+    if partial:
+        response = Mock(status=200)
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=None)
+        response.read.side_effect = failure
+        opener.open.return_value = response
+    else:
+        opener.open.side_effect = failure
+    monkeypatch.setattr(image.urllib.request, "build_opener", Mock(return_value=opener))
+    with pytest.raises(image.NativeReaderGroupError) as caught:
+        image._native_group_request(ROOT + "?per_page=100&page=1")
+    rendered = "".join(traceback.format_exception(caught.value))
+    assert "PARTIALRESPONSECANARY" not in rendered and "PATCANARY" not in rendered
+    assert caught.value.__context__ is None
