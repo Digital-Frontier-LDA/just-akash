@@ -22,14 +22,24 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TypedDict
+from typing import Any, TypedDict, cast
 
 from akash_lease_core import Auction, AuctionPolicy, AuctionStatus, BidObservation
 from akash_lease_core.auction import PreferredSelection
 from akash_lease_core.capacity import ProviderCapacity, ResourceProfile
 
 from . import chain
-from ._diagnostics import Code, emit, enabled
+from ._confidential import (
+    active,
+    canonical_dseq,
+    diagnostic_context,
+    display,
+    error_text,
+    protect_content,
+    sdl_operation,
+)
+from ._diagnostics import Code, enabled
+from ._diagnostics import emit as _raw_emit
 from .api import (
     AkashAPIError,
     AkashConsoleAPI,
@@ -56,6 +66,22 @@ logger = logging.getLogger("akash.deploy")
 # re-create (the issue-#19 re-deploy round), and both are the same run's residue. Hex so
 # it survives `_KEY_RE`'s charset and reads back through provenance.run_id_of.
 _RUN_ID = uuid.uuid4().hex[:12]
+
+
+def emit(code, level, message, **context):
+    if active():
+        message = "credential-bearing operation diagnostic (details withheld)"
+        context = cast(dict[str, Any], diagnostic_context(context))
+    _raw_emit(code, level, message, **context)
+
+
+def _private_create_identity(dseq: object) -> None:
+    if active() and not canonical_dseq(dseq):
+        emit(Code.NO_DSEQ_RETURNED, "error", "private create response identity was not verified")
+        raise RuntimeError(
+            "NON-RETRYABLE CREATE OUTCOME AMBIGUOUS: private create response identity "
+            "was not verified; reconcile the submitting receipt/owner before any retry"
+        )
 
 
 def _ts() -> str:
@@ -143,11 +169,16 @@ def _close_proven_orphan(client, dseq: str, key: str) -> bool:
     try:
         client.close_deployment(str(dseq))
     except Exception as exc:  # noqa: BLE001 — an error path must not raise a second error
-        _log(logging.WARNING, f"could not close orphan {dseq} ({key}): {exc}")
+        _log(
+            logging.WARNING,
+            f"could not close orphan {display(dseq, 'dseq')} "
+            f"({display(key, 'withheld')}): {error_text(exc)}",
+        )
         return False
     _log(
         logging.ERROR,
-        f"ORPHAN CLOSED: deployment {dseq} carried this run's provenance ({key}) and no "
+        f"ORPHAN CLOSED: deployment {display(dseq, 'dseq')} "
+        f"carried this run's provenance ({display(key, 'withheld')}) and no "
         f"lease. The create reported failure but the transaction had committed, so it was "
         f"holding escrow under a dseq nobody would have known to look for. Closed "
         f"automatically; no action needed.",
@@ -155,7 +186,7 @@ def _close_proven_orphan(client, dseq: str, key: str) -> bool:
     emit(
         Code.DEPLOY_CREATE_ORPHAN_SUSPECTED,
         "error",
-        f"deployment {dseq} was created by a failed create and has been closed",
+        f"deployment {display(dseq, 'dseq')} was created by a failed create and has been closed",
         dseq=str(dseq),
         provenance=[key],
         owned=True,
@@ -209,7 +240,10 @@ def _close_stale_for_retry(client, *, now: float | None = None) -> list[str]:
     try:
         owner = client.account_address()
     except Exception as exc:  # noqa: BLE001 — never mask the caller's error
-        _log(logging.WARNING, f"Stale recovery: could not resolve the account ({exc}) — skipped")
+        _log(
+            logging.WARNING,
+            f"Stale recovery: could not resolve the account ({error_text(exc)}) — skipped",
+        )
         return []
 
     # GUARD 1 — enumerate from the CHAIN, owner-scoped and authoritative.
@@ -232,7 +266,10 @@ def _close_stale_for_retry(client, *, now: float | None = None) -> list[str]:
     try:
         active = chain.list_active_deployments(owner)
     except Exception as exc:  # noqa: BLE001 — never mask the caller's error
-        _log(logging.WARNING, f"Stale recovery: chain enumeration raised ({exc}) — skipped")
+        _log(
+            logging.WARNING,
+            f"Stale recovery: chain enumeration raised ({error_text(exc)}) — skipped",
+        )
         return []
     if active is None:
         _log(logging.WARNING, "Stale recovery: chain enumeration failed — closing nothing")
@@ -255,7 +292,11 @@ def _close_stale_for_retry(client, *, now: float | None = None) -> list[str]:
         except Exception as exc:  # noqa: BLE001 — unreadable is not closable
             # DEBUG, matching _report_suspected_orphans: a skipped dseq must not
             # appear in human-facing output, but a silent skip is untraceable.
-            _log(logging.DEBUG, f"  stale recovery: {dseq} unreadable ({exc}) — left alone")
+            _log(
+                logging.DEBUG,
+                f"  stale recovery: {display(dseq, 'dseq')} "
+                f"unreadable ({error_text(exc)}) — left alone",
+            )
             continue
         if (detail or {}).get("leases") or (detail or {}).get("lease"):
             continue
@@ -265,7 +306,11 @@ def _close_stale_for_retry(client, *, now: float | None = None) -> list[str]:
         try:
             names = chain.deployment_group_names(owner, str(dseq))
         except Exception as exc:  # noqa: BLE001 — unreadable provenance is unproven
-            _log(logging.DEBUG, f"  stale recovery: {dseq} provenance unreadable ({exc})")
+            _log(
+                logging.DEBUG,
+                f"  stale recovery: {display(dseq, 'dseq')} "
+                f"provenance unreadable ({error_text(exc)})",
+            )
             continue
         if not any(n.startswith(PLACEMENT_PREFIX) for n in names):
             continue
@@ -280,9 +325,12 @@ def _close_stale_for_retry(client, *, now: float | None = None) -> list[str]:
         try:
             client.close_deployment(dseq)
             closed.append(dseq)
-            _log(logging.INFO, f"Closed stale deployment {dseq}")
+            _log(logging.INFO, f"Closed stale deployment {display(dseq, 'dseq')}")
         except Exception as exc:  # noqa: BLE001 — keep going; report at the end
-            _log(logging.WARNING, f"Could not close stale deployment {dseq}: {exc}")
+            _log(
+                logging.WARNING,
+                f"Could not close stale deployment {display(dseq, 'dseq')}: {error_text(exc)}",
+            )
     if len(candidates) > STALE_RETRY_MAX_CLOSE:
         _log(
             logging.WARNING,
@@ -347,7 +395,7 @@ def _report_suspected_orphans(client, since_epoch_s: float, run_id: str = "") ->
     try:
         active = client.list_deployments(active_only=True)
     except Exception as exc:  # noqa: BLE001 — diagnosis must never mask the real failure
-        _log(logging.WARNING, f"Could not check for an orphaned deployment: {exc}")
+        _log(logging.WARNING, f"Could not check for an orphaned deployment: {error_text(exc)}")
         return []
 
     suspects: list[str] = []
@@ -400,8 +448,9 @@ def _report_suspected_orphans(client, since_epoch_s: float, run_id: str = "") ->
             # available for diagnosing a wrong suppression.
             _log(
                 logging.DEBUG,
-                f"  deployment {dseq} was created in this window but belongs to another "
-                f"repo (group_spec.name={names}) — suppressed",
+                f"  deployment {display(dseq, 'dseq')} was "
+                f"created in this window but belongs to another "
+                f"repo (group_spec.name={display(names, 'withheld')}) — suppressed",
             )
             continue
 
@@ -414,16 +463,21 @@ def _report_suspected_orphans(client, since_epoch_s: float, run_id: str = "") ->
             # PROVEN to be this call's residue. Close it rather than describing it.
             if _close_proven_orphan(client, dseq, mine_key):
                 continue
-            headline = f"ORPHAN (this run, group_spec.name={mine_key}) — COULD NOT CLOSE"
+            headline = (
+                f"ORPHAN (this run, group_spec.name={display(mine_key, 'withheld')}) "
+                "— COULD NOT CLOSE"
+            )
             proof = (
                 "Its provenance carries THIS run's id, so this call created it, and the "
                 "automatic close failed"
             )
         elif our_key:
-            headline = f"ORPHAN (confirmed ours, group_spec.name={our_key})"
+            headline = f"ORPHAN (confirmed ours, group_spec.name={display(our_key, 'withheld')})"
             proof = "Its on-chain provenance carries this repo's prefix"
         elif names:
-            headline = f"POSSIBLE ORPHAN (unattributed, group_spec.name={names[0]})"
+            headline = (
+                f"POSSIBLE ORPHAN (unattributed, group_spec.name={display(names[0], 'withheld')})"
+            )
             proof = (
                 "Its provenance names no repo we recognise — it may be from a caller "
                 "SDL of ours, or another tenant's; check before destroying"
@@ -436,16 +490,19 @@ def _report_suspected_orphans(client, since_epoch_s: float, run_id: str = "") ->
             )
         _log(
             logging.ERROR,
-            f"{headline}: deployment {dseq} was created during the failed request and "
+            f"{headline}: deployment {display(dseq, 'dseq')} "
+            f"was created during the failed request and "
             f"holds no lease. The create reported failure, but the transaction may still "
             f"have committed — it is holding escrow against the grant the next run spends "
-            f"from. {proof}. Verify and close: just-akash status --dseq {dseq} && "
-            f"just-akash destroy --dseq {dseq} -y",
+            f"from. {display(proof, 'withheld')}. Verify and close: just-akash "
+            f"status --dseq {display(dseq, 'dseq')} && "
+            f"just-akash destroy --dseq {display(dseq, 'dseq')} -y",
         )
         emit(
             Code.DEPLOY_CREATE_ORPHAN_SUSPECTED,
             "error",
-            f"deployment {dseq} may have been created by a create that reported failure",
+            f"deployment {display(dseq, 'dseq')} may have "
+            f"been created by a create that reported failure",
             dseq=dseq,
             provenance=names or None,
             owned=ours,
@@ -456,7 +513,7 @@ def _report_suspected_orphans(client, since_epoch_s: float, run_id: str = "") ->
 
 def _fmt_price(bid) -> str:
     amount, denom = _extract_bid_price(bid)
-    return f"{amount} {denom}"
+    return f"{amount} {display(denom, 'denom')}"
 
 
 def _bid_state(b) -> str:
@@ -748,7 +805,8 @@ def _log_bid_table(
             suffix = f"  [{_classify_bid(provider, preferred, backup)}]"
         _log(
             logging.INFO,
-            f"    [{i + 1}] provider={provider}  price={_fmt_price(b)}  state={state}{suffix}",
+            f"    [{i + 1}] provider={display(provider, 'address')}  "
+            f"price={_fmt_price(b)}  state={display(state, 'state')}{suffix}",
         )
 
 
@@ -813,6 +871,7 @@ def _resolve_sdl_path(sdl_path: str, gpu: bool) -> str:
     return sdl_path
 
 
+@sdl_operation
 def _prepare_sdl_content(
     sdl_path: str,
     image: str | None = None,
@@ -830,6 +889,7 @@ def _prepare_sdl_content(
 
     with open(sdl_path_obj) as f:
         sdl_content = f.read()
+    protect_content(sdl_content)
     _log(logging.DEBUG, f"SDL content length: {len(sdl_content)} bytes")
 
     # RUN-SCOPE THE PROVENANCE KEY. The repo prefix proves which repo created a
@@ -848,8 +908,8 @@ def _prepare_sdl_content(
     try:
         validate_sdl(sdl_content)
     except SDLValidationError as e:
-        _log(logging.ERROR, str(e))
-        raise RuntimeError(str(e)) from e
+        _log(logging.ERROR, error_text(e))
+        raise RuntimeError(error_text(e)) from e
     _log(logging.INFO, "SDL validation OK")
 
     if image:
@@ -914,7 +974,7 @@ def _check_wallet_credit(client: AkashConsoleAPI, deposit: float) -> None:
         emit(
             Code.WALLET_CREDIT_QUERY_FAILED,
             "warning",
-            f"could not resolve account address for credit check: {e}",
+            f"could not resolve account address for credit check: {error_text(e)}",
         )
         return
     try:
@@ -923,7 +983,7 @@ def _check_wallet_credit(client: AkashConsoleAPI, deposit: float) -> None:
         emit(
             Code.WALLET_CREDIT_QUERY_FAILED,
             "warning",
-            f"deploy-credit query failed (LCD unreachable?): {e}",
+            f"deploy-credit query failed (LCD unreachable?): {error_text(e)}",
             account=address,
         )
         return
@@ -954,6 +1014,7 @@ def _check_wallet_credit(client: AkashConsoleAPI, deposit: float) -> None:
         )
 
 
+@sdl_operation
 def deploy(
     sdl_path: str,
     gpu: bool = False,
@@ -1014,7 +1075,8 @@ def deploy(
     if wallet.configured_keys > 1:
         _log(
             logging.INFO,
-            f"WALLET policy={wallet.policy_version} selected_account={wallet.account} "
+            f"WALLET policy={wallet.policy_version} "
+            f"selected_account={display(wallet.account, 'address')} "
             f"available_uact={wallet.available_uact} distinct_accounts="
             f"{wallet.distinct_accounts}/{wallet.configured_keys}",
         )
@@ -1029,9 +1091,12 @@ def deploy(
         f"preferred_window={bid_wait}s  fallback_deadline={bid_wait_retry}s total",
     )
     if preferred:
-        _log(logging.INFO, f"PREFERRED_PROVIDERS ({len(preferred)}): {preferred}")
+        _log(
+            logging.INFO,
+            f"PREFERRED_PROVIDERS ({len(preferred)}): {display(preferred, 'address_list')}",
+        )
     if backup:
-        _log(logging.INFO, f"BACKUP_PROVIDERS ({len(backup)}): {backup}")
+        _log(logging.INFO, f"BACKUP_PROVIDERS ({len(backup)}): {display(backup, 'address_list')}")
     if not has_allowlist:
         _log(logging.INFO, "ALLOWED_PROVIDERS: (any — no allowlist set)")
 
@@ -1039,6 +1104,7 @@ def deploy(
     sdl_path = _resolve_sdl_path(sdl_path, gpu)
     _log(logging.INFO, "STEP 1: Preparing SDL")
     sdl_content = _prepare_sdl_content(sdl_path, image=image, env_vars=env_vars)
+    protect_content(sdl_content)
     _check_wallet_credit(client, deposit)
 
     prepared_receipt = None
@@ -1071,7 +1137,7 @@ def deploy(
     try:
         deployment_response = client.create_deployment(sdl_content, deposit=deposit)
     except RuntimeError as e:
-        if "already exists" in str(e).lower():
+        if "already exists" in error_text(e).lower():
             if prepared_receipt is not None:
                 # Receipt-mode CI shares its wallet with other runs and purposes.
                 # This response proves neither which create committed nor which
@@ -1092,20 +1158,22 @@ def deploy(
                 # direction for a function whose next act is to close things.
                 _close_stale_for_retry(client, now=_create_started)
             except Exception as cleanup_err:  # noqa: BLE001 — documented as never raising
-                _log(logging.ERROR, f"Stale deployment cleanup failed: {cleanup_err}")
+                _log(logging.ERROR, f"Stale deployment cleanup failed: {error_text(cleanup_err)}")
             # Retry once after cleanup
             try:
                 deployment_response = client.create_deployment(sdl_content, deposit=deposit)
             except RuntimeError as retry_err:
-                _log(logging.ERROR, f"Create deployment FAILED after retry: {retry_err}")
+                _log(
+                    logging.ERROR, f"Create deployment FAILED after retry: {error_text(retry_err)}"
+                )
                 emit(
                     Code.DEPLOY_CREATE_FAILED,
                     "error",
-                    f"create deployment failed after retry: {retry_err}",
+                    f"create deployment failed after retry: {error_text(retry_err)}",
                 )
                 _report_suspected_orphans(client, _create_started, _RUN_ID)
                 raise RuntimeError(
-                    f"Failed to create deployment after retry: {retry_err}"
+                    f"Failed to create deployment after retry: {error_text(retry_err)}"
                 ) from retry_err
         else:
             # ⛔ NAME AN UPSTREAM TIMEOUT AS UPSTREAM. A Cloudflare 524 is the proxy
@@ -1116,7 +1184,8 @@ def deploy(
             if isinstance(e, AkashAPIError) and e.is_upstream_timeout():
                 _log(
                     logging.ERROR,
-                    f"Create deployment FAILED — UPSTREAM TIMEOUT, not this change: {e}",
+                    "Create deployment FAILED — UPSTREAM TIMEOUT, not this change: "
+                    f"{error_text(e)}",
                 )
                 emit(
                     Code.DEPLOY_CREATE_FAILED,
@@ -1149,28 +1218,37 @@ def deploy(
                         "landed. See the orphan report below before re-running.",
                     )
             else:
-                _log(logging.ERROR, f"Create deployment FAILED: {e}")
-                emit(Code.DEPLOY_CREATE_FAILED, "error", f"create deployment failed: {e}")
+                _log(logging.ERROR, f"Create deployment FAILED: {error_text(e)}")
+                emit(
+                    Code.DEPLOY_CREATE_FAILED,
+                    "error",
+                    f"create deployment failed: {error_text(e)}",
+                )
             _report_suspected_orphans(client, _create_started, _RUN_ID)
-            raise RuntimeError(f"Failed to create deployment: {e}") from e
+            raise RuntimeError(f"Failed to create deployment: {error_text(e)}") from e
 
     dseq = deployment_response.get("dseq")
     if dseq is None:
         _log(
             logging.ERROR,
-            f"No DSEQ in response: {json.dumps(deployment_response, default=str)}",
+            "No DSEQ in response (details withheld)"
+            if active()
+            else f"No DSEQ in response: {json.dumps(deployment_response, default=str)}",
         )
         emit(
             Code.NO_DSEQ_RETURNED,
             "error",
             "create deployment returned no DSEQ",
             response_keys=list(deployment_response.keys())
-            if isinstance(deployment_response, dict)
+            if isinstance(deployment_response, dict) and not active()
             else None,
         )
         raise RuntimeError(
-            f"No DSEQ returned from API. Response: {json.dumps(deployment_response)}"
+            "No DSEQ returned from API (details withheld)"
+            if active()
+            else f"No DSEQ returned from API. Response: {json.dumps(deployment_response)}"
         )
+    _private_create_identity(dseq)
     if prepared_receipt is not None:
         try:
             mark_create_response_received(
@@ -1180,20 +1258,26 @@ def deploy(
             )
         except Exception as receipt_error:
             raise RuntimeError(
-                f"NON-RETRYABLE CREATE OUTCOME AMBIGUOUS: Console returned dseq={dseq}, "
+                f"NON-RETRYABLE CREATE OUTCOME AMBIGUOUS: "
+                f"Console returned dseq={display(dseq, 'dseq')}, "
                 "but its local recovery receipt could not be durably transitioned. The "
                 "existing receipt path remains a create-submitted recovery seed; reconcile "
                 "its owner and complete group identity against the chain before any retry. "
-                f"Receipt error: {receipt_error}"
+                f"Receipt error: {error_text(receipt_error)}"
             ) from receipt_error
 
     _manifest_raw = deployment_response.get("manifest", "")
     manifest = _manifest_raw if isinstance(_manifest_raw, str) else ""
 
-    _log(logging.INFO, f"Deployment created  DSEQ={dseq}  manifest_len={len(manifest)}")
+    _log(
+        logging.INFO,
+        f"Deployment created  DSEQ={display(dseq, 'dseq')}  manifest_len={len(manifest)}",
+    )
     _log(
         logging.DEBUG,
-        f"Full deployment response: {json.dumps(deployment_response, default=str)[:500]}",
+        "Full deployment response: withheld"
+        if active()
+        else f"Full deployment response: {json.dumps(deployment_response, default=str)[:500]}",
     )
 
     # Step 3: one equal-opportunity bid collection window, then one shared decision.
@@ -1257,7 +1341,7 @@ def deploy(
         except RuntimeError as e:
             _log_below_status(
                 logging.WARNING,
-                f"  poll #{poll_count} @ {elapsed}s: API error: {e}",
+                f"  poll #{poll_count} @ {elapsed}s: API error: {error_text(e)}",
             )
             print(f"\r{status_line}  api_error=1", end="", flush=True)
             _status_open = True
@@ -1283,7 +1367,8 @@ def deploy(
                     tag = _classify_bid(p, preferred, backup)
                     _log_below_status(
                         logging.INFO,
-                        f"    bid[{i}] provider={p}  price={_fmt_price(b)}  state={s}  [{tag}]",
+                        f"    bid[{i}] provider={display(p, 'address')}  "
+                        f"price={_fmt_price(b)}  state={display(s, 'state')}  [{tag}]",
                     )
 
         status_line = _fmt_window_status_line(
@@ -1399,7 +1484,9 @@ def deploy(
     _request_profiles = derive_resource_profiles(sdl_content)
     _log(
         logging.INFO,
-        f"auction[collection] {_request_profiles.describe(_count_gseqless(bids))}",
+        "auction[collection] REQUEST_PROFILE diagnostics withheld"
+        if active()
+        else f"auction[collection] {_request_profiles.describe(_count_gseqless(bids))}",
     )
     selected_bid, auction_result = _select_auction_bid(
         bids,
@@ -1491,7 +1578,9 @@ def deploy(
                     )
         _log(
             logging.INFO,
-            f"auction[fallback] {_request_profiles.describe(_count_gseqless(bids))}",
+            "auction[fallback] REQUEST_PROFILE diagnostics withheld"
+            if active()
+            else f"auction[fallback] {_request_profiles.describe(_count_gseqless(bids))}",
         )
         selected_bid, auction_result = _select_auction_bid(
             bids,
@@ -1532,7 +1621,7 @@ def deploy(
             )
             for p in no_bid_from:
                 tier = "preferred" if p in preferred else "backup"
-                _log(logging.WARNING, f"  {p} ({tier})")
+                _log(logging.WARNING, f"  {display(p, 'address')} ({tier})")
                 try:
                     prov_info = client.get_provider(p)
                     if prov_info:
@@ -1550,12 +1639,13 @@ def deploy(
                             mem = {}
                         _log(
                             logging.WARNING,
-                            f"    on-chain status: isOnline={online} "
-                            f"isValidVersion={valid} uptime1d={uptime} "
-                            f"cpu_avail={cpu.get('available')} "
-                            f"cpu_active={cpu.get('active')} "
-                            f"mem_avail={mem.get('available')} "
-                            f"mem_active={mem.get('active')}",
+                            f"    on-chain status: isOnline={display(online, 'bool')} "
+                            f"isValidVersion={display(valid, 'bool')} "
+                            f"uptime1d={display(uptime, 'number')} "
+                            f"cpu_avail={display(cpu.get('available'), 'number')} "
+                            f"cpu_active={display(cpu.get('active'), 'number')} "
+                            f"mem_avail={display(mem.get('available'), 'number')} "
+                            f"mem_active={display(mem.get('active'), 'number')}",
                         )
                         # Classify WHY this provider didn't bid, from its on-chain
                         # status — a structured event a caller (CI/Sentry) can act on.
@@ -1575,7 +1665,7 @@ def deploy(
                         emit(
                             pcode,
                             "warning",
-                            f"{pmsg}: {p}",
+                            f"{pmsg}: {display(p, 'address')}",
                             provider=p,
                             tier=tier,
                             isOnline=online,
@@ -1594,19 +1684,20 @@ def deploy(
                         emit(
                             Code.PROVIDER_UNKNOWN,
                             "warning",
-                            f"allowlisted provider not in registry: {p}",
+                            f"allowlisted provider not in registry: {display(p, 'address')}",
                             provider=p,
                             tier=tier,
                         )
                 except RuntimeError as e:
-                    _log(logging.WARNING, f"    on-chain status: query failed: {e}")
+                    _log(logging.WARNING, f"    on-chain status: query failed: {error_text(e)}")
                     emit(
                         Code.PROVIDER_STATUS_QUERY_FAILED,
                         "warning",
-                        f"on-chain status query failed for {p}: {e}",
+                        f"on-chain status query failed for "
+                        f"{display(p, 'address')}: {error_text(e)}",
                         provider=p,
                         tier=tier,
-                        query_error=str(e)[:120],
+                        query_error=error_text(e)[:120],
                     )
 
     # Failure paths.
@@ -1622,12 +1713,19 @@ def deploy(
                 "network partition, deposit too low, or no capacity on "
                 "allowed providers",
             )
-            _log(logging.INFO, f"Cleaning up deployment {dseq} (no bids)...")
+            _log(logging.INFO, f"Cleaning up deployment {display(dseq, 'dseq')} (no bids)...")
             try:
                 client.close_deployment(str(dseq))
-                _log(logging.INFO, f"Deployment {dseq} closed after no bids received")
+                _log(
+                    logging.INFO,
+                    f"Deployment {display(dseq, 'dseq')} closed after no bids received",
+                )
             except Exception as cleanup_err:
-                _log(logging.ERROR, f"Cleanup of deployment {dseq} failed: {cleanup_err}")
+                _log(
+                    logging.ERROR,
+                    f"Cleanup of deployment {display(dseq, 'dseq')} "
+                    f"failed: {error_text(cleanup_err)}",
+                )
             emit(
                 Code.NO_BIDS_RECEIVED,
                 "error",
@@ -1647,11 +1745,17 @@ def deploy(
         valid_bids = [b for b in bids if isinstance(b, dict)]
         if has_allowlist and not valid_bids:
             _log(logging.ERROR, f"All {len(bids)} bid(s) are invalid (non-dict entries)")
-            _log(logging.INFO, f"Cleaning up deployment {dseq} (no valid bids)...")
+            _log(
+                logging.INFO, f"Cleaning up deployment {display(dseq, 'dseq')} (no valid bids)..."
+            )
             try:
                 client.close_deployment(str(dseq))
             except Exception as cleanup_err:
-                _log(logging.ERROR, f"Cleanup of deployment {dseq} failed: {cleanup_err}")
+                _log(
+                    logging.ERROR,
+                    f"Cleanup of deployment {display(dseq, 'dseq')} "
+                    f"failed: {error_text(cleanup_err)}",
+                )
             emit(
                 Code.BIDS_MALFORMED,
                 "error",
@@ -1660,11 +1764,18 @@ def deploy(
             )
             raise RuntimeError("No valid bids received — all bid entries were malformed.")
         if valid_bids and not any(_extract_provider(b) for b in valid_bids):
-            _log(logging.INFO, f"Cleaning up deployment {dseq} (bids have no provider)...")
+            _log(
+                logging.INFO,
+                f"Cleaning up deployment {display(dseq, 'dseq')} (bids have no provider)...",
+            )
             try:
                 client.close_deployment(str(dseq))
             except Exception as cleanup_err:
-                _log(logging.ERROR, f"Cleanup of deployment {dseq} failed: {cleanup_err}")
+                _log(
+                    logging.ERROR,
+                    f"Cleanup of deployment {display(dseq, 'dseq')} "
+                    f"failed: {error_text(cleanup_err)}",
+                )
             raise RuntimeError("Selected bid has no provider address")
         # Bids from our own providers exist, but every one has aged out of the
         # 'open' state (issue #14). Without this branch the failure below would
@@ -1679,20 +1790,24 @@ def deploy(
         else:
             allowed_bids = valid_bids
         if allowed_bids and not any(_is_open_bid(b) for b in allowed_bids):
-            states = sorted({_bid_state(b) for b in allowed_bids})
+            states = sorted({display(_bid_state(b), "state") for b in allowed_bids})
             providers = [_extract_provider(b) or "unknown" for b in allowed_bids]
             _log(
                 logging.ERROR,
                 f"All {len(allowed_bids)} bid(s) from your providers are no "
                 f"longer open (states seen: {states})",
             )
-            _log(logging.ERROR, f"  Providers: {providers}")
-            _log(logging.INFO, f"Cleaning up deployment {dseq} (no open bids)...")
+            _log(logging.ERROR, f"  Providers: {display(providers, 'address_list')}")
+            _log(logging.INFO, f"Cleaning up deployment {display(dseq, 'dseq')} (no open bids)...")
             try:
                 client.close_deployment(str(dseq))
-                _log(logging.INFO, f"Deployment {dseq} closed after no open bids")
+                _log(logging.INFO, f"Deployment {display(dseq, 'dseq')} closed after no open bids")
             except Exception as cleanup_err:
-                _log(logging.ERROR, f"Cleanup of deployment {dseq} failed: {cleanup_err}")
+                _log(
+                    logging.ERROR,
+                    f"Cleanup of deployment {display(dseq, 'dseq')} "
+                    f"failed: {error_text(cleanup_err)}",
+                )
             emit(
                 Code.BIDS_STALE,
                 "error",
@@ -1709,15 +1824,23 @@ def deploy(
         foreign = [_extract_provider(b) or "unknown" for b in bids]
         allowed_all = preferred + backup
         _log(logging.ERROR, f"All {len(bids)} bid(s) are from non-allowed providers")
-        _log(logging.ERROR, f"  Preferred: {preferred}")
-        _log(logging.ERROR, f"  Backup:    {backup}")
-        _log(logging.ERROR, f"  Received from: {foreign}")
-        _log(logging.INFO, f"Cleaning up deployment {dseq} (foreign bids only)...")
+        _log(logging.ERROR, f"  Preferred: {display(preferred, 'address_list')}")
+        _log(logging.ERROR, f"  Backup:    {display(backup, 'address_list')}")
+        _log(logging.ERROR, f"  Received from: {display(foreign, 'address_list')}")
+        _log(
+            logging.INFO, f"Cleaning up deployment {display(dseq, 'dseq')} (foreign bids only)..."
+        )
         try:
             client.close_deployment(str(dseq))
-            _log(logging.INFO, f"Deployment {dseq} closed after foreign bids rejection")
+            _log(
+                logging.INFO,
+                f"Deployment {display(dseq, 'dseq')} closed after foreign bids rejection",
+            )
         except Exception as cleanup_err:
-            _log(logging.ERROR, f"Cleanup of deployment {dseq} failed: {cleanup_err}")
+            _log(
+                logging.ERROR,
+                f"Cleanup of deployment {display(dseq, 'dseq')} failed: {error_text(cleanup_err)}",
+            )
         emit(
             Code.BIDS_FOREIGN_ONLY,
             "error",
@@ -1760,10 +1883,10 @@ def deploy(
             # allow-list rejection falls through to "deploy-failed", scoring OUR filter as
             # a PROVIDER FAIL — the exact mis-attribution this message is being fixed for.
             f"Received {len(bids)} bid(s) but NONE from our providers.\n"
-            f"  Preferred: {preferred}\n"
-            f"  Backup:    {backup}\n"
-            f"  Received from: {foreign}\n"
-            f"  Allowed total: {allowed_all}\n"
+            f"  Preferred: {display(preferred, 'address_list')}\n"
+            f"  Backup:    {display(backup, 'address_list')}\n"
+            f"  Received from: {display(foreign, 'address_list')}\n"
+            f"  Allowed total: {display(allowed_all, 'address_list')}\n"
             "This is NOT a capacity or liveness problem — a bid is proof the provider was "
             "online and had capacity for this order shape. The mismatch is between the "
             "bidders above and the allow-list above. Widen the allow-list, or place the "
@@ -1840,7 +1963,8 @@ def deploy(
         marker = " <-- SELECTED" if b is selected_bid else ""
         _log(
             logging.INFO,
-            f"  {ranking_label} rank[{i + 1}] provider={p}  price={_fmt_price(b)}{marker}",
+            f"  {ranking_label} rank[{i + 1}] "
+            f"provider={display(p, 'address')}  price={_fmt_price(b)}{marker}",
         )
 
     provider = _extract_provider(selected_bid) or ""
@@ -1855,17 +1979,23 @@ def deploy(
     price_amount, price_denom = _extract_bid_price(selected_bid)
 
     if not provider:
-        _log(logging.INFO, f"Cleaning up deployment {dseq} (no provider in bid)...")
+        _log(
+            logging.INFO, f"Cleaning up deployment {display(dseq, 'dseq')} (no provider in bid)..."
+        )
         try:
             client.close_deployment(str(dseq))
-            _log(logging.INFO, f"Deployment {dseq} closed after no-provider bid")
+            _log(logging.INFO, f"Deployment {display(dseq, 'dseq')} closed after no-provider bid")
         except Exception as cleanup_err:
-            _log(logging.ERROR, f"Cleanup of deployment {dseq} failed: {cleanup_err}")
+            _log(
+                logging.ERROR,
+                f"Cleanup of deployment {display(dseq, 'dseq')} failed: {error_text(cleanup_err)}",
+            )
         raise RuntimeError("Selected bid has no provider address")
 
     _log(
         logging.INFO,
-        f"SELECTED  provider={provider}  price={price_amount} {price_denom}  ({selection_label})",
+        f"SELECTED  provider={display(provider, 'address')}  price={price_amount} "
+        f"{display(price_denom, 'denom')}  ({selection_label})",
     )
 
     # Step 6: Create lease (with stale-bid retry — issue #14).
@@ -1983,13 +2113,14 @@ def deploy(
         if prepared_receipt is not None:
             raise RuntimeError(
                 "receipt mode refuses internal re-deploy: the durable receipt binds the "
-                f"original DSEQ {dseq}, so closing it and creating another order would "
+                f"original DSEQ {display(dseq, 'dseq')}, so "
+                f"closing it and creating another order would "
                 "make the recovery identity false"
             )
         _log(
             logging.WARNING,
             f"Re-creating the order for fresh bids — {reason} (1 re-deploy round); "
-            f"closing {dseq}...",
+            f"closing {display(dseq, 'dseq')}...",
         )
         # Close the stale order BEFORE creating a new one — never leave two
         # funded orders on-chain. Transient close failures (often the same
@@ -1999,22 +2130,22 @@ def deploy(
         for close_attempt in range(1, 4):
             try:
                 client.close_deployment(str(dseq))
-                _log(logging.INFO, f"  Stale order {dseq} closed")
+                _log(logging.INFO, f"  Stale order {display(dseq, 'dseq')} closed")
                 closed = True
                 break
             except Exception as close_err:
                 _log(
                     logging.WARNING,
-                    f"  Close of stale order {dseq} failed "
-                    f"(attempt {close_attempt}/3): {close_err}",
+                    f"  Close of stale order {display(dseq, 'dseq')} failed "
+                    f"(attempt {close_attempt}/3): {error_text(close_err)}",
                 )
                 if close_attempt < 3:
                     time.sleep(2)
         if not closed:
             raise RuntimeError(
-                f"could not close stale order {dseq} after 3 attempts — not "
+                f"could not close stale order {display(dseq, 'dseq')} after 3 attempts — not "
                 "re-deploying, to avoid double escrow. Close it manually: "
-                f"just-akash destroy --dseq {dseq}"
+                f"just-akash destroy --dseq {display(dseq, 'dseq')}"
             )
         # Same ambiguity as the initial create, and the same escrow at stake — this
         # path exists precisely because the first order went stale, so leaking a second
@@ -2024,18 +2155,24 @@ def deploy(
             redeploy_response = client.create_deployment(sdl_content, deposit=deposit)
         except RuntimeError as redeploy_err:
             _report_suspected_orphans(client, _redeploy_started, _RUN_ID)
-            raise RuntimeError(f"re-deploy create failed: {redeploy_err}") from redeploy_err
+            raise RuntimeError(
+                f"re-deploy create failed: {error_text(redeploy_err)}"
+            ) from redeploy_err
         new_dseq = redeploy_response.get("dseq")
         if new_dseq is None:
             raise RuntimeError(
-                f"re-deploy returned no DSEQ (response: "
+                "re-deploy returned no DSEQ (details withheld)"
+                if active()
+                else f"re-deploy returned no DSEQ (response: "
                 f"{json.dumps(redeploy_response, default=str)[:200]})"
             )
+        _private_create_identity(new_dseq)
         _raw_manifest = redeploy_response.get("manifest", "")
         new_manifest = _raw_manifest if isinstance(_raw_manifest, str) else ""
         _log(
             logging.INFO,
-            f"  Re-deployed: new order DSEQ={new_dseq} — fast-polling for fresh bids...",
+            f"  Re-deployed: new order DSEQ={display(new_dseq, 'dseq')} "
+            f"— fast-polling for fresh bids...",
         )
         wait_s, courtesy_s, interval_s = _redeploy_poll_window()
         if deprioritize:
@@ -2050,14 +2187,23 @@ def deploy(
         if fresh is None or not fresh_provider:
             try:
                 client.close_deployment(str(new_dseq))
-                _log(logging.INFO, f"  Re-created order {new_dseq} closed (no fresh bid)")
+                _log(
+                    logging.INFO,
+                    f"  Re-created order {display(new_dseq, 'dseq')} closed (no fresh bid)",
+                )
             except Exception as cleanup_err:
-                _log(logging.ERROR, f"  Cleanup of {new_dseq} failed: {cleanup_err}")
-            raise RuntimeError(f"no fresh open bid on re-created order {new_dseq}")
+                _log(
+                    logging.ERROR,
+                    f"  Cleanup of {display(new_dseq, 'dseq')} failed: {error_text(cleanup_err)}",
+                )
+            raise RuntimeError(
+                f"no fresh open bid on re-created order {display(new_dseq, 'dseq')}"
+            )
         amount, denom = _extract_bid_price(fresh)
         _log(
             logging.INFO,
-            f"  Fresh bid selected: provider={fresh_provider}  price={amount} {denom} "
+            f"  Fresh bid selected: provider={display(fresh_provider, 'address')} "
+            f" price={amount} {display(denom, 'denom')} "
             "— leasing immediately",
         )
         # ⚠ The fresh bid's GROUP travels with it. A re-created order is a NEW order:
@@ -2101,7 +2247,7 @@ def deploy(
             )
             break
         except RuntimeError as e:
-            err_str = str(e).lower()
+            err_str = error_text(e).lower()
             stale = "no longer open" in err_str
             # 404 "no lease for deployment": the deployment's order became
             # un-leaseable during the bid-wait (Console GC/propagation, or a
@@ -2125,7 +2271,8 @@ def deploy(
                 _log(
                     logging.WARNING,
                     f"Lease attempt {attempt}/{max_lease_attempts} hit a transient "
-                    f"Console auth error (JWT claims) for provider={provider} — "
+                    f"Console auth error (JWT claims) for "
+                    f"provider={display(provider, 'address')} — "
                     "retrying the same bid in 5s...",
                 )
                 time.sleep(5)
@@ -2135,12 +2282,12 @@ def deploy(
                 _log(
                     logging.WARNING,
                     f"Lease attempt {attempt}/{max_lease_attempts} hit a stale bid "
-                    f"(provider={provider}): re-fetching open bids...",
+                    f"(provider={display(provider, 'address')}): re-fetching open bids...",
                 )
                 try:
                     fresh_bids = client.get_bids(str(dseq))
                 except RuntimeError as poll_err:
-                    _log(logging.WARNING, f"  Bid re-fetch failed: {poll_err}")
+                    _log(logging.WARNING, f"  Bid re-fetch failed: {error_text(poll_err)}")
                     fresh_bids = []
                 next_bid = _next_open_bid(fresh_bids, failed_providers)
                 if next_bid is not None:
@@ -2154,8 +2301,9 @@ def deploy(
                     price_amount, price_denom = _extract_bid_price(next_bid)
                     _log(
                         logging.INFO,
-                        f"  Retrying lease with next open bid: provider={provider}  "
-                        f"price={price_amount} {price_denom}",
+                        f"  Retrying lease with next open bid: "
+                        f"provider={display(provider, 'address')}  "
+                        f"price={price_amount} {display(price_denom, 'denom')}",
                     )
                     continue
                 _log(logging.WARNING, "  No other open bid available to retry with")
@@ -2193,39 +2341,46 @@ def deploy(
                     emit(
                         Code.REDEPLOY_FAILED,
                         "error",
-                        f"re-deploy round failed: {redeploy_err}",
+                        f"re-deploy round failed: {error_text(redeploy_err)}",
                         dseq=str(dseq),
                     )
                     raise RuntimeError(
-                        f"Failed to create lease after re-deploy: {redeploy_err}"
+                        f"Failed to create lease after re-deploy: {error_text(redeploy_err)}"
                     ) from redeploy_err
                 continue
-            _log(logging.ERROR, f"Lease creation FAILED: {e}")
-            _log(logging.INFO, f"Cleaning up deployment {dseq}...")
+            _log(logging.ERROR, f"Lease creation FAILED: {error_text(e)}")
+            _log(logging.INFO, f"Cleaning up deployment {display(dseq, 'dseq')}...")
             try:
                 client.close_deployment(str(dseq))
-                _log(logging.INFO, f"Deployment {dseq} closed after lease failure")
+                _log(
+                    logging.INFO, f"Deployment {display(dseq, 'dseq')} closed after lease failure"
+                )
             except Exception as cleanup_err:
-                _log(logging.ERROR, f"Cleanup of deployment {dseq} also failed: {cleanup_err}")
+                _log(
+                    logging.ERROR,
+                    f"Cleanup of deployment {display(dseq, 'dseq')} "
+                    f"also failed: {error_text(cleanup_err)}",
+                )
             emit(
                 Code.LEASE_CREATE_FAILED,
                 "error",
-                f"lease creation failed: {e}",
+                f"lease creation failed: {error_text(e)}",
                 dseq=str(dseq),
                 provider=provider,
             )
-            raise RuntimeError(f"Failed to create lease: {e}") from e
+            raise RuntimeError(f"Failed to create lease: {error_text(e)}") from e
 
     _log(logging.INFO, "Lease created successfully!")
     _log(
         logging.INFO,
-        f"DEPLOYMENT SUMMARY  DSEQ={dseq}  "
-        f"provider={provider}  price={price_amount} {price_denom}",
+        f"DEPLOYMENT SUMMARY  DSEQ={display(dseq, 'dseq')}  "
+        f"provider={display(provider, 'address')}  "
+        f"price={price_amount} {display(price_denom, 'denom')}",
     )
     print("\nDeployment Summary:")
-    print(f"  DSEQ: {dseq}")
-    print(f"  Provider: {provider}")
-    print(f"  Price: {price_amount} {price_denom}")
+    print(f"  DSEQ: {display(dseq, 'dseq')}")
+    print(f"  Provider: {display(provider, 'address')}")
+    print(f"  Price: {price_amount} {display(price_denom, 'denom')}")
     wallet_account = wallet.account
     if wallet_account is None:
         try:
@@ -2235,10 +2390,10 @@ def deploy(
             # Identity is lifecycle metadata, not a reason to fail a lease that already exists.
             wallet_account = None
     if wallet_account:
-        print(f"  Wallet: {wallet_account}")
+        print(f"  Wallet: {display(wallet_account, 'address')}")
     if wallet.available_uact is not None:
         print(f"  Wallet available: {wallet.available_uact} uact")
-    print(f"\nUse 'just-akash status --dseq {dseq}' to check deployment status")
+    print(f"\nUse 'just-akash status --dseq {display(dseq, 'dseq')}' to check deployment status")
 
     return {
         "dseq": dseq,
@@ -2251,6 +2406,7 @@ def deploy(
     }
 
 
+@sdl_operation
 def update(
     dseq: str,
     sdl_path: str,
@@ -2270,31 +2426,42 @@ def update(
             "AKASH_API_KEY environment variable not set. Set AKASH_API_KEY before calling update."
         )
 
+    if active() and not canonical_dseq(dseq):
+        raise RuntimeError("Private update identity was not verified; no update submitted")
     client = AkashConsoleAPI(api_key)
 
     _log(
         logging.INFO,
-        f"UPDATE  dseq={dseq}  sdl={sdl_path}  image={image or '(default)'}",
+        f"UPDATE  dseq={display(dseq, 'dseq')}  sdl={sdl_path}  image={image or '(default)'}",
     )
 
     # Step 1: Read + validate + transform SDL (identical to deploy).
     _log(logging.INFO, "STEP 1: Preparing SDL")
     sdl_content = _prepare_sdl_content(sdl_path, image=image, env_vars=env_vars)
+    protect_content(sdl_content)
 
     # Step 2: Submit the in-place update.
-    _log(logging.INFO, f"STEP 2: Submitting in-place update for deployment {dseq}...")
+    _log(
+        logging.INFO,
+        f"STEP 2: Submitting in-place update for deployment {display(dseq, 'dseq')}...",
+    )
     try:
         result = client.update_deployment(str(dseq), sdl_content)
     except RuntimeError as e:
-        _log(logging.ERROR, f"Update FAILED: {e}")
-        raise RuntimeError(f"Failed to update deployment {dseq}: {e}") from e
+        _log(logging.ERROR, f"Update FAILED: {error_text(e)}")
+        raise RuntimeError(
+            f"Failed to update deployment {display(dseq, 'dseq')}: {error_text(e)}"
+        ) from e
 
     _log(
         logging.INFO,
-        f"Deployment {dseq} updated in place (DSEQ and lease preserved).",
+        f"Deployment {display(dseq, 'dseq')} updated in place (DSEQ and lease preserved).",
     )
-    print(f"\nDeployment {dseq} updated.")
-    print(f"Use 'just-akash status --dseq {dseq}' to verify the new revision is live.")
+    print(f"\nDeployment {display(dseq, 'dseq')} updated.")
+    print(
+        f"Use 'just-akash status --dseq {display(dseq, 'dseq')}' "
+        f"to verify the new revision is live."
+    )
 
     return {"dseq": str(dseq), "result": result}
 
@@ -2410,5 +2577,5 @@ def deploy_main():
         )
         sys.exit(0)
     except RuntimeError as e:
-        print(f"Error: {e}", file=sys.stderr)
+        print(f"Error: {error_text(e)}", file=sys.stderr)
         sys.exit(1)

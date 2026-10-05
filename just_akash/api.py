@@ -23,6 +23,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ._confidential import request_is_confidential, sanitize_exception, withheld_error
+
 logger = logging.getLogger("akash.api")
 
 # ⛔ THE ONE SOCKET TIMEOUT FOR EVERY CONSOLE HTTP CALL (#368). Without it, a socket
@@ -138,8 +140,10 @@ class AkashAPIError(RuntimeError):
     do — `"already exists" in str(e).lower()` in deploy.py, `_is_credit_error` in
     cleanup_stale. The structured fields are added BESIDE the message, never
     inside it, so no substring match can shift underneath those callers.
-    This compatibility contract applies to AkashConsoleAPI; the opt-in
-    CIConsoleAPI deliberately omits response details that can echo runtime secrets.
+    Legacy credential-bearing SDL/manifest operations retain only fixed retry
+    classifications, withholding arbitrary upstream prose/body. Public legacy
+    operations retain the original string. The opt-in CIConsoleAPI deliberately
+    omits all response details that can echo runtime secrets.
     """
 
     def __init__(
@@ -234,6 +238,7 @@ class AkashConsoleAPI:
         data: dict[str, Any] | None = None,
     ) -> Any:
         url = f"{self.base_url}{endpoint}"
+        confidential = self._protect_runtime_payloads or request_is_confidential(data)
         if method.upper() == "GET":
             # A cache in front of the Console API can answer a GET from an earlier
             # response to the same URL (measured: cf-cache-status HIT, max-age=30), so a
@@ -245,7 +250,7 @@ class AkashConsoleAPI:
         request_body = json.dumps(data).encode("utf-8") if data else None
         # SDLs can contain a short-lived JIT configuration. Log the actual byte
         # population rather than request values, even on the legacy client.
-        log_endpoint = "<CI Console endpoint>" if self._protect_runtime_payloads else endpoint
+        log_endpoint = "<CI Console endpoint>" if confidential else endpoint
         logger.debug(
             f"[{_ts()}] API {method} {log_endpoint} body_bytes={len(request_body or b'')}"
         )
@@ -263,7 +268,9 @@ class AkashConsoleAPI:
             t0 = datetime.now(timezone.utc)
             with self._open_request(req) as response:
                 response_bytes = response.read()
-                response_data = response_bytes.decode("utf-8")
+                response_data = response_bytes.decode(
+                    "utf-8", errors="replace" if confidential else "strict"
+                )
                 elapsed_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
                 if response_data:
                     try:
@@ -280,7 +287,7 @@ class AkashConsoleAPI:
                 )
                 return result
         except urllib.error.HTTPError as e:
-            error_body = e.read().decode("utf-8")
+            error_body = e.read().decode("utf-8", errors="replace" if confidential else "strict")
             elapsed_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
             logger.error(
                 f"[{_ts()}] API {method} {log_endpoint} -> HTTP {e.code} ({elapsed_ms}ms)"
@@ -329,6 +336,15 @@ class AkashConsoleAPI:
                 error_name = (
                     "origin_response_timeout" if error_name == "origin_response_timeout" else ""
                 )
+            elif confidential:
+                # Legacy private SDL callers retain only the fixed classifications
+                # their existing retry decisions use. CIConsoleAPI above keeps its
+                # stronger, deliberately classification-free runtime protection.
+                error_msg = withheld_error(error_msg)
+                error_body = ""
+                error_name = (
+                    "origin_response_timeout" if error_name == "origin_response_timeout" else ""
+                )
             raise AkashAPIError(
                 f"API Error ({e.code}): {error_msg}",
                 status=e.code,
@@ -336,8 +352,8 @@ class AkashConsoleAPI:
                 retryable=retryable,
                 retry_after=retry_after,
                 error_name=error_name,
-            ) from (None if self._protect_runtime_payloads else e)
-        except TimeoutError:
+            ) from (None if confidential else e)
+        except TimeoutError as e:
             # ⛔ TRANSPORT, UNKNOWN OUTCOME (#368). The endpoint connected and then
             # went silent past CONSOLE_HTTP_TIMEOUT: whether the request was applied
             # is as unknown as with a dropped connection, and raising AkashAPIError
@@ -353,12 +369,23 @@ class AkashConsoleAPI:
             logger.error(f"[{_ts()}] API {method} {log_endpoint} -> TIMEOUT after {elapsed_ms}ms")
             if self._protect_runtime_payloads:
                 raise TimeoutError("Console request timed out; reconcile create outcome") from None
+            if confidential:
+                sanitize_exception(e)
+                raise e from None
             raise
         except urllib.error.URLError as e:
             logger.error(f"[{_ts()}] API {method} {log_endpoint} -> URLError")
             if self._protect_runtime_payloads:
                 raise RuntimeError("Connection error: Console request failed") from None
+            if confidential:
+                raise RuntimeError("Connection error: details withheld") from None
             raise RuntimeError(f"Connection error: {e}") from e
+        except OSError as e:
+            if confidential:
+                # Keep transport classification; no HTTP verdict was received.
+                sanitize_exception(e)
+                raise e from None
+            raise
 
     def _open_request(self, request: urllib.request.Request) -> Any:
         # S310: the URL is built from the operator-configured Console origin.
