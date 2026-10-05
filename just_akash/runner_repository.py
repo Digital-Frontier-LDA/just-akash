@@ -91,3 +91,4 @@ def verify_native_reader_repository() -> None:
         or not valid_expiry
     ):
         raise NativeReaderRepositoryError("Native reader registration POST was not verified")
+    verify_native_reader_repository_identity()
