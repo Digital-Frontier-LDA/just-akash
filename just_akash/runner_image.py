@@ -109,6 +109,20 @@ def validate_native_reader_scope(*, reader_from_sops: bool) -> str:
         addresses.append(provider["address"])
     if set(addresses) != NATIVE_READER_PROVIDERS:
         raise ValueError("Native reader provider scope was not verified")
+    owned_raw = os.environ.get("NATIVE_READER_OWNED_PROVIDERS", "")
+    if len(owned_raw) > 8192:
+        raise ValueError("Native reader ownership scope was not verified")
+    try:
+        owned = json.loads(owned_raw)
+    except (ValueError, RecursionError) as exc:
+        raise ValueError("Native reader ownership scope was not verified") from exc
+    if (
+        not isinstance(owned, list)
+        or len(owned) != 3
+        or any(not isinstance(address, str) for address in owned)
+        or set(owned) != NATIVE_READER_PROVIDERS
+    ):
+        raise ValueError("Native reader ownership scope was not verified")
     return label
 
 

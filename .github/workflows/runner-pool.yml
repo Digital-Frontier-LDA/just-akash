@@ -1069,6 +1069,7 @@ jobs:
           NATIVE_READER_EPHEMERAL: ${{ inputs.ephemeral }}
           NATIVE_READER_PROVIDER_SELECT: ${{ inputs.provider-select }}
           NATIVE_READER_PROVIDERS: ${{ inputs.providers }}
+          NATIVE_READER_OWNED_PROVIDERS: ${{ inputs.owned-providers }}
           NATIVE_READER_LABEL: ${{ inputs.runner-label }}
           NATIVE_READER_PLACEMENT: ${{ inputs.placement-key }}
           NATIVE_READER_TAG_PREFIX: ${{ inputs.tag-prefix }}

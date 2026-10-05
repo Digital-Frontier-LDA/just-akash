@@ -43,6 +43,7 @@ def scope(monkeypatch):
                 for address in sorted(NATIVE_READER_PROVIDERS)
             ]
         ),
+        "NATIVE_READER_OWNED_PROVIDERS": json.dumps(sorted(NATIVE_READER_PROVIDERS)),
     }
     for key, value in values.items():
         monkeypatch.setenv(key, value)
@@ -352,6 +353,32 @@ def test_renderer_does_not_export_reader_to_parent_environment(tmp_path, monkeyp
     assert "DOCKERHUB_PULL_USERNAME" not in os.environ
 
 
+@pytest.mark.parametrize(
+    "owned",
+    ["", "[]", "null", "{}", "not-json", '["foreign"]', "[{}, {}, {}]"],
+)
+def test_missing_or_foreign_owned_allowlist_fails_before_decryption(
+    tmp_path, monkeypatch, capsys, owned
+):
+    scope(monkeypatch)
+    monkeypatch.setenv("NATIVE_READER_OWNED_PROVIDERS", owned)
+    cipher, calls = decrypt(tmp_path, monkeypatch)
+    path = template(tmp_path)
+    before = path.read_bytes()
+    assert invoke(monkeypatch, path, cipher) == 1
+    assert calls == []
+    assert path.read_bytes() == before
+    assert "::add-mask::" not in capsys.readouterr().out
+
+
+def test_owned_candidates_cannot_replace_one_owned_address_with_duplicate(tmp_path, monkeypatch):
+    scope(monkeypatch)
+    addresses = sorted(NATIVE_READER_PROVIDERS)
+    monkeypatch.setenv("NATIVE_READER_OWNED_PROVIDERS", json.dumps(addresses[:2] + addresses[:1]))
+    with pytest.raises(ValueError, match="ownership scope"):
+        validate_native_reader_scope(reader_from_sops=True)
+
+
 def test_native_workflow_uses_only_scoped_hosted_sops_step():
     from pathlib import Path
 
@@ -378,6 +405,7 @@ def test_native_workflow_uses_only_scoped_hosted_sops_step():
     assert decrypt_step["env"]["NATIVE_READER_CALLER"] == "${{ github.repository }}"
     assert decrypt_step["env"]["NATIVE_READER_RUN_ID"] == "${{ github.run_id }}"
     assert decrypt_step["env"]["NATIVE_READER_RUN_ATTEMPT"] == "${{ github.run_attempt }}"
+    assert decrypt_step["env"]["NATIVE_READER_OWNED_PROVIDERS"] == "${{ inputs.owned-providers }}"
     assert (
         "SOPS_AGE_KEY" not in next(s for s in pool["steps"] if s.get("id") == "provision")["env"]
     )
