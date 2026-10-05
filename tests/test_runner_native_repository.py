@@ -68,7 +68,8 @@ def test_all_pool_api_sites_and_rollback_share_fixed_scope():
     rollback = doc["jobs"]["teardown"]["with"]
     assert doc["jobs"]["teardown"]["uses"].endswith("@810e75fb5cd0963f80329d54d11e1b00cecf527f")
     assert rollback["just-akash-ref"] == (
-        "${{ inputs.runner-native-pull-reader && '810e75fb5cd0963f80329d54d11e1b00cecf527f' "
+        "${{ inputs.runner-native-pull-reader && '"
+        "810e75fb5cd0963f80329d54d11e1b00cecf527f' "  # pragma: allowlist secret
         "|| inputs.just-akash-ref }}"
     )
     assert (

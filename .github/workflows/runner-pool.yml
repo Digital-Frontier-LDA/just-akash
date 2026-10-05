@@ -2299,7 +2299,7 @@ jobs:
       # ⚠ THIS REPO'S OWN CI CANNOT SEE IT. Nothing here calls runner-pool.yml as a
       # reusable, so the broken graph is only ever built in a consumer. Same blind spot
       # as the `./` defect in #248, one input along.
-      just-akash-ref: ${{ inputs.runner-native-pull-reader && '810e75fb5cd0963f80329d54d11e1b00cecf527f' || inputs.just-akash-ref }}
+      just-akash-ref: ${{ inputs.runner-native-pull-reader && '810e75fb5cd0963f80329d54d11e1b00cecf527f' || inputs.just-akash-ref }}  # pragma: allowlist secret
     secrets:
       AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
       AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}
