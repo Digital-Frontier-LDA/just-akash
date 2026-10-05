@@ -163,10 +163,8 @@ def test_exact_id_call_site_mutation_changes_the_cleanup_effect(tmp_path: Path) 
 def test_operation_label_binding_effect_mutation_deletes_the_wrong_runner(tmp_path: Path) -> None:
     body = _body()
     target = " and any(.labels[].name; .==$L)"
-    # The first predicate binds the generic exact-ID path; a second predicate
-    # independently rechecks private repository runners immediately before DELETE.
-    assert body.count(target) == 2
-    mutant = body.replace(target, "", 1)
+    assert body.count(target) == 1
+    mutant = body.replace(target, "")
     listing = {
         "runners": [
             {

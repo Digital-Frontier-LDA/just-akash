@@ -65,7 +65,7 @@ def test_actual_teardown_selects_repository_or_holds_without_any_api(
     body = next(
         s["run"]
         for s in workflow("runner-teardown.yml")["jobs"]["teardown"]["steps"]
-        if s.get("id") == "dereg"
+        if s.get("id") == "dereg_private"
     )
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -117,9 +117,14 @@ def test_actual_teardown_selects_repository_or_holds_without_any_api(
         text=True,
         timeout=10,
     )
-    assert result.returncode == 0, result.stderr
+    successful = expected and busy is False and identity_ok and not became_busy
+    assert result.returncode == (0 if successful else 1), result.stderr
     if expected and busy is False and identity_ok and not became_busy:
-        assert (tmp_path / "checks").read_text().splitlines() == ["identity", "identity"]
+        assert (tmp_path / "checks").read_text().splitlines() == [
+            "identity",
+            "identity",
+            "identity",
+        ]
         actual = calls.read_text()
         assert "repos/Borduas-Holdings/blazing/actions/runners/701" in actual
         assert "-X DELETE repos/Borduas-Holdings/blazing/actions/runners/701" in actual
