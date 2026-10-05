@@ -11,8 +11,165 @@ import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
 
+NATIVE_READER_IMAGE = (
+    "docker.io/digitalfrontierunipessoallda/akash-runner@sha256:"
+    "aaf3799b5e138abef0831bb8467ded7325164316f0cfde5c183fe6e129eae79e"
+)
+NATIVE_READER_PROVIDERS = frozenset(
+    {
+        "akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",
+        "akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z",
+        "akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x",
+    }
+)
 
-def read_pull_credentials(path: Path, *, username: str, password: str) -> tuple[str, str]:
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Native reader provider scope was not verified")
+        result[key] = value
+    return result
+
+
+def validate_native_reader_scope(*, reader_from_sops: bool) -> str:
+    """Fail closed before decryption or lease creation; inputs are hosted context only."""
+    expected = {
+        "NATIVE_READER_CALLER": "Borduas-Holdings/blazing",
+        "NATIVE_READER_ORG": "Borduas-Holdings",
+        "NATIVE_READER_SOURCE": "Digital-Frontier-LDA/just-akash",
+        "RUNNER_IMAGE": NATIVE_READER_IMAGE,
+        "RUNNER_REGISTRY_HOST": "https://index.docker.io/v1/",
+        "RUNNER_REGISTRY_USERNAME": "jobordu",
+        "NATIVE_READER_POOL_SIZE": "1",
+        "NATIVE_READER_EPHEMERAL": "true",
+        "NATIVE_READER_PROVIDER_SELECT": "cheapest",
+        "NATIVE_READER_TAG_PREFIX": "ci-blazing-podman-images",
+    }
+    if not reader_from_sops or any(os.environ.get(k) != v for k, v in expected.items()):
+        raise ValueError("Native reader tenant scope was not verified")
+    if os.environ.get("RUNNER_REGISTRY_PASSWORD"):
+        raise ValueError("Native reader requires only the hosted SOPS reader bundle")
+    identities = [
+        os.environ.get(k, "") for k in ("NATIVE_READER_RUN_ID", "NATIVE_READER_RUN_ATTEMPT")
+    ]
+    if any(
+        re.fullmatch(r"[1-9][0-9]{0,19}", value) is None or int(value) > 2**64 - 1
+        for value in identities
+    ):
+        raise ValueError("Native reader run identity was not verified")
+    run_id, attempt = identities
+    label = f"podman-images-{run_id}-{attempt}"
+    if (
+        os.environ.get("NATIVE_READER_LABEL") != label
+        or os.environ.get("NATIVE_READER_PLACEMENT") != f"borduas-runner-run-{run_id}-end"
+        or os.environ.get("NATIVE_READER_MIN_POOL_SIZE", "") not in ("", "1")
+    ):
+        raise ValueError("Native reader run ownership was not verified")
+    raw = os.environ.get("NATIVE_READER_PROVIDERS", "")
+    if len(raw) > 8192:
+        raise ValueError("Native reader provider scope was not verified")
+    try:
+        providers = json.loads(raw, object_pairs_hook=_unique_object)
+    except (ValueError, RecursionError) as exc:
+        raise ValueError("Native reader provider scope was not verified") from exc
+    allowed_keys = {
+        "address",
+        "preferred",
+        "runner_host",
+        "runner_deny",
+        "ci_only",
+        "name",
+        "failover_priority",
+    }
+    if not isinstance(providers, list) or len(providers) != 3:
+        raise ValueError("Native reader provider scope was not verified")
+    addresses = []
+    for provider in providers:
+        if (
+            not isinstance(provider, dict)
+            or set(provider) - allowed_keys
+            or not isinstance(provider.get("address"), str)
+            or provider.get("address") not in NATIVE_READER_PROVIDERS
+            or provider.get("preferred") is not True
+            or provider.get("runner_deny", False) is not False
+            or provider.get("ci_only", False) is not False
+            or type(provider.get("runner_host", False)) is not bool
+            or ("name" in provider and not isinstance(provider["name"], str))
+            or (
+                "failover_priority" in provider
+                and (
+                    type(provider["failover_priority"]) is not int
+                    or provider["failover_priority"] < 0
+                )
+            )
+        ):
+            raise ValueError("Native reader provider scope was not verified")
+        addresses.append(provider["address"])
+    if set(addresses) != NATIVE_READER_PROVIDERS:
+        raise ValueError("Native reader provider scope was not verified")
+    return label
+
+
+def _verify_native_token(password: str) -> None:
+    if not password or len(password) > 4096 or any(not 32 <= ord(c) < 127 for c in password):
+        raise ValueError("Native reader credential format was not verified")
+
+
+def _native_reader_env(text: str, indent: str, *, label: str, password: str) -> str:
+    """Add only fixed reader scalars to the generated, run-bound runner environment."""
+    _verify_native_token(password)
+    header = re.compile(r"^" + re.escape(indent) + r"env:[ \t]*$", re.MULTILINE)
+    matches = list(header.finditer(text))
+    if len(matches) != 1:
+        raise ValueError("Native reader runner environment was not verified")
+    match = matches[0]
+    existing: dict[str, str] = {}
+    for line in text[match.end() :].splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if not line.startswith(indent + "  "):
+            break
+        scalar = line.strip()
+        if not scalar.startswith("- "):
+            raise ValueError("Native reader runner environment was not verified")
+        scalar = scalar[2:]
+        if scalar.startswith('"'):
+            try:
+                scalar = json.loads(scalar)
+            except ValueError as exc:
+                raise ValueError("Native reader runner environment was not verified") from exc
+        if not isinstance(scalar, str):
+            raise ValueError("Native reader runner environment was not verified")
+        key, separator, value = scalar.partition("=")
+        if not separator or key in existing:
+            raise ValueError("Native reader runner environment was not verified")
+        existing[key] = value
+    if existing != {
+        "RUNNER_TOKEN": "@@RUNNER_TOKEN@@",
+        "ORG_NAME": "Borduas-Holdings",
+        "RUNNER_SCOPE": "org",
+        "RUNNER_NAME_PREFIX": f"just-akash-{label}",
+        "LABELS": f"self-hosted,linux,akash,{label}",
+        "EPHEMERAL": "true",
+        "RUNNER_WORKDIR": "/_work",
+        "RUN_AS_ROOT": "true",
+    }:
+        raise ValueError("Native reader runner environment was not verified")
+    lines = "".join(
+        f"\n{indent}  - {json.dumps(key + '=' + value)}"
+        for key, value in (
+            ("DOCKERHUB_PULL_USERNAME", "jobordu"),
+            ("DOCKERHUB_PULL_TOKEN", password),
+        )
+    )
+    return text[: match.end()] + lines + text[match.end() :]
+
+
+def read_pull_credentials(
+    path: Path, *, username: str, password: str, native_reader: bool = False
+) -> tuple[str, str]:
     """Decrypt only the caller's pull bundle, without exporting credentials to the job."""
     if password or not username or not os.environ.get("SOPS_AGE_KEY"):
         raise ValueError("SOPS mode requires an age key, explicit username and no direct password")
@@ -55,12 +212,32 @@ def read_pull_credentials(path: Path, *, username: str, password: str) -> tuple[
     if values["DOCKERHUB_PULL_USERNAME"] != username:
         raise ValueError("Pull identity does not match the configured registry username")
     token = values["DOCKERHUB_PULL_TOKEN"]
+    if native_reader:
+        _verify_native_token(token)
     # Actions command escaping prevents '%' in a token becoming a command escape.
     print("::add-mask::" + token.replace("%", "%25"))
     return username, token
 
 
-def configure(path: Path, *, image: str, host: str, username: str, password: str) -> None:
+def configure(
+    path: Path,
+    *,
+    image: str,
+    host: str,
+    username: str,
+    password: str,
+    native_reader: bool = False,
+    reader_from_sops: bool = False,
+) -> None:
+    label = (
+        validate_native_reader_scope(reader_from_sops=reader_from_sops) if native_reader else ""
+    )
+    if native_reader and (
+        image != NATIVE_READER_IMAGE
+        or username != "jobordu"
+        or host != "https://index.docker.io/v1/"
+    ):
+        raise ValueError("Native reader mirror identity was not verified")
     if not any((image, host, username, password)):
         return
     if path.is_symlink():
@@ -112,6 +289,8 @@ def configure(path: Path, *, image: str, host: str, username: str, password: str
         raise ValueError("Runner template already contains registry credentials")
     replacement = match.group(1) + "image: " + chosen + credential_lines
     updated = text[: match.start()] + replacement + text[match.end() :]
+    if native_reader:
+        updated = _native_reader_env(updated, match.group(1), label=label, password=password)
     # The template begins holding registry credentials here. Replace it atomically
     # with an owner-only file; never print its contents or credentials.
     with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as stream:
@@ -131,11 +310,20 @@ def main() -> int:
     parser.add_argument("--sops-env-file", type=Path)
     args = parser.parse_args()
     try:
+        native_mode = os.environ.get("RUNNER_NATIVE_PULL_READER", "false")
+        if native_mode not in ("true", "false", ""):
+            raise ValueError("Native reader option was not verified")
+        native_reader = native_mode == "true"
+        if native_reader:
+            validate_native_reader_scope(reader_from_sops=args.sops_env_file is not None)
         username = os.environ.get("RUNNER_REGISTRY_USERNAME", "")
         password = os.environ.get("RUNNER_REGISTRY_PASSWORD", "")
         if args.sops_env_file:
             username, password = read_pull_credentials(
-                args.sops_env_file, username=username, password=password
+                args.sops_env_file,
+                username=username,
+                password=password,
+                native_reader=native_reader,
             )
         configure(
             args.sdl,
@@ -143,6 +331,8 @@ def main() -> int:
             host=os.environ.get("RUNNER_REGISTRY_HOST", ""),
             username=username,
             password=password,
+            native_reader=native_reader,
+            reader_from_sops=args.sops_env_file is not None,
         )
     except (ValueError, OSError):
         print(

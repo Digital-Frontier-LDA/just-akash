@@ -95,6 +95,11 @@ on:
         required: false
         type: boolean
         default: false
+      runner-native-pull-reader:
+        description: 'Opt-in fixed Blazing one-job tenant payload: expose only its hosted SOPS reader to native private-cache pulls.'
+        required: false
+        type: boolean
+        default: false
       tag-prefix:
         description: >-
           REQUIRED, no default. Deployments are tagged `<tag-prefix>-<run_id>` and a
@@ -1042,6 +1047,7 @@ jobs:
           RUNNER_REGISTRY_HOST: ${{ inputs.runner-registry-host }}
           RUNNER_REGISTRY_USERNAME: ${{ inputs.runner-registry-username }}
           RUNNER_REGISTRY_PASSWORD: ${{ secrets.RUNNER_REGISTRY_PASSWORD }}
+          RUNNER_NATIVE_PULL_READER: ${{ inputs.runner-native-pull-reader }}
         run: python3 just_akash/runner_image.py --sdl /tmp/runner-sdl.yaml
 
       - name: Configure the qualified private runner mirror from SOPS
@@ -1052,6 +1058,20 @@ jobs:
           RUNNER_REGISTRY_USERNAME: ${{ inputs.runner-registry-username }}
           RUNNER_REGISTRY_PASSWORD: ${{ secrets.RUNNER_REGISTRY_PASSWORD }}
           SOPS_AGE_KEY: ${{ secrets.RUNNER_REGISTRY_AGE_KEY }}
+          RUNNER_NATIVE_PULL_READER: ${{ inputs.runner-native-pull-reader }}
+          NATIVE_READER_CALLER: ${{ github.repository }}
+          NATIVE_READER_RUN_ID: ${{ github.run_id }}
+          NATIVE_READER_RUN_ATTEMPT: ${{ github.run_attempt }}
+          NATIVE_READER_SOURCE: ${{ inputs.just-akash-repository }}
+          NATIVE_READER_ORG: ${{ inputs.github-org }}
+          NATIVE_READER_POOL_SIZE: ${{ inputs.pool-size }}
+          NATIVE_READER_MIN_POOL_SIZE: ${{ inputs.min-pool-size }}
+          NATIVE_READER_EPHEMERAL: ${{ inputs.ephemeral }}
+          NATIVE_READER_PROVIDER_SELECT: ${{ inputs.provider-select }}
+          NATIVE_READER_PROVIDERS: ${{ inputs.providers }}
+          NATIVE_READER_LABEL: ${{ inputs.runner-label }}
+          NATIVE_READER_PLACEMENT: ${{ inputs.placement-key }}
+          NATIVE_READER_TAG_PREFIX: ${{ inputs.tag-prefix }}
         run: >-
           python3 just_akash/runner_image.py --sdl /tmp/runner-sdl.yaml
           --sops-env-file ../.runner-registry-source/secrets/registry-pull.sops.env
