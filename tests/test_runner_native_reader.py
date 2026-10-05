@@ -3,6 +3,7 @@
 import json
 import os
 import subprocess
+from typing import TypedDict
 
 import pytest
 import yaml
@@ -73,7 +74,14 @@ def template(tmp_path):
     return path
 
 
-def options():
+class ImageOptions(TypedDict):
+    image: str
+    host: str
+    username: str
+    password: str
+
+
+def options() -> ImageOptions:
     return {
         "image": NATIVE_READER_IMAGE,
         "host": "https://index.docker.io/v1/",
@@ -281,10 +289,10 @@ def test_native_reader_rejects_control_or_unbounded_tokens(tmp_path, monkeypatch
     scope(monkeypatch)
     path = template(tmp_path)
     original = path.read_bytes()
+    values = options()
+    values["password"] = token
     with pytest.raises(ValueError):
-        configure(
-            path, **(options() | {"password": token}), native_reader=True, reader_from_sops=True
-        )
+        configure(path, **values, native_reader=True, reader_from_sops=True)
     assert path.read_bytes() == original
 
 
@@ -313,12 +321,12 @@ def test_registration_placeholder_in_native_reader_cannot_be_rewritten(tmp_path,
     path = template(tmp_path)
     original = path.read_bytes()
     token = "prefix@@RUNNER_TOKEN@@suffix"
+    values = options()
+    values["password"] = token
     # The provisioning shell replaces every occurrence in the complete SDL.
     assert token.replace("@@RUNNER_TOKEN@@", "registration-fixture") != token
     with pytest.raises(ValueError, match="credential format"):
-        configure(
-            path, **(options() | {"password": token}), native_reader=True, reader_from_sops=True
-        )
+        configure(path, **values, native_reader=True, reader_from_sops=True)
     assert path.read_bytes() == original
 
 
