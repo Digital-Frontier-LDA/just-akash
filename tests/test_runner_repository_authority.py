@@ -5,7 +5,7 @@ import io
 import traceback
 import urllib.error
 from datetime import datetime, timedelta, timezone
-from http.client import HTTPMessage
+from http.client import BadStatusLine, HTTPMessage, IncompleteRead
 from unittest.mock import Mock
 
 import pytest
@@ -79,6 +79,7 @@ def authority(monkeypatch, *, identity=None, grant=None):
         urllib.error.HTTPError(
             "https://echo-canary", 403, "echo-canary", HTTPMessage(), io.BytesIO(b"echo-canary")
         ),
+        BadStatusLine("echo-canary"),
         OSError("echo-canary"),
         TimeoutError("echo-canary"),
     ],
@@ -129,3 +130,25 @@ def test_repository_identity_refusal_never_requests_token(monkeypatch, patch):
     with pytest.raises(repository.NativeReaderRepositoryError):
         repository.verify_native_reader_repository()
     assert calls == [False]
+
+
+def test_bounded_positive_registration_grant_is_accepted(monkeypatch):
+    calls = authority(monkeypatch)
+    repository.verify_native_reader_repository()
+    assert calls == [False, True]
+
+
+def test_partial_registration_response_is_withheld_without_exception_context(monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", "PATCANARY")
+    response = Mock(status=201)
+    response.read.side_effect = IncompleteRead(b'{"token":"PARTIALRESPONSECANARY"}', 100)
+    response.__enter__ = Mock(return_value=response)
+    response.__exit__ = Mock(return_value=None)
+    opener = Mock()
+    opener.open.return_value = response
+    monkeypatch.setattr(repository.urllib.request, "build_opener", Mock(return_value=opener))
+    with pytest.raises(repository.NativeReaderRepositoryError) as caught:
+        repository._native_repository_request(registration=True)
+    rendered = "".join(traceback.format_exception(caught.value))
+    assert "PARTIALRESPONSECANARY" not in rendered and "PATCANARY" not in rendered
+    assert caught.value.__context__ is None

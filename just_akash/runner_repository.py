@@ -6,6 +6,7 @@ import re
 import urllib.request
 from contextlib import suppress
 from datetime import datetime, timezone
+from http.client import HTTPException
 
 
 class NativeReaderRepositoryError(ValueError):
@@ -53,7 +54,7 @@ def _native_repository_request(*, registration: bool = False) -> dict:
             document = json.loads(raw, object_pairs_hook=_unique_object)
             if isinstance(document, dict):
                 return document
-    except (OSError, ValueError, TypeError, RecursionError):
+    except (OSError, HTTPException, ValueError, TypeError, RecursionError):
         pass
     raise NativeReaderRepositoryError("Native reader repository authority was not verified")
 
