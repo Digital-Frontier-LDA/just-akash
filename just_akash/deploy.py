@@ -29,6 +29,7 @@ from akash_lease_core.auction import PreferredSelection
 from akash_lease_core.capacity import ProviderCapacity, ResourceProfile
 
 from . import chain
+from ._confidential import active, error_text, protect_content, sdl_operation
 from ._diagnostics import Code, emit, enabled
 from .api import (
     AkashAPIError,
@@ -143,7 +144,7 @@ def _close_proven_orphan(client, dseq: str, key: str) -> bool:
     try:
         client.close_deployment(str(dseq))
     except Exception as exc:  # noqa: BLE001 — an error path must not raise a second error
-        _log(logging.WARNING, f"could not close orphan {dseq} ({key}): {exc}")
+        _log(logging.WARNING, f"could not close orphan {dseq} ({key}): {error_text(exc)}")
         return False
     _log(
         logging.ERROR,
@@ -209,7 +210,10 @@ def _close_stale_for_retry(client, *, now: float | None = None) -> list[str]:
     try:
         owner = client.account_address()
     except Exception as exc:  # noqa: BLE001 — never mask the caller's error
-        _log(logging.WARNING, f"Stale recovery: could not resolve the account ({exc}) — skipped")
+        _log(
+            logging.WARNING,
+            f"Stale recovery: could not resolve the account ({error_text(exc)}) — skipped",
+        )
         return []
 
     # GUARD 1 — enumerate from the CHAIN, owner-scoped and authoritative.
@@ -232,7 +236,10 @@ def _close_stale_for_retry(client, *, now: float | None = None) -> list[str]:
     try:
         active = chain.list_active_deployments(owner)
     except Exception as exc:  # noqa: BLE001 — never mask the caller's error
-        _log(logging.WARNING, f"Stale recovery: chain enumeration raised ({exc}) — skipped")
+        _log(
+            logging.WARNING,
+            f"Stale recovery: chain enumeration raised ({error_text(exc)}) — skipped",
+        )
         return []
     if active is None:
         _log(logging.WARNING, "Stale recovery: chain enumeration failed — closing nothing")
@@ -255,7 +262,10 @@ def _close_stale_for_retry(client, *, now: float | None = None) -> list[str]:
         except Exception as exc:  # noqa: BLE001 — unreadable is not closable
             # DEBUG, matching _report_suspected_orphans: a skipped dseq must not
             # appear in human-facing output, but a silent skip is untraceable.
-            _log(logging.DEBUG, f"  stale recovery: {dseq} unreadable ({exc}) — left alone")
+            _log(
+                logging.DEBUG,
+                f"  stale recovery: {dseq} unreadable ({error_text(exc)}) — left alone",
+            )
             continue
         if (detail or {}).get("leases") or (detail or {}).get("lease"):
             continue
@@ -265,7 +275,10 @@ def _close_stale_for_retry(client, *, now: float | None = None) -> list[str]:
         try:
             names = chain.deployment_group_names(owner, str(dseq))
         except Exception as exc:  # noqa: BLE001 — unreadable provenance is unproven
-            _log(logging.DEBUG, f"  stale recovery: {dseq} provenance unreadable ({exc})")
+            _log(
+                logging.DEBUG,
+                f"  stale recovery: {dseq} provenance unreadable ({error_text(exc)})",
+            )
             continue
         if not any(n.startswith(PLACEMENT_PREFIX) for n in names):
             continue
@@ -282,7 +295,7 @@ def _close_stale_for_retry(client, *, now: float | None = None) -> list[str]:
             closed.append(dseq)
             _log(logging.INFO, f"Closed stale deployment {dseq}")
         except Exception as exc:  # noqa: BLE001 — keep going; report at the end
-            _log(logging.WARNING, f"Could not close stale deployment {dseq}: {exc}")
+            _log(logging.WARNING, f"Could not close stale deployment {dseq}: {error_text(exc)}")
     if len(candidates) > STALE_RETRY_MAX_CLOSE:
         _log(
             logging.WARNING,
@@ -347,7 +360,7 @@ def _report_suspected_orphans(client, since_epoch_s: float, run_id: str = "") ->
     try:
         active = client.list_deployments(active_only=True)
     except Exception as exc:  # noqa: BLE001 — diagnosis must never mask the real failure
-        _log(logging.WARNING, f"Could not check for an orphaned deployment: {exc}")
+        _log(logging.WARNING, f"Could not check for an orphaned deployment: {error_text(exc)}")
         return []
 
     suspects: list[str] = []
@@ -813,6 +826,7 @@ def _resolve_sdl_path(sdl_path: str, gpu: bool) -> str:
     return sdl_path
 
 
+@sdl_operation
 def _prepare_sdl_content(
     sdl_path: str,
     image: str | None = None,
@@ -830,6 +844,7 @@ def _prepare_sdl_content(
 
     with open(sdl_path_obj) as f:
         sdl_content = f.read()
+    protect_content(sdl_content)
     _log(logging.DEBUG, f"SDL content length: {len(sdl_content)} bytes")
 
     # RUN-SCOPE THE PROVENANCE KEY. The repo prefix proves which repo created a
@@ -848,8 +863,8 @@ def _prepare_sdl_content(
     try:
         validate_sdl(sdl_content)
     except SDLValidationError as e:
-        _log(logging.ERROR, str(e))
-        raise RuntimeError(str(e)) from e
+        _log(logging.ERROR, error_text(e))
+        raise RuntimeError(error_text(e)) from e
     _log(logging.INFO, "SDL validation OK")
 
     if image:
@@ -914,7 +929,7 @@ def _check_wallet_credit(client: AkashConsoleAPI, deposit: float) -> None:
         emit(
             Code.WALLET_CREDIT_QUERY_FAILED,
             "warning",
-            f"could not resolve account address for credit check: {e}",
+            f"could not resolve account address for credit check: {error_text(e)}",
         )
         return
     try:
@@ -923,7 +938,7 @@ def _check_wallet_credit(client: AkashConsoleAPI, deposit: float) -> None:
         emit(
             Code.WALLET_CREDIT_QUERY_FAILED,
             "warning",
-            f"deploy-credit query failed (LCD unreachable?): {e}",
+            f"deploy-credit query failed (LCD unreachable?): {error_text(e)}",
             account=address,
         )
         return
@@ -954,6 +969,7 @@ def _check_wallet_credit(client: AkashConsoleAPI, deposit: float) -> None:
         )
 
 
+@sdl_operation
 def deploy(
     sdl_path: str,
     gpu: bool = False,
@@ -1039,6 +1055,7 @@ def deploy(
     sdl_path = _resolve_sdl_path(sdl_path, gpu)
     _log(logging.INFO, "STEP 1: Preparing SDL")
     sdl_content = _prepare_sdl_content(sdl_path, image=image, env_vars=env_vars)
+    protect_content(sdl_content)
     _check_wallet_credit(client, deposit)
 
     prepared_receipt = None
@@ -1071,7 +1088,7 @@ def deploy(
     try:
         deployment_response = client.create_deployment(sdl_content, deposit=deposit)
     except RuntimeError as e:
-        if "already exists" in str(e).lower():
+        if "already exists" in error_text(e).lower():
             if prepared_receipt is not None:
                 # Receipt-mode CI shares its wallet with other runs and purposes.
                 # This response proves neither which create committed nor which
@@ -1092,20 +1109,22 @@ def deploy(
                 # direction for a function whose next act is to close things.
                 _close_stale_for_retry(client, now=_create_started)
             except Exception as cleanup_err:  # noqa: BLE001 — documented as never raising
-                _log(logging.ERROR, f"Stale deployment cleanup failed: {cleanup_err}")
+                _log(logging.ERROR, f"Stale deployment cleanup failed: {error_text(cleanup_err)}")
             # Retry once after cleanup
             try:
                 deployment_response = client.create_deployment(sdl_content, deposit=deposit)
             except RuntimeError as retry_err:
-                _log(logging.ERROR, f"Create deployment FAILED after retry: {retry_err}")
+                _log(
+                    logging.ERROR, f"Create deployment FAILED after retry: {error_text(retry_err)}"
+                )
                 emit(
                     Code.DEPLOY_CREATE_FAILED,
                     "error",
-                    f"create deployment failed after retry: {retry_err}",
+                    f"create deployment failed after retry: {error_text(retry_err)}",
                 )
                 _report_suspected_orphans(client, _create_started, _RUN_ID)
                 raise RuntimeError(
-                    f"Failed to create deployment after retry: {retry_err}"
+                    f"Failed to create deployment after retry: {error_text(retry_err)}"
                 ) from retry_err
         else:
             # ⛔ NAME AN UPSTREAM TIMEOUT AS UPSTREAM. A Cloudflare 524 is the proxy
@@ -1116,7 +1135,8 @@ def deploy(
             if isinstance(e, AkashAPIError) and e.is_upstream_timeout():
                 _log(
                     logging.ERROR,
-                    f"Create deployment FAILED — UPSTREAM TIMEOUT, not this change: {e}",
+                    "Create deployment FAILED — UPSTREAM TIMEOUT, not this change: "
+                    f"{error_text(e)}",
                 )
                 emit(
                     Code.DEPLOY_CREATE_FAILED,
@@ -1149,27 +1169,35 @@ def deploy(
                         "landed. See the orphan report below before re-running.",
                     )
             else:
-                _log(logging.ERROR, f"Create deployment FAILED: {e}")
-                emit(Code.DEPLOY_CREATE_FAILED, "error", f"create deployment failed: {e}")
+                _log(logging.ERROR, f"Create deployment FAILED: {error_text(e)}")
+                emit(
+                    Code.DEPLOY_CREATE_FAILED,
+                    "error",
+                    f"create deployment failed: {error_text(e)}",
+                )
             _report_suspected_orphans(client, _create_started, _RUN_ID)
-            raise RuntimeError(f"Failed to create deployment: {e}") from e
+            raise RuntimeError(f"Failed to create deployment: {error_text(e)}") from e
 
     dseq = deployment_response.get("dseq")
     if dseq is None:
         _log(
             logging.ERROR,
-            f"No DSEQ in response: {json.dumps(deployment_response, default=str)}",
+            "No DSEQ in response (details withheld)"
+            if active()
+            else f"No DSEQ in response: {json.dumps(deployment_response, default=str)}",
         )
         emit(
             Code.NO_DSEQ_RETURNED,
             "error",
             "create deployment returned no DSEQ",
             response_keys=list(deployment_response.keys())
-            if isinstance(deployment_response, dict)
+            if isinstance(deployment_response, dict) and not active()
             else None,
         )
         raise RuntimeError(
-            f"No DSEQ returned from API. Response: {json.dumps(deployment_response)}"
+            "No DSEQ returned from API (details withheld)"
+            if active()
+            else f"No DSEQ returned from API. Response: {json.dumps(deployment_response)}"
         )
     if prepared_receipt is not None:
         try:
@@ -1184,7 +1212,7 @@ def deploy(
                 "but its local recovery receipt could not be durably transitioned. The "
                 "existing receipt path remains a create-submitted recovery seed; reconcile "
                 "its owner and complete group identity against the chain before any retry. "
-                f"Receipt error: {receipt_error}"
+                f"Receipt error: {error_text(receipt_error)}"
             ) from receipt_error
 
     _manifest_raw = deployment_response.get("manifest", "")
@@ -1193,7 +1221,9 @@ def deploy(
     _log(logging.INFO, f"Deployment created  DSEQ={dseq}  manifest_len={len(manifest)}")
     _log(
         logging.DEBUG,
-        f"Full deployment response: {json.dumps(deployment_response, default=str)[:500]}",
+        "Full deployment response: withheld"
+        if active()
+        else f"Full deployment response: {json.dumps(deployment_response, default=str)[:500]}",
     )
 
     # Step 3: one equal-opportunity bid collection window, then one shared decision.
@@ -1257,7 +1287,7 @@ def deploy(
         except RuntimeError as e:
             _log_below_status(
                 logging.WARNING,
-                f"  poll #{poll_count} @ {elapsed}s: API error: {e}",
+                f"  poll #{poll_count} @ {elapsed}s: API error: {error_text(e)}",
             )
             print(f"\r{status_line}  api_error=1", end="", flush=True)
             _status_open = True
@@ -1599,14 +1629,14 @@ def deploy(
                             tier=tier,
                         )
                 except RuntimeError as e:
-                    _log(logging.WARNING, f"    on-chain status: query failed: {e}")
+                    _log(logging.WARNING, f"    on-chain status: query failed: {error_text(e)}")
                     emit(
                         Code.PROVIDER_STATUS_QUERY_FAILED,
                         "warning",
-                        f"on-chain status query failed for {p}: {e}",
+                        f"on-chain status query failed for {p}: {error_text(e)}",
                         provider=p,
                         tier=tier,
-                        query_error=str(e)[:120],
+                        query_error=error_text(e)[:120],
                     )
 
     # Failure paths.
@@ -1627,7 +1657,10 @@ def deploy(
                 client.close_deployment(str(dseq))
                 _log(logging.INFO, f"Deployment {dseq} closed after no bids received")
             except Exception as cleanup_err:
-                _log(logging.ERROR, f"Cleanup of deployment {dseq} failed: {cleanup_err}")
+                _log(
+                    logging.ERROR,
+                    f"Cleanup of deployment {dseq} failed: {error_text(cleanup_err)}",
+                )
             emit(
                 Code.NO_BIDS_RECEIVED,
                 "error",
@@ -1651,7 +1684,10 @@ def deploy(
             try:
                 client.close_deployment(str(dseq))
             except Exception as cleanup_err:
-                _log(logging.ERROR, f"Cleanup of deployment {dseq} failed: {cleanup_err}")
+                _log(
+                    logging.ERROR,
+                    f"Cleanup of deployment {dseq} failed: {error_text(cleanup_err)}",
+                )
             emit(
                 Code.BIDS_MALFORMED,
                 "error",
@@ -1664,7 +1700,10 @@ def deploy(
             try:
                 client.close_deployment(str(dseq))
             except Exception as cleanup_err:
-                _log(logging.ERROR, f"Cleanup of deployment {dseq} failed: {cleanup_err}")
+                _log(
+                    logging.ERROR,
+                    f"Cleanup of deployment {dseq} failed: {error_text(cleanup_err)}",
+                )
             raise RuntimeError("Selected bid has no provider address")
         # Bids from our own providers exist, but every one has aged out of the
         # 'open' state (issue #14). Without this branch the failure below would
@@ -1692,7 +1731,10 @@ def deploy(
                 client.close_deployment(str(dseq))
                 _log(logging.INFO, f"Deployment {dseq} closed after no open bids")
             except Exception as cleanup_err:
-                _log(logging.ERROR, f"Cleanup of deployment {dseq} failed: {cleanup_err}")
+                _log(
+                    logging.ERROR,
+                    f"Cleanup of deployment {dseq} failed: {error_text(cleanup_err)}",
+                )
             emit(
                 Code.BIDS_STALE,
                 "error",
@@ -1717,7 +1759,7 @@ def deploy(
             client.close_deployment(str(dseq))
             _log(logging.INFO, f"Deployment {dseq} closed after foreign bids rejection")
         except Exception as cleanup_err:
-            _log(logging.ERROR, f"Cleanup of deployment {dseq} failed: {cleanup_err}")
+            _log(logging.ERROR, f"Cleanup of deployment {dseq} failed: {error_text(cleanup_err)}")
         emit(
             Code.BIDS_FOREIGN_ONLY,
             "error",
@@ -1860,7 +1902,7 @@ def deploy(
             client.close_deployment(str(dseq))
             _log(logging.INFO, f"Deployment {dseq} closed after no-provider bid")
         except Exception as cleanup_err:
-            _log(logging.ERROR, f"Cleanup of deployment {dseq} failed: {cleanup_err}")
+            _log(logging.ERROR, f"Cleanup of deployment {dseq} failed: {error_text(cleanup_err)}")
         raise RuntimeError("Selected bid has no provider address")
 
     _log(
@@ -2006,7 +2048,7 @@ def deploy(
                 _log(
                     logging.WARNING,
                     f"  Close of stale order {dseq} failed "
-                    f"(attempt {close_attempt}/3): {close_err}",
+                    f"(attempt {close_attempt}/3): {error_text(close_err)}",
                 )
                 if close_attempt < 3:
                     time.sleep(2)
@@ -2024,11 +2066,15 @@ def deploy(
             redeploy_response = client.create_deployment(sdl_content, deposit=deposit)
         except RuntimeError as redeploy_err:
             _report_suspected_orphans(client, _redeploy_started, _RUN_ID)
-            raise RuntimeError(f"re-deploy create failed: {redeploy_err}") from redeploy_err
+            raise RuntimeError(
+                f"re-deploy create failed: {error_text(redeploy_err)}"
+            ) from redeploy_err
         new_dseq = redeploy_response.get("dseq")
         if new_dseq is None:
             raise RuntimeError(
-                f"re-deploy returned no DSEQ (response: "
+                "re-deploy returned no DSEQ (details withheld)"
+                if active()
+                else f"re-deploy returned no DSEQ (response: "
                 f"{json.dumps(redeploy_response, default=str)[:200]})"
             )
         _raw_manifest = redeploy_response.get("manifest", "")
@@ -2052,7 +2098,7 @@ def deploy(
                 client.close_deployment(str(new_dseq))
                 _log(logging.INFO, f"  Re-created order {new_dseq} closed (no fresh bid)")
             except Exception as cleanup_err:
-                _log(logging.ERROR, f"  Cleanup of {new_dseq} failed: {cleanup_err}")
+                _log(logging.ERROR, f"  Cleanup of {new_dseq} failed: {error_text(cleanup_err)}")
             raise RuntimeError(f"no fresh open bid on re-created order {new_dseq}")
         amount, denom = _extract_bid_price(fresh)
         _log(
@@ -2101,7 +2147,7 @@ def deploy(
             )
             break
         except RuntimeError as e:
-            err_str = str(e).lower()
+            err_str = error_text(e).lower()
             stale = "no longer open" in err_str
             # 404 "no lease for deployment": the deployment's order became
             # un-leaseable during the bid-wait (Console GC/propagation, or a
@@ -2140,7 +2186,7 @@ def deploy(
                 try:
                     fresh_bids = client.get_bids(str(dseq))
                 except RuntimeError as poll_err:
-                    _log(logging.WARNING, f"  Bid re-fetch failed: {poll_err}")
+                    _log(logging.WARNING, f"  Bid re-fetch failed: {error_text(poll_err)}")
                     fresh_bids = []
                 next_bid = _next_open_bid(fresh_bids, failed_providers)
                 if next_bid is not None:
@@ -2193,28 +2239,31 @@ def deploy(
                     emit(
                         Code.REDEPLOY_FAILED,
                         "error",
-                        f"re-deploy round failed: {redeploy_err}",
+                        f"re-deploy round failed: {error_text(redeploy_err)}",
                         dseq=str(dseq),
                     )
                     raise RuntimeError(
-                        f"Failed to create lease after re-deploy: {redeploy_err}"
+                        f"Failed to create lease after re-deploy: {error_text(redeploy_err)}"
                     ) from redeploy_err
                 continue
-            _log(logging.ERROR, f"Lease creation FAILED: {e}")
+            _log(logging.ERROR, f"Lease creation FAILED: {error_text(e)}")
             _log(logging.INFO, f"Cleaning up deployment {dseq}...")
             try:
                 client.close_deployment(str(dseq))
                 _log(logging.INFO, f"Deployment {dseq} closed after lease failure")
             except Exception as cleanup_err:
-                _log(logging.ERROR, f"Cleanup of deployment {dseq} also failed: {cleanup_err}")
+                _log(
+                    logging.ERROR,
+                    f"Cleanup of deployment {dseq} also failed: {error_text(cleanup_err)}",
+                )
             emit(
                 Code.LEASE_CREATE_FAILED,
                 "error",
-                f"lease creation failed: {e}",
+                f"lease creation failed: {error_text(e)}",
                 dseq=str(dseq),
                 provider=provider,
             )
-            raise RuntimeError(f"Failed to create lease: {e}") from e
+            raise RuntimeError(f"Failed to create lease: {error_text(e)}") from e
 
     _log(logging.INFO, "Lease created successfully!")
     _log(
@@ -2251,6 +2300,7 @@ def deploy(
     }
 
 
+@sdl_operation
 def update(
     dseq: str,
     sdl_path: str,
@@ -2280,14 +2330,15 @@ def update(
     # Step 1: Read + validate + transform SDL (identical to deploy).
     _log(logging.INFO, "STEP 1: Preparing SDL")
     sdl_content = _prepare_sdl_content(sdl_path, image=image, env_vars=env_vars)
+    protect_content(sdl_content)
 
     # Step 2: Submit the in-place update.
     _log(logging.INFO, f"STEP 2: Submitting in-place update for deployment {dseq}...")
     try:
         result = client.update_deployment(str(dseq), sdl_content)
     except RuntimeError as e:
-        _log(logging.ERROR, f"Update FAILED: {e}")
-        raise RuntimeError(f"Failed to update deployment {dseq}: {e}") from e
+        _log(logging.ERROR, f"Update FAILED: {error_text(e)}")
+        raise RuntimeError(f"Failed to update deployment {dseq}: {error_text(e)}") from e
 
     _log(
         logging.INFO,
@@ -2410,5 +2461,5 @@ def deploy_main():
         )
         sys.exit(0)
     except RuntimeError as e:
-        print(f"Error: {e}", file=sys.stderr)
+        print(f"Error: {error_text(e)}", file=sys.stderr)
         sys.exit(1)
