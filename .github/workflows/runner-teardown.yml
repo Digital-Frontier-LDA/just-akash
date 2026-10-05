@@ -100,6 +100,11 @@ on:
         required: false
         type: string
         default: '[]'
+      github-repository:
+        description: 'Optional fixed Blazing native-proof repository; empty retains organization registration.'
+        required: false
+        type: string
+        default: ''
       github-org:
         required: false
         type: string
@@ -181,8 +186,8 @@ jobs:
       held_reason: ${{ steps.close.outputs.held_reason }}
       held_dseq: ${{ steps.close.outputs.held_dseq }}
       held_deployment_group: ${{ steps.close.outputs.held_deployment_group }}
-      deregistered: ${{ steps.dereg.outputs.deregistered }}
-      deregister_failed: ${{ steps.dereg.outputs.deregister_failed }}
+      deregistered: ${{ inputs.github-repository != '' && steps.dereg_private.outputs.deregistered || steps.dereg.outputs.deregistered }}
+      deregister_failed: ${{ inputs.github-repository != '' && steps.dereg_private.outputs.deregister_failed || steps.dereg.outputs.deregister_failed }}
     defaults:
       run:
         working-directory: .just-akash
@@ -510,7 +515,7 @@ jobs:
       # cleaned even when the lease close failed.
       - name: De-register offline runners for this label
         id: dereg
-        if: always() && inputs.runner-label != '' && inputs.github-org != ''
+        if: always() && inputs.github-repository == '' && inputs.runner-label != '' && inputs.github-org != ''
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GH_RUNNER_PAT }}
@@ -610,4 +615,114 @@ jobs:
           echo "de-registered ${N} offline runner(s) labelled ${RUNNER_LABEL}"
           if [ "$FAILED" -gt 0 ]; then
             echo "::warning title=${FAILED} runner registration(s) left behind::They stay in the org listing, which every pool's poll pages through — so this raises the request cost of the NEXT run and makes the next throttle likelier. Usual cause at spike is the 900-points/minute secondary limit (a DELETE costs 5). Re-run this teardown, or sweep offline runners for label ${RUNNER_LABEL}."
+          fi
+
+      - name: Clean private repository runner registrations
+        id: dereg_private
+        if: always() && inputs.github-repository != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_RUNNER_PAT }}
+          ORG: ${{ inputs.github-org }}
+          REPOSITORY: ${{ inputs.github-repository }}
+          CALLER: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUNNER_LABEL: ${{ inputs.runner-label }}
+          RUNNER_IDS_JSON: ${{ inputs.runner-ids }}
+        run: |
+          set -uo pipefail
+          DELETED_COUNT=0
+          hold_cleanup() {
+            {
+              echo "deregistered=$DELETED_COUNT"
+              echo 'deregister_failed=unmeasured'
+            } >> "$GITHUB_OUTPUT"
+            echo '::error::Private repository runner cleanup was not measured'
+            exit 1
+          }
+          [ -n "${GH_TOKEN:-}" ] || hold_cleanup
+          export LC_ALL=C
+          # shellcheck disable=SC2071
+          if [ "${REPOSITORY:-}" != Borduas-Holdings/blazing ] || [ "${ORG:-}" != Borduas-Holdings ] \
+            || [ "${CALLER:-}" != Borduas-Holdings/blazing ] \
+            || [[ ! "${RUN_ID:-}" =~ ^[1-9][0-9]{0,19}$ ]] || [[ ! "${RUN_ATTEMPT:-}" =~ ^[1-9][0-9]{0,19}$ ]] \
+            || { [ "${#RUN_ID}" -eq 20 ] && [[ "$RUN_ID" > 18446744073709551615 ]]; } \
+            || { [ "${#RUN_ATTEMPT}" -eq 20 ] && [[ "$RUN_ATTEMPT" > 18446744073709551615 ]]; } \
+            || [ "${RUNNER_LABEL:-}" != "podman-images-${RUN_ID}-${RUN_ATTEMPT}" ]; then
+            hold_cleanup
+          fi
+          RUNNER_COLLECTION='repos/Borduas-Holdings/blazing/actions/runners'
+          verify_repository() {
+            python3 - <<'PYIDENTITY'
+          from just_akash.runner_repository import verify_native_reader_repository_identity
+          try:
+              verify_native_reader_repository_identity()
+          except (ValueError, OSError):
+              raise SystemExit('Private repository identity was not verified')
+          PYIDENTITY
+          }
+          verify_runner() {
+            local current_runner
+            current_runner=$(gh api "${RUNNER_COLLECTION}/$1" 2>/dev/null) || return 1
+            printf '%s' "$current_runner" | jq -e --argjson ID "$1" --arg L "$RUNNER_LABEL" \
+              '.id==$ID and .busy==false and (.name|type=="string" and startswith("just-akash-"+$L+"-")) and any(.labels[].name; .==$L) and any(.labels[].name; .=="self-hosted") and any(.labels[].name; .=="akash")' >/dev/null 2>&1
+          }
+          verify_repository || hold_cleanup
+          if [ -n "${RUNNER_IDS_JSON:-}" ] && [ "$RUNNER_IDS_JSON" != '[]' ]; then
+            IDS_RC=0
+            IDS=$(printf '%s' "$RUNNER_IDS_JSON" | jq -er \
+              'if type=="array" and length>0 and all(.[]; type=="number" and .>0 and .<9007199254740992 and floor==.) and (unique|length)==length then .[] else error("unverified runner ids") end' 2>/dev/null) || IDS_RC=$?
+            [ "$IDS_RC" -eq 0 ] || hold_cleanup
+            for id in $IDS; do
+              verify_runner "$id" || hold_cleanup
+            done
+          else
+            LIST_RC=0
+            RUNNER_PAGES=$(gh api --paginate --slurp "${RUNNER_COLLECTION}?per_page=100" 2>/dev/null) || LIST_RC=$?
+            [ "$LIST_RC" -eq 0 ] || hold_cleanup
+            IDS_RC=0
+            IDS=$(printf '%s' "$RUNNER_PAGES" | jq -er --arg L "$RUNNER_LABEL" \
+              'if type=="array" and length>0
+                  and all(.[]; type=="object" and (.total_count|type=="number" and .>=0 and floor==.) and (.runners|type=="array"))
+                  and ([.[].total_count]|unique|length)==1
+                  and ([.[].runners[]]|length)==.[0].total_count
+                  and all(.[].runners[]; (.id|type=="number" and .>0 and .<9007199254740992 and floor==.) and (.name|type=="string" and length>0) and (.busy|type=="boolean") and (.status|.=="online" or .=="offline") and (.labels|type=="array") and all(.labels[]; .name|type=="string"))
+                  and ([.[].runners[].id]|unique|length)==.[0].total_count
+                then [.[].runners[] | select(any(.labels[].name; .==$L))] as $owned
+                  | if all($owned[]; .busy==false and (.name|startswith("just-akash-"+$L+"-")) and any(.labels[].name; .=="self-hosted") and any(.labels[].name; .=="akash"))
+                    then $owned | map(.id|tostring) | join("\n") else error("unverified operation runners") end
+                else error("unverified runner population") end' 2>/dev/null) || IDS_RC=$?
+            [ "$IDS_RC" -eq 0 ] || hold_cleanup
+          fi
+          # A complete empty population is evidence only while the fixed private
+          # repository still has the same fresh server-derived identity.
+          verify_repository || hold_cleanup
+          for id in $IDS; do
+            verify_repository || hold_cleanup
+            verify_runner "$id" || hold_cleanup
+            if ! gh api -X DELETE "${RUNNER_COLLECTION}/${id}" >/dev/null 2>&1; then
+              hold_cleanup
+            fi
+            DELETED_COUNT=$((DELETED_COUNT+1))
+          done
+          {
+            echo "deregistered=$DELETED_COUNT"
+            echo 'deregister_failed=0'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Require measured private repository cleanup
+        if: always() && inputs.github-repository != ''
+        env:
+          CLEANUP_OUTCOME: ${{ steps.dereg_private.outcome }}
+          DEREGISTERED: ${{ steps.dereg_private.outputs.deregistered }}
+          DEREGISTER_FAILED: ${{ steps.dereg_private.outputs.deregister_failed }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          # shellcheck disable=SC2071
+          if [ "${CLEANUP_OUTCOME:-}" != success ] || [ "${DEREGISTER_FAILED:-}" != 0 ] \
+            || [[ ! "${DEREGISTERED:-}" =~ ^(0|[1-9][0-9]{0,19})$ ]] \
+            || { [ "${#DEREGISTERED}" -eq 20 ] && [[ "$DEREGISTERED" > 18446744073709551615 ]]; }; then
+            echo '::error::Private repository runner cleanup requires measured successful evidence'
+            exit 1
           fi
