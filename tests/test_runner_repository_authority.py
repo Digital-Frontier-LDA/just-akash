@@ -135,7 +135,7 @@ def test_repository_identity_refusal_never_requests_token(monkeypatch, patch):
 def test_bounded_positive_registration_grant_is_accepted(monkeypatch):
     calls = authority(monkeypatch)
     repository.verify_native_reader_repository()
-    assert calls == [False, True]
+    assert calls == [False, True, False]
 
 
 def test_partial_registration_response_is_withheld_without_exception_context(monkeypatch):
@@ -152,3 +152,27 @@ def test_partial_registration_response_is_withheld_without_exception_context(mon
     rendered = "".join(traceback.format_exception(caught.value))
     assert "PARTIALRESPONSECANARY" not in rendered and "PATCANARY" not in rendered
     assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "change", [{"private": False}, {"id": 1071436278}, {"full_name": "Other/blazing"}]
+)
+def test_repository_changed_during_mint_is_held(monkeypatch, change):
+    calls = []
+    grant = {
+        "token": "REGISTRATIONCANARY",
+        "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=30)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
+    }
+
+    def request(*, registration=False):
+        calls.append(registration)
+        if registration:
+            return grant
+        return REPO if len(calls) == 1 else REPO | change
+
+    monkeypatch.setattr(repository, "_native_repository_request", request)
+    with pytest.raises(repository.NativeReaderRepositoryError):
+        repository.verify_native_reader_repository()
+    assert calls == [False, True, False]
