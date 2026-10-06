@@ -238,20 +238,21 @@ class AkashConsoleAPI:
         endpoint: str,
         data: dict[str, Any] | None = None,
     ) -> Any:
-        if ci_required(self):
-            direct_create = method.upper() == "POST" and endpoint.rstrip("/") == "/v1/deployments"
-            top_up = method.upper() == "POST" and endpoint.rstrip("/") == "/v1/deposit-deployment"
-            settings = method.upper() in {"POST", "PATCH", "PUT"} and (
-                endpoint == "/v2/deployment-settings"
-                or endpoint.startswith("/v2/deployment-settings/")
-            )
-            disabled = (
-                isinstance(data, dict)
-                and isinstance(data.get("data"), dict)
-                and (data["data"].get("autoTopUpEnabled") is False)
-            )
-            if direct_create or top_up or (settings and not disabled):
-                raise CIRunBudgetError("CI_BUDGET_DIRECT_MUTATION_REFUSED")
+        direct_create = method.upper() == "POST" and endpoint.rstrip("/") == "/v1/deployments"
+        top_up = method.upper() == "POST" and endpoint.rstrip("/") == "/v1/deposit-deployment"
+        settings = method.upper() in {"POST", "PATCH", "PUT"} and (
+            endpoint == "/v2/deployment-settings"
+            or endpoint.startswith("/v2/deployment-settings/")
+        )
+        disabled = (
+            isinstance(data, dict)
+            and isinstance(data.get("data"), dict)
+            and (data["data"].get("autoTopUpEnabled") is False)
+        )
+        # Even malformed process configuration must not prevent cleanup/read or
+        # exact False auto-top-up disabling. Classify only possible spend here.
+        if (direct_create or top_up or (settings and not disabled)) and ci_required(self):
+            raise CIRunBudgetError("CI_BUDGET_DIRECT_MUTATION_REFUSED")
         url = f"{self.base_url}{endpoint}"
         confidential = self._protect_runtime_payloads or request_is_confidential(data)
         if method.upper() == "GET":
@@ -605,7 +606,30 @@ class AkashConsoleAPI:
         self, sdl_content: str, deposit: float = 5.0, *, ci_operation_id: str | None = None
     ) -> dict[str, Any]:
         if ci_required(self):
-            return CIRunBudgetClient().create(sdl_content, deposit, ci_operation_id)
+            # Lifecycle requests send headers, not api_key. Do not rely on the
+            # constructor invariant after callers can mutate either attribute.
+            if not isinstance(self.headers, dict) or any(
+                not isinstance(name, str) for name in self.headers
+            ):
+                raise CIRunBudgetError("CI_BUDGET_CONFIG_REQUIRED")
+            wire_keys = [
+                value for name, value in self.headers.items() if name.lower() == "x-api-key"
+            ]
+            if (
+                len(wire_keys) != 1
+                or not isinstance(wire_keys[0], str)
+                or wire_keys[0] != self.api_key
+            ):
+                # Multiple case variants collapse in urllib's wire headers;
+                # refuse rather than assume which credential would win.
+                raise CIRunBudgetError("CI_BUDGET_CONFIG_REQUIRED")
+            return CIRunBudgetClient().create(
+                sdl_content,
+                deposit,
+                ci_operation_id,
+                console_api_key=self.api_key,
+                console_origin=self.base_url,
+            )
         response = self._request(
             "POST",
             "/v1/deployments",

@@ -6,6 +6,7 @@ This binds cooperative SDK callers; possession of a Console key is not sandboxed
 """
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -16,6 +17,8 @@ from decimal import Decimal, InvalidOperation, localcontext
 
 UNIT = "CONSOLE_DEPOSIT_USD_REQUEST"
 CREATE_PATH = "/v1/akash-ci-budget/creates"
+CONSOLE_ORIGIN = "https://console-api.akash.network"
+PROOF_DOMAIN = b"akash-ci-console-create-v1\0"
 MAX_RESPONSE = 524288
 MAX_MANIFEST = 262144
 MAX_SDL = 262144
@@ -50,8 +53,18 @@ class CIRunBudgetError(RuntimeError):
 
 
 def ci_required(client=None):
-    return getattr(client, "_ci_run_budget_required", False) is True or (
-        os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
+    """Trusted CI process configuration, not containment of a raw-key holder.
+
+    Privacy/configuration/token presence is not mode authority. An explicit false
+    process flag cannot override an Actions process or a designated CI client.
+    """
+    flag = os.environ.get("AKASH_CI_BUDGET_REQUIRED")
+    if flag not in (None, "false", "0", "off", "true", "1", "on"):
+        raise CIRunBudgetError("CI_BUDGET_CONFIG_REQUIRED")
+    return (
+        flag in ("true", "1", "on")
+        or getattr(client, "_ci_run_budget_required", False) is True
+        or os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
     )
 
 
@@ -181,9 +194,17 @@ class CIRunBudgetClient:
         self._exchange = exchange or _exchange
         self._token_source = token_source or _token
 
-    def create(self, sdl_content, deposit, operation_id):
+    def create(self, sdl_content, deposit, operation_id, *, console_api_key, console_origin):
         """Exactly one budget POST. Replay/unknown never authorizes a new create."""
         try:
+            # Bind the same credential the selected SDK client uses for receipt,
+            # bids/lease/cleanup. This proves neither chain ownership nor funds.
+            if (
+                console_origin != CONSOLE_ORIGIN
+                or not _credential(console_api_key)
+                or len(console_api_key) > 4096
+            ):
+                raise CIRunBudgetError("CI_BUDGET_CONFIG_REQUIRED")
             origin = os.environ.get("AKASH_CI_BUDGET_URL", "")
             audience = os.environ.get("AKASH_CI_BUDGET_AUDIENCE", "")
             account = os.environ.get("AKASH_CI_BUDGET_ACCOUNT_ID", "")
@@ -214,6 +235,11 @@ class CIRunBudgetClient:
                 "sdl_content": sdl_content,
                 "deposit_usd": canonical_deposit(deposit),
             }
+            body["console_credential_proof"] = hmac.new(
+                console_api_key.encode("ascii"),
+                PROOF_DOMAIN + request_digest(body).encode("ascii"),
+                hashlib.sha256,
+            ).hexdigest()
             token = self._token_source(audience)
             if not _credential(token):
                 raise CIRunBudgetError("CI_BUDGET_OIDC_REFUSED")

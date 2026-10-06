@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 @pytest.fixture(autouse=True)
 def no_external_calls(monkeypatch):
     monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("AKASH_CI_BUDGET_REQUIRED", raising=False)
     monkeypatch.setattr(
         "urllib.request.HTTPSHandler.https_open", Mock(side_effect=AssertionError("network"))
     )
@@ -242,8 +243,8 @@ def test_actual_import_deploy_terminal_and_stale_intent(monkeypatch, tmp_path, s
     dp._report_suspected_orphans.assert_not_called()
 
 
-@pytest.mark.parametrize("actions", [False, True])
-def test_actual_import_authorized_transport_contract(monkeypatch, actions):
+@pytest.mark.parametrize("mode", ["local", "actions", "process"])
+def test_actual_import_authorized_transport_contract(monkeypatch, mode):
     # Reuse the existing real public reserve/redeem fixture, not replacement SDK objects.
     spec = importlib.util.spec_from_file_location(
         "authorized_contract_fixture", ROOT / "tests/test_authorized_console.py"
@@ -251,8 +252,10 @@ def test_actual_import_authorized_transport_contract(monkeypatch, actions):
     fixture = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(fixture)
     client = fixture.client.__wrapped__(monkeypatch)
-    if actions:
-        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    if mode != "local":
+        monkeypatch.setenv(
+            "GITHUB_ACTIONS" if mode == "actions" else "AKASH_CI_BUDGET_REQUIRED", "true"
+        )
         opener = fixture.transport(monkeypatch)
         with pytest.raises(fixture.CreateHeld):
             client.submit(**fixture.authority())
