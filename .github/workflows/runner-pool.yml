@@ -995,7 +995,9 @@ jobs:
           case "${PLACEMENT_KEY}" in
             dcloud|dcloud-*) echo "::error title=runner-pool::placement-key '${PLACEMENT_KEY}' is the Akash-wide default placement name, owned by nobody. A reaper aimed at it would match strangers' deployments. Namespace it to your repo." >&2; exit 2 ;;
             dfci-infra-*)
-              if { [ "${RUNNER_PUBLIC_PROFILE:-}" != bb-ce1 ] && [ "${RUNNER_PRIVATE_PROFILE:-}" != bb-ce1 ]; } || [ "${GITHUB_REPOSITORY:-}" != Borduas-Holdings/Blazing-Back ] || [ "$PLACEMENT_KEY" != "dfci-infra-runner-run-${GH_RUN_ID}-end" ] || [ "$RUNNER_LABEL" != "fast-pool-${GH_RUN_ID}" ]; then
+              if [ "${RUNNER_PRIVATE_PROFILE:-}" = bb-ce1 ] && [ "${RUNNER_PUBLIC_PROFILE:-}" = "" ] && [ "${GITHUB_REPOSITORY:-}" = Borduas-Holdings/Blazing-Back ] && [ "$ORG" = Borduas-Holdings ] && [ "$PLACEMENT_KEY" = "dfci-infra-b-tier-run-${GH_RUN_ID}-end" ] && [ "$RUNNER_LABEL" = "b-tier-${GH_RUN_ID}-${GITHUB_RUN_ATTEMPT:-}" ] && [ "$EPHEMERAL" = true ] && { [ "$POOL_SIZE" = 1 ] || [ "$POOL_SIZE" = 2 ] || [ "$POOL_SIZE" = 3 ]; }; then
+                : # The private profile gate already verified the exact B topology.
+              elif { [ "${RUNNER_PUBLIC_PROFILE:-}" != bb-ce1 ] && [ "${RUNNER_PRIVATE_PROFILE:-}" != bb-ce1 ]; } || [ "${GITHUB_REPOSITORY:-}" != Borduas-Holdings/Blazing-Back ] || [ "$PLACEMENT_KEY" != "dfci-infra-runner-run-${GH_RUN_ID}-end" ] || [ "$RUNNER_LABEL" != "fast-pool-${GH_RUN_ID}" ]; then
                 echo "::error title=runner-pool::placement-key '${PLACEMENT_KEY}' is the SIBLING repo's prefix, which its sweeper reaps on a schedule. Stamping it would have that sweeper close this pool mid-CI." >&2
                 exit 2
               fi ;;
