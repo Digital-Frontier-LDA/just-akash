@@ -722,8 +722,6 @@ def validate_private_profile(profile: str) -> str:
         or values.get("GITHUB_REPOSITORY") != "Borduas-Holdings/Blazing-Back"
         or values.get("PRIVATE_PROFILE_SOURCE") != "Digital-Frontier-LDA/just-akash"
         or values.get("PRIVATE_PROFILE_ORG") != "Borduas-Holdings"
-        or values.get("PRIVATE_PROFILE_POOL_SIZE") != "1"
-        or values.get("PRIVATE_PROFILE_MIN_POOL_SIZE", "") not in ("", "1")
     ):
         raise ValueError("Private BB profile was not verified")
     run, attempt = values.get("GITHUB_RUN_ID", ""), values.get("GITHUB_RUN_ATTEMPT", "")
@@ -762,6 +760,19 @@ def validate_private_profile(profile: str) -> str:
         values.get("PRIVATE_PROFILE_TAG_PREFIX"),
         values.get("PRIVATE_PROFILE_EPHEMERAL"),
     )
+    pool_size = values.get("PRIVATE_PROFILE_POOL_SIZE")
+    minimum = values.get("PRIVATE_PROFILE_MIN_POOL_SIZE", "")
+    if identity == (
+        f"b-tier-{run}-{attempt}",
+        f"dfci-infra-b-tier-run-{run}-end",
+        "ci-blazing-back-b-tier",
+        "true",
+    ):
+        if pool_size not in ("1", "2", "3") or minimum != pool_size:
+            raise ValueError("Private BB profile was not verified")
+        return label
+    if pool_size != "1" or minimum not in ("", "1"):
+        raise ValueError("Private BB profile was not verified")
     if identity not in (
         (
             f"fast-pool-{run}",
