@@ -8,6 +8,7 @@ import binascii
 import json
 import os
 import re
+import stat
 import subprocess
 import tempfile
 import urllib.request
@@ -517,6 +518,174 @@ def read_pull_credentials(
     return username, token
 
 
+PUBLIC_BB_CE1_IMAGE = (
+    "ghcr.io/digital-frontier-lda/df-akash-runner:2.337.0@sha256:"
+    "ce1b123c98e273479e08e6315fc81f7017957c23dbf88878076e75572b7b18cc"  # pragma: allowlist secret
+)
+
+
+def validate_public_profile(profile: str) -> str:
+    """Admit only the two fixed BB roles, without any private credential transport."""
+    if profile != "bb-ce1":
+        raise ValueError("Public BB profile was not verified")
+    values = os.environ
+    if any(
+        values.get(key, "")
+        for key in (
+            "RUNNER_IMAGE",
+            "RUNNER_REGISTRY_HOST",
+            "RUNNER_REGISTRY_USERNAME",
+            "RUNNER_REGISTRY_PASSWORD",
+            "SOPS_AGE_KEY",
+            "RUNNER_REGISTRY_AGE_KEY",
+            "DOCKERHUB_PULL_USERNAME",
+            "DOCKERHUB_PULL_TOKEN",
+        )
+    ) or any(
+        values.get(key, "false") != "false"
+        for key in (
+            "RUNNER_NATIVE_PULL_READER",
+            "RUNNER_NATIVE_REPOSITORY_SCOPE",
+            "PUBLIC_PROFILE_SOPS",
+            "PUBLIC_PROFILE_CREDENTIALS_PRESENT",
+        )
+    ):
+        raise ValueError("Public BB profile was not verified")
+    if (
+        values.get("RUNNER_ENVIRONMENT") != "github-hosted"
+        or values.get("GITHUB_REPOSITORY") != "Borduas-Holdings/Blazing-Back"
+        or values.get("PUBLIC_PROFILE_SOURCE") != "Digital-Frontier-LDA/just-akash"
+        or values.get("PUBLIC_PROFILE_ORG") != "Borduas-Holdings"
+        or values.get("PUBLIC_PROFILE_POOL_SIZE") != "1"
+        or values.get("PUBLIC_PROFILE_MIN_POOL_SIZE", "") not in ("", "1")
+    ):
+        raise ValueError("Public BB profile was not verified")
+    run, attempt = values.get("GITHUB_RUN_ID", ""), values.get("GITHUB_RUN_ATTEMPT", "")
+    if any(
+        re.fullmatch(r"[1-9][0-9]{0,19}", value) is None or int(value) > 2**64 - 1
+        for value in (run, attempt)
+    ):
+        raise ValueError("Public BB profile was not verified")
+
+    def unique_pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("Public BB profile was not verified")
+            result[key] = value
+        return result
+
+    ownership = values.get("PUBLIC_PROFILE_OWNED_PROVIDERS", "")
+    if not 0 < len(ownership) <= 512:
+        raise ValueError("Public BB profile was not verified")
+    try:
+        owners = json.loads(ownership, object_pairs_hook=unique_pairs)
+    except ValueError:
+        raise ValueError("Public BB profile was not verified") from None
+    if (
+        not isinstance(owners, list)
+        or len(owners) != 3
+        or any(not isinstance(value, str) for value in owners)
+        or set(owners) != NATIVE_READER_PROVIDERS
+    ):
+        raise ValueError("Public BB profile was not verified")
+    label = values.get("PUBLIC_PROFILE_LABEL", "")
+    identity = (
+        label,
+        values.get("PUBLIC_PROFILE_PLACEMENT"),
+        values.get("PUBLIC_PROFILE_TAG_PREFIX"),
+        values.get("PUBLIC_PROFILE_EPHEMERAL"),
+    )
+    if identity not in (
+        (
+            f"fast-pool-{run}",
+            f"dfci-infra-runner-run-{run}-end",
+            "ci-blazing-back-fast-pool",
+            "false",
+        ),
+        (
+            f"sentry-{run}-{attempt}",
+            f"borduas-sentry-run-{run}-end",
+            "ci-blazing-back-sentry",
+            "true",
+        ),
+    ):
+        raise ValueError("Public BB profile was not verified")
+    return label
+
+
+def _public_profile_payload(path: Path, label: str) -> str:
+    """Change just the qualified image and original BB name prefix in the generated SDL."""
+    details = path.lstat()
+    if (
+        not stat.S_ISREG(details.st_mode)
+        or details.st_uid != os.getuid()
+        or details.st_nlink != 1
+        or not 0 < details.st_size <= 65536
+    ):
+        raise ValueError("Public BB template was not verified")
+    text = path.read_text()
+    # Generated mappings have plain keys and no aliases. Refuse credential nodes,
+    # quoted mapping keys or aliases rather than interpreting an expanded template.
+    content = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    if re.search(
+        r"(?im)^\s*[\"']?credentials[\"']?\s*:|^\s*[\"'][^\n]*?:|(?:^|\s)[&*][A-Za-z_]", content
+    ):
+        raise ValueError("Public BB template was not verified")
+    matches = list(re.finditer(r"^([ \t]*)image:[ \t]+(\S+)[ \t]*$", text, re.MULTILINE))
+    if (
+        len(matches) != 1
+        or matches[0].group(2)
+        != "ghcr.io/digital-frontier-lda/df-akash-runner@" + NATIVE_READER_IMAGE.rsplit("@", 1)[1]
+    ):
+        raise ValueError("Public BB template was not verified")
+    image = matches[0]
+    indent = image.group(1)
+    headers = list(re.finditer(r"^" + re.escape(indent) + r"env:[ \t]*$", text, re.MULTILINE))
+    if len(headers) != 1:
+        raise ValueError("Public BB template was not verified")
+    existing = {}
+    for line in text[headers[0].end() :].splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if not line.startswith(indent + "  "):
+            break
+        scalar = line.strip()
+        if not scalar.startswith("- "):
+            raise ValueError("Public BB template was not verified")
+        key, separator, value = scalar[2:].partition("=")
+        if not separator or key in existing:
+            raise ValueError("Public BB template was not verified")
+        existing[key] = value
+    if existing != {
+        "RUNNER_TOKEN": "@@RUNNER_TOKEN@@",
+        "ORG_NAME": "Borduas-Holdings",
+        "RUNNER_SCOPE": "org",
+        "RUNNER_NAME_PREFIX": f"just-akash-{label}",
+        "LABELS": f"self-hosted,linux,akash,{label}",
+        "EPHEMERAL": os.environ["PUBLIC_PROFILE_EPHEMERAL"],
+        "RUNNER_WORKDIR": "/_work",
+        "RUN_AS_ROOT": "true",
+    }:
+        raise ValueError("Public BB template was not verified")
+    updated = (
+        text[: image.start()] + indent + "image: " + PUBLIC_BB_CE1_IMAGE + text[image.end() :]
+    )
+    updated, count = re.subn(
+        r"^"
+        + re.escape(indent)
+        + r"  - RUNNER_NAME_PREFIX=just-akash-"
+        + re.escape(label)
+        + r"[ \t]*$",
+        indent + "  - RUNNER_NAME_PREFIX=df-core-" + label,
+        updated,
+        flags=re.MULTILINE,
+    )
+    if count != 1:
+        raise ValueError("Public BB template was not verified")
+    return updated
+
+
 def configure(
     path: Path,
     *,
@@ -526,7 +695,23 @@ def configure(
     password: str,
     native_reader: bool = False,
     reader_from_sops: bool = False,
+    public_profile: str = "",
 ) -> None:
+    if public_profile != "":
+        if native_reader or reader_from_sops or any((image, host, username, password)):
+            raise ValueError("Public BB profile was not verified")
+        label = validate_public_profile(public_profile)
+        updated = _public_profile_payload(path, label)
+        with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            try:
+                stream.write(updated)
+                stream.flush()
+                os.chmod(temporary, 0o600)
+                temporary.replace(path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        return
     label = (
         validate_native_reader_scope(reader_from_sops=reader_from_sops) if native_reader else ""
     )
@@ -611,8 +796,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sdl", type=Path, required=True)
     parser.add_argument("--sops-env-file", type=Path)
+    parser.add_argument("--check-public-profile", action="store_true")
     args = parser.parse_args()
     try:
+        public_profile = os.environ.get("RUNNER_PUBLIC_PROFILE", "")
+        if public_profile != "":
+            if args.sops_env_file:
+                raise ValueError("Public BB profile was not verified")
+            validate_public_profile(public_profile)
+        if args.check_public_profile:
+            if public_profile == "":
+                raise ValueError("Public BB profile was not verified")
+            return 0
         native_mode = os.environ.get("RUNNER_NATIVE_PULL_READER", "false")
         if native_mode not in ("true", "false", ""):
             raise ValueError("Native reader option was not verified")
@@ -638,6 +833,7 @@ def main() -> int:
             password=password,
             native_reader=native_reader,
             reader_from_sops=args.sops_env_file is not None,
+            public_profile=public_profile,
         )
     except NativeReaderRoleError:
         print("Runner image configuration held: NATIVE_READER_ROLE_UNQUALIFIED")
