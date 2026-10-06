@@ -525,7 +525,7 @@ PUBLIC_BB_CE1_IMAGE = (
 
 
 def validate_public_profile(profile: str) -> str:
-    """Admit only the two fixed BB roles, without any private credential transport."""
+    """Admit only the three fixed BB roles, without any private credential transport."""
     if profile != "bb-ce1":
         raise ValueError("Public BB profile was not verified")
     values = os.environ
@@ -609,7 +609,15 @@ def validate_public_profile(profile: str) -> str:
             "ci-blazing-back-sentry",
             "true",
         ),
+        (
+            f"apps-{run}-{attempt}",
+            f"borduas-apps-run-{run}-end",
+            "ci-blazing-back-apps",
+            "true",
+        ),
     ):
+        raise ValueError("Public BB profile was not verified")
+    if label == f"apps-{run}-{attempt}" and values.get("PUBLIC_PROFILE_MIN_POOL_SIZE") != "1":
         raise ValueError("Public BB profile was not verified")
     return label
 

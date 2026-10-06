@@ -33,7 +33,16 @@ def context(monkeypatch, role="fast"):
         "RUNNER_NATIVE_REPOSITORY_SCOPE",
     ):
         monkeypatch.delenv(key, raising=False)
-    label = "fast-pool-123" if role == "fast" else "sentry-123-2"
+    label, placement, tag, ephemeral = {
+        "fast": (
+            "fast-pool-123",
+            "dfci-infra-runner-run-123-end",
+            "ci-blazing-back-fast-pool",
+            "false",
+        ),
+        "sentry": ("sentry-123-2", "borduas-sentry-run-123-end", "ci-blazing-back-sentry", "true"),
+        "apps": ("apps-123-2", "borduas-apps-run-123-end", "ci-blazing-back-apps", "true"),
+    }[role]
     values = {
         "RUNNER_ENVIRONMENT": "github-hosted",
         "GITHUB_REPOSITORY": "Borduas-Holdings/Blazing-Back",
@@ -43,14 +52,10 @@ def context(monkeypatch, role="fast"):
         "PUBLIC_PROFILE_ORG": "Borduas-Holdings",
         "PUBLIC_PROFILE_POOL_SIZE": "1",
         "PUBLIC_PROFILE_MIN_POOL_SIZE": "1",
-        "PUBLIC_PROFILE_EPHEMERAL": "false" if role == "fast" else "true",
+        "PUBLIC_PROFILE_EPHEMERAL": ephemeral,
         "PUBLIC_PROFILE_LABEL": label,
-        "PUBLIC_PROFILE_PLACEMENT": "dfci-infra-runner-run-123-end"
-        if role == "fast"
-        else "borduas-sentry-run-123-end",
-        "PUBLIC_PROFILE_TAG_PREFIX": "ci-blazing-back-fast-pool"
-        if role == "fast"
-        else "ci-blazing-back-sentry",
+        "PUBLIC_PROFILE_PLACEMENT": placement,
+        "PUBLIC_PROFILE_TAG_PREFIX": tag,
         "PUBLIC_PROFILE_OWNED_PROVIDERS": json.dumps(sorted(subject.NATIVE_READER_PROVIDERS)),
         "PUBLIC_PROFILE_SOPS": "false",
         "PUBLIC_PROFILE_CREDENTIALS_PRESENT": "false",
@@ -86,7 +91,7 @@ def template(tmp_path, monkeypatch, role="fast"):
     return path
 
 
-@pytest.mark.parametrize("role", ["fast", "sentry"])
+@pytest.mark.parametrize("role", ["fast", "sentry", "apps"])
 def test_actual_generated_template_selects_only_ce1_and_preserves_reaped_name(
     tmp_path, monkeypatch, role
 ):
@@ -157,6 +162,60 @@ def test_foreign_role_ownership_or_credentials_hold_without_template_change(
             path, image="", host="", username="", password="", public_profile="bb-ce1"
         )
     assert "echo-canary" not in str(caught.value) and path.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("GITHUB_REPOSITORY", "Borduas-Holdings/blazing"),
+        ("RUNNER_ENVIRONMENT", "self-hosted"),
+        ("PUBLIC_PROFILE_SOURCE", "foreign/just-akash"),
+        ("PUBLIC_PROFILE_ORG", "foreign"),
+        ("PUBLIC_PROFILE_LABEL", "apps-124-2"),
+        ("PUBLIC_PROFILE_LABEL", "apps-123-1"),
+        ("PUBLIC_PROFILE_PLACEMENT", "borduas-apps-run-124-end"),
+        ("PUBLIC_PROFILE_PLACEMENT", "borduas-sentry-run-123-end"),
+        ("PUBLIC_PROFILE_TAG_PREFIX", "ci-blazing-back-sentry"),
+        ("PUBLIC_PROFILE_EPHEMERAL", "false"),
+        ("PUBLIC_PROFILE_POOL_SIZE", "2"),
+        ("PUBLIC_PROFILE_MIN_POOL_SIZE", ""),
+        ("PUBLIC_PROFILE_MIN_POOL_SIZE", "0"),
+        ("PUBLIC_PROFILE_MIN_POOL_SIZE", "2"),
+        ("PUBLIC_PROFILE_OWNED_PROVIDERS", "[]"),
+        ("PUBLIC_PROFILE_OWNED_PROVIDERS", '["foreign"]'),
+        ("PUBLIC_PROFILE_SOPS", "true"),
+        ("PUBLIC_PROFILE_CREDENTIALS_PRESENT", "true"),
+        ("RUNNER_NATIVE_PULL_READER", "true"),
+        ("RUNNER_NATIVE_REPOSITORY_SCOPE", "true"),
+        ("RUNNER_IMAGE", "echo-canary"),
+        ("RUNNER_REGISTRY_HOST", "echo-canary"),
+        ("RUNNER_REGISTRY_USERNAME", "echo-canary"),
+        ("RUNNER_REGISTRY_PASSWORD", "echo-canary"),
+        ("SOPS_AGE_KEY", "echo-canary"),
+        ("DOCKERHUB_PULL_TOKEN", "echo-canary"),
+    ],
+)
+def test_apps_role_holds_foreign_or_cross_role_or_credential_delivery(
+    tmp_path, monkeypatch, capsys, key, value
+):
+    path = template(tmp_path, monkeypatch, "apps")
+    original = path.read_bytes()
+    monkeypatch.setenv(key, value)
+    with pytest.raises(ValueError) as caught:
+        subject.configure(
+            path, image="", host="", username="", password="", public_profile="bb-ce1"
+        )
+    captured = capsys.readouterr()
+    assert path.read_bytes() == original
+    assert "echo-canary" not in str(caught.value) + captured.out + captured.err
+    assert "add-mask" not in captured.out
+
+
+@pytest.mark.parametrize("role", ["fast", "sentry"])
+def test_existing_roles_keep_optional_minimum_pool_contract(monkeypatch, role):
+    label, _ = context(monkeypatch, role)
+    monkeypatch.delenv("PUBLIC_PROFILE_MIN_POOL_SIZE")
+    assert subject.validate_public_profile("bb-ce1") == label
 
 
 @pytest.mark.parametrize(
@@ -237,8 +296,11 @@ def test_noncanonical_template_is_not_a_public_profile(tmp_path, monkeypatch, mu
     assert path.read_bytes() == original
 
 
-def test_profile_plus_sops_is_refused_before_decryption_or_mask(tmp_path, monkeypatch, capsys):
-    path = template(tmp_path, monkeypatch)
+@pytest.mark.parametrize("role", ["fast", "sentry", "apps"])
+def test_profile_plus_sops_is_refused_before_decryption_or_mask(
+    tmp_path, monkeypatch, capsys, role
+):
+    path = template(tmp_path, monkeypatch, role)
     monkeypatch.setenv("RUNNER_PUBLIC_PROFILE", "bb-ce1")
     monkeypatch.setattr(
         sys, "argv", ["runner", "--sdl", str(path), "--sops-env-file", "unread-cipher"]
@@ -250,8 +312,11 @@ def test_profile_plus_sops_is_refused_before_decryption_or_mask(tmp_path, monkey
     assert "add-mask" not in capsys.readouterr().out
 
 
-def test_default_off_keeps_current_rendered_bytes_and_never_checks_profile(tmp_path, monkeypatch):
-    path = template(tmp_path, monkeypatch)
+@pytest.mark.parametrize("role", ["fast", "sentry", "apps"])
+def test_default_off_keeps_current_rendered_bytes_and_never_checks_profile(
+    tmp_path, monkeypatch, role
+):
+    path = template(tmp_path, monkeypatch, role)
     original = path.read_bytes()
     monkeypatch.setattr(
         subject, "validate_public_profile", lambda *args: pytest.fail("default must not gate")
@@ -292,8 +357,11 @@ def test_workflow_new_input_is_false_default_and_profile_admission_precedes_sops
     )
 
 
-def test_early_profile_check_is_executed_and_writes_only_fixed_refusal(tmp_path, monkeypatch):
-    _, env = context(monkeypatch)
+@pytest.mark.parametrize("role", ["fast", "sentry", "apps"])
+def test_early_profile_check_is_executed_and_writes_only_fixed_refusal(
+    tmp_path, monkeypatch, role
+):
+    _, env = context(monkeypatch, role)
     guard = next(step for step in STEPS if step.get("id") == "public_profile")
     script = guard["run"].replace("python3", str(sys.executable))
     output = tmp_path / "guard-output"
