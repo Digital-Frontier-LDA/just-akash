@@ -23,7 +23,8 @@ def test_typed_outcome_is_published_through_both_workflow_boundaries() -> None:
         "${{ jobs.pool.outputs.deployment_outcome }}"
     )
     assert DOC["jobs"]["pool"]["outputs"]["deployment_outcome"] == (
-        "${{ steps.provision.outputs.deployment_outcome }}"
+        "${{ steps.provision.outputs.deployment_outcome || "
+        "(steps.pat.outputs.native_pre_create_refused == 'true' && 'no-deployment' || '') }}"
     )
     teardown_with = DOC["jobs"]["teardown"]["with"]
     assert teardown_with["deployment-outcome"] == ("${{ needs.pool.outputs.deployment_outcome }}")

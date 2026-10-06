@@ -1490,13 +1490,6 @@ BASELINE: dict[tuple[str, str, str, str], tuple[int, str]] = {
         "pool/Provision (retry down candidates, tag before waiting)",
         "7e97ecd1cba8",  # pragma: allowlist secret
     ): (1, "`grep -c` exits 1 on zero matches while printing 0; the count is gated"),
-    # VERDICT_RESP=$(gh api --method POST "orgs/${ORG}/actions/runners/regis…
-    (
-        "R2",
-        ".github/workflows/runner-pool.yml",
-        "pool/Provision (retry down candidates, tag before waiting)",
-        "83245f3e0d2e",  # pragma: allowlist secret
-    ): (1, "captures the token-mint response; the guard below classifies it"),
     # GATE_WRONG=$(printf '%s\n' "$RUNNER_VERSIONS" | grep -vxF -- "null" | …
     (
         "R2",

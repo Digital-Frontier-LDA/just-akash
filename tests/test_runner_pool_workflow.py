@@ -2624,7 +2624,9 @@ def _run_preflight(tmp_path, response: str, rc: int, org: str = "testorg") -> tu
     out, summary = tmp_path / "out.txt", tmp_path / "sum.txt"
     script.write_text(
         f"set -uo pipefail\nORG={shlex.quote(org)}\n"
-        f'GITHUB_OUTPUT="{out}"\nGITHUB_STEP_SUMMARY="{summary}"\n' + body[body.index("RC=0") :],
+        + 'RUNNER_COLLECTION="orgs/${ORG}/actions/runners"\n'
+        + f'GITHUB_OUTPUT="{out}"\nGITHUB_STEP_SUMMARY="{summary}"\n'
+        + body[body.index("RC=0") :],
         encoding="utf-8",
     )
     fake_bin = tmp_path / "bin"
@@ -3263,7 +3265,10 @@ def _verdict_script(tmp_path, response: str) -> tuple[str, str]:
     out = tmp_path / "out.txt"
     script = tmp_path / "verdict.sh"
     script.write_text(
-        f'set -uo pipefail\nORG=testorg\nGITHUB_OUTPUT="{out}"\n: > "{out}"\n' + block + tail,
+        "set -uo pipefail\nORG=testorg\nRUNNER_COLLECTION=orgs/testorg/actions/runners\n"
+        + f'GITHUB_OUTPUT="{out}"\n: > "{out}"\n'
+        + block
+        + tail,
         encoding="utf-8",
     )
     fake = tmp_path / "bin"
@@ -3324,8 +3329,12 @@ class TestBothProbesUseTheWriteVerb:
     def test_both_sites_post_a_registration_token(self):
         preflight = _step("PAT must still be valid")["run"]
         provision = _step("Provision")["run"]
-        for label, body in (("preflight", preflight), ("verdict", provision)):
-            assert "actions/runners/registration-token" in body, f"{label} still reads"
+        for label, body, endpoint in (
+            ("preflight", preflight, '"orgs/${ORG}/actions/runners/registration-token"'),
+            ("verdict", provision, '"${RUNNER_COLLECTION}/registration-token"'),
+        ):
+            assert endpoint in body, f"{label} still reads"
+            assert 'RUNNER_COLLECTION="orgs/${ORG}/actions/runners"' in body
             assert "--method POST" in body, f"{label} is not using the write verb"
 
     def test_the_preflight_no_longer_probes_with_a_bare_list_read(self):

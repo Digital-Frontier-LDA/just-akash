@@ -2,6 +2,7 @@
 
 import copy
 import io
+import json
 import traceback
 import urllib.error
 from datetime import datetime, timedelta, timezone
@@ -176,3 +177,108 @@ def test_repository_changed_during_mint_is_held(monkeypatch, change):
     with pytest.raises(repository.NativeReaderRepositoryError):
         repository.verify_native_reader_repository()
     assert calls == [False, True, False]
+
+
+@pytest.mark.parametrize(
+    "expiry",
+    [
+        "2026-01-02T00:30:00Z",
+        "2026-01-02T00:30:00+00:00",
+        "2026-01-02T00:30:00-00:00",
+        "2026-01-02T06:00:00+05:30",
+        "2026-01-01T16:30:00-08:00",
+        "2026-01-03T00:29:00+23:59",
+        "2026-01-02T00:30:00.123Z",
+        "2026-01-02T06:00:00.123456789+05:30",
+    ],
+)
+def test_rfc3339_expiries_represent_the_same_bounded_utc_grant(expiry):
+    now = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    assert repository._registration_expiry_valid(expiry, now)
+    parsed = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+    assert parsed.astimezone(timezone.utc).replace(microsecond=0) == now + timedelta(minutes=30)
+
+
+@pytest.mark.parametrize(
+    "expiry",
+    [
+        None,
+        True,
+        1,
+        "",
+        "echo-canary",
+        "2026-01-02T00:30:00",
+        "2026-01-02 00:30:00Z",
+        "２０２６-01-02T00:30:00Z",
+        "2026-01-02T00:30:00Z\necho-canary",
+        "2026-01-02T00:30:00.1234567890Z",
+        "2026-01-02T00:30:00+24:00",
+        "2026-01-02T00:30:00+01:60",
+        "2026-01-02T00:30:00+0100",
+        "2026-01-02T00:30:60Z",
+        "2026-02-30T00:30:00Z",
+        "0000-01-02T00:30:00Z",
+        "9999-12-31T23:59:59.999999999-23:59",
+        "2026-01-02T00:00:00Z",
+        "2026-01-01T23:59:59.999999999Z",
+        "2026-01-02T01:05:00.000000001Z",
+        "2026-01-02T09:05:00.000000001+08:00",
+        "2099-01-01T00:00:00Z",
+        "x" * 41,
+    ],
+)
+def test_invalid_naive_expired_or_excessive_rfc3339_grants_are_held(expiry):
+    assert not repository._registration_expiry_valid(
+        expiry, datetime(2026, 1, 2, tzinfo=timezone.utc)
+    )
+
+
+def test_fractional_expiry_preserves_both_exact_ttl_boundaries():
+    now = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    assert repository._registration_expiry_valid("2026-01-02T00:00:00.000000001Z", now)
+    assert repository._registration_expiry_valid("2026-01-02T01:05:00Z", now)
+    assert not repository._registration_expiry_valid("2026-01-02T01:05:00.000000001Z", now)
+
+
+@pytest.mark.parametrize(
+    "offset",
+    [timezone.utc, timezone(timedelta(hours=-8)), timezone(timedelta(hours=5, minutes=30))],
+)
+def test_actual_fixed_transport_composes_get_post_get_with_offset_expiry(monkeypatch, offset):
+    monkeypatch.setenv("GH_TOKEN", "PATCANARY")
+    grant = {
+        "token": "REGISTRATIONCANARY",
+        "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=30))
+        .astimezone(offset)
+        .isoformat(),
+    }
+    responses = []
+    for status, document in [(200, REPO), (201, grant), (200, REPO)]:
+        response = Mock(status=status)
+        response.read.return_value = json.dumps(document).encode()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=None)
+        responses.append(response)
+    opener = Mock()
+    opener.open.side_effect = responses
+    monkeypatch.setattr(repository.urllib.request, "build_opener", Mock(return_value=opener))
+    repository.verify_native_reader_repository()
+    calls = opener.open.call_args_list
+    assert len(calls) == 3
+    assert [call.args[0].method for call in calls] == ["GET", "POST", "GET"]
+    assert [call.args[0].full_url for call in calls] == [
+        "https://api.github.com/repos/Borduas-Holdings/blazing",
+        "https://api.github.com/repos/Borduas-Holdings/blazing/actions/runners/registration-token",
+        "https://api.github.com/repos/Borduas-Holdings/blazing",
+    ]
+
+
+def test_invalid_expiry_echo_is_quiet_and_does_not_skip_to_final_identity(monkeypatch):
+    calls = authority(
+        monkeypatch, grant={"token": "REGISTRATIONCANARY", "expires_at": "echo-canary"}
+    )
+    with pytest.raises(repository.NativeReaderRepositoryError) as caught:
+        repository.verify_native_reader_repository()
+    assert calls == [False, True]
+    assert caught.value.__context__ is None
+    assert "echo-canary" not in "".join(traceback.format_exception(caught.value))

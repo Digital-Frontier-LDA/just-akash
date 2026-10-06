@@ -77,10 +77,11 @@ def _run_verdict(http_status: str | None) -> dict[str, str]:
     )
     stub = os.path.join(bin_, "gh")
     with open(stub, "w") as fh:
-        fh.write("#!/bin/sh\n" + body)
+        fh.write('#!/bin/sh\nprintf \'%s\\n\' "$@" > "$GH_API_ARGS"\n' + body)
     os.chmod(stub, 0o755)
 
     out_file = os.path.join(tmp, "gh_output")
+    args_file = os.path.join(tmp, "gh_api_args")
     open(out_file, "w").close()
     script = "set -uo pipefail\nSAW_BID=1\nSAW_SEQ_CONTENTION=0\n" + _verdict_block()
     subprocess.run(
@@ -89,13 +90,23 @@ def _run_verdict(http_status: str | None) -> dict[str, str]:
             **os.environ,
             "PATH": bin_ + os.pathsep + os.environ["PATH"],
             "GITHUB_OUTPUT": out_file,
+            "GH_API_ARGS": args_file,
             "ORG": "some-org",
+            "RUNNER_COLLECTION": "orgs/some-org/actions/runners",
+            "RUNNER_NATIVE_PULL_READER": "false",
             "MAX_ATTEMPTS": "3",
         },
         capture_output=True,
         text=True,
         timeout=60,
     )
+    assert Path(args_file).read_text().splitlines() == [
+        "api",
+        "--method",
+        "POST",
+        "orgs/some-org/actions/runners/registration-token",
+        "-i",
+    ], "the extracted org verdict must recheck actual registration-token authority"
     parsed = {}
     for line in Path(out_file).read_text().splitlines():
         if "=" in line:

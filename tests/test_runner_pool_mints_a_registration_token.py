@@ -189,6 +189,7 @@ def _run_attempt(
         "FAKE_RC": str(rc),
         "GH_TOKEN": PAT,
         "ORG": "testorg",
+        "RUNNER_COLLECTION": "orgs/testorg/actions/runners",
         "PROVIDER_SELECT": "",
         "GITHUB_OUTPUT": str(output),
     }
@@ -383,7 +384,12 @@ def test_the_rendered_sdl_carries_only_the_placeholder_and_no_pat():
 def test_the_token_is_masked_before_its_first_use_and_never_published():
     lines = _code(_mint_fragment(_step("provision")["run"])).splitlines()
     mask = [i for i, line in enumerate(lines) if 'echo "::add-mask::${RUNNER_TOKEN}"' in line]
-    assert len(mask) == 1, mask
+    assert len(mask) == 2, mask
+    assert 'if [ "${RUNNER_NATIVE_PULL_READER:-false}" != true ]; then' in lines[mask[0] - 1]
+    between = "\n".join(lines[mask[0] + 1 : mask[1]])
+    assert 'case "${RC}:${CODE}:${RUNNER_TOKEN}"' in between
+    assert '[ "${#RUNNER_TOKEN}" -le 4096 ] || RUNNER_TOKEN=""' in between
+    assert 'if [ "${RUNNER_NATIVE_PULL_READER:-false}" = true ]; then' in between
     before = [
         line.strip()
         for line in lines[: mask[0]]
@@ -451,9 +457,7 @@ def _window_violations(provision_run: str) -> list[str]:
     code = _code(provision_run)
     violations = []
     loop = code.find("for attempt in $(seq 1")
-    mint = code.find(
-        'RESP=$(gh api --method POST "orgs/${ORG}/actions/runners/registration-token"'
-    )
+    mint = code.find('RESP=$(gh api --method POST "${RUNNER_COLLECTION}/registration-token"')
     deploys = [m.start() for m in re.finditer(r'"\$\{JA\[@\]\}" deploy ', code)]
     if loop < 0 or mint < 0 or len(deploys) != 1:
         return [f"cannot locate the attempt: loop {loop}, mint {mint}, deploys {deploys}"]

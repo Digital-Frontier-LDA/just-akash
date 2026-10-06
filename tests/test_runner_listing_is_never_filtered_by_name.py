@@ -36,7 +36,7 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 # A runners query carrying a `name=` parameter. Deliberately NOT a bare "name=" search:
 # `.labels[].name` and `--arg L "$RUNNER_LABEL"` are legitimate client-side field access
 # and would make this fire on correct code — a control that cries wolf gets deleted.
-_FILTERED_LISTING = re.compile(r"actions/runners\?[^\"'\s]*\bname=")
+_FILTERED_LISTING = re.compile(r"(?:actions/runners|\$\{RUNNER_COLLECTION\})\?[^\"'\s]*\bname=")
 
 
 # Every `grep ...` up to the next pipe or command separator. Matching the SEGMENT
@@ -115,6 +115,12 @@ def test_the_matcher_fires_on_the_shape_it_guards():
     assert _FILTERED_LISTING.search(
         'gh api "orgs/${ORG}/actions/runners?per_page=100&name=${RUNNER_NAME_PREFIX}"'
     ), "the matcher must catch a name-filtered listing"
+    assert _FILTERED_LISTING.search(
+        'gh api "${RUNNER_COLLECTION}?per_page=100&name=${RUNNER_NAME_PREFIX}"'
+    ), "the matcher must catch a scope-selected name-filtered listing"
+    assert _FILTERED_LISTING.search(
+        'gh api "repos/Borduas-Holdings/blazing/actions/runners?per_page=100&name=prefix"'
+    ), "the matcher must catch a repository-scoped name-filtered listing"
 
 
 def test_the_matcher_does_not_fire_on_legitimate_client_side_matching():
@@ -212,3 +218,23 @@ def test_that_matcher_would_catch_a_regex_comparison(label, line, is_offender):
         )
     else:
         assert not offenders, f"{label}: must be accepted — this grep already matches literally"
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "${RUNNER_COLLECTION}",
+        "repos/Borduas-Holdings/blazing/actions/runners",
+    ],
+)
+def test_actual_workflow_name_filter_mutation_trips_source_guard(tmp_path, monkeypatch, endpoint):
+    source = (WORKFLOWS / "runner-pool.yml").read_text()
+    target = '"${RUNNER_COLLECTION}?per_page=100"'
+    assert source.count(target) == 1
+    workflow = tmp_path / "runner-pool.yml"
+    workflow.write_text(source)
+    monkeypatch.setattr("tests.test_runner_listing_is_never_filtered_by_name.WORKFLOWS", tmp_path)
+    test_no_workflow_filters_the_runner_listing_by_name()
+    workflow.write_text(source.replace(target, '"' + endpoint + '?per_page=100&name=prefix"'))
+    with pytest.raises(AssertionError, match="EXACT-match"):
+        test_no_workflow_filters_the_runner_listing_by_name()
