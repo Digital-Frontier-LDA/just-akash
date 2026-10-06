@@ -78,9 +78,11 @@ def test_actual_pat_step_emits_refusal_only_before_an_immediate_exit(
     assert ("native_pre_create_refused=true" in text) is refused
     assert (result.returncode != 0) is refused
     if refused:
-        assert dict(line.split("=", 1) for line in text.splitlines()).get("failure_reason") == (
-            "NATIVE_READER_REPOSITORY_UNQUALIFIED"
-        )
+        values = {
+            key: value
+            for key, _separator, value in (line.partition("=") for line in text.splitlines())
+        }
+        assert values.get("failure_reason") == "NATIVE_READER_REPOSITORY_UNQUALIFIED"
     assert "deployment_outcome=" not in text, (
         "do not redefine the unconditional create-boundary marker"
     )

@@ -4,6 +4,7 @@ import json
 import os
 import re
 import urllib.request
+from contextlib import suppress
 from datetime import datetime, timezone
 from http.client import HTTPException
 
@@ -81,7 +82,7 @@ def _registration_expiry_valid(value: object, now: datetime) -> bool:
     )
     if shape is None:
         return False
-    try:
+    with suppress(ValueError, TypeError, OverflowError):
         expiry = datetime.fromisoformat(value.replace("Z", "+00:00"))
         delta = expiry - now
         # Python datetime retains six fractional digits. Preserve the remaining
@@ -93,8 +94,7 @@ def _registration_expiry_valid(value: object, now: datetime) -> bool:
             + fraction_ns % 1000
         )
         return 0 < remaining_ns <= 65 * 60 * 1_000_000_000
-    except (ValueError, TypeError, OverflowError):
-        return False
+    return False
 
 
 def verify_native_reader_repository() -> None:
