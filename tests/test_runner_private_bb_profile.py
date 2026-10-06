@@ -70,14 +70,14 @@ def test_private_generated_payload_preserves_env_and_adds_only_reader_credential
     }
     actual = yaml.safe_load(path.read_text())
     assert actual == expected
-    assert calls == [("jobordu", "reader-canary")]
+    assert calls == [("jobordu", READ_FIXTURE)]
     assert subject.validate_private_profile("bb-ce1") == label
     assert actual["services"]["runner"]["image"].endswith(
         subject.PUBLIC_BB_CE1_IMAGE.split("@")[1]
     )
     assert len(actual["services"]["runner"]["env"]) == 8
     assert f"RUNNER_NAME_PREFIX=just-akash-{label}" in actual["services"]["runner"]["env"]
-    assert "reader-canary" not in "\n".join(actual["services"]["runner"]["env"])
+    assert READ_FIXTURE not in "\n".join(actual["services"]["runner"]["env"])
     assert path.stat().st_mode & 0o777 == 0o600
     assert sorted(p.name for p in tmp_path.iterdir()) == ["output", "runner.yaml"]
 
@@ -254,10 +254,10 @@ def test_cli_decrypts_only_hosted_reader_then_verifies_role_and_writes_private_p
         assert selected == bundle
         assert options == {"username": "jobordu", "password": "", "native_reader": False}
         calls.append("decrypt-reader")
-        return "jobordu", "reader-canary"
+        return "jobordu", READ_FIXTURE
 
     def verify(user, token):
-        assert (user, token) == ("jobordu", "reader-canary")
+        assert (user, token) == ("jobordu", READ_FIXTURE)
         calls.append("fresh-role")
 
     monkeypatch.setattr(subject, "read_pull_credentials", decrypt)
@@ -269,11 +269,10 @@ def test_cli_decrypts_only_hosted_reader_then_verifies_role_and_writes_private_p
     assert calls == ["decrypt-reader", "fresh-role"]
     runner = yaml.safe_load(path.read_text())["services"]["runner"]
     assert runner["image"] == subject.PRIVATE_BB_CE1_IMAGE
-    assert runner["credentials"]["password"] == "reader-canary"
+    assert runner["credentials"]["password"] == READ_FIXTURE
     assert len(runner["env"]) == 8
     assert not any(
-        "reader-canary" in entry or "AGE" in entry or "GH_TOKEN" in entry
-        for entry in runner["env"]
+        READ_FIXTURE in entry or "AGE" in entry or "GH_TOKEN" in entry for entry in runner["env"]
     )
 
 
@@ -329,7 +328,7 @@ def test_private_malformed_template_is_rejected_without_partial_credentials(
             private_profile="bb-ce1",
         )
     assert path.read_bytes() == before
-    assert b"reader-canary" not in path.read_bytes()
+    assert READ_FIXTURE.encode() not in path.read_bytes()
 
 
 def test_private_destination_preserves_public_root_without_reusing_legacy_mirror_tags():
