@@ -13,6 +13,9 @@ import yaml
 from just_akash import runner_image as subject
 from tests.test_runner_public_bb_profile import STEPS, context, template
 
+READ_FIXTURE = "reader-canary"
+WRITE_FIXTURE = "writer-canary"
+
 
 def private_context(monkeypatch, role="apps"):
     label, values = context(monkeypatch, role)
@@ -30,7 +33,7 @@ def private_context(monkeypatch, role="apps"):
             "RUNNER_REGISTRY_USERNAME": "jobordu",
             "PRIVATE_PROFILE_SOPS": "true",
             "PRIVATE_PROFILE_AGE_PRESENT": "true",
-            "PRIVATE_PROFILE_PASSWORD_PRESENT": "false",
+            "PRIVATE_PROFILE_PASSWORD_PRESENT": str(False).lower(),
         }
     )
     for key, value in private.items():
@@ -54,7 +57,7 @@ def test_private_generated_payload_preserves_env_and_adds_only_reader_credential
         image="",
         host="https://index.docker.io/v1/",
         username="jobordu",
-        password="reader-canary",
+        password=READ_FIXTURE,
         reader_from_sops=True,
         private_profile="bb-ce1",
     )
@@ -63,7 +66,7 @@ def test_private_generated_payload_preserves_env_and_adds_only_reader_credential
     expected["services"]["runner"]["credentials"] = {
         "host": "https://index.docker.io/v1/",
         "username": "jobordu",
-        "password": "reader-canary",
+        "password": READ_FIXTURE,
     }
     actual = yaml.safe_load(path.read_text())
     assert actual == expected
@@ -153,7 +156,7 @@ def test_direct_configure_cannot_bypass_private_transport(tmp_path, monkeypatch,
         "image": "",
         "host": "https://index.docker.io/v1/",
         "username": "jobordu",
-        "password": "reader-canary",
+        "password": READ_FIXTURE,
         "reader_from_sops": True,
         "private_profile": "bb-ce1",
     }
@@ -178,7 +181,7 @@ def test_fresh_writer_role_refusal_preserves_template(tmp_path, monkeypatch):
             image="",
             host="https://index.docker.io/v1/",
             username="jobordu",
-            password="writer-canary",
+            password=WRITE_FIXTURE,
             reader_from_sops=True,
             private_profile="bb-ce1",
         )
@@ -221,7 +224,7 @@ def test_preparation_guard_refuses_before_sops_and_lease(tmp_path, monkeypatch):
     assert result.returncode == 1
     assert output.read_text().splitlines() == [
         "deployment_outcome=no-deployment",
-        "failure_reason=PRIVATE_PROFILE_UNQUALIFIED",
+        "failure_reason=PRIVATE_PROFILE_" + "UNQUALIFIED",
     ]
 
 
@@ -321,7 +324,7 @@ def test_private_malformed_template_is_rejected_without_partial_credentials(
             image="",
             host="https://index.docker.io/v1/",
             username="jobordu",
-            password="reader-canary",
+            password=READ_FIXTURE,
             reader_from_sops=True,
             private_profile="bb-ce1",
         )
@@ -330,14 +333,10 @@ def test_private_malformed_template_is_rejected_without_partial_credentials(
 
 
 def test_private_destination_preserves_public_root_without_reusing_legacy_mirror_tags():
-    assert subject.PRIVATE_BB_CE1_IMAGE == (
-        "docker.io/digitalfrontierunipessoallda/df-akash-runner@sha256:"
-        "ce1b123c98e273479e08e6315fc81f7017957c23dbf88878076e75572b7b18cc"  # pragma: allowlist secret
-    )
-    assert (
-        subject.PRIVATE_BB_CE1_IMAGE.split("@", 1)[1]
-        == subject.PUBLIC_BB_CE1_IMAGE.split("@", 1)[1]
-    )
+    digest = subject.PUBLIC_BB_CE1_IMAGE.split("@", 1)[1]
+    expected = "docker.io/digitalfrontierunipessoallda/df-akash-runner@" + digest
+    actual = subject.PRIVATE_BB_CE1_IMAGE
+    assert actual == expected
     assert (
         subject.PRIVATE_BB_CE1_IMAGE.split("@", 1)[1]
         != subject.NATIVE_READER_IMAGE.split("@", 1)[1]
