@@ -19,6 +19,7 @@ def test_outcome_prefers_every_provision_result_over_pre_create_refusal():
     assert job["outputs"]["deployment_outcome"] == (
         "${{ steps.provision.outputs.deployment_outcome || "
         "steps.public_profile.outputs.deployment_outcome || "
+        "steps.private_profile.outputs.deployment_outcome || "
         "(steps.pat.outputs.native_pre_create_refused == 'true' && 'no-deployment' || '') }}"
     )
     steps = job["steps"]
