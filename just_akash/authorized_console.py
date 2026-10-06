@@ -71,6 +71,10 @@ class AuthorizedConsoleCreate(CIConsoleAPI):
     request; it does not grant cleanup authority over other wallet resources.
     """
 
+    # This redeemed transport has its own trusted authorization. Privacy is not
+    # budget-mode authority; mandatory Actions mode still overrides this marker.
+    _ci_run_budget_required = False
+
     def __init__(self, api_key: str, *, owner: str, policy_revision: str, broker: str):
         if (
             not is_canonical_akash_owner(owner)

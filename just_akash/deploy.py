@@ -48,6 +48,7 @@ from .api import (
     _extract_gseq,
     _extract_provider,
 )
+from .ci_run_budget import CIRunBudgetError, ci_required
 from .deployment_receipt import (
     credential_binding_for,
     mark_create_response_received,
@@ -66,6 +67,17 @@ logger = logging.getLogger("akash.deploy")
 # re-create (the issue-#19 re-deploy round), and both are the same run's residue. Hex so
 # it survives `_KEY_RE`'s charset and reads back through provenance.run_id_of.
 _RUN_ID = uuid.uuid4().hex[:12]
+
+
+def _create_with_budget_intent(client, sdl_content, deposit, operation_id):
+    """Keep one CI create intent across retries; the server owns send-once state.
+
+    A replacement is a distinct intent, not a retry. Legacy local clients retain
+    their existing call signature. This adds no closure/funding authority.
+    """
+    if ci_required(client):
+        return client.create_deployment(sdl_content, deposit=deposit, ci_operation_id=operation_id)
+    return client.create_deployment(sdl_content, deposit=deposit)
 
 
 def emit(code, level, message, **context):
@@ -1132,10 +1144,16 @@ def deploy(
     # Stamped BEFORE the request so a deployment created by THIS call can be told from
     # one that already existed. See _report_suspected_orphans.
     _create_started = time.time()
+    create_operation_id = receipt_operation_id or uuid.uuid4().hex
     if prepared_receipt is not None:
         prepared_receipt = mark_submitting(*prepared_receipt)
     try:
-        deployment_response = client.create_deployment(sdl_content, deposit=deposit)
+        deployment_response = _create_with_budget_intent(
+            client, sdl_content, deposit, create_operation_id
+        )
+    except CIRunBudgetError:
+        # No generic retry, stale sweep, or re-wrapping that loses terminality.
+        raise
     except RuntimeError as e:
         if "already exists" in error_text(e).lower():
             if prepared_receipt is not None:
@@ -1161,7 +1179,11 @@ def deploy(
                 _log(logging.ERROR, f"Stale deployment cleanup failed: {error_text(cleanup_err)}")
             # Retry once after cleanup
             try:
-                deployment_response = client.create_deployment(sdl_content, deposit=deposit)
+                deployment_response = _create_with_budget_intent(
+                    client, sdl_content, deposit, create_operation_id
+                )
+            except CIRunBudgetError:
+                raise
             except RuntimeError as retry_err:
                 _log(
                     logging.ERROR, f"Create deployment FAILED after retry: {error_text(retry_err)}"
@@ -2152,7 +2174,11 @@ def deploy(
         # one here doubles the cost of the failure it is trying to recover from.
         _redeploy_started = time.time()
         try:
-            redeploy_response = client.create_deployment(sdl_content, deposit=deposit)
+            redeploy_response = _create_with_budget_intent(
+                client, sdl_content, deposit, uuid.uuid4().hex
+            )
+        except CIRunBudgetError:
+            raise
         except RuntimeError as redeploy_err:
             _report_suspected_orphans(client, _redeploy_started, _RUN_ID)
             raise RuntimeError(

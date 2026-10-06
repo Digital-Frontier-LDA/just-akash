@@ -481,27 +481,35 @@ def test_private_response_receipt_survives_later_bid_failure(
 
 
 def test_main_ci_runtime_client_keeps_stronger_marker_free_protection(monkeypatch, caplog, capsys):
+    from just_akash import ci_run_budget
     from just_akash.api import CIConsoleAPI
+    from just_akash.ci_run_budget import CIRunBudgetError
 
     caplog.set_level(logging.DEBUG)
+    monkeypatch.setenv("AKASH_CI_BUDGET_URL", "https://budget.invalid")
+    monkeypatch.setenv("AKASH_CI_BUDGET_AUDIENCE", "ci-budget")
+    monkeypatch.setenv("AKASH_CI_BUDGET_ACCOUNT_ID", "primary")
+    monkeypatch.setattr(ci_run_budget, "_token", lambda _audience: "synthetic-oidc-token")
     client = CIConsoleAPI("synthetic-controller-key")
     body = json.dumps({"message": f"already exists; no longer open; {ECHO_CANARY}"}).encode()
 
-    def fail(*_args, **_kwargs):
+    def fail(_opener, request, **_kwargs):
+        assert request.full_url == "https://budget.invalid/v1/akash-ci-budget/creates"
+        assert request.get_header("X-api-key") is None
+        assert request.get_header("Authorization") == "Bearer synthetic-oidc-token"
+        assert json.loads(request.data)["sdl_content"] == PRIVATE
         raise urllib.error.HTTPError(
-            "https://console.invalid", 409, ECHO_CANARY, Message(), io.BytesIO(body)
+            "https://budget.invalid", 409, ECHO_CANARY, Message(), io.BytesIO(body)
         )
 
-    monkeypatch.setattr(client, "_open_request", fail)
-    with pytest.raises(AkashAPIError) as caught:
-        client.create_deployment(PRIVATE)
-    assert (
-        str(caught.value)
-        == "API Error (409): CI runtime response omitted; reconcile create outcome"
-    )
+    monkeypatch.setattr("urllib.request.OpenerDirector.open", fail)
+    with pytest.raises(CIRunBudgetError) as caught:
+        client.create_deployment(PRIVATE, ci_operation_id="stable-intent")
+    assert str(caught.value) == "CI_BUDGET_OPERATION_REPLAY"
     assert "already exists" not in str(caught.value)
     assert "no longer open" not in str(caught.value)
-    assert caught.value.status == 409 and caught.value.body == ""
+    assert caught.value._is_non_retryable is True
+    assert vars(caught.value) == {"code": "CI_BUDGET_OPERATION_REPLAY"}
     assert ECHO_CANARY not in _visible(caught.value, caplog, capsys)
 
 

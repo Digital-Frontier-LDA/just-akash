@@ -1,4 +1,8 @@
-"""Exercise the real Console transport with synthetic one-job runtime secrets."""
+"""Exercise remaining direct update/read transport with synthetic runtime secrets.
+
+CI creates now require the budget proxy; test_ci_run_budget covers that boundary.
+Updates retain the existing confidential Console transport, including error shape.
+"""
 
 import io
 import json
@@ -32,7 +36,7 @@ def assert_private(caplog, error=None):
     assert KEY not in visible
 
 
-def test_create_sends_exact_runtime_payload_without_logging_values(monkeypatch, caplog):
+def test_update_sends_exact_runtime_payload_without_logging_values(monkeypatch, caplog):
     caplog.set_level(logging.DEBUG, logger="akash.api")
     response = MagicMock()
     response.status = 200
@@ -41,14 +45,14 @@ def test_create_sends_exact_runtime_payload_without_logging_values(monkeypatch, 
     transport = MagicMock(return_value=response)
     monkeypatch.setattr("urllib.request.OpenerDirector.open", transport)
 
-    result = CIConsoleAPI(KEY).create_deployment(SDL, deposit=0.5)
+    result = CIConsoleAPI(KEY).update_deployment("123", SDL)
 
     transport.assert_called_once()
     request = transport.call_args.args[0]
-    assert request.method == "POST"
-    assert request.full_url == "https://console-api.akash.network/v1/deployments"
+    assert request.method == "PUT"
+    assert request.full_url == "https://console-api.akash.network/v1/deployments/123"
     assert request.get_header("X-api-key") == KEY
-    assert json.loads(request.data) == {"data": {"sdl": SDL, "deposit": 0.5}}
+    assert json.loads(request.data) == {"data": {"sdl": SDL}}
     assert transport.call_args.kwargs == {"timeout": CONSOLE_HTTP_TIMEOUT}
     assert result == {"dseq": "123", JIT: KEY}
     assert "body_bytes=" in caplog.text
@@ -75,7 +79,7 @@ def test_echoed_http_errors_are_safe_to_report_without_retry(monkeypatch, caplog
     monkeypatch.setattr("urllib.request.OpenerDirector.open", transport)
 
     with pytest.raises(AkashAPIError) as caught:
-        CIConsoleAPI(KEY).create_deployment(SDL)
+        CIConsoleAPI(KEY).update_deployment("123", SDL)
 
     assert caught.value.status == 502
     assert caught.value.body == ""
@@ -103,7 +107,7 @@ def test_timeout_metadata_survives_redaction_without_authorizing_retry(monkeypat
     )
     monkeypatch.setattr("urllib.request.OpenerDirector.open", transport)
     with pytest.raises(AkashAPIError) as caught:
-        CIConsoleAPI(KEY).create_deployment(SDL)
+        CIConsoleAPI(KEY).update_deployment("123", SDL)
     assert caught.value.status == 500
     assert caught.value.is_upstream_timeout()
     assert caught.value.retryable is True
@@ -121,7 +125,7 @@ def test_transport_error_details_do_not_escape(monkeypatch, caplog, failure, exc
     transport = MagicMock(side_effect=failure)
     monkeypatch.setattr("urllib.request.OpenerDirector.open", transport)
     with pytest.raises(exception_type) as caught:
-        CIConsoleAPI(KEY).create_deployment(SDL)
+        CIConsoleAPI(KEY).update_deployment("123", SDL)
     assert not isinstance(caught.value, AkashAPIError)
     transport.assert_called_once()
     assert_private(caplog, caught.value)
@@ -182,13 +186,13 @@ def test_redirect_never_sends_controller_key_to_another_origin(monkeypatch, capl
     # socket boundary is replaced. No Console or other-origin traffic occurs.
     monkeypatch.setattr("urllib.request.HTTPSHandler.https_open", https_open)
     with pytest.raises(AkashAPIError) as caught:
-        CIConsoleAPI(KEY).create_deployment(SDL)
+        CIConsoleAPI(KEY).update_deployment("123", SDL)
 
     assert caught.value.status == status
     assert len(calls) == 1
-    assert calls[0].full_url == "https://console-api.akash.network/v1/deployments"
+    assert calls[0].full_url == "https://console-api.akash.network/v1/deployments/123"
     assert calls[0].get_header("X-api-key") == KEY
-    assert json.loads(calls[0].data) == {"data": {"sdl": SDL, "deposit": 5.0}}
+    assert json.loads(calls[0].data) == {"data": {"sdl": SDL}}
     assert_private(caplog, caught.value)
 
 

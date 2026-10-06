@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from ._confidential import request_is_confidential, sanitize_exception, withheld_error
+from .ci_run_budget import CIRunBudgetClient, CIRunBudgetError, ci_required
 
 logger = logging.getLogger("akash.api")
 
@@ -237,6 +238,20 @@ class AkashConsoleAPI:
         endpoint: str,
         data: dict[str, Any] | None = None,
     ) -> Any:
+        if ci_required(self):
+            direct_create = method.upper() == "POST" and endpoint.rstrip("/") == "/v1/deployments"
+            top_up = method.upper() == "POST" and endpoint.rstrip("/") == "/v1/deposit-deployment"
+            settings = method.upper() in {"POST", "PATCH", "PUT"} and (
+                endpoint == "/v2/deployment-settings"
+                or endpoint.startswith("/v2/deployment-settings/")
+            )
+            disabled = (
+                isinstance(data, dict)
+                and isinstance(data.get("data"), dict)
+                and (data["data"].get("autoTopUpEnabled") is False)
+            )
+            if direct_create or top_up or (settings and not disabled):
+                raise CIRunBudgetError("CI_BUDGET_DIRECT_MUTATION_REFUSED")
         url = f"{self.base_url}{endpoint}"
         confidential = self._protect_runtime_payloads or request_is_confidential(data)
         if method.upper() == "GET":
@@ -586,7 +601,11 @@ class AkashConsoleAPI:
             return first if isinstance(first, dict) else response
         return response
 
-    def create_deployment(self, sdl_content: str, deposit: float = 5.0) -> dict[str, Any]:
+    def create_deployment(
+        self, sdl_content: str, deposit: float = 5.0, *, ci_operation_id: str | None = None
+    ) -> dict[str, Any]:
+        if ci_required(self):
+            return CIRunBudgetClient().create(sdl_content, deposit, ci_operation_id)
         response = self._request(
             "POST",
             "/v1/deployments",
@@ -938,6 +957,7 @@ class CIConsoleAPI(AkashConsoleAPI):
     This client is not admission authority, and existing consumers do not use it.
     """
 
+    _ci_run_budget_required = True
     _protect_runtime_payloads = True
 
     def __init__(self, api_key: str):
