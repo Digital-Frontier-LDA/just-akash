@@ -103,8 +103,10 @@ def test_complete_original_topology_preserves_generated_resources_and_environmen
     assert subject.validate_private_profile("bb-ce1") == "b-tier-123-2"
     runner_env = actual["services"]["runner"]["env"]
     assert len(runner_env) == 8
-    assert "RUNNER_NAME_PREFIX=just-akash-b-tier-123-2" in runner_env
-    assert "EPHEMERAL=true" in runner_env
+    fields = dict(entry.split("=", 1) for entry in runner_env)
+    assert len(fields) == 8
+    assert fields["RUNNER_NAME_PREFIX"] == "just-akash-b-tier-123-2"
+    assert fields["EPHEMERAL"] == "true"
     assert READ_FIXTURE not in "\n".join(runner_env)
     assert path.stat().st_mode & 0o777 == 0o600
     assert sorted(item.name for item in tmp_path.iterdir()) == ["output", "runner.yaml"]
