@@ -615,7 +615,7 @@ def validate_public_profile(profile: str) -> str:
 
 
 def _public_profile_payload(path: Path, label: str) -> str:
-    """Change just the qualified image and original BB name prefix in the generated SDL."""
+    """Select the qualified image while retaining the SDK's reaped runner-name prefix."""
     details = path.lstat()
     if (
         not stat.S_ISREG(details.st_mode)
@@ -668,22 +668,7 @@ def _public_profile_payload(path: Path, label: str) -> str:
         "RUN_AS_ROOT": "true",
     }:
         raise ValueError("Public BB template was not verified")
-    updated = (
-        text[: image.start()] + indent + "image: " + PUBLIC_BB_CE1_IMAGE + text[image.end() :]
-    )
-    updated, count = re.subn(
-        r"^"
-        + re.escape(indent)
-        + r"  - RUNNER_NAME_PREFIX=just-akash-"
-        + re.escape(label)
-        + r"[ \t]*$",
-        indent + "  - RUNNER_NAME_PREFIX=df-core-" + label,
-        updated,
-        flags=re.MULTILINE,
-    )
-    if count != 1:
-        raise ValueError("Public BB template was not verified")
-    return updated
+    return text[: image.start()] + indent + "image: " + PUBLIC_BB_CE1_IMAGE + text[image.end() :]
 
 
 def configure(

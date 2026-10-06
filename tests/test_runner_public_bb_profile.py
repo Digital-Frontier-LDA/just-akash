@@ -87,7 +87,7 @@ def template(tmp_path, monkeypatch, role="fast"):
 
 
 @pytest.mark.parametrize("role", ["fast", "sentry"])
-def test_actual_generated_template_selects_only_ce1_and_original_df_core_name(
+def test_actual_generated_template_selects_only_ce1_and_preserves_reaped_name(
     tmp_path, monkeypatch, role
 ):
     path = template(tmp_path, monkeypatch, role)
@@ -96,11 +96,14 @@ def test_actual_generated_template_selects_only_ce1_and_original_df_core_name(
     after = yaml.safe_load(path.read_text())
     expected = copy.deepcopy(before)
     expected["services"]["runner"]["image"] = subject.PUBLIC_BB_CE1_IMAGE
-    expected["services"]["runner"]["env"] = [
-        entry.replace("RUNNER_NAME_PREFIX=just-akash-", "RUNNER_NAME_PREFIX=df-core-")
-        for entry in expected["services"]["runner"]["env"]
-    ]
     assert after == expected
+    runner_env = dict(entry.split("=", 1) for entry in after["services"]["runner"]["env"])
+    reaper = yaml.safe_load((WORKFLOW.parent / "reap-stale-runners.yml").read_text())
+    backstop = reaper["jobs"]["reap-stale-runners"]
+    assert backstop["uses"].endswith("@5d82c5973e01b0067e61e7b65ab97579aed5ffd9")
+    assert backstop["with"]["name-prefixes"] == "just-akash-"
+    assert runner_env["RUNNER_NAME_PREFIX"].startswith(backstop["with"]["name-prefixes"])
+    assert not runner_env["RUNNER_NAME_PREFIX"].startswith("df-core-")
     assert path.stat().st_mode & 0o777 == 0o600
     assert all("credentials" not in service for service in after["services"].values())
     assert any(
