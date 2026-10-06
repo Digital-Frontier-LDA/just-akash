@@ -75,6 +75,16 @@ on:
         description: 'Unique label for this pool; carries run identity into runs-on.'
         required: true
         type: string
+      runner-public-profile:
+        description: 'Opt-in fixed public BB ce1 payload; empty preserves the existing qualified runner contract.'
+        required: false
+        type: string
+        default: ''
+      runner-private-profile:
+        description: 'Opt-in fixed private BB ce1 bootstrap from hosted SOPS reader; empty preserves existing behavior.'
+        required: false
+        type: string
+        default: ''
       runner-image:
         description: 'Optional private mirror reference. Must retain the qualified runner image digest.'
         required: false
@@ -472,11 +482,11 @@ jobs:
     timeout-minutes: 120
     outputs:
       dseq: ${{ steps.provision.outputs.dseq }}
-      deployment_outcome: ${{ steps.provision.outputs.deployment_outcome || (steps.pat.outputs.native_pre_create_refused == 'true' && 'no-deployment' || '') }}
+      deployment_outcome: ${{ steps.provision.outputs.deployment_outcome || steps.public_profile.outputs.deployment_outcome || steps.private_profile.outputs.deployment_outcome || (steps.pat.outputs.native_pre_create_refused == 'true' && 'no-deployment' || '') }}
       create_ambiguous: ${{ steps.provision.outputs.create_ambiguous }}
       provision_healthy: ${{ steps.provision.outputs.provision_healthy }}
       runners_online: ${{ steps.provision.outputs.runners_online }}
-      failure_reason: ${{ steps.pat.outputs.failure_reason || steps.provision.outputs.failure_reason || steps.candidates.outputs.failure_reason }}
+      failure_reason: ${{ steps.pat.outputs.failure_reason || steps.provision.outputs.failure_reason || steps.public_profile.outputs.failure_reason || steps.private_profile.outputs.failure_reason || steps.candidates.outputs.failure_reason }}
       wallet_free_usd: ${{ steps.provision.outputs.wallet_free_usd }}
       runner_hosts_proven: ${{ steps.candidates.outputs.proven_hosts }}
       wallet_index: 'deprecated'
@@ -516,6 +526,63 @@ jobs:
           ref: ${{ inputs.just-akash-ref }}
           path: .just-akash
           persist-credentials: false
+
+      - name: Validate the fixed public BB runner profile before any private preparation
+        id: public_profile
+        if: inputs.runner-public-profile != ''
+        env:
+          RUNNER_PUBLIC_PROFILE: ${{ inputs.runner-public-profile }}
+          RUNNER_PRIVATE_PROFILE: ${{ inputs.runner-private-profile }}
+          PUBLIC_PROFILE_SOURCE: ${{ inputs.just-akash-repository }}
+          PUBLIC_PROFILE_ORG: ${{ inputs.github-org }}
+          PUBLIC_PROFILE_POOL_SIZE: ${{ inputs.pool-size }}
+          PUBLIC_PROFILE_MIN_POOL_SIZE: ${{ inputs.min-pool-size }}
+          PUBLIC_PROFILE_EPHEMERAL: ${{ inputs.ephemeral }}
+          PUBLIC_PROFILE_OWNED_PROVIDERS: ${{ inputs.owned-providers }}
+          PUBLIC_PROFILE_LABEL: ${{ inputs.runner-label }}
+          PUBLIC_PROFILE_PLACEMENT: ${{ inputs.placement-key }}
+          PUBLIC_PROFILE_TAG_PREFIX: ${{ inputs.tag-prefix }}
+          PUBLIC_PROFILE_SOPS: ${{ inputs.runner-registry-sops }}
+          PUBLIC_PROFILE_CREDENTIALS_PRESENT: ${{ secrets.RUNNER_REGISTRY_PASSWORD != '' || secrets.RUNNER_REGISTRY_AGE_KEY != '' }}
+          RUNNER_IMAGE: ${{ inputs.runner-image }}
+          RUNNER_REGISTRY_HOST: ${{ inputs.runner-registry-host }}
+          RUNNER_REGISTRY_USERNAME: ${{ inputs.runner-registry-username }}
+          RUNNER_NATIVE_PULL_READER: ${{ inputs.runner-native-pull-reader }}
+          RUNNER_NATIVE_REPOSITORY_SCOPE: ${{ inputs.runner-native-repository-scope }}
+        run: |
+          if ! python3 -m just_akash.runner_image --sdl /tmp/runner-sdl.yaml --check-public-profile; then
+            printf 'deployment_outcome=no-deployment\nfailure_reason=PUBLIC_PROFILE_%s\n' UNQUALIFIED >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      - name: Validate the fixed private BB runner profile before reader preparation
+        id: private_profile
+        if: inputs.runner-private-profile != ''
+        env:
+          RUNNER_PUBLIC_PROFILE: ${{ inputs.runner-public-profile }}
+          RUNNER_PRIVATE_PROFILE: ${{ inputs.runner-private-profile }}
+          PRIVATE_PROFILE_SOURCE: ${{ inputs.just-akash-repository }}
+          PRIVATE_PROFILE_ORG: ${{ inputs.github-org }}
+          PRIVATE_PROFILE_POOL_SIZE: ${{ inputs.pool-size }}
+          PRIVATE_PROFILE_MIN_POOL_SIZE: ${{ inputs.min-pool-size }}
+          PRIVATE_PROFILE_EPHEMERAL: ${{ inputs.ephemeral }}
+          PRIVATE_PROFILE_OWNED_PROVIDERS: ${{ inputs.owned-providers }}
+          PRIVATE_PROFILE_LABEL: ${{ inputs.runner-label }}
+          PRIVATE_PROFILE_PLACEMENT: ${{ inputs.placement-key }}
+          PRIVATE_PROFILE_TAG_PREFIX: ${{ inputs.tag-prefix }}
+          PRIVATE_PROFILE_SOPS: ${{ inputs.runner-registry-sops }}
+          PRIVATE_PROFILE_AGE_PRESENT: ${{ secrets.RUNNER_REGISTRY_AGE_KEY != '' }}
+          PRIVATE_PROFILE_PASSWORD_PRESENT: ${{ secrets.RUNNER_REGISTRY_PASSWORD != '' }}
+          RUNNER_IMAGE: ${{ inputs.runner-image }}
+          RUNNER_REGISTRY_HOST: ${{ inputs.runner-registry-host }}
+          RUNNER_REGISTRY_USERNAME: ${{ inputs.runner-registry-username }}
+          RUNNER_NATIVE_PULL_READER: ${{ inputs.runner-native-pull-reader }}
+          RUNNER_NATIVE_REPOSITORY_SCOPE: ${{ inputs.runner-native-repository-scope }}
+        run: |
+          if ! python3 -m just_akash.runner_image --sdl /tmp/runner-sdl.yaml --check-private-profile; then
+            printf 'deployment_outcome=no-deployment\nfailure_reason=PRIVATE_PROFILE_%s\n' UNQUALIFIED >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
 
       - name: Check out the caller encrypted reader bundle
         if: inputs.runner-registry-sops
@@ -869,6 +936,8 @@ jobs:
       - name: Render runner SDL
         id: render
         env:
+          RUNNER_PUBLIC_PROFILE: ${{ inputs.runner-public-profile }}
+          RUNNER_PRIVATE_PROFILE: ${{ inputs.runner-private-profile }}
           ORG: ${{ inputs.github-org }}
           RUNNER_LABEL: ${{ inputs.runner-label }}
           POOL_SIZE: ${{ inputs.pool-size }}
@@ -925,7 +994,11 @@ jobs:
           esac
           case "${PLACEMENT_KEY}" in
             dcloud|dcloud-*) echo "::error title=runner-pool::placement-key '${PLACEMENT_KEY}' is the Akash-wide default placement name, owned by nobody. A reaper aimed at it would match strangers' deployments. Namespace it to your repo." >&2; exit 2 ;;
-            dfci-infra-*)    echo "::error title=runner-pool::placement-key '${PLACEMENT_KEY}' is the SIBLING repo's prefix, which its sweeper reaps on a schedule. Stamping it would have that sweeper close this pool mid-CI." >&2; exit 2 ;;
+            dfci-infra-*)
+              if { [ "${RUNNER_PUBLIC_PROFILE:-}" != bb-ce1 ] && [ "${RUNNER_PRIVATE_PROFILE:-}" != bb-ce1 ]; } || [ "${GITHUB_REPOSITORY:-}" != Borduas-Holdings/Blazing-Back ] || [ "$PLACEMENT_KEY" != "dfci-infra-runner-run-${GH_RUN_ID}-end" ] || [ "$RUNNER_LABEL" != "fast-pool-${GH_RUN_ID}" ]; then
+                echo "::error title=runner-pool::placement-key '${PLACEMENT_KEY}' is the SIBLING repo's prefix, which its sweeper reaps on a schedule. Stamping it would have that sweeper close this pool mid-CI." >&2
+                exit 2
+              fi ;;
           esac
           _rest="${PLACEMENT_KEY##*-run-}"
           _seg="${_rest%%-*}"
@@ -1082,6 +1155,31 @@ jobs:
       - name: Configure the qualified private runner mirror
         if: ${{ !inputs.runner-registry-sops }}
         env:
+          RUNNER_PUBLIC_PROFILE: ${{ inputs.runner-public-profile }}
+          RUNNER_PRIVATE_PROFILE: ${{ inputs.runner-private-profile }}
+          PRIVATE_PROFILE_SOURCE: ${{ inputs.just-akash-repository }}
+          PRIVATE_PROFILE_ORG: ${{ inputs.github-org }}
+          PRIVATE_PROFILE_POOL_SIZE: ${{ inputs.pool-size }}
+          PRIVATE_PROFILE_MIN_POOL_SIZE: ${{ inputs.min-pool-size }}
+          PRIVATE_PROFILE_EPHEMERAL: ${{ inputs.ephemeral }}
+          PRIVATE_PROFILE_OWNED_PROVIDERS: ${{ inputs.owned-providers }}
+          PRIVATE_PROFILE_LABEL: ${{ inputs.runner-label }}
+          PRIVATE_PROFILE_PLACEMENT: ${{ inputs.placement-key }}
+          PRIVATE_PROFILE_TAG_PREFIX: ${{ inputs.tag-prefix }}
+          PRIVATE_PROFILE_SOPS: ${{ inputs.runner-registry-sops }}
+          PRIVATE_PROFILE_AGE_PRESENT: ${{ secrets.RUNNER_REGISTRY_AGE_KEY != '' }}
+          PRIVATE_PROFILE_PASSWORD_PRESENT: ${{ secrets.RUNNER_REGISTRY_PASSWORD != '' }}
+          PUBLIC_PROFILE_SOURCE: ${{ inputs.just-akash-repository }}
+          PUBLIC_PROFILE_ORG: ${{ inputs.github-org }}
+          PUBLIC_PROFILE_POOL_SIZE: ${{ inputs.pool-size }}
+          PUBLIC_PROFILE_MIN_POOL_SIZE: ${{ inputs.min-pool-size }}
+          PUBLIC_PROFILE_EPHEMERAL: ${{ inputs.ephemeral }}
+          PUBLIC_PROFILE_OWNED_PROVIDERS: ${{ inputs.owned-providers }}
+          PUBLIC_PROFILE_LABEL: ${{ inputs.runner-label }}
+          PUBLIC_PROFILE_PLACEMENT: ${{ inputs.placement-key }}
+          PUBLIC_PROFILE_TAG_PREFIX: ${{ inputs.tag-prefix }}
+          PUBLIC_PROFILE_SOPS: ${{ inputs.runner-registry-sops }}
+          PUBLIC_PROFILE_CREDENTIALS_PRESENT: ${{ secrets.RUNNER_REGISTRY_PASSWORD != '' || secrets.RUNNER_REGISTRY_AGE_KEY != '' }}
           RUNNER_IMAGE: ${{ inputs.runner-image }}
           RUNNER_REGISTRY_HOST: ${{ inputs.runner-registry-host }}
           RUNNER_REGISTRY_USERNAME: ${{ inputs.runner-registry-username }}
@@ -1093,6 +1191,31 @@ jobs:
       - name: Configure the qualified private runner mirror from SOPS
         if: inputs.runner-registry-sops
         env:
+          RUNNER_PUBLIC_PROFILE: ${{ inputs.runner-public-profile }}
+          RUNNER_PRIVATE_PROFILE: ${{ inputs.runner-private-profile }}
+          PRIVATE_PROFILE_SOURCE: ${{ inputs.just-akash-repository }}
+          PRIVATE_PROFILE_ORG: ${{ inputs.github-org }}
+          PRIVATE_PROFILE_POOL_SIZE: ${{ inputs.pool-size }}
+          PRIVATE_PROFILE_MIN_POOL_SIZE: ${{ inputs.min-pool-size }}
+          PRIVATE_PROFILE_EPHEMERAL: ${{ inputs.ephemeral }}
+          PRIVATE_PROFILE_OWNED_PROVIDERS: ${{ inputs.owned-providers }}
+          PRIVATE_PROFILE_LABEL: ${{ inputs.runner-label }}
+          PRIVATE_PROFILE_PLACEMENT: ${{ inputs.placement-key }}
+          PRIVATE_PROFILE_TAG_PREFIX: ${{ inputs.tag-prefix }}
+          PRIVATE_PROFILE_SOPS: ${{ inputs.runner-registry-sops }}
+          PRIVATE_PROFILE_AGE_PRESENT: ${{ secrets.RUNNER_REGISTRY_AGE_KEY != '' }}
+          PRIVATE_PROFILE_PASSWORD_PRESENT: ${{ secrets.RUNNER_REGISTRY_PASSWORD != '' }}
+          PUBLIC_PROFILE_SOURCE: ${{ inputs.just-akash-repository }}
+          PUBLIC_PROFILE_ORG: ${{ inputs.github-org }}
+          PUBLIC_PROFILE_POOL_SIZE: ${{ inputs.pool-size }}
+          PUBLIC_PROFILE_MIN_POOL_SIZE: ${{ inputs.min-pool-size }}
+          PUBLIC_PROFILE_EPHEMERAL: ${{ inputs.ephemeral }}
+          PUBLIC_PROFILE_OWNED_PROVIDERS: ${{ inputs.owned-providers }}
+          PUBLIC_PROFILE_LABEL: ${{ inputs.runner-label }}
+          PUBLIC_PROFILE_PLACEMENT: ${{ inputs.placement-key }}
+          PUBLIC_PROFILE_TAG_PREFIX: ${{ inputs.tag-prefix }}
+          PUBLIC_PROFILE_SOPS: ${{ inputs.runner-registry-sops }}
+          PUBLIC_PROFILE_CREDENTIALS_PRESENT: ${{ secrets.RUNNER_REGISTRY_PASSWORD != '' || secrets.RUNNER_REGISTRY_AGE_KEY != '' }}
           RUNNER_IMAGE: ${{ inputs.runner-image }}
           RUNNER_REGISTRY_HOST: ${{ inputs.runner-registry-host }}
           RUNNER_REGISTRY_USERNAME: ${{ inputs.runner-registry-username }}
