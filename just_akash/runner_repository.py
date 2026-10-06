@@ -4,7 +4,6 @@ import json
 import os
 import re
 import urllib.request
-from contextlib import suppress
 from datetime import datetime, timezone
 from http.client import HTTPException
 
@@ -71,20 +70,39 @@ def verify_native_reader_repository_identity() -> None:
         raise NativeReaderRepositoryError("Native reader repository identity was not verified")
 
 
+def _registration_expiry_valid(value: object, now: datetime) -> bool:
+    """Accept bounded RFC3339 instants without discarding sub-microsecond TTL bounds."""
+    if not isinstance(value, str) or not 20 <= len(value) <= 40:
+        return False
+    shape = re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+        r"(?:\.(?P<fraction>[0-9]{1,9}))?(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])",
+        value,
+    )
+    if shape is None:
+        return False
+    try:
+        expiry = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        delta = expiry - now
+        # Python datetime retains six fractional digits. Preserve the remaining
+        # nanoseconds so a value just beyond either TTL boundary cannot round in.
+        fraction_ns = int((shape.group("fraction") or "").ljust(9, "0"))
+        remaining_ns = (
+            (delta.days * 86400 + delta.seconds) * 1_000_000_000
+            + delta.microseconds * 1000
+            + fraction_ns % 1000
+        )
+        return 0 < remaining_ns <= 65 * 60 * 1_000_000_000
+    except (ValueError, TypeError, OverflowError):
+        return False
+
+
 def verify_native_reader_repository() -> None:
     """Prove exact private identity and actual POST authority; discard its token."""
     verify_native_reader_repository_identity()
     document = _native_repository_request(registration=True)
     token, expiry = document.get("token"), document.get("expires_at")
-    valid_expiry = False
-    if isinstance(expiry, str) and re.fullmatch(
-        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", expiry
-    ):
-        with suppress(ValueError):
-            remaining = (
-                datetime.fromisoformat(expiry.replace("Z", "+00:00")) - datetime.now(timezone.utc)
-            ).total_seconds()
-            valid_expiry = 0 < remaining <= 65 * 60
+    valid_expiry = _registration_expiry_valid(expiry, datetime.now(timezone.utc))
     if (
         not isinstance(token, str)
         or re.fullmatch(r"[A-Za-z0-9]{1,4096}", token) is None
