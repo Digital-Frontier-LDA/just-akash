@@ -472,7 +472,7 @@ jobs:
     timeout-minutes: 120
     outputs:
       dseq: ${{ steps.provision.outputs.dseq }}
-      deployment_outcome: ${{ steps.provision.outputs.deployment_outcome }}
+      deployment_outcome: ${{ steps.provision.outputs.deployment_outcome || (steps.pat.outputs.native_pre_create_refused == 'true' && 'no-deployment' || '') }}
       create_ambiguous: ${{ steps.provision.outputs.create_ambiguous }}
       provision_healthy: ${{ steps.provision.outputs.provision_healthy }}
       runners_online: ${{ steps.provision.outputs.runners_online }}
@@ -601,6 +601,7 @@ jobs:
               if [ "${RUNNER_NATIVE_PULL_READER:-false}" != true ] || [ "${READER_SOPS:-false}" != true ] \
                 || [ "${CALLER:-}" != Borduas-Holdings/blazing ] || [ "$ORG" != Borduas-Holdings ]; then
                 echo failure_reason=NATIVE_READER_REPOSITORY_UNQUALIFIED >> "$GITHUB_OUTPUT"
+                echo native_pre_create_refused=true >> "$GITHUB_OUTPUT"
                 echo '::error::Native reader repository scope was not verified'; exit 1
               fi
               if ! python3 - <<'PYREPOSITORY'
@@ -612,6 +613,7 @@ jobs:
           PYREPOSITORY
               then
                 echo failure_reason=NATIVE_READER_REPOSITORY_UNQUALIFIED >> "$GITHUB_OUTPUT"
+                echo native_pre_create_refused=true >> "$GITHUB_OUTPUT"
                 echo '::error::Native reader repository registration authority was not verified'; exit 1
               fi
               echo 'Fixed private repository registration POST authority verified'
