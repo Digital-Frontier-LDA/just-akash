@@ -81,7 +81,7 @@ on:
         type: string
         default: ''
       runner-private-profile:
-        description: 'Opt-in fixed private BB ce1 bootstrap from hosted SOPS reader; empty preserves existing behavior.'
+        description: 'Opt-in fixed private BB ce1 or Blazing aaf bootstrap from hosted SOPS reader; empty preserves existing behavior.'
         required: false
         type: string
         default: ''
@@ -555,7 +555,7 @@ jobs:
             exit 1
           fi
 
-      - name: Validate the fixed private BB runner profile before reader preparation
+      - name: Validate the fixed private runner profile before reader preparation
         id: private_profile
         if: inputs.runner-private-profile != ''
         env:

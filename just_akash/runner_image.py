@@ -628,8 +628,78 @@ PRIVATE_BB_CE1_IMAGE = (
 )
 
 
+PRIVATE_BLAZING_AAF_IMAGE = (
+    "docker.io/digitalfrontierunipessoallda/df-akash-runner@"
+    + NATIVE_READER_IMAGE.rsplit("@", 1)[1]
+)
+
+
+def validate_private_blazing_profile(profile: str) -> str:
+    """Preserve the fixed Blazing fast/E2E pool contracts with a hosted reader."""
+    values = os.environ
+    if (
+        profile != "blazing-aaf"
+        or values.get("RUNNER_PUBLIC_PROFILE", "") != ""
+        or values.get("RUNNER_IMAGE", "") != ""
+        or values.get("RUNNER_REGISTRY_HOST") != "https://index.docker.io/v1/"
+        or values.get("RUNNER_REGISTRY_USERNAME") != "jobordu"
+        or values.get("RUNNER_REGISTRY_PASSWORD", "") != ""
+        or values.get("PRIVATE_PROFILE_SOPS") != "true"
+        or values.get("PRIVATE_PROFILE_AGE_PRESENT") != "true"
+        or values.get("PRIVATE_PROFILE_PASSWORD_PRESENT") != "false"
+        or any(
+            values.get(key, "false") != "false"
+            for key in ("RUNNER_NATIVE_PULL_READER", "RUNNER_NATIVE_REPOSITORY_SCOPE")
+        )
+        or values.get("RUNNER_ENVIRONMENT") != "github-hosted"
+        or values.get("GITHUB_REPOSITORY") != "Borduas-Holdings/blazing"
+        or values.get("PRIVATE_PROFILE_SOURCE") != "Digital-Frontier-LDA/just-akash"
+        or values.get("PRIVATE_PROFILE_ORG") != "Borduas-Holdings"
+        or values.get("PRIVATE_PROFILE_EPHEMERAL") != "false"
+    ):
+        raise ValueError("Private Blazing profile was not verified")
+    run, attempt = values.get("GITHUB_RUN_ID", ""), values.get("GITHUB_RUN_ATTEMPT", "")
+    if any(
+        re.fullmatch(r"[1-9][0-9]{0,19}", value) is None or int(value) > 2**64 - 1
+        for value in (run, attempt)
+    ):
+        raise ValueError("Private Blazing profile was not verified")
+    ownership = values.get("PRIVATE_PROFILE_OWNED_PROVIDERS", "")
+    if not 0 < len(ownership) <= 512:
+        raise ValueError("Private Blazing profile was not verified")
+    try:
+        owners = json.loads(ownership)
+    except ValueError:
+        raise ValueError("Private Blazing profile was not verified") from None
+    if (
+        not isinstance(owners, list)
+        or len(owners) != 3
+        or any(not isinstance(value, str) for value in owners)
+        or set(owners) != NATIVE_READER_PROVIDERS
+    ):
+        raise ValueError("Private Blazing profile was not verified")
+    label = values.get("PRIVATE_PROFILE_LABEL", "")
+    identity = (
+        label,
+        values.get("PRIVATE_PROFILE_PLACEMENT"),
+        values.get("PRIVATE_PROFILE_TAG_PREFIX"),
+        values.get("PRIVATE_PROFILE_POOL_SIZE"),
+    )
+    if identity not in (
+        (f"fast-pool-{run}-{attempt}", f"borduas-runner-run-{run}-end", "ci-blazing-fast", "4"),
+        (f"e2epool-{run}-{attempt}", f"borduas-runner-run-{run}-end", "ci-blazing-e2e", "2"),
+    ) or values.get("PRIVATE_PROFILE_MIN_POOL_SIZE", "") not in (
+        "",
+        values.get("PRIVATE_PROFILE_POOL_SIZE"),
+    ):
+        raise ValueError("Private Blazing profile was not verified")
+    return label
+
+
 def validate_private_profile(profile: str) -> str:
     """Admit fixed BB roles with hosted SOPS transport and standard SDL credentials."""
+    if profile == "blazing-aaf":
+        return validate_private_blazing_profile(profile)
     values = os.environ
     if (
         profile != "bb-ce1"
@@ -805,7 +875,11 @@ def configure(
         updated = _public_profile_payload(
             path,
             label,
-            selected_image=PRIVATE_BB_CE1_IMAGE,
+            selected_image=(
+                PRIVATE_BLAZING_AAF_IMAGE
+                if private_profile == "blazing-aaf"
+                else PRIVATE_BB_CE1_IMAGE
+            ),
             ephemeral=os.environ["PRIVATE_PROFILE_EPHEMERAL"],
         )
         matches = list(re.finditer(r"^([ \t]*)image:[ \t]+(\S+)[ \t]*$", updated, re.MULTILINE))
