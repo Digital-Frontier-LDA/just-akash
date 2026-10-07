@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Verify exact source and publish wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Check out exact tag source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Require reviewed main ancestry and successful exact source gates
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify_release_source.py \
+            --output release-source-evidence.json --write-env
+
+      - name: Build with the closed pinned tool set
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --no-deps \
+            build==1.6.1 hatchling==1.32.0 packaging==26.3 pathspec==1.1.1 \
+            pluggy==1.6.0 pyproject_hooks==1.2.0 tomlkit==0.15.1 \
+            trove-classifiers==2026.6.1.19
+          python3 -m build --no-isolation
+
+      - name: Verify the installed wheel contract and emit its immutable pin
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess, tomllib, zipfile
+          version = os.environ["RELEASE_VERSION"]
+          wheel = pathlib.Path("dist") / f"just_akash-{version}-py3-none-any.whl"
+          sdist = pathlib.Path("dist") / f"just_akash-{version}.tar.gz"
+          if not wheel.is_file() or not sdist.is_file() or len(list(pathlib.Path("dist").iterdir())) != 2:
+              raise SystemExit("unexpected release artifact names/population")
+          with zipfile.ZipFile(wheel) as archive:
+              if "just_akash/execution_observation.py" not in archive.namelist():
+                  raise SystemExit("typed execution adapter missing from wheel")
+          core = next(item for item in tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["dependencies"] if item.startswith("akash-lease-core @ "))
+          subprocess.run(("python3", "-m", "venv", ".release-wheel-check"), check=True)
+          python = str(pathlib.Path(".release-wheel-check/bin/python").resolve())
+          # Smoke-test the installed wheel with the exact locked runtime closure,
+          # not broad metadata ranges resolving different dependencies at release.
+          packages = tomllib.loads(pathlib.Path("uv.lock").read_text())["package"]
+          runtime_names = {"websockets", "pexpect", "ptyprocess", "pyyaml"}
+          runtime = [f"{item['name']}=={item['version']}" for item in packages if item["name"] in runtime_names]
+          if len(runtime) != len(runtime_names):
+              raise SystemExit("locked runtime dependency population is incomplete")
+          subprocess.run((python, "-m", "pip", "install", "--no-deps", core, str(wheel.resolve()), *runtime), check=True)
+          subprocess.run((python, "-I", "-c", "from just_akash.execution_observation import observe_execution, ExecutionObservation; from akash_lease_core import ExecutionClosure, SettlementEvidence; assert callable(observe_execution)"), cwd="/", check=True)
+          checksum = hashlib.sha256(wheel.read_bytes()).hexdigest()
+          line = f"just-akash @ https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/download/{os.environ['GITHUB_REF_NAME']}/{wheel.name}#sha256={checksum}"
+          pathlib.Path("dist/SHA256SUMS").write_text("".join(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n" for path in (wheel, sdist)))
+          pathlib.Path("dist/requirements-release.txt").write_text(line + "\n")
+          pathlib.Path("dist/release-source-evidence.json").write_bytes(pathlib.Path("release-source-evidence.json").read_bytes())
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
+              output.write(f"### Immutable release pin\n\nSource: `{os.environ['RELEASE_SOURCE']}`\n\n```\n{line}\n```\n")
+          PY
+
+      - name: Publish the verified new release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify_release_source.py \
+            --expected-source "${RELEASE_SOURCE}" --recorded-evidence release-source-evidence.json \
+            --output dist/release-publication-evidence.json
+          gh release create "${GITHUB_REF_NAME}" dist/* --verify-tag \
+            --title "${GITHUB_REF_NAME}" --generate-notes
