@@ -64,6 +64,29 @@ def create_body(sdl_content: str, deposit: float) -> bytes:
     return json.dumps({"data": {"sdl": sdl_content, "deposit": deposit}}).encode("utf-8")
 
 
+def create_runtime_body(sdl_content: str, runtime_limit_hours: float) -> bytes:
+    """Preserve the runtime-limit payload; it proves no financial exposure bound.
+
+    The trusted broker must derive exposure separately for these exact bytes and
+    the backend policy. No deposit is inferred or added to this payload.
+    """
+    if (
+        not isinstance(sdl_content, str)
+        or not sdl_content
+        or type(runtime_limit_hours) not in (int, float)
+        or runtime_limit_hours <= 0
+        or (type(runtime_limit_hours) is float and not math.isfinite(runtime_limit_hours))
+    ):
+        raise CreateHeld("Invalid Console runtime-limit create payload")
+    try:
+        return json.dumps(
+            {"data": {"sdl": sdl_content, "runtimeLimitHours": runtime_limit_hours}},
+            allow_nan=False,
+        ).encode("utf-8")
+    except (ValueError, OverflowError):
+        raise CreateHeld("Invalid Console runtime-limit create payload") from None
+
+
 class AuthorizedConsoleCreate(CIConsoleAPI):
     """Single-use transport configured by the trusted controller.
 
@@ -120,18 +143,29 @@ class AuthorizedConsoleCreate(CIConsoleAPI):
         sdl_content: str,
         deposit: float,
     ) -> dict[str, Any]:
-        if not self._submit_lock.acquire(blocking=False):
-            raise CreateHeld("Console create submission is already in progress")
-        try:
-            return self._submit(
-                request=request,
-                permit=permit,
-                authorization=authorization,
-                sdl_content=sdl_content,
-                deposit=deposit,
-            )
-        finally:
-            self._submit_lock.release()
+        return self._submit(
+            request=request,
+            permit=permit,
+            authorization=authorization,
+            body=create_body(sdl_content, deposit),
+        )
+
+    def submit_runtime_limit(
+        self,
+        *,
+        request: AdmissionRequest,
+        permit: CreatePermit,
+        authorization: CreateSubmissionAuthorization,
+        sdl_content: str,
+        runtime_limit_hours: float,
+    ) -> dict[str, Any]:
+        """Submit one redeemed create with the exact runtime-limit wire variant."""
+        return self._submit(
+            request=request,
+            permit=permit,
+            authorization=authorization,
+            body=create_runtime_body(sdl_content, runtime_limit_hours),
+        )
 
     def _submit(
         self,
@@ -139,12 +173,30 @@ class AuthorizedConsoleCreate(CIConsoleAPI):
         request: AdmissionRequest,
         permit: CreatePermit,
         authorization: CreateSubmissionAuthorization,
-        sdl_content: str,
-        deposit: float,
+        body: bytes,
+    ) -> dict[str, Any]:
+        if not self._submit_lock.acquire(blocking=False):
+            raise CreateHeld("Console create submission is already in progress")
+        try:
+            return self._submit_locked(
+                request=request,
+                permit=permit,
+                authorization=authorization,
+                body=body,
+            )
+        finally:
+            self._submit_lock.release()
+
+    def _submit_locked(
+        self,
+        *,
+        request: AdmissionRequest,
+        permit: CreatePermit,
+        authorization: CreateSubmissionAuthorization,
+        body: bytes,
     ) -> dict[str, Any]:
         if self._used:
             raise CreateHeld("This Console create client is already consumed")
-        body = create_body(sdl_content, deposit)
         if not all(
             isinstance(value, expected)
             for value, expected in (
@@ -160,7 +212,9 @@ class AuthorizedConsoleCreate(CIConsoleAPI):
             # A fresh authenticated account read uses this same fixed-origin key.
             if self.account_address() != self._owner:
                 raise CreateHeld("Console credential owner differs from the prepared owner")
-            response = super().create_deployment(sdl_content, deposit)
+            envelope = super()._request("POST", "/v1/deployments", json.loads(body))
+            data = envelope.get("data", envelope) if isinstance(envelope, dict) else {}
+            response = data if isinstance(data, dict) else envelope
             dseq = response.get("dseq")
             if (
                 type(dseq) not in (str, int)
