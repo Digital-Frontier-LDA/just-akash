@@ -527,92 +527,6 @@ jobs:
           path: .just-akash
           persist-credentials: false
 
-      - name: Validate the fixed public BB runner profile before any private preparation
-        id: public_profile
-        if: inputs.runner-public-profile != ''
-        env:
-          RUNNER_PUBLIC_PROFILE: ${{ inputs.runner-public-profile }}
-          RUNNER_PRIVATE_PROFILE: ${{ inputs.runner-private-profile }}
-          PUBLIC_PROFILE_SOURCE: ${{ inputs.just-akash-repository }}
-          PUBLIC_PROFILE_ORG: ${{ inputs.github-org }}
-          PUBLIC_PROFILE_POOL_SIZE: ${{ inputs.pool-size }}
-          PUBLIC_PROFILE_MIN_POOL_SIZE: ${{ inputs.min-pool-size }}
-          PUBLIC_PROFILE_EPHEMERAL: ${{ inputs.ephemeral }}
-          PUBLIC_PROFILE_OWNED_PROVIDERS: ${{ inputs.owned-providers }}
-          PUBLIC_PROFILE_LABEL: ${{ inputs.runner-label }}
-          PUBLIC_PROFILE_PLACEMENT: ${{ inputs.placement-key }}
-          PUBLIC_PROFILE_TAG_PREFIX: ${{ inputs.tag-prefix }}
-          PUBLIC_PROFILE_SOPS: ${{ inputs.runner-registry-sops }}
-          PUBLIC_PROFILE_CREDENTIALS_PRESENT: ${{ secrets.RUNNER_REGISTRY_PASSWORD != '' || secrets.RUNNER_REGISTRY_AGE_KEY != '' }}
-          RUNNER_IMAGE: ${{ inputs.runner-image }}
-          RUNNER_REGISTRY_HOST: ${{ inputs.runner-registry-host }}
-          RUNNER_REGISTRY_USERNAME: ${{ inputs.runner-registry-username }}
-          RUNNER_NATIVE_PULL_READER: ${{ inputs.runner-native-pull-reader }}
-          RUNNER_NATIVE_REPOSITORY_SCOPE: ${{ inputs.runner-native-repository-scope }}
-        run: |
-          if ! python3 -m just_akash.runner_image --sdl /tmp/runner-sdl.yaml --check-public-profile; then
-            printf 'deployment_outcome=no-deployment\nfailure_reason=PUBLIC_PROFILE_%s\n' UNQUALIFIED >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
-
-      - name: Validate the fixed private runner profile before reader preparation
-        id: private_profile
-        if: inputs.runner-private-profile != ''
-        env:
-          RUNNER_PUBLIC_PROFILE: ${{ inputs.runner-public-profile }}
-          RUNNER_PRIVATE_PROFILE: ${{ inputs.runner-private-profile }}
-          PRIVATE_PROFILE_SOURCE: ${{ inputs.just-akash-repository }}
-          PRIVATE_PROFILE_ORG: ${{ inputs.github-org }}
-          PRIVATE_PROFILE_POOL_SIZE: ${{ inputs.pool-size }}
-          PRIVATE_PROFILE_MIN_POOL_SIZE: ${{ inputs.min-pool-size }}
-          PRIVATE_PROFILE_CPU: ${{ inputs.cpu }}
-          PRIVATE_PROFILE_MEMORY: ${{ inputs.memory }}
-          PRIVATE_PROFILE_STORAGE: ${{ inputs.storage }}
-          PRIVATE_PROFILE_EPHEMERAL: ${{ inputs.ephemeral }}
-          PRIVATE_PROFILE_OWNED_PROVIDERS: ${{ inputs.owned-providers }}
-          PRIVATE_PROFILE_LABEL: ${{ inputs.runner-label }}
-          PRIVATE_PROFILE_PLACEMENT: ${{ inputs.placement-key }}
-          PRIVATE_PROFILE_TAG_PREFIX: ${{ inputs.tag-prefix }}
-          PRIVATE_PROFILE_SOPS: ${{ inputs.runner-registry-sops }}
-          PRIVATE_PROFILE_AGE_PRESENT: ${{ secrets.RUNNER_REGISTRY_AGE_KEY != '' }}
-          PRIVATE_PROFILE_PASSWORD_PRESENT: ${{ secrets.RUNNER_REGISTRY_PASSWORD != '' }}
-          RUNNER_IMAGE: ${{ inputs.runner-image }}
-          RUNNER_REGISTRY_HOST: ${{ inputs.runner-registry-host }}
-          RUNNER_REGISTRY_USERNAME: ${{ inputs.runner-registry-username }}
-          RUNNER_NATIVE_PULL_READER: ${{ inputs.runner-native-pull-reader }}
-          RUNNER_NATIVE_REPOSITORY_SCOPE: ${{ inputs.runner-native-repository-scope }}
-        run: |
-          if ! python3 -m just_akash.runner_image --sdl /tmp/runner-sdl.yaml --check-private-profile; then
-            printf 'deployment_outcome=no-deployment\nfailure_reason=PRIVATE_PROFILE_%s\n' UNQUALIFIED >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
-
-      - name: Check out the caller encrypted reader bundle
-        if: inputs.runner-registry-sops
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.sha }}
-          path: .runner-registry-source
-          sparse-checkout: secrets/registry-pull.sops.env
-          sparse-checkout-cone-mode: false
-          persist-credentials: false
-
-      - name: Install checksum-pinned SOPS for private runner pulls
-        if: inputs.runner-registry-sops
-        run: |
-          set -euo pipefail
-          task_dir=$(mktemp -d)
-          trap 'rm -rf "$task_dir"' EXIT
-          curl --fail --silent --show-error --location --retry 3 --max-time 120 \
-            https://github.com/getsops/sops/releases/download/v3.13.1/sops-v3.13.1.linux.amd64 \
-            --output "$task_dir/sops"
-          echo "620a9d7e3352ababeca6908cea24a6e8b14ce89a448ddbd3f94f1ef3398f470a  $task_dir/sops" | sha256sum --check
-          mkdir -p "$RUNNER_TEMP/runner-pull-bin"
-          install -m 0755 "$task_dir/sops" "$RUNNER_TEMP/runner-pull-bin/sops"
-          printf '%s\n' "$RUNNER_TEMP/runner-pull-bin" >> "$GITHUB_PATH"
-
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
-
       # A PAT EXPIRY MUST NOT BE SILENT. Without this the runner simply never registers,
       # the pool times out after ~15 minutes, and the run reports RUNNER_NEVER_REGISTERED
       # — indistinguishable from a provider that leases and never schedules. That reading
@@ -672,7 +586,8 @@ jobs:
                 || [ "${CALLER:-}" != Borduas-Holdings/blazing ] || [ "$ORG" != Borduas-Holdings ]; then
                 echo failure_reason=NATIVE_READER_REPOSITORY_UNQUALIFIED >> "$GITHUB_OUTPUT"
                 echo native_pre_create_refused=true >> "$GITHUB_OUTPUT"
-                echo '::error::Native reader repository scope was not verified'; exit 1
+                echo '::error::Native reader repository scope was not verified'
+                exit 1
               fi
               if ! python3 - <<'PYREPOSITORY'
           from just_akash.runner_repository import verify_native_reader_repository
@@ -684,11 +599,16 @@ jobs:
               then
                 echo failure_reason=NATIVE_READER_REPOSITORY_UNQUALIFIED >> "$GITHUB_OUTPUT"
                 echo native_pre_create_refused=true >> "$GITHUB_OUTPUT"
-                echo '::error::Native reader repository registration authority was not verified'; exit 1
+                echo '::error::Native reader repository registration authority was not verified'
+                exit 1
               fi
               echo 'Fixed private repository registration POST authority verified'
               exit 0 ;;
-            *) echo failure_reason=NATIVE_READER_REPOSITORY_UNQUALIFIED >> "$GITHUB_OUTPUT"; exit 1 ;;
+            *)
+              echo failure_reason=NATIVE_READER_REPOSITORY_UNQUALIFIED >> "$GITHUB_OUTPUT"
+              echo native_pre_create_refused=true >> "$GITHUB_OUTPUT"
+              exit 1
+              ;;
           esac
           # ONE request, not two. Two calls double latency and API spend and can
           # disagree: the status line could come from a call that succeeded while
@@ -859,6 +779,92 @@ jobs:
             exit 1
           fi
           echo "runner PAT valid for ${ORG}"
+
+      - name: Validate the fixed public BB runner profile before any private preparation
+        id: public_profile
+        if: inputs.runner-public-profile != ''
+        env:
+          RUNNER_PUBLIC_PROFILE: ${{ inputs.runner-public-profile }}
+          RUNNER_PRIVATE_PROFILE: ${{ inputs.runner-private-profile }}
+          PUBLIC_PROFILE_SOURCE: ${{ inputs.just-akash-repository }}
+          PUBLIC_PROFILE_ORG: ${{ inputs.github-org }}
+          PUBLIC_PROFILE_POOL_SIZE: ${{ inputs.pool-size }}
+          PUBLIC_PROFILE_MIN_POOL_SIZE: ${{ inputs.min-pool-size }}
+          PUBLIC_PROFILE_EPHEMERAL: ${{ inputs.ephemeral }}
+          PUBLIC_PROFILE_OWNED_PROVIDERS: ${{ inputs.owned-providers }}
+          PUBLIC_PROFILE_LABEL: ${{ inputs.runner-label }}
+          PUBLIC_PROFILE_PLACEMENT: ${{ inputs.placement-key }}
+          PUBLIC_PROFILE_TAG_PREFIX: ${{ inputs.tag-prefix }}
+          PUBLIC_PROFILE_SOPS: ${{ inputs.runner-registry-sops }}
+          PUBLIC_PROFILE_CREDENTIALS_PRESENT: ${{ secrets.RUNNER_REGISTRY_PASSWORD != '' || secrets.RUNNER_REGISTRY_AGE_KEY != '' }}
+          RUNNER_IMAGE: ${{ inputs.runner-image }}
+          RUNNER_REGISTRY_HOST: ${{ inputs.runner-registry-host }}
+          RUNNER_REGISTRY_USERNAME: ${{ inputs.runner-registry-username }}
+          RUNNER_NATIVE_PULL_READER: ${{ inputs.runner-native-pull-reader }}
+          RUNNER_NATIVE_REPOSITORY_SCOPE: ${{ inputs.runner-native-repository-scope }}
+        run: |
+          if ! python3 -m just_akash.runner_image --sdl /tmp/runner-sdl.yaml --check-public-profile; then
+            printf 'deployment_outcome=no-deployment\nfailure_reason=PUBLIC_PROFILE_%s\n' UNQUALIFIED >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      - name: Validate the fixed private runner profile before reader preparation
+        id: private_profile
+        if: inputs.runner-private-profile != ''
+        env:
+          RUNNER_PUBLIC_PROFILE: ${{ inputs.runner-public-profile }}
+          RUNNER_PRIVATE_PROFILE: ${{ inputs.runner-private-profile }}
+          PRIVATE_PROFILE_SOURCE: ${{ inputs.just-akash-repository }}
+          PRIVATE_PROFILE_ORG: ${{ inputs.github-org }}
+          PRIVATE_PROFILE_POOL_SIZE: ${{ inputs.pool-size }}
+          PRIVATE_PROFILE_MIN_POOL_SIZE: ${{ inputs.min-pool-size }}
+          PRIVATE_PROFILE_CPU: ${{ inputs.cpu }}
+          PRIVATE_PROFILE_MEMORY: ${{ inputs.memory }}
+          PRIVATE_PROFILE_STORAGE: ${{ inputs.storage }}
+          PRIVATE_PROFILE_EPHEMERAL: ${{ inputs.ephemeral }}
+          PRIVATE_PROFILE_OWNED_PROVIDERS: ${{ inputs.owned-providers }}
+          PRIVATE_PROFILE_LABEL: ${{ inputs.runner-label }}
+          PRIVATE_PROFILE_PLACEMENT: ${{ inputs.placement-key }}
+          PRIVATE_PROFILE_TAG_PREFIX: ${{ inputs.tag-prefix }}
+          PRIVATE_PROFILE_SOPS: ${{ inputs.runner-registry-sops }}
+          PRIVATE_PROFILE_AGE_PRESENT: ${{ secrets.RUNNER_REGISTRY_AGE_KEY != '' }}
+          PRIVATE_PROFILE_PASSWORD_PRESENT: ${{ secrets.RUNNER_REGISTRY_PASSWORD != '' }}
+          RUNNER_IMAGE: ${{ inputs.runner-image }}
+          RUNNER_REGISTRY_HOST: ${{ inputs.runner-registry-host }}
+          RUNNER_REGISTRY_USERNAME: ${{ inputs.runner-registry-username }}
+          RUNNER_NATIVE_PULL_READER: ${{ inputs.runner-native-pull-reader }}
+          RUNNER_NATIVE_REPOSITORY_SCOPE: ${{ inputs.runner-native-repository-scope }}
+        run: |
+          if ! python3 -m just_akash.runner_image --sdl /tmp/runner-sdl.yaml --check-private-profile; then
+            printf 'deployment_outcome=no-deployment\nfailure_reason=PRIVATE_PROFILE_%s\n' UNQUALIFIED >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      - name: Check out the caller encrypted reader bundle
+        if: inputs.runner-registry-sops
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: .runner-registry-source
+          sparse-checkout: secrets/registry-pull.sops.env
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Install checksum-pinned SOPS for private runner pulls
+        if: inputs.runner-registry-sops
+        run: |
+          set -euo pipefail
+          task_dir=$(mktemp -d)
+          trap 'rm -rf "$task_dir"' EXIT
+          curl --fail --silent --show-error --location --retry 3 --max-time 120 \
+            https://github.com/getsops/sops/releases/download/v3.13.1/sops-v3.13.1.linux.amd64 \
+            --output "$task_dir/sops"
+          echo "620a9d7e3352ababeca6908cea24a6e8b14ce89a448ddbd3f94f1ef3398f470a  $task_dir/sops" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/runner-pull-bin"
+          install -m 0755 "$task_dir/sops" "$RUNNER_TEMP/runner-pull-bin/sops"
+          printf '%s\n' "$RUNNER_TEMP/runner-pull-bin" >> "$GITHUB_PATH"
+
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
 
       # runner_deny removed, proven hosts first. NOT continue-on-error: a malformed
       # spec must not fall through to defaults and silently re-select a provider the
@@ -1284,6 +1290,11 @@ jobs:
         run: |
           set -uo pipefail
 
+          # Fail closed before the first possible submit. Every branch inherits UNKNOWN;
+          # only the enumerated no-broadcast sites below may narrow it to no-deployment.
+          echo "deployment_outcome=unknown" >> "$GITHUB_OUTPUT"
+
+
 
           RUNNER_COLLECTION="orgs/${ORG}/actions/runners"
           case "${RUNNER_NATIVE_REPOSITORY_SCOPE:-false}" in
@@ -1306,10 +1317,6 @@ jobs:
               raise SystemExit('Native reader private repository identity was not verified')
           PYIDENTITY
           }
-
-          # Fail closed before the first possible submit. Every branch inherits UNKNOWN;
-          # only the enumerated no-broadcast sites below may narrow it to no-deployment.
-          echo "deployment_outcome=unknown" >> "$GITHUB_OUTPUT"
 
           # ⛔ THE CLASSIFICATION BELOW READS just-akash's STRUCTURED DIAGNOSTICS (#348).
           # AKASH_DIAGNOSTICS=off silences them, so an ambiguous create or a failed lease
