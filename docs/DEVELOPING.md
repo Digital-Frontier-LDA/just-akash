@@ -117,12 +117,78 @@ transport operation through dispatch. The pattern:
 4. Test the frame/protocol surface; add a case to the local fake suite
    (`tests/_fake_akash.py`) if it has a new wire shape.
 
+## Typed execution observation
+
+```python
+from akash_lease_core import DeploymentKey, PreparedGroup
+from just_akash.execution_observation import observe_execution
+
+observation = observe_execution(
+    operation_id,
+    DeploymentKey(owner, dseq),
+    tuple(PreparedGroup(index, name) for index, name in enumerate(signed_create_names, 1)),
+)
+```
+
+The caller supplies the exact operation, deployment and complete expected group
+population from its known create receipt. The adapter independently binds that
+population to the successful signed create on the two registered chain sources;
+caller metadata or a Console response does not establish ownership.
+
+`no_further_close_needed` is true only for a complete, fresh, finalized closed
+execution snapshot: deployment, every expected group, and every enumerated lease.
+A false/unknown observation never grants permission to submit a close. Escrow is
+reported separately as `settled`, `overdrawn-unsettled`, or `unknown`.
+
+`closure` contains the pinned core `ExecutionClosure` only when the real successful
+signed `MsgCloseDeployment` height is recovered. Every historical state probe is
+height pinned and corroborated; the exact transition block is completely exhausted,
+its raw transactions and decoded population agree, and the close transaction hash
+is read back from both sources. A complete finalized snapshot is refreshed afterward.
+Unavailable history leaves `closure=None` and preserves the dated closed snapshot
+for replay suppression. `recover_close_transaction=False` requests that snapshot
+without historical close recovery.
+
+`settlement` is a separate core `SettlementEvidence` with `UNMEASURED` payment
+settlement. Closed escrow alone is not a complete payment proof; the explicit
+`payment_settlement_proven` and `financial_exposure_release_authorized` properties
+remain false for every observation. Neither result mutates a journal, authorizes
+retirement, nor releases financial exposure. A consumer
+must retain its ownership/admission checks and require typed closure before appending
+closure-dependent journal/accounting transitions. Unknown or overdrawn escrow cannot
+release financial exposure. The legacy `_lease_verification.verdict` meaning remains
+unchanged. Default reads carry no Console credentials, refuse redirects and missing
+height echoes, and enforce byte/read/time bounds and strict JSON decoding.
+
 ## Release flow
 
-1. Bump `version` in `pyproject.toml`.
-2. Add a `## [x.y.z] — YYYY-MM-DD` entry to `CHANGELOG.md` (Keep a Changelog). Be
-   candid — the changelog documents failures and reversions, not just features.
-3. Commit, tag, push. CI runs the no-spend + (on `main`) the e2e jobs.
+1. Bump `version` in `pyproject.toml` and add a unique, descending
+   `## [x.y.z] — YYYY-MM-DD` entry to `CHANGELOG.md`.
+2. Review and merge the exact release source through the required main checks.
+   Wait for its post-merge `CI` (including both live E2E jobs), `Secret Scan`, and
+   `Security` push runs to finish successfully. A merge-queue or PR result on another
+   commit is insufficient.
+3. Tag that reviewed main ancestor as `v<project version>` and push the tag after
+   release authorization. The `Release` workflow reads the tag source and refuses
+   publication unless the tag/version agree, the commit is an ancestor of current
+   main, and every expected gate succeeded in the latest exact-commit push runs.
+   Immediately before publication it resolves the remote tag again (including
+   annotated tags), rechecks main ancestry and the exact recorded successful CI
+   run attempts, and refuses moved tags or newly started reruns. These read fences
+   cannot make tag movement atomic with release creation; release tags must remain
+   unchanged. It does not dispatch paid tests or skip failed gates. A premature tag run can be
+   rerun after the exact source gates pass; source must never be changed under a tag.
+4. The workflow builds with the closed pinned backend/tool set and `--no-isolation`,
+   checks `just_akash-<version>-py3-none-any.whl`, imports the typed API from the built
+   wheel with the already pinned core release, then uploads wheel and sdist to a new
+   immutable GitHub release. Existing releases are refused.
+5. Copy the emitted SHA-256 requirements line into each consumer, update its lock/pin,
+   and validate the installed released wheel through the actual consumer path. Keep
+   core v0.16.1's immutable wheel pin; this additive adapter requires no core change.
+   Consumer live recovery and observation-window acceptance remain separate evidence.
+
+Do not republish v1.43.1: its published wheel predates the current journal/admission
+interfaces. The additive execution API is released as v1.44.0.
 
 ## Conventions worth preserving
 

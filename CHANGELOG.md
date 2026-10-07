@@ -16,6 +16,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   Registered observations refuse redirects and missing height echoes. Financial
   settlement remains separate; runner migration and durable broker wiring remain gated.
 
+## [1.44.0] — 2026-10-07
+
+### Added
+
+- Generic typed `just_akash.execution_observation.observe_execution` read-only API
+  for independently corroborated execution closure and separate escrow observations.
+  Complete signed creation identity fixes the deployment/group population. Exact
+  successful close transactions are recovered from bounded historical state probes
+  and complete matching blocks before constructing the released core closure type.
+  Missing close history retains a dated closed snapshot without inventing a height;
+  unknown or overdrawn escrow never becomes financial settlement.
+- Guarded tag release automation: publish only a main ancestor with successful CI,
+  Secret Scan and Security runs on the exact source commit. Tag, project version and
+  wheel filename must agree; closed pinned build dependencies produce wheel/sdist
+  artifacts and an immutable SHA-256 consumer pin.
+
 ## [1.43.1] — 2026-08-22
 
 ### Fixed
