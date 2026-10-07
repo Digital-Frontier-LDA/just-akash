@@ -763,6 +763,21 @@ def validate_private_profile(profile: str) -> str:
     pool_size = values.get("PRIVATE_PROFILE_POOL_SIZE")
     minimum = values.get("PRIVATE_PROFILE_MIN_POOL_SIZE", "")
     if identity == (
+        f"dfc-images-{run}-{attempt}",
+        f"borduas-dfc-images-run-{run}-end",
+        "ci-blazing-back-dfc-images",
+        "true",
+    ):
+        if (
+            pool_size != "1"
+            or minimum != "1"
+            or values.get("PRIVATE_PROFILE_CPU") != "4"
+            or values.get("PRIVATE_PROFILE_MEMORY") != "16Gi"
+            or values.get("PRIVATE_PROFILE_STORAGE") != "96Gi"
+        ):
+            raise ValueError("Private DFC profile was not verified")
+        return label
+    if identity == (
         f"b-tier-{run}-{attempt}",
         f"dfci-infra-b-tier-run-{run}-end",
         "ci-blazing-back-b-tier",
@@ -862,6 +877,36 @@ def _public_profile_payload(
     return text[: image.start()] + indent + "image: " + selected_image + text[image.end() :]
 
 
+def _private_dfc_template(text: str) -> None:
+    """Bind the new role to the exact generated single-replica resource tail."""
+    content = "\n".join(
+        line for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")
+    )
+    run = os.environ["GITHUB_RUN_ID"]
+    placement = f"borduas-dfc-images-run-{run}-end"
+    expected = (
+        "profiles:\n"
+        "  compute:\n"
+        "    runner:\n"
+        "      resources:\n"
+        "        cpu: { units: 4 }\n"
+        "        memory: { size: 16Gi }\n"
+        "        storage: { size: 96Gi }\n"
+        "  placement:\n"
+        f"    {placement}:\n"
+        "      pricing:\n"
+        "        runner: { denom: uact, amount: 100000 }\n"
+        "deployment:\n"
+        "  runner:\n"
+        f"    {placement}:\n"
+        "      profile: runner\n"
+        "      count: 1"
+    )
+    headers = list(re.finditer(r"^profiles:$", content, re.MULTILINE))
+    if len(headers) != 1 or content[headers[0].start() :] != expected:
+        raise ValueError("Private DFC template was not verified")
+
+
 def configure(
     path: Path,
     *,
@@ -882,16 +927,29 @@ def configure(
         label = validate_private_profile(private_profile)
         if username != "jobordu" or host != "https://index.docker.io/v1/":
             raise ValueError("Private BB mirror identity was not verified")
+        checked = None
+        if label.startswith("dfc-images-"):
+            checked = _public_profile_payload(
+                path,
+                label,
+                selected_image=PRIVATE_BB_CE1_IMAGE,
+                ephemeral=os.environ["PRIVATE_PROFILE_EPHEMERAL"],
+            )
+            _private_dfc_template(checked)
         verify_native_reader_role(username, password)
-        updated = _public_profile_payload(
-            path,
-            label,
-            selected_image=(
-                PRIVATE_BLAZING_AAF_IMAGE
-                if private_profile == "blazing-aaf"
-                else PRIVATE_BB_CE1_IMAGE
-            ),
-            ephemeral=os.environ["PRIVATE_PROFILE_EPHEMERAL"],
+        updated = (
+            checked
+            if checked is not None
+            else _public_profile_payload(
+                path,
+                label,
+                selected_image=(
+                    PRIVATE_BLAZING_AAF_IMAGE
+                    if private_profile == "blazing-aaf"
+                    else PRIVATE_BB_CE1_IMAGE
+                ),
+                ephemeral=os.environ["PRIVATE_PROFILE_EPHEMERAL"],
+            )
         )
         matches = list(re.finditer(r"^([ \t]*)image:[ \t]+(\S+)[ \t]*$", updated, re.MULTILINE))
         if len(matches) != 1:
