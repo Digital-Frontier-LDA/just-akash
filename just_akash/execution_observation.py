@@ -44,6 +44,7 @@ MAX_RESPONSE_BYTES = 2_097_152
 MAX_SECONDS = 120
 MAX_GROUPS = 100
 MAX_HISTORY_STEPS = 64
+TERMINAL_GROUP_STATES = frozenset({"closed", "insufficient_funds"})
 
 
 class ExecutionState(str, Enum):
@@ -308,7 +309,7 @@ def _info(
             or _number(key.get("gseq")) not in wanted
             or not isinstance(specification, dict)
             or specification.get("name") != wanted[_number(key["gseq"])].group_name
-            or row.get("state") not in {"open", "paused", "closed"}
+            or row.get("state") not in {"open", "paused"} | TERMINAL_GROUP_STATES
         ):
             raise _Held
         expected = wanted[_number(key["gseq"])]
@@ -430,7 +431,7 @@ def _sample(
         raise _Held
     closed = (
         infos[0][0] == "closed"
-        and all(row[2] == "closed" for row in infos[0][1])
+        and all(row[2] in TERMINAL_GROUP_STATES for row in infos[0][1])
         and set(maps[0].values()).issubset(TERMINAL_STATES)
     )
     escrow = EscrowStatus.UNKNOWN

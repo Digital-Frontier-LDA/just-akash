@@ -215,6 +215,92 @@ def observe(world, **kwargs):
     )
 
 
+@pytest.mark.parametrize(
+    "states",
+    [
+        ("insufficient_funds", "insufficient_funds"),
+        ("closed", "insufficient_funds"),
+        ("insufficient_funds", "closed"),
+    ],
+)
+@pytest.mark.parametrize("lease_state", ["closed", "insufficient_funds"])
+def test_depleted_closed_groups_without_signed_close_suppress_replay_only(
+    world, states, lease_state
+):
+    for row, state in zip(world.info["groups"], states, strict=True):
+        row["state"] = state
+    world.info["escrow_account"]["state"]["state"] = "overdrawn"
+    world.leases[0]["lease"]["state"] = lease_state
+    world.txs[150] = []
+    world.raw[150] = []
+    result = observe(world)
+    assert result.execution_state is m.ExecutionState.CLOSED
+    assert result.no_further_close_needed
+    assert result.escrow_status is m.EscrowStatus.OVERDRAWN_UNSETTLED
+    assert result.reason is m.ObservationReason.CLOSE_HISTORY_UNKNOWN
+    assert result.closure is None and result.close_transaction is None
+    assert result.settlement is not None
+    assert result.settlement.state is SettlementState.UNMEASURED
+    assert not result.payment_settlement_proven
+    assert not result.financial_exposure_release_authorized
+
+
+def test_depleted_groups_with_exact_successful_signed_close_allow_typed_closure(world):
+    for row in world.info["groups"]:
+        row["state"] = "insufficient_funds"
+    world.info["escrow_account"]["state"]["state"] = "overdrawn"
+    world.leases[0]["lease"]["state"] = "insufficient_funds"
+    result = observe(world)
+    assert result.execution_state is m.ExecutionState.CLOSED
+    assert result.no_further_close_needed
+    assert isinstance(result.closure, ExecutionClosure)
+    assert result.closure.close_transaction_height == 150
+    assert result.close_transaction is not None
+    assert result.reason is m.ObservationReason.EXECUTION_CLOSED
+    assert result.escrow_status is m.EscrowStatus.OVERDRAWN_UNSETTLED
+    assert result.settlement is not None
+    assert result.settlement.state is SettlementState.UNMEASURED
+    assert not result.payment_settlement_proven
+    assert not result.financial_exposure_release_authorized
+
+
+@pytest.mark.parametrize("live_component", ["deployment", "lease", "open-group", "paused-group"])
+def test_depleted_groups_do_not_override_any_live_component(world, live_component):
+    for row in world.info["groups"]:
+        row["state"] = "insufficient_funds"
+    if live_component == "deployment":
+        world.info["deployment"]["state"] = "active"
+    elif live_component == "lease":
+        world.leases[0]["lease"]["state"] = "active"
+    else:
+        world.info["groups"][0]["state"] = live_component.removesuffix("-group")
+    result = observe(world)
+    assert result.execution_state is m.ExecutionState.ACTIVE
+    assert not result.no_further_close_needed
+    assert result.closure is None and result.settlement is None
+
+
+@pytest.mark.parametrize("state", ["future-state", None, True])
+def test_depleted_groups_do_not_allow_unknown_group_states(world, state):
+    world.info["groups"][0]["state"] = "insufficient_funds"
+    world.info["groups"][1]["state"] = state
+    result = observe(world)
+    assert result.execution_state is m.ExecutionState.UNKNOWN
+    assert not result.no_further_close_needed and result.closure is None
+
+
+def test_distinct_terminal_group_states_between_sources_remain_unknown(world):
+    def mutate(base, path, _height, doc):
+        if base == world.sources[1]["url"] and "/deployments/info" in path:
+            doc["groups"][0]["state"] = "insufficient_funds"
+        return doc
+
+    world.mutate = mutate
+    result = observe(world)
+    assert result.execution_state is m.ExecutionState.UNKNOWN
+    assert not result.no_further_close_needed and result.closure is None
+
+
 def test_actual_signed_create_and_close_readers_produce_released_core_evidence(world):
     result = observe(world)
     assert result.execution_state is m.ExecutionState.CLOSED
