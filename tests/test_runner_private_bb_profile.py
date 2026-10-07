@@ -211,7 +211,7 @@ def test_preparation_guard_refuses_before_sops_and_lease(tmp_path, monkeypatch):
     assert guard["if"] == "inputs.runner-private-profile != ''"
     assert "SOPS_AGE_KEY" not in guard["env"]
     assert "RUNNER_REGISTRY_PASSWORD" not in guard["env"]
-    assert len(guard["env"]) == 19
+    assert len(guard["env"]) == 22
     assert (
         guard["env"]["PRIVATE_PROFILE_PASSWORD_PRESENT"]
         == "${{ secrets.RUNNER_REGISTRY_PASSWORD != '' }}"

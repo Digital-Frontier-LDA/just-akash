@@ -565,6 +565,9 @@ jobs:
           PRIVATE_PROFILE_ORG: ${{ inputs.github-org }}
           PRIVATE_PROFILE_POOL_SIZE: ${{ inputs.pool-size }}
           PRIVATE_PROFILE_MIN_POOL_SIZE: ${{ inputs.min-pool-size }}
+          PRIVATE_PROFILE_CPU: ${{ inputs.cpu }}
+          PRIVATE_PROFILE_MEMORY: ${{ inputs.memory }}
+          PRIVATE_PROFILE_STORAGE: ${{ inputs.storage }}
           PRIVATE_PROFILE_EPHEMERAL: ${{ inputs.ephemeral }}
           PRIVATE_PROFILE_OWNED_PROVIDERS: ${{ inputs.owned-providers }}
           PRIVATE_PROFILE_LABEL: ${{ inputs.runner-label }}
@@ -951,6 +954,13 @@ jobs:
           GH_RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
+          case "$RUNNER_LABEL/$PLACEMENT_KEY" in
+            dfc-images-*|*/borduas-dfc-images-*)
+              if [ "${RUNNER_PRIVATE_PROFILE:-}" != bb-ce1 ] || [ "${RUNNER_PUBLIC_PROFILE:-}" != "" ] || [ "${GITHUB_REPOSITORY:-}" != Borduas-Holdings/Blazing-Back ] || [ "$ORG" != Borduas-Holdings ] || [ "$RUNNER_LABEL" != "dfc-images-${GH_RUN_ID}-${GITHUB_RUN_ATTEMPT:-}" ] || [ "$PLACEMENT_KEY" != "borduas-dfc-images-run-${GH_RUN_ID}-end" ] || [ "$POOL_SIZE" != 1 ] || [ "$EPHEMERAL" != true ] || [ "$CPU" != 4 ] || [ "$MEMORY" != 16Gi ] || [ "$STORAGE" != 96Gi ]; then
+                printf '%s\n' 'Private DFC runner render was not verified' >&2
+                exit 2
+              fi ;;
+          esac
           # ⛔ FAIL CLOSED ON THE ONE INPUT WHOSE FAILURE MODE IS SILENT. An empty or
           # foreign placement key does not break the deploy — it produces a lease nobody
           # can claim, or one a sibling's sweeper will close mid-CI, and both look like a
@@ -1163,6 +1173,9 @@ jobs:
           PRIVATE_PROFILE_ORG: ${{ inputs.github-org }}
           PRIVATE_PROFILE_POOL_SIZE: ${{ inputs.pool-size }}
           PRIVATE_PROFILE_MIN_POOL_SIZE: ${{ inputs.min-pool-size }}
+          PRIVATE_PROFILE_CPU: ${{ inputs.cpu }}
+          PRIVATE_PROFILE_MEMORY: ${{ inputs.memory }}
+          PRIVATE_PROFILE_STORAGE: ${{ inputs.storage }}
           PRIVATE_PROFILE_EPHEMERAL: ${{ inputs.ephemeral }}
           PRIVATE_PROFILE_OWNED_PROVIDERS: ${{ inputs.owned-providers }}
           PRIVATE_PROFILE_LABEL: ${{ inputs.runner-label }}
@@ -1199,6 +1212,9 @@ jobs:
           PRIVATE_PROFILE_ORG: ${{ inputs.github-org }}
           PRIVATE_PROFILE_POOL_SIZE: ${{ inputs.pool-size }}
           PRIVATE_PROFILE_MIN_POOL_SIZE: ${{ inputs.min-pool-size }}
+          PRIVATE_PROFILE_CPU: ${{ inputs.cpu }}
+          PRIVATE_PROFILE_MEMORY: ${{ inputs.memory }}
+          PRIVATE_PROFILE_STORAGE: ${{ inputs.storage }}
           PRIVATE_PROFILE_EPHEMERAL: ${{ inputs.ephemeral }}
           PRIVATE_PROFILE_OWNED_PROVIDERS: ${{ inputs.owned-providers }}
           PRIVATE_PROFILE_LABEL: ${{ inputs.runner-label }}
