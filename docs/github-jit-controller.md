@@ -1,5 +1,14 @@
 # GitHub JIT controller primitive
 
+For a non-reusable workflow, trusted `JitPolicy` configuration binds the selected
+workflow to its fixed default branch and separately binds the approved producer
+source SHA. `source_workflow_branch` defaults to `main`; `master` is also admitted
+for reviewed repositories that use it. The branch in `workflows` must exactly
+match this field. A master policy cannot mint into a main-restricted group, and
+a matching branch never substitutes for the exact `source_workflow_revision`.
+Other branch names are held. Reusable workflows retain their SHA-only policy
+and cannot select `master` through this field.
+
 This prerequisite for [just-akash #332](https://github.com/Digital-Frontier-LDA/just-akash/issues/332)
 and [df-cicd #381](https://github.com/Digital-Frontier-LDA/df-cicd/issues/381) implements
 the narrow GitHub half of a one-job delivery slot. It does not enable the existing
