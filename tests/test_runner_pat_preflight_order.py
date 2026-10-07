@@ -103,8 +103,10 @@ def test_actual_pat_native_scope_branches_exit_before_any_following_command(
     marker = tmp_path / "following-command"
     script = tmp_path / "step.sh"
     script.write_text(body + '\nprintf reached > "$TEST_MARKER"\n')
+    python_binary = shutil.which("python3")
+    assert python_binary is not None
     environment = {
-        "PATH": str(Path(shutil.which("python3")).parent) + os.pathsep + os.defpath,
+        "PATH": str(Path(python_binary).parent) + os.pathsep + os.defpath,
         "PYTHONPATH": str(tmp_path),
         "GH_TOKEN": "SYNTHETIC_PAT",
         "RUNNER_NATIVE_REPOSITORY_SCOPE": scope,
