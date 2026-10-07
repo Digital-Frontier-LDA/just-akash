@@ -163,7 +163,7 @@ def world():
             }
         elif "/txs/block/" in parsed.path:
             selected = int(parsed.path.rsplit("/", 1)[-1])
-            assert height == selected
+            assert height == 200 and selected in w.txs
             doc = block(selected)
             offset = int(query["pagination.offset"][0])
             limit = int(query["pagination.limit"][0])
@@ -173,7 +173,7 @@ def world():
             )
         elif parsed.path == "/cosmos/tx/v1beta1/txs":
             selected = int(query["query"][0].removeprefix("tx.height="))
-            assert height == selected == 100
+            assert height == 200 and selected in w.txs
             doc = {
                 "total": str(len(w.txs[selected])),
                 "txs": copy.deepcopy(w.txs[selected]),
@@ -183,16 +183,18 @@ def world():
             }
         elif "/cosmos/tx/v1beta1/txs/" in parsed.path:
             selected_hash = parsed.path.rsplit("/", 1)[-1]
+            assert height == 200
             matching = [
-                index
-                for index in range(len(w.txs[height]))
-                if response(height, index)["txhash"] == selected_hash
+                (selected, index)
+                for selected in w.txs
+                for index in range(len(w.txs[selected]))
+                if response(selected, index)["txhash"] == selected_hash
             ]
             assert len(matching) == 1
-            index = matching[0]
+            selected, index = matching[0]
             doc = {
-                "tx": copy.deepcopy(w.txs[height][index]),
-                "tx_response": response(height, index),
+                "tx": copy.deepcopy(w.txs[selected][index]),
+                "tx_response": response(selected, index),
             }
         else:
             raise AssertionError("unexpected public-chain read")
@@ -725,6 +727,10 @@ def test_create_and_close_in_one_complete_block_recover_actual_creation_height(w
     world.close_height = 100
     world.txs[100].append(world.txs[150][0])
     world.raw[100].append(world.raw[150][0])
+    # The hash lookup names its actual earliest inclusion, not the fresh state
+    # query context. The same transaction cannot be included twice on chain.
+    del world.txs[150]
+    del world.raw[150]
     result = observe(world)
     assert result.closure is not None
     assert result.closure.close_transaction_height == 100

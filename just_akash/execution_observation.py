@@ -464,10 +464,33 @@ def _closed_at(
     return infos[0][0] == "closed"
 
 
-def _signed_close(source: dict, height: int, subject: DeploymentKey, budget: _Budget) -> tuple:
+def _candidate_closed_at(subject, groups, sources, height, budget) -> bool:
+    """Locate a candidate only; historical state availability grants no authority.
+
+    A source may prune state while retaining immutable blocks. A single available
+    registered state read may bracket a candidate, which still needs the complete
+    signed successful close in BOTH sources and independently fresh terminal state.
+    """
+    hints = []
+    for source in sources:
+        try:
+            hints.append(_info(subject, groups, source, height, budget)[:2])
+        except Exception:  # noqa: BLE001 — a locator does not establish closure
+            logger.debug("historical state locator unavailable")
+            continue
+    if not hints or any(value != hints[0] for value in hints[1:]):
+        raise _Held
+    return hints[0][0] == "closed"
+
+
+def _signed_close(
+    source: dict, height: int, subject: DeploymentKey, budget: _Budget, *, state_height: int
+) -> tuple:
     # The existing SDK exhausts the exact block, validates totals, canonical raw
     # transaction bytes/hashes and decoded fingerprints. Never scan the wallet.
-    block = chain._creation_block_population(budget.read, source, height)
+    block = chain._creation_block_population(
+        budget.read, source, height, state_height=state_height
+    )
     if block is None:
         raise _Held
     matches = []
@@ -489,7 +512,7 @@ def _signed_close(source: dict, height: int, subject: DeploymentKey, budget: _Bu
             ):
                 txhash = block["raw_hashes"][index]
                 document = budget.read(
-                    "/cosmos/tx/v1beta1/txs/" + txhash, base=source["url"], height=height
+                    "/cosmos/tx/v1beta1/txs/" + txhash, base=source["url"], height=state_height
                 )
                 response, observed_tx = document.get("tx_response"), document.get("tx")
                 signatures = tx.get("signatures")
@@ -502,6 +525,7 @@ def _signed_close(source: dict, height: int, subject: DeploymentKey, budget: _Bu
                     or response.get("txhash") != txhash
                     or _number(response.get("height")) != str(height)
                     or chain._canonical_document_hash(observed_tx) != block["fingerprints"][index]
+                    or block["response_population"][index][2] != 0
                     or not isinstance(signatures, list)
                     or not signatures
                     or any(chain._canonical_base64_bytes(sig) is None for sig in signatures)
@@ -519,6 +543,7 @@ def _signed_close(source: dict, height: int, subject: DeploymentKey, budget: _Bu
         block["fingerprints"],
         matches[0],
         block["block_time"],
+        block["response_population"],
     )
 
 
@@ -530,14 +555,14 @@ def _recover_close(
     budget: _Budget,
 ) -> CloseTransactionProof:
     low, high = snapshot.evidence["creation_height"], snapshot.evidence["height"]
-    # Deployment closure is terminal. Find the first closed finalized state,
-    # corroborating every probe at the same height on the two fixed trust paths.
-    if not _closed_at(subject, groups, sources, low, budget):
+    # A state bracket is merely a locator. Only the two independently registered
+    # signed block/result populations below can prove the actual close height.
+    if not _candidate_closed_at(subject, groups, sources, low, budget):
         for _step in range(MAX_HISTORY_STEPS):
             if high - low <= 1:
                 break
             middle = (low + high) // 2
-            if _closed_at(subject, groups, sources, middle, budget):
+            if _candidate_closed_at(subject, groups, sources, middle, budget):
                 high = middle
             else:
                 low = middle
@@ -545,9 +570,12 @@ def _recover_close(
             raise _Held
     else:
         high = low
-    if not _closed_at(subject, groups, sources, high, budget):
+    if not _candidate_closed_at(subject, groups, sources, high, budget):
         raise _Held
-    proofs = tuple(_signed_close(source, high, subject, budget) for source in sources)
+    proofs = tuple(
+        _signed_close(source, high, subject, budget, state_height=snapshot.evidence["height"])
+        for source in sources
+    )
     if proofs[0] != proofs[1]:
         raise _Held
     match = proofs[0][3]
@@ -569,7 +597,7 @@ def _recover_close(
         match[2],
         proofs[0][0],
         close_time.isoformat(),
-        _digest((*proofs[0][:3], close_time.isoformat())),
+        _digest((*proofs[0][:3], close_time.isoformat(), proofs[0][5])),
         (sources[0]["source_id"], sources[1]["source_id"]),
     )
 
