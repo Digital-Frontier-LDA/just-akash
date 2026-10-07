@@ -16,6 +16,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   Registered observations refuse redirects and missing height echoes. Financial
   settlement remains separate; runner migration and durable broker wiring remain gated.
 
+## [1.46.0] — 2026-10-07
+
+### Added
+
+- Explicit `create_runtime_body` and `AuthorizedConsoleCreate.submit_runtime_limit`
+  for the exact Console `{sdl, runtimeLimitHours}` payload. The deposit variant
+  remains compatible and separate. Both variants share the durable authority
+  binding, one-use lock and final-byte guard at the actual socket opener.
+- Reject mixed or cross-wired payload authority, invalid runtime hints and
+  tampered request bytes. Uncertain outcomes retain their operation and cannot
+  replay. Runtime hints and deposit fields do not establish financial exposure;
+  the trusted broker still supplies qualified policy and exposure evidence.
+
 ## [1.45.0] — 2026-10-07
 
 ### Fixed
