@@ -117,10 +117,60 @@ def test_master_default_branch_mints_with_exact_group_and_source():
     assert sum(call[0] == "POST" for call in github.calls) == 1
 
 
-@pytest.mark.parametrize("branch", ["feature", "refs/heads/master", "", None, False, "master\n"])
+@pytest.mark.parametrize(
+    "branch", ["feature", "refs/heads/master", "", None, False, "master\n", "deploy-env\n"]
+)
 def test_only_reviewed_default_branch_names_are_accepted(branch):
     with pytest.raises(jit.JitHold):
         replace(master_policy(), source_workflow_branch=branch)
+
+
+def deploy_env_policy():
+    return replace(
+        branch_policy(),
+        workflows=(REPO + "/.github/workflows/ci-observability.yml@refs/heads/deploy-env",),
+        source_workflow_branch="deploy-env",
+    )
+
+
+def test_deploy_env_binding_mints_only_after_exact_group_and_source_checks():
+    github = GitHub()
+    policy = deploy_env_policy()
+    github.group["selected_workflows"] = list(policy.workflows)
+    handoff = jit.mint_jit(
+        policy, NAME, LABELS, "installation-fixture", request=github,
+        producer_workflow_revision="a" * 40,
+    )
+    assert handoff.runner_id == 789
+    assert sum(call[0] == "POST" for call in github.calls) == 1
+
+
+@pytest.mark.parametrize("selected", [branch_policy(), master_policy()])
+def test_other_branch_groups_cannot_receive_deploy_env_qualified_runner(selected):
+    github = GitHub()
+    github.group["selected_workflows"] = list(selected.workflows)
+    with pytest.raises(jit.JitHold, match="runner group differs"):
+        jit.mint_jit(
+            deploy_env_policy(), NAME, LABELS, "installation-fixture", request=github,
+            producer_workflow_revision="a" * 40,
+        )
+    assert not any(call[0] == "POST" for call in github.calls)
+
+
+def test_deploy_env_branch_does_not_replace_approved_producer_source():
+    github = GitHub()
+    github.group["selected_workflows"] = list(deploy_env_policy().workflows)
+    with pytest.raises(jit.JitHold):
+        jit.mint_jit(
+            deploy_env_policy(), NAME, LABELS, "installation-fixture", request=github,
+            producer_workflow_revision="c" * 40,
+        )
+    assert github.calls == []
+
+
+def test_deploy_env_cannot_broaden_reusable_workflow_admission():
+    with pytest.raises(jit.JitHold):
+        replace(POLICY, source_workflow_branch="deploy-env")
 
 
 def test_main_group_cannot_receive_a_master_qualified_runner():
