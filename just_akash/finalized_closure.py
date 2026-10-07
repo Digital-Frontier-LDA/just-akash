@@ -94,11 +94,14 @@ def _close_transaction(reader, source, subject: DeploymentKey, txhash: str, heig
         raise ClosureUnverified("transaction does not close the exact deployment")
     # Reuse the complete raw/decoded block reader: the tx endpoint's hash and
     # decoded message must bind to a raw transaction in its claimed block.
-    block = chain._creation_block_population(reader, source, tx_height)
+    block = chain._creation_block_population(reader, source, tx_height, state_height=height)
     if block is None or txhash not in block["raw_hashes"]:
         raise ClosureUnverified("close transaction absent from its inclusion block")
     index = block["raw_hashes"].index(txhash)
-    if chain._canonical_document_hash(tx) != block["fingerprints"][index]:
+    if (
+        chain._canonical_document_hash(tx) != block["fingerprints"][index]
+        or block["response_population"][index][2] != response["code"]
+    ):
         raise ClosureUnverified("close transaction and inclusion block disagree")
     return {
         "height": tx_height,
@@ -107,6 +110,7 @@ def _close_transaction(reader, source, subject: DeploymentKey, txhash: str, heig
         "block_time": block["block_time"].isoformat(),
         "transaction_digest": block["fingerprints"][index],
         "block_population": block["raw_hashes"],
+        "response_population": block["response_population"],
     }
 
 

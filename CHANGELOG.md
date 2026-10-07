@@ -16,6 +16,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   Registered observations refuse redirects and missing height echoes. Financial
   settlement remains separate; runner migration and durable broker wiring remain gated.
 
+## [1.45.0] — 2026-10-07
+
+### Fixed
+
+- Separate the immutable inclusion height of historical blocks and transactions
+  from their fresh finalized REST state context. Both registered sources retain
+  strict transport height echoes and independently reconcile complete raw blocks,
+  decoded transactions, exact inclusion heights and all indexed execution results.
+  This permits proof when historical state is pruned but immutable data remains.
+- Historical state probes locate a candidate close height only. A single available
+  registered probe cannot establish closure: both registered sources must prove
+  the actual successful signed exact-resource close transaction, matching complete
+  block populations and execution results, followed by fresh complete terminal
+  deployment, group and lease observations. Missing or inconsistent history remains
+  unknown; positive closed snapshots still suppress replay without financial release.
+- Include failed sibling transactions in complete cross-source result agreement.
+  A successful hash lookup that contradicts its indexed execution result is refused.
+
 ## [1.44.0] — 2026-10-07
 
 ### Added

@@ -879,8 +879,29 @@ def _read_source_document(reader, source, path: str, *, height: int) -> dict | N
     return data
 
 
-def _creation_block_population(reader, source, created_at: int) -> dict | None:
+def _history_context(block_height: int, state_height: int | None) -> int:
+    """Immutable inclusion height differs from the REST server's state context.
+
+    A historical block/transaction is addressed and checked in its body. The
+    optional context is an already proven fresh finalized state height whose
+    transport echo remains mandatory; no historical state is inferred from it.
+    """
+    selected = block_height if state_height is None else state_height
+    if (
+        type(block_height) is not int
+        or not 0 < block_height <= 2**64 - 1
+        or type(selected) is not int
+        or not block_height <= selected <= 2**64 - 1
+    ):
+        raise ChainResponseError("immutable history context is invalid")
+    return selected
+
+
+def _creation_block_population(
+    reader, source, created_at: int, *, state_height: int | None = None
+) -> dict | None:
     """Exhaust one exact creation block and reconcile decoded and raw populations."""
+    context = _history_context(created_at, state_height)
     decoded = []
     fingerprints = []
     expected_raw_hashes = None
@@ -893,7 +914,7 @@ def _creation_block_population(reader, source, created_at: int) -> dict | None:
             f"?pagination.offset={offset}&pagination.limit={_CREATION_PAGE_SIZE}"
             "&pagination.count_total=true"
         )
-        doc = _read_source_document(reader, source, path, height=created_at)
+        doc = _read_source_document(reader, source, path, height=context)
         if doc is None:
             return None
         pagination = doc.get("pagination")
@@ -962,24 +983,31 @@ def _creation_block_population(reader, source, created_at: int) -> dict | None:
         raise ChainResponseError("creation block population did not reconcile")
     complete_block = cast(tuple[str, datetime, tuple[str, ...]], expected_block)
     complete_raw_hashes = cast(tuple[str, ...], expected_raw_hashes)
-    return {
+    result = {
         "block_hash": complete_block[0],
         "block_time": complete_block[1],
         "raw_hashes": complete_raw_hashes,
         "fingerprints": tuple(fingerprints),
         "txs": decoded,
     }
+    if state_height is not None:
+        indexed = _indexed_transaction_population(reader, source, created_at, state_height=context)
+        if indexed is None:
+            return None
+        if (
+            indexed["fingerprints"] != result["fingerprints"]
+            or indexed["raw_hashes"] != result["raw_hashes"]
+        ):
+            raise ChainResponseError("immutable block and complete indexed results disagree")
+        result["response_population"] = indexed["response_population"]
+    return result
 
 
-def _signed_creation_population(
-    reader,
-    source,
-    created_at: int,
-    owner: str,
-    dseq: str,
-    block_population: dict,
+def _indexed_transaction_population(
+    reader, source, created_at: int, *, state_height: int | None = None
 ) -> dict | None:
-    """Exhaust tx-search results and bind one successful signed create to the block."""
+    """Exhaust exact-height indexed results, including failed sibling transactions."""
+    context = _history_context(created_at, state_height)
     txs = []
     responses = []
     total = None
@@ -995,7 +1023,7 @@ def _signed_creation_population(
     while page <= (_CREATION_MAX_TXS // _CREATION_PAGE_SIZE) + 1:
         page_query = re.sub(r"page=[0-9]+", f"page={page}", encoded_query, count=1)
         doc = _read_source_document(
-            reader, source, f"/cosmos/tx/v1beta1/txs?{page_query}", height=created_at
+            reader, source, f"/cosmos/tx/v1beta1/txs?{page_query}", height=context
         )
         if doc is None:
             return None
@@ -1027,8 +1055,8 @@ def _signed_creation_population(
     if total is None or len(txs) != total or len(responses) != total:
         raise ChainResponseError("creation tx-search population did not reconcile")
     fingerprints = tuple(_canonical_document_hash(tx) for tx in txs)
-    if None in fingerprints or fingerprints != block_population["fingerprints"]:
-        raise ChainResponseError("creation block and tx-search decoded populations disagree")
+    if None in fingerprints or len(set(fingerprints)) != len(fingerprints):
+        raise ChainResponseError("indexed decoded transaction population is invalid")
     response_hashes = []
     for response in responses:
         txhash = response.get("txhash")
@@ -1038,12 +1066,51 @@ def _signed_creation_population(
             or not re.fullmatch(r"[0-9A-F]{64}", txhash)
             or not isinstance(code, int)
             or isinstance(code, bool)
+            or not 0 <= code <= 2**32 - 1
             or str(response.get("height")) != str(created_at)
         ):
             raise ChainResponseError("creation tx response did not bind exact height and hash")
         response_hashes.append(txhash)
-    if tuple(response_hashes) != block_population["raw_hashes"]:
+    if len(set(response_hashes)) != len(response_hashes):
+        raise ChainResponseError("indexed transaction hash population is duplicated")
+    return {
+        "txs": txs,
+        "responses": responses,
+        "fingerprints": fingerprints,
+        "raw_hashes": tuple(response_hashes),
+        "response_population": tuple(
+            (str(response["height"]), response["txhash"], response["code"], fingerprint)
+            for response, fingerprint in zip(responses, fingerprints, strict=True)
+        ),
+    }
+
+
+def _signed_creation_population(
+    reader,
+    source,
+    created_at: int,
+    owner: str,
+    dseq: str,
+    block_population: dict,
+    *,
+    state_height: int | None = None,
+) -> dict | None:
+    """Bind one successful signed create to complete raw and indexed populations."""
+    indexed = _indexed_transaction_population(
+        reader, source, created_at, state_height=state_height
+    )
+    if indexed is None:
+        return None
+    txs, responses = indexed["txs"], indexed["responses"]
+    if indexed["fingerprints"] != block_population["fingerprints"]:
+        raise ChainResponseError("creation block and tx-search decoded populations disagree")
+    if indexed["raw_hashes"] != block_population["raw_hashes"]:
         raise ChainResponseError("raw creation transactions did not match tx response hashes")
+    if (
+        "response_population" in block_population
+        and indexed["response_population"] != block_population["response_population"]
+    ):
+        raise ChainResponseError("creation indexed results changed while observed")
 
     matches = []
     for tx_index, (tx, response) in enumerate(zip(txs, responses, strict=True)):
@@ -1083,6 +1150,7 @@ def _signed_creation_population(
         "snapshot": snapshot,
         "txhash": response["txhash"],
         "tx_index": tx_index,
+        "response_population": indexed["response_population"],
     }
 
 
@@ -1211,7 +1279,9 @@ def _owner_close_evidence(
         if current_created_at > height:
             return None
         try:
-            block_population = _creation_block_population(reader, source, current_created_at)
+            block_population = _creation_block_population(
+                reader, source, current_created_at, state_height=height
+            )
             if block_population is None:
                 continue
             signed_population = _signed_creation_population(
@@ -1221,6 +1291,7 @@ def _owner_close_evidence(
                 owner,
                 dseq,
                 block_population,
+                state_height=height,
             )
         except ChainResponseError:
             return None
@@ -1237,6 +1308,7 @@ def _owner_close_evidence(
             signed_population["txhash"],
             signed_population["tx_index"],
             signed_population["snapshot"],
+            signed_population["response_population"],
         )
         if signed_population["snapshot"] != current_snapshot:
             return None

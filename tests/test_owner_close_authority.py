@@ -223,9 +223,12 @@ def test_fresh_common_height_and_complete_signed_create_produce_bounded_evidence
         chain.OWNER_CORROBORATION_REGISTRY_PROVENANCE_SHA256
     )
     pinned_info = [call for call in calls if "/deployments/info" in call[1] and call[2] == 100]
-    pinned_creation = [call for call in calls if "/txs" in call[1] and call[2] == CREATED_AT]
+    pinned_creation = [call for call in calls if "/txs" in call[1] and call[2] == 100]
     assert len(pinned_info) == 2
-    assert len(pinned_creation) == 4
+    assert len(pinned_creation) == 6
+    assert all(
+        str(CREATED_AT) in path or "tx.height%3D90" in path for _, path, _ in pinned_creation
+    )
 
 
 def test_measured_tendermint_nanoseconds_are_accepted_but_not_weakened():
@@ -449,7 +452,7 @@ def test_txhash_mismatch_effect_mutation():
     mutant = _mutated_function(
         chain._signed_creation_population,
         (
-            'if tuple(response_hashes) != block_population["raw_hashes"]:',
+            'if indexed["raw_hashes"] != block_population["raw_hashes"]:',
             "if False:",
         ),
     )
@@ -470,7 +473,7 @@ def test_decoded_transaction_order_disagreement_effect_mutation():
     mutant = _mutated_function(
         chain._signed_creation_population,
         (
-            'if None in fingerprints or fingerprints != block_population["fingerprints"]:',
+            'if indexed["fingerprints"] != block_population["fingerprints"]:',
             "if False:",
         ),
     )
@@ -615,7 +618,7 @@ def test_creation_block_hash_disagreement_is_not_authority():
     assert mutant(OWNER, DSEQ, GROUP, **arguments) is not None
 
 
-def test_creation_height_cannot_follow_the_pinned_action_height():
+def test_creation_height_cannot_follow_the_pinned_action_height(monkeypatch):
     reader, _ = _reader(created_at=101)
     arguments: dict[str, Any] = dict(sources=SOURCES, reader=reader, now=NOW)
     assert chain._owner_close_evidence(OWNER, DSEQ, GROUP, **arguments) is None
@@ -623,6 +626,13 @@ def test_creation_height_cannot_follow_the_pinned_action_height():
         chain._owner_close_evidence,
         ("if current_created_at > height:", "if False:"),
     )
+    # The addressed-history context adds an independent containment boundary.
+    assert mutant(OWNER, DSEQ, GROUP, **arguments) is None
+    weak_context = _mutated_function(
+        chain._history_context,
+        ("not block_height <= selected <= 2**64 - 1", "not 0 < selected <= 2**64 - 1"),
+    )
+    monkeypatch.setattr(chain, "_history_context", weak_context)
     assert mutant(OWNER, DSEQ, GROUP, **arguments) is not None
 
 

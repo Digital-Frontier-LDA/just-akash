@@ -75,6 +75,15 @@ def reader_factory(monkeypatch):
                     "txs": [tx],
                     "pagination": {"next_key": None, "total": "1"},
                 }
+            elif path.startswith("/cosmos/tx/v1beta1/txs?") and parse_qs(urlsplit(path).query)[
+                "query"
+            ] == ["tx.height=95"]:
+                doc = {
+                    "txs": [tx],
+                    "tx_responses": [{"height": "95", "txhash": TXHASH, "code": 0}],
+                    "pagination": None,
+                    "total": "1",
+                }
             elif "/leases/list?" in path:
                 query = parse_qs(urlsplit(path).query)
                 assert query["filters.owner"] == [OWNER]
@@ -242,8 +251,8 @@ def test_empty_lease_history_has_real_creation_and_close_block_proof(reader_fact
     assert closure["common_finality_height"] == 100
     assert closure["close_transaction_height"] == 95
     assert closure["operator_identity_a"] != closure["operator_identity_b"]
-    assert len([c for c in calls if "/txs/block/90?" in c[1] and c[2] == 90]) == 2
-    assert len([c for c in calls if "/txs/block/95?" in c[1] and c[2] == 95]) == 2
+    assert len([c for c in calls if "/txs/block/90?" in c[1] and c[2] == 100]) == 2
+    assert len([c for c in calls if "/txs/block/95?" in c[1] and c[2] == 100]) == 2
     assert len([c for c in calls if "/leases/list?" in c[1] and c[2] == 100]) == 2
     encoded = json.dumps(
         report["evidence"], sort_keys=True, separators=(",", ":"), ensure_ascii=True
@@ -535,7 +544,11 @@ def test_effect_mutation_removing_close_subject_check_false_allows(reader_factor
     def mutate(path, _base, _height, doc):
         if path == f"/cosmos/tx/v1beta1/txs/{TXHASH}":
             doc["tx"]["body"]["messages"][0]["id"]["owner"] = PROVIDER
-        elif "/txs/block/95?" in path:
+        elif (
+            "/txs/block/95?" in path
+            or path.startswith("/cosmos/tx/v1beta1/txs?")
+            and parse_qs(urlsplit(path).query)["query"] == ["tx.height=95"]
+        ):
             doc["txs"][0]["body"]["messages"][0]["id"]["owner"] = PROVIDER
 
     reader, _ = reader_factory(mutate=mutate)
@@ -548,3 +561,15 @@ def test_effect_mutation_removing_close_subject_check_false_allows(reader_factor
     exec(source.replace(target, "and True", 1), namespace)
     monkeypatch.setattr(adapter, "_close_transaction", namespace["_close_transaction"])
     assert observe(reader)["execution_closed"] is True
+
+
+def test_indexed_close_result_cannot_disagree_with_successful_hash_lookup(reader_factory):
+    def mutate(path, _base, _height, doc):
+        if path.startswith("/cosmos/tx/v1beta1/txs?") and parse_qs(urlsplit(path).query)[
+            "query"
+        ] == ["tx.height=95"]:
+            doc["tx_responses"][0]["code"] = 5
+
+    reader, _ = reader_factory(mutate=mutate)
+    with pytest.raises(adapter.ClosureUnverified):
+        observe(reader)
