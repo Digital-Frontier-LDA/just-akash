@@ -138,7 +138,11 @@ def test_deploy_env_binding_mints_only_after_exact_group_and_source_checks():
     policy = deploy_env_policy()
     github.group["selected_workflows"] = list(policy.workflows)
     handoff = jit.mint_jit(
-        policy, NAME, LABELS, "installation-fixture", request=github,
+        policy,
+        NAME,
+        LABELS,
+        "installation-fixture",
+        request=github,
         producer_workflow_revision="a" * 40,
     )
     assert handoff.runner_id == 789
@@ -151,7 +155,11 @@ def test_other_branch_groups_cannot_receive_deploy_env_qualified_runner(selected
     github.group["selected_workflows"] = list(selected.workflows)
     with pytest.raises(jit.JitHold, match="runner group differs"):
         jit.mint_jit(
-            deploy_env_policy(), NAME, LABELS, "installation-fixture", request=github,
+            deploy_env_policy(),
+            NAME,
+            LABELS,
+            "installation-fixture",
+            request=github,
             producer_workflow_revision="a" * 40,
         )
     assert not any(call[0] == "POST" for call in github.calls)
@@ -162,7 +170,11 @@ def test_deploy_env_branch_does_not_replace_approved_producer_source():
     github.group["selected_workflows"] = list(deploy_env_policy().workflows)
     with pytest.raises(jit.JitHold):
         jit.mint_jit(
-            deploy_env_policy(), NAME, LABELS, "installation-fixture", request=github,
+            deploy_env_policy(),
+            NAME,
+            LABELS,
+            "installation-fixture",
+            request=github,
             producer_workflow_revision="c" * 40,
         )
     assert github.calls == []
