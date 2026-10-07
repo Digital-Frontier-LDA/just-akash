@@ -119,6 +119,7 @@ class JitPolicy:
     workflows: tuple[str, ...]
     non_reusable_workflow: bool = False
     source_workflow_revision: str | None = None
+    source_workflow_branch: str = "main"
 
     def __post_init__(self):
         if (
@@ -132,20 +133,22 @@ class JitPolicy:
             or not self.workflows
             or len(self.workflows) > 100
             or type(self.non_reusable_workflow) is not bool
+            or self.source_workflow_branch not in ("main", "master")
         ):
             raise JitHold("invalid immutable JIT policy")
         if self.non_reusable_workflow:
             # GitHub group restrictions pin non-reusable workflows to a branch.
-            # Bind the pilot to main and retain its separately approved source SHA.
+            # The trusted policy fixes the default branch separately from the
+            # approved source SHA. Existing main callers keep the same default.
             if (
                 len(self.workflows) != 1
                 or not isinstance(self.source_workflow_revision, str)
                 or re.fullmatch(r"[0-9a-f]{40}", self.source_workflow_revision) is None
             ):
                 raise JitHold("non-reusable pilot needs one workflow and its source SHA")
-            suffix = r"refs/heads/main"
+            suffix = re.escape("refs/heads/" + self.source_workflow_branch)
         else:
-            if self.source_workflow_revision is not None:
+            if self.source_workflow_revision is not None or self.source_workflow_branch != "main":
                 raise JitHold("branch source binding requires non-reusable workflow policy")
             suffix = r"[0-9a-f]{40}"
         prefix = re.escape(self.repository_name) + r"/\.github/workflows/"
