@@ -124,5 +124,6 @@ def test_actual_pat_native_scope_branches_exit_before_any_following_command(
     assert marker.exists() is (scope == "false")
     emitted = output.read_text() if output.exists() else ""
     assert bool(re.search(r"^failure_reason=", emitted, re.MULTILINE)) is reason
+    assert bool(re.search(r"^native_pre_create_refused=true$", emitted, re.MULTILINE)) is reason
     assert "deployment_outcome=" not in emitted
     assert "SYNTHETIC_PRIVATE_CANARY" not in (result.stdout + result.stderr).decode()

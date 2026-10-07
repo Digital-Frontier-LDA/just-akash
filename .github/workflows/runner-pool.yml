@@ -606,6 +606,7 @@ jobs:
               exit 0 ;;
             *)
               echo failure_reason=NATIVE_READER_REPOSITORY_UNQUALIFIED >> "$GITHUB_OUTPUT"
+              echo native_pre_create_refused=true >> "$GITHUB_OUTPUT"
               exit 1
               ;;
           esac
