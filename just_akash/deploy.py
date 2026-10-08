@@ -1029,6 +1029,7 @@ def deploy(
     already_selected: list[str] | None = None,
     receipt_path: str | None = None,
     receipt_operation_id: str | None = None,
+    quiet_wallet: bool | None = None,
 ) -> dict:
     # deposit is user-controlled (--deposit); reject non-finite/non-positive
     # values before they reach json.dumps (which would emit invalid NaN/Infinity).
@@ -1070,7 +1071,11 @@ def deploy(
     from .wallet_pool import select_client_for_create
 
     required_uact = math.ceil(deposit * 1_000_000)
-    wallet = select_client_for_create(required_uact, client_factory=AkashConsoleAPI)
+    # openmix-wxs8: OPT-IN (--quiet-wallet / AKASH_QUIET_WALLET=1; None reads the env): with
+    # several keys, the wallet must be funded AND quiet. Default: funding-only, as before.
+    wallet = select_client_for_create(
+        required_uact, client_factory=AkashConsoleAPI, quiet=quiet_wallet
+    )
     client = wallet.client
     if wallet.configured_keys > 1:
         _log(
@@ -1106,6 +1111,26 @@ def deploy(
     sdl_content = _prepare_sdl_content(sdl_path, image=image, env_vars=env_vars)
     protect_content(sdl_content)
     _check_wallet_credit(client, deposit)
+    # ⛔ RE-CHECK QUIET AS LATE AS POSSIBLE, BUT BEFORE THE RECEIPT. The receipt binds the
+    # owner, so a re-selection after it would record the wrong wallet. It runs AFTER the
+    # credit probe (an LCD round-trip) so that probe is not inside the window. What remains
+    # between this line and create_deployment is the receipt's account_address() (one Console
+    # call) and a local file write: seconds at worst, not zero. Quiet is evidence, not a lock.
+    if getattr(wallet, "contention_aware", False):
+        from .wallet_pool import confirm_quiet_or_reselect
+
+        rechecked = confirm_quiet_or_reselect(
+            wallet, required_uact, client_factory=AkashConsoleAPI
+        )
+        if rechecked is not wallet:
+            _log(
+                logging.WARNING,
+                "WALLET became busy before create; re-ranked to "
+                f"selected_account={display(rechecked.account, 'address')}",
+            )
+            wallet = rechecked
+            client = wallet.client
+            _check_wallet_credit(client, deposit)  # the probe described the OLD wallet
 
     prepared_receipt = None
     if receipt_path is not None:

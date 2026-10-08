@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
@@ -17,7 +18,8 @@ from typing import Any
 from akash_lease_core import WalletCandidate, WalletPolicy, rank_wallets
 
 from . import chain
-from .api import AkashConsoleAPI, _extract_dseq
+from ._confidential import canonical_dseq, display
+from .api import AkashConsoleAPI, ListingTruncated, _extract_dseq, _extract_lease_provider
 from .chain import ChainCorroborationUnreachable
 from .owner_lookup import (
     OWNER_LOOKUP_DEADLINE_SECONDS,
@@ -38,6 +40,9 @@ class WalletClientSelection:
     configured_keys: int
     distinct_accounts: int
     policy_version: str
+    # openmix-wxs8: True when this selection was made quiet-aware (opt-in), so the caller
+    # must re-check the chosen wallet (confirm_quiet_or_reselect) right before the create tx.
+    contention_aware: bool = False
 
 
 def configured_api_keys() -> list[str]:
@@ -209,13 +214,138 @@ def _quorum_uact(readings: list[int | None], quorum: int = 2) -> int:
     raise RuntimeError("no height-pinned LCD quorum for this Console wallet allowance")
 
 
+# ── openmix-wxs8: contention-aware wallet selection ─────────────────────────────────────
+# A funded wallet is not a free one. Measured 2026-10-07: one funded Console wallet carried an
+# owned CI runner controller that created a deployment every 1-4 minutes (15/15 slots), and the
+# richest wallet held 66 deployments with fresh creates. Ranking on funding alone sends a fleet
+# create straight into another creator's window. An OPT-IN multi-key create (deploy
+# --quiet-wallet / AKASH_QUIET_WALLET=1) therefore also requires the wallet to be QUIET:
+#   * no deployment CREATED within FLEET_QUIET_MINUTES (default 10). A dseq is the creation time
+#     in epoch-ms, so any state counts — a NO_BID create that already closed is still a create;
+#   * no deployment still BIDDING (active, no lease).
+# ⚠ One Console read cannot see a create that opened and closed between two reads, and the
+#   Console listing can lag the chain. Quiet is evidence, not a lock. The re-check right before
+#   the create tx (confirm_quiet_or_reselect) narrows the window; a real lock both creators
+#   honour, or a dedicated wallet, is the only closure (openmix-qctk).
+# ⛔ OFF BY DEFAULT. The multi-key callers include CI runners (df-cicd akash-runner-ci,
+#   df-akash-gate, akash-github-runner's pool handoff) that create on these wallets every few
+#   minutes; default-on, CI would refuse because of its OWN creates. Funding-only ranking stays
+#   the default for every caller.
+# ⚠ The Console lists OLDEST-first (measured 2026-10-08), so the newest rows are on the last
+#   page and the listing cannot stop early on age. It is capped at QUIET_LIST_MAX_PAGES; a
+#   listing still going past the cap is TRUNCATED and the wallet counts as busy.
+QUIET_MINUTES_ENV = "FLEET_QUIET_MINUTES"
+QUIET_WALLET_ENV = "AKASH_QUIET_WALLET"
+DEFAULT_QUIET_MINUTES = 10.0
+QUIET_LIST_MAX_PAGES = 5
+# A dseq is EITHER Console's creation epoch-ms (~1.79e12) OR, from the Akash CLI default, a
+# BLOCK HEIGHT (~2.5e7). Read as ms, a height is always decades old, which would fail OPEN. A
+# canonical dseq below this bound is a height, aged against the chain head at ~6 s/block; an
+# unreadable head makes its age UNKNOWN, which is busy.
+HEIGHT_DSEQ_BELOW = 10**12
+SECONDS_PER_BLOCK = 6.0
+_TRUE = {"1", "true", "yes", "on"}
+_FALSE = {"0", "false", "no", "off", ""}
+
+
+def _quiet_minutes() -> float:
+    raw = os.environ.get(QUIET_MINUTES_ENV, "").strip()
+    if not raw:
+        return DEFAULT_QUIET_MINUTES
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{QUIET_MINUTES_ENV} must be a number of minutes") from exc
+    if not (value >= 0 and value < float("inf")):
+        raise RuntimeError(f"{QUIET_MINUTES_ENV} must be a finite non-negative number of minutes")
+    return value
+
+
+def _quiet_from_env() -> bool:
+    raw = os.environ.get(QUIET_WALLET_ENV, "").strip().lower()
+    if raw in _TRUE:
+        return True
+    if raw in _FALSE:
+        return False
+    # A typo must not silently mean "off" for an opt-in safety check.
+    raise RuntimeError(f"{QUIET_WALLET_ENV} must be one of 1/true/yes/on or 0/false/no/off")
+
+
+def wallet_contention(
+    client: AkashConsoleAPI,
+    *,
+    now_ms: float,
+    quiet_minutes: float,
+    keys: list[str] | None = None,
+    height_reader: Callable[[], int | None] = chain.latest_height,
+) -> list[str]:
+    """Why this wallet is NOT quiet; empty means quiet. Fails CLOSED: an unreadable or
+    truncated listing, an unparseable dseq, or a block-height dseq whose age cannot be read
+    is a reason, never silence (an empty Console page is not proof of an idle wallet).
+    The chain head is read at most once, and only when a block-height dseq is present."""
+
+    try:
+        rows = client.list_deployments(active_only=False, max_pages=QUIET_LIST_MAX_PAGES)
+    except ListingTruncated:
+        return [
+            f"listing truncated after {QUIET_LIST_MAX_PAGES} page(s): its newest rows (last, "
+            "the Console lists oldest-first) were not read"
+        ]
+    except Exception as exc:  # noqa: BLE001 — unreadable = not provably quiet
+        text = _redact_keys(f"{type(exc).__name__}: {exc}", keys or [])
+        return [f"listing unavailable ({_one_line(text, 160)})"]
+    window_ms = quiet_minutes * 60_000
+    reasons: list[str] = []
+    head: list[int | None] = []  # read lazily, once
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        dseq = _extract_dseq(row)
+        # canonical_dseq, not str.isdigit: isdigit accepts Unicode digits ("²") that int()
+        # then rejects with an uncaught ValueError.
+        if dseq is None or not canonical_dseq(dseq):
+            reasons.append(f"unparseable dseq {display(dseq, 'dseq')}")
+        else:
+            value = int(dseq)
+            age_ms: float | None
+            if value < HEIGHT_DSEQ_BELOW:
+                if not head:
+                    head.append(height_reader())
+                height = head[0]
+                age_ms = None if height is None else (height - value) * SECONDS_PER_BLOCK * 1000
+            else:
+                age_ms = now_ms - value
+            if age_ms is None:
+                reasons.append(
+                    f"age unknown for block-height dseq {display(dseq, 'dseq')} "
+                    "(chain head unreadable)"
+                )
+                continue
+            if age_ms < window_ms:
+                reasons.append(
+                    f"recent create {display(dseq, 'dseq')} {max(age_ms, 0) / 60_000:.1f}m ago"
+                )
+                continue
+        dep = row.get("deployment", row)
+        state = str(dep.get("state", "")) if isinstance(dep, dict) else ""
+        if state == "active" and not _extract_lease_provider(row):
+            reasons.append(f"bidding {display(dseq, 'dseq')} (active, no lease)")
+    return reasons
+
+
 def select_client_for_create(
     required_uact: int,
     *,
     client_factory: Callable[[str], AkashConsoleAPI] = AkashConsoleAPI,
     credit_reader: Callable[[str], int] = _default_credit_reader,
+    quiet: bool | None = None,
+    clock: Callable[[], float] = time.time,
 ) -> WalletClientSelection:
-    """Choose the richest distinct account able to fund a new deployment."""
+    """Choose a distinct account able to fund a new deployment.
+
+    One key: that key, unchanged (no probe). Several keys: the richest FUNDED wallet. With
+    ``quiet`` (or AKASH_QUIET_WALLET=1; None reads the env), only a funded wallet that is also
+    QUIET (see the block above), refusing with a per-wallet reason when none qualifies."""
 
     keys = configured_api_keys()
     if not keys:
@@ -255,10 +385,41 @@ def select_client_for_create(
                 f"{candidate_id}: {_one_line(_redact_keys(f'{type(exc).__name__}: {exc}', keys))}"
             )
 
+    contention_aware = _quiet_from_env() if quiet is None else quiet
+    busy: dict[str, list[str]] = {}
+    if contention_aware:
+        now_ms = clock() * 1000
+        quiet_minutes = _quiet_minutes()
+        for item in candidates:
+            if item.available_credit < required_uact:
+                continue  # unfunded: rank_wallets refuses it anyway; no listing read needed
+            reasons = wallet_contention(
+                clients[item.candidate_id], now_ms=now_ms, quiet_minutes=quiet_minutes, keys=keys
+            )
+            if reasons:
+                busy[item.candidate_id] = reasons
+    ranked = [item for item in candidates if item.candidate_id not in busy]
+
     result = rank_wallets(
-        candidates,
+        ranked,
         WalletPolicy(required_credit=Decimal(required_uact), denom="uact"),
     )
+    if result.selected is None and busy:
+        lines = []
+        for item in candidates:
+            if item.candidate_id in busy:
+                why = "; ".join(busy[item.candidate_id][:5])
+                more = len(busy[item.candidate_id]) - 5
+                why += f"; +{more} more" if more > 0 else ""
+            else:
+                why = f"unfunded ({int(item.available_credit)} < {required_uact} uact)"
+            lines.append(f"{item.candidate_id} {display(item.account, 'address')}: {why}")
+        lines.extend(failures)
+        raise RuntimeError(
+            f"no funded AND quiet Console wallet (quiet = no create within "
+            f"{_quiet_minutes():g} min, nothing bidding; requested by --quiet-wallet / "
+            f"{QUIET_WALLET_ENV}):\n  " + ";\n  ".join(lines)
+        )
     if result.selected is None:
         if not candidates and errors:
             # One per line, as the PR describes. A single "; "-joined line put
@@ -280,7 +441,39 @@ def select_client_for_create(
         available_uact=int(selected.available_credit),
         configured_keys=len(keys),
         distinct_accounts=len({item.account for item in candidates}),
-        policy_version=result.policy_version,
+        policy_version=result.policy_version + ("+quiet" if contention_aware else ""),
+        contention_aware=contention_aware,
+    )
+
+
+def confirm_quiet_or_reselect(
+    selection: WalletClientSelection,
+    required_uact: int,
+    *,
+    client_factory: Callable[[str], AkashConsoleAPI] = AkashConsoleAPI,
+    credit_reader: Callable[[str], int] = _default_credit_reader,
+    clock: Callable[[], float] = time.time,
+) -> WalletClientSelection:
+    """The pre-create re-check (openmix-wxs8). Still quiet: the same selection. Busy since it
+    was chosen: re-rank ONCE over the whole pool (which re-reads every wallet) and return that,
+    or raise the per-wallet refusal. Never loops, never races."""
+
+    if not getattr(selection, "contention_aware", False):
+        return selection
+    reasons = wallet_contention(
+        selection.client,
+        now_ms=clock() * 1000,
+        quiet_minutes=_quiet_minutes(),
+        keys=configured_api_keys(),
+    )
+    if not reasons:
+        return selection
+    return select_client_for_create(
+        required_uact,
+        client_factory=client_factory,
+        credit_reader=credit_reader,
+        quiet=True,
+        clock=clock,
     )
 
 
