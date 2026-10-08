@@ -180,12 +180,21 @@ height echoes, and enforce byte/read/time bounds and strict JSON decoding.
    rerun after the exact source gates pass; source must never be changed under a tag.
 4. The workflow builds with the closed pinned backend/tool set and `--no-isolation`,
    checks `just_akash-<version>-py3-none-any.whl`, imports the typed API from the built
-   wheel with the already pinned core release, then uploads wheel and sdist to a new
+   wheel with the already pinned core release, verifies the financial DATA codec,
+   then uploads wheel and sdist to a new
    immutable GitHub release. Existing releases are refused.
 5. Copy the emitted SHA-256 requirements line into each consumer, update its lock/pin,
-   and validate the installed released wheel through the actual consumer path. Keep
-   core v0.16.1's immutable wheel pin; this additive adapter requires no core change.
+   and validate the installed released wheel through the actual consumer path.
+   SDK 1.47.0 consumes the published core v0.17.0 wheel (SHA-256
+   `a3e41338835d6929ad90c8117107cd59a5c04fde11392259a34c0323aead353d`).
+   Its financial records and codecs are data, never quote, signing or sending
+   authority. Genuine policy, issuer, durable CAS/ACK and custody integration remain
+   separate prerequisites. Earlier SDK 1.44–1.46 releases retain their immutable
+   core v0.16.1 pin; the original execution adapter required no core change.
    Consumer live recovery and observation-window acceptance remain separate evidence.
+   A dependency or authenticated source-bundle change requires newly authenticated
+   history and a new actual cleanup observation window; no dated proof is refreshed
+   by changing its timestamp.
 
 Do not republish v1.43.1: its published wheel predates the current journal/admission
 interfaces. The additive execution API is released as v1.44.0.

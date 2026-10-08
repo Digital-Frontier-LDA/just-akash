@@ -73,7 +73,7 @@ jobs:
           if len(runtime) != len(runtime_names):
               raise SystemExit("locked runtime dependency population is incomplete")
           subprocess.run((python, "-m", "pip", "install", "--no-deps", core, str(wheel.resolve()), *runtime), check=True)
-          subprocess.run((python, "-I", "-c", "from just_akash.execution_observation import observe_execution, ExecutionObservation; from akash_lease_core import ExecutionClosure, SettlementEvidence; assert callable(observe_execution)"), cwd="/", check=True)
+          subprocess.run((python, "-I", str(pathlib.Path(".github/scripts/verify_release_wheel_contract.py").resolve()), version), cwd="/", check=True)
           checksum = hashlib.sha256(wheel.read_bytes()).hexdigest()
           line = f"just-akash @ https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/download/{os.environ['GITHUB_REF_NAME']}/{wheel.name}#sha256={checksum}"
           pathlib.Path("dist/SHA256SUMS").write_text("".join(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n" for path in (wheel, sdist)))
