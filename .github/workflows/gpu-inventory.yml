@@ -1,0 +1,90 @@
+name: V100 inventory
+
+# Who on the WHOLE Akash network can place which V100 shape? (openmix-67w3 AC3)
+#
+# One UNPINNED order per shape (1/2/4/8 x v100 x 16Gi/32Gi x sxm/pcie = 16
+# orders), every bidder kept, every order closed — never a lease. The largest
+# units a provider bids on is its free GPUs per node for that shape. See
+# just_akash/gpu_inventory.py.
+#
+# DISPATCH-ONLY, no schedule: it churns 16 order deposits (refunded on close)
+# and the operator dispatches it — dispatching IS the approval.
+
+on:
+  workflow_dispatch:
+    inputs:
+      wait:
+        description: "Seconds to collect bids per order"
+        type: string
+        default: "60"
+
+# Same group as bid-probe / provider-smoke / cleanup-stale: one Console wallet,
+# one Cosmos account, one sequence number. See bid-probe.yml.
+concurrency:
+  group: akash-wallet
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    name: Survey V100 placement
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Load SOPS secrets
+        uses: ./.github/actions/sops-env
+        with:
+          age-key: ${{ secrets.SOPS_AGE_KEY }}
+
+      # 16 orders x (60s wait + create/close) ~= 20 min; 30m leaves the reap
+      # step inside the 45m job backstop.
+      - name: Run inventory
+        timeout-minutes: 30
+        env:
+          WAIT_INPUT: ${{ inputs.wait }}
+        run: |
+          set -euo pipefail
+          WAIT="${WAIT_INPUT:-60}"
+          if [[ ! "$WAIT" =~ ^[0-9]+$ ]]; then
+            echo "wait must be a non-negative integer, got: $WAIT" >&2
+            exit 2
+          fi
+          uv run python -m just_akash.gpu_inventory --wait "$WAIT" \
+            --json-out "$GITHUB_WORKSPACE/v100-inventory.json" | tee inventory.log
+          { echo '```'; cat inventory.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload inventory
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: v100-inventory-${{ github.run_id }}
+          path: ${{ github.workspace }}/v100-inventory.json
+          if-no-files-found: ignore
+          retention-days: 90
+
+      # Belt and braces: probe_order_sdl closes in a finally, but a killed step
+      # cannot run a finally. Same reaper and scope as bid-probe.yml.
+      - name: Reap leaked probe orders
+        if: always()
+        timeout-minutes: 10
+        run: |
+          command -v uv >/dev/null || { echo "uv absent — setup failed, so no orders were created"; exit 0; }
+          uv run python -m just_akash.cleanup_stale --only-service probe --ownership-register '{"just-akash-":"Digital-Frontier-LDA/just-akash"}' --execute

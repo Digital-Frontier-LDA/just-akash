@@ -50,7 +50,11 @@ class FakeClient:
         key = (gpu["units"], attrs["ram"], attrs["interface"])
         return [
             {
-                "bid": {"id": {"provider": p}, "state": "open", "price": {"amount": "12.5", "denom": "uact"}},
+                "bid": {
+                    "id": {"provider": p},
+                    "state": "open",
+                    "price": {"amount": "12.5", "denom": "uact"},
+                },
             }
             for p in self.bids.get(key, [])
         ]
@@ -73,7 +77,9 @@ def test_sdl_is_unpinned_and_asks_for_the_exact_shape():
     sdl = yaml.safe_load(build_inventory_sdl(Shape(4, "32Gi", "sxm")))
     gpu = sdl["profiles"]["compute"]["probe"]["resources"]["gpu"]
     assert gpu["units"] == 4
-    assert gpu["attributes"]["vendor"]["nvidia"] == [{"model": "v100", "ram": "32Gi", "interface": "sxm"}]
+    assert gpu["attributes"]["vendor"]["nvidia"] == [
+        {"model": "v100", "ram": "32Gi", "interface": "sxm"}
+    ]
     # No placement attributes: an inventory pinned to one provider surveys nothing.
     assert "attributes" not in sdl["profiles"]["placement"]["dcloud"]
 

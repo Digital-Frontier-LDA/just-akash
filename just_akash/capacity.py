@@ -104,6 +104,7 @@ def probe_order_sdl(
     poll_s: int = 5,
     provider: str | None = None,
     deposit: float = 0.5,
+    collect_all: bool = False,
 ) -> dict[str, Any]:
     """Order-only probe for an arbitrary SDL: create, watch bids, ALWAYS close.
 
@@ -116,6 +117,10 @@ def probe_order_sdl(
 
     Returns ``{placeable, bidders, dseq, owner, waited_s}``. Never creates a
     lease. ``owner`` is carried so the chain cross-check can filter by it.
+
+    ``collect_all`` waits the whole ``wait_s`` window and keeps every bidder
+    instead of returning on the first one — the inventory survey
+    (``gpu_inventory.py``) needs the full bid set, not "anyone bid".
     """
     from .api import _extract_bid_price, _extract_dseq, _extract_owner, _extract_provider
     from .deploy import _is_open_bid
@@ -148,7 +153,7 @@ def probe_order_sdl(
                 amount, denom = _extract_bid_price(b)
                 seen.add(prov)
                 bidders.append({"provider": prov, "price_amount": amount, "price_denom": denom})
-            if bidders or waited >= wait_s:
+            if (bidders and not collect_all) or waited >= wait_s:
                 break
             time.sleep(poll_s)
             waited += poll_s
