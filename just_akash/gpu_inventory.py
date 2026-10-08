@@ -25,6 +25,12 @@ what providers advertise, every shaped order gets 0 bids and that reads as
 v100, nothing else. The network reported allocatable V100s on 2026-10-08, so a
 control with no bidder means the survey cannot see V100 bids at all, and the
 run fails instead of reporting an empty inventory.
+
+A bidding control is not enough either: it proves SOME provider has a free
+V100, not that our spelling matches what THAT provider advertises. The four
+1x shapes cover every V100 variant (16/32 GB x SXM/PCIe), so a provider that
+bids on the control must also bid on a shaped order. One that does not is
+``unmatched``: its zeros are indeterminate, and so is the run (exit 3).
 """
 
 from __future__ import annotations
@@ -210,20 +216,41 @@ def main(argv: list[str] | None = None) -> int:
             f">={r['free_gpus_per_node_at_least']} free GPU/node, "
             f"bid {r['bid_uact_per_block']} {r['bid_denom']}/block"
         )
+    unmatched = unmatched_control_bidders(records)
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as fh:
-            json.dump({"records": records, "summary": rows}, fh, indent=2)
+            json.dump(
+                {"records": records, "summary": rows, "unmatched_control_bidders": unmatched},
+                fh,
+                indent=2,
+            )
         print(f"wrote {args.json_out}")
     return exit_code(records)
+
+
+def unmatched_control_bidders(records: list[dict[str, Any]]) -> list[str]:
+    """Providers that bid on the control but on no shaped order.
+
+    Every V100 is one of the four 1x shapes, so such a provider advertises
+    ram/interface under names this survey does not ask for (or its 1x order
+    errored): its shaped zeros say nothing about its capacity."""
+    control = {b["provider"] for r in records if r.get("control") for b in r.get("bidders") or []}
+    shaped = {
+        b["provider"] for r in records if not r.get("control") for b in r.get("bidders") or []
+    }
+    return sorted(control - shaped)
 
 
 def exit_code(records: list[dict[str, Any]]) -> int:
     """0 = an inventory that can be trusted, including its zeros.
 
     A failed ORDER is data; a survey where nothing could be asked is a failed
-    run (1). So is a control with no bidder (2): then every zero above it may
-    be an attribute nobody advertises, not missing capacity."""
-    if not records or all(r["error"] for r in records):
+    run (1), and so is one where every SHAPED order failed (1), however the
+    control did. A control with no bidder (2) means every zero may be an
+    attribute nobody advertises, not missing capacity. A control bidder with
+    no shaped bid (3) means the same for that provider: indeterminate."""
+    shaped = [r for r in records if not r.get("control")]
+    if not shaped or all(r["error"] for r in shaped):
         return 1
     control = [r for r in records if r.get("control")]
     if not control or control[0]["error"] or not control[0]["bidders"]:
@@ -233,6 +260,15 @@ def exit_code(records: list[dict[str, Any]]) -> int:
             file=sys.stderr,
         )
         return 2
+    unmatched = unmatched_control_bidders(records)
+    if unmatched:
+        print(
+            f"ERROR: {', '.join(unmatched)} bid on the control (any 1x v100) but on no shaped "
+            "order: their ram/interface spelling is not what this survey asks for, so their "
+            "zeros are indeterminate",
+            file=sys.stderr,
+        )
+        return 3
     return 0
 
 

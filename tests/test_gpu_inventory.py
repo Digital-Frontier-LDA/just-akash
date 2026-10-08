@@ -165,11 +165,43 @@ def test_zeros_without_a_bidding_control_fail_the_run(monkeypatch):
     assert exit_code(records) == 2
 
 
-def test_zeros_with_a_bidding_control_are_a_trusted_inventory(monkeypatch):
+def test_zeros_with_a_matched_control_bidder_are_a_trusted_inventory(monkeypatch):
+    # akash1zen bids on the control AND on its real 1x shape: its 8x zero is a real zero.
     monkeypatch.setattr(capacity.time, "sleep", lambda _s: None)
-    client = FakeClient({(1, "", ""): ["akash1zen"]})
+    client = FakeClient({(1, "", ""): ["akash1zen"], (1, "32Gi", "pcie"): ["akash1zen"]})
     records = run_inventory(client, shapes=[CONTROL, *V100_SHAPES], wait_s=5, poll_s=5)
     assert exit_code(records) == 0
+
+
+def test_a_control_bidder_with_no_shaped_bid_makes_the_run_indeterminate(monkeypatch):
+    # CodeRabbit on #440: a bidding control does not prove the shaped zeros. akash1odd has a free
+    # V100 but advertises ram/interface under other names, so every shaped order misses it.
+    monkeypatch.setattr(capacity.time, "sleep", lambda _s: None)
+    client = FakeClient(
+        {
+            (1, "", ""): ["akash1zen", "akash1odd"],
+            (1, "32Gi", "pcie"): ["akash1zen"],
+        }
+    )
+    records = run_inventory(client, shapes=[CONTROL, *V100_SHAPES], wait_s=5, poll_s=5)
+    assert gpu_inventory.unmatched_control_bidders(records) == ["akash1odd"]
+    assert exit_code(records) == 3
+
+
+def test_every_shaped_order_erroring_fails_even_with_a_bidding_control(monkeypatch):
+    # CodeRabbit on #440: the control alone succeeding is not an inventory.
+    monkeypatch.setattr(capacity.time, "sleep", lambda _s: None)
+
+    class ShapedBoom(FakeClient):
+        def create_deployment(self, sdl: str, deposit: float = 0.5) -> dict[str, Any]:
+            if "ram:" in sdl:
+                raise RuntimeError("rpc down")
+            return super().create_deployment(sdl, deposit)
+
+    client = ShapedBoom({(1, "", ""): ["akash1zen"]})
+    records = run_inventory(client, shapes=[CONTROL, *V100_SHAPES], wait_s=5, poll_s=5)
+    assert records[0]["bidders"] and all(r["error"] for r in records[1:])
+    assert exit_code(records) == 1
 
 
 def test_a_survey_where_every_order_errored_exits_1(monkeypatch, capsys):
