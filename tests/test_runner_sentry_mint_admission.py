@@ -8,6 +8,7 @@ import shlex
 import socket
 import subprocess
 import urllib.error
+from http.client import HTTPMessage
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -64,12 +65,7 @@ def profile(tmp_path, monkeypatch):
         "RUNNER_LABEL": "sentry-123456-2",
         "GH_TOKEN": "fixture-hosted-github-token",
         "SENTRY_ADMISSION_OWNED_PROVIDERS": json.dumps(sorted(sdk.NATIVE_READER_PROVIDERS)),
-        "SENTRY_ADMISSION_PROVIDERS": json.dumps(
-            [
-                {"address": address, "preferred": True}
-                for address in sorted(sdk.NATIVE_READER_PROVIDERS)
-            ]
-        ),
+        "SENTRY_ADMISSION_PROVIDERS": ",".join(sorted(sdk.NATIVE_READER_PROVIDERS)),
     }
     placement = format_identity(
         Identity("borduas-sentry-", subject.REPOSITORY, "ci-runner", 1, 123456, 2),
@@ -88,7 +84,7 @@ def profile(tmp_path, monkeypatch):
                     "RUNNER_TOKEN=@@RUNNER_TOKEN@@",
                     "ORG_NAME=Borduas-Holdings",
                     "RUNNER_SCOPE=org",
-                    "RUNNER_NAME_PREFIX=just-akash-sentry-123456-2",
+                    "RUNNER_NAME_PREFIX=just-akash-" + values["RUNNER_LABEL"],
                     "LABELS=self-hosted,linux,akash,sentry-123456-2",
                     "EPHEMERAL=true",
                     "RUNNER_WORKDIR=/_work",
@@ -427,7 +423,9 @@ def test_private_http_error_body_is_closed_without_read_or_chained_exception(mon
     class Opener:
         def open(self, request, *, timeout):
             assert request.method == "GET" and timeout == 20
-            raise urllib.error.HTTPError(request.full_url, 403, "fixture-error", {}, body)
+            raise urllib.error.HTTPError(
+                request.full_url, 403, "fixture-error", HTTPMessage(), body
+            )
 
     monkeypatch.setattr(subject.urllib.request, "build_opener", lambda *_: Opener())
     with pytest.raises(subject.SentryAdmissionError) as caught:
@@ -491,7 +489,8 @@ def test_workflow_opt_in_precedes_original_mint_inside_retry_and_refusal_conserv
         assert ("deployment_outcome=no-deployment" in output.read_text()) is (
             observed == "" and unknown == "0"
         )
-        assert "failure_reason=SENTRY_MINT_ADMISSION_UNQUALIFIED" in output.read_text()
+        result_fields = dict(line.split("=", 1) for line in output.read_text().splitlines())
+        assert result_fields["failure_reason"] == "SENTRY_MINT_ADMISSION_UNQUALIFIED"
     calls, minted = tmp_path / "dormant-calls", tmp_path / "dormant-minted"
     env.update(
         RUNNER_SENTRY_MINT_ADMISSION="false", TEST_CALLS=str(calls), TEST_MINTED=str(minted)

@@ -96,21 +96,10 @@ def _scope(document: dict) -> tuple[str, str]:
     _require(isinstance(owned, list) and len(owned) == 3)
     _require(all(isinstance(address, str) for address in owned))
     _require(set(owned) == sdk.NATIVE_READER_PROVIDERS)
-    providers = json.loads(
-        os.environ.get("SENTRY_ADMISSION_PROVIDERS", ""), object_pairs_hook=sdk._unique_object
-    )
-    _require(isinstance(providers, list) and len(providers) == 3)
-    _require(
-        all(
-            isinstance(row, dict)
-            and set(row) == {"address", "preferred"}
-            and row["preferred"] is True
-            for row in providers
-        )
-    )
-    addresses = [row["address"] for row in providers]
-    _require(all(isinstance(address, str) for address in addresses))
-    _require(set(addresses) == sdk.NATIVE_READER_PROVIDERS)
+    # Select providers already removed denied suppliers and assigned auction tiers.
+    # Only its preferred CSV reaches provision; raw caller input stays out of scope.
+    addresses = os.environ.get("SENTRY_ADMISSION_PROVIDERS", "").split(",")
+    _require(len(addresses) == 3 and set(addresses) == sdk.NATIVE_READER_PROVIDERS)
     _require(set(document) == {"version", "services", "profiles", "deployment"})
     _require(document["version"] == "2.0" and set(document["services"]) == {"runner"})
     runner = document["services"]["runner"]
@@ -186,9 +175,9 @@ def _private_repository() -> None:
         error.close()  # Remote error bodies are never read or retained.
     except (OSError, HTTPException, ValueError, TypeError, RecursionError):
         pass
-    _require(
-        isinstance(identity, dict) and type(identity.get("id")) is int and identity["id"] == RID
-    )
+    if not isinstance(identity, dict):
+        raise SentryAdmissionError("Sentry before-mint admission was not verified")
+    _require(type(identity.get("id")) is int and identity["id"] == RID)
     _require(
         identity.get("full_name") == REPOSITORY
         and identity.get("private") is True

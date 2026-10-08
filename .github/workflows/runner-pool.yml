@@ -1295,7 +1295,7 @@ jobs:
           SENTRY_ADMISSION_SOPS: ${{ inputs.runner-registry-sops }}
           SENTRY_ADMISSION_PRIVATE_PROFILE: ${{ inputs.runner-private-profile }}
           SENTRY_ADMISSION_PUBLIC_PROFILE: ${{ inputs.runner-public-profile }}
-          SENTRY_ADMISSION_PROVIDERS: ${{ inputs.providers }}
+          SENTRY_ADMISSION_PROVIDERS: ${{ steps.candidates.outputs.preferred_candidates }}
           SENTRY_ADMISSION_OWNED_PROVIDERS: ${{ inputs.owned-providers }}
           RUNNER_NATIVE_PULL_READER: ${{ inputs.runner-native-pull-reader }}
           RUNNER_NATIVE_REPOSITORY_SCOPE: ${{ inputs.runner-native-repository-scope }}
