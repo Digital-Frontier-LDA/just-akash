@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 import pytest
 import yaml
 
+from just_akash import runner_candidates
 from just_akash import runner_image as sdk
 from just_akash import runner_sentry_admission as subject
 from just_akash.workload_identity import Identity, format_identity
@@ -503,3 +504,80 @@ def test_workflow_opt_in_precedes_original_mint_inside_retry_and_refusal_conserv
         timeout=10,
     )
     assert result.returncode == 0 and not calls.exists() and minted.read_bytes() == b"xxx"
+
+
+@pytest.mark.parametrize("preferred_count", [0, 1, 2, 3])
+def test_filtered_owned_candidates_admit_across_auction_tiers(
+    profile, transport, monkeypatch, tmp_path, preferred_count
+):
+    """The real selector partitions tiers; admission needs the complete owned set."""
+    addresses = sorted(sdk.NATIVE_READER_PROVIDERS)
+    foreign = "akash1" + "q" * 38
+    assert foreign not in sdk.NATIVE_READER_PROVIDERS
+    providers = [
+        {"address": address, "preferred": index < preferred_count}
+        for index, address in enumerate(addresses)
+    ] + [{"address": foreign, "preferred": True}]
+    output = tmp_path / "candidate-output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    assert (
+        runner_candidates.main(
+            [
+                "--providers",
+                json.dumps(providers),
+                "--owned-providers",
+                json.dumps(addresses),
+                "--github-output",
+            ]
+        )
+        == 0
+    )
+    emitted = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert set(emitted["candidates"].split(",")) == sdk.NATIVE_READER_PROVIDERS
+    assert (
+        emitted["preferred_candidates"].split(",") == addresses[:preferred_count]
+        if preferred_count
+        else emitted["preferred_candidates"] == ""
+    )
+    assert (
+        emitted["fallback_candidates"].split(",") == addresses[preferred_count:]
+        if preferred_count < 3
+        else emitted["fallback_candidates"] == ""
+    )
+    assert foreign not in emitted["candidates"]
+    workflow = yaml.safe_load((ROOT / ".github/workflows/runner-pool.yml").read_text())
+    provision = next(
+        row for row in workflow["jobs"]["pool"]["steps"] if row.get("id") == "provision"
+    )
+    source = provision["env"]["SENTRY_ADMISSION_PROVIDERS"]
+    prefix, suffix = "${{ steps.candidates.outputs.", " }}"
+    assert source.startswith(prefix) and source.endswith(suffix)
+    selected_output = source[len(prefix) : -len(suffix)]
+    monkeypatch.setenv("SENTRY_ADMISSION_PROVIDERS", emitted[selected_output])
+    subject.verify_sentry_mint_admission(profile)
+    assert transport["events"]
+    assert (
+        provision["env"]["PREFERRED_CANDIDATES_CSV"]
+        == "${{ steps.candidates.outputs.preferred_candidates }}"
+    )
+    assert (
+        provision["env"]["FALLBACK_CANDIDATES_CSV"]
+        == "${{ steps.candidates.outputs.fallback_candidates }}"
+    )
+
+
+@pytest.mark.parametrize("mutation", ["subset", "duplicate", "foreign"])
+def test_complete_candidate_guard_still_refuses_owned_set_drift_before_transport(
+    profile, transport, monkeypatch, mutation
+):
+    addresses = sorted(sdk.NATIVE_READER_PROVIDERS)
+    if mutation == "subset":
+        addresses = addresses[:2]
+    elif mutation == "duplicate":
+        addresses[-1] = addresses[0]
+    else:
+        addresses[-1] = "akash1" + "q" * 38
+    monkeypatch.setenv("SENTRY_ADMISSION_PROVIDERS", ",".join(addresses))
+    with pytest.raises(ValueError):
+        subject.verify_sentry_mint_admission(profile)
+    assert transport["events"] == []
