@@ -16,6 +16,13 @@ from just_akash.wallet_pool import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_quiet_wallet_env(monkeypatch):
+    """openmix-wxs8: these tests pin the DEFAULT (funding-only) path; a stray
+    AKASH_QUIET_WALLET in the shell must not change what they measure."""
+    monkeypatch.delenv("AKASH_QUIET_WALLET", raising=False)
+
+
 def test_wallet_lcd_boundary_rejects_non_http_schemes():
     with pytest.raises(RuntimeError, match="must use http or https"):
         _http_endpoint("file:///etc/passwd")

@@ -323,6 +323,8 @@ class TestCliDeployPassesArgs:
             already_selected=[],
             receipt_path=None,
             receipt_operation_id=None,
+            # openmix-wxs8: None = no flag, defer to AKASH_QUIET_WALLET (off unless set).
+            quiet_wallet=None,
         )
 
     @patch("just_akash.deploy.deploy")
@@ -573,3 +575,19 @@ class TestCliNoBackupFallback:
             )
         assert exc_info.value.code == 0
         assert mock_deploy.call_args.kwargs["backup_providers"] == []
+
+
+@pytest.mark.parametrize(
+    "argv,expect", [([], None), (["--quiet-wallet"], True), (["--no-quiet-wallet"], False)]
+)
+def test_quiet_wallet_is_a_boolean_optional_flag(monkeypatch, argv, expect):
+    """openmix-wxs8: --quiet-wallet / --no-quiet-wallet; absent = None (the env decides)."""
+    import sys
+    from unittest.mock import patch as _patch
+
+    from just_akash import cli
+
+    monkeypatch.setattr(sys, "argv", ["just-akash", "deploy", *argv])
+    with _patch("just_akash.deploy.deploy") as d, pytest.raises(SystemExit):
+        cli.main()
+    assert d.call_args.kwargs["quiet_wallet"] is expect
