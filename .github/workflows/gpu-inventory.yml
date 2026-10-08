@@ -3,11 +3,13 @@ name: V100 inventory
 # Who on the WHOLE Akash network can place which V100 shape? (openmix-67w3 AC3)
 #
 # One UNPINNED order per shape (1/2/4/8 x v100 x 16Gi/32Gi x sxm/pcie = 16
-# orders), every bidder kept, every order closed — never a lease. The largest
-# units a provider bids on is its free GPUs per node for that shape. See
+# orders) plus one control order (1x v100, no ram/interface), every bidder
+# kept, every order closed — never a lease. The largest units a provider bids
+# on is a lower bound on its free GPUs per node for that shape. A control with
+# no bidder fails the run (exit 2): its zeros could not be trusted. See
 # just_akash/gpu_inventory.py.
 #
-# DISPATCH-ONLY, no schedule: it churns 16 order deposits (refunded on close)
+# DISPATCH-ONLY, no schedule: it churns 17 order deposits (refunded on close)
 # and the operator dispatches it — dispatching IS the approval.
 
 on:
@@ -54,7 +56,7 @@ jobs:
         with:
           age-key: ${{ secrets.SOPS_AGE_KEY }}
 
-      # 16 orders x (60s wait + create/close) ~= 20 min; 30m leaves the reap
+      # 17 orders x (60s wait + create/close) ~= 21 min; 30m leaves the reap
       # step inside the 45m job backstop.
       - name: Run inventory
         timeout-minutes: 30
@@ -67,9 +69,11 @@ jobs:
             echo "wait must be a non-negative integer, got: $WAIT" >&2
             exit 2
           fi
+          rc=0
           uv run python -m just_akash.gpu_inventory --wait "$WAIT" \
-            --json-out "$GITHUB_WORKSPACE/v100-inventory.json" | tee inventory.log
+            --json-out "$GITHUB_WORKSPACE/v100-inventory.json" 2>&1 | tee inventory.log || rc=$?
           { echo '```'; cat inventory.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
 
       - name: Upload inventory
         if: always()

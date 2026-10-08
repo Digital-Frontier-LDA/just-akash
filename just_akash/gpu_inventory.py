@@ -15,7 +15,16 @@ Console API's ``/v1/gpu`` totals do not expose (2026-10-08: 14 V100s on the
 whole network, per-node layout unknown).
 
 Shapes go to 8 because the operator asked whether 8x V100 nodes exist for
-GLM / DeepSeek; a units:8 bid is the only proof one does.
+GLM / DeepSeek; a units:8 bid is the only proof one does. The shapes step
+1/2/4/8, so the largest bid shape is a LOWER BOUND on a node's free GPUs (a
+node with 6 free reads as 4).
+
+A zero needs a control. If the ``ram``/``interface`` spelling does not match
+what providers advertise, every shaped order gets 0 bids and that reads as
+"no V100 capacity". So the survey first places ``CONTROL``: units:1, model
+v100, nothing else. The network reported allocatable V100s on 2026-10-08, so a
+control with no bidder means the survey cannot see V100 bids at all, and the
+run fails instead of reporting an empty inventory.
 """
 
 from __future__ import annotations
@@ -34,8 +43,8 @@ from .capacity import probe_order_sdl
 @dataclass(frozen=True)
 class Shape:
     units: int
-    ram: str  # Akash gpu attribute, e.g. "16Gi"
-    interface: str  # Akash gpu attribute: "sxm" | "pcie"
+    ram: str  # Akash gpu attribute, e.g. "16Gi"; "" = not asked
+    interface: str  # Akash gpu attribute: "sxm" | "pcie"; "" = not asked
 
 
 V100_SHAPES: tuple[Shape, ...] = tuple(
@@ -44,6 +53,8 @@ V100_SHAPES: tuple[Shape, ...] = tuple(
     for ram in ("16Gi", "32Gi")
     for units in (1, 2, 4, 8)
 )
+#: The positive control: any V100, no ram/interface. See the module docstring.
+CONTROL = Shape(1, "", "")
 
 # No placement attributes, on purpose: this survey must be open to every
 # provider. Pricing is a generous ceiling in uact so price never decides a bid.
@@ -69,7 +80,7 @@ profiles:
           attributes:
             vendor:
               nvidia:
-                - {{ model: v100, ram: {ram}, interface: {interface} }}
+                - {{ {attrs} }}
         storage: [{{ size: 2Gi }}]
   placement:
     dcloud:
@@ -84,13 +95,18 @@ deployment:
 def build_inventory_sdl(shape: Shape) -> str:
     if shape.units < 1:
         raise ValueError("units must be >= 1")
-    return _SDL.format(units=shape.units, ram=shape.ram, interface=shape.interface)
+    attrs = "model: v100"
+    if shape.ram:
+        attrs += f", ram: {shape.ram}"
+    if shape.interface:
+        attrs += f", interface: {shape.interface}"
+    return _SDL.format(units=shape.units, attrs=attrs)
 
 
 def run_inventory(
     client: Any,
     *,
-    shapes: tuple[Shape, ...] | list[Shape] = V100_SHAPES,
+    shapes: tuple[Shape, ...] | list[Shape] = (CONTROL, *V100_SHAPES),
     wait_s: int = 60,
     poll_s: int = 5,
     deposit: float = 0.5,
@@ -106,6 +122,7 @@ def run_inventory(
             "units": shape.units,
             "ram": shape.ram,
             "interface": shape.interface,
+            "control": shape == CONTROL,
             "ts": time.time(),
         }
         try:
@@ -122,7 +139,8 @@ def run_inventory(
             rec.update(dseq=None, bidders=[], error=f"{type(exc).__name__}: {exc}"[:300])
         records.append(rec)
         print(
-            f"  [{idx + 1}/{len(shapes)}] {shape.units}x v100 {shape.ram} {shape.interface}: "
+            f"  [{idx + 1}/{len(shapes)}] {shape.units}x v100 {shape.ram or 'any'} "
+            f"{shape.interface or 'any'}{' (control)' if rec['control'] else ''}: "
             f"{len(rec['bidders'])} bidder(s){' ERROR ' + rec['error'] if rec['error'] else ''}"
         )
     return records
@@ -136,18 +154,24 @@ def _price(amount: Any) -> float | None:
 
 
 def summarize(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Per (provider, VRAM, form factor): the largest units it bid on = free GPUs per node."""
+    """Per (provider, VRAM, form factor): the largest units it bid on.
+
+    That is a lower bound on the free GPUs of that provider's best node (shapes
+    step 1/2/4/8), hence ``free_gpus_per_node_at_least``. The control order is
+    not a shape and is left out."""
     best: dict[tuple[str, str, str], dict[str, Any]] = {}
     for rec in records:
+        if rec.get("control"):
+            continue
         for b in rec.get("bidders") or []:
             key = (b["provider"], rec["ram"], rec["interface"])
             cur = best.get(key)
-            if cur is None or rec["units"] > cur["max_gpus_per_node"]:
+            if cur is None or rec["units"] > cur["free_gpus_per_node_at_least"]:
                 best[key] = {
                     "provider": b["provider"],
                     "ram": rec["ram"],
                     "interface": rec["interface"],
-                    "max_gpus_per_node": rec["units"],
+                    "free_gpus_per_node_at_least": rec["units"],
                     "bid_uact_per_block": _price(b.get("price_amount")),
                     "bid_denom": b.get("price_denom"),
                     "dseq": rec.get("dseq"),
@@ -167,8 +191,8 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.dry_run:
-        for s in V100_SHAPES:
-            print(f"{s.units}x v100 {s.ram} {s.interface}")
+        for s in (CONTROL, *V100_SHAPES):
+            print(f"{s.units}x v100 {s.ram or 'any'} {s.interface or 'any'}")
         return 0
     api_key = os.environ.get("AKASH_API_KEY", "").strip()
     if not api_key:
@@ -183,15 +207,33 @@ def main(argv: list[str] | None = None) -> int:
     for r in rows:
         print(
             f"  {r['provider']} v100 {r['ram']} {r['interface']}: "
-            f"{r['max_gpus_per_node']} GPU/node, "
+            f">={r['free_gpus_per_node_at_least']} free GPU/node, "
             f"bid {r['bid_uact_per_block']} {r['bid_denom']}/block"
         )
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as fh:
             json.dump({"records": records, "summary": rows}, fh, indent=2)
         print(f"wrote {args.json_out}")
-    # A failed ORDER is data; only a survey where nothing could be asked is a failed run.
-    return 1 if records and all(r["error"] for r in records) else 0
+    return exit_code(records)
+
+
+def exit_code(records: list[dict[str, Any]]) -> int:
+    """0 = an inventory that can be trusted, including its zeros.
+
+    A failed ORDER is data; a survey where nothing could be asked is a failed
+    run (1). So is a control with no bidder (2): then every zero above it may
+    be an attribute nobody advertises, not missing capacity."""
+    if not records or all(r["error"] for r in records):
+        return 1
+    control = [r for r in records if r.get("control")]
+    if not control or control[0]["error"] or not control[0]["bidders"]:
+        print(
+            "ERROR: the control order (1x v100, no ram/interface) got no bidder: "
+            "this survey cannot tell 'no capacity' from 'attributes nobody advertises'",
+            file=sys.stderr,
+        )
+        return 2
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover

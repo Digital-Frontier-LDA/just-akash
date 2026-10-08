@@ -18,11 +18,13 @@ from typing import Any
 import pytest
 import yaml
 
-from just_akash import capacity
+from just_akash import capacity, gpu_inventory
 from just_akash.gpu_inventory import (
+    CONTROL,
     V100_SHAPES,
     Shape,
     build_inventory_sdl,
+    exit_code,
     run_inventory,
     summarize,
 )
@@ -47,7 +49,7 @@ class FakeClient:
     def get_bids(self, dseq: str) -> list[dict[str, Any]]:
         gpu = yaml.safe_load(self._sdl[dseq])["profiles"]["compute"]["probe"]["resources"]["gpu"]
         attrs = gpu["attributes"]["vendor"]["nvidia"][0]
-        key = (gpu["units"], attrs["ram"], attrs["interface"])
+        key = (gpu["units"], attrs.get("ram", ""), attrs.get("interface", ""))
         return [
             {
                 "bid": {
@@ -111,8 +113,8 @@ def test_summary_reports_largest_shape_per_provider_as_gpus_per_node(monkeypatch
     )
     rows = summarize(run_inventory(client, shapes=V100_SHAPES, wait_s=5, poll_s=5))
     by = {(r["provider"], r["ram"], r["interface"]): r for r in rows}
-    assert by[("akash1zen", "32Gi", "pcie")]["max_gpus_per_node"] == 2
-    assert by[("akash1h4i", "16Gi", "sxm")]["max_gpus_per_node"] == 4
+    assert by[("akash1zen", "32Gi", "pcie")]["free_gpus_per_node_at_least"] == 2
+    assert by[("akash1h4i", "16Gi", "sxm")]["free_gpus_per_node_at_least"] == 4
     assert by[("akash1h4i", "16Gi", "sxm")]["bid_uact_per_block"] == 12.5
 
 
@@ -132,3 +134,86 @@ def test_a_failed_order_is_recorded_not_raised(monkeypatch):
 def test_bad_units_refused(units):
     with pytest.raises(ValueError):
         build_inventory_sdl(Shape(units, "16Gi", "sxm"))
+
+
+# ── review openmix-67w3 F6 / F9 / gaps e, f ─────────────────────────────────────
+
+
+def test_the_control_asks_for_any_v100_and_runs_first():
+    sdl = yaml.safe_load(build_inventory_sdl(CONTROL))
+    gpu = sdl["profiles"]["compute"]["probe"]["resources"]["gpu"]
+    assert gpu["units"] == 1
+    assert gpu["attributes"]["vendor"]["nvidia"] == [{"model": "v100"}]
+    import inspect
+
+    default = inspect.signature(run_inventory).parameters["shapes"].default
+    assert default[0] == CONTROL and set(default[1:]) == set(V100_SHAPES)
+
+
+def test_the_control_is_not_a_shape_row_in_the_summary(monkeypatch):
+    monkeypatch.setattr(capacity.time, "sleep", lambda _s: None)
+    client = FakeClient({(1, "", ""): ["akash1zen"]})
+    records = run_inventory(client, shapes=[CONTROL, Shape(1, "16Gi", "sxm")], wait_s=5, poll_s=5)
+    assert records[0]["control"] is True and records[0]["bidders"]
+    assert summarize(records) == []
+
+
+def test_zeros_without_a_bidding_control_fail_the_run(monkeypatch):
+    # The attribute-spelling case: nothing bids on ANY shape, the control included.
+    monkeypatch.setattr(capacity.time, "sleep", lambda _s: None)
+    records = run_inventory(FakeClient({}), shapes=[CONTROL, *V100_SHAPES], wait_s=5, poll_s=5)
+    assert exit_code(records) == 2
+
+
+def test_zeros_with_a_bidding_control_are_a_trusted_inventory(monkeypatch):
+    monkeypatch.setattr(capacity.time, "sleep", lambda _s: None)
+    client = FakeClient({(1, "", ""): ["akash1zen"]})
+    records = run_inventory(client, shapes=[CONTROL, *V100_SHAPES], wait_s=5, poll_s=5)
+    assert exit_code(records) == 0
+
+
+def test_a_survey_where_every_order_errored_exits_1(monkeypatch, capsys):
+    monkeypatch.setattr(capacity.time, "sleep", lambda _s: None)
+    monkeypatch.setenv("AKASH_API_KEY", "k")
+
+    class Boom(FakeClient):
+        def __init__(self, _key: str):
+            super().__init__({})
+
+        def create_deployment(self, sdl: str, deposit: float = 0.5) -> dict[str, Any]:
+            raise RuntimeError("rpc down")
+
+    import just_akash.api
+
+    monkeypatch.setattr(just_akash.api, "AkashConsoleAPI", Boom)
+    assert gpu_inventory.main(["--wait", "0"]) == 1
+
+
+def test_collect_all_waits_the_window_and_keeps_a_late_bidder(monkeypatch):
+    # gap e: bidders arrive on DIFFERENT polls. Without collect_all the probe returns on the
+    # first bidder and the late one is never seen.
+    monkeypatch.setattr(capacity.time, "sleep", lambda _s: None)
+
+    class Staggered(FakeClient):
+        polls = 0
+
+        def get_bids(self, dseq: str) -> list[dict[str, Any]]:
+            self.polls += 1
+            provs = ["akash1early"] + (["akash1late"] if self.polls >= 3 else [])
+            return [
+                {
+                    "bid": {
+                        "id": {"provider": p},
+                        "state": "open",
+                        "price": {"amount": "1", "denom": "uact"},
+                    }
+                }
+                for p in provs
+            ]
+
+    sdl = build_inventory_sdl(Shape(1, "16Gi", "sxm"))
+    all_ = capacity.probe_order_sdl(Staggered({}), sdl, wait_s=20, poll_s=5, collect_all=True)
+    assert sorted(b["provider"] for b in all_["bidders"]) == ["akash1early", "akash1late"]
+    assert all_["waited_s"] == 20
+    first = capacity.probe_order_sdl(Staggered({}), sdl, wait_s=20, poll_s=5)
+    assert [b["provider"] for b in first["bidders"]] == ["akash1early"]
