@@ -1,6 +1,6 @@
 [project]
 name = "just-akash"
-version = "1.43.1"
+version = "1.48.0"
 description = "Justfile recipes + Python CLI for deploying on Akash Network via the Console API"
 readme = "README.md"
 license = "MIT"
@@ -18,10 +18,10 @@ dependencies = [
     # Shared sans-I/O core for lease-shell and provider-auction semantics — the
     # same package the DigitalFrontier control plane consumes, so protocol and
     # provider-selection decisions have exactly ONE implementation.
-    # Immutable released journal/admission API shared with Guardian. v0.16.1
-    # retains request-profile selection and supports confirmed one-use redemption.
+    # Immutable released journal/admission and financial DATA API shared with Guardian.
+    # v0.18.0 retains legacy contracts; typed financial data never grants effect authority.
     # Behavior tests below the real transport boundary reject incompatible pins.
-    "akash-lease-core @ https://github.com/Digital-Frontier-LDA/akash-lease-core/releases/download/v0.16.1/akash_lease_core-0.16.1-py3-none-any.whl#sha256=24fd64c88aa588dfb586be801ed82ae79bb6b02631ab81eda75e3fd243197b4f",
+    "akash-lease-core @ https://github.com/Digital-Frontier-LDA/akash-lease-core/releases/download/v0.18.0/akash_lease_core-0.18.0-py3-none-any.whl#sha256=7d9ccb117b1cf2f30ebea17018371902ed063daa6c087e2c64e109fe00788070",
 ]
 
 [project.scripts]

@@ -186,6 +186,11 @@ class AkashAPIError(RuntimeError):
         return self.status == 524 or self.error_name == "origin_response_timeout"
 
 
+class ListingTruncated(RuntimeError):
+    """A capped listing stopped before its end (openmix-wxs8). Distinct from an inconsistent
+    or failed listing so a caller can report "truncated" rather than "unavailable"."""
+
+
 class AkashConsoleAPI:
     _protect_runtime_payloads = False
     # PAGE SIZE for list_deployments, which pages with `skip` until the listing is
@@ -391,7 +396,9 @@ class AkashConsoleAPI:
         # S310: the URL is built from the operator-configured Console origin.
         return urllib.request.urlopen(request, timeout=CONSOLE_HTTP_TIMEOUT)  # noqa: S310
 
-    def list_deployments(self, active_only: bool = True) -> list[dict[str, Any]]:
+    def list_deployments(
+        self, active_only: bool = True, max_pages: int | None = None
+    ) -> list[dict[str, Any]]:
         """Deployments for this API key, EVERY page of them.
 
         An empty list means "the account is empty" and NEVER "the request went wrong".
@@ -441,11 +448,17 @@ class AkashConsoleAPI:
         reading matched the chain (1 active). Only a chain cross-check (orphan_detect,
         chain.list_active_deployments) is independent of the Console.
         `active_only` is still filtered here, client side, after the complete listing.
+
+        `max_pages` (openmix-wxs8) caps a pass below LIST_MAX_PAGES and raises
+        ListingTruncated past it. A caller that only needs RECENT rows cannot stop early on
+        age: measured 2026-10-08 on a 67-deployment wallet, every page came back OLDEST-first
+        (ascending dseq), so the newest rows are on the LAST page. The cap bounds the cost
+        instead, and the caller must treat a truncated listing as unknown, never as empty.
         """
         confirmed: list[str | None] | None = None
         failures = 0
         while True:
-            rows, why, pages = self._list_deployments_pass()
+            rows, why, pages = self._list_deployments_pass(max_pages)
             # One page is self-checked, unless a multi-page pass was already seen: then a
             # sudden single page must match it like any other pass.
             if rows is not None and pages == 1 and confirmed is None:
@@ -516,12 +529,15 @@ class AkashConsoleAPI:
         rows = [d for d in raw if isinstance(d, dict)]
         return rows, len(raw), pagination if isinstance(pagination, dict) else {}
 
-    def _list_deployments_pass(self) -> tuple[list[dict[str, Any]] | None, str, int]:
+    def _list_deployments_pass(
+        self, max_pages: int | None = None
+    ) -> tuple[list[dict[str, Any]] | None, str, int]:
         """One whole listing from skip=0: (rows, "", pages) or (None, why, pages)."""
         rows_out: list[dict[str, Any]] = []
         seen: set[str] = set()
         skip = 0
-        for page_no in range(1, self.LIST_MAX_PAGES + 1):
+        cap = self.LIST_MAX_PAGES if max_pages is None else min(max_pages, self.LIST_MAX_PAGES)
+        for page_no in range(1, cap + 1):
             rows, n_raw, pg = self._list_deployments_page(skip)
             if not pg:
                 print(
@@ -541,6 +557,17 @@ class AkashConsoleAPI:
                         return None, f"dseq {dseq} repeated at skip={skip}", page_no
                     seen.add(dseq)
                 rows_out.append(d)
+            # openmix-wxs8: on the LAST page a cap allows, a full page that states its own end
+            # (hasMore=false, total == rows so far) is complete — honour it before the cap,
+            # or exactly cap full pages would read as truncated.
+            if (
+                page_no == cap
+                and cap < self.LIST_MAX_PAGES
+                and pg.get("hasMore") is False
+                and total is not None
+                and total == skip + n_raw
+            ):
+                return rows_out, "", page_no
             if has_more or n_raw >= self.LIST_LIMIT:
                 if not isinstance(pg.get("hasMore"), bool) or total is None:
                     return (
@@ -569,6 +596,11 @@ class AkashConsoleAPI:
                     page_no,
                 )
             return rows_out, "", page_no
+        if max_pages is not None and cap < self.LIST_MAX_PAGES:
+            raise ListingTruncated(
+                f"list_deployments: capped at {cap} page(s) of {self.LIST_LIMIT} and the "
+                "listing continues"
+            )
         raise RuntimeError(
             f"list_deployments: still paging after {self.LIST_MAX_PAGES} pages of "
             f"{self.LIST_LIMIT}; refusing to guess (is the server ignoring skip?)."

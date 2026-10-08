@@ -318,3 +318,51 @@ def test_a_paged_listing_cannot_end_without_an_integer_total(monkeypatch, end_pa
     fake = FakeConsole(rows, has_more=False, script={n: end for n in (2, 4, 6)})
     with pytest.raises(RuntimeError, match="no integer total and hasMore=false"):
         _client(fake, monkeypatch).list_deployments(active_only=False)
+
+
+# ── openmix-wxs8: an explicit page cap ─────────────────────────────────────────────────────
+
+
+def test_a_capped_listing_that_continues_raises_listing_truncated(monkeypatch):
+    """max_pages bounds the cost of a quiet-wallet read; past it the listing is TRUNCATED, a
+    distinct error so the caller can say so (and count the wallet busy), never 'empty'."""
+    from just_akash.api import ListingTruncated
+
+    fake = FakeConsole([_row(i) for i in range(350)])
+    c = _client(fake, monkeypatch)
+    with pytest.raises(ListingTruncated, match="capped at 2 page"):
+        c.list_deployments(active_only=False, max_pages=2)
+    assert len(fake.calls) == 2
+
+
+def test_a_capped_listing_that_fits_is_the_complete_listing(monkeypatch):
+    fake = FakeConsole([_row(i) for i in range(150)])
+    out = _client(fake, monkeypatch).list_deployments(active_only=False, max_pages=2)
+    assert [d["dseq"] for d in out] == [str(i) for i in range(150)]
+
+
+def test_no_cap_keeps_the_server_bound_error(monkeypatch):
+    """Uncapped, the endless server still hits LIST_MAX_PAGES as a plain RuntimeError,
+    not a ListingTruncated (callers that never asked for a cap see no new error type)."""
+    from just_akash.api import ListingTruncated
+
+    def endless(method, path, *a, **kw):
+        endless.n = getattr(endless, "n", 0) + 1
+        return {
+            "data": {
+                "deployments": [_row(endless.n * 1000 + i) for i in range(100)],
+                "pagination": {"total": 10**6, "hasMore": True},
+            }
+        }
+
+    with pytest.raises(RuntimeError, match="still paging") as err:
+        _client(endless, monkeypatch).list_deployments()
+    assert not isinstance(err.value, ListingTruncated)
+
+
+def test_exactly_cap_full_pages_ending_with_has_more_false_is_complete(monkeypatch):
+    """Five full pages whose last says hasMore=false and total=500 is the WHOLE listing, not a
+    truncation: hasMore is honoured before the cap."""
+    fake = FakeConsole([_row(i) for i in range(500)])
+    out = _client(fake, monkeypatch).list_deployments(active_only=False, max_pages=5)
+    assert [d["dseq"] for d in out] == [str(i) for i in range(500)]

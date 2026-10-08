@@ -330,6 +330,19 @@ def main():
         help="Preferred provider address (repeatable; overrides AKASH_PROVIDERS)",
     )
     deploy_p.add_argument(
+        "--quiet-wallet",
+        dest="quiet_wallet",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "With several keys in AKASH_API_KEYS, use only a funded wallet that is also QUIET: "
+            "no deployment created within FLEET_QUIET_MINUTES (default 10) and none still "
+            "bidding; refuse when none is. --no-quiet-wallet forces it off. Absent: "
+            "AKASH_QUIET_WALLET decides (off when unset: funding-only ranking). One key is "
+            "never checked."
+        ),
+    )
+    deploy_p.add_argument(
         "--already-selected",
         dest="already_selected",
         action="append",
@@ -947,6 +960,7 @@ def main():
                 already_selected=args.already_selected,
                 receipt_path=args.receipt_path,
                 receipt_operation_id=args.receipt_operation_id,
+                quiet_wallet=args.quiet_wallet,
             )
             sys.exit(0)
         except RuntimeError as e:

@@ -16,6 +16,78 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   Registered observations refuse redirects and missing height echoes. Financial
   settlement remains separate; runner migration and durable broker wiring remain gated.
 
+## [1.48.0] — 2026-10-08
+
+### Added
+
+- Pin the actual immutable core v0.18.0 wheel with the additive fee-only
+  `transaction_fee` DATA purpose. It retains the confirmed original create,
+  deployment, creator leaf and lifetime maximum; unknown and failed fees remain
+  charged. A typed proposal never grants signing or broadcast authority.
+- Check the new DATA purpose in the isolated installed release wheel and refuse
+  core 0.17 or a missing purpose. Actual registered fee attribution, durable
+  financial CAS, independent ACK and effect-boundary enforcement remain required.
+  Existing SDK runtime, request authorization and closure behavior are unchanged.
+
+## [1.47.0] — 2026-10-08
+
+### Added
+
+- Pin the actual immutable core v0.17.0 wheel containing additive financial data
+  proposals and strict canonical recovery. Native liability vectors, retained
+  one-use effect identities and unknown charges are data contracts; they do not
+  authenticate a quote, grant signing or sending authority, or release exposure.
+- Verify those financial data and codec capabilities in the isolated installed
+  release wheel, alongside the existing execution-closure API. Existing runtime
+  and deposit request authorization, wire bytes and closure semantics are unchanged.
+
+## [1.46.0] — 2026-10-07
+
+### Added
+
+- Explicit `create_runtime_body` and `AuthorizedConsoleCreate.submit_runtime_limit`
+  for the exact Console `{sdl, runtimeLimitHours}` payload. The deposit variant
+  remains compatible and separate. Both variants share the durable authority
+  binding, one-use lock and final-byte guard at the actual socket opener.
+- Reject mixed or cross-wired payload authority, invalid runtime hints and
+  tampered request bytes. Uncertain outcomes retain their operation and cannot
+  replay. Runtime hints and deposit fields do not establish financial exposure;
+  the trusted broker still supplies qualified policy and exposure evidence.
+
+## [1.45.0] — 2026-10-07
+
+### Fixed
+
+- Separate the immutable inclusion height of historical blocks and transactions
+  from their fresh finalized REST state context. Both registered sources retain
+  strict transport height echoes and independently reconcile complete raw blocks,
+  decoded transactions, exact inclusion heights and all indexed execution results.
+  This permits proof when historical state is pruned but immutable data remains.
+- Historical state probes locate a candidate close height only. A single available
+  registered probe cannot establish closure: both registered sources must prove
+  the actual successful signed exact-resource close transaction, matching complete
+  block populations and execution results, followed by fresh complete terminal
+  deployment, group and lease observations. Missing or inconsistent history remains
+  unknown; positive closed snapshots still suppress replay without financial release.
+- Include failed sibling transactions in complete cross-source result agreement.
+  A successful hash lookup that contradicts its indexed execution result is refused.
+
+## [1.44.0] — 2026-10-07
+
+### Added
+
+- Generic typed `just_akash.execution_observation.observe_execution` read-only API
+  for independently corroborated execution closure and separate escrow observations.
+  Complete signed creation identity fixes the deployment/group population. Exact
+  successful close transactions are recovered from bounded historical state probes
+  and complete matching blocks before constructing the released core closure type.
+  Missing close history retains a dated closed snapshot without inventing a height;
+  unknown or overdrawn escrow never becomes financial settlement.
+- Guarded tag release automation: publish only a main ancestor with successful CI,
+  Secret Scan and Security runs on the exact source commit. Tag, project version and
+  wheel filename must agree; closed pinned build dependencies produce wheel/sdist
+  artifacts and an immutable SHA-256 consumer pin.
+
 ## [1.43.1] — 2026-08-22
 
 ### Fixed

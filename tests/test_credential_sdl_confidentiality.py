@@ -11,6 +11,7 @@ import traceback
 import urllib.error
 from email.message import Message
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -227,8 +228,10 @@ def private_deploy(tmp_path, monkeypatch, caplog):
     monkeypatch.delenv("AKASH_PROVIDERS_BACKUP", raising=False)
     monkeypatch.setattr(dp, "_check_wallet_credit", lambda *_args: None)
     monkeypatch.setattr(dp, "_report_suspected_orphans", Mock())
-    monkeypatch.setattr(dp.time, "time", _time_mock())
-    monkeypatch.setattr(dp.time, "sleep", lambda *_args: None)
+    # Replacing the shared stdlib time.time makes DEBUG logging consume this
+    # advancing auction clock and expire the bid window before the first poll.
+    # Scope the fake clock to the deployment module; retain every wire/privacy check.
+    monkeypatch.setattr(dp, "time", SimpleNamespace(time=_time_mock(), sleep=lambda *_args: None))
     client = Mock()
     monkeypatch.setattr(dp, "AkashConsoleAPI", Mock(return_value=client))
     client.create_deployment.return_value = {
