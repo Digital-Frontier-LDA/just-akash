@@ -16,6 +16,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   Registered observations refuse redirects and missing height echoes. Financial
   settlement remains separate; runner migration and durable broker wiring remain gated.
 
+## [1.47.0] — 2026-10-08
+
+### Added
+
+- Pin the actual immutable core v0.17.0 wheel containing additive financial data
+  proposals and strict canonical recovery. Native liability vectors, retained
+  one-use effect identities and unknown charges are data contracts; they do not
+  authenticate a quote, grant signing or sending authority, or release exposure.
+- Verify those financial data and codec capabilities in the isolated installed
+  release wheel, alongside the existing execution-closure API. Existing runtime
+  and deposit request authorization, wire bytes and closure semantics are unchanged.
+
 ## [1.46.0] — 2026-10-07
 
 ### Added
