@@ -185,11 +185,14 @@ height echoes, and enforce byte/read/time bounds and strict JSON decoding.
    immutable GitHub release. Existing releases are refused.
 5. Copy the emitted SHA-256 requirements line into each consumer, update its lock/pin,
    and validate the installed released wheel through the actual consumer path.
-   SDK 1.47.0 consumes the published core v0.17.0 wheel (SHA-256
-   `a3e41338835d6929ad90c8117107cd59a5c04fde11392259a34c0323aead353d`).
+   SDK 1.48.0 consumes the published core v0.18.0 wheel (SHA-256
+   `7d9ccb117b1cf2f30ebea17018371902ed063daa6c087e2c64e109fe00788070`).
    Its financial records and codecs are data, never quote, signing or sending
    authority. Genuine policy, issuer, durable CAS/ACK and custody integration remain
-   separate prerequisites. Earlier SDK 1.44–1.46 releases retain their immutable
+   separate prerequisites. The new fee-only purpose retains the original lifetime
+   maximum; it still requires genuine registered transaction attribution and effect
+   enforcement. SDK 1.47 retains its immutable core 0.17 pin and cannot use that purpose.
+   Earlier SDK 1.44–1.46 releases retain their immutable
    core v0.16.1 pin; the original execution adapter required no core change.
    Consumer live recovery and observation-window acceptance remain separate evidence.
    A dependency or authenticated source-bundle change requires newly authenticated

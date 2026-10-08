@@ -25,7 +25,7 @@ def test_wrong_sdk_release_metadata_is_refused():
         m.verify("0.0.0-inert-fixture")
 
 
-@pytest.mark.parametrize("version", ["0.16.1", "0.17.1", "0.17.0-inert-fixture"])
+@pytest.mark.parametrize("version", ["0.17.0", "0.18.1", "0.18.0-inert-fixture"])
 def test_wrong_core_release_metadata_is_refused(monkeypatch, version):
     actual_version = m.metadata.version
     monkeypatch.setattr(
@@ -38,7 +38,7 @@ def test_wrong_core_release_metadata_is_refused(monkeypatch, version):
 
 
 def test_changed_loaded_core_version_is_refused(monkeypatch):
-    monkeypatch.setattr(m.core, "__version__", "0.16.1")
+    monkeypatch.setattr(m.core, "__version__", "0.17.0")
     with pytest.raises(RuntimeError, match="core release version mismatch"):
         m.verify(m.metadata.version("just-akash"))
 
@@ -46,6 +46,12 @@ def test_changed_loaded_core_version_is_refused(monkeypatch):
 def test_missing_execution_adapter_is_refused(monkeypatch):
     monkeypatch.setattr(m, "observe_execution", None)
     with pytest.raises(RuntimeError, match="execution adapter missing"):
+        m.verify(m.metadata.version("just-akash"))
+
+
+def test_missing_transaction_fee_data_purpose_is_refused(monkeypatch):
+    monkeypatch.setattr(m.core, "FinancialEffectPurpose", type("MissingFeePurpose", (), {}))
+    with pytest.raises(RuntimeError, match="transaction-fee DATA purpose missing"):
         m.verify(m.metadata.version("just-akash"))
 
 

@@ -16,6 +16,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   Registered observations refuse redirects and missing height echoes. Financial
   settlement remains separate; runner migration and durable broker wiring remain gated.
 
+## [1.48.0] — 2026-10-08
+
+### Added
+
+- Pin the actual immutable core v0.18.0 wheel with the additive fee-only
+  `transaction_fee` DATA purpose. It retains the confirmed original create,
+  deployment, creator leaf and lifetime maximum; unknown and failed fees remain
+  charged. A typed proposal never grants signing or broadcast authority.
+- Check the new DATA purpose in the isolated installed release wheel and refuse
+  core 0.17 or a missing purpose. Actual registered fee attribution, durable
+  financial CAS, independent ACK and effect-boundary enforcement remain required.
+  Existing SDK runtime, request authorization and closure behavior are unchanged.
+
 ## [1.47.0] — 2026-10-08
 
 ### Added

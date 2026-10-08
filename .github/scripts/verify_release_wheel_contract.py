@@ -13,7 +13,7 @@ from just_akash.execution_observation import ExecutionObservation, observe_execu
 def verify(expected_sdk_version: str) -> None:
     if metadata.version("just-akash") != expected_sdk_version:
         raise RuntimeError("installed SDK release version mismatch")
-    if metadata.version("akash-lease-core") != "0.17.0" or core.__version__ != "0.17.0":
+    if metadata.version("akash-lease-core") != "0.18.0" or core.__version__ != "0.18.0":
         raise RuntimeError("installed core release version mismatch")
     if not callable(observe_execution) or not isinstance(ExecutionObservation, type):
         raise RuntimeError("installed execution adapter missing")
@@ -21,6 +21,9 @@ def verify(expected_sdk_version: str) -> None:
         core.SettlementEvidence, type
     ):
         raise RuntimeError("installed legacy core contract missing")
+    purpose = getattr(getattr(core, "FinancialEffectPurpose", None), "TRANSACTION_FEE", None)
+    if purpose is None or purpose.value != "transaction_fee":
+        raise RuntimeError("installed transaction-fee DATA purpose missing")
     # This inert codec fixture has no owner, operation, quote, policy or authority.
     value = core.NativeLiabilityVector((core.NativeLiability("uakt", 0),))
     encoded = core.encode_financial_data(value)
