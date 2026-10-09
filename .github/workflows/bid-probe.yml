@@ -70,7 +70,15 @@ jobs:
     # Backstop only. The real bound is the step timeout below: a JOB timeout
     # cancels the whole job and the always()-reap step would never run, leaking
     # every open order this run created.
-    timeout-minutes: 62
+    #
+    # Sized as the SUM of everything that can run before the reaper finishes,
+    # because job time is wall-clock for all steps, not just the probe:
+    #   8m  setup + telemetry upload (no step timeout of their own; measured
+    #       ~10s on 2026-10-09, the allowance covers the uv retry path)
+    #   52m the probe step's timeout
+    #   10m the reap step's timeout
+    # tests/test_bid_probe_budget.py recomputes this from the step timeouts.
+    timeout-minutes: 70
     steps:
       # FIRST step, before anything slow, so this is as close to "when the run
       # actually began" as the runner can report. It exists because
@@ -126,7 +134,7 @@ jobs:
       # Worst case is every pair no-bidding AND being retried:
       # 16 x (45s wait + 60s confirm delay + 45s retry wait) = 2400s = 40 min,
       # plus order create/close overhead. The rule wants 0.75m of headroom per
-      # pair (12m), so 52m -- still 10 min inside the 62m job backstop so the
+      # pair (12m), so 52m. The job backstop above is sized around it so the
       # always()-reap step always runs. (13 -> 16 pairs: porto, 2026-10-09.)
       #
       # ⛔ THIS ARITHMETIC IS DERIVED FROM THE PAIR COUNT AND WENT STALE ONCE.

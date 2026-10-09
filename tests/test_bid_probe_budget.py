@@ -148,15 +148,29 @@ def test_step_timeout_covers_the_worst_case(workflow_text: str):
     )
 
 
+# Setup and the telemetry upload carry no timeout of their own. Measured ~10s
+# (2026-10-09); the allowance covers the uv retry path without measuring it.
+SETUP_AND_UPLOAD_ALLOWANCE_MIN = 8
+
+
 def test_reap_step_still_has_a_window(workflow_text: str):
-    """The job backstop must exceed the step timeout, or the always()-reap
-    never runs and the leak the reap exists to prevent happens instead."""
+    """The job backstop must cover setup, the WHOLE probe step AND the whole
+    reap step, or the always()-reap is cancelled mid-close and the leak it exists
+    to prevent happens instead. Job time is wall-clock for every step, so a
+    backstop of "probe + 10" left the reaper only what setup had not used
+    (Copilot, review of #443)."""
     job = re.search(r"^    timeout-minutes: (\d+)$", workflow_text, re.M)
     step = re.search(r"- name: Run bid probe\n\s+timeout-minutes: (\d+)", workflow_text)
-    assert job and step
-    assert int(job.group(1)) - int(step.group(1)) >= 10, (
-        "fewer than 10 min between the step timeout and the job backstop: a "
-        "slow step leaves the always()-reap step no time to close open orders"
+    reap = re.search(
+        r"- name: Reap leaked probe orders\n(?:\s+if: .*\n)?\s+timeout-minutes: (\d+)",
+        workflow_text,
+    )
+    assert job and step and reap
+    needed = SETUP_AND_UPLOAD_ALLOWANCE_MIN + int(step.group(1)) + int(reap.group(1))
+    assert int(job.group(1)) >= needed, (
+        f"job backstop {job.group(1)}m < setup/upload {SETUP_AND_UPLOAD_ALLOWANCE_MIN}m "
+        f"+ probe {step.group(1)}m + reap {reap.group(1)}m: a slow run cancels the "
+        "always()-reap step before it can close open orders"
     )
 
 
