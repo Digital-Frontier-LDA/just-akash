@@ -72,6 +72,30 @@ def test_pinning_attributes_are_unique_per_provider():
         seen[key] = p.cluster
 
 
+def test_no_pin_is_satisfied_by_another_providers_pin():
+    # Unique is not enough: a provider matches every attribute it HAS, so if
+    # A's pin is a subset of B's, B is eligible for all of A's orders. That is
+    # exactly what porto did to onidc's pin before `city` was added
+    # (both are region=eu-west, hosting-provider=oni).
+    for a in PROVIDERS:
+        for b in PROVIDERS:
+            if a is b:
+                continue
+            assert not a.attributes.items() <= b.attributes.items(), (
+                f"{b.cluster} carries every attribute of {a.cluster}'s pin, so it "
+                f"can bid on {a.cluster}'s probe orders"
+            )
+
+
+def test_porto_is_probed_and_pinned_by_city():
+    porto = next(p for p in PROVIDERS if p.cluster == "porto")
+    assert porto.attributes["city"] == "OPO"
+    assert ONIDC.attributes["city"] == "LIS"
+    pairs = {(p.cluster, s.name) for p, s in eligible_pairs()}
+    assert ("porto", "cpu") in pairs
+    assert ("porto", "ip-lease") not in pairs
+
+
 # --------------------------------------------------------------------------
 # Pinning
 # --------------------------------------------------------------------------

@@ -23,7 +23,7 @@ name: Bid probe
 # telemetry branch records every run's scheduled-vs-actual so delivery and skew
 # are computed from data, not assumed.
 #
-# 13 pairs/run x 8 runs/day = 104 orders/day, ~$52/day of escrow CHURN (each
+# 16 pairs/run x 8 runs/day = 128 orders/day, ~$64/day of escrow CHURN (each
 # deposit returns on close) against a grant that has been fully locked once
 # before. The other cost is wall-clock in the shared akash-wallet concurrency
 # group; the first fleet run measured 3m23s.
@@ -39,7 +39,7 @@ on:
         default: all
         # "all" rather than an empty string: actionlint rejects an empty option
         # value, and the workflow would not render in the UI at all.
-        options: [all, alphavps, onidc, hetzner_hel]
+        options: [all, alphavps, onidc, hetzner_hel, porto]
       retry_delay:
         description: "Seconds before confirming a NO-BID (0 disables the retry)"
         type: string
@@ -70,7 +70,15 @@ jobs:
     # Backstop only. The real bound is the step timeout below: a JOB timeout
     # cancels the whole job and the always()-reap step would never run, leaking
     # every open order this run created.
-    timeout-minutes: 55
+    #
+    # Sized as the SUM of everything that can run before the reaper finishes,
+    # because job time is wall-clock for all steps, not just the probe:
+    #   8m  setup + telemetry upload (no step timeout of their own; measured
+    #       ~10s on 2026-10-09, the allowance covers the uv retry path)
+    #   52m the probe step's timeout
+    #   10m the reap step's timeout
+    # tests/test_bid_probe_budget.py recomputes this from the step timeouts.
+    timeout-minutes: 70
     steps:
       # FIRST step, before anything slow, so this is as close to "when the run
       # actually began" as the runner can report. It exists because
@@ -124,19 +132,19 @@ jobs:
           age-key: ${{ secrets.SOPS_AGE_KEY }}
 
       # Worst case is every pair no-bidding AND being retried:
-      # 13 x (45s wait + 60s confirm delay + 45s retry wait) = 1950s = 32.5 min,
-      # plus order create/close overhead. 40m left only 7.5m of headroom where the
-      # rule wants 9.75m (0.75m per pair), so 45m -- still 10 min inside the 55m job
-      # backstop so the always()-reap step always runs.
+      # 16 x (45s wait + 60s confirm delay + 45s retry wait) = 2400s = 40 min,
+      # plus order create/close overhead. The rule wants 0.75m of headroom per
+      # pair (12m), so 52m. The job backstop above is sized around it so the
+      # always()-reap step always runs. (13 -> 16 pairs: porto, 2026-10-09.)
       #
       # ⛔ THIS ARITHMETIC IS DERIVED FROM THE PAIR COUNT AND WENT STALE ONCE.
       # #257 took it from 9 pairs to 12 and 35m stopped being enough. A budget
       # that silently under-provisions does not fail loudly — the step is KILLED
       # mid-run, and per the job comment above that leaks every order still open.
-      # tests/test_bid_probe_budget.py pins the 12 to len(eligible_pairs()) so
+      # tests/test_bid_probe_budget.py pins the pair count to len(eligible_pairs()) so
       # the next scenario added fails a test instead of a production run.
       - name: Run bid probe
-        timeout-minutes: 45
+        timeout-minutes: 52
         env:
           BIDPROBE_PROM: ${{ github.workspace }}/bidprobe-metrics.prom
           BIDPROBE_JSONL: ${{ github.workspace }}/bidprobe.jsonl
