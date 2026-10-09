@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 from collections.abc import Mapping
 from pathlib import Path
@@ -44,8 +45,11 @@ def _run(
         encoding="utf-8",
     )
     gh.chmod(0o755)
+    script = (body or _body()).replace(
+        "/tmp/gh-dereg.err", shlex.quote(str(tmp_path / "gh-dereg.err"))
+    )
     return subprocess.run(
-        ["/bin/bash", "-e", "-c", body or _body()],
+        ["/bin/bash", "-e", "-c", script],
         env={
             **os.environ,
             "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
