@@ -411,9 +411,8 @@ class ProviderTarget:
 
     ``nodeport`` is therefore on every provider (#257). Directly evidenced for
     alphavps, which served the two-NodePort E2E workload on 2026-09-04. For
-    onidc, hetzner_hel and porto it is INFERENCE from their running the same
-    provider stack — and that unverified inference is precisely what needs
-    measuring.
+    onidc and hetzner_hel it is INFERENCE from their running the same provider
+    stack — and that unverified inference is precisely what needs measuring.
     """
 
     cluster: str
@@ -438,6 +437,8 @@ PROVIDERS: tuple[ProviderTarget, ...] = (
         # `city` is load-bearing since porto (2026-10-06): porto is ALSO
         # region=eu-west + hosting-provider=oni, so without it porto is eligible
         # for every onidc probe order. Both cities are on chain (LIS / OPO).
+        # (Holds even while porto is unprobed — see below: once audited it would
+        # satisfy the signedBy clause too.)
         attributes={
             "region": "eu-west",
             "organization": "digital frontier",
@@ -451,21 +452,24 @@ PROVIDERS: tuple[ProviderTarget, ...] = (
         capabilities=frozenset({"cpu", "persistent-beta3", "nodeport"}),
         attributes={"region": "eu-north", "organization": "digital frontier"},
     ),
-    ProviderTarget(
-        # The second DC (Porto), on chain since 2026-10-06. Same oni facility
-        # attributes as onidc, told apart by city. No ip-lease (the autobidder's
-        # CLUSTER_CAPABILITIES has none for porto) and no GPU.
-        cluster="porto",
-        wallet="akash1jk3v62a5kf7m4ee0lqpagwvvjyw6e3vnl5ggr9",  # pragma: allowlist secret
-        capabilities=frozenset({"cpu", "persistent-beta3", "nodeport"}),
-        attributes={
-            "region": "eu-west",
-            "organization": "digital frontier",
-            "hosting-provider": "oni",
-            "city": "OPO",
-        },
-    ),
 )
+
+# ⛔ porto (akash1jk3v62a5kf7m4ee0lqpagwvvjyw6e3vnl5ggr9, the second DC, on chain
+# since 2026-10-06) is DELIBERATELY ABSENT until its attributes are audited.
+# Probe orders placed through the Console carry `signedBy` the audit authority
+# (sdl_validate.AUDIT_AUTHORITY_ADDRESS), and porto has no signed attributes, so
+# it declines every one: "attribute signature requirements not met" (porto's
+# Loki, all three pairs of run 37919590986, 2026-10-09). The probe can only ever
+# record "untestable" there, so listing it spends 3 orders and ~7.5 min of
+# retries per run to learn nothing, and the autobidder's bidprobe-untestable
+# rule would page. Porto's in-cluster synthetic probe covers its bid health.
+#
+# Once porto is audited, add it back as:
+#   ProviderTarget(cluster="porto", wallet=<above>,
+#       capabilities=frozenset({"cpu", "persistent-beta3", "nodeport"}),
+#       attributes={"region": "eu-west", "organization": "digital frontier",
+#                   "hosting-provider": "oni", "city": "OPO"})
+# with the step/job budget below re-derived (tests/test_bid_probe_budget.py).
 
 
 def eligible_pairs(
