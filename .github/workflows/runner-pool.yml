@@ -379,6 +379,12 @@ on:
       runners_online:
         description: 'Distinct online runners as "K/N".'
         value: ${{ jobs.pool.outputs.runners_online }}
+      runner-ids:
+        description: >-
+          JSON array of known operation-labelled registration IDs from this pool's
+          existing runner polls. Forward with the same github-org, repository scope
+          and runner-label to teardown; this is not proof of a complete registration census.
+        value: ${{ jobs.pool.outputs.runner-ids }}
       runner-targets:
         description: >-
           JSON array for the caller's runs-on: the pool's labels when healthy, else
@@ -486,6 +492,7 @@ jobs:
       create_ambiguous: ${{ steps.provision.outputs.create_ambiguous }}
       provision_healthy: ${{ steps.provision.outputs.provision_healthy }}
       runners_online: ${{ steps.provision.outputs.runners_online }}
+      runner-ids: ${{ steps.provision.outputs.runner_ids || '[]' }}
       failure_reason: ${{ steps.pat.outputs.failure_reason || steps.provision.outputs.failure_reason || steps.public_profile.outputs.failure_reason || steps.private_profile.outputs.failure_reason || steps.candidates.outputs.failure_reason }}
       wallet_free_usd: ${{ steps.provision.outputs.wallet_free_usd }}
       runner_hosts_proven: ${{ steps.candidates.outputs.proven_hosts }}
@@ -1293,6 +1300,8 @@ jobs:
           # Fail closed before the first possible submit. Every branch inherits UNKNOWN;
           # only the enumerated no-broadcast sites below may narrow it to no-deployment.
           echo "deployment_outcome=unknown" >> "$GITHUB_OUTPUT"
+          KNOWN_RUNNER_IDS_JSON='[]'
+          echo 'runner_ids=[]' >> "$GITHUB_OUTPUT"
 
 
 
@@ -1945,6 +1954,30 @@ jobs:
                 continue
               fi
               API_OK=1
+              # Preserve known identities across polls/retry leases, including offline
+              # registrations. Teardown still verifies each ID in the original org/repo
+              # scope; no new listing or registration authority is introduced here.
+              if NEXT_RUNNER_IDS_JSON=$(printf '%s' "$RUNNER_PAGES" | jq -sc \
+                  --arg L "$RUNNER_LABEL" --argjson PRIOR "$KNOWN_RUNNER_IDS_JSON" '
+                  if length>0 and length<=100
+                    and all(.[]; type=="object" and (.runners|type=="array" and length<=100))
+                  then
+                    [.[] | .runners[] | select(type=="object")
+                      | select(.id|type=="number" and .>0 and .<9007199254740992 and floor==.)
+                      | select(.name|type=="string" and startswith("just-akash-") and length<=256)
+                      | select(.labels|type=="array" and length<=100)
+                      | select(any(.labels[]; type=="object" and .name==$L))
+                      | select(any(.labels[]; type=="object" and .name=="self-hosted"))
+                      | select(any(.labels[]; type=="object" and .name=="akash"))
+                      | .id] as $observed
+                    | ($PRIOR + $observed | unique)
+                    | if length<=10000 then . else error("identity bound") end
+                  else error("runner pages") end' 2>/dev/null); then
+                KNOWN_RUNNER_IDS_JSON="$NEXT_RUNNER_IDS_JSON"
+                printf 'runner_ids=%s\n' "$KNOWN_RUNNER_IDS_JSON" >> "$GITHUB_OUTPUT"
+              else
+                echo '::warning::Exact runner identities were not recorded from this poll; earlier known IDs are retained'
+              fi
               # COUNT LINES, NEVER `| length`. `gh api --paginate --jq` applies the jq
               # filter to EACH PAGE SEPARATELY and concatenates the results, so an
               # aggregating filter emits one number PER PAGE: an org with >100 runners
@@ -2430,6 +2463,7 @@ jobs:
       deployment-group: ${{ needs.pool.outputs.deployment_group }}
       tag-prefix: ${{ inputs.tag-prefix }}
       runner-label: ${{ inputs.runner-label }}
+      runner-ids: ${{ needs.pool.outputs.runner-ids }}
       # ⭐ inputs.github-org, NOT github.organization — that context property DOES NOT
       # EXIST and evaluates to EMPTY STRING silently (caught by sentinel + CodeRabbit
       # review on #182; all six required checks were green on the broken form). The

@@ -46,6 +46,7 @@ jobs:
     with:
       just-akash-ref: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa # MUST equal the workflow pin
       dseq: ${{ needs.pool.outputs.dseq }}
+      runner-ids: ${{ needs.pool.outputs.runner-ids }}
       runner-label: ci-example-${{ github.run_id }}
       tag-prefix: ci-example
       github-org: Borduas-Holdings
