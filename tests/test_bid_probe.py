@@ -87,13 +87,25 @@ def test_no_pin_is_satisfied_by_another_providers_pin():
             )
 
 
-def test_porto_is_probed_and_pinned_by_city():
-    porto = next(p for p in PROVIDERS if p.cluster == "porto")
-    assert porto.attributes["city"] == "OPO"
+def test_onidc_pin_excludes_porto_by_city():
+    # porto is not probed yet (unaudited; see the note under PROVIDERS), but it
+    # is on chain with every other attribute of onidc's pin, so onidc's orders
+    # must still carry the city that tells the two apart.
+    porto_on_chain = {
+        "region": "eu-west",
+        "organization": "digital frontier",
+        "hosting-provider": "oni",
+        "city": "OPO",
+    }
     assert ONIDC.attributes["city"] == "LIS"
-    pairs = {(p.cluster, s.name) for p, s in eligible_pairs()}
-    assert ("porto", "cpu") in pairs
-    assert ("porto", "ip-lease") not in pairs
+    assert not ONIDC.attributes.items() <= porto_on_chain.items()
+
+
+def test_porto_is_not_probed_until_audited():
+    # Console orders carry signedBy the audit authority and porto declines all of
+    # them ("attribute signature requirements not met"), so probing it records
+    # only "untestable" and the autobidder's bidprobe-untestable rule would page.
+    assert "porto" not in {p.cluster for p in PROVIDERS}
 
 
 # --------------------------------------------------------------------------
