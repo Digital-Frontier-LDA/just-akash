@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -29,6 +30,8 @@ from . import chain
 from . import execution_observation as execution
 from . import sentry_lease_receipt as capture
 from .deployment_receipt import _canonical_bytes, _private_parent, decode_receipt
+
+logger = logging.getLogger(__name__)
 
 
 def _require(value):
@@ -224,9 +227,12 @@ def _spec(value: Any, group: str):
     value = _object(value)
     _require(set(value) <= {"name", "requirements", "resources"})
     _require(value.get("name") == group)
-    resources = _array(value.get("resources"))
-    _require(len(resources) == 1)
-    row = _object(resources[0])
+    # Protocol arity, not an observer quorum: this fixed deployment has exactly
+    # one resource row. Unpack the complete array so neither an empty population
+    # nor trailing rows can be ignored. The two independent sources and two
+    # complete snapshots remain mandatory in _allocation and its caller.
+    (only_row,) = _array(value.get("resources"))
+    row = _object(only_row)
     _require(set(row) <= {"resource", "count", "price"})
     shape = _resource(row.get("resource"), row.get("count"))
     return shape, _canonical_bytes(value)
@@ -512,4 +518,5 @@ def observe_sentry_allocation(
             expires_at=int(execution._time(evidence["expires_at"]).timestamp()),
         )
     except Exception:  # noqa: BLE001 — errors/credentials/bodies never escape into reports
+        logger.warning("allocation observation held: allocation.unverified")
         return AllocationObservation(False, "allocation.unverified", budget.reads if budget else 0)
