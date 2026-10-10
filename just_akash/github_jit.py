@@ -14,11 +14,16 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 API = "https://api.github.com"
 ORGANIZATION = "Digital-Frontier-LDA"
 _ROOT = f"/orgs/{ORGANIZATION}/actions"
+_OWNED_ROOT = "/orgs/Borduas-Holdings/actions"
+_OWNED_REPOSITORIES = {
+    "Borduas-Holdings/blazing": 1074974924,
+    "Borduas-Holdings/Blazing-Back": 1071436278,
+}
 _MAX_BYTES = 1024 * 1024
 
 
@@ -58,7 +63,8 @@ def github_request(method: str, path: str, token: str, body: dict | None = None)
     """Fixed-origin, no-redirect, bounded request with no automatic POST retry."""
     if (
         method not in {"GET", "POST"}
-        or not path.startswith(_ROOT + "/")
+        or not isinstance(path, str)
+        or not any(path.startswith(root + "/") for root in (_ROOT, _OWNED_ROOT))
         or re.search(r"[\s#\\]", path)
         or ".." in path
         or "%" in path
@@ -128,7 +134,10 @@ class JitPolicy:
             or not _positive(self.group_id)
             or not _positive(self.repository_id)
             or not isinstance(self.repository_name, str)
-            or re.fullmatch(ORGANIZATION + r"/[A-Za-z0-9_.-]+", self.repository_name) is None
+            or (
+                re.fullmatch(ORGANIZATION + r"/[A-Za-z0-9_.-]+", self.repository_name) is None
+                and _OWNED_REPOSITORIES.get(self.repository_name) != self.repository_id
+            )
             or type(self.workflows) is not tuple
             or not self.workflows
             or len(self.workflows) > 100
@@ -161,9 +170,14 @@ class JitPolicy:
         if len(set(self.workflows)) != len(self.workflows):
             raise JitHold("duplicate workflow policy")
 
+    @property
+    def api_root(self) -> str:
+        """Derive the fixed organization from the already validated repository."""
+        return f"/orgs/{self.repository_name.partition('/')[0]}/actions"
+
 
 def _verify_group(policy: JitPolicy, call: Callable[..., dict]) -> None:
-    path = f"{_ROOT}/runner-groups/{policy.group_id}"
+    path = f"{policy.api_root}/runner-groups/{policy.group_id}"
     group = call("GET", path)
     workflows = group.get("selected_workflows")
     if (
@@ -248,6 +262,11 @@ def mint_jit(
     *,
     request: Callable[..., dict] = github_request,
     producer_workflow_revision: str | None = None,
+    mint_receipt_path: str | None = None,
+    controller_operation_id: str | None = None,
+    controller_run_id: str | None = None,
+    controller_run_attempt: str | None = None,
+    controller_source_revision: str | None = None,
 ) -> JitHandoff:
     """Verify current exact policy and mint one slot, never retrying a mutation.
 
@@ -257,6 +276,8 @@ def mint_jit(
     For a non-reusable workflow the trusted caller supplies the source revision
     from its authenticated producer. Equality here binds that revision to policy;
     it does not authenticate caller-supplied strings or replace admission.
+    Optional receipt context is likewise unauthenticated data; durable UNKNOWN
+    blocks a later mint but grants no registration, delivery or create authority.
     """
     if (
         not isinstance(policy, JitPolicy)
@@ -281,21 +302,68 @@ def mint_jit(
     elif producer_workflow_revision is not None:
         raise JitHold("unexpected branch source binding for reusable workflow policy")
 
+    capture_fields = (
+        controller_operation_id,
+        controller_run_id,
+        controller_run_attempt,
+        controller_source_revision,
+    )
+    capture_slot = None
+    capture_claim = None
+    if mint_receipt_path is not None or any(value is not None for value in capture_fields):
+        if mint_receipt_path is None or any(value is None for value in capture_fields):
+            raise JitHold("JIT mint receipt arguments are all-or-none")
+        from . import jit_mint_receipt
+
+        # Casts narrow static types only; inspect_slot validates actual values.
+        capture_claim = tuple(cast(str, value) for value in capture_fields)
+        try:
+            capture_slot = jit_mint_receipt.inspect_slot(mint_receipt_path, *capture_claim)
+        except (RuntimeError, OSError, TypeError, ValueError):
+            raise JitHold("JIT mint receipt slot is unavailable or invalid") from None
+
     def call(method: str, path: str, body: dict | None = None) -> dict:
         return request(method, path, installation_token, body)
 
     verify_group_policy(policy, installation_token, request=request)
+    pending = None
+    if capture_slot is not None and capture_claim is not None:
+        try:
+            pending = jit_mint_receipt.prepare(
+                capture_slot,
+                policy=policy,
+                operation_id=capture_claim[0],
+                run_id=capture_claim[1],
+                run_attempt=capture_claim[2],
+                source_revision=capture_claim[3],
+                runner_name=runner_name,
+                labels=labels,
+                producer_revision=producer_workflow_revision,
+            )
+        except Exception:
+            raise JitMintUnknown(
+                "JIT mint observation incomplete; reconcile the exact slot"
+            ) from None
     try:
-        doc = call(
-            "POST",
-            _ROOT + "/runners/generate-jitconfig",
-            {
-                "name": runner_name,
-                "runner_group_id": policy.group_id,
-                "labels": list(labels),
-                "work_folder": "_work",
-            },
-        )
+        try:
+            doc = call(
+                "POST",
+                policy.api_root + "/runners/generate-jitconfig",
+                {
+                    "name": runner_name,
+                    "runner_group_id": policy.group_id,
+                    "labels": list(labels),
+                    "work_folder": "_work",
+                },
+            )
+        except Exception:
+            if pending is None:
+                raise
+            raise JitMintUnknown(
+                "GitHub mutation outcome unknown; reconcile the exact slot"
+            ) from None
+        if pending is not None and not isinstance(doc, dict):
+            raise ValueError("invalid JIT response object")
         runner, config = doc.get("runner"), doc.get("encoded_jit_config")
         if (
             not isinstance(runner, dict)
@@ -324,8 +392,16 @@ def mint_jit(
             file_bytes = base64.b64decode(content, validate=True)
             if not file_bytes or base64.b64encode(file_bytes).decode() != content:
                 raise ValueError("invalid JIT configuration file encoding")
-        return JitHandoff(
+        handoff = JitHandoff(
             runner["id"], runner_name, policy.group_id, policy.revision, labels, config
         )
+        if pending is not None:
+            try:
+                jit_mint_receipt.response_received(pending, runner["id"], runner_name)
+            except Exception:
+                raise JitMintUnknown(
+                    "JIT mint observation incomplete; reconcile the exact slot"
+                ) from None
+        return handoff
     except (JitHold, ValueError, TypeError, KeyError, UnicodeError, RecursionError):
         raise JitMintUnknown("GitHub mutation outcome unknown; reconcile the exact slot") from None
