@@ -9,6 +9,7 @@ Akash closure and the whole600/cleanup10 route remain separate and unqualified.
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import os
 import re
@@ -461,6 +462,10 @@ def retire_completed_jit_registration(
                 acknowledged = status == 204 and body is None
             except Exception:
                 # Mutation may have happened. Reads may reconcile, never retry.
+                logging.getLogger(__name__).warning(
+                    "JIT registration DELETE acknowledgement unverified; "
+                    "retain UNKNOWN and reconcile read-only"
+                )
                 acknowledged = False
             absent = observer.stable() is None
         else:

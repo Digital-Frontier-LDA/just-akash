@@ -277,6 +277,35 @@ def test_lost_delete_ack_without_removal_preserves_unknown_and_never_retries(tar
     assert sum(m == "DELETE" for m, _ in target.trace) == 1
 
 
+def test_lost_delete_ack_logs_only_fixed_warning_and_keeps_single_wire(target, caplog):
+    original = target.github
+    sensitive = "synthetic-installation-token private-body signed-url exception-detail"
+
+    def request(method, path, token, *, deadline):
+        result = original(method, path, token, deadline=deadline)
+        if method == "DELETE":
+            raise TimeoutError(sensitive)
+        return result
+
+    result = target.invoke(_request=request)
+    assert result.absent_observed and not result.delete_acknowledged
+    assert json.loads(target.end.read_bytes())["state"] == "UNKNOWN"
+    assert caplog.record_tuples == [
+        (
+            "just_akash.jit_registration_terminal",
+            30,
+            "JIT registration DELETE acknowledgement unverified; "
+            "retain UNKNOWN and reconcile read-only",
+        )
+    ]
+    assert all(record.exc_info is None and record.stack_info is None for record in caplog.records)
+    assert sensitive not in caplog.text
+    with pytest.raises(JitHold):
+        target.invoke()
+    assert target.invoke(reconcile=True).absent_observed
+    assert sum(method == "DELETE" for method, _ in target.trace) == 1
+
+
 def test_intent_fsync_lost_ack_never_sends_delete(target, monkeypatch):
     original = terminal._create_durable
 
