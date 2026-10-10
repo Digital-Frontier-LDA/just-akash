@@ -19,6 +19,11 @@ from typing import Any
 API = "https://api.github.com"
 ORGANIZATION = "Digital-Frontier-LDA"
 _ROOT = f"/orgs/{ORGANIZATION}/actions"
+_OWNED_ROOT = "/orgs/Borduas-Holdings/actions"
+_OWNED_REPOSITORIES = {
+    "Borduas-Holdings/blazing": 1074974924,
+    "Borduas-Holdings/Blazing-Back": 1071436278,
+}
 _MAX_BYTES = 1024 * 1024
 
 
@@ -58,7 +63,8 @@ def github_request(method: str, path: str, token: str, body: dict | None = None)
     """Fixed-origin, no-redirect, bounded request with no automatic POST retry."""
     if (
         method not in {"GET", "POST"}
-        or not path.startswith(_ROOT + "/")
+        or not isinstance(path, str)
+        or not any(path.startswith(root + "/") for root in (_ROOT, _OWNED_ROOT))
         or re.search(r"[\s#\\]", path)
         or ".." in path
         or "%" in path
@@ -128,7 +134,10 @@ class JitPolicy:
             or not _positive(self.group_id)
             or not _positive(self.repository_id)
             or not isinstance(self.repository_name, str)
-            or re.fullmatch(ORGANIZATION + r"/[A-Za-z0-9_.-]+", self.repository_name) is None
+            or (
+                re.fullmatch(ORGANIZATION + r"/[A-Za-z0-9_.-]+", self.repository_name) is None
+                and _OWNED_REPOSITORIES.get(self.repository_name) != self.repository_id
+            )
             or type(self.workflows) is not tuple
             or not self.workflows
             or len(self.workflows) > 100
@@ -161,9 +170,14 @@ class JitPolicy:
         if len(set(self.workflows)) != len(self.workflows):
             raise JitHold("duplicate workflow policy")
 
+    @property
+    def api_root(self) -> str:
+        """Derive the fixed organization from the already validated repository."""
+        return f"/orgs/{self.repository_name.partition('/')[0]}/actions"
+
 
 def _verify_group(policy: JitPolicy, call: Callable[..., dict]) -> None:
-    path = f"{_ROOT}/runner-groups/{policy.group_id}"
+    path = f"{policy.api_root}/runner-groups/{policy.group_id}"
     group = call("GET", path)
     workflows = group.get("selected_workflows")
     if (
@@ -288,7 +302,7 @@ def mint_jit(
     try:
         doc = call(
             "POST",
-            _ROOT + "/runners/generate-jitconfig",
+            policy.api_root + "/runners/generate-jitconfig",
             {
                 "name": runner_name,
                 "runner_group_id": policy.group_id,
