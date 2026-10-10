@@ -176,7 +176,8 @@ def test_requested_labels_are_complete_unique_and_extra_labels_only_known_defaul
 def test_incomplete_population_policy_or_readback_movement_fails_closed(bad):
     github = GitHub()
 
-    def change(method, path, doc, count):
+    def change(method, path, document, count):
+        doc = document
         if "/runners?" in path:
             if bad == "missing-first" and path.endswith("page=1"):
                 doc["runners"] = []

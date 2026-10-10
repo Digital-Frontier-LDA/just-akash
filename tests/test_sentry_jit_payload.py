@@ -225,6 +225,7 @@ def startup(tmp_path):
             "UNRELATED_MANAGEMENT_SECRET": "synthetic-management-do-not-forward",
         }
         env.update(extra or {})
+        assert BASH is not None
         result = subprocess.run(
             [BASH, "--noprofile", "--norc", "-p", str(script)],
             env=env,
