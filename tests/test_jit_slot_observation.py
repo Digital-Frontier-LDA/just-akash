@@ -17,7 +17,8 @@ HANDOFF = jit.JitHandoff(789, NAME, 37, "b" * 40, LABELS, "synthetic-config-not-
 
 
 class GitHub:
-    def __init__(self):
+    def __init__(self, policy=POLICY):
+        self.policy = policy
         self.calls = []
         self.runner = {
             "id": 789,
@@ -38,7 +39,7 @@ class GitHub:
             "visibility": "selected",
             "allows_public_repositories": False,
             "restricted_to_workflows": True,
-            "selected_workflows": list(POLICY.workflows),
+            "selected_workflows": list(policy.workflows),
         }
         self.change = lambda method, path, document, count: None
         self.reads = {}
@@ -51,7 +52,13 @@ class GitHub:
             rows = (
                 []
                 if path.endswith("page=2")
-                else [{"id": 1071436278, "full_name": REPO, "private": True}]
+                else [
+                    {
+                        "id": self.policy.repository_id,
+                        "full_name": self.policy.repository_name,
+                        "private": True,
+                    }
+                ]
             )
             doc = {"total_count": 1, "repositories": rows}
         elif "/runners?" in path:
@@ -87,6 +94,29 @@ def test_exact_returned_id_is_observed_in_two_complete_groups_and_direct_readbac
     assert sum(path.endswith("/runners/789") for _, path in github.calls) == 2
     assert all(path.startswith("/orgs/Borduas-Holdings/actions/") for _, path in github.calls)
     assert "synthetic-config-not-retained" not in repr(result)
+
+
+@pytest.mark.parametrize(
+    "repository,identity",
+    [("Borduas-Holdings/blazing", 1074974924), ("Digital-Frontier-LDA/df-grafana", 123)],
+)
+def test_other_supported_repository_observations_keep_the_validated_organization_route(
+    repository, identity
+):
+    policy = jit.JitPolicy(
+        "b" * 40,
+        37,
+        identity,
+        repository,
+        (repository + "/.github/workflows/owned.yml@" + "a" * 40,),
+    )
+    github = GitHub(policy)
+    result = observe.observe_ready_jit_slot(
+        policy, HANDOFF, "installation-fixture", deadline=100, request=github
+    )
+    assert result.runner_id == 789
+    assert len(github.calls) == 14
+    assert all(path.startswith(policy.api_root + "/") for _, path in github.calls)
 
 
 @pytest.mark.parametrize(
@@ -168,7 +198,7 @@ def test_incomplete_population_policy_or_readback_movement_fails_closed(bad):
         ready(github)
 
 
-@pytest.mark.parametrize("deadline", [10, 9, float("inf"), float("nan"), True, 611])
+@pytest.mark.parametrize("deadline", [10, 9, float("inf"), float("nan"), True, 611, 10**1000])
 def test_expired_or_unbounded_deadline_refuses_before_any_get(deadline):
     github = GitHub()
     with pytest.raises(jit.JitHold):
@@ -195,3 +225,31 @@ def test_foreign_handoff_policy_is_rejected_before_any_get():
             POLICY, handoff, "installation-fixture", deadline=100, request=github
         )
     assert github.calls == []
+
+
+def test_transport_failure_never_echoes_controller_token_or_response():
+    def unavailable(*args):
+        raise RuntimeError("synthetic-config-not-retained installation-fixture")
+
+    with pytest.raises(jit.JitHold) as error:
+        ready(unavailable)
+    assert str(error.value) == "exact JIT slot readiness is unverified"
+
+
+def test_case_ambiguous_declared_labels_refuse_before_any_get():
+    github = GitHub()
+    handoff = jit.JitHandoff(789, NAME, 37, "b" * 40, (NAME, "Linux", "linux"), "fixture")
+    with pytest.raises(jit.JitHold):
+        observe.observe_ready_jit_slot(
+            POLICY, handoff, "installation-fixture", deadline=100, request=github
+        )
+    assert github.calls == []
+
+
+def test_deadline_cannot_expire_between_last_read_and_return(monkeypatch):
+    times = iter([10] * 29 + [100])
+    monkeypatch.setattr(observe.time, "monotonic", lambda: next(times))
+    github = GitHub()
+    with pytest.raises(jit.JitHold):
+        ready(github)
+    assert len(github.calls) == 14
