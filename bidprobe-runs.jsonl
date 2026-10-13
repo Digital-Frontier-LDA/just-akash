@@ -480,3 +480,4 @@
 {"run_id":"38396287291","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-10-13T12:18:11Z","attempt":"1","accrued_at":"2026-10-13T12:24:35Z","published":true}
 {"run_id":"38419959039","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-10-13T15:11:57Z","attempt":"1","accrued_at":"2026-10-13T15:17:51Z","published":true}
 {"run_id":"38445251492","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-10-13T18:15:27Z","attempt":"1","accrued_at":"2026-10-13T18:21:29Z","published":true}
+{"run_id":"38468370264","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-10-13T21:09:00Z","attempt":"1","accrued_at":"2026-10-13T21:15:16Z","published":true}
