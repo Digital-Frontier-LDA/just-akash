@@ -618,12 +618,38 @@ class AkashConsoleAPI:
             return first if isinstance(first, dict) else response
         return response
 
-    def create_deployment(self, sdl_content: str, deposit: float = 5.0) -> dict[str, Any]:
-        response = self._request(
-            "POST",
-            "/v1/deployments",
-            {"data": {"sdl": sdl_content, "deposit": deposit}},
-        )
+    #: The Console's POST /v1/deployments `runtimeLimitHours` range (live schema, 2026-10-12).
+    RUNTIME_LIMIT_HOURS_RANGE = (1, 48)
+
+    def create_deployment(
+        self,
+        sdl_content: str,
+        deposit: float = 5.0,
+        *,
+        runtime_limit_hours: int | None = None,
+    ) -> dict[str, Any]:
+        """POST /v1/deployments.
+
+        ``runtime_limit_hours`` (1..48, just-akash #448) is the Console's runtimeLimitHours:
+        "Automatic funding keeps the deployment running until the limit, then the deployment
+        is closed automatically". It is what bounds a JOB lease now; ``deposit`` is still sent
+        for compatibility but the Console documents it as deprecated and ignored. Omitted
+        (None), the request is exactly what it always was. The write is not proof: read the
+        limit back (get_deployment_settings) before leasing.
+        """
+        body: dict[str, Any] = {"sdl": sdl_content, "deposit": deposit}
+        if runtime_limit_hours is not None:
+            lo, hi = self.RUNTIME_LIMIT_HOURS_RANGE
+            if (
+                isinstance(runtime_limit_hours, bool)
+                or not isinstance(runtime_limit_hours, int)
+                or not lo <= runtime_limit_hours <= hi
+            ):
+                raise ValueError(
+                    f"runtime_limit_hours must be a whole number of hours from {lo} to {hi}"
+                )
+            body["runtimeLimitHours"] = runtime_limit_hours
+        response = self._request("POST", "/v1/deployments", {"data": body})
         if not isinstance(response, dict):
             return response if isinstance(response, dict) else {}
         data = response.get("data", response)

@@ -378,3 +378,167 @@ def inline_sdls() -> list[tuple[str, str]]:
             ):
                 out.append((f"{wf.name}:{path}", text))
     return out
+
+
+# ── openmix-pvr6: lease charters ─────────────────────────────────────────────────────────
+#
+# Flynn/OpenMix owns the placement names below on the shared Console wallets, and its lease
+# attribution (Flynn app/background/leases.py `_NAME_EXACT` / `_NAME_PREFIXES`, `is_ours`)
+# classes a lease by exactly these: `flynn-*` and `fleet-*` by PREFIX, `dcloud` and `akash` by
+# EXACT name. A deploy whose SDL declares one of them is subject to the charter gate
+# (just_akash/charter.py); every other caller — `dfci-*`, `just-akash-*`, anything else — is
+# not, in any mode.
+OURS_PREFIXES: tuple[str, ...] = ("flynn-", "fleet-")
+OURS_EXACT: frozenset[str] = frozenset({"dcloud", "akash"})
+
+#: Akash keeps a group name of up to 62 characters byte-exact (module docstring: verified on
+#: mainnet by the sibling's provenance module). A stamped key never exceeds it.
+MAX_PLACEMENT_KEY_LEN = 62
+
+#: Flynn mints charter ids as "ch-" + 10 hex (lease_charters.CHARTER_ID_RE).
+CHARTER_ID_RE = re.compile(r"^ch-[0-9a-f]{10}$")
+_CHARTER_SUFFIX_RE = re.compile(r"\.ch-[0-9a-f]{10}$")
+
+
+def is_ours(key: str) -> bool:
+    """True if a placement key is one Flynn's lease attribution counts as OURS."""
+    return key in OURS_EXACT or any(key.startswith(p) for p in OURS_PREFIXES)
+
+
+def ours_keys(text: str) -> list[str]:
+    """The placement keys in one SDL that are OURS (see is_ours). Templates never are."""
+    return [k for k in placement_keys(text) if not is_templated(k) and is_ours(k)]
+
+
+def charter_id_of(key: str) -> str:
+    """The charter id a stamped key carries, or "" when it carries none."""
+    m = _CHARTER_SUFFIX_RE.search(key)
+    return m.group(0)[1:] if m else ""
+
+
+def charter_scoped(key: str, charter_id: str) -> str:
+    """`fleet-serve-qwen` + `ch-0123456789` -> `fleet-serve-qwen.ch-0123456789`.
+
+    The PREFIX is what Flynn attributes on (`startswith`), so it is kept: the workload part is
+    truncated, never the prefix and never the charter id, to stay within
+    MAX_PLACEMENT_KEY_LEN. A key that already carries a charter id has it REPLACED, not
+    stacked, so a re-stamp cannot grow the name past the cap or make the id ambiguous.
+    A DOT separates the two, as RUN_SEPARATOR does for run ids: workload names contain hyphens.
+    """
+    if not CHARTER_ID_RE.match(charter_id or ""):
+        raise ValueError("charter_id must be ch-<10 hex>")
+    head = _CHARTER_SUFFIX_RE.sub("", key)
+    suffix = f"{RUN_SEPARATOR}{charter_id}"
+    head = head[: MAX_PLACEMENT_KEY_LEN - len(suffix)].rstrip("-.")
+    out = f"{head}{suffix}"
+    # Cannot fail for the two prefixes we stamp (6 chars, far under the cap), but this is the
+    # property Flynn depends on, so it is asserted rather than assumed.
+    if not any(out.startswith(p) for p in OURS_PREFIXES):
+        raise ValueError("a stamped key must keep its flynn-/fleet- prefix")
+    if out.startswith(SIBLING_REAPED_PREFIX):  # pragma: no cover - impossible by the line above
+        raise ValueError("a stamped key must never carry the sibling sweeper's prefix")
+    return out
+
+
+def stamp_charter(sdl_text: str, charter_id: str) -> tuple[str, list[str]]:
+    """Rewrite every OURS PREFIX placement key to carry ``charter_id``. Returns (sdl, new keys).
+
+    So the chain's group name says which charter paid for the lease, readable from public
+    REST with no auth — the same reason the repo prefix lives there (module docstring).
+
+    ⚠ The EXACT names (`dcloud`, `akash`) are NOT stamped. Flynn attributes them by equality,
+    so `dcloud.ch-…` would match no rule there and the lease would read UNATTRIBUTED — the
+    exact opposite of what a charter is for. They are bound by dseq instead (charter bind).
+    Keys of anyone else (dfci-*, just-akash-*, …) are never touched.
+
+    STRUCTURE-AWARE, unlike stamp_run's line match: only `profiles.placement.<KEY>` (where
+    placement_keys finds it) and the `deployment.<service>.<KEY>` reference are rewritten. A
+    SERVICE may carry the same name as its placement (`fleet-embed:` under `services:`), and
+    renaming the service would change the lease's service set and every name-based lookup of
+    it. Block-scalar bodies are copied through untouched, as everywhere in this module.
+    Raises ValueError if the rewrite cannot be shown complete (a placement whose reference was
+    not found, or two keys that would collide after truncation): an SDL naming a placement
+    group that does not exist is rejected by Akash, and better here than after a spend.
+    """
+    targets = {
+        key: charter_scoped(key, charter_id)
+        for key in placement_keys(sdl_text)
+        if not is_templated(key) and key not in OURS_EXACT and is_ours(key)
+    }
+    if not targets:
+        return sdl_text, []
+    if len(set(targets.values())) != len(targets):
+        raise ValueError("two placement keys collide once charter-stamped (truncation)")
+
+    lines = sdl_text.split("\n")
+    out_lines: list[str] = []
+    rewrote_placement: set[str] = set()
+    rewrote_ref: set[str] = set()
+    section = ""  # current top-level key
+    in_placement = False
+    service_ind = -1  # indent of service names under `deployment:`
+    ref_ind = -1  # indent of placement refs under a deployment service
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip())
+
+        if stripped and _BLOCK_OPEN_RE.search(line):
+            out_lines.append(line)
+            body_min = indent + 1
+            i += 1
+            while i < len(lines):
+                nxt = lines[i]
+                if nxt.strip() and (len(nxt) - len(nxt.lstrip())) < body_min:
+                    break
+                out_lines.append(nxt)
+                i += 1
+            continue
+
+        if not stripped or stripped.startswith("#"):
+            out_lines.append(line)
+            i += 1
+            continue
+
+        if indent == 0:
+            section = stripped.split(":", 1)[0]
+            in_placement = False
+            service_ind = ref_ind = -1
+            out_lines.append(line)
+            i += 1
+            continue
+
+        m = _SCOPE_LINE_RE.match(line)
+        new = line
+        if section == "profiles":
+            if _PLACEMENT_RE.match(line):
+                in_placement = True
+            elif indent <= 2:
+                in_placement = False
+            elif in_placement and indent == 4 and m and m.group("key") in targets:
+                key = m.group("key")
+                new = f"{m.group('ind')}{targets[key]}:{m.group('rest')}"
+                rewrote_placement.add(key)
+        elif section == "deployment":
+            if service_ind < 0:
+                service_ind = indent
+            if indent == service_ind:
+                ref_ind = -1
+            elif indent > service_ind:
+                if ref_ind < 0:
+                    ref_ind = indent
+                if indent == ref_ind and m and m.group("key") in targets:
+                    key = m.group("key")
+                    new = f"{m.group('ind')}{targets[key]}:{m.group('rest')}"
+                    rewrote_ref.add(key)
+        out_lines.append(new)
+        i += 1
+
+    missing = set(targets) - (rewrote_placement & rewrote_ref)
+    if missing:
+        raise ValueError(
+            f"charter stamp incomplete: {sorted(missing)} not found under both "
+            "profiles.placement and deployment.<service>"
+        )
+    return "\n".join(out_lines), list(targets.values())

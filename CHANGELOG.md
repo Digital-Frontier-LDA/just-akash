@@ -10,6 +10,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Lease charter gate for OUR placement names only (`flynn-*`, `fleet-*`, exactly `dcloud` /
+  `akash`; openmix-pvr6.1). `deploy --charter FILE|JSON` validates the charter locally, records
+  it at Flynn (`POST /api/v1/leases/charters`, Bearer `FLYNN_CHARTER_KEY` else
+  `FLYNN_CANARY_KEY`, https only, never logged) BEFORE wallet selection, the credit probe or
+  `create_deployment`, and binds it to the final dseq after the lease (wallet LABEL
+  console-2 / console-3). `JUST_AKASH_CHARTER=warn` (default) logs and continues; `enforce`
+  refuses with zero creates; `off` does nothing. Every other placement (`dfci-*`,
+  `just-akash-*`, anything else) is unchanged in every mode.
+- `provenance.stamp_charter`: the charter id rides in the chain group name
+  (`fleet-x.ch-0123456789`, <= 62 chars, `flynn-`/`fleet-` prefix kept). Exact `dcloud` /
+  `akash` are not stamped (Flynn attributes them by equality); they are bound by dseq.
+- JOB charters create with the Console's `runtimeLimitHours` = ceil(max_hours) (1..48) and read
+  it back from `/v2/deployment-settings/{dseq}` before any bid is accepted; a limit that does
+  not read back exactly closes the order unleased. `create_deployment(...,
+  runtime_limit_hours=)` is the first-class parameter #448 asked for (refs #448).
+
 - Read-only `verify-finalized-closed` adapter for the pinned core execution-closure
   envelope: complete creation identity, successful exact close transaction inclusion,
   common finalized state height and complete agreeing deployment/group/lease populations.

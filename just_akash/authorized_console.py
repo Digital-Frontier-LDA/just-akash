@@ -112,7 +112,13 @@ class AuthorizedConsoleCreate(CIConsoleAPI):
             tuple[AdmissionRequest, CreatePermit, CreateSubmissionAuthorization] | None
         ) = None
 
-    def create_deployment(self, sdl_content: str, deposit: float = 5.0) -> dict[str, Any]:
+    def create_deployment(
+        self,
+        sdl_content: str,
+        deposit: float = 5.0,
+        *,
+        runtime_limit_hours: int | None = None,
+    ) -> dict[str, Any]:
         raise CreateHeld("Use submit with a durably redeemed create authorization")
 
     def account_address(self) -> str:

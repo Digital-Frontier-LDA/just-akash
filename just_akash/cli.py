@@ -403,6 +403,20 @@ def main():
         "when the deployment closes; size it to outlast the workload.",
     )
     deploy_p.add_argument(
+        "--charter",
+        default=None,
+        metavar="FILE|JSON",
+        help=(
+            "Lease charter (openmix-pvr6) for an SDL whose placement is OURS (flynn-*, fleet-*, "
+            "dcloud, akash): a JSON object or a path to one with bead, owner, why, kind "
+            "(job|capacity), max_hours, max_act (capacity also: served_model_name, "
+            "image_digest, canary_prompt, canary_expect). Recorded at Flynn before any spend, "
+            "bound to the dseq after the lease; a job charter also sets the Console runtime "
+            "limit. JUST_AKASH_CHARTER=warn (default) | enforce | off. Other placements: "
+            "ignored."
+        ),
+    )
+    deploy_p.add_argument(
         "--receipt-path",
         help="Absolute path in a private (0700) directory for the crash-durable create receipt",
     )
@@ -961,6 +975,7 @@ def main():
                 receipt_path=args.receipt_path,
                 receipt_operation_id=args.receipt_operation_id,
                 quiet_wallet=args.quiet_wallet,
+                charter=args.charter,
             )
             sys.exit(0)
         except RuntimeError as e:

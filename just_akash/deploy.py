@@ -29,6 +29,7 @@ from akash_lease_core.auction import PreferredSelection
 from akash_lease_core.capacity import ProviderCapacity, ResourceProfile
 
 from . import chain
+from . import charter as _charter
 from ._confidential import (
     active,
     canonical_dseq,
@@ -54,7 +55,13 @@ from .deployment_receipt import (
     mark_submitting,
     prepare_receipt,
 )
-from .provenance import PLACEMENT_PREFIX, SIBLING_REAPED_PREFIX, run_id_of, stamp_run
+from .provenance import (
+    PLACEMENT_PREFIX,
+    SIBLING_REAPED_PREFIX,
+    run_id_of,
+    stamp_charter,
+    stamp_run,
+)
 from .provider_capacity import capacity_by_provider
 from .request_profile import attach_profile, derive_resource_profiles, observed_gseq
 from .sdl_validate import SDLValidationError, validate_sdl
@@ -1014,6 +1021,30 @@ def _check_wallet_credit(client: AkashConsoleAPI, deposit: float) -> None:
         )
 
 
+def _verify_runtime_limit_or_close(client, dseq: str, hours: int | None) -> None:
+    """A JOB charter's runtime limit must READ BACK before any bid is accepted; if it does not,
+    the order is closed UNLEASED (nothing is spent on an order with no lease) and the deploy
+    raises. No-op when no limit was asked for."""
+    if hours is None:
+        return
+    try:
+        _charter.verify_runtime_limit(client, dseq, hours)
+    except RuntimeError as e:
+        _log(logging.ERROR, f"CHARTER {error_text(e)}; closing {display(dseq, 'dseq')} unleased")
+        try:
+            client.close_deployment(dseq)
+        except Exception as close_err:  # noqa: BLE001 - reported, then the refusal stands
+            _log(
+                logging.ERROR,
+                f"close of {display(dseq, 'dseq')} FAILED: {error_text(close_err)}. "
+                f"Close it: just-akash destroy --dseq {display(dseq, 'dseq')}",
+            )
+        raise RuntimeError(
+            f"runtime limit not verified on {display(dseq, 'dseq')}: {error_text(e)}"
+        ) from e
+    _log(logging.INFO, f"CHARTER runtime limit {hours} h verified on {display(dseq, 'dseq')}")
+
+
 @sdl_operation
 def deploy(
     sdl_path: str,
@@ -1030,6 +1061,7 @@ def deploy(
     receipt_path: str | None = None,
     receipt_operation_id: str | None = None,
     quiet_wallet: bool | None = None,
+    charter: "str | dict | None" = None,
 ) -> dict:
     # deposit is user-controlled (--deposit); reject non-finite/non-positive
     # values before they reach json.dumps (which would emit invalid NaN/Infinity).
@@ -1068,6 +1100,18 @@ def deploy(
         fallback_window_seconds=fallback_wait,
     )
 
+    # ⛔ CHARTER GATE (openmix-pvr6 AC1), BEFORE THE WALLET IS EVEN CHOSEN. Only an SDL that
+    # declares one of OUR placement names (flynn-*, fleet-*, dcloud, akash) is gated; every
+    # other caller gets an inert plan and nothing below changes for it. In enforce mode a
+    # missing / invalid / unrecorded charter raises HERE: zero wallet checks, zero creates.
+    sdl_path = _resolve_sdl_path(sdl_path, gpu)
+    try:
+        _gate_text = Path(sdl_path).read_text(encoding="utf-8")
+    except OSError:
+        _gate_text = ""  # _prepare_sdl_content reports the missing file, before any spend
+    charter_plan = _charter.gate(_gate_text, charter)
+    del _gate_text
+
     from .wallet_pool import select_client_for_create
 
     required_uact = math.ceil(deposit * 1_000_000)
@@ -1105,11 +1149,24 @@ def deploy(
     if not has_allowlist:
         _log(logging.INFO, "ALLOWED_PROVIDERS: (any — no allowlist set)")
 
-    # Step 1: Read + validate + transform SDL (resolve GPU variant first)
-    sdl_path = _resolve_sdl_path(sdl_path, gpu)
+    # Step 1: Read + validate + transform SDL (GPU variant resolved before the charter gate)
     _log(logging.INFO, "STEP 1: Preparing SDL")
     sdl_content = _prepare_sdl_content(sdl_path, image=image, env_vars=env_vars)
     protect_content(sdl_content)
+    if charter_plan.charter_id:
+        # The chain's group name carries the charter id (provenance.stamp_charter), prefix kept
+        # so Flynn's attribution still files it as ours. Validated again: a bad rewrite fails
+        # against our validator, not as an opaque Console rejection after a spend.
+        try:
+            stamped, _charter_keys = stamp_charter(sdl_content, charter_plan.charter_id)
+            validate_sdl(stamped)
+        except (ValueError, SDLValidationError) as e:
+            charter_plan.fail(f"charter stamp failed ({error_text(e)}); SDL sent unstamped")
+        else:
+            sdl_content = stamped
+            protect_content(sdl_content)
+            if _charter_keys:
+                _log(logging.INFO, f"CHARTER {charter_plan.charter_id} placement {_charter_keys}")
     _check_wallet_credit(client, deposit)
     # ⛔ RE-CHECK QUIET AS LATE AS POSSIBLE, BUT BEFORE THE RECEIPT. The receipt binds the
     # owner, so a re-selection after it would record the wrong wallet. It runs AFTER the
@@ -1131,6 +1188,31 @@ def deploy(
             wallet = rechecked
             client = wallet.client
             _check_wallet_credit(client, deposit)  # the probe described the OLD wallet
+
+    # The bind names the owner wallet by LABEL; an owner with no label cannot be bound, so in
+    # enforce that is refused here, still before the create.
+    charter_wallet: str | None = None
+    if charter_plan.charter_id:
+        try:
+            _owner = wallet.account or client.account_address()
+        except RuntimeError as e:
+            _owner = None
+            _log(logging.WARNING, f"charter: owner address unreadable: {error_text(e)}")
+        charter_wallet = _charter.owner_label(_owner if isinstance(_owner, str) else None)
+        if charter_wallet is None:
+            charter_plan.fail(
+                "the selected wallet is not one of our owner wallets "
+                f"({', '.join(sorted(_charter.OWNER_LABELS.values()))}); the charter "
+                "cannot be bound"
+            )
+    create_kwargs: dict[str, Any] = {}
+    if charter_plan.runtime_limit_hours is not None:
+        create_kwargs["runtime_limit_hours"] = charter_plan.runtime_limit_hours
+        _log(
+            logging.INFO,
+            f"CHARTER job: runtime limit {charter_plan.runtime_limit_hours} h "
+            "(read back before any bid is accepted)",
+        )
 
     prepared_receipt = None
     if receipt_path is not None:
@@ -1160,7 +1242,9 @@ def deploy(
     if prepared_receipt is not None:
         prepared_receipt = mark_submitting(*prepared_receipt)
     try:
-        deployment_response = client.create_deployment(sdl_content, deposit=deposit)
+        deployment_response = client.create_deployment(
+            sdl_content, deposit=deposit, **create_kwargs
+        )
     except RuntimeError as e:
         if "already exists" in error_text(e).lower():
             if prepared_receipt is not None:
@@ -1186,7 +1270,9 @@ def deploy(
                 _log(logging.ERROR, f"Stale deployment cleanup failed: {error_text(cleanup_err)}")
             # Retry once after cleanup
             try:
-                deployment_response = client.create_deployment(sdl_content, deposit=deposit)
+                deployment_response = client.create_deployment(
+                    sdl_content, deposit=deposit, **create_kwargs
+                )
             except RuntimeError as retry_err:
                 _log(
                     logging.ERROR, f"Create deployment FAILED after retry: {error_text(retry_err)}"
@@ -1290,6 +1376,8 @@ def deploy(
                 "its owner and complete group identity against the chain before any retry. "
                 f"Receipt error: {error_text(receipt_error)}"
             ) from receipt_error
+
+    _verify_runtime_limit_or_close(client, str(dseq), charter_plan.runtime_limit_hours)
 
     _manifest_raw = deployment_response.get("manifest", "")
     manifest = _manifest_raw if isinstance(_manifest_raw, str) else ""
@@ -2177,7 +2265,9 @@ def deploy(
         # one here doubles the cost of the failure it is trying to recover from.
         _redeploy_started = time.time()
         try:
-            redeploy_response = client.create_deployment(sdl_content, deposit=deposit)
+            redeploy_response = client.create_deployment(
+                sdl_content, deposit=deposit, **create_kwargs
+            )
         except RuntimeError as redeploy_err:
             _report_suspected_orphans(client, _redeploy_started, _RUN_ID)
             raise RuntimeError(
@@ -2192,6 +2282,7 @@ def deploy(
                 f"{json.dumps(redeploy_response, default=str)[:200]})"
             )
         _private_create_identity(new_dseq)
+        _verify_runtime_limit_or_close(client, str(new_dseq), charter_plan.runtime_limit_hours)
         _raw_manifest = redeploy_response.get("manifest", "")
         new_manifest = _raw_manifest if isinstance(_raw_manifest, str) else ""
         _log(
@@ -2420,6 +2511,23 @@ def deploy(
         print(f"  Wallet available: {wallet.available_uact} uact")
     print(f"\nUse 'just-akash status --dseq {display(dseq, 'dseq')}' to check deployment status")
 
+    # Bind the charter to the deployment it paid for: the FINAL dseq, after the lease, because
+    # the issue-#19 re-deploy round can replace the order and Flynn refuses a second bind.
+    # A failed bind never raises here (the lease exists and the caller needs its dseq); Flynn
+    # pages a lease of ours that stays unbound, so the miss is visible.
+    charter_bound = False
+    if charter_plan.charter_id and charter_wallet:
+        try:
+            _charter.bind_remote(charter_plan.charter_id, wallet=charter_wallet, dseq=str(dseq))
+            charter_bound = True
+            _log(logging.INFO, f"CHARTER bound {charter_plan.charter_id} -> {charter_wallet}")
+        except _charter.CharterAPIError as e:
+            _log(
+                logging.ERROR,
+                f"CHARTER {charter_plan.charter_id} NOT bound to {display(dseq, 'dseq')}: "
+                f"{error_text(e)} (Flynn will page this lease as uncharted)",
+            )
+
     return {
         "dseq": dseq,
         "provider": provider,
@@ -2428,6 +2536,8 @@ def deploy(
         "lease": lease_response,
         "wallet_account": wallet_account,
         "wallet_policy": wallet.policy_version,
+        "charter_id": charter_plan.charter_id,
+        "charter_bound": charter_bound,
     }
 
 
@@ -2547,6 +2657,8 @@ def deploy_main():
     )
     parser.add_argument("--receipt-path")
     parser.add_argument("--receipt-operation-id")
+    # Mirrors `just-akash deploy --charter` (cli.py): both entry points reach the same deploy().
+    parser.add_argument("--charter", default=None, metavar="FILE|JSON")
     # Mirrors the flag on `just-akash deploy` (cli.py). Both entry points reach the same
     # deploy(), so a flag on only one of them is a trap for whoever uses the other.
     parser.add_argument(
@@ -2599,6 +2711,7 @@ def deploy_main():
             backup_providers=[] if args.no_backup_fallback else args.backup_providers,
             receipt_path=args.receipt_path,
             receipt_operation_id=args.receipt_operation_id,
+            charter=args.charter,
         )
         sys.exit(0)
     except RuntimeError as e:
