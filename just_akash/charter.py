@@ -227,8 +227,22 @@ def _detail(body: bytes) -> str:
 Opener = Callable[[urllib.request.Request, float], Any]
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse EVERY redirect. `_base_url` checks only the first URL, and urllib follows a POST's
+    301/302/303 as a GET carrying the original headers, Authorization included: one redirect
+    would hand the Flynn bearer key to any host, over plain http too. The charter API never
+    redirects, so a 3xx is an error (HTTPError -> CharterAPIError in _post), never followed."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, "redirect refused", headers, fp)
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def _default_opener(req: urllib.request.Request, timeout: float) -> Any:
-    return urllib.request.urlopen(req, timeout=timeout)  # noqa: S310 - https enforced above
+    # https enforced by _base_url; redirects refused by _NoRedirect
+    return _OPENER.open(req, timeout=timeout)
 
 
 def _post(

@@ -7,6 +7,7 @@ import io
 import json
 import math
 import urllib.error
+import urllib.request
 from typing import Any, cast
 
 import pytest
@@ -678,3 +679,71 @@ def test_deploy_main_takes_the_flag_too(monkeypatch):
     with patch.object(deploy_mod, "deploy") as d, pytest.raises(SystemExit):
         deploy_mod.deploy_main()
     assert d.call_args.kwargs["charter"] == '{"a": 1}'
+
+
+# ── no redirect may carry the bearer key (CodeRabbit on #451) ────────────────────────────
+
+
+@pytest.mark.parametrize("code", [301, 302, 303, 307, 308])
+def test_a_redirect_is_refused_and_the_key_never_reaches_the_target(code):
+    """Two loopback servers: the first answers `code` with Location = the second. The default
+    opener must raise without ever requesting the second, so no Authorization header leaves."""
+    import http.server
+    import threading
+
+    seen: list[dict] = []
+
+    class Target(http.server.BaseHTTPRequestHandler):
+        def _any(self):
+            seen.append(dict(self.headers))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        do_GET = do_POST = _any
+
+        def log_message(self, *a):
+            pass
+
+    target = http.server.HTTPServer(("127.0.0.1", 0), Target)
+
+    class Redirector(http.server.BaseHTTPRequestHandler):
+        def _any(self):
+            self.send_response(code)
+            self.send_header("Location", f"http://127.0.0.1:{target.server_port}/stolen")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        do_GET = do_POST = _any
+
+        def log_message(self, *a):
+            pass
+
+    redirector = http.server.HTTPServer(("127.0.0.1", 0), Redirector)
+    threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in (target, redirector)]
+    for t in threads:
+        t.start()
+    try:
+        req = urllib.request.Request(  # noqa: S310 - loopback test server
+            f"http://127.0.0.1:{redirector.server_port}/api/v1/leases/charters",
+            data=b"{}",
+            headers={"Authorization": f"Bearer {KEY}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as e:
+            C._default_opener(req, 5)
+        assert e.value.code == code
+    finally:
+        for s in (target, redirector):
+            s.shutdown()
+            s.server_close()
+    assert seen == [], "the redirect target was contacted"
+
+
+def test_post_turns_a_refused_redirect_into_a_charter_api_error():
+    def redirecting(req, timeout):
+        raise urllib.error.HTTPError(req.full_url, 302, "redirect refused", cast(Any, {}), None)
+
+    with pytest.raises(C.CharterAPIError, match="HTTP 302") as e:
+        C.create_remote(JOB, env=ENV, opener=redirecting)
+    assert KEY not in str(e.value)
