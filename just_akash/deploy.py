@@ -1072,6 +1072,11 @@ def deploy(
         deployment_response = client.create_deployment(sdl_content, deposit=deposit)
     except RuntimeError as e:
         if "already exists" in str(e).lower():
+            if prepared_receipt is not None:
+                raise RuntimeError(
+                    "Receipt-bound create already exists; reconcile the recorded "
+                    "operation before retrying"
+                ) from e
             _log(
                 logging.WARNING,
                 "Deployment already exists — closing stale deployments and retrying...",
