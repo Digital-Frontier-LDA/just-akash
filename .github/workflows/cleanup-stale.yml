@@ -183,7 +183,9 @@ jobs:
           #     STALE_OWNED_AGE_SECONDS (48h), regardless of service name. Previously a live
           #     run closed only STALE-runner/probe/e2e.
           #
-          # ⇒ That widening is the POINT — it is what reaps the canaries — but an operator
+          # ⇒ That widening is the POINT — it reaps any OLD owned deployment — EXCEPT the canary:
+          # canaries are persistent (operator 2026-10-16, openmix-hxlg), so classify() leaves
+          # the exact {canary} service set as LEAVE-canary before the owned rule. But an operator
           # dispatching execute=true must know the close set grew. An earlier draft of this
           # comment said "changes what is reported, not what is closed", which was true of
           # the scheduled path and false of the dispatch path, and would have been read as

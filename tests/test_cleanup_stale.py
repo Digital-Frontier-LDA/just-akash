@@ -92,9 +92,14 @@ class TestClassify:
         verdict, _, _ = cs.classify(
             _detail(["canary"]), ancient, NOW, reap_runners=True, group_names=ours
         )
-        assert verdict == "LEAVE-real-or-unknown", (
+        assert verdict == "LEAVE-canary", (
             "the canary must never be classified stale: flag on, our prefix, 30 days old"
         )
+        verdict, _, _ = cs.classify(
+            _detail(["canary"]), ancient, NOW, reap_runners=True, reap_owned=True,
+            group_names=ours,
+        )
+        assert verdict == "LEAVE-canary", "--reap-owned must not reach the canary either"
 
     def test_a_mixed_service_set_containing_the_runner_is_NOT_reaped(self):
         """⚠ `services == ['runner']` is an EQUALITY, not a membership test, and that is
