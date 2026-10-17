@@ -1,0 +1,276 @@
+"""V100 inventory — who on the WHOLE network can place which V100 shape, by real bids.
+
+openmix-67w3 AC3. ``bid_probe`` pins every order to OUR providers (an unpinned
+order loses the 20-bid race to everyone else), so it cannot answer the
+question this does: one UNPINNED order per shape — units x VRAM x form
+factor — open to every provider, waiting the full window for every bidder,
+then closed. It never creates a lease; the bid set is the datum, and the only
+cost is each order's deposit, escrowed and refunded on close.
+
+Why bids and not ``/status``: a provider's aggregate inventory cannot say how
+the GPUs sit on nodes, and Akash places one replica on ONE node. A bid on
+``units: N`` means some node of that provider has N free GPUs of that shape, so
+the largest N a provider bids on is its free GPUs per node — the number the
+Console API's ``/v1/gpu`` totals do not expose (2026-10-08: 14 V100s on the
+whole network, per-node layout unknown).
+
+Shapes go to 8 because the operator asked whether 8x V100 nodes exist for
+GLM / DeepSeek; a units:8 bid is the only proof one does. The shapes step
+1/2/4/8, so the largest bid shape is a LOWER BOUND on a node's free GPUs (a
+node with 6 free reads as 4).
+
+A zero needs a control. If the ``ram``/``interface`` spelling does not match
+what providers advertise, every shaped order gets 0 bids and that reads as
+"no V100 capacity". So the survey first places ``CONTROL``: units:1, model
+v100, nothing else. The network reported allocatable V100s on 2026-10-08, so a
+control with no bidder means the survey cannot see V100 bids at all, and the
+run fails instead of reporting an empty inventory.
+
+A bidding control is not enough either: it proves SOME provider has a free
+V100, not that our spelling matches what THAT provider advertises. The four
+1x shapes cover every V100 variant (16/32 GB x SXM/PCIe), so a provider that
+bids on the control must also bid on a shaped order. One that does not is
+``unmatched``: its zeros are indeterminate, and so is the run (exit 3).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from dataclasses import dataclass
+from typing import Any
+
+from .capacity import probe_order_sdl
+
+
+@dataclass(frozen=True)
+class Shape:
+    units: int
+    ram: str  # Akash gpu attribute, e.g. "16Gi"; "" = not asked
+    interface: str  # Akash gpu attribute: "sxm" | "pcie"; "" = not asked
+
+
+V100_SHAPES: tuple[Shape, ...] = tuple(
+    Shape(units, ram, interface)
+    for interface in ("sxm", "pcie")
+    for ram in ("16Gi", "32Gi")
+    for units in (1, 2, 4, 8)
+)
+#: The positive control: any V100, no ram/interface. See the module docstring.
+CONTROL = Shape(1, "", "")
+
+# No placement attributes, on purpose: this survey must be open to every
+# provider. Pricing is a generous ceiling in uact so price never decides a bid.
+_SDL = """\
+---
+version: "2.0"
+services:
+  probe:
+    image: alpine:3.19
+    command: ["sh", "-c", "sleep 30"]
+    expose:
+      - port: 80
+        as: 80
+        to: [{{ global: true }}]
+profiles:
+  compute:
+    probe:
+      resources:
+        cpu: {{ units: 1 }}
+        memory: {{ size: 1Gi }}
+        gpu:
+          units: {units}
+          attributes:
+            vendor:
+              nvidia:
+                - {{ {attrs} }}
+        storage: [{{ size: 2Gi }}]
+  placement:
+    dcloud:
+      pricing:
+        probe: {{ denom: uact, amount: 1000000 }}
+deployment:
+  probe:
+    dcloud: {{ profile: probe, count: 1 }}
+"""
+
+
+def build_inventory_sdl(shape: Shape) -> str:
+    if shape.units < 1:
+        raise ValueError("units must be >= 1")
+    attrs = "model: v100"
+    if shape.ram:
+        attrs += f", ram: {shape.ram}"
+    if shape.interface:
+        attrs += f", interface: {shape.interface}"
+    return _SDL.format(units=shape.units, attrs=attrs)
+
+
+def run_inventory(
+    client: Any,
+    *,
+    shapes: tuple[Shape, ...] | list[Shape] = (CONTROL, *V100_SHAPES),
+    wait_s: int = 60,
+    poll_s: int = 5,
+    deposit: float = 0.5,
+) -> list[dict[str, Any]]:
+    """One order per shape, every bidder kept, every order closed (in ``probe_order_sdl``).
+
+    A failed order is recorded with its error, never raised: one bad shape must
+    not abort the survey and leave the rest unasked.
+    """
+    records: list[dict[str, Any]] = []
+    for idx, shape in enumerate(shapes):
+        rec: dict[str, Any] = {
+            "units": shape.units,
+            "ram": shape.ram,
+            "interface": shape.interface,
+            "control": shape == CONTROL,
+            "ts": time.time(),
+        }
+        try:
+            res = probe_order_sdl(
+                client,
+                build_inventory_sdl(shape),
+                wait_s=wait_s,
+                poll_s=poll_s,
+                deposit=deposit,
+                collect_all=True,
+            )
+            rec.update(dseq=res.get("dseq"), bidders=res.get("bidders") or [], error="")
+        except Exception as exc:  # noqa: BLE001 - recorded, not swallowed
+            rec.update(dseq=None, bidders=[], error=f"{type(exc).__name__}: {exc}"[:300])
+        records.append(rec)
+        print(
+            f"  [{idx + 1}/{len(shapes)}] {shape.units}x v100 {shape.ram or 'any'} "
+            f"{shape.interface or 'any'}{' (control)' if rec['control'] else ''}: "
+            f"{len(rec['bidders'])} bidder(s){' ERROR ' + rec['error'] if rec['error'] else ''}"
+        )
+    return records
+
+
+def _price(amount: Any) -> float | None:
+    try:
+        return float(amount)
+    except (TypeError, ValueError):
+        return None
+
+
+def summarize(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per (provider, VRAM, form factor): the largest units it bid on.
+
+    That is a lower bound on the free GPUs of that provider's best node (shapes
+    step 1/2/4/8), hence ``free_gpus_per_node_at_least``. The control order is
+    not a shape and is left out."""
+    best: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for rec in records:
+        if rec.get("control"):
+            continue
+        for b in rec.get("bidders") or []:
+            key = (b["provider"], rec["ram"], rec["interface"])
+            cur = best.get(key)
+            if cur is None or rec["units"] > cur["free_gpus_per_node_at_least"]:
+                best[key] = {
+                    "provider": b["provider"],
+                    "ram": rec["ram"],
+                    "interface": rec["interface"],
+                    "free_gpus_per_node_at_least": rec["units"],
+                    "bid_uact_per_block": _price(b.get("price_amount")),
+                    "bid_denom": b.get("price_denom"),
+                    "dseq": rec.get("dseq"),
+                }
+    return sorted(best.values(), key=lambda r: (r["provider"], r["ram"], r["interface"]))
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(description="Unpinned V100 inventory survey (orders only).")
+    ap.add_argument("--wait", type=int, default=60, help="seconds to collect bids per order")
+    ap.add_argument("--deposit", type=float, default=0.5, help="order deposit (ACT)")
+    ap.add_argument("--json-out", default="", help="write records + summary here")
+    ap.add_argument("--dry-run", action="store_true", help="print the shapes and exit")
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    if args.dry_run:
+        for s in (CONTROL, *V100_SHAPES):
+            print(f"{s.units}x v100 {s.ram or 'any'} {s.interface or 'any'}")
+        return 0
+    api_key = os.environ.get("AKASH_API_KEY", "").strip()
+    if not api_key:
+        print("ERROR: AKASH_API_KEY is not set", file=sys.stderr)
+        return 1
+
+    from .api import AkashConsoleAPI
+
+    records = run_inventory(AkashConsoleAPI(api_key), wait_s=args.wait, deposit=args.deposit)
+    rows = summarize(records)
+    print(f"\nINVENTORY: {len(rows)} provider x shape rows")
+    for r in rows:
+        print(
+            f"  {r['provider']} v100 {r['ram']} {r['interface']}: "
+            f">={r['free_gpus_per_node_at_least']} free GPU/node, "
+            f"bid {r['bid_uact_per_block']} {r['bid_denom']}/block"
+        )
+    unmatched = unmatched_control_bidders(records)
+    if args.json_out:
+        with open(args.json_out, "w", encoding="utf-8") as fh:
+            json.dump(
+                {"records": records, "summary": rows, "unmatched_control_bidders": unmatched},
+                fh,
+                indent=2,
+            )
+        print(f"wrote {args.json_out}")
+    return exit_code(records)
+
+
+def unmatched_control_bidders(records: list[dict[str, Any]]) -> list[str]:
+    """Providers that bid on the control but on no shaped order.
+
+    Every V100 is one of the four 1x shapes, so such a provider advertises
+    ram/interface under names this survey does not ask for (or its 1x order
+    errored): its shaped zeros say nothing about its capacity."""
+    control = {b["provider"] for r in records if r.get("control") for b in r.get("bidders") or []}
+    shaped = {
+        b["provider"] for r in records if not r.get("control") for b in r.get("bidders") or []
+    }
+    return sorted(control - shaped)
+
+
+def exit_code(records: list[dict[str, Any]]) -> int:
+    """0 = an inventory that can be trusted, including its zeros.
+
+    A failed ORDER is data; a survey where nothing could be asked is a failed
+    run (1), and so is one where every SHAPED order failed (1), however the
+    control did. A control with no bidder (2) means every zero may be an
+    attribute nobody advertises, not missing capacity. A control bidder with
+    no shaped bid (3) means the same for that provider: indeterminate."""
+    shaped = [r for r in records if not r.get("control")]
+    if not shaped or all(r["error"] for r in shaped):
+        return 1
+    control = [r for r in records if r.get("control")]
+    if not control or control[0]["error"] or not control[0]["bidders"]:
+        print(
+            "ERROR: the control order (1x v100, no ram/interface) got no bidder: "
+            "this survey cannot tell 'no capacity' from 'attributes nobody advertises'",
+            file=sys.stderr,
+        )
+        return 2
+    unmatched = unmatched_control_bidders(records)
+    if unmatched:
+        print(
+            f"ERROR: {', '.join(unmatched)} bid on the control (any 1x v100) but on no shaped "
+            "order: their ram/interface spelling is not what this survey asks for, so their "
+            "zeros are indeterminate",
+            file=sys.stderr,
+        )
+        return 3
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
