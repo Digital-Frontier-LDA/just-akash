@@ -1,0 +1,96 @@
+name: Lease intent backfill
+
+# Flynn openmix-h2l7: declare WHY already-running canary leases exist, in Flynn's lease intent
+# ledger. provider-canary.yml registers an intent only when it DEPLOYS a canary, so the canaries
+# that were already running when #457 landed (prod 2026-10-17: 1789100636167, 1789100716448,
+# 1789100804519, console-2) have none, and Flynn's /leases page and flynn_lease_intent{dseq}
+# gauge show them as undeclared. `python -m just_akash.lease_intent backfill` was written for
+# exactly that set; this workflow is its only caller, because the client secret
+# (JUST_AKASH_LEASE_INTENT_CLIENT_SECRET) lives in secrets/ci.sops.env and nowhere else.
+#
+# SAFETY IS IN THE MODULE. `backfill` reads each lease from chain, refuses one whose group name
+# is not a just-akash-canary group, computes max_hours and max_spend_act from the lease's own
+# creation height (Flynn measures both from there), and abandons an intent whose bind fails, so
+# a wrong dseq is a refusal and leaves nothing behind. It spends nothing: no deploy, no close,
+# so it does not join the akash-wallet group.
+#
+# ENFORCE MODE: a refusal fails the run. The canary itself runs in warn mode so the ledger can
+# never block it; a backfill exists only to write the ledger, so a silent green would hide the
+# one thing it is for.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dseqs:
+        description: "Running canary deployment(s) to declare: space separated, digits only. Required."
+        type: string
+        required: true
+      owner:
+        description: "Console wallet that owns them (just_akash.lease_intent.WALLET_LABELS)"
+        type: choice
+        default: akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee # pragma: allowlist secret
+        options:
+          - akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee # pragma: allowlist secret
+          - akash1cklqag0e0v794msgqkr6uwf7sr6zyy42gm78f0 # pragma: allowlist secret
+          - akash14n4rkmz64rn0tey0r5g07l8q5x0fh2h4hu44kt # pragma: allowlist secret
+      horizon_hours:
+        description: "Hours the intent allows beyond the lease's current age: whole hours, 1 to 2160"
+        type: string
+        default: "720"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lease-intent-backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    name: Backfill lease intents
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: uv sync
+      - name: Load SOPS secrets
+        uses: ./.github/actions/sops-env
+        with:
+          age-key: ${{ secrets.SOPS_AGE_KEY }}
+      # Every input reaches the shell through the environment, never `${{ }}` interpolation
+      # into `run:` (same rule as close-orphans.yml). DSEQS is split only after the whole value
+      # matched digits-and-spaces, so word splitting cannot carry anything but dseqs.
+      - name: Backfill
+        env:
+          DSEQS: ${{ inputs.dseqs }}
+          OWNER: ${{ inputs.owner }}
+          HORIZON: ${{ inputs.horizon_hours }}
+          JUST_AKASH_INTENT_MODE: enforce
+        run: |
+          set -euo pipefail
+          if [ -z "${JUST_AKASH_LEASE_INTENT_CLIENT_SECRET:-}" ]; then
+            echo "::error::JUST_AKASH_LEASE_INTENT_CLIENT_SECRET is not in secrets/ci.sops.env: the module would do nothing and exit 0"
+            exit 1
+          fi
+          [[ "$DSEQS" =~ ^[[:space:]]*[1-9][0-9]{0,19}([[:space:]]+[1-9][0-9]{0,19})*[[:space:]]*$ ]] \
+            || { echo "::error::dseqs must be space-separated digits"; exit 1; }
+          # Bounded: the horizon IS the intent's limit, so an unbounded one (say 1e9 h) would
+          # declare a lease that can never exceed its intent, and INTENT_EXCEEDED would never fire.
+          if ! [[ "$HORIZON" =~ ^[1-9][0-9]{0,3}$ ]] || [ "$HORIZON" -gt 2160 ]; then
+            echo "::error::horizon_hours must be a whole number of hours, 1 to 2160 (90 days)"
+            exit 1
+          fi
+          read -r -a DS <<< "$DSEQS"
+          uv run python -m just_akash.lease_intent backfill \
+            --owner "$OWNER" \
+            --dseq "${DS[@]}" \
+            --reason "just-akash persistent provider canary: liveness + ingress telemetry (provider-canary.yml); backfilled by lease-intent-backfill.yml" \
+            --horizon-hours "$HORIZON" \
+            --bead openmix-h2l7
