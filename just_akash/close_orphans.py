@@ -53,6 +53,7 @@ import os
 import sys
 import time
 
+from . import lease_intent
 from ._states import TERMINAL_DEPLOYMENT_STATES
 from .api import AkashConsoleAPI, _reconcile_lease_row, lease_status
 from .cleanup_stale import _credit_line
@@ -177,6 +178,9 @@ def run(*, dseqs: list[str], execute: bool = False) -> int:
         if state in TERMINAL_DEPLOYMENT_STATES:
             closed += 1
             print(f"  closed {dseq} (read back: {state})")
+            # Flynn openmix-h2l7: end the intent that said why it existed (a no-op when none is
+            # bound, or before the client secret exists). Never stands in the way of a close.
+            lease_intent.close_quietly(dseq, f"closed as a verified orphan (read back: {state})")
         else:
             failed += 1
             print(f"  {dseq}: close sent but state is still {state!r} — NOT counted as closed")

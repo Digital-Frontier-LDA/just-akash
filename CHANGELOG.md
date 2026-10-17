@@ -23,6 +23,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `enforce` refuses before any create. `dfci-*`/`just-akash-*` deploys are unchanged.
   Needs `FLYNN_API_URL` + `FLYNN_INTERNAL_API_KEY`, and the wallet label from the charter's
   `wallet_label` or `JUST_AKASH_WALLET_LABELS`.
+- `lease-intent-backfill.yml` (Flynn openmix-h2l7): the dispatch-only caller of
+  `lease_intent backfill`, for canaries that were already running when intents landed
+  (provider-canary.yml registers one only at deploy). Inputs reach the shell through env and
+  `dseqs` is validated as digits before splitting; enforce mode, so a refusal fails the run.
+- `python -m just_akash.lease_intent` (Flynn openmix-h2l7): persistent provider canaries record
+  WHY they exist in Flynn's lease intent ledger (Keycloak client `just-akash-lease-intent`,
+  Akash-Console #1147). `provider-canary.yml` registers a CAPACITY intent before each canary
+  deploy, binds it to the dseq, and abandons it when the provider does not bid; `close_orphans`
+  closes the intent after a verified close. `backfill` registers leases that already run with
+  limits computed from their chain age (age + horizon), never a bare horizon. Inert and silent
+  until `JUST_AKASH_LEASE_INTENT_CLIENT_SECRET` exists; warn mode never blocks a canary.
 - Read-only `verify-finalized-closed` adapter for the pinned core execution-closure
   envelope: complete creation identity, successful exact close transaction inclusion,
   common finalized state height and complete agreeing deployment/group/lease populations.
