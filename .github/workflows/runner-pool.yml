@@ -115,6 +115,11 @@ on:
         required: false
         type: boolean
         default: false
+      runner-sentry-mint-admission:
+        description: 'Opt-in hosted private BB one-job Sentry admission before every registration token mint.'
+        required: false
+        type: boolean
+        default: false
       tag-prefix:
         description: >-
           REQUIRED, no default. Deployments are tagged `<tag-prefix>-<run_id>` and a
@@ -1285,6 +1290,13 @@ jobs:
           REQUIRED_DEPOSIT_USD: ${{ inputs.required-deposit-usd }}
           PROVIDER_SELECT: ${{ inputs.provider-select }}
           DEPLOYMENT_GROUP: ${{ steps.render.outputs.deployment_group }}
+          RUNNER_SENTRY_MINT_ADMISSION: ${{ inputs.runner-sentry-mint-admission }}
+          SENTRY_ADMISSION_SOURCE: ${{ inputs.just-akash-repository }}
+          SENTRY_ADMISSION_SOPS: ${{ inputs.runner-registry-sops }}
+          SENTRY_ADMISSION_PRIVATE_PROFILE: ${{ inputs.runner-private-profile }}
+          SENTRY_ADMISSION_PUBLIC_PROFILE: ${{ inputs.runner-public-profile }}
+          SENTRY_ADMISSION_PROVIDERS: ${{ steps.candidates.outputs.candidates }}
+          SENTRY_ADMISSION_OWNED_PROVIDERS: ${{ inputs.owned-providers }}
           RUNNER_NATIVE_PULL_READER: ${{ inputs.runner-native-pull-reader }}
           RUNNER_NATIVE_REPOSITORY_SCOPE: ${{ inputs.runner-native-repository-scope }}
         run: |
@@ -1502,6 +1514,15 @@ jobs:
               echo failure_reason=RUNNER_SDL_TEMPLATE_MISSING >> "$GITHUB_OUTPUT"
               echo "::error title=Runner SDL template missing, empty or without its token placeholder::attempt $attempt: nothing minted or deployed."
               echo "::endgroup::"; exit 1
+            fi
+            # This generic BB profile cannot use the specialized Blazing native
+            # payload. Reuse its fresh role/group oracles, with exact BB membership,
+            # before every token mint; only the original hosted SOPS step decrypts.
+            if [ "${RUNNER_SENTRY_MINT_ADMISSION:-false}" = true ] && ! python3 -m just_akash.runner_sentry_admission; then
+              [ -n "$CREATED_DSEQ" ] || [ "$UNCLASSIFIED_ATTEMPT" = 1 ] || echo "deployment_outcome=no-deployment" >> "$GITHUB_OUTPUT"
+              echo failure_reason=SENTRY_MINT_ADMISSION_UNQUALIFIED >> "$GITHUB_OUTPUT"
+              echo '::error::Sentry registration authority was not verified; no new token or deployment submitted'
+              echo '::endgroup::'; exit 1
             fi
             # Recheck server admission before every mint. Org mode observes the
             # actual Default group; repository mode proves fixed private identity
