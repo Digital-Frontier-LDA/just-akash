@@ -83,8 +83,10 @@ jobs:
             || { echo "::error::dseqs must be space-separated digits"; exit 1; }
           # Bounded: the horizon IS the intent's limit, so an unbounded one (say 1e9 h) would
           # declare a lease that can never exceed its intent, and INTENT_EXCEEDED would never fire.
-          [[ "$HORIZON" =~ ^[1-9][0-9]{0,3}$ ]] && [ "$HORIZON" -le 2160 ] \
-            || { echo "::error::horizon_hours must be a whole number of hours, 1 to 2160 (90 days)"; exit 1; }
+          if ! [[ "$HORIZON" =~ ^[1-9][0-9]{0,3}$ ]] || [ "$HORIZON" -gt 2160 ]; then
+            echo "::error::horizon_hours must be a whole number of hours, 1 to 2160 (90 days)"
+            exit 1
+          fi
           read -r -a DS <<< "$DSEQS"
           uv run python -m just_akash.lease_intent backfill \
             --owner "$OWNER" \
