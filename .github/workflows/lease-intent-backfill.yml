@@ -34,7 +34,7 @@ on:
           - akash1cklqag0e0v794msgqkr6uwf7sr6zyy42gm78f0 # pragma: allowlist secret
           - akash14n4rkmz64rn0tey0r5g07l8q5x0fh2h4hu44kt # pragma: allowlist secret
       horizon_hours:
-        description: "Hours the intent allows beyond the lease's current age"
+        description: "Hours the intent allows beyond the lease's current age: whole hours, 1 to 2160"
         type: string
         default: "720"
 
@@ -81,8 +81,10 @@ jobs:
           fi
           [[ "$DSEQS" =~ ^[[:space:]]*[1-9][0-9]{0,19}([[:space:]]+[1-9][0-9]{0,19})*[[:space:]]*$ ]] \
             || { echo "::error::dseqs must be space-separated digits"; exit 1; }
-          [[ "$HORIZON" =~ ^[0-9]+(\.[0-9]+)?$ ]] \
-            || { echo "::error::horizon_hours must be a number"; exit 1; }
+          # Bounded: the horizon IS the intent's limit, so an unbounded one (say 1e9 h) would
+          # declare a lease that can never exceed its intent, and INTENT_EXCEEDED would never fire.
+          [[ "$HORIZON" =~ ^[1-9][0-9]{0,3}$ ]] && [ "$HORIZON" -le 2160 ] \
+            || { echo "::error::horizon_hours must be a whole number of hours, 1 to 2160 (90 days)"; exit 1; }
           read -r -a DS <<< "$DSEQS"
           uv run python -m just_akash.lease_intent backfill \
             --owner "$OWNER" \
