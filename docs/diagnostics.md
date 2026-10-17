@@ -65,6 +65,15 @@ Silent in an interactive terminal (humans keep the existing `_log`/`Error:` pros
 | `SDL_ERROR` | SDL validation/missing/placeholder (reserved). |
 | `CONFIG_ERROR` | Missing API key / bad deposit / bad `--env` (reserved). |
 
+### Lease charters (openmix-pvr6.1 — placements Flynn counts as ours: `flynn-*`, `fleet-*`, `dcloud`, `akash`)
+
+| Code | Condition |
+|---|---|
+| `CHARTER_MISSING` | No charter for a placement of ours. `JUST_AKASH_CHARTER=warn` (default) proceeds; `enforce` refuses before any create. |
+| `CHARTER_POST_FAILED` | Flynn refused or could not be reached for the charter POST; nothing was created. |
+| `CHARTER_DEPOSIT_FAILED` | The follow-up deposit, or switching auto top-up off, failed after the lease; the lease was closed. |
+| `CHARTER_BIND_FAILED` | The bind to the final dseq failed after retries; the lease is kept and reads as uncharted in Flynn. |
+
 ### Reliability (post-deploy / smoke — "external sweep reaps the lease")
 
 | Code | Condition |

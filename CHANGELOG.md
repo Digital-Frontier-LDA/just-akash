@@ -10,6 +10,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Lease charters for placements Flynn counts as ours (`flynn-*`, `fleet-*`, exactly
+  `dcloud`/`akash`; openmix-pvr6.1). `deploy --charter FILE.json` (or
+  `JUST_AKASH_CHARTER_JSON`) POSTs the charter to Flynn before the credit probe and refuses
+  the deploy if Flynn does not accept it, stamps `.<charter_id>` into `flynn-`/`fleet-`
+  placement names (≤ 62 chars, prefix kept; `dcloud`/`akash` are exact names in Flynn and
+  stay unstamped), creates the order at the 0.5 minimum and tops it up after the lease to
+  `max_hours × bid uact/block × 600 × 1.15` (capped at `max_act`), switches auto top-up off
+  unless `prod_pinned` (read back), and binds the charter to the final dseq. A failed
+  top-up closes the lease; a failed bind keeps it and emits `CHARTER_BIND_FAILED`. Without
+  a charter, `JUST_AKASH_CHARTER=warn` (default) emits `CHARTER_MISSING` and proceeds;
+  `enforce` refuses before any create. `dfci-*`/`just-akash-*` deploys are unchanged.
+  Needs `FLYNN_API_URL` + `FLYNN_INTERNAL_API_KEY`, and the wallet label from the charter's
+  `wallet_label` or `JUST_AKASH_WALLET_LABELS`.
 - Read-only `verify-finalized-closed` adapter for the pinned core execution-closure
   envelope: complete creation identity, successful exact close transaction inclusion,
   common finalized state height and complete agreeing deployment/group/lease populations.

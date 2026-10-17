@@ -224,30 +224,8 @@ def run_id_of(key: str) -> str:
     return tail if _RUN_ID_RE.match(tail) else ""
 
 
-def stamp_run(sdl_text: str, run_id: str) -> tuple[str, list[str]]:
-    """Rewrite every OWNED placement key to carry ``run_id``. Returns (sdl, new keys).
-
-    Only keys already carrying this repo's prefix are touched. A caller may pass their
-    own SDL declaring any placement key, and rewriting that would claim provenance over
-    a document we do not control — the deployment is ours to account for either way, but
-    the marker should say what it can prove, and `just-akash-` on someone else's SDL
-    would assert authorship we did not have.
-
-    The key appears TWICE and both must move together: `profiles.placement.<KEY>` and the
-    `deployment.<service>.<KEY>` reference that selects it. Rewriting one leaves an SDL
-    that names a placement group which does not exist, which Akash rejects — so this
-    rewrites by exact key line and returns the new keys for the caller to verify.
-    """
-    if not run_id:
-        return sdl_text, []
-    targets = {
-        key: run_scoped(key, run_id)
-        for key in placement_keys(sdl_text)
-        if key.startswith(PLACEMENT_PREFIX) and not run_id_of(key)
-    }
-    if not targets:
-        return sdl_text, []
-
+def _rewrite_keys(sdl_text: str, targets: dict[str, str]) -> str:
+    """Rename placement keys per ``targets``, at every structural occurrence."""
     # A LINE WALK, not a regex over the document, and for the same reason
     # `placement_keys` is one: an SDL may embed a whole YAML document inside a block
     # scalar, e.g. `args: - |` followed by indented text a container receives as an
@@ -288,7 +266,86 @@ def stamp_run(sdl_text: str, run_id: str) -> tuple[str, list[str]]:
             out_lines.append(line)
         i += 1
 
-    return "\n".join(out_lines), list(targets.values())
+    return "\n".join(out_lines)
+
+
+def stamp_run(sdl_text: str, run_id: str) -> tuple[str, list[str]]:
+    """Rewrite every OWNED placement key to carry ``run_id``. Returns (sdl, new keys).
+
+    Only keys already carrying this repo's prefix are touched. A caller may pass their
+    own SDL declaring any placement key, and rewriting that would claim provenance over
+    a document we do not control — the deployment is ours to account for either way, but
+    the marker should say what it can prove, and `just-akash-` on someone else's SDL
+    would assert authorship we did not have.
+
+    The key appears TWICE and both must move together: `profiles.placement.<KEY>` and the
+    `deployment.<service>.<KEY>` reference that selects it. Rewriting one leaves an SDL
+    that names a placement group which does not exist, which Akash rejects — so this
+    rewrites by exact key line and returns the new keys for the caller to verify.
+    """
+    if not run_id:
+        return sdl_text, []
+    targets = {
+        key: run_scoped(key, run_id)
+        for key in placement_keys(sdl_text)
+        if key.startswith(PLACEMENT_PREFIX) and not run_id_of(key)
+    }
+    if not targets:
+        return sdl_text, []
+
+    return _rewrite_keys(sdl_text, targets), list(targets.values())
+
+
+# ── Lease charters (openmix-pvr6.1 / just-akash-3sq) ─────────────────────────────────────
+# Flynn's attribution of OUR leases, by placement name (openmix app/background/leases.py,
+# _NAME_PREFIXES / _NAME_EXACT, classes in OURS_CLASSES). Mirrored, not imported: Flynn is
+# another repo, and test_provenance re-checks each stamped name against a copy of its rules.
+OURS_PREFIXES = ("flynn-", "fleet-")
+OURS_EXACT = frozenset({"dcloud", "akash"})
+CHARTER_ID_RE = re.compile(r"ch-[0-9a-f]{10}")
+CHARTER_SEPARATOR = "."
+# The longest placement name verified on mainnet (see the module docstring).
+MAX_PLACEMENT_KEY_LEN = 62
+
+
+def _uncharted(key: str) -> str:
+    head, sep, tail = key.rpartition(CHARTER_SEPARATOR)
+    return head if sep and CHARTER_ID_RE.fullmatch(tail) else key
+
+
+def is_ours_placement(key: str) -> bool:
+    """True when Flynn counts a lease with this placement name as OURS: ``flynn-*``,
+    ``fleet-*``, or exactly ``dcloud`` / ``akash``. A charter suffix does not change it."""
+    base = _uncharted(key)
+    return base.startswith(OURS_PREFIXES) or base in OURS_EXACT
+
+
+def stamp_charter(sdl_text: str, charter_id: str) -> tuple[str, list[str]]:
+    """Append ``.<charter_id>`` to every ``flynn-``/``fleet-`` placement key. Returns
+    (sdl, new keys), like stamp_run, and by the same line walk: both copies of the key move,
+    block scalars and trailing comments are untouched.
+
+    ⛔ THE PREFIX IS WHAT FLYNN ATTRIBUTES ON, so it is never cut. A key that would pass
+    62 characters loses the END of its workload part instead.
+
+    ⛔ ``dcloud`` and ``akash`` ARE NOT STAMPED. Flynn matches them as EXACT names, so
+    ``dcloud.ch-…`` would read as UNATTRIBUTED — the opposite of what a charter is for.
+    Their charter reaches Flynn through the bind alone.
+    """
+    if not CHARTER_ID_RE.fullmatch(charter_id or ""):
+        raise ValueError(f"not a charter id: {charter_id!r}")
+    suffix = f"{CHARTER_SEPARATOR}{charter_id}"
+    targets: dict[str, str] = {}
+    for key in placement_keys(sdl_text):
+        if not key.startswith(OURS_PREFIXES) or _uncharted(key) != key:
+            continue
+        prefix = next(p for p in OURS_PREFIXES if key.startswith(p))
+        room = MAX_PLACEMENT_KEY_LEN - len(suffix)
+        targets[key] = key[: max(room, len(prefix))] + suffix
+    if not targets:
+        return sdl_text, []
+
+    return _rewrite_keys(sdl_text, targets), list(targets.values())
 
 
 def sdl_files() -> list[Path]:

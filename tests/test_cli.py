@@ -325,6 +325,7 @@ class TestCliDeployPassesArgs:
             receipt_operation_id=None,
             # openmix-wxs8: None = no flag, defer to AKASH_QUIET_WALLET (off unless set).
             quiet_wallet=None,
+            charter=None,
         )
 
     @patch("just_akash.deploy.deploy")

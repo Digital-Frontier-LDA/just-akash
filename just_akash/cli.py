@@ -403,6 +403,15 @@ def main():
         "when the deployment closes; size it to outlast the workload.",
     )
     deploy_p.add_argument(
+        "--charter",
+        metavar="FILE.json",
+        help="Lease charter (openmix-pvr6) for a placement of ours (flynn-*, fleet-*, dcloud, "
+        "akash): {bead, owner, why, kind, max_hours, max_act, ...}, plus wallet_label / "
+        "endpoint_url / telemetry_url for the bind. Falls back to JUST_AKASH_CHARTER_JSON. "
+        "With a charter the escrow is sized from max_hours at the winning bid and --deposit "
+        "is ignored; without one, JUST_AKASH_CHARTER=warn|enforce decides.",
+    )
+    deploy_p.add_argument(
         "--receipt-path",
         help="Absolute path in a private (0700) directory for the crash-durable create receipt",
     )
@@ -942,6 +951,8 @@ def main():
             )
             sys.exit(2)
         try:
+            from .charter import load_charter
+
             deploy(
                 sdl_path=args.sdl,
                 gpu=args.gpu,
@@ -961,6 +972,7 @@ def main():
                 receipt_path=args.receipt_path,
                 receipt_operation_id=args.receipt_operation_id,
                 quiet_wallet=args.quiet_wallet,
+                charter=load_charter(args.charter),
             )
             sys.exit(0)
         except RuntimeError as e:

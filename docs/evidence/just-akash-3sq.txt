@@ -1,0 +1,53 @@
+# just-akash-3sq evidence (openmix-pvr6.1 lease charters)
+
+# RED at base c6ec122d (no implementation), 2026-10-17T21:33:47Z
+$ pytest tests/test_charter_gate.py tests/test_charter_flynn_order.py tests/test_charter_deposit.py
+==================================== ERRORS ====================================
+_________________ ERROR collecting tests/test_charter_gate.py __________________
+______________ ERROR collecting tests/test_charter_flynn_order.py ______________
+________________ ERROR collecting tests/test_charter_deposit.py ________________
+ERROR tests/test_charter_gate.py
+ERROR tests/test_charter_flynn_order.py
+ERROR tests/test_charter_deposit.py
+!!!!!!!!!!!!!!!!!!! Interrupted: 3 errors during collection !!!!!!!!!!!!!!!!!!!!
+3 errors in 0.22s
+$ pytest tests/test_provenance.py
+  13 E       ImportError: cannot import name 'stamp_charter' from 'just_akash.provenance' (just_akash/provenance.py)
+   1 FAILED tests/test_provenance.py::test_stamp_charter_appends_the_id_to_both_copies
+   1 FAILED tests/test_provenance.py::test_charter_stamping_leaves_other_keys_alone[just-akash-runner]
+   1 FAILED tests/test_provenance.py::test_charter_stamping_leaves_other_keys_alone[dfci-infra-r]
+   1 FAILED tests/test_provenance.py::test_charter_stamping_leaves_other_keys_alone[borduas]
+   1 FAILED tests/test_provenance.py::test_charter_stamping_is_idempotent - Import...
+   1 FAILED tests/test_provenance.py::test_a_stamped_name_attributes_like_the_unstamped_one[flynn-x]
+   1 FAILED tests/test_provenance.py::test_a_stamped_name_attributes_like_the_unstamped_one[flynn-burst-a]
+   1 FAILED tests/test_provenance.py::test_a_stamped_name_attributes_like_the_unstamped_one[fleet-wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww]
+   1 FAILED tests/test_provenance.py::test_a_stamped_name_attributes_like_the_unstamped_one[fleet-serve-qwen]
+   1 FAILED tests/test_provenance.py::test_a_stamped_name_attributes_like_the_unstamped_one[dcloud]
+   1 FAILED tests/test_provenance.py::test_a_stamped_name_attributes_like_the_unstamped_one[akash]
+   1 FAILED tests/test_provenance.py::test_a_malformed_charter_id_is_refused - Imp...
+   1 FAILED tests/test_provenance.py::test_a_long_key_is_cut_in_its_workload_part_to_exactly_62
+   1 13 failed, 36 passed in 1.44s
+
+# GREEN after implementation, 2026-10-17T22:48:04Z
+$ pytest tests/test_charter_gate.py tests/test_charter_flynn_order.py tests/test_charter_deposit.py tests/test_provenance.py
+112 passed in 36.68s
+
+# MUTATION CHECKS (each mutation applied alone to the implementation, then reverted)
+## M1: gate() never refuses (returns [] always)
+8 failed, 31 deselected in 5.91s
+## M2: charter POST moved after the credit probe
+4 failed, 7 deselected in 6.01s
+## M3: chartered create at the full --deposit, no top-up
+3 failed, 21 deselected in 7.64s
+## M4: auto top-up left on
+1 failed, 1 passed, 11 deselected in 5.24s
+## M5: failed deposit does not close the lease
+2 failed, 11 deselected in 5.05s
+
+# RELATED SUBSET (54 test files touching deploy/provenance/cli/diagnostics/_fake_akash/repo invariants;
+#  excludes test_smoke_providers.py and test_runner_pool_workflow.py, whose run exceeds the 10-min local cap
+#  on the BASE commit too — those run in CI, the full-suite evidence)
+1491 passed in 209.17s (0:03:29)
+
+# POLLUTION FOUND (pre-existing, filed as just-akash-o69): test_adversarial.py then test_balance_check.py leaves
+# just_akash.deploy.AkashConsoleAPI as a MagicMock; the charter harness pins the real class.

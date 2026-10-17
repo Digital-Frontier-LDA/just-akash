@@ -162,12 +162,31 @@ class _ConsoleApp:
         self.deployments: dict[str, dict] = {}
         self.bids = [_bid()]
         self.provider_record = {"owner": _PROVIDER, "hostUri": _HOST_URI, "isOnline": True}
+        # Escrow-side record for the charter tests (just-akash-3sq). `events` is a plain
+        # list a test may REPLACE with one it shares with other fakes, so a single log
+        # shows the order of calls across Console, Flynn and the credit probe.
+        self.events: list[tuple] = []
+        self.created_deposits: list[float | None] = []
+        self.deposits: list[tuple[str, float | None]] = []
+        self.closed: list[str] = []
+        self.settings: dict[str, dict] = {}
+        # Knobs (off by default):
+        # lease_errors: (status, message) answered by successive lease POSTs, then success.
+        # deposit_error: (status, message) answered by every deposit-deployment POST.
+        # settings_ignore_writes: accept a settings write but keep the old value (the
+        #   "write accepted, not honoured" shape set_auto_top_up reads back for).
+        self.lease_errors: list[tuple[int, str]] = []
+        self.deposit_error: tuple[int, str] | None = None
+        self.settings_ignore_writes = False
 
     def create_deployment(self, body: dict) -> dict:
         dseq = str(self._next)
         self._next += 1
-        sdl = (body.get("data") or {}).get("sdl", "")
-        self.deployments[dseq] = {"dseq": dseq, "manifest": sdl}
+        data = body.get("data") or {}
+        sdl = data.get("sdl", "")
+        self.created_deposits.append(data.get("deposit"))
+        self.events.append(("create_deployment", dseq, data.get("deposit")))
+        self.deployments[dseq] = {"dseq": dseq, "manifest": sdl, "sdl": sdl}
         return {"dseq": dseq, "manifest": sdl}
 
     def get_deployment(self, dseq: str) -> dict:
@@ -189,7 +208,35 @@ class _ConsoleApp:
         ]
 
     def close_deployment(self, dseq: str) -> None:
+        self.closed.append(dseq)
+        self.events.append(("close_deployment", dseq))
         self.deployments.pop(dseq, None)
+
+    def create_lease(self, body: dict) -> tuple[int, dict]:
+        dseq = str(((body.get("leases") or [{}])[0]).get("dseq", ""))
+        if self.lease_errors:
+            status, message = self.lease_errors.pop(0)
+            self.events.append(("create_lease_failed", dseq))
+            return status, {"message": message}
+        self.events.append(("create_lease", dseq))
+        return 200, {"data": {"lease": "created"}}
+
+    def deposit_deployment(self, body: dict) -> tuple[int, dict]:
+        data = body.get("data") or {}
+        dseq, amount = str(data.get("dseq")), data.get("deposit")
+        self.events.append(("deposit_deployment", dseq, amount))
+        if self.deposit_error is not None:
+            status, message = self.deposit_error
+            return status, {"message": message}
+        self.deposits.append((dseq, amount))
+        return 200, {"data": {"dseq": dseq}}
+
+    def write_settings(self, dseq: str, enabled) -> dict:
+        self.events.append(("set_auto_top_up", dseq, enabled))
+        current = self.settings.setdefault(dseq, {"dseq": dseq, "autoTopUpEnabled": True})
+        if not self.settings_ignore_writes:
+            current["autoTopUpEnabled"] = enabled
+        return current
 
 
 def _bid() -> dict:
@@ -226,6 +273,13 @@ class _ConsoleHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/v1/deployments":
             self._send(200, {"data": app.list_deployments()})
+        elif path.startswith("/v2/deployment-settings/"):
+            dseq = path.rsplit("/", 1)[-1]
+            app.events.append(("get_deployment_settings", dseq))
+            if dseq in app.settings:
+                self._send(200, {"data": app.settings[dseq]})
+            else:
+                self._send(404, {"message": "not found"})
         elif path.startswith("/v1/deployments/"):
             self._send(200, {"data": app.get_deployment(path.rsplit("/", 1)[-1])})
         elif path == "/v1/bids":
@@ -242,9 +296,30 @@ class _ConsoleHandler(BaseHTTPRequestHandler):
         if path == "/v1/deployments":
             self._send(200, {"data": app.create_deployment(body)})
         elif path == "/v1/leases":
-            self._send(200, {"data": {"lease": "created"}})
+            status, payload = app.create_lease(body)
+            self._send(status, payload)
+        elif path == "/v1/deposit-deployment":
+            status, payload = app.deposit_deployment(body)
+            self._send(status, payload)
+        elif path == "/v2/deployment-settings":
+            data = body.get("data") or {}
+            self._send(
+                200,
+                {"data": app.write_settings(str(data.get("dseq")), data.get("autoTopUpEnabled"))},
+            )
         elif path == "/v1/create-jwt-token":
             self._send(200, {"data": {"token": "fake.jwt.token"}})
+        else:
+            self._send(404, {"message": "not found"})
+
+    def do_PATCH(self) -> None:
+        app: _ConsoleApp = self.server.app  # type: ignore[attr-defined]
+        path = urlparse(self.path).path
+        body = self._json_body()
+        if path.startswith("/v2/deployment-settings/"):
+            dseq = path.rsplit("/", 1)[-1]
+            enabled = (body.get("data") or {}).get("autoTopUpEnabled")
+            self._send(200, {"data": app.write_settings(dseq, enabled)})
         else:
             self._send(404, {"message": "not found"})
 
@@ -264,6 +339,63 @@ class FakeConsole:
         self.app = _ConsoleApp()
         self._http = ThreadingHTTPServer(("127.0.0.1", 0), _ConsoleHandler)
         self._http.app = self.app  # type: ignore[attr-defined]
+        threading.Thread(target=self._http.serve_forever, daemon=True).start()
+        self.base_url = f"http://127.0.0.1:{self._http.server_address[1]}"
+
+    def stop(self) -> None:
+        self._http.shutdown()
+        self._http.server_close()
+
+
+class _FlynnHandler(BaseHTTPRequestHandler):
+    def log_message(self, *a) -> None:
+        pass
+
+    def do_POST(self) -> None:
+        flynn: FakeFlynn = self.server.flynn  # type: ignore[attr-defined]
+        n = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(n) or b"{}")
+        path = urlparse(self.path).path
+        flynn.auth.append(self.headers.get("Authorization"))
+        m = re.fullmatch(r"/api/v1/leases/charters/(?P<cid>[^/]+)/bind", path)
+        if path == "/api/v1/leases/charters":
+            flynn.posts.append(body)
+            flynn.events.append(("flynn.post",))
+            status, payload = flynn.post_status, {"charter_id": flynn.charter_id}
+        elif m:
+            flynn.binds.append((m.group("cid"), body))
+            flynn.events.append(("flynn.bind", m.group("cid"), body.get("dseq")))
+            status = flynn.bind_statuses.pop(0) if flynn.bind_statuses else 200
+            payload = {"charter_id": m.group("cid"), **body}
+        else:
+            status, payload = 404, {"detail": "not found"}
+        raw = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+
+class FakeFlynn:
+    """A localhost stand-in for Flynn's lease-charter API (openmix-pvr6, 8943c379):
+    POST /api/v1/leases/charters -> 201 {charter_id}, POST .../{id}/bind -> 200.
+
+    Records every POST body and the Authorization header. Knobs: ``post_status`` (any
+    non-201 refuses the deploy), ``charter_id`` (a malformed id must refuse it too),
+    ``bind_statuses`` (answered by successive binds, then 200).
+    """
+
+    def __init__(self, events: list | None = None) -> None:
+        self.events: list[tuple] = events if events is not None else []
+        self.posts: list[dict] = []
+        self.binds: list[tuple[str, dict]] = []
+        self.auth: list[str | None] = []
+        self.post_status = 201
+        self.charter_id = "ch-0123456789"
+        self.bind_statuses: list[int] = []
+        self._http = ThreadingHTTPServer(("127.0.0.1", 0), _FlynnHandler)
+        self._http.flynn = self  # type: ignore[attr-defined]
         threading.Thread(target=self._http.serve_forever, daemon=True).start()
         self.base_url = f"http://127.0.0.1:{self._http.server_address[1]}"
 
