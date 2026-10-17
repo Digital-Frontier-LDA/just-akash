@@ -1030,6 +1030,7 @@ def deploy(
     receipt_path: str | None = None,
     receipt_operation_id: str | None = None,
     quiet_wallet: bool | None = None,
+    lease_receipt_path: str | None = None,
 ) -> dict:
     # deposit is user-controlled (--deposit); reject non-finite/non-positive
     # values before they reach json.dumps (which would emit invalid NaN/Infinity).
@@ -1048,6 +1049,13 @@ def deploy(
         raise RuntimeError(
             "deployment receipt arguments are all-or-none: receipt_path and receipt_operation_id"
         )
+    lease_slot = None
+    if lease_receipt_path is not None:
+        if receipt_path is None or receipt_operation_id is None:
+            raise RuntimeError("Sentry lease receipt requires the original create receipt")
+        from . import sentry_lease_receipt
+
+        lease_slot = sentry_lease_receipt.inspect_slot(lease_receipt_path, receipt_path)
     fallback_wait = bid_wait_retry - bid_wait
     # ⛔ VALIDATE BEFORE YOU SPEND. This raises on a bad --select, and it must raise HERE:
     #   resolving it next to its use (just before the auction) put it AFTER
@@ -1110,6 +1118,8 @@ def deploy(
     _log(logging.INFO, "STEP 1: Preparing SDL")
     sdl_content = _prepare_sdl_content(sdl_path, image=image, env_vars=env_vars)
     protect_content(sdl_content)
+    if lease_slot is not None:
+        sentry_lease_receipt.payload_profile(sdl_content)
     _check_wallet_credit(client, deposit)
     # ⛔ RE-CHECK QUIET AS LATE AS POSSIBLE, BUT BEFORE THE RECEIPT. The receipt binds the
     # owner, so a re-selection after it would record the wrong wallet. It runs AFTER the
@@ -2263,15 +2273,32 @@ def deploy(
     attempt = 0
     while True:
         attempt += 1
+        lease_capture = None
         try:
+            if lease_slot is not None:
+                lease_capture = sentry_lease_receipt.prepare(
+                    lease_slot,
+                    create_path=Path(str(receipt_path)),
+                    operation_id=str(receipt_operation_id),
+                    sdl=sdl_content,
+                    dseq=str(dseq),
+                    provider=provider,
+                    lease_group=lease_gseq,
+                )
             lease_response = client.create_lease(
                 dseq=str(dseq),
                 provider=provider,
                 manifest=manifest,
                 gseq=lease_gseq,
             )
+            if lease_capture is not None:
+                sentry_lease_receipt.response_received(lease_capture, lease_response)
             break
-        except RuntimeError as e:
+        except (RuntimeError, OSError, ValueError, TypeError) as e:
+            if lease_slot is None and not isinstance(e, RuntimeError):
+                raise  # Original callers retain their exception/cleanup behavior.
+            if lease_slot is not None:
+                e = RuntimeError("Sentry captured lease attempt requires exact reconciliation")
             err_str = error_text(e).lower()
             stale = "no longer open" in err_str
             # 404 "no lease for deployment": the deployment's order became
@@ -2292,7 +2319,7 @@ def deploy(
             # and every second of backoff ages the bid toward its ~5-min
             # expiry (issue #19).
             transient_auth = "jwt has invalid claims" in err_str
-            if transient_auth and attempt < max_lease_attempts:
+            if lease_slot is None and transient_auth and attempt < max_lease_attempts:
                 _log(
                     logging.WARNING,
                     f"Lease attempt {attempt}/{max_lease_attempts} hit a transient "
@@ -2302,7 +2329,7 @@ def deploy(
                 )
                 time.sleep(5)
                 continue
-            if stale and attempt < max_lease_attempts:
+            if lease_slot is None and stale and attempt < max_lease_attempts:
                 failed_providers.add(provider)
                 _log(
                     logging.WARNING,
@@ -2332,7 +2359,7 @@ def deploy(
                     )
                     continue
                 _log(logging.WARNING, "  No other open bid available to retry with")
-            if (stale or no_order) and not redeployed:
+            if lease_slot is None and (stale or no_order) and not redeployed:
                 # issue #19: every bid on this order has expired (bids share the
                 # ORDER's ~5-min clock, so re-fetching the same order can't
                 # recover), OR the order itself became un-leaseable (no_order
@@ -2393,6 +2420,12 @@ def deploy(
                 dseq=str(dseq),
                 provider=provider,
             )
+            if lease_slot is not None:
+                # Preserve the original exact-deployment cleanup above; UNKNOWN
+                # forbids lease replay, not independent deployment closure.
+                raise RuntimeError(
+                    "NON-RETRYABLE LEASE OUTCOME UNKNOWN: reconcile the exact captured attempt"
+                ) from None
             raise RuntimeError(f"Failed to create lease: {error_text(e)}") from e
 
     _log(logging.INFO, "Lease created successfully!")

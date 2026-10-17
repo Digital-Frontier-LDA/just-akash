@@ -763,6 +763,21 @@ def validate_private_profile(profile: str) -> str:
     pool_size = values.get("PRIVATE_PROFILE_POOL_SIZE")
     minimum = values.get("PRIVATE_PROFILE_MIN_POOL_SIZE", "")
     if identity == (
+        f"sentry-{run}-{attempt}",
+        f"borduas-sentry-idv1-class-ci-runner-g1-attempt-{attempt}-run-{run}-end",
+        "ci-blazing-back-sentry",
+        "true",
+    ):
+        if (
+            pool_size != "1"
+            or minimum != "1"
+            or values.get("PRIVATE_PROFILE_CPU") != "2"
+            or values.get("PRIVATE_PROFILE_MEMORY") != "6Gi"
+            or values.get("PRIVATE_PROFILE_STORAGE") != "40Gi"
+        ):
+            raise ValueError("Private versioned Sentry profile was not verified")
+        return label
+    if identity == (
         f"dfc-images-{run}-{attempt}",
         f"borduas-dfc-images-run-{run}-end",
         "ci-blazing-back-dfc-images",
@@ -907,6 +922,36 @@ def _private_dfc_template(text: str) -> None:
         raise ValueError("Private DFC template was not verified")
 
 
+def _private_versioned_sentry_template(text: str) -> None:
+    """Bind the new versioned role to the original single-replica Sentry resources."""
+    content = "\n".join(
+        line for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")
+    )
+    run, attempt = os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"]
+    placement = f"borduas-sentry-idv1-class-ci-runner-g1-attempt-{attempt}-run-{run}-end"
+    expected = (
+        "profiles:\n"
+        "  compute:\n"
+        "    runner:\n"
+        "      resources:\n"
+        "        cpu: { units: 2 }\n"
+        "        memory: { size: 6Gi }\n"
+        "        storage: { size: 40Gi }\n"
+        "  placement:\n"
+        f"    {placement}:\n"
+        "      pricing:\n"
+        "        runner: { denom: uact, amount: 100000 }\n"
+        "deployment:\n"
+        "  runner:\n"
+        f"    {placement}:\n"
+        "      profile: runner\n"
+        "      count: 1"
+    )
+    headers = list(re.finditer(r"^profiles:$", content, re.MULTILINE))
+    if len(headers) != 1 or content[headers[0].start() :] != expected:
+        raise ValueError("Private versioned Sentry template was not verified")
+
+
 def configure(
     path: Path,
     *,
@@ -936,6 +981,14 @@ def configure(
                 ephemeral=os.environ["PRIVATE_PROFILE_EPHEMERAL"],
             )
             _private_dfc_template(checked)
+        elif label.startswith("sentry-") and "-idv1-" in os.environ["PRIVATE_PROFILE_PLACEMENT"]:
+            checked = _public_profile_payload(
+                path,
+                label,
+                selected_image=PRIVATE_BB_CE1_IMAGE,
+                ephemeral=os.environ["PRIVATE_PROFILE_EPHEMERAL"],
+            )
+            _private_versioned_sentry_template(checked)
         verify_native_reader_role(username, password)
         updated = (
             checked
