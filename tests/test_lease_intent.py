@@ -184,7 +184,10 @@ def test_bind_posts_the_dseq_and_refuses_a_non_dseq(monkeypatch):
     fake = Fake()
     monkeypatch.setenv(LI.MODE_ENV, "enforce")
     assert LI.main(["bind", "--id", IID, "--dseq", "01"], transport=fake) == 1
-    assert fake.flynn() == []
+    urls = [c["url"] for c in fake.flynn()]
+    # no bind is sent for a non-canonical dseq; the intent it was meant for is abandoned
+    assert not any(u.endswith("/bind") for u in urls)
+    assert urls == ["https://api.flynn.digitalfrontier.so/api/v1/lease-intents/" + IID + "/close"]
 
 
 def test_abandon_closes_the_requested_intent_by_id(monkeypatch):
@@ -328,3 +331,53 @@ def test_the_close_plane_ends_the_intent_after_a_verified_close():
 
     src = inspect.getsource(close_orphans.run)
     assert src.index("TERMINAL_DEPLOYMENT_STATES") < src.index("lease_intent.close_quietly")
+
+
+def test_a_failed_bind_abandons_the_intent_even_in_warn_mode(monkeypatch):
+    """CodeRabbit on #457: a requested intent left behind can never be closed by dseq."""
+    monkeypatch.setenv(LI.SECRET_ENV, SECRET)
+    fake = Fake(bind=409)
+    assert LI.main(["bind", "--id", IID, "--dseq", "1789100636167"], transport=fake) == 0
+    urls = [c["url"] for c in fake.flynn()]
+    assert urls[0].endswith("/bind") and urls[-1].endswith(f"/api/v1/lease-intents/{IID}/close")
+    monkeypatch.setenv(LI.MODE_ENV, "enforce")
+    assert LI.main(["bind", "--id", IID, "--dseq", "1789100636167"], transport=Fake(bind=409)) == 1
+
+
+def test_a_redirect_is_never_followed_with_the_bearer_token():
+    """CodeRabbit on #457: urllib's default handler would re-send Authorization to a target the
+    https guard never checked, and a redirected 200 would read as success."""
+    import http.server
+    import threading
+
+    seen: list[str] = []
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            seen.append(self.path)
+            self.send_response(302)
+            self.send_header("Location", "/elsewhere")
+            self.end_headers()
+
+        def do_GET(self):  # noqa: N802
+            seen.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        req = __import__("urllib.request").request.Request(
+            f"http://127.0.0.1:{srv.server_port}/bind",
+            data=b"{}",
+            method="POST",
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+        status, _ = LI._urlopen(req)
+    finally:
+        srv.shutdown()
+    assert status == 302 and seen == ["/bind"], "the redirect target must never be requested"

@@ -101,9 +101,21 @@ def _https(url: str) -> str:
 Transport = Callable[[urllib.request.Request], tuple[int, bytes]]
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A credential-bearing request never follows a redirect. urllib's default handler would
+    re-send the request (with its Authorization header) to a target `_https()` never saw, and a
+    redirected GET answering 200 would read as a bind or close that never happened."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ARG002
+        return None  # urllib then raises HTTPError(3xx), returned below as a refusal
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def _urlopen(req: urllib.request.Request) -> tuple[int, bytes]:
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT_S) as r:  # noqa: S310 - https-only, guarded by _https
+        with _OPENER.open(req, timeout=TIMEOUT_S) as r:  # noqa: S310 - https-only, guarded by _https
             return r.status, r.read()
     except urllib.error.HTTPError as e:
         return e.code, b""
@@ -440,7 +452,16 @@ def main(argv: list[str] | None = None, *, transport: Transport = _urlopen) -> i
             _log(f"intent {iid} (CAPACITY, {args.max_hours:g} h) on {wallet}")
             print(iid)
         elif args.cmd == "bind":
-            ledger.bind(args.id, args.dseq)
+            try:
+                ledger.bind(args.id, args.dseq)
+            except IntentError as e:
+                # Never leave a requested intent behind for a lease it does not name: close_quietly
+                # finds intents by dseq and could never reach it. Same rule as backfill.
+                try:
+                    ledger.abandon(args.id, f"bind to {args.dseq} failed")
+                except IntentError as e2:
+                    _log(f"WARN: could not abandon {args.id} after a failed bind ({e2})")
+                return _fail(str(e))
             _log(f"intent {args.id} bound to {args.dseq}")
         elif args.cmd == "abandon":
             ledger.abandon(args.id, args.reason)
