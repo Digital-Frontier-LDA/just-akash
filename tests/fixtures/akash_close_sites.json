@@ -92,6 +92,13 @@
   },
   {
     "callee": "close_deployment",
+    "count": 1,
+    "kind": "python",
+    "path": "just_akash/deploy.py",
+    "scope": "_verify_runtime_limit_or_close"
+  },
+  {
+    "callee": "close_deployment",
     "count": 7,
     "kind": "python",
     "path": "just_akash/deploy.py",
