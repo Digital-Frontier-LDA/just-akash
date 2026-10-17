@@ -105,6 +105,13 @@ STALE_OWNED_AGE_SECONDS = 48 * 3600
 RUNNER_SERVICE = "runner"
 STALE_RUNNER_AGE_SECONDS = 6 * 3600
 
+# The persistent per-provider canary (sdl/canary.yaml: "MUST NOT BE REAPED"). provider-canary.yml
+# adopts it by its exact service set ({"canary"}, canary/ensure.py) and needs it to live for weeks:
+# the failures it exists to catch only happen over time. --reap-owned would otherwise class it
+# STALE-owned after 48 h (it carries our prefix), so it is left by NAME, before the owned rule.
+# Operator decision 2026-10-16 (openmix-hxlg): canaries are persistent, not ephemeral.
+CANARY_SERVICE = "canary"
+
 # ── EXECUTE-PATH RAILS (#250) ────────────────────────────────────────────
 #
 # These bind ONLY when --execute is passed. A dry run reports whatever it finds;
@@ -150,6 +157,7 @@ KNOWN_VERDICTS = frozenset(
         "STALE-runner",
         "STALE-owned",
         "STALE-provider-closed",
+        "LEAVE-canary",
         "LEAVE-not-ours",
         "LEAVE-not-ours-provider-closed",
         "LEAVE-real-or-unknown",
@@ -271,6 +279,9 @@ def classify(
         if age is not None and age >= STALE_E2E_AGE_SECONDS:
             return "STALE-e2e", services, age
         return "LEAVE-recent-backtest", services, age
+    if services == [CANARY_SERVICE]:
+        # Persistent by design (CANARY_SERVICE above): never stale, whatever its age or flags.
+        return "LEAVE-canary", services, age
     if services == [RUNNER_SERVICE]:
         # OWNERSHIP IS NOW PROVEN, NOT ASSERTED.
         #

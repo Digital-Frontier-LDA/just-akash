@@ -236,3 +236,26 @@ def test_an_unaged_deployment_is_still_read() -> None:
     from just_akash.cleanup_stale import _wants_owned_provenance
 
     assert _wants_owned_provenance(_detail("app"), "not-a-dseq")
+
+
+def test_the_persistent_canary_is_never_stale_owned() -> None:
+    """openmix-hxlg (operator 2026-10-16): canaries are persistent. sdl/canary.yaml says MUST NOT
+    BE REAPED and provider-canary.yml adopts them for weeks; --reap-owned had classed the three
+    live canaries (35 d, our prefix) STALE-owned, held back only by the identity proof."""
+    from just_akash.cleanup_stale import KNOWN_VERDICTS
+
+    for age in (OLD, 35 * 86400, YOUNG):
+        v = _classify("canary", age, [f"{PLACEMENT_PREFIX}canary.09a75b4f3236"])
+        assert v == "LEAVE-canary", (age, v)
+        assert v not in STALE_VERDICTS and v in KNOWN_VERDICTS
+    assert _classify("canary", OLD, ["dcloud"]) == "LEAVE-canary"      # not ours: still left
+    assert _classify("canary", OLD, None, reap_owned=False) == "LEAVE-canary"
+
+
+def test_a_mixed_service_set_with_a_canary_is_not_exempt() -> None:
+    """Only the exact {canary} set is the canary (canary/ensure.py matches it exactly)."""
+    detail = {"leases": [{"id": {"provider": "akash1prov"},
+                          "status": {"services": {"canary": {}, "app": {}}}}]}
+    v = classify(detail, _dseq_aged(OLD), group_names=[f"{PLACEMENT_PREFIX}x"], reap_owned=True)[0]
+    assert v == "STALE-owned", v
+
