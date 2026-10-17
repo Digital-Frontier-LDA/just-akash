@@ -15,4 +15,12 @@ repos:
     rev: v1.5.0
     hooks:
       - id: detect-secrets
-        args: [--baseline, .secrets.baseline]
+        # Same exclusions as .github/workflows/secrets.yml: SOPS ciphertext and the registry's
+        # keyed expected_hmac digests are not secrets and change on every sops-edit.
+        args:
+          - --baseline
+          - .secrets.baseline
+          - --exclude-files
+          - '.*\.sops\.(env|ya?ml|json)$'
+          - --exclude-lines
+          - '^\s*expected_hmac:\s*"[0-9a-f]{64}"\s*$'
