@@ -275,6 +275,13 @@ jobs:
             fi
           fi
           CANARY_PY_B64=$(base64 -w0 canary/canary.py)
+          # Flynn openmix-h2l7: the deploying wallet, so each canary can say WHY it exists in
+          # Flynn's lease intent ledger. Same source as the collect step below (credit.json).
+          # Empty, or no JUST_AKASH_LEASE_INTENT_CLIENT_SECRET yet: the intent calls are inert.
+          if ! owner="$(python3 -c 'import json;print(json.load(open("credit.json")).get("account",""))' 2>/dev/null)"; then
+            owner=""
+            echo "::warning::no owner address in credit.json - canary lease intents will not be recorded this run"
+          fi
           # name<TAB>address, both resolved by canary/ensure.py from AKASH_PROVIDERS.
           while IFS=$'\t' read -r provider address; do
             [ -n "$provider" ] && [ -n "$address" ] || continue
@@ -359,6 +366,17 @@ jobs:
             # every 30 minutes for a quiet provider is how a signal stops being read. The
             # ALERT owns the paging, off telemetry that now actually gets published.
             # Raised by CodeRabbit on #145.
+            # Flynn openmix-h2l7: declare the canary BEFORE spending on it (prints an intent id,
+            # or nothing while the client secret is absent). Warn mode: a ledger failure never
+            # blocks the canary. CAPACITY, 720 h; Flynn measures that from the lease's creation.
+            iid=""
+            if [ -n "$owner" ] && ! iid="$(uv run python -m just_akash.lease_intent create --owner "$owner" \
+                --group-name "just-akash-canary" \
+                --reason "just-akash persistent provider canary for ${provider}: liveness + ingress telemetry (provider-canary.yml)" \
+                --bead openmix-h2l7)"; then
+              iid=""
+              echo "::warning::lease intent for the ${provider} canary was not registered (Flynn's ledger refused it); the canary goes on"
+            fi
             if ! uv run just-akash deploy \
               --sdl "sdl-canary-${provider}.yaml" \
               --provider "$address" \
@@ -367,6 +385,10 @@ jobs:
             | tee "deploy-${provider}.log"; then
               echo "::warning::${provider} did not bid, so no canary was created for it. This is --no-backup-fallback working: a canary on a backup provider cannot answer for ${provider}. AkashCanaryNoIngress/NoDeployments will report the gap from the telemetry this run still publishes."
               echo "${provider}" >> not-deployed.txt
+              if [ -n "$iid" ] && ! uv run python -m just_akash.lease_intent abandon --id "$iid" \
+                  --reason "${provider} did not bid; no canary deployed"; then
+                echo "::warning::lease intent ${iid} could not be abandoned"
+              fi
               echo "::endgroup::"
               continue
             fi
@@ -379,10 +401,18 @@ jobs:
               # would have opened three more leases. canary/ensure.py now identifies a
               # canary by service set + lease provider, both read off the deployment.
               uv run just-akash tag --dseq "$dseq" --name "canary-${provider}" || true
+              if [ -n "$iid" ] && ! uv run python -m just_akash.lease_intent bind --id "$iid" \
+                  --dseq "$dseq"; then
+                echo "::warning::lease intent ${iid} could not be bound to ${dseq}"
+              fi
               uv run just-akash auto-topup --dseq "$dseq" --on || \
                 echo "::warning::auto-topup could not be enabled on ${dseq}; escrow will need watching"
             else
               echo "::warning::could not parse a dseq from the deploy output for ${provider}"
+              if [ -n "$iid" ] && ! uv run python -m just_akash.lease_intent abandon --id "$iid" \
+                  --reason "deploy output carried no dseq for ${provider}"; then
+                echo "::warning::lease intent ${iid} could not be abandoned"
+              fi
             fi
             echo "::endgroup::"
           done < missing.txt

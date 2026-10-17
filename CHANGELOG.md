@@ -10,6 +10,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- `python -m just_akash.lease_intent` (Flynn openmix-h2l7): persistent provider canaries record
+  WHY they exist in Flynn's lease intent ledger (Keycloak client `just-akash-lease-intent`,
+  Akash-Console #1147). `provider-canary.yml` registers a CAPACITY intent before each canary
+  deploy, binds it to the dseq, and abandons it when the provider does not bid; `close_orphans`
+  closes the intent after a verified close. `backfill` registers leases that already run with
+  limits computed from their chain age (age + horizon), never a bare horizon. Inert and silent
+  until `JUST_AKASH_LEASE_INTENT_CLIENT_SECRET` exists; warn mode never blocks a canary.
 - Read-only `verify-finalized-closed` adapter for the pinned core execution-closure
   envelope: complete creation identity, successful exact close transaction inclusion,
   common finalized state height and complete agreeing deployment/group/lease populations.
