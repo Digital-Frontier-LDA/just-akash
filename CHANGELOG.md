@@ -27,6 +27,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   Needs `FLYNN_API_URL` + `FLYNN_INTERNAL_API_KEY`, and the wallet label from the charter's
   `wallet_label` or `JUST_AKASH_WALLET_LABELS`; with several keys the label must be confirmed
   for the wallet the pool selected (by the map), or the deploy refuses before the POST.
+  `prod_pinned` must be a JSON boolean. `CHARTER_DEPOSIT_FAILED` carries `closed` and says
+  "close FAILED; close it manually" when the close itself failed; runner-pool recovers its
+  dseq for teardown. `update` re-stamps the charter id (`--charter-id`, else read back from
+  the deployment's group names) so the PUT names the same placement group as the chain.
+  `python -m just_akash.deploy` takes `--charter` / `JUST_AKASH_CHARTER_JSON` too.
 - `lease-intent-backfill.yml` (Flynn openmix-h2l7): the dispatch-only caller of
   `lease_intent backfill`, for canaries that were already running when intents landed
   (provider-canary.yml registers one only at deploy). Inputs reach the shell through env and

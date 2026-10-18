@@ -171,7 +171,11 @@ class Charter:
                     raise ValueError
             except (TypeError, ValueError):
                 problems.append("idle_threshold_pct must be 0..100")
-        out["prod_pinned"] = bool(doc.get("prod_pinned") or False)
+        # A JSON boolean only: bool("false") is True, and prod_pinned switches auto top-up ON.
+        pinned = doc.get("prod_pinned")
+        if pinned is not None and not isinstance(pinned, bool):
+            problems.append("prod_pinned must be a JSON boolean")
+        out["prod_pinned"] = pinned is True
         for key, limit in zip(_CAPACITY_FIELDS, (256, 128, 1024, 256), strict=True):
             out[key] = _text(doc, key, limit)
         if kind == "capacity":

@@ -81,6 +81,13 @@
     "count": 1,
     "kind": "python",
     "path": "just_akash/deploy.py",
+    "scope": "_close_charter_deployment"
+  },
+  {
+    "callee": "close_deployment",
+    "count": 1,
+    "kind": "python",
+    "path": "just_akash/deploy.py",
     "scope": "_close_proven_orphan"
   },
   {
@@ -92,14 +99,7 @@
   },
   {
     "callee": "close_deployment",
-    "count": 1,
-    "kind": "python",
-    "path": "just_akash/deploy.py",
-    "scope": "_fund_charter_lease"
-  },
-  {
-    "callee": "close_deployment",
-    "count": 8,
+    "count": 7,
     "kind": "python",
     "path": "just_akash/deploy.py",
     "scope": "deploy"

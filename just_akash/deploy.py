@@ -57,12 +57,16 @@ from .deployment_receipt import (
     prepare_receipt,
 )
 from .provenance import (
+    CHARTER_ID_RE,
+    CHARTER_SEPARATOR,
+    OURS_PREFIXES,
     PLACEMENT_PREFIX,
     SIBLING_REAPED_PREFIX,
     placement_keys,
     run_id_of,
     stamp_charter,
     stamp_run,
+    uncharted_key,
 )
 from .provider_capacity import capacity_by_provider
 from .request_profile import attach_profile, derive_resource_profiles, observed_gseq
@@ -1066,6 +1070,20 @@ def _post_charter(charter: Charter) -> tuple[charter_mod.FlynnCharterClient, str
     return flynn, charter_id
 
 
+def _close_charter_deployment(client, dseq: str) -> bool:
+    """Best-effort close after a charter refusal. True only when the close call returned:
+    a caller must never report "closed" for a deployment that may still be live."""
+    try:
+        client.close_deployment(dseq)
+    except Exception as cleanup_err:
+        _log(
+            logging.ERROR,
+            f"Cleanup of {display(dseq, 'dseq')} also failed: {error_text(cleanup_err)}",
+        )
+        return False
+    return True
+
+
 def _fund_charter_lease(
     client, charter: Charter, dseq: str, price_amount, price_denom: str
 ) -> float:
@@ -1103,22 +1121,18 @@ def _fund_charter_lease(
             logging.ERROR,
             f"CHARTER funding failed for {display(dseq, 'dseq')}: {error_text(e)} — closing",
         )
-        try:
-            client.close_deployment(dseq)
-        except Exception as cleanup_err:
-            _log(
-                logging.ERROR,
-                f"Cleanup of {display(dseq, 'dseq')} also failed: {error_text(cleanup_err)}",
-            )
+        closed = _close_charter_deployment(client, dseq)
+        outcome = "lease closed" if closed else "lease close FAILED; close it manually"
         emit(
             Code.CHARTER_DEPOSIT_FAILED,
             "error",
-            f"charter deposit/auto top-up failed; lease closed: {error_text(e)}",
+            f"charter deposit/auto top-up failed; {outcome}: {error_text(e)}",
             dseq=dseq,
+            closed=closed,
         )
         raise RuntimeError(
             f"charter deposit/auto top-up failed for {display(dseq, 'dseq')}; "
-            f"the lease was closed: {error_text(e)}"
+            f"{outcome}: {error_text(e)}"
         ) from e
     return minimum + top_up
 
@@ -2464,23 +2478,22 @@ def deploy(
             # conversion is how a budget silently ends up a factor of 10^6 wrong. Checked on
             # EVERY attempt: a stale-bid retry or the issue-#19 re-deploy can switch bids.
             _log(logging.ERROR, f"Bid priced in {price_denom}, not uact — cannot size the charter")
-            try:
-                client.close_deployment(str(dseq))
-            except Exception as cleanup_err:
-                _log(
-                    logging.ERROR,
-                    f"Cleanup of {display(dseq, 'dseq')} failed: {error_text(cleanup_err)}",
-                )
+            closed = _close_charter_deployment(client, str(dseq))
+            outcome = (
+                "deployment closed before lease"
+                if closed
+                else "deployment close FAILED before lease; close it manually"
+            )
             emit(
                 Code.CHARTER_DEPOSIT_FAILED,
                 "error",
-                f"selected bid is priced in {price_denom}, not uact; "
-                "deployment closed before lease",
+                f"selected bid is priced in {price_denom}, not uact; {outcome}",
                 dseq=str(dseq),
+                closed=closed,
             )
             raise RuntimeError(
                 f"selected bid is priced in {price_denom!r}, not uact: a chartered deposit cannot "
-                "be sized from it; deployment closed before the lease"
+                f"be sized from it; {outcome}"
             )
         try:
             lease_response = client.create_lease(
@@ -2662,6 +2675,53 @@ def deploy(
     return result
 
 
+def _charter_ids_in(doc: Any) -> set[str]:
+    """Charter ids carried by any ``flynn-``/``fleet-`` group name in a Console deployment
+    document. Walked, not indexed: only the name strings matter, wherever they sit."""
+    found: set[str] = set()
+    if isinstance(doc, dict):
+        for value in doc.values():
+            found |= _charter_ids_in(value)
+    elif isinstance(doc, list):
+        for value in doc:
+            found |= _charter_ids_in(value)
+    elif isinstance(doc, str):
+        head, sep, tail = doc.rpartition(CHARTER_SEPARATOR)
+        if sep and head.startswith(OURS_PREFIXES) and CHARTER_ID_RE.fullmatch(tail):
+            found.add(tail)
+    return found
+
+
+def _restamp_charter_for_update(
+    client, dseq: str, sdl_content: str, charter_id: str | None
+) -> str:
+    """Re-apply the charter stamp deploy() put on the placement keys, so the PUT manifest
+    names the SAME groups as the chain. Not ours (no flynn-/fleet- key): unchanged."""
+    if not any(uncharted_key(k).startswith(OURS_PREFIXES) for k in placement_keys(sdl_content)):
+        return sdl_content
+    if charter_id is None:
+        try:
+            ids = _charter_ids_in(client.get_deployment(dseq))
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"cannot read deployment {display(dseq, 'dseq')} to recover its charter id "
+                f"({error_text(e)}); pass --charter-id"
+            ) from e
+        if len(ids) > 1:
+            raise RuntimeError(
+                f"deployment {display(dseq, 'dseq')} carries several charter ids "
+                f"({', '.join(sorted(ids))}); pass --charter-id"
+            )
+        if not ids:
+            return sdl_content  # an uncharted lease: its group names are the SDL's own
+        charter_id = ids.pop()
+    sdl_content, stamped = stamp_charter(sdl_content, charter_id)
+    validate_sdl(sdl_content)
+    if stamped:
+        _log(logging.INFO, f"CHARTER {charter_id} re-stamped: {', '.join(stamped)}")
+    return sdl_content
+
+
 @sdl_operation
 def update(
     dseq: str,
@@ -2669,12 +2729,17 @@ def update(
     image: str | None = None,
     env_vars: list[str] | None = None,
     api_key: str | None = None,
+    charter_id: str | None = None,
 ) -> dict:
     """Update an active deployment in place with a revised SDL.
 
     Reuses the same SDL preparation as deploy() (validation, image/SSH/env
     overrides) then PUTs to the Console API. The DSEQ and existing lease are
     preserved — no re-bid or new lease is created.
+
+    A chartered lease's placement group is named ``<key>.ch-<id>`` on chain, so its own
+    SDL file no longer matches it: the charter id (``charter_id``, else read back from the
+    deployment's group names) is stamped again before the PUT.
     """
     api_key = api_key or os.environ.get("AKASH_API_KEY")
     if not api_key:
@@ -2694,6 +2759,7 @@ def update(
     # Step 1: Read + validate + transform SDL (identical to deploy).
     _log(logging.INFO, "STEP 1: Preparing SDL")
     sdl_content = _prepare_sdl_content(sdl_path, image=image, env_vars=env_vars)
+    sdl_content = _restamp_charter_for_update(client, str(dseq), sdl_content, charter_id)
     protect_content(sdl_content)
 
     # Step 2: Submit the in-place update.
@@ -2778,6 +2844,14 @@ def deploy_main():
     )
     parser.add_argument("--receipt-path")
     parser.add_argument("--receipt-operation-id")
+    # Mirrors `just-akash deploy --charter` (cli.py): without it, enforce would refuse every
+    # flynn-*/fleet-* deploy here with advice this entry point could not follow.
+    parser.add_argument(
+        "--charter",
+        metavar="FILE.json",
+        help="Lease charter for a placement of ours (flynn-*, fleet-*, dcloud, akash). "
+        "Falls back to JUST_AKASH_CHARTER_JSON; see `just-akash deploy --help`.",
+    )
     # Mirrors the flag on `just-akash deploy` (cli.py). Both entry points reach the same
     # deploy(), so a flag on only one of them is a trap for whoever uses the other.
     parser.add_argument(
@@ -2830,6 +2904,7 @@ def deploy_main():
             backup_providers=[] if args.no_backup_fallback else args.backup_providers,
             receipt_path=args.receipt_path,
             receipt_operation_id=args.receipt_operation_id,
+            charter=charter_mod.load_charter(args.charter),
         )
         sys.exit(0)
     except RuntimeError as e:

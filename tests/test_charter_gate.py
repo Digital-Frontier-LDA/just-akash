@@ -47,6 +47,15 @@ def _stop_at_first_create(monkeypatch, h):
     monkeypatch.setattr(AkashConsoleAPI, "create_deployment", create)
 
 
+CAPACITY = {
+    "kind": "capacity",
+    "served_model_name": "qwen3-32b",
+    "image_digest": "sha256:" + "a" * 64,
+    "canary_prompt": "say ok",
+    "canary_expect": "ok",
+}
+
+
 @pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("key", OURS)
 def test_ours_without_a_charter(monkeypatch, h, capsys, key, mode):
@@ -162,6 +171,19 @@ class TestCharterDocument:
     def test_prod_pinned_is_capacity_only(self):
         with pytest.raises(charter_mod.CharterInvalid, match="prod_pinned"):
             charter_mod.Charter.from_dict(harness.charter_doc(prod_pinned=True))
+
+    @pytest.mark.parametrize("value", ["false", "true", 0, 1, "no"])
+    def test_prod_pinned_must_be_a_json_boolean(self, value):
+        """Review (CodeRabbit, a1eab31): bool("false") is True, and prod_pinned turns auto
+        top-up ON -- a string must be refused, never coerced."""
+        doc = harness.charter_doc(prod_pinned=value, **CAPACITY)
+        with pytest.raises(charter_mod.CharterInvalid, match="prod_pinned must be a JSON boolean"):
+            charter_mod.Charter.from_dict(doc)
+
+    @pytest.mark.parametrize("value,expected", [(None, False), (False, False), (True, True)])
+    def test_prod_pinned_null_or_boolean_loads(self, value, expected):
+        doc = harness.charter_doc(prod_pinned=value, **CAPACITY)
+        assert charter_mod.Charter.from_dict(doc).prod_pinned is expected
 
     def test_max_act_below_the_console_minimum_is_refused(self):
         with pytest.raises(charter_mod.CharterInvalid, match="max_act"):

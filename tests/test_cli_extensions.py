@@ -121,6 +121,27 @@ class TestCliUpdate:
         assert kwargs["dseq"] == "12345"
         assert kwargs["sdl_path"] == "x.yaml"
         assert kwargs["image"] == "img:2"
+        assert kwargs["charter_id"] is None
+
+    @patch("just_akash.deploy.update")
+    @patch("just_akash.api.AkashConsoleAPI")
+    def test_update_passes_charter_id(self, MockAPI, mock_update, monkeypatch):
+        monkeypatch.setenv("AKASH_API_KEY", "k")
+        with pytest.raises(SystemExit):
+            _run_cli(
+                monkeypatch,
+                [
+                    "just-akash",
+                    "update",
+                    "--dseq",
+                    "12345",
+                    "--sdl",
+                    "x.yaml",
+                    "--charter-id",
+                    "ch-0123456789",
+                ],
+            )
+        assert mock_update.call_args.kwargs["charter_id"] == "ch-0123456789"
 
     @patch("just_akash.deploy.update", side_effect=RuntimeError("boom"))
     @patch("just_akash.api.AkashConsoleAPI")

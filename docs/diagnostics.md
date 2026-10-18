@@ -71,7 +71,7 @@ Silent in an interactive terminal (humans keep the existing `_log`/`Error:` pros
 |---|---|
 | `CHARTER_MISSING` | No charter for a placement of ours. `JUST_AKASH_CHARTER=warn` (default) proceeds; `enforce` refuses before any create. |
 | `CHARTER_POST_FAILED` | Flynn refused or could not be reached for the charter POST; nothing was created. |
-| `CHARTER_DEPOSIT_FAILED` | The follow-up deposit, or setting auto top-up (off; on for `prod_pinned`), failed after the lease and the lease was closed — or the bid about to be leased is not priced in uact and the deployment was closed before the lease. |
+| `CHARTER_DEPOSIT_FAILED` | The follow-up deposit, or setting auto top-up (off; on for `prod_pinned`), failed after the lease and the lease was closed — or the bid about to be leased is not priced in uact and the deployment was closed before the lease. `context.closed` is `false` (and the message says "close FAILED; close it manually") when that close itself failed: the deployment may still be live. |
 | `CHARTER_BIND_FAILED` | The bind to the final dseq failed after retries; the lease is kept and reads as uncharted in Flynn. |
 
 ### Reliability (post-deploy / smoke — "external sweep reaps the lease")

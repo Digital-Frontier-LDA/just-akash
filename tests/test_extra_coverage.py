@@ -29,6 +29,54 @@ class TestDeployMain:
         assert exc_info.value.code == 1
 
 
+class TestDeployMainCharter:
+    """Review (fallback, a1eab31): `python -m just_akash.deploy` must honour a charter like
+    `just-akash deploy` does, or enforce refuses with advice this entry point cannot follow."""
+
+    @patch("just_akash.deploy.deploy")
+    def test_charter_file_is_loaded_and_passed(self, mock_deploy, monkeypatch, tmp_path):
+        import json
+
+        from tests import _charter_harness as harness
+
+        path = tmp_path / "c.json"
+        path.write_text(json.dumps(harness.charter_doc()))
+        monkeypatch.setattr(sys, "argv", ["deploy", "--sdl", "t.yaml", "--charter", str(path)])
+        from just_akash.deploy import deploy_main
+
+        with pytest.raises(SystemExit) as exc_info:
+            deploy_main()
+        assert exc_info.value.code == 0
+        charter = mock_deploy.call_args.kwargs["charter"]
+        assert charter is not None and charter.bead == "openmix-pvr6.1"
+
+    @patch("just_akash.deploy.deploy")
+    def test_charter_env_is_honoured(self, mock_deploy, monkeypatch):
+        import json
+
+        from tests import _charter_harness as harness
+
+        monkeypatch.setenv("JUST_AKASH_CHARTER_JSON", json.dumps(harness.charter_doc()))
+        monkeypatch.setattr(sys, "argv", ["deploy", "--sdl", "t.yaml"])
+        from just_akash.deploy import deploy_main
+
+        with pytest.raises(SystemExit):
+            deploy_main()
+        assert mock_deploy.call_args.kwargs["charter"].bead == "openmix-pvr6.1"
+
+    @patch("just_akash.deploy.deploy")
+    def test_an_invalid_charter_exits_1_before_deploy(self, mock_deploy, monkeypatch, tmp_path):
+        path = tmp_path / "c.json"
+        path.write_text("{}")
+        monkeypatch.setattr(sys, "argv", ["deploy", "--sdl", "t.yaml", "--charter", str(path)])
+        from just_akash.deploy import deploy_main
+
+        with pytest.raises(SystemExit) as exc_info:
+            deploy_main()
+        assert exc_info.value.code == 1
+        mock_deploy.assert_not_called()
+
+
 class TestApiMain:
     def test_no_api_key(self, monkeypatch):
         monkeypatch.delenv("AKASH_API_KEY", raising=False)

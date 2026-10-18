@@ -1585,13 +1585,13 @@ jobs:
             rm -f /tmp/runner-sdl.minted.yaml
             # ⛔ A FAILED LEASE STILL HOLDS A DEPLOYMENT (#348). just-akash prints the
             # "DSEQ:" summary only after a lease succeeds. When lease creation fails it
-            # closes best-effort and emits LEASE_CREATE_FAILED (or REDEPLOY_FAILED) with the
-            # dseq, then raises. That deployment is real until proven closed, so the same
+            # closes best-effort and emits LEASE_CREATE_FAILED (or REDEPLOY_FAILED, or for a
+            # chartered deploy CHARTER_DEPOSIT_FAILED) with the dseq, then raises. That deployment is real until proven closed, so the same
             # single read also recovers its identity from that diagnostic line; the paths
             # below then refuse to create again until it is proven closed.
             DSEQ=$(awk -F': +' '
               /^[[:space:]]*DSEQ:/ && !found { summary = $2; found = 1 }
-              /"code": "(LEASE_CREATE_FAILED|REDEPLOY_FAILED)"/ && match($0, /"dseq": "[1-9][0-9]*"/) {
+              /"code": "(LEASE_CREATE_FAILED|REDEPLOY_FAILED|CHARTER_DEPOSIT_FAILED)"/ && match($0, /"dseq": "[1-9][0-9]*"/) {
                 recovered = substr($0, RSTART + 9, RLENGTH - 10)
               }
               END { if (found) print summary; else if (recovered != "") print recovered }

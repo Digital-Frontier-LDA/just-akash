@@ -69,3 +69,22 @@ Related subset (charter*, provenance, close-site census, cli, cli_dispatch, depl
 wallet_pool*, chain_provenance, runner_native_diagnostics): 466 passed in 63.47s.
 ruff check + format: clean; pyright charter/deploy/provenance: 0 errors.
 Full suite: PR #460 CI on the pushed head (recorded on the bead).
+
+== FEEDBACK run 5959a944 (CodeRabbit review of a1eab31 + fallback review of a1eab31) ==
+New/changed tests, run against a1eab317 code (temp worktree, branch tests copied in; base messages
+in the failures confirm the base tree was imported):
+  17 failed, 151 passed in 32.79s
+  FAILED test_runner_pool_dseq_recovery::test_a_charter_deposit_failure_dseq_is_recovered  (assert '' == '777001')
+  FAILED test_update_flow::TestUpdateKeepsTheCharterStamp::test_the_charter_id_is_read_back_and_restamped
+  FAILED test_update_flow::TestUpdateKeepsTheCharterStamp::test_an_explicit_charter_id_wins_without_a_read  (TypeError charter_id)
+  FAILED test_update_flow::TestUpdateKeepsTheCharterStamp::test_several_charter_ids_refuse_before_the_put  (DID NOT RAISE)
+  FAILED test_extra_coverage::TestDeployMainCharter::{test_charter_file_is_loaded_and_passed, test_charter_env_is_honoured,
+         test_an_invalid_charter_exits_1_before_deploy}  (no --charter; no charter kw)
+  FAILED test_cli_extensions::TestCliUpdate::{test_update_success, test_update_passes_charter_id}  (no charter_id)
+  FAILED test_charter_gate::TestCharterDocument::test_prod_pinned_must_be_a_json_boolean[false|true|0|1|no]  (DID NOT RAISE)
+  FAILED test_charter_deposit::{test_a_failed_close_after_failed_funding_is_not_reported_as_closed,
+         test_a_failed_close_after_a_non_uact_refusal_is_not_reported_as_closed, test_a_successful_close_reports_closed_true}
+         (base says "the lease was closed" even when the close raised; no closed context)
+Same tests on the fix: all pass. Related subset (update_flow, extra_coverage, cli_extensions, charter_gate/deposit/
+flynn_order, provenance, cli, close-site census, runner_pool_dseq_recovery): see bead note.
+Close-site census manifest: _fund_charter_lease(1) + one deploy() site merged into _close_charter_deployment(1); deploy 8 -> 7.

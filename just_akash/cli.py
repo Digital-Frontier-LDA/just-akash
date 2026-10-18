@@ -434,6 +434,12 @@ def main():
         default=[],
         help="KEY=VALUE env var to inject into SDL (repeatable, provider-visible)",
     )
+    update_p.add_argument(
+        "--charter-id",
+        default=None,
+        help="Charter id (ch-<10 hex>) the lease's placement keys were stamped with; "
+        "read back from the deployment when omitted",
+    )
 
     # ── connect ────────────────────────────────────────
     connect_p = subparsers.add_parser(
@@ -991,6 +997,7 @@ def main():
                 image=args.image,
                 env_vars=args.update_env_vars,
                 api_key=client.api_key,
+                charter_id=args.charter_id,
             )
             sys.exit(0)
         except RuntimeError as e:

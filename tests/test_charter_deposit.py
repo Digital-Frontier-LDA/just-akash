@@ -162,3 +162,43 @@ def test_a_retry_bid_not_priced_in_uact_is_refused_before_its_lease(h):
     assert "create_lease" not in h.names()
     assert h.names().count("create_lease_failed") == 1
     assert h.app.closed == ["1000"]
+
+
+def _close_fails(monkeypatch):
+    def refuse(self, dseq):
+        raise RuntimeError("console 503")
+
+    monkeypatch.setattr(harness.REAL_CONSOLE_API, "close_deployment", refuse)
+
+
+def test_a_failed_close_after_failed_funding_is_not_reported_as_closed(h, monkeypatch, capsys):
+    """Review (fallback + CodeRabbit, a1eab31): when the close itself raises, the lease may
+    still be live and funded. The diagnostic and the error must say so, not 'closed'."""
+    h.set_bid_price(1000)
+    h.app.deposit_error = (500, "insufficient funds")
+    _close_fails(monkeypatch)
+    with pytest.raises(RuntimeError, match="close FAILED") as exc:
+        _deploy(h)
+    assert "was closed" not in str(exc.value)
+    err = capsys.readouterr().err
+    assert "CHARTER_DEPOSIT_FAILED" in err
+    assert "close FAILED; close it manually" in err
+    assert '"closed": false' in err
+
+
+def test_a_failed_close_after_a_non_uact_refusal_is_not_reported_as_closed(h, monkeypatch, capsys):
+    h.set_bid_price(1000, denom="ibc/170C677610AC31DF")
+    _close_fails(monkeypatch)
+    with pytest.raises(RuntimeError, match="close FAILED before lease"):
+        _deploy(h)
+    err = capsys.readouterr().err
+    assert "deployment close FAILED before lease" in err
+    assert '"closed": false' in err
+
+
+def test_a_successful_close_reports_closed_true(h, capsys):
+    h.set_bid_price(1000)
+    h.app.deposit_error = (500, "insufficient funds")
+    with pytest.raises(RuntimeError, match="lease closed"):
+        _deploy(h)
+    assert '"closed": true' in capsys.readouterr().err

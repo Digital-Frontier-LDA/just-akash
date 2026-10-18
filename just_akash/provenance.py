@@ -311,7 +311,8 @@ MAX_PLACEMENT_KEY_LEN = 62
 _CUT_HASH_LEN = 6
 
 
-def _uncharted(key: str) -> str:
+def uncharted_key(key: str) -> str:
+    """The placement key without its ``.ch-<id>`` charter suffix, if it has one."""
     head, sep, tail = key.rpartition(CHARTER_SEPARATOR)
     return head if sep and CHARTER_ID_RE.fullmatch(tail) else key
 
@@ -319,7 +320,7 @@ def _uncharted(key: str) -> str:
 def is_ours_placement(key: str) -> bool:
     """True when Flynn counts a lease with this placement name as OURS: ``flynn-*``,
     ``fleet-*``, or exactly ``dcloud`` / ``akash``. A charter suffix does not change it."""
-    base = _uncharted(key)
+    base = uncharted_key(key)
     return base.startswith(OURS_PREFIXES) or base in OURS_EXACT
 
 
@@ -349,7 +350,7 @@ def stamp_charter(sdl_text: str, charter_id: str) -> tuple[str, list[str]]:
     existing = placement_keys(sdl_text)
     targets: dict[str, str] = {}
     for key in existing:
-        base = _uncharted(key)
+        base = uncharted_key(key)
         if not base.startswith(OURS_PREFIXES) or key.endswith(suffix):
             continue
         prefix = next(p for p in OURS_PREFIXES if base.startswith(p))
