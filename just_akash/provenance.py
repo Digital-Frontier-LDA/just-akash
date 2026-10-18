@@ -51,6 +51,7 @@ reference under ``deployment.<service>.<KEY>`` carry this marker.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import textwrap
 from pathlib import Path
@@ -306,6 +307,8 @@ CHARTER_ID_RE = re.compile(r"ch-[0-9a-f]{10}")
 CHARTER_SEPARATOR = "."
 # The longest placement name verified on mainnet (see the module docstring).
 MAX_PLACEMENT_KEY_LEN = 62
+# Hex characters of the key's hash that replace the cut end of an over-long key.
+_CUT_HASH_LEN = 6
 
 
 def _uncharted(key: str) -> str:
@@ -326,24 +329,45 @@ def stamp_charter(sdl_text: str, charter_id: str) -> tuple[str, list[str]]:
     block scalars and trailing comments are untouched.
 
     ⛔ THE PREFIX IS WHAT FLYNN ATTRIBUTES ON, so it is never cut. A key that would pass
-    62 characters loses the END of its workload part instead.
+    62 characters loses the END of its workload part instead, and that end is replaced by
+    a short hash of the whole key: two keys sharing their first 48 characters must not
+    collapse into ONE placement group (a duplicate YAML key — one group silently dropped
+    while the lease is still funded). Any collision that remains raises, before the spend.
 
     ⛔ ``dcloud`` and ``akash`` ARE NOT STAMPED. Flynn matches them as EXACT names, so
     ``dcloud.ch-…`` would read as UNATTRIBUTED — the opposite of what a charter is for.
     Their charter reaches Flynn through the bind alone.
+
+    A key already carrying a DIFFERENT charter id (an SDL reused from an earlier chartered
+    deploy) is re-stamped with this one: the placement name must point at the charter that
+    pays for THIS lease. The same id is left alone, so stamping twice is a no-op.
     """
     if not CHARTER_ID_RE.fullmatch(charter_id or ""):
         raise ValueError(f"not a charter id: {charter_id!r}")
     suffix = f"{CHARTER_SEPARATOR}{charter_id}"
+    room = MAX_PLACEMENT_KEY_LEN - len(suffix)
+    existing = placement_keys(sdl_text)
     targets: dict[str, str] = {}
-    for key in placement_keys(sdl_text):
-        if not key.startswith(OURS_PREFIXES) or _uncharted(key) != key:
+    for key in existing:
+        base = _uncharted(key)
+        if not base.startswith(OURS_PREFIXES) or key.endswith(suffix):
             continue
-        prefix = next(p for p in OURS_PREFIXES if key.startswith(p))
-        room = MAX_PLACEMENT_KEY_LEN - len(suffix)
-        targets[key] = key[: max(room, len(prefix))] + suffix
+        prefix = next(p for p in OURS_PREFIXES if base.startswith(p))
+        if len(base) > room:
+            digest = hashlib.sha256(base.encode()).hexdigest()[:_CUT_HASH_LEN]
+            base = f"{base[: max(room - _CUT_HASH_LEN - 1, len(prefix))]}-{digest}"
+        targets[key] = base + suffix
     if not targets:
         return sdl_text, []
+    new_keys = list(targets.values())
+    untouched = set(existing) - set(targets)
+    clashes = sorted({k for k in new_keys if new_keys.count(k) > 1} | (set(new_keys) & untouched))
+    if clashes:
+        raise ValueError(
+            f"charter stamping would merge placement groups into {', '.join(clashes)}; "
+            "rename the placement keys so they differ within their first "
+            f"{room - _CUT_HASH_LEN - 1} characters"
+        )
 
     return _rewrite_keys(sdl_text, targets), list(targets.values())
 

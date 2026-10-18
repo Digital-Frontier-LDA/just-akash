@@ -654,3 +654,60 @@ def test_a_malformed_charter_id_is_refused():
 
     with pytest.raises(ValueError):
         stamp_charter(_sdl("flynn-x"), "ch-NOTHEX")
+
+
+def _sdl2(a: str, b: str) -> str:
+    return (
+        "services:\n"
+        "  web:\n"
+        "    image: nginx\n"
+        "  api:\n"
+        "    image: nginx\n"
+        "profiles:\n"
+        "  placement:\n"
+        f"    {a}:\n"
+        "      pricing: {}\n"
+        f"    {b}:\n"
+        "      pricing: {}\n"
+        "deployment:\n"
+        "  web:\n"
+        f"    {a}:\n"
+        "      profile: web\n"
+        "  api:\n"
+        f"    {b}:\n"
+        "      profile: api\n"
+    )
+
+
+def test_two_long_keys_sharing_a_prefix_stay_two_placement_groups():
+    """Review F1: cutting both to their first 48 characters made them ONE key (a duplicate
+    YAML key: one placement group dropped while the lease is still funded)."""
+    from just_akash.provenance import stamp_charter
+
+    a = "fleet-serve-qwen3-coder-480b-a35b-instruct-fp8-variant-a"
+    b = "fleet-serve-qwen3-coder-480b-a35b-instruct-fp8-variant-b"
+    out, keys = stamp_charter(_sdl2(a, b), CHARTER)
+    assert len(set(keys)) == 2
+    assert all(len(k) == 62 and k.startswith("fleet-") for k in keys)
+    assert sorted(placement_keys(out)) == sorted(keys)
+    assert out.count(keys[0] + ":") == 2 and out.count(keys[1] + ":") == 2
+
+
+def test_a_stamp_that_would_hit_an_existing_key_is_refused():
+    """flynn-x would become flynn-x.ch-0123456789, which the SDL already declares as a
+    SEPARATE group: refused, never merged."""
+    from just_akash.provenance import stamp_charter
+
+    with pytest.raises(ValueError, match="merge placement groups"):
+        stamp_charter(_sdl2("flynn-x", "flynn-x.ch-0123456789"), CHARTER)
+
+
+def test_a_key_stamped_by_an_earlier_charter_is_restamped():
+    """Review (fallback, decabfe): an SDL reused from an earlier chartered deploy must not
+    go on chain naming the OLD charter while the new one is posted and bound."""
+    from just_akash.provenance import stamp_charter
+
+    out, keys = stamp_charter(_sdl("fleet-serve-qwen.ch-aaaaaaaaaa"), CHARTER)
+    assert keys == ["fleet-serve-qwen.ch-0123456789"]
+    assert placement_keys(out) == keys
+    assert out.count("fleet-serve-qwen.ch-0123456789:") == 2

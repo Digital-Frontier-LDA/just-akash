@@ -184,10 +184,44 @@ class TestCharterDocument:
 class TestWalletLabel:
     """Flynn binds by wallet LABEL (console-2), and just-akash only knows addresses."""
 
-    def test_the_charter_field_wins(self, monkeypatch):
+    def test_the_charter_field_is_used_with_one_key(self, monkeypatch):
+        monkeypatch.delenv("JUST_AKASH_WALLET_LABELS", raising=False)
+        c = charter_mod.Charter.from_dict(harness.charter_doc(wallet_label="console-2"))
+        assert charter_mod.wallet_label_for(c, None) == "console-2"
+
+    def test_the_charter_field_confirmed_by_the_map_is_used(self, monkeypatch):
+        monkeypatch.setenv("JUST_AKASH_WALLET_LABELS", "akash1abc=console-2, akash1def=console-3")
+        c = charter_mod.Charter.from_dict(harness.charter_doc(wallet_label="console-2"))
+        assert charter_mod.wallet_label_for(c, "akash1abc", configured_keys=2) == "console-2"
+
+    def test_a_charter_label_naming_another_wallet_is_refused(self, monkeypatch):
+        """Review (fallback, decabfe): the pool picked console-9's wallet; binding the lease
+        as console-2 would attach it to the wrong wallet or 4xx and leave it uncharted."""
         monkeypatch.setenv("JUST_AKASH_WALLET_LABELS", "akash1abc=console-9")
         c = charter_mod.Charter.from_dict(harness.charter_doc(wallet_label="console-2"))
-        assert charter_mod.wallet_label_for(c, "akash1abc") == "console-2"
+        with pytest.raises(RuntimeError, match="not the selected wallet"):
+            charter_mod.wallet_label_for(c, "akash1abc")
+
+    def test_a_charter_label_that_cannot_be_confirmed_with_several_keys_is_refused(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("JUST_AKASH_WALLET_LABELS", raising=False)
+        c = charter_mod.Charter.from_dict(harness.charter_doc(wallet_label="console-2"))
+        with pytest.raises(RuntimeError, match="cannot be confirmed"):
+            charter_mod.wallet_label_for(c, "akash1abc", configured_keys=3)
+
+    def test_deploy_resolves_the_label_of_the_selected_wallet(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from just_akash import deploy as deploy_mod
+
+        monkeypatch.setenv("JUST_AKASH_WALLET_LABELS", "akash1one=console-1,akash1two=console-2")
+        c = charter_mod.Charter.from_dict(harness.charter_doc(wallet_label=None))
+        picked = SimpleNamespace(account="akash1two", configured_keys=2)
+        assert deploy_mod._charter_wallet_label(c, picked, client=None) == "console-2"
+        static = charter_mod.Charter.from_dict(harness.charter_doc(wallet_label="console-1"))
+        with pytest.raises(RuntimeError, match="not the selected wallet"):
+            deploy_mod._charter_wallet_label(static, picked, client=None)
 
     def test_the_address_map_is_the_fallback(self, monkeypatch):
         monkeypatch.setenv("JUST_AKASH_WALLET_LABELS", "akash1abc=console-9, akash1def=console-3")

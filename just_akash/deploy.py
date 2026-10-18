@@ -1038,10 +1038,15 @@ def _sdl_placement_keys(sdl_path: str, gpu: bool) -> list[str]:
 
 
 def _charter_wallet_label(charter: Charter, wallet, client) -> str:
-    if charter.wallet_label:
-        return charter.wallet_label
-    address = wallet.account or client.account_address()
-    return charter_mod.wallet_label_for(charter, address)
+    """The bind label of the wallet the pool SELECTED — checked against it, not assumed."""
+    address = wallet.account
+    # The address is only needed to read the label map; one key and a charter label needs
+    # no Console round-trip.
+    if not address and (not charter.wallet_label or os.environ.get(charter_mod.WALLET_LABELS_ENV)):
+        address = client.account_address()
+    return charter_mod.wallet_label_for(
+        charter, address, configured_keys=getattr(wallet, "configured_keys", 1) or 1
+    )
 
 
 def _post_charter(charter: Charter) -> tuple[charter_mod.FlynnCharterClient, str]:
@@ -1065,7 +1070,7 @@ def _fund_charter_lease(
     client, charter: Charter, dseq: str, price_amount, price_denom: str
 ) -> float:
     """Top the minimum-deposit order up to the charter's lifetime, then switch auto top-up
-    OFF (unless prod_pinned) — read back by set_auto_top_up. Returns the total deposit.
+    OFF (ON when prod_pinned) — read back by set_auto_top_up. Returns the total deposit.
 
     ⛔ ANY FAILURE CLOSES THE LEASE. Underfunded, it dies early and reads as a provider
     fault; with auto top-up still on, it never expires — the uncapped lease a charter
@@ -1084,9 +1089,15 @@ def _fund_charter_lease(
         if top_up > 0:
             client.deposit_deployment(dseq, top_up)
             _log(logging.INFO, f"CHARTER deposit +{top_up:g} USD (total {minimum + top_up:g})")
-        if not charter.prod_pinned:
-            client.set_auto_top_up(dseq, False)
-            _log(logging.INFO, "CHARTER auto top-up OFF (verified by read-back)")
+        # Written in BOTH cases: a new deployment has no settings at all (the Console
+        # 404s them, which reads as OFF), so a prod-pinned lease left alone would run out
+        # at max_hours exactly like a job lease.
+        client.set_auto_top_up(dseq, charter.prod_pinned)
+        _log(
+            logging.INFO,
+            f"CHARTER auto top-up {'ON (prod_pinned)' if charter.prod_pinned else 'OFF'} "
+            "(verified by read-back)",
+        )
     except Exception as e:
         _log(
             logging.ERROR,
@@ -1225,6 +1236,11 @@ def deploy(
     # A chartered order is created at the Console minimum and topped up once the winning
     # bid's price is known; the wallet is still chosen, and probed, for the whole budget
     # the charter may spend. Without a charter all three are --deposit, as before.
+    if charter is not None and deposit != 5.0:
+        _log(
+            logging.WARNING,
+            f"--deposit {deposit:g} is ignored: the charter sizes the escrow from max_hours",
+        )
     create_deposit = charter_mod.MIN_DEPOSIT if charter is not None else deposit
     budget = charter.max_act if charter is not None else deposit
 
@@ -1275,8 +1291,12 @@ def deploy(
         # The label is resolved BEFORE the charter is written: a lease that cannot be bound
         # is an uncharted lease, and finding that out after the spend is too late.
         charter_wallet_label = _charter_wallet_label(charter, wallet, client)
+        # Stamping can only fail on the KEYS (a merge of two placement groups), never on
+        # the id, so a dry run with a placeholder id refuses before anything is written.
+        stamp_charter(sdl_content, "ch-" + "0" * 10)
         flynn, charter_id = _post_charter(charter)
         sdl_content, _stamped = stamp_charter(sdl_content, charter_id)
+        validate_sdl(sdl_content)
         protect_content(sdl_content)
         _log(
             logging.INFO,
@@ -2421,28 +2441,6 @@ def deploy(
             _extract_gseq(fresh) or 1,
         )
 
-    if charter is not None and price_denom != "uact":
-        # Refused BEFORE the lease: the deposit formula is uact/block, and a guessed
-        # conversion is how a budget silently ends up a factor of 10^6 wrong.
-        _log(logging.ERROR, f"Bid priced in {price_denom}, not uact — cannot size the charter")
-        try:
-            client.close_deployment(str(dseq))
-        except Exception as cleanup_err:
-            _log(
-                logging.ERROR,
-                f"Cleanup of {display(dseq, 'dseq')} failed: {error_text(cleanup_err)}",
-            )
-        emit(
-            Code.CHARTER_DEPOSIT_FAILED,
-            "error",
-            f"selected bid is priced in {price_denom}, not uact; deployment closed before lease",
-            dseq=str(dseq),
-        )
-        raise RuntimeError(
-            f"selected bid is priced in {price_denom!r}, not uact: a chartered deposit cannot "
-            "be sized from it; deployment closed before the lease"
-        )
-
     _log(logging.INFO, "STEP 6: Creating lease...")
     max_lease_attempts = 3
     failed_providers: set[str] = set()
@@ -2461,6 +2459,29 @@ def deploy(
     attempt = 0
     while True:
         attempt += 1
+        if charter is not None and price_denom != "uact":
+            # Refused BEFORE the lease: the deposit formula is uact/block, and a guessed
+            # conversion is how a budget silently ends up a factor of 10^6 wrong. Checked on
+            # EVERY attempt: a stale-bid retry or the issue-#19 re-deploy can switch bids.
+            _log(logging.ERROR, f"Bid priced in {price_denom}, not uact — cannot size the charter")
+            try:
+                client.close_deployment(str(dseq))
+            except Exception as cleanup_err:
+                _log(
+                    logging.ERROR,
+                    f"Cleanup of {display(dseq, 'dseq')} failed: {error_text(cleanup_err)}",
+                )
+            emit(
+                Code.CHARTER_DEPOSIT_FAILED,
+                "error",
+                f"selected bid is priced in {price_denom}, not uact; "
+                "deployment closed before lease",
+                dseq=str(dseq),
+            )
+            raise RuntimeError(
+                f"selected bid is priced in {price_denom!r}, not uact: a chartered deposit cannot "
+                "be sized from it; deployment closed before the lease"
+            )
         try:
             lease_response = client.create_lease(
                 dseq=str(dseq),

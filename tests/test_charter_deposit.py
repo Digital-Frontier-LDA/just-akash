@@ -104,10 +104,15 @@ def test_auto_top_up_is_switched_off_and_read_back(h):
     assert "get_deployment_settings" in names[last_write:], "the switch must be read back"
 
 
-def test_a_prod_pinned_charter_leaves_auto_top_up_alone(h):
+def test_a_prod_pinned_charter_switches_auto_top_up_on_and_reads_it_back(h):
+    """Review (fallback, decabfe): a NEW deployment has no settings (the Console 404s them,
+    which reads as off), so leaving a prod-pinned lease alone let it expire at max_hours
+    like a job lease. It is switched ON explicitly, and the read-back confirms it."""
     h.set_bid_price(1000)
+    assert h.app.settings == {}, "a fresh deployment starts with no settings"
     _deploy(h, prod_pinned=True, **CAPACITY)
-    assert "set_auto_top_up" not in h.names()
+    assert ("set_auto_top_up", "1000", True) in h.events
+    assert h.app.settings["1000"]["autoTopUpEnabled"] is True
 
 
 def test_a_top_up_switch_that_does_not_take_closes_the_lease(h, capsys):
@@ -129,4 +134,31 @@ def test_a_bid_not_priced_in_uact_is_refused_before_the_lease(h):
     with pytest.raises(RuntimeError, match="uact"):
         _deploy(h)
     assert "create_lease" not in h.names()
+    assert h.app.closed == ["1000"]
+
+
+def test_a_retry_bid_not_priced_in_uact_is_refused_before_its_lease(h):
+    """Review F2: the stale-bid retry can switch to another bid. Its denom is checked
+    before THAT lease too, so the deploy refuses instead of leasing and then closing."""
+    h.set_bid_price(1000)
+    other = {
+        "bid": {"id": {"provider": "akash1otherprovider"}},
+        "id": {"provider": "akash1otherprovider"},
+        "price": {"amount": 5000, "denom": "ibc/170C677610AC31DF"},
+        "state": "open",
+    }
+    # The other bid arrives only after the first lease attempt: bids in two denoms on one
+    # order cannot be ranked at selection, but a re-fetch after a stale bid can return one.
+    first_lease = h.app.create_lease
+
+    def lease_then_rebid(body):
+        h.app.bids[:] = [other]
+        return first_lease(body)
+
+    h.app.create_lease = lease_then_rebid
+    h.app.lease_errors = [(400, "bid no longer open")]
+    with pytest.raises(RuntimeError, match="uact"):
+        _deploy(h)
+    assert "create_lease" not in h.names()
+    assert h.names().count("create_lease_failed") == 1
     assert h.app.closed == ["1000"]

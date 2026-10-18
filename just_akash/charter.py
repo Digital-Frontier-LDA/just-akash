@@ -264,24 +264,42 @@ def deposit_for(max_hours: float, price_uact_per_block: float, max_act: float) -
     return max(MIN_DEPOSIT, min(raw, float(max_act)))
 
 
-def wallet_label_for(charter: Charter, address: str | None) -> str:
-    """The wallet LABEL Flynn binds by (``console-2``). just-akash only knows addresses, so:
-    the charter's own ``wallet_label``, else ``JUST_AKASH_WALLET_LABELS="akash1…=label,…"``.
-    Resolved before the spend: a lease that cannot be bound is an uncharted lease."""
-    if charter.wallet_label:
-        return charter.wallet_label
+def wallet_label_for(charter: Charter, address: str | None, configured_keys: int = 1) -> str:
+    """The wallet LABEL Flynn binds by (``console-2``) for the wallet the pool SELECTED.
+    just-akash only knows addresses, so the label comes from the charter's own
+    ``wallet_label`` or ``JUST_AKASH_WALLET_LABELS="akash1…=label,…"`` — and must describe
+    the wallet that actually pays. Resolved before the spend: a lease bound to the wrong
+    wallet (or not at all) is an uncharted lease.
+
+    ⛔ WITH SEVERAL KEYS THE CHARTER'S LABEL IS ONLY A CLAIM. The pool picks the wallet, so
+    a static ``wallet_label`` names the right one only by luck. It is accepted when the
+    address map confirms it for the selected address, or when there is just one key; a
+    contradiction, or several keys with nothing to confirm it, refuses."""
     mapping: dict[str, str] = {}
     for piece in re.split(r"[\n,;]", os.environ.get(WALLET_LABELS_ENV, "")):
         addr, sep, label = piece.strip().partition("=")
         if sep and addr.strip() and label.strip():
             mapping[addr.strip()] = label.strip()
-    label = mapping.get(address or "")
-    if not label or not _WALLET_LABEL_RE.fullmatch(label):
+    mapped = mapping.get(address or "")
+    if charter.wallet_label:
+        if mapped and mapped != charter.wallet_label:
+            raise RuntimeError(
+                f"the charter's wallet_label {charter.wallet_label!r} is not the selected "
+                f"wallet, which {WALLET_LABELS_ENV} labels {mapped!r}"
+            )
+        if not mapped and configured_keys > 1:
+            raise RuntimeError(
+                f"the charter's wallet_label {charter.wallet_label!r} cannot be confirmed for "
+                f"the selected wallet: {configured_keys} keys are configured, so map their "
+                f"addresses in {WALLET_LABELS_ENV}"
+            )
+        return charter.wallet_label
+    if not mapped or not _WALLET_LABEL_RE.fullmatch(mapped):
         raise RuntimeError(
             "no wallet label for the charter bind: set wallet_label in the charter or map "
             f"this wallet's address in {WALLET_LABELS_ENV}"
         )
-    return label
+    return mapped
 
 
 class FlynnCharterClient:
