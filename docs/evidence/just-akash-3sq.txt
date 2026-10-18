@@ -88,3 +88,25 @@ in the failures confirm the base tree was imported):
 Same tests on the fix: all pass. Related subset (update_flow, extra_coverage, cli_extensions, charter_gate/deposit/
 flynn_order, provenance, cli, close-site census, runner_pool_dseq_recovery): see bead note.
 Close-site census manifest: _fund_charter_lease(1) + one deploy() site merged into _close_charter_deployment(1); deploy 8 -> 7.
+
+== RESOLVER run fc3cada2 (fallback review of 0759ccb: 3 findings) ==
+New tests, run against 0759ccb6 code (just_akash/ reverted to HEAD, new tests kept):
+  17 failed, 80 passed (tests/test_charter_gate.py + tests/test_update_flow.py)
+  FAILED tests/test_charter_gate.py::test_the_scanner_misses_these_layouts_and_yaml_does_not[commented] - AssertionError: assert [] == (['flynn-x'], ['flynn-x'])
+  FAILED tests/test_charter_gate.py::test_the_scanner_misses_these_layouts_and_yaml_does_not[four-space] - AssertionError: assert [] == (['flynn-x'], ['flynn-x'])
+  FAILED tests/test_charter_gate.py::test_the_scanner_misses_these_layouts_and_yaml_does_not[quoted] - AssertionError: assert [] == (['flynn-x'], ['flynn-x'])
+  FAILED tests/test_charter_gate.py::test_enforce_refuses_ours_in_any_valid_layout[commented] - tests.test_charter_gate._StopAtCreate
+  FAILED tests/test_charter_gate.py::test_enforce_refuses_ours_in_any_valid_layout[four-space] - tests.test_charter_gate._StopAtCreate
+  FAILED tests/test_charter_gate.py::test_enforce_refuses_ours_in_any_valid_layout[quoted] - tests.test_charter_gate._StopAtCreate
+  FAILED tests/test_charter_gate.py::test_warn_reports_ours_in_any_valid_layout[commented] - AssertionError: assert 'CHARTER_MISSING' in ''
+  FAILED tests/test_charter_gate.py::test_warn_reports_ours_in_any_valid_layout[four-space] - AssertionError: assert 'CHARTER_MISSING' in ''
+  FAILED tests/test_charter_gate.py::test_warn_reports_ours_in_any_valid_layout[quoted] - AssertionError: assert 'CHARTER_MISSING' in ''
+  FAILED tests/test_charter_gate.py::test_a_charter_that_could_not_be_stamped_refuses_before_any_spend[commented] - AssertionError: Regex pattern did not match.
+  FAILED tests/test_charter_gate.py::test_a_charter_that_could_not_be_stamped_refuses_before_any_spend[four-space] - AssertionError: Regex pattern did not match.
+  FAILED tests/test_charter_gate.py::test_a_charter_that_could_not_be_stamped_refuses_before_any_spend[quoted] - AssertionError: Regex pattern did not match.
+  FAILED tests/test_charter_gate.py::test_an_ambient_charter_is_ignored_for_other_callers[dfci-infra-r] - RuntimeError: a lease charter was given, but placement ['dfci-infr
+  FAILED tests/test_charter_gate.py::test_an_ambient_charter_is_ignored_for_other_callers[just-akash-runner] - RuntimeError: a lease charter was given, but placement ['just
+  FAILED tests/test_charter_gate.py::test_only_the_env_charter_is_ambient_and_flynn_never_sees_the_flag - AttributeError: 'Charter' object has no attribute 'ambient'
+  FAILED tests/test_charter_gate.py::test_a_placement_group_clash_is_a_runtime_error_with_a_diagnostic - ValueError: charter stamping would merge placement groups into flyn
+  FAILED tests/test_update_flow.py::TestUpdateKeepsTheCharterStamp::test_a_malformed_charter_id_is_a_runtime_error_before_the_put - ValueError: not a charter id: 'ch-NOTHEX
+Same tests on the fix: 97 passed.

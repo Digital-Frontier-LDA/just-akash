@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypedDict, cast
 
+import yaml
 from akash_lease_core import Auction, AuctionPolicy, AuctionStatus, BidObservation
 from akash_lease_core.auction import PreferredSelection
 from akash_lease_core.capacity import ProviderCapacity, ResourceProfile
@@ -1027,18 +1028,54 @@ def _check_wallet_credit(client: AkashConsoleAPI, deposit: float) -> None:
         )
 
 
-def _sdl_placement_keys(sdl_path: str, gpu: bool) -> list[str]:
-    """The placement keys of the SDL deploy() will read, for the charter gate. An unreadable
-    file yields none: Step 1 raises on it anyway, and still before anything is spent."""
+def _yaml_placement_keys(text: str) -> list[str]:
+    """``profiles.placement`` keys as YAML reads them; [] when the text does not parse (a
+    templated SDL) or has no such mapping."""
+    try:
+        doc = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return []
+    profiles = doc.get("profiles") if isinstance(doc, dict) else None
+    placement = profiles.get("placement") if isinstance(profiles, dict) else None
+    return [str(k) for k in placement] if isinstance(placement, dict) else []
+
+
+def _sdl_placement_keys(sdl_path: str, gpu: bool) -> tuple[list[str], list[str]]:
+    """(placement keys, the ones of ours only YAML sees) of the SDL deploy() will read, for
+    the charter gate. An unreadable file yields none: Step 1 raises on it anyway, and still
+    before anything is spent.
+
+    ⛔ THE LINE SCANNER IS NOT THE ONLY READER. ``placement_keys`` (which stamp_charter
+    rewrites by) reads only the canonical layout: ``  placement:`` at 2 spaces with nothing
+    after it, unquoted keys at 4. A valid SDL with a 4-space indent, a trailing comment or a
+    quoted key yields nothing there, and the gate would let a placement of ours out with no
+    charter and no CHARTER_MISSING. So YAML is asked too, and every key of ours it alone
+    sees is returned in the second list: gated like any other, and refused when a charter
+    would have to stamp it."""
     p = Path(sdl_path)
     if gpu:
         variant = p.with_name(f"{p.stem}-gpu{p.suffix}")
         if variant.exists():
             p = variant
     try:
-        return placement_keys(p.read_text(encoding="utf-8"))
+        text = p.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
-        return []
+        return [], []
+    keys = placement_keys(text)
+    unscanned = [
+        k for k in _yaml_placement_keys(text) if k not in keys and charter_mod.is_ours_placement(k)
+    ]
+    return keys + unscanned, unscanned
+
+
+def _stamp_charter_or_refuse(sdl_content: str, charter_id: str) -> tuple[str, list[str]]:
+    """stamp_charter, with its ValueError (a placement-group clash, a malformed charter id)
+    turned into the RuntimeError every entry point reports, and a typed SDL_ERROR."""
+    try:
+        return stamp_charter(sdl_content, charter_id)
+    except ValueError as e:
+        emit(Code.SDL_ERROR, "error", error_text(e))
+        raise RuntimeError(error_text(e)) from e
 
 
 def _charter_wallet_label(charter: Charter, wallet, client) -> str:
@@ -1222,13 +1259,32 @@ def deploy(
     # enforce, an uncharted placement of ours must cost nothing. Read from the file as
     # given; Step 1's transforms only ever stamp just-akash- keys, which are not ours.
     _charter_mode = charter_mod.mode()
-    _charter_keys = _sdl_placement_keys(sdl_path, gpu)
-    if charter is not None and not any(charter_mod.is_ours_placement(k) for k in _charter_keys):
+    _charter_keys, _unscanned = _sdl_placement_keys(sdl_path, gpu)
+    _ours = any(charter_mod.is_ours_placement(k) for k in _charter_keys)
+    if charter is not None and charter.ambient and not _ours:
+        # JUST_AKASH_CHARTER_JSON is a job-wide default: a dfci-*/just-akash-* deploy in the
+        # same job is not refused for it, it simply has no charter (AC1: unchanged).
+        _log(
+            logging.INFO,
+            f"{charter_mod.CHARTER_JSON_ENV} ignored: placement "
+            f"{_charter_keys or '(none)'} is not ours",
+        )
+        charter = None
+    if charter is not None and not _ours:
         raise RuntimeError(
             f"a lease charter was given, but placement {_charter_keys or '(none)'} is not one "
             "Flynn attributes to us (flynn-*, fleet-*, dcloud, akash); the charter could never "
             "be matched to the lease"
         )
+    _unstampable = [k for k in _unscanned if uncharted_key(k).startswith(OURS_PREFIXES)]
+    if charter is not None and _unstampable:
+        msg = (
+            f"placement {', '.join(_unstampable)} is in an SDL layout the charter stamp cannot "
+            "rewrite (it needs `  placement:` at 2 spaces with no trailing comment, and "
+            "unquoted keys at 4); the lease could not carry its charter id. Reformat the SDL"
+        )
+        emit(Code.SDL_ERROR, "error", msg, placements=_unstampable)
+        raise RuntimeError(msg)
     try:
         _uncharted = charter_mod.gate(_charter_keys, charter, _charter_mode)
     except charter_mod.CharterMissing as e:
@@ -1307,9 +1363,9 @@ def deploy(
         charter_wallet_label = _charter_wallet_label(charter, wallet, client)
         # Stamping can only fail on the KEYS (a merge of two placement groups), never on
         # the id, so a dry run with a placeholder id refuses before anything is written.
-        stamp_charter(sdl_content, "ch-" + "0" * 10)
+        _stamp_charter_or_refuse(sdl_content, "ch-" + "0" * 10)
         flynn, charter_id = _post_charter(charter)
-        sdl_content, _stamped = stamp_charter(sdl_content, charter_id)
+        sdl_content, _stamped = _stamp_charter_or_refuse(sdl_content, charter_id)
         validate_sdl(sdl_content)
         protect_content(sdl_content)
         _log(
@@ -2715,7 +2771,7 @@ def _restamp_charter_for_update(
         if not ids:
             return sdl_content  # an uncharted lease: its group names are the SDL's own
         charter_id = ids.pop()
-    sdl_content, stamped = stamp_charter(sdl_content, charter_id)
+    sdl_content, stamped = _stamp_charter_or_refuse(sdl_content, charter_id)
     validate_sdl(sdl_content)
     if stamped:
         _log(logging.INFO, f"CHARTER {charter_id} re-stamped: {', '.join(stamped)}")

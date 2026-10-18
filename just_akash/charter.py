@@ -32,7 +32,7 @@ import re
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -126,8 +126,12 @@ class Charter:
     wallet_label: str | None = None
     endpoint_url: str | None = None
     telemetry_url: str | None = None
+    # Set by load_charter when the charter came from JUST_AKASH_CHARTER_JSON rather than
+    # --charter: an AMBIENT charter is a job-wide default, so deploy() ignores it for a
+    # placement that is not ours instead of refusing (dfci-*/just-akash-* stay unchanged).
+    ambient: bool = False
 
-    _LOCAL = ("wallet_label", "endpoint_url", "telemetry_url")
+    _LOCAL = ("wallet_label", "endpoint_url", "telemetry_url", "ambient")
 
     @classmethod
     def from_dict(cls, doc: Any) -> Charter:
@@ -217,7 +221,8 @@ class Charter:
 
 def load_charter(path: str | None) -> Charter | None:
     """The charter from ``--charter FILE`` or, failing that, ``JUST_AKASH_CHARTER_JSON``.
-    None when neither is given; CharterInvalid when one is given and wrong."""
+    None when neither is given; CharterInvalid when one is given and wrong. One read from
+    the environment is marked ``ambient``."""
     if path:
         try:
             raw = Path(path).read_text(encoding="utf-8")
@@ -231,7 +236,8 @@ def load_charter(path: str | None) -> Charter | None:
         doc = json.loads(raw)
     except json.JSONDecodeError as e:
         raise CharterInvalid([f"charter is not valid JSON: {e}"]) from e
-    return Charter.from_dict(doc)
+    charter = Charter.from_dict(doc)
+    return charter if path else replace(charter, ambient=True)
 
 
 def mode() -> str:

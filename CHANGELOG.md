@@ -32,6 +32,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   dseq for teardown. `update` re-stamps the charter id (`--charter-id`, else read back from
   the deployment's group names) so the PUT names the same placement group as the chain.
   `python -m just_akash.deploy` takes `--charter` / `JUST_AKASH_CHARTER_JSON` too.
+  The gate also reads placement keys with YAML, so a 4-space, commented or quoted
+  `placement:` block of ours is gated too, and refused (`SDL_ERROR`) when a charter would
+  have to stamp it. A charter from `JUST_AKASH_CHARTER_JSON` is ignored for a placement
+  that is not ours; a stamping refusal is an error message, not a traceback.
 - `lease-intent-backfill.yml` (Flynn openmix-h2l7): the dispatch-only caller of
   `lease_intent backfill`, for canaries that were already running when intents landed
   (provider-canary.yml registers one only at deploy). Inputs reach the shell through env and

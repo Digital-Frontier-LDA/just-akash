@@ -216,6 +216,19 @@ class TestUpdateKeepsTheCharterStamp:
         client.update_deployment.assert_not_called()
 
     @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_a_malformed_charter_id_is_a_runtime_error_before_the_put(
+        self, MockAPI, tmp_path, monkeypatch
+    ):
+        """Review (fallback, 0759ccb): stamp_charter's ValueError escaped cli.py, which
+        catches RuntimeError only, as a traceback."""
+        monkeypatch.setenv("AKASH_API_KEY", "k")
+        client = MockAPI.return_value
+        with pytest.raises(RuntimeError, match="not a charter id") as exc:
+            update(dseq="123", sdl_path=self._sdl(tmp_path), charter_id="ch-NOTHEX")
+        assert not isinstance(exc.value, ValueError)
+        client.update_deployment.assert_not_called()
+
+    @patch("just_akash.deploy.AkashConsoleAPI")
     def test_a_placement_not_ours_is_never_read(self, MockAPI, tmp_path, monkeypatch):
         monkeypatch.setenv("AKASH_API_KEY", "k")
         client = MockAPI.return_value

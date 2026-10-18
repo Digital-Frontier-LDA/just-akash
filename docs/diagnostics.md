@@ -62,7 +62,7 @@ Silent in an interactive terminal (humans keep the existing `_log`/`Error:` pros
 | `NO_DSEQ_RETURNED` | Create succeeded but no DSEQ in response. |
 | `LEASE_CREATE_FAILED` | Lease creation failed (incl. 404 "no lease for deployment"). |
 | `REDEPLOY_FAILED` | The issue-#19 re-deploy round exhausted. |
-| `SDL_ERROR` | SDL validation/missing/placeholder (reserved). |
+| `SDL_ERROR` | SDL validation/missing/placeholder. Emitted when a charter cannot be stamped into the placement keys (a group clash, a malformed charter id, or a placement of ours in a layout the stamp cannot rewrite); nothing is created. |
 | `CONFIG_ERROR` | Missing API key / bad deposit / bad `--env` (reserved). |
 
 ### Lease charters (openmix-pvr6.1 — placements Flynn counts as ours: `flynn-*`, `fleet-*`, `dcloud`, `akash`)
