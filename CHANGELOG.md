@@ -55,15 +55,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
-- The provider smoke probe and the bid probe declare a just-akash placement key instead of
-  the SDL default `akash` (Flynn openmix-nnqg): `just-akash-smoke` (run-scoped on chain to
-  `just-akash-smoke.<run id>` by `deploy`) and `just-akash-bidprobe`. Flynn maps `akash`
-  exactly to its R&D fleet, so every daily probe read as a Flynn fleet lease, and
-  `is_ours_placement` put it in Flynn's charter scope. Placement name only: resources, pricing,
-  providers and attributes are unchanged. The smoke's orphan sweep now reads the orphan's group
-  from chain and passes that exact name to the destroy; it still accepts the legacy `akash` so a
-  probe leaked before this change is reaped, and it leaves (and flags) a `{probe}` service whose
-  group is unreadable or one the probe never creates.
+- The provider smoke probe and the bid probe declare `just-akash-probe` as their placement key
+  instead of the SDL default `akash` (Flynn openmix-nnqg). It is the name cleanup_identity
+  already treats as a disposable probe; `deploy` run-scopes the smoke's to
+  `just-akash-probe.<run id>` on chain, and the bid probe (created through the Console client)
+  keeps it as written. Flynn maps `akash` exactly to its R&D fleet, so every daily probe read as
+  a Flynn fleet lease, and `is_ours_placement` put it in Flynn's charter scope. Placement name
+  only: resources, pricing, providers and attributes are unchanged. The probe SDL's deployment
+  reference is block form so `stamp_run` rewrites it with the placement. The in-place update
+  pre-stamps the run id already on chain, so `update` names the deployment's own group. The
+  orphan sweep reads the orphan's group from chain (inside its per-deployment error handler)
+  and passes that exact name to the destroy. Below the 1h floor (`--min-age 0`) it reaps only a
+  probe this job stamped, read from the job's own deployment receipts. The legacy `akash` is
+  still reaped, but only past 1h. A `{probe}` service under an unreadable group, or one the
+  probe never creates, is left and flagged.
 
 ## [1.49.0] — 2026-10-18
 

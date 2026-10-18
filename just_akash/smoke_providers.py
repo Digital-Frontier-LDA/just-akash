@@ -85,7 +85,7 @@ from .paid_create import (
     reconcile_receipt,
     verified_cleanup,
 )
-from .provenance import PLACEMENT_PREFIX, RUN_SEPARATOR, run_id_of
+from .provenance import PLACEMENT_PREFIX, RUN_SEPARATOR, run_id_of, stamp_run
 
 # The baseline HTTP marker the probe serves; the update check changes it and
 # re-reads it through the ingress to prove a new revision went live.
@@ -221,12 +221,14 @@ profiles:
         memory: { size: 1Gi }
         storage: [{ size: 5Gi }]
   placement:
-    just-akash-smoke:
+    just-akash-probe:
       pricing:
         probe: { denom: uact, amount: 10000 }
 deployment:
   probe:
-    just-akash-smoke: { profile: probe, count: 1 }
+    just-akash-probe:
+      profile: probe
+      count: 1
 """.replace("__SMOKE_MARKER__", INGRESS_BASELINE).replace(
     # The death-cause beacon ships DARK: BEACON_URL reaches the container only when
     # the operator sets SMOKE_BEACON_URL in the smoke's environment (a collector on
@@ -476,16 +478,25 @@ PROBE_SERVICE = "probe"
 # The probe SDL's placement key (``profiles.placement.<KEY>``), and so its on-chain
 # ``group_spec.name``. It carries just-akash's provenance prefix so Flynn's lease snapshot
 # attributes the probe to just_akash by its existing `just-akash-` rule (Flynn
-# app/background/leases.py _NAME_PREFIXES). deploy.py run-scopes every key with that
-# prefix (provenance.stamp_run), so what lands on chain is `just-akash-smoke.<run id>`;
-# the in-run destroy reads that exact name from the deploy receipt's group population.
-PROBE_GROUP = PLACEMENT_PREFIX + "smoke"
+# app/background/leases.py _NAME_PREFIXES), and it is the name cleanup_identity already
+# recognises as a disposable probe (`just-akash-probe[.<run id>]`, _legacy_name). deploy.py
+# run-scopes every key with that prefix (provenance.stamp_run), so what lands on chain is
+# `just-akash-probe.<run id>`; the in-run destroy reads that exact name from the deploy
+# receipt's group population. The deployment reference below the placement is BLOCK form
+# on purpose: stamp_run rewrites a key line, and an inline `{ profile: ... }` mapping
+# would leave the reference unstamped, an SDL whose groups disagree, which the receipt
+# (deployment_receipt.artifact_identity) refuses before any create.
+PROBE_GROUP = PLACEMENT_PREFIX + "probe"
+# Exactly the run-scoped name stamp_run writes: the key, one separator, one run id.
+_STAMPED_PROBE_GROUP_RE = re.compile(rf"{re.escape(PROBE_GROUP + RUN_SEPARATOR)}[a-f0-9]{{6,32}}")
 # The key every probe used before openmix-nnqg: the SDL default `akash`, which Flynn maps
 # EXACTLY to its R&D fleet, so each daily probe read as a Flynn fleet lease (run
 # 39107604489: 1792308348418, 1792308552194, 1792308760818). The orphan sweep still
-# accepts it so a probe leaked under the old key is reaped after this ships. Probes live
-# minutes and the sweep runs first on every daily run, so it can go once no active
-# deployment on our wallets carries it with a {probe} service.
+# accepts it so a probe leaked under the old key is reaped after this ships, but ONLY past
+# MIN_ORPHAN_AGE_SECONDS whatever --min-age says: `akash` is also Flynn's fleet SDL key, so
+# a young one is never presumed to be this run's. Probes live minutes and the sweep runs
+# first on every daily run, so it can go once no active deployment on our wallets carries
+# it with a {probe} service.
 LEGACY_PROBE_GROUP = "akash"
 
 # Don't reap a probe younger than this: a concurrent smoke run could still be
@@ -589,10 +600,51 @@ def _is_orphan_probe(
 
 def _is_probe_group(name: str) -> bool:
     """True for a group name only the smoke probe SDL creates: the legacy ``akash``, or
-    ``just-akash-smoke`` bare or run-scoped (``just-akash-smoke.<run id>``)."""
+    ``just-akash-probe`` bare or run-scoped with exactly one run id
+    (``just-akash-probe.<run id>``). ``just-akash-probe.research.abcdef`` is not one:
+    run_id_of() validates only the last component, so the whole suffix is matched here."""
     if name in (LEGACY_PROBE_GROUP, PROBE_GROUP):
         return True
-    return name.startswith(PROBE_GROUP + RUN_SEPARATOR) and bool(run_id_of(name))
+    return _STAMPED_PROBE_GROUP_RE.fullmatch(name) is not None
+
+
+def _this_run_probe_groups(owner: str) -> set[str]:
+    """The probe group names THIS job's deploys stamped, from its own deployment receipts.
+
+    Every smoke deploy writes a receipt under $RUNNER_TEMP before it creates anything
+    (paid_create.receipt_environment), and the receipt's group population is the stamped
+    SDL's, so it names exactly `just-akash-probe.<run id>` for each probe this job opened.
+    A run id is per deploy PROCESS (deploy._RUN_ID), so nothing else can name them. Empty
+    outside CI or when no receipt is readable: then no young probe is this run's.
+    """
+    runner_temp = os.environ.get("RUNNER_TEMP")
+    if not runner_temp:
+        return set()
+    try:
+        paths = list(
+            (Path(runner_temp) / "just-akash-deployment-receipts").glob("provider-smoke-*.json")
+        )
+    except OSError:
+        return set()
+    groups: set[str] = set()
+    for path in paths:
+        try:
+            receipt = decode_receipt(path.read_bytes())
+        except Exception as e:  # noqa: BLE001 - an unreadable receipt proves nothing
+            # Said, not swallowed: a probe this receipt named is then NOT this run's, so
+            # the sweep spares it below the 1h floor and the next run's sweep reaps it.
+            print(
+                f"  {YELLOW}orphan sweep: receipt {path.name} unreadable ({str(e)[:80]}); "
+                f"its probe is not treated as this run's{RESET}"
+            )
+            continue
+        if receipt.get("expected_owner") != owner:
+            continue
+        for entry in receipt.get("group_population") or []:
+            name = entry.get("name") if isinstance(entry, dict) else None
+            if isinstance(name, str) and _STAMPED_PROBE_GROUP_RE.fullmatch(name):
+                groups.add(name)
+    return groups
 
 
 def _probe_group_on_chain(owner: str, dseq: str) -> str | None:
@@ -636,6 +688,10 @@ def sweep_orphan_probes(
     except Exception as e:  # noqa: BLE001 -- sweep must never abort the run
         print(f"  {YELLOW}orphan sweep skipped: list_deployments failed: {e}{RESET}")
         return []
+    # Only read when the floor is below the 1h orphan age (the end-of-job reap).
+    this_run_groups = (
+        _this_run_probe_groups(owner) if min_age_seconds < MIN_ORPHAN_AGE_SECONDS else set()
+    )
     found: list[str] = []  # orphans identified
     swept: list[str] = []  # orphans confirmed destroyed (or, in dry-run, matched)
     uninspected: list[str] = []  # listed but detail fetch genuinely failed
@@ -656,10 +712,28 @@ def sweep_orphan_probes(
             continue
         if not _is_orphan_probe(detail, dseq, min_age_seconds=min_age_seconds, now=now):
             continue
-        found.append(dseq)
         age = _probe_age_seconds(dseq, now)
         age_note = f"{int(age // 60)}m old" if age is not None else "age unknown"
-        group = _probe_group_on_chain(owner, dseq)
+        try:
+            group = _probe_group_on_chain(owner, dseq)
+        except Exception as e:  # noqa: BLE001 -- one bad chain read must not abort the sweep
+            uninspected.append(dseq)
+            print(f"  {YELLOW}orphan sweep: could not read {dseq}'s group: {str(e)[:120]}{RESET}")
+            continue
+        # Below the 1h floor (the end-of-job reap runs --min-age 0) a probe is reaped only
+        # when THIS job stamped it. A concurrent run's or a developer's live probe carries
+        # another run id, and the legacy `akash` name proves no run at all.
+        if (
+            group is not None
+            and (age is None or age < MIN_ORPHAN_AGE_SECONDS)
+            and not (_STAMPED_PROBE_GROUP_RE.fullmatch(group) and group in this_run_groups)
+        ):
+            print(
+                f"  orphan sweep: spared {dseq} ({age_note}, group {group}): younger than "
+                f"{MIN_ORPHAN_AGE_SECONDS // 60}m and not stamped by this run"
+            )
+            continue
+        found.append(dseq)
         if group is None:
             # A {probe} service under a group the probe SDL never creates, or one we could
             # not read: not provably ours, so it is left, and counted as found-not-swept so
@@ -1950,7 +2024,34 @@ def _record_ingress_timeout(
     )
 
 
-def _check_update(dseq: str, sdl_path: str, uri: str, diag: dict | None = None) -> bool:
+def _update_sdl_for(sdl_path: str, groups: object) -> tuple[str, str | None]:
+    """The SDL to PUT for an in-place update, and a temp path to remove afterwards.
+
+    `just-akash update` prepares the SDL like a deploy, so it would stamp a NEW run id (a
+    run id is per process) onto the probe's key, and the update would name a placement
+    group the deployment does not have. Pre-stamping the key with the run id already on
+    chain (from the deploy receipt's group population) makes stamp_run leave it alone.
+    Without a readable stamped name the original SDL is used unchanged.
+    """
+    names = (
+        [g.get("name") for g in groups if isinstance(g, dict)] if isinstance(groups, list) else []
+    )
+    if len(names) != 1 or not isinstance(names[0], str):
+        return sdl_path, None
+    if not _STAMPED_PROBE_GROUP_RE.fullmatch(names[0]):
+        return sdl_path, None
+    text = Path(sdl_path).read_text()
+    stamped, keys = stamp_run(text, run_id_of(names[0]))
+    if keys != [names[0]]:
+        return sdl_path, None
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+        f.write(stamped)
+    return f.name, f.name
+
+
+def _check_update(
+    dseq: str, sdl_path: str, uri: str, diag: dict | None = None, groups: object = None
+) -> bool:
     """In-place manifest update: change the served marker and confirm the new
     revision goes live at the same ingress (lease preserved).
 
@@ -1959,21 +2060,26 @@ def _check_update(dseq: str, sdl_path: str, uri: str, diag: dict | None = None) 
     the run log + telemetry and any later cap change is data-driven, not a guess. The
     diagnostics never flip the verdict: a genuine provider defect must stay visible."""
     token = f"probe-updated-{dseq[-6:]}"
-    r = _run(
-        [
-            "uv",
-            "run",
-            "just-akash",
-            "update",
-            "--dseq",
-            dseq,
-            "--sdl",
-            sdl_path,
-            "--env",
-            f"SMOKE_MARKER={token}",
-        ],
-        timeout=120,
-    )
+    update_sdl, temp_sdl = _update_sdl_for(sdl_path, groups)
+    try:
+        r = _run(
+            [
+                "uv",
+                "run",
+                "just-akash",
+                "update",
+                "--dseq",
+                dseq,
+                "--sdl",
+                update_sdl,
+                "--env",
+                f"SMOKE_MARKER={token}",
+            ],
+            timeout=120,
+        )
+    finally:
+        if temp_sdl:
+            Path(temp_sdl).unlink(missing_ok=True)
     if r.returncode != 0:
         err = " ".join((r.stderr or r.stdout or "").split())
         print(f"  update command failed (rc={r.returncode}): {err[:200]}")
@@ -2176,7 +2282,11 @@ def smoke_provider(
             run_check(
                 "update",
                 lambda: _check_update(
-                    dseq, sdl_path, uri, diag=diagnostics.setdefault("update", {})
+                    dseq,
+                    sdl_path,
+                    uri,
+                    diag=diagnostics.setdefault("update", {}),
+                    groups=dseq_ref.get("groups"),
                 ),
             )
         else:

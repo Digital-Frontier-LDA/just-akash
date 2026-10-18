@@ -1113,8 +1113,8 @@ class TestOrphanProbeSweep:
     """
 
     NOW = 1_783_930_000.0  # a fixed "now" (~mid-2026, ms-epoch dseq era)
-    # What deploy.py's stamp_run puts on chain for the probe SDL: `just-akash-smoke.<run id>`.
-    STAMPED = "just-akash-smoke.0123456789ab"
+    # What deploy.py's stamp_run puts on chain for the probe SDL: `just-akash-probe.<run id>`.
+    STAMPED = "just-akash-probe.0123456789ab"
 
     @pytest.fixture(autouse=True)
     def _chain_groups(self, monkeypatch):
@@ -1285,9 +1285,11 @@ class TestOrphanProbeSweep:
         [
             [],  # unreadable from every endpoint: UNKNOWN, not "not ours"
             ["dfci-infra-probe"],  # another repo's probe-shaped workload
-            ["just-akash-smokey"],  # shares the prefix, is not the probe's key
-            ["just-akash-smoke.NOT-A-RUN-ID"],
-            ["just-akash-smoke.0123456789ab", "just-akash-smoke.0123456789ab"],  # two groups
+            ["just-akash-probey"],  # shares the prefix, is not the probe's key
+            ["just-akash-probe.NOT-A-RUN-ID"],
+            # run_id_of() validates only the LAST component; the whole suffix must be one id
+            ["just-akash-probe.research.abcdef"],
+            ["just-akash-probe.0123456789ab", "just-akash-probe.0123456789ab"],  # two groups
         ],
     )
     def test_a_probe_service_under_a_group_the_probe_never_creates_is_left(self, groups, capsys):
@@ -1306,15 +1308,165 @@ class TestOrphanProbeSweep:
         # Found but not swept: the summary must flag it for a human, never read as clean.
         assert "could NOT be destroyed" in out
 
-    def test_the_probe_sdl_declares_the_provenance_key(self):
-        """Flynn attributes a lease by its group name; the SDL's placement key IS that name."""
+    def test_the_real_stamp_run_stamps_both_key_lines_and_the_receipt_accepts_it(self):
+        """Codex P1 on f4d4a659: stamp_run rewrites key LINES, so an inline
+        `{ profile: probe, count: 1 }` reference stayed unstamped and artifact_identity
+        refused every smoke deploy. placement_keys() reads only the definition, so it
+        cannot see that; this runs the real stamp_run and the real receipt check."""
+        from just_akash.deployment_receipt import artifact_identity
         from just_akash.provenance import PLACEMENT_PREFIX, placement_keys, stamp_run
 
         assert placement_keys(sp.PROBE_SDL) == [sp.PROBE_GROUP]
         assert sp.PROBE_GROUP.startswith(PLACEMENT_PREFIX)
         stamped, keys = stamp_run(sp.PROBE_SDL, "0123456789ab")
         assert keys == [self.STAMPED] and sp._is_probe_group(keys[0])
-        assert placement_keys(stamped) == [self.STAMPED]
+        key_lines = [ln.strip() for ln in stamped.splitlines() if "just-akash-probe" in ln]
+        assert key_lines == [f"{self.STAMPED}:", f"{self.STAMPED}:"], key_lines
+        population, _, _ = artifact_identity(stamped)
+        assert population == [{"gseq": 1, "name": self.STAMPED}]
+
+    def test_the_probe_name_is_the_one_cleanup_identity_treats_as_a_probe(self):
+        from just_akash.cleanup_identity import CleanupIntent, _legacy_name
+
+        assert _legacy_name("just-akash-", CleanupIntent.PROBE, self.STAMPED)
+        assert _legacy_name("just-akash-", CleanupIntent.PROBE, sp.PROBE_GROUP)
+
+    # ── min-age below the 1h floor: the end-of-job reap (`--sweep-only --min-age 0`) ──
+    def _sweep_young(self, dseq, group, this_run, service="probe", age_s=5):
+        self.groups[dseq] = [group]
+        api = self._fake_api([{"dseq": dseq}], {dseq: self._detail([service])})
+        with (
+            patch.object(sp, "_api", return_value=api),
+            patch.object(sp, "_this_run_probe_groups", return_value=set(this_run)),
+            patch.object(sp, "robust_destroy", return_value=True) as rd,
+            patch.object(sp.time, "time", return_value=self.NOW),
+        ):
+            swept = sp.sweep_orphan_probes(min_age_seconds=0)
+        return swept, rd
+
+    def test_min_age_zero_reaps_a_young_probe_this_run_stamped(self):
+        d = self._dseq_aged(5)
+        swept, rd = self._sweep_young(d, self.STAMPED, {self.STAMPED})
+        assert swept == [d]
+        rd.assert_called_once_with(d, owner=OWNER, group=self.STAMPED)
+
+    def test_min_age_zero_spares_another_runs_live_probe(self, capsys):
+        """Codex P1: a concurrent run's (or a developer's) live probe carries ANOTHER run
+        id. Under --min-age 0 it must not reach robust_destroy."""
+        d = self._dseq_aged(5)
+        swept, rd = self._sweep_young(d, "just-akash-probe.fedcba987654", {self.STAMPED})
+        assert swept == []
+        rd.assert_not_called()
+        assert "spared" in capsys.readouterr().out
+
+    def test_min_age_zero_never_reaps_a_young_legacy_akash_probe(self):
+        """Codex P1: `akash` proves no run. Under --min-age 0 a 5-second-old one is NOT
+        reaped; the legacy name needs the 1h floor unconditionally."""
+        d = self._dseq_aged(5)
+        swept, rd = self._sweep_young(d, "akash", {self.STAMPED, "akash"})
+        assert swept == []
+        rd.assert_not_called()
+
+    def test_min_age_zero_spares_a_young_unstamped_probe(self):
+        d = self._dseq_aged(5)
+        swept, rd = self._sweep_young(d, sp.PROBE_GROUP, {self.STAMPED})
+        assert swept == []
+        rd.assert_not_called()
+
+    def test_another_runs_probe_past_the_floor_is_reaped_under_min_age_zero(self):
+        d = self._dseq_aged(7200)
+        swept, rd = self._sweep_young(d, "just-akash-probe.fedcba987654", set(), age_s=7200)
+        assert swept == [d]
+        rd.assert_called_once_with(d, owner=OWNER, group="just-akash-probe.fedcba987654")
+
+    def test_a_chain_read_that_raises_flags_the_candidate_and_the_sweep_continues(
+        self, monkeypatch, capsys
+    ):
+        """Codex P2: a truthy non-object group_spec makes the chain parser raise. That
+        must leave the candidate, flag the sweep INCOMPLETE, and reap the others."""
+        bad, good = self._dseq_aged(7200), self._dseq_aged(7300)
+
+        def read(owner, dseq):
+            if dseq == bad:
+                raise AttributeError("'str' object has no attribute 'get'")
+            return [self.STAMPED]
+
+        monkeypatch.setattr(sp.chain, "deployment_group_names", read)
+        api = self._fake_api(
+            [{"dseq": bad}, {"dseq": good}],
+            {bad: self._detail(["probe"]), good: self._detail(["probe"])},
+        )
+        with (
+            patch.object(sp, "_api", return_value=api),
+            patch.object(sp, "robust_destroy", return_value=True) as rd,
+            patch.object(sp.time, "time", return_value=self.NOW),
+        ):
+            assert sp.sweep_orphan_probes() == [good]
+        rd.assert_called_once_with(good, owner=OWNER, group=self.STAMPED)
+        out = capsys.readouterr().out
+        assert f"could not read {bad}" in out
+        assert "INCOMPLETE" in out
+
+    def test_this_run_groups_come_from_this_jobs_receipts(self, monkeypatch, tmp_path):
+        receipts = tmp_path / "just-akash-deployment-receipts"
+        receipts.mkdir()
+        payloads = {
+            "provider-smoke-a.json": (OWNER, self.STAMPED),
+            "provider-smoke-b.json": ("akash1someoneelse", "just-akash-probe.111111111111"),
+            "provider-smoke-c.json": (OWNER, "just-akash-probe.research.abcdef"),
+            "other-label.json": (OWNER, "just-akash-probe.222222222222"),
+        }
+        for name in payloads:
+            (receipts / name).write_text(name)
+
+        def decode(payload):
+            owner, group = payloads[payload.decode()]
+            return {"expected_owner": owner, "group_population": [{"gseq": 1, "name": group}]}
+
+        monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+        monkeypatch.setattr(sp, "decode_receipt", decode)
+        assert sp._this_run_probe_groups(OWNER) == {self.STAMPED}
+        monkeypatch.delenv("RUNNER_TEMP")
+        assert sp._this_run_probe_groups(OWNER) == set()
+
+    # ── in-place update keeps the run id already on chain ─────────────
+    def test_update_sdl_carries_the_on_chain_stamped_key(self, tmp_path):
+        """`just-akash update` re-prepares the SDL in a NEW process, whose stamp_run would
+        give the probe key a NEW run id: an update naming a group the deployment does not
+        have. Pre-stamped with the on-chain id, deploy's stamp_run leaves it alone."""
+        from just_akash.deployment_receipt import artifact_identity
+        from just_akash.provenance import stamp_run
+
+        src = tmp_path / "probe.yaml"
+        src.write_text(sp.PROBE_SDL)
+        path, temp = sp._update_sdl_for(str(src), [{"gseq": 1, "name": self.STAMPED}])
+        assert temp == path and path != str(src)
+        text = Path(path).read_text()
+        assert stamp_run(text, "fedcba987654") == (text, [])  # deploy's re-stamp: no-op
+        assert artifact_identity(text)[0] == [{"gseq": 1, "name": self.STAMPED}]
+        # Nothing readable -> the original SDL, unchanged (the pre-rename behaviour).
+        for groups in (None, [], [{"gseq": 1, "name": "akash"}], "x"):
+            assert sp._update_sdl_for(str(src), groups) == (str(src), None)
+
+    def test_check_update_sends_the_stamped_sdl_and_removes_it(self, tmp_path):
+        src = tmp_path / "probe.yaml"
+        src.write_text(sp.PROBE_SDL)
+        seen = {}
+
+        def fake_run(cmd, timeout):
+            path = cmd[cmd.index("--sdl") + 1]
+            seen["path"], seen["text"] = path, Path(path).read_text()
+            return subprocess.CompletedProcess(cmd, 1, "", "boom")
+
+        with patch.object(sp, "_run", side_effect=fake_run):
+            assert (
+                sp._check_update(
+                    "123456", str(src), "uri", groups=[{"gseq": 1, "name": self.STAMPED}]
+                )
+                is False
+            )
+        assert f"{self.STAMPED}:" in seen["text"]
+        assert not Path(seen["path"]).exists()
 
     def test_successful_sweep_deletes_only_its_resolved_receipt(self, monkeypatch, tmp_path):
         old_probe = self._dseq_aged(7200)

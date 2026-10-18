@@ -73,11 +73,12 @@ GPU_PROBE_MODELS: tuple[str, ...] = (
 # The placement key every probe SDL below declares, and so the order's on-chain
 # ``group_spec.name``. It carries just-akash's provenance prefix (provenance.PLACEMENT_PREFIX)
 # so Flynn's lease snapshot attributes a probe order to just_akash by its existing
-# `just-akash-` rule (Flynn app/background/leases.py _NAME_PREFIXES). It was the SDL default
-# `akash` until openmix-nnqg, which Flynn maps EXACTLY to its own R&D fleet, so every probe
-# order read as a Flynn lease. probe_order_sdl creates through the Console client, not
-# deploy.py, so no run id is stamped onto it: this exact name is what lands on chain.
-BID_PROBE_GROUP = "just-akash-bidprobe"
+# `just-akash-` rule (Flynn app/background/leases.py _NAME_PREFIXES), and it is the name
+# cleanup_identity already treats as a disposable probe (`just-akash-probe[.<run id>]`). It
+# was the SDL default `akash` until openmix-nnqg, which Flynn maps EXACTLY to its own R&D
+# fleet. probe_order_sdl creates through the Console client, not deploy.py, so stamp_run
+# never runs on these SDLs: this exact, unstamped name is what lands on chain.
+BID_PROBE_GROUP = "just-akash-probe"
 
 _SDL_CPU = """\
 ---
@@ -102,14 +103,14 @@ profiles:
         storage:
           size: 128Mi
   placement:
-    just-akash-bidprobe:
+    just-akash-probe:
       pricing:
         probe:
           denom: uact
           amount: 1000000
 deployment:
   probe:
-    just-akash-bidprobe:
+    just-akash-probe:
       profile: probe
       count: 1
 """
@@ -143,14 +144,14 @@ profiles:
               nvidia:
 {models}
   placement:
-    just-akash-bidprobe:
+    just-akash-probe:
       pricing:
         probe:
           denom: uact
           amount: 5000000
 deployment:
   probe:
-    just-akash-bidprobe:
+    just-akash-probe:
       profile: probe
       count: 1
 """.format(models="\n".join(f"                - model: {m}" for m in GPU_PROBE_MODELS))
@@ -198,14 +199,14 @@ profiles:
               nvidia:
 {models}
   placement:
-    just-akash-bidprobe:
+    just-akash-probe:
       pricing:
         probe:
           denom: uact
           amount: 5000000
 deployment:
   probe:
-    just-akash-bidprobe:
+    just-akash-probe:
       profile: probe
       count: 1
 """.format(models="\n".join(f"                - model: {m}" for m in GPU_PROBE_MODELS))
@@ -242,14 +243,14 @@ profiles:
               persistent: true
               class: beta3
   placement:
-    just-akash-bidprobe:
+    just-akash-probe:
       pricing:
         probe:
           denom: uact
           amount: 2000000
 deployment:
   probe:
-    just-akash-bidprobe:
+    just-akash-probe:
       profile: probe
       count: 1
 """
@@ -281,14 +282,14 @@ profiles:
         storage:
           size: 128Mi
   placement:
-    just-akash-bidprobe:
+    just-akash-probe:
       pricing:
         probe:
           denom: uact
           amount: 1500000
 deployment:
   probe:
-    just-akash-bidprobe:
+    just-akash-probe:
       profile: probe
       count: 1
 """
@@ -338,14 +339,14 @@ profiles:
         storage:
           size: 128Mi
   placement:
-    just-akash-bidprobe:
+    just-akash-probe:
       pricing:
         probe:
           denom: uact
           amount: 1000000
 deployment:
   probe:
-    just-akash-bidprobe:
+    just-akash-probe:
       profile: probe
       count: 1
 """
