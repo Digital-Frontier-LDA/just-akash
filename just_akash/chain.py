@@ -70,30 +70,32 @@ DEFAULT_REST_FALLBACKS = (
 )
 
 # Destructive identity reads use trust paths, not the availability/credit endpoints above.
-# Source labels and URLs: cosmos/chain-registry, akash/chain.json; observed and DNS
-# ancestry checked 2026-09-12. Both voters were also measured serving pinned
-# ``GetBlockWithTxs`` and ``GetTxsEvent`` creation populations with reconciled totals.
+# Registry 3 source labels and URLs: pinned cosmos/chain-registry akash/chain.json.
+# Route names describe observed operator/gateway/cache boundaries, not an assertion
+# that either response is uncached. See docs/owner-corroboration-registry.md.
 # Bump the registry version when any entry or proof contract changes.
+# Keep the V2 Python symbol for callers of the existing proof API. The registry
+# identity below is version 3; this does not alias or accept historical registry 2.
 OWNER_CORROBORATION_SOURCES_V2 = (
     {
-        "source_id": "quad",
-        "url": "https://akash.rpc.uquad.org:443",
+        "source_id": "crouton",
+        "url": "https://akash-mainnet-api.crouton.digital",
         "chain_id": "akashnet-2",
-        "operator": "quad",
-        "gateway_ancestry": "direct-88.198.50.175",
-        "cache_ancestry": "none-direct-88.198.50.175",
+        "operator": "crouton-digital",
+        "gateway_ancestry": "crouton-api-148.251.53.24",
+        "cache_ancestry": "crouton-api-route",
         "proof_mode": "fresh-common-height-and-complete-creation-block",
         "finality_rule": "committed-tip-minus-2",
         "max_age_seconds": 180,
         "max_height_skew": 5,
     },
     {
-        "source_id": "c29r3",
-        "url": "https://akash.c29r3.xyz:443/api",
+        "source_id": "polkachu",
+        "url": "https://akash-api.polkachu.com",
         "chain_id": "akashnet-2",
-        "operator": "c29r3",
-        "gateway_ancestry": "direct-65.21.234.82",
-        "cache_ancestry": "none-direct-65.21.234.82",
+        "operator": "polkachu",
+        "gateway_ancestry": "cloudflare-polkachu-api",
+        "cache_ancestry": "cloudflare-polkachu-api-route",
         "proof_mode": "fresh-common-height-and-complete-creation-block",
         "finality_rule": "committed-tip-minus-2",
         "max_age_seconds": 180,
@@ -116,13 +118,13 @@ def _source_registry_digest(sources) -> str:
     ).hexdigest()
 
 
-OWNER_CORROBORATION_REGISTRY_VERSION = 2
+OWNER_CORROBORATION_REGISTRY_VERSION = 3
 OWNER_CORROBORATION_REGISTRY_PROVENANCE = (
     "https://github.com/cosmos/chain-registry/blob/"
-    "c67c94a5f5c41ad1b116b1b847ef8b5f196b6405/akash/chain.json"
+    "cc1ed04b31326bc79f3208e571fb71fa0fddb987/akash/chain.json"
 )
 OWNER_CORROBORATION_REGISTRY_PROVENANCE_SHA256 = (
-    "071d561eccb4a26ac4e3404b58ce1d1fb2b881c230e4468f78b44d92b8c5cd51"
+    "3720728bb01b964132cf1452678c6aaf20f0f5b2df098e2d56ceb577e741b1c2"
 )
 OWNER_CORROBORATION_REGISTRY_SHA256 = _source_registry_digest(OWNER_CORROBORATION_SOURCES_V2)
 

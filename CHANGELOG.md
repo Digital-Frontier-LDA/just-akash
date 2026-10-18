@@ -53,6 +53,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   Registered observations refuse redirects and missing height echoes. Financial
   settlement remains separate; runner migration and durable broker wiring remain gated.
 
+## [1.49.0] — 2026-10-18
+
+### Changed
+
+- Prepare SDK 1.49.0 with owner corroboration registry 3: Crouton Digital and
+  Polkachu replace the registry 2 sources. Keep the two independent voters,
+  complete signed creation and transaction-index proofs, common finalized height,
+  exact height echoes and existing freshness limits. Retain core 0.18.0 and the
+  existing proof API; the `OWNER_CORROBORATION_SOURCES_V2` Python name now exposes
+  the explicitly versioned registry 3. Registry 2 history is not relabeled:
+  consumers must regenerate and authenticate history for the new registry before
+  enabling it. See [registry migration](docs/owner-corroboration-registry.md).
+  This preparation does not establish release or production qualification.
+
+### Fixed
+
+- Send the SDK's existing `just-akash-balance/1.0` User-Agent from the native
+  execution observer, matching its chain reader. An October 18 paired request
+  to Polkachu returned HTTP 403 with urllib's default User-Agent and HTTP 200
+  with the existing SDK identifier. Proof predicates and transport bounds remain
+  unchanged; full candidate observation qualification is still required.
+
 ## [1.48.0] — 2026-10-08
 
 ### Added

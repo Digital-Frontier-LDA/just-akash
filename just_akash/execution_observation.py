@@ -185,7 +185,7 @@ class _Budget:
         if self.reader is not None:
             result = self.reader(path, base=base, height=height)
         else:
-            headers = {"Accept": "application/json"}
+            headers = {"Accept": "application/json", "User-Agent": "just-akash-balance/1.0"}
             if height is not None:
                 headers["x-cosmos-block-height"] = str(height)
             request = urllib.request.Request(base.rstrip("/") + path, headers=headers)  # noqa: S310
