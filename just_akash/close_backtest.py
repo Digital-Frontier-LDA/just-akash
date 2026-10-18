@@ -22,34 +22,49 @@ it by name:
 --------------------------------
 From a PERSON: the operator names the exact dseq and its exact group, and a reviewer approves
 the ``production`` environment for that run. The checks below do not prove "leaked"; they
-stop a WRONG dseq (a typo, a fleet or canary lease, someone else's deployment, a young or
-live one) from being closed under that approval. They do not stop a determined actor who
-holds this wallet's key: anything such an actor can name, this would close. The signed
-creation proof the other paths want would not separate them either, since repos that share
-the Console wallet share its signer.
+stop a WRONG dseq from being closed under that approval: a typo, a fleet or canary lease,
+someone else's deployment, or a recent one (the 48 h floor; a long-running live backtest
+older than that passes it). They do not stop a determined actor who holds this wallet's key:
+anything such an actor can name, this would close. The signed creation proof the other paths
+want would not separate them either, since repos that share the Console wallet share its
+signer.
 
 WHAT IT REFUSES
 ---------------
   * the dseq or group not in their exact shapes (group ``just-akash-backtest.<12 hex>``), or
     an owner that is not a plain akash address;
-  * on the CHAIN (public LCDs, no key; this is all the ungated ``plan`` job can see): fewer
-    than 2 registered sources that answer WITHOUT redirect and resolve to disjoint addresses;
-    any of them reporting a state other than ``active``, a group population other than
-    exactly ``[expected_group]``, a ``created_at`` height they disagree on, tips more than
-    ``max_height_skew`` blocks apart or older than ``max_age_seconds``; an age, from
-    ``created_at`` HEIGHT x ``wallet_pool.SECONDS_PER_BLOCK`` (never from the dseq, which the
-    deployer chooses), under ``cleanup_stale.STALE_E2E_AGE_SECONDS`` (48 h);
+  * on the CHAIN (public LCDs, no key; this is all the ungated ``plan`` job can see):
+      - fewer than 2 sources from the registry ``chain.OWNER_CORROBORATION_SOURCES_V2``, or two
+        with the same registered ``operator`` or host, or a registered chain id other than
+        ``akashnet-2``. Independence here is the REGISTRY's claim (distinct operators), not
+        something this module measures: it does not resolve DNS or prove two hosts are not
+        fronting one upstream. Reads never follow a redirect, so an answer comes from the
+        registered host.
+      - a tip whose header chain id is not ``akashnet-2``, whose height is not a positive
+        integer, or whose block time is older than ``max_age_seconds`` when THAT response
+        arrived; tips more than ``max_height_skew`` blocks apart.
+      - then every source is read at ONE pinned height, the lowest tip minus 2 (the registry's
+        ``committed-tip-minus-2``), with ``x-cosmos-block-height`` sent and the echoed height
+        required to equal it (``chain._lcd_get``): a cached or historical answer is refused.
+        At that height each must report state ``active``, exactly ``[expected_group]`` as the
+        group population, and the same well-formed, positive ``created_at`` height at or
+        below the pin.
+      - an age, ``(pin - created_at) x wallet_pool.SECONDS_PER_BLOCK`` (never from the dseq,
+        which the deployer chooses), under ``cleanup_stale.STALE_E2E_AGE_SECONDS`` (48 h);
   * with the KEY (only the gated ``close`` job): a key whose wallet is not ``owner``; a
-    Console record whose owner, dseq or state disagrees; anything but EXACTLY ONE active
-    lease whose status was read and whose complete service set is ``{backtest}``.
+    Console record whose owner, dseq or state disagrees; any malformed lease row (no state, no
+    id); anything but EXACTLY ONE active lease, with this owner and dseq in its id, whose
+    status was read and whose complete service set is ``{backtest}``.
 
 The Console read of the active lease is the LAST thing before the DELETE, after the chain
 view. ⚠ A race remains and is not closable here: Console's DELETE takes the dseq only, with
-no precondition, so a change between that last read and the DELETE (seconds) is not seen.
+no precondition, so a change between that last read and the DELETE is not seen. The window is
+the DELETE call itself, bounded by the Console timeout (``api.CONSOLE_HTTP_TIMEOUT``, 180 s).
 
 A close counts only when the deployment reads back with this owner, this dseq and state
 exactly ``closed``. If the DELETE itself errors, the read-back still runs: the close may have
-been committed and only its reply lost.
+been committed and only its reply lost. Reporting after a proven close (credit, intent) can
+only warn; it never changes the outcome.
 
 Exit codes: 0 verified (plan) or closed (execute); 1 refused, nothing sent; 2 usage;
 3 outcome UNKNOWN (a DELETE may have been sent; verify by hand).
@@ -65,7 +80,6 @@ from __future__ import annotations
 import argparse
 import os
 import re
-import socket
 import sys
 import time
 import urllib.parse
@@ -81,6 +95,12 @@ from .wallet_pool import SECONDS_PER_BLOCK
 DSEQ_RE = re.compile(r"[1-9][0-9]{0,19}")
 GROUP_RE = re.compile(r"just-akash-backtest\.[0-9a-f]{12}")
 OWNER_RE = re.compile(r"akash1[a-z0-9]{38,58}")
+HEIGHT_RE = re.compile(r"[1-9][0-9]{0,19}")
+CHAIN_ID = "akashnet-2"
+# The registry's finality rule, `committed-tip-minus-2`: read state two blocks under the tip.
+FINALITY_DEPTH = 2
+# Our clock against a block's timestamp: a block may look a little "from the future".
+CLOCK_SKEW_SECONDS = 30
 
 EXIT_OK, EXIT_REFUSED, EXIT_USAGE, EXIT_UNKNOWN = 0, 1, 2, 3
 
@@ -104,19 +124,35 @@ def shape_refusal(owner: str, dseq: str, group: str) -> str | None:
 @dataclass(frozen=True)
 class ChainView:
     created_height: int
-    tip_height: int
+    pinned_height: int
     age_seconds: float
 
 
-def _read_no_redirect(path: str, base: str) -> dict:
-    # A redirect would let one registered host answer for another; refuse to follow it.
-    return chain._lcd_get(path, base=base, timeout=15, follow_redirects=False)
+def _read_no_redirect(path: str, base: str, height: int | None) -> dict:
+    # No redirect: an answer comes from the registered host. With `height`, _lcd_get sends
+    # x-cosmos-block-height and refuses an answer that does not echo exactly that height.
+    return chain._lcd_get(path, base=base, timeout=15, height=height, follow_redirects=False)
 
 
-def _resolve(host: str) -> frozenset[str]:
-    return frozenset(
-        str(info[4][0]) for info in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
-    )
+def _sources_refusal(sources) -> str | None:
+    hosts: set[str] = set()
+    operators: set[str] = set()
+    for source in sources:
+        if not isinstance(source, dict) or not isinstance(source.get("url"), str):
+            return "a registered chain source is malformed"
+        host = (urllib.parse.urlsplit(source["url"]).hostname or "").lower()
+        operator = source.get("operator")
+        if not host or not isinstance(operator, str) or not operator:
+            return "a registered chain source has no host or no operator"
+        if source.get("chain_id") != CHAIN_ID:
+            return f"a registered chain source is not on {CHAIN_ID}"
+        if host in hosts or operator in operators:
+            return "two registered chain sources share a host or an operator"
+        hosts.add(host)
+        operators.add(operator)
+    if len(operators) < 2:
+        return f"only {len(operators)} registered chain operator(s)"
+    return None
 
 
 def _chain_view(
@@ -125,70 +161,81 @@ def _chain_view(
     group: str,
     *,
     sources,
-    reader: Callable[[str, str], dict],
-    resolve: Callable[[str], frozenset[str]],
-    now: datetime,
+    reader: Callable[[str, str, int | None], dict],
+    clock: Callable[[], datetime],
 ) -> tuple[ChainView | None, str | None]:
-    """Every registered source's view of this deployment, or why it is not enough."""
+    """Every registered source's view of this deployment at one pinned height, or why not."""
+    why = _sources_refusal(sources)
+    if why is not None:
+        return None, why
+
+    tips: list[int] = []
+    for source in sources:
+        host = urllib.parse.urlsplit(source["url"]).hostname
+        try:
+            tip = reader("/cosmos/base/tendermint/v1beta1/blocks/latest", source["url"], None)
+        except Exception as exc:  # noqa: BLE001 — an unread source is no vote
+            return None, f"chain source {host} unreadable ({type(exc).__name__})"
+        arrived = clock()
+        header = (tip.get("block") or {}).get("header") if isinstance(tip, dict) else None
+        if not isinstance(header, dict):
+            return None, f"chain source {host} answered an unexpected tip shape"
+        if header.get("chain_id") != CHAIN_ID:
+            return None, f"chain source {host} is on chain {header.get('chain_id')!r}"
+        height_text = header.get("height")
+        tip_time = chain._rfc3339(header.get("time"))
+        if not isinstance(height_text, str) or not HEIGHT_RE.fullmatch(height_text):
+            return None, f"chain source {host} gave a malformed tip height"
+        if tip_time is None:
+            return None, f"chain source {host} gave no block time"
+        lag = (arrived - tip_time).total_seconds()
+        if not -CLOCK_SKEW_SECONDS <= lag <= int(source.get("max_age_seconds", 180)):
+            return None, f"chain source {host} tip is not fresh ({lag:.0f} s old on arrival)"
+        tips.append(int(height_text))
+
+    skew = min(int(s.get("max_height_skew", 5)) for s in sources)
+    if max(tips) - min(tips) > skew:
+        return None, f"chain source tips are {max(tips) - min(tips)} blocks apart (> {skew})"
+    pinned = min(tips) - FINALITY_DEPTH
+    if pinned < 1:
+        return None, "chain tip is too low to pin"
+
     info_path = (
         f"{chain._DEPLOYMENT_API}/deployments/info"
         f"?id.owner={urllib.parse.quote(owner)}&id.dseq={urllib.parse.quote(dseq)}"
     )
-    tip_path = "/cosmos/base/tendermint/v1beta1/blocks/latest"
-    votes: list[tuple[frozenset[str], int, datetime, int]] = []
+    created_heights: set[int] = set()
     for source in sources:
-        base = source.get("url") if isinstance(source, dict) else None
-        if not isinstance(base, str):
-            return None, "a registered chain source has no url"
-        host = urllib.parse.urlsplit(base).hostname
-        if not host:
-            return None, "a registered chain source has no host"
+        host = urllib.parse.urlsplit(source["url"]).hostname
         try:
-            addresses = resolve(host)
-            tip = reader(tip_path, base)
-            info = reader(info_path, base)
-        except Exception as exc:  # noqa: BLE001 — an unread source is no vote
-            return None, f"chain source {host} unreadable ({type(exc).__name__})"
-        header = (tip.get("block") or {}).get("header") if isinstance(tip, dict) else None
+            info = reader(info_path, source["url"], pinned)
+        except Exception as exc:  # noqa: BLE001 — includes a wrong or missing echoed height
+            return (
+                None,
+                f"chain source {host} unreadable at height {pinned} ({type(exc).__name__})",
+            )
         dep = info.get("deployment") if isinstance(info, dict) else None
-        try:
-            tip_height = int(header["height"])  # type: ignore[index]
-            tip_time = chain._rfc3339(header["time"])  # type: ignore[index]
-            created = int(dep["created_at"])  # type: ignore[index]
-            state = dep["state"]  # type: ignore[index]
-        except (KeyError, TypeError, ValueError):
-            return None, f"chain source {host} answered an unexpected shape"
-        if not addresses or tip_time is None:
-            return None, f"chain source {host} gave no address or no block time"
-        if state != "active":
-            return None, f"chain source {host} reports state {state!r}, not active"
+        if not isinstance(dep, dict):
+            return None, f"chain source {host} answered an unexpected deployment shape"
+        if dep.get("state") != "active":
+            return None, f"chain source {host} reports state {dep.get('state')!r}, not active"
         if chain._deployment_group_snapshot(info, owner, dseq) != (("1", group),):
             return None, f"chain source {host} does not show {group!r} as the only group"
-        max_age = source.get("max_age_seconds", 180)
-        if not 0 <= (now - tip_time).total_seconds() <= max_age:
-            return None, f"chain source {host} tip is not fresh (block time {tip_time})"
-        votes.append((addresses, tip_height, tip_time, created))
-
-    # Independence: two names on one upstream are one vote.
-    distinct: list[tuple[frozenset[str], int, datetime, int]] = []
-    for vote in votes:
-        if all(vote[0].isdisjoint(other[0]) for other in distinct):
-            distinct.append(vote)
-    if len(distinct) < 2:
-        return None, f"only {len(distinct)} independent chain source(s) answered"
-    created_heights = {v[3] for v in distinct}
+        created_text = dep.get("created_at")
+        if not isinstance(created_text, str) or not HEIGHT_RE.fullmatch(created_text):
+            return None, f"chain source {host} gave a malformed created_at {created_text!r}"
+        created = int(created_text)
+        if created > pinned:
+            return None, f"chain source {host} says it was created above the pinned height"
+        created_heights.add(created)
     if len(created_heights) != 1:
         return None, f"chain sources disagree on created_at ({sorted(created_heights)})"
-    tips = [v[1] for v in distinct]
-    skew = min(int(s.get("max_height_skew", 5)) for s in sources if isinstance(s, dict))
-    if max(tips) - min(tips) > skew:
-        return None, f"chain source tips are {max(tips) - min(tips)} blocks apart (> {skew})"
     created_height = created_heights.pop()
-    age = (min(tips) - created_height) * SECONDS_PER_BLOCK
+    age = (pinned - created_height) * SECONDS_PER_BLOCK
     if age < STALE_E2E_AGE_SECONDS:
         hours = STALE_E2E_AGE_SECONDS // 3600
-        return None, f"only {age / 3600:.1f} h old on chain; a backtest is stale after {hours} h"
-    return ChainView(created_height, min(tips), age), None
+        return None, f"only {age / 3600:.2f} h old on chain; a backtest is stale after {hours} h"
+    return ChainView(created_height, pinned, age), None
 
 
 def chain_view(owner: str, dseq: str, group: str) -> tuple[ChainView | None, str | None]:
@@ -204,8 +251,7 @@ def chain_view(owner: str, dseq: str, group: str) -> tuple[ChainView | None, str
         group,
         sources=sources,
         reader=_read_no_redirect,
-        resolve=_resolve,
-        now=datetime.now(timezone.utc),
+        clock=lambda: datetime.now(timezone.utc),
     )
 
 
@@ -227,13 +273,22 @@ def console_refusal(client, owner: str, dseq: str) -> str | None:
     if dep.get("state") != "active":  # type: ignore[union-attr]
         return f"Console state is {dep.get('state')!r}, not active"  # type: ignore[union-attr]
     leases = detail.get("leases")
-    active = (
-        [x for x in leases if isinstance(x, dict) and x.get("state") == "active"]
-        if isinstance(leases, list)
-        else []
-    )
+    if not isinstance(leases, list):
+        return "the Console record has no lease list"
+    for lease in leases:
+        # A row we cannot classify could be the live one: refuse rather than skip it.
+        if (
+            not isinstance(lease, dict)
+            or not isinstance(lease.get("state"), str)
+            or not isinstance(lease.get("id"), dict)
+        ):
+            return "a lease row has no state or no id"
+    active = [x for x in leases if x["state"] == "active"]
     if len(active) != 1:
         return f"{len(active)} active lease(s); exactly one is required"
+    lease_id = active[0]["id"]
+    if lease_id.get("owner") != owner or str(lease_id.get("dseq")) != dseq:
+        return "the active lease's id names another owner or dseq"
     status = active[0].get("status")
     services = status.get("services") if isinstance(status, dict) else None
     if not isinstance(services, dict) or not services:
@@ -274,7 +329,7 @@ def run(*, owner: str, dseq: str, group: str, execute: bool = False) -> int:
             print(f"::error::{dseq} refused: {why}")
             return EXIT_REFUSED
         print(
-            f"  {dseq}  {group}  created_at={view.created_height}  tip={view.tip_height}  "
+            f"  {dseq}  {group}  created_at={view.created_height}  pinned={view.pinned_height}  "
             f"age={view.age_seconds / 86400:.1f} d  -> chain VERIFIED (services are read by the "
             "gated close job, with the key)"
         )
@@ -289,7 +344,7 @@ def run(*, owner: str, dseq: str, group: str, execute: bool = False) -> int:
     if client.account_address() != owner:
         print(f"::error::{dseq} refused: the key's wallet is not {owner}")
         return EXIT_REFUSED
-    print(f"credit BEFORE: {_credit_line(client, owner)}")
+    _report("credit BEFORE", lambda: _credit_line(client, owner))
 
     view, why = chain_view(owner, dseq, group)
     if view is None:
@@ -317,15 +372,36 @@ def run(*, owner: str, dseq: str, group: str, execute: bool = False) -> int:
     if sent_error is not None:
         print(f"  DELETE raised ({sent_error}) but the deployment reads back closed")
     print(f"  closed {dseq} (read back: closed)")
-    # Flynn openmix-h2l7: end any intent bound to it. Never stands in the way of a close.
-    lease_intent.close_quietly(dseq, "closed as a leaked backtest (read back: closed)")
+    # Everything below only reports. The outcome is settled: a failure here warns, and the
+    # exit stays 0, because 1 means "refused, nothing sent" and that is no longer true.
+    # Flynn openmix-h2l7: end any intent bound to it.
+    _report(
+        "intent",
+        lambda: lease_intent.close_quietly(
+            dseq, "closed as a leaked backtest (read back: closed)"
+        ),
+    )
     time.sleep(SETTLE_PAUSE_SECONDS)
-    print(f"credit AFTER:  {_credit_line(client, owner)}")
+    _report("credit AFTER", lambda: _credit_line(client, owner))
     return EXIT_OK
 
 
+def _report(label: str, fn: Callable[[], object]) -> None:
+    """Print a reporting line; a failure warns and never changes the run's outcome."""
+    try:
+        value = fn()
+    except Exception as exc:  # noqa: BLE001
+        print(f"::warning::{label} not reported: {type(exc).__name__}: {str(exc)[:120]}")
+        return
+    if value is not None:
+        print(f"{label}: {value}")
+
+
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Close one named, leaked just-akash backtest.")
+    # allow_abbrev=False: `--exec` (or any prefix) must not silently mean --execute.
+    ap = argparse.ArgumentParser(
+        description="Close one named, leaked just-akash backtest.", allow_abbrev=False
+    )
     ap.add_argument("--owner", required=True, help="The wallet that owns it (akash1...).")
     ap.add_argument("--dseq", required=True, help="The deployment to close.")
     ap.add_argument(

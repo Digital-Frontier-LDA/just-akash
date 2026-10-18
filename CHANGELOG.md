@@ -16,16 +16,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   creation tx, which public LCDs have pruned for any lease older than their history
   (openmix-hxlg). The authority is a person (the operator names `owner`, `dseq` and
   `expected_group`; a reviewer approves `production`); the checks stop a wrong dseq, not a
-  same-wallet actor. `plan` (ungated) loads NO secret and reads the public chain only: >= 2
-  registered sources read without redirects and resolving to disjoint addresses must agree
-  the deployment is active, its only group is exactly `just-akash-backtest.<12 hex>`, its
-  `created_at` height, fresh tips within the skew, and an age >= 48 h from that HEIGHT (not
-  the deployer-chosen dseq). `close` (execute=true, after plan, behind `production`, the only
+  same-wallet actor. `plan` (ungated) loads NO secret and reads the public chain only: sources
+  from >= 2 distinct registered operators on `akashnet-2` (the registry's independence claim;
+  no DNS claim), read without redirects, with fresh tips (judged on each response's arrival)
+  within the skew; then each is read at ONE pinned height (lowest tip - 2) whose echoed
+  `x-cosmos-block-height` must match, and must agree the deployment is active, its only group
+  is exactly `just-akash-backtest.<12 hex>`, and its positive `created_at` height; age >= 48 h
+  from that HEIGHT (not the deployer-chosen dseq). `close` (execute=true, after plan, behind `production`, the only
   job that decrypts the key) re-runs that, checks the key's wallet, then as the LAST read
-  before the DELETE requires exactly one active lease whose status was read and whose
-  complete service set is `{backtest}`. A close counts only on a read-back with this owner,
+  before the DELETE requires well-formed lease rows and exactly one active lease, naming this
+  owner and dseq, whose status was read and whose complete service set is `{backtest}`. A close counts only on a read-back with this owner,
   this dseq and state exactly `closed`; a DELETE that errors is still read back, and an
-  unproven outcome exits 3 ("outcome UNKNOWN"). `plan` refuses execute=true unless
+  unproven outcome exits 3 ("outcome UNKNOWN"); reporting after a proven close only warns.
+  `--execute` cannot be abbreviated. `plan` refuses execute=true unless
   `production` already exists with a required reviewer (GitHub creates a named environment
   unprotected on first use).
 - Lease charters for placements Flynn counts as ours (`flynn-*`, `fleet-*`, exactly

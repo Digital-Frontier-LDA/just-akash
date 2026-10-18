@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -30,20 +31,25 @@ GROUP = "just-akash-backtest.482950fc2cf3"
 REPO = Path(__file__).resolve().parents[1]
 NOW = datetime(2026, 10, 18, 12, 0, tzinfo=timezone.utc)
 TIP = 29_200_000
-OLD_CREATED = TIP - int(STALE_E2E_AGE_SECONDS / SECONDS_PER_BLOCK) - 1000
+PIN = TIP - cb.FINALITY_DEPTH
+FLOOR_BLOCKS = int(STALE_E2E_AGE_SECONDS / SECONDS_PER_BLOCK)
+OLD_CREATED = PIN - FLOOR_BLOCKS - 1000
+
+
+def _source(sid, url, operator):
+    return {
+        "source_id": sid,
+        "url": url,
+        "operator": operator,
+        "chain_id": "akashnet-2",
+        "max_age_seconds": 180,
+        "max_height_skew": 5,
+    }
+
+
 SOURCES = (
-    {
-        "source_id": "a",
-        "url": "https://a.example:443",
-        "max_age_seconds": 180,
-        "max_height_skew": 5,
-    },
-    {
-        "source_id": "b",
-        "url": "https://b.example:443/api",
-        "max_age_seconds": 180,
-        "max_height_skew": 5,
-    },
+    _source("a", "https://a.example:443", "op-a"),
+    _source("b", "https://b.example:443/api", "op-b"),
 )
 
 
@@ -64,34 +70,34 @@ def _info(*, state="active", created=OLD_CREATED, groups=(GROUP,), owner=OWNER, 
     }
 
 
-def _tip(height=TIP, age_s=10):
-    t = (NOW - timedelta(seconds=age_s)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-    return {"block": {"header": {"height": str(height), "time": t}}}
+def _tip(height=TIP, block_time=None, chain_id="akashnet-2"):
+    t = (block_time or NOW - timedelta(seconds=10)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return {"block": {"header": {"height": str(height), "time": t, "chain_id": chain_id}}}
 
 
 class _Lcd:
+    """Answers per host; records every (host, kind, height) read."""
+
     def __init__(self, **per_host):
-        self.answers = {"a.example": {}, "b.example": {}}
+        self.answers: dict[str, dict] = {"a.example": {}, "b.example": {}}
         for host, over in per_host.items():
             self.answers[host.replace("_", ".")].update(over)
+        self.reads: list[tuple[str, str, int | None]] = []
 
-    def read(self, path, base):
+    def read(self, path, base, height):
         host = base.split("//")[1].split(":")[0].split("/")[0]
+        kind = "tip" if "blocks/latest" in path else "info"
+        self.reads.append((host, kind, height))
         mine = self.answers[host]
         if "raise" in mine:
             raise mine["raise"]
-        if "blocks/latest" in path:
-            return mine.get("tip", _tip())
-        return mine.get("info", _info())
+        return mine.get(kind, _tip() if kind == "tip" else _info())
 
 
-def _view(lcd=None, resolve=None, dseq=DSEQ, group=GROUP):
+def _view(lcd=None, sources=SOURCES, clock=None, dseq=DSEQ, group=GROUP):
     lcd = lcd or _Lcd()
-    resolve = resolve or (
-        lambda host: frozenset({{"a.example": "1.1.1.1", "b.example": "2.2.2.2"}[host]})
-    )
     return cb._chain_view(
-        OWNER, dseq, group, sources=SOURCES, reader=lcd.read, resolve=resolve, now=NOW
+        OWNER, dseq, group, sources=sources, reader=lcd.read, clock=clock or (lambda: NOW)
     )
 
 
@@ -101,16 +107,104 @@ def _refused(view_result) -> str:
     return why
 
 
-def test_two_independent_fresh_agreeing_sources_verify():
-    view, why = _view()
+def test_two_registered_operators_agreeing_at_a_pinned_height_verify():
+    lcd = _Lcd()
+    view, why = _view(lcd)
     assert why is None and view is not None
-    assert view.created_height == OLD_CREATED
-    assert view.age_seconds >= STALE_E2E_AGE_SECONDS
+    assert view.created_height == OLD_CREATED and view.pinned_height == PIN
+    # Tips unpinned; every deployment read pinned to the SAME corroborated height.
+    assert [h for _, kind, h in lcd.reads if kind == "tip"] == [None, None]
+    assert [h for _, kind, h in lcd.reads if kind == "info"] == [PIN, PIN]
 
 
-def test_two_urls_on_one_upstream_count_once():
-    """Codex OBJECT 5: independence is by resolved address, not by URL."""
-    assert "only 1 independent" in _refused(_view(resolve=lambda host: frozenset({"9.9.9.9"})))
+def test_a_deployment_answer_with_a_wrong_echoed_height_is_refused(monkeypatch):
+    """Codex round 2, P1-a: the REAL reader sends x-cosmos-block-height and refuses an answer
+    that echoes another height (a cached or historical response)."""
+    sent = {}
+
+    class _Resp:
+        headers = {"x-cosmos-block-height": "1"}
+
+        def read(self):
+            return json.dumps(_info()).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _Opener:
+        def open(self, req, timeout):
+            sent["height"] = req.get_header("X-cosmos-block-height")
+            return _Resp()
+
+    monkeypatch.setattr(cb.chain.urllib.request, "build_opener", lambda *h: _Opener())
+    with pytest.raises(cb.chain.ChainResponseError, match="echo pinned height"):
+        cb._read_no_redirect("/akash/x", "https://a.example", PIN)
+    assert sent["height"] == str(PIN)
+
+
+def test_an_unreadable_pinned_read_is_refused():
+    lcd = _Lcd()
+    real = lcd.read
+
+    def read(path, base, height):
+        if height is not None and "b.example" in base:
+            raise cb.chain.ChainResponseError("did not echo pinned height")
+        return real(path, base, height)
+
+    assert f"unreadable at height {PIN}" in _refused(
+        cb._chain_view(OWNER, DSEQ, GROUP, sources=SOURCES, reader=read, clock=lambda: NOW)
+    )
+
+
+def test_two_sources_from_one_registered_operator_are_one_vote():
+    """Codex round 2, P1-b: independence is the registry's distinct operators, not DNS."""
+    same = (SOURCES[0], _source("b", "https://b.example:443/api", "op-a"))
+    assert "share a host or an operator" in _refused(_view(sources=same))
+
+
+def test_two_sources_on_one_host_are_one_vote():
+    same = (SOURCES[0], _source("b", "https://a.example:443/other", "op-b"))
+    assert "share a host or an operator" in _refused(_view(sources=same))
+
+
+def test_one_source_is_not_enough():
+    assert "only 1 registered" in _refused(_view(sources=SOURCES[:1]))
+
+
+def test_a_registered_source_on_another_chain_is_refused():
+    other = (SOURCES[0], {**SOURCES[1], "chain_id": "sandbox-01"})
+    assert "not on akashnet-2" in _refused(_view(sources=other))
+
+
+def test_a_tip_from_another_chain_is_refused():
+    """Codex round 2, P2-d: a wrong chain id must not verify."""
+    lcd = _Lcd(b_example={"tip": _tip(chain_id="sandbox-01")})
+    assert "is on chain 'sandbox-01'" in _refused(_view(lcd))
+
+
+@pytest.mark.parametrize("created", ["0", "-1", "", "abc", "1e9", None, 12345])
+def test_a_malformed_created_at_is_refused(created):
+    """Codex round 2, P2-d: 0 or -1 must not read as 'very old'."""
+    info = _info()
+    info["deployment"]["created_at"] = created
+    lcd = _Lcd(a_example={"info": info}, b_example={"info": info})
+    assert "malformed created_at" in _refused(_view(lcd))
+
+
+def test_a_created_at_above_the_pinned_height_is_refused():
+    info = _info(created=PIN + 1)
+    lcd = _Lcd(a_example={"info": info}, b_example={"info": info})
+    assert "above the pinned height" in _refused(_view(lcd))
+
+
+@pytest.mark.parametrize("height", ["0", "-5", "", "12a"])
+def test_a_malformed_tip_height_is_refused(height):
+    tip = _tip()
+    tip["block"]["header"]["height"] = height
+    assert "malformed tip height" in _refused(_view(_Lcd(a_example={"tip": tip})))
 
 
 def test_a_source_reporting_the_deployment_not_active_is_refused():
@@ -127,7 +221,18 @@ def test_tips_too_far_apart_are_refused():
 
 
 def test_a_stale_tip_is_refused():
-    assert "not fresh" in _refused(_view(_Lcd(a_example={"tip": _tip(age_s=600)})))
+    lcd = _Lcd(a_example={"tip": _tip(block_time=NOW - timedelta(seconds=600))})
+    assert "not fresh" in _refused(_view(lcd))
+
+
+def test_a_block_committed_during_verification_is_fresh():
+    """Codex round 2, P2-c: freshness is judged when THAT response arrived. Source b's tip
+    was committed 20 s after verification began and arrived 1 s later."""
+    start = NOW
+    lcd = _Lcd(b_example={"tip": _tip(height=TIP + 3, block_time=start + timedelta(seconds=20))})
+    arrivals = iter([start + timedelta(seconds=1), start + timedelta(seconds=21)])
+    view, why = _view(lcd, clock=lambda: next(arrivals))
+    assert why is None and view is not None
 
 
 @pytest.mark.parametrize(
@@ -144,11 +249,22 @@ def test_another_wallets_deployment_is_refused():
 def test_age_comes_from_the_chain_height_not_the_dseq():
     """Codex OBJECT 2a: the deployer picks the dseq. A dseq that 'decodes' to a month ago on
     a deployment the chain created an hour ago is young."""
-    recent = TIP - int(3600 / SECONDS_PER_BLOCK)
+    recent = PIN - int(3600 / SECONDS_PER_BLOCK)
     lcd = _Lcd(
         a_example={"info": _info(created=recent)}, b_example={"info": _info(created=recent)}
     )
     assert "h old on chain" in _refused(_view(lcd))
+
+
+@pytest.mark.parametrize("minutes,ok", [(48 * 60 - 1, False), (48 * 60 + 1, True)])
+def test_the_48h_floor_is_exact(minutes, ok):
+    """Codex round 2: a mutant lowering the floor to 2 h passed every earlier test."""
+    created = PIN - int(minutes * 60 / SECONDS_PER_BLOCK)
+    lcd = _Lcd(
+        a_example={"info": _info(created=created)}, b_example={"info": _info(created=created)}
+    )
+    view, why = _view(lcd)
+    assert (view is not None) is ok, why
 
 
 def test_an_unreadable_source_is_refused():
@@ -156,19 +272,24 @@ def test_an_unreadable_source_is_refused():
 
 
 def test_an_unexpected_shape_is_refused():
-    assert "unexpected shape" in _refused(_view(_Lcd(a_example={"tip": {"block": {}}})))
+    assert "unexpected tip shape" in _refused(_view(_Lcd(a_example={"tip": {"block": {}}})))
 
 
 def test_the_real_reader_does_not_follow_redirects(monkeypatch):
     seen = {}
 
-    def fake_lcd_get(path, *, base, timeout, follow_redirects):
-        seen["follow_redirects"] = follow_redirects
+    def fake_lcd_get(path, *, base, timeout, height, follow_redirects):
+        seen.update(follow_redirects=follow_redirects, height=height)
         return {}
 
     monkeypatch.setattr(cb.chain, "_lcd_get", fake_lcd_get)
-    cb._read_no_redirect("/x", "https://a.example")
-    assert seen == {"follow_redirects": False}
+    cb._read_no_redirect("/x", "https://a.example", PIN)
+    assert seen == {"follow_redirects": False, "height": PIN}
+
+
+def test_the_registered_sources_satisfy_the_operator_rule():
+    """The production registry itself: >= 2 distinct operators and hosts on akashnet-2."""
+    assert cb._sources_refusal(cb.chain.OWNER_CORROBORATION_SOURCES_V2) is None
 
 
 def test_an_rest_override_is_refused_on_the_destructive_read(monkeypatch):
@@ -282,6 +403,33 @@ def test_a_console_record_that_disagrees_is_refused(detail, needle):
     assert why is not None and needle in why
 
 
+@pytest.mark.parametrize(
+    "lease,needle",
+    [
+        (
+            {**_lease(), "id": {"owner": OTHER, "dseq": DSEQ, "provider": "akash1p"}},
+            "another owner",
+        ),
+        (
+            {**_lease(), "id": {"owner": OWNER, "dseq": "1", "provider": "akash1p"}},
+            "another owner",
+        ),
+        ({k: v for k, v in _lease().items() if k != "id"}, "no state or no id"),
+    ],
+)
+def test_the_active_lease_must_name_this_owner_and_dseq(lease, needle):
+    """Codex round 2, P2-e."""
+    why = cb.console_refusal(_Client(_detail(leases=[lease])), OWNER, DSEQ)
+    assert why is not None and needle in why
+
+
+def test_a_vllm_lease_with_no_state_beside_a_backtest_lease_is_refused():
+    """Codex round 2, P2-e: a row we cannot classify could be the live one."""
+    stateless = {k: v for k, v in _lease(services=("vllm",)).items() if k != "state"}
+    why = cb.console_refusal(_Client(_detail(leases=[_lease(), stateless])), OWNER, DSEQ)
+    assert why is not None and "no state or no id" in why
+
+
 # ── run(): plan holds no key; execute orders the reads and proves the close ──────────────
 
 
@@ -387,6 +535,24 @@ def test_a_delete_that_raises_and_does_not_read_back_closed_is_unknown(wired, ca
     assert client.closed == [DSEQ]
 
 
+def test_a_reporting_failure_after_a_proven_close_keeps_exit_0(wired, monkeypatch, capsys):
+    """Codex round 2, P2-f: 1 means "refused, nothing sent"; after a proven close it is false."""
+    client = wired["use"](_Client(_detail()))
+    monkeypatch.setattr(cb, "_credit_line", lambda c, a: (_ for _ in ()).throw(RuntimeError("x")))
+    monkeypatch.setattr(
+        cb.lease_intent, "close_quietly", lambda d, r: (_ for _ in ()).throw(RuntimeError("y"))
+    )
+    assert _run() == cb.EXIT_OK
+    assert client.closed == [DSEQ]
+    assert "::warning::" in capsys.readouterr().out
+
+
+def test_an_abbreviated_execute_flag_is_rejected():
+    """Codex round 2: argparse would read `--exec` as --execute."""
+    with pytest.raises(SystemExit):
+        cb.main(["--owner", OWNER, "--dseq", DSEQ, "--expected-group", GROUP, "--exec"])
+
+
 def test_malformed_input_is_usage_and_sends_nothing(wired):
     client = wired["use"](_Client(_detail()))
     assert cb.run(owner=OWNER, dseq="1;rm", group=GROUP, execute=True) == cb.EXIT_USAGE
@@ -423,7 +589,15 @@ def test_plan_loads_no_secret():
 def test_plan_never_passes_execute_to_python_in_any_form():
     for step in _wf()["jobs"]["plan"]["steps"]:
         for field in ("run", "env", "with"):
-            assert "execute" not in yaml.safe_dump(step.get(field, "")).lower(), step.get("name")
+            text = yaml.safe_dump(step.get(field, "")).lower()
+            assert "execute" not in text, step.get("name")
+            # Any prefix of --execute (`--e`, `--exec`): reject even though the parser now
+            # refuses abbreviations, so neither guard alone carries the property.
+            for token in re.split(r"[\s'\"=\\]+", text):
+                assert not (token.startswith("--e") and "--execute".startswith(token)), (
+                    step.get("name"),
+                    token,
+                )
 
 
 def test_only_the_gated_job_holds_the_key_and_closes():

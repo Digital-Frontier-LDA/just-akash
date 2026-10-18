@@ -9,8 +9,8 @@ name: Close a leaked backtest
 #
 # THE AUTHORITY IS A PERSON: the operator names the dseq and its group, and a reviewer
 # approves `production` for this run. The module's checks stop a WRONG dseq (a typo, a fleet
-# or canary lease, another wallet's, a young or live one); they do not stop someone who
-# holds this wallet's key. just_akash/close_backtest.py lists them.
+# or canary lease, another wallet's, a recent one under the 48 h floor); they do not stop
+# someone who holds this wallet's key. just_akash/close_backtest.py lists them.
 #
 # TWO JOBS. `plan` reads the PUBLIC chain only and closes nothing; it always runs and loads
 # NO secret: an ungated job runs branch-controlled code, so it must not hold the wallet key.
