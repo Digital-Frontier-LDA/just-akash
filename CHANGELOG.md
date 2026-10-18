@@ -14,13 +14,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   named, leased, leaked e2e backtest. Nothing else could: close-orphans closes only lease-less
   deployments, and cleanup-stale and `robust_destroy(owner=, group=)` both need the signed
   creation tx, which public LCDs have pruned for any lease older than their history
-  (openmix-hxlg). It refuses unless the deployment is this key's wallet's, active, running
-  exactly `{backtest}`, at least 48 h old, and carries exactly the typed `expected_group`
-  (`just-akash-backtest.<12 hex>`) as its only group on >= 2 agreeing LCD sources; it re-checks
-  all of that at the close and counts the close only on a terminal read-back. Two jobs: `plan`
-  verifies and closes nothing; `close` runs only with `execute=true`, after `plan`, behind the
-  `production` environment, and `plan` refuses `execute=true` unless that environment already
-  exists with a required reviewer (GitHub creates a named environment unprotected on first use).
+  (openmix-hxlg). The authority is a person (the operator names `owner`, `dseq` and
+  `expected_group`; a reviewer approves `production`); the checks stop a wrong dseq, not a
+  same-wallet actor. `plan` (ungated) loads NO secret and reads the public chain only: >= 2
+  registered sources read without redirects and resolving to disjoint addresses must agree
+  the deployment is active, its only group is exactly `just-akash-backtest.<12 hex>`, its
+  `created_at` height, fresh tips within the skew, and an age >= 48 h from that HEIGHT (not
+  the deployer-chosen dseq). `close` (execute=true, after plan, behind `production`, the only
+  job that decrypts the key) re-runs that, checks the key's wallet, then as the LAST read
+  before the DELETE requires exactly one active lease whose status was read and whose
+  complete service set is `{backtest}`. A close counts only on a read-back with this owner,
+  this dseq and state exactly `closed`; a DELETE that errors is still read back, and an
+  unproven outcome exits 3 ("outcome UNKNOWN"). `plan` refuses execute=true unless
+  `production` already exists with a required reviewer (GitHub creates a named environment
+  unprotected on first use).
 - Lease charters for placements Flynn counts as ours (`flynn-*`, `fleet-*`, exactly
   `dcloud`/`akash`; openmix-pvr6.1). `deploy --charter FILE.json` (or
   `JUST_AKASH_CHARTER_JSON`) POSTs the charter to Flynn before the credit probe and refuses

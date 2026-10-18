@@ -7,15 +7,16 @@ name: Close a leaked backtest
 # live close needs the signed creation tx, which they have pruned (Flynn openmix-hxlg). The
 # module docstring (just_akash/close_backtest.py) has the whole argument.
 #
-# SAFETY IS IN THE MODULE, NOT IN THIS FILE. It refuses anything that is not this wallet's,
-# active, exactly {backtest}, older than 48 h, and carrying exactly `expected_group` as its
-# only group on >= 2 agreeing LCD sources, and it re-checks all of that at the close.
+# THE AUTHORITY IS A PERSON: the operator names the dseq and its group, and a reviewer
+# approves `production` for this run. The module's checks stop a WRONG dseq (a typo, a fleet
+# or canary lease, another wallet's, a young or live one); they do not stop someone who
+# holds this wallet's key. just_akash/close_backtest.py lists them.
 #
-# TWO JOBS. `plan` verifies and closes nothing; it always runs. `close` runs only with
-# execute=true, after `plan` passed, and sits behind the `production` environment, so a
-# person approves the exact dseq and group the plan job printed. A job-level environment
-# gates the whole job, which is why verification is NOT in the gated job alone: the
-# approver reads the plan's verdict before approving.
+# TWO JOBS. `plan` reads the PUBLIC chain only and closes nothing; it always runs and loads
+# NO secret: an ungated job runs branch-controlled code, so it must not hold the wallet key.
+# `close` runs only with execute=true, after `plan` passed, behind the `production`
+# environment; it alone decrypts the key, re-runs the chain checks, reads the Console's
+# active lease last, and closes. The approver reads the plan's verdict before approving.
 #
 # ⛔ THE GATE MUST EXIST BEFORE IT IS TRUSTED. GitHub creates an environment that a job
 # names on first use, UNPROTECTED. So `plan` refuses execute=true unless `production` already
@@ -25,6 +26,14 @@ name: Close a leaked backtest
 on:
   workflow_dispatch:
     inputs:
+      owner:
+        description: "Console wallet that owns it (just_akash.lease_intent.WALLET_LABELS)"
+        type: choice
+        default: akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee # pragma: allowlist secret
+        options:
+          - akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee # pragma: allowlist secret
+          - akash1cklqag0e0v794msgqkr6uwf7sr6zyy42gm78f0 # pragma: allowlist secret
+          - akash14n4rkmz64rn0tey0r5g07l8q5x0fh2h4hu44kt # pragma: allowlist secret
       dseq:
         description: "The leaked backtest deployment to close (one dseq). Required."
         type: string
@@ -91,15 +100,15 @@ jobs:
           python-version: "3.13"
       - name: Install dependencies
         run: uv sync
-      - name: Load SOPS secrets
-        uses: ./.github/actions/sops-env
-        with:
-          age-key: ${{ secrets.SOPS_AGE_KEY }}
-      - name: Verify (closes nothing)
+      # No SOPS step here, on purpose: the chain reads are public.
+      - name: Verify on chain (closes nothing)
         env:
+          OWNER: ${{ inputs.owner }}
           DSEQ: ${{ inputs.dseq }}
           GROUP: ${{ inputs.expected_group }}
-        run: uv run python -m just_akash.close_backtest --dseq "$DSEQ" --expected-group "$GROUP"
+        run: |
+          uv run python -m just_akash.close_backtest \
+            --owner "$OWNER" --dseq "$DSEQ" --expected-group "$GROUP"
 
   close:
     name: Close the verified backtest
@@ -122,11 +131,13 @@ jobs:
         uses: ./.github/actions/sops-env
         with:
           age-key: ${{ secrets.SOPS_AGE_KEY }}
-      # The module re-runs every check before the close and reads the state back after it.
+      # The module re-runs the chain checks, reads the active lease last, and reads back.
       - name: Close
         env:
+          OWNER: ${{ inputs.owner }}
           DSEQ: ${{ inputs.dseq }}
           GROUP: ${{ inputs.expected_group }}
         run: |
           set -euo pipefail
-          uv run python -m just_akash.close_backtest --dseq "$DSEQ" --expected-group "$GROUP" --execute
+          uv run python -m just_akash.close_backtest \
+            --owner "$OWNER" --dseq "$DSEQ" --expected-group "$GROUP" --execute
