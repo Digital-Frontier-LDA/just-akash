@@ -1,0 +1,181 @@
+{
+  "UA_diagnostic": {
+    "GETs": 2,
+    "existing_SDK_identifier_HTTP_status": 200,
+    "existing_identifier_strict_JSON_and_deployment_group_schema": true,
+    "native_default_HTTP_status": 403,
+    "same_client_TLS_method_path_and_Accept_only_UA_differs": true,
+    "scope": "Paired request evidence supports reusing the SDK chain reader identifier in the native observer; no operator-wide filter policy inferred."
+  },
+  "archive_capability_scope": {
+    "all_history_availability_proven": false,
+    "both_candidate_block_and_index_populations_agree": true,
+    "creation_heights": [
+      28583009,
+      28618269
+    ],
+    "full_33_subject_population_qualified": false
+  },
+  "authority_and_goal_credit": {
+    "complete_cleanup_cycles_credited": 0,
+    "financial_authority": false,
+    "genuine_recovery_cases_credited": 0,
+    "goal_complete": false,
+    "monitoring_hours_credited": 0,
+    "new_close_transactions": 0,
+    "production_actions": 0,
+    "resource_authority": false
+  },
+  "candidate_status_at_observation": "unreleased; not installed in production Guardian",
+  "current_Guardian_context": {
+    "historical_subject_run_attempt": "37170764293/1",
+    "production_candidate_activation": false,
+    "repository": "Digital-Frontier-LDA/guardian-cli-claude-code",
+    "source": "20019da9f1646bb7efe6e599eff1d3f47462080f"
+  },
+  "dated_close_height_comparison_only": 28909464,
+  "fresh_snapshot_observation": {
+    "SDK_reads": 18,
+    "escrow_status_separate": "settled",
+    "execution_state": "closed",
+    "financial_exposure_release_authorized": false,
+    "fresh_closed_snapshot_verified": true,
+    "group_count": 1,
+    "lease_count": 1,
+    "native_typed_closure_present": false,
+    "observation_height": 29117144,
+    "observed_at_unix": 1792310747,
+    "payment_settlement_proven": false,
+    "reason": "execution.closed",
+    "recover_close_transaction": false,
+    "trace": {
+      "event_limit": 256,
+      "events": 49,
+      "exceptions": 0,
+      "failed": false,
+      "line_events_disabled": true,
+      "prior_trace_absent": true,
+      "prior_trace_restored": true,
+      "truncated": false
+    }
+  },
+  "instrumentation_helper_sha256": {
+    "fresh_snapshot_original_native_call": "600faff07d05c4d7fe3a41df4076c608677b5da735fbc4ffe01cd27e3358ccce",
+    "paired_same_client_UA_comparison": "550b69f8f22ed81d3f40e995dd2b0a4d13d39bcc7cb5f305243ba10e832322b5",
+    "signed_close_original_native_call": "37a0ca7c905566f6a75a68f53a08ad36a258083291f4f9696b7a777ee0b868f6"
+  },
+  "native_closure_metadata": {
+    "close_transaction_height": 28909464,
+    "common_finality_height": 29117167,
+    "group_count": 1,
+    "lease_count": 1,
+    "observed_at": 1792310883,
+    "proof_mode": "exact_finalized_height",
+    "source_a_height": 29117167,
+    "source_b_height": 29117167,
+    "source_ids": [
+      "crouton",
+      "polkachu"
+    ]
+  },
+  "qualified_source_file_sha256": {
+    "just_akash/chain.py": "d3f4cf622cce9b482ad6d351c0039ffb5395d35b4a833cb44b09e0eb89d3a2f8",
+    "just_akash/execution_observation.py": "dfb3efef7a45ca263bccc9886d60b4605cec25a023e97bd49901c1b91d9563d5"
+  },
+  "receipt_sha256": {
+    "UA_comparison": "05b1d65648f312b6544cc69de1a3c536bea5b809b0072f9997baebaa59056be0",
+    "candidate_installed_package_manifest": "ca9e7a1e59707cfc7a12a3f71a729f05637c35756279391fa4022acb24a4a499",
+    "fresh_snapshot_independent_review": "7520ae04d7449e39fb96fc566cdb249da0d5309352619fed5ba0703ed0612214",
+    "native_fresh_snapshot": "bc2fe6e108127b11545ac7fd23ce838c041df85b129d80722fe13f048f3663df",
+    "native_signed_close_recovery": "f5259d8f6666f950cfb54f2ded80a433764156957ad6e1fada516a06fb6fc1aa",
+    "operator_node_identity_mapping": "07bfb541c5f08f7341e2b923ab4b7c25b5911646b216b82ce8e694fbad0a476a",
+    "signed_close_independent_review": "8f449022e57967f156594464d614c5b2d070c8b11ebfd4e9873fe1d17d1ed974",
+    "two_height_archive_capability": "7665081cc9d04e685dc17ff8bd53201f912ee7ba97b30c1a73c0b4d592acb03a"
+  },
+  "recorded_at_utc": "2026-10-18T08:12:51.366099+00:00",
+  "registry": {
+    "independence_basis": "Different public operator attributions and peer mappings, matching REST/RPC node identities within each operator, distinct node identities between operators, and different observed operator/gateway/cache route domains. This is a supported separation inference; no absence of origin caches or exact deployed configuration attestation is claimed.",
+    "official_provenance": "https://github.com/cosmos/chain-registry/blob/cc1ed04b31326bc79f3208e571fb71fa0fddb987/akash/chain.json",
+    "official_provenance_sha256": "3720728bb01b964132cf1452678c6aaf20f0f5b2df098e2d56ceb577e741b1c2",
+    "operators": [
+      "crouton-digital",
+      "polkachu"
+    ],
+    "primary_sources": [
+      "https://crouton.digital/services/mainnet-networks/akash",
+      "https://polkachu.com/public_api",
+      "https://polkachu.com/docs/index.html",
+      "https://github.com/polkachu/cosmos-validators/tree/2b0d6bc4c4ffe59cc69e2c1fc93a0d96b3f36bfa/roles/support_public_endpoints"
+    ],
+    "sha256": "0c7aa778a81d9ac6938615eb203c18583006a77c387be50df047429f5e18d395",
+    "source_ids": [
+      "crouton",
+      "polkachu"
+    ],
+    "version": 3
+  },
+  "remaining_qualification": [
+    "Normal SDK review, merge, immutable release and exact consumer wheel/source pin migration.",
+    "Regenerate and authenticate compatible registry3 execution and owner histories and catalog.",
+    "Qualify the complete 33-subject population and a fresh complete Guardian fleet census.",
+    "Finish remaining genuine recovery exercises and the original monitoring window and issue acceptance criteria."
+  ],
+  "schema": "just_akash_owner_registry3_public_candidate_qualification_v1",
+  "scope": "Public sanitized record of reviewed candidate observations for one historical Guardian subject; receipt digests identify the underlying records and are not independent external attestation.",
+  "signed_close_recovery_observation": {
+    "SDK_reads": 82,
+    "escrow_status_separate": "settled",
+    "execution_state": "closed",
+    "financial_exposure_release_authorized": false,
+    "fresh_closed_snapshot_verified": true,
+    "group_count": 1,
+    "lease_count": 1,
+    "native_typed_closure_present": true,
+    "observation_height": 29117167,
+    "observed_at_unix": 1792310883,
+    "payment_settlement_proven": false,
+    "reason": "execution.closed",
+    "recover_close_transaction": true,
+    "trace": {
+      "event_limit": 256,
+      "events": 218,
+      "exceptions": 0,
+      "failed": false,
+      "line_events_disabled": true,
+      "prior_trace_absent": true,
+      "prior_trace_restored": true,
+      "truncated": false
+    }
+  },
+  "typed_closure_predicates": {
+    "canonical_population_and_evidence_digests": true,
+    "canonical_signed_transaction_hash": true,
+    "chain_and_proof_mode": true,
+    "closure_observed_at_fresh": true,
+    "common_fresh_finalized_height": true,
+    "complete_prepared_groups": true,
+    "exact_registered_operators": true,
+    "exact_registered_sources": true,
+    "exact_registered_trust_paths": true,
+    "exact_signed_transaction_sources": true,
+    "exact_subject_and_operation": true,
+    "native_close_height_matches_dated_comparison": true,
+    "native_typed_closure_and_signed_transaction_present": true,
+    "operator_independence": true,
+    "signed_close_height": true,
+    "signed_transaction_index": true
+  },
+  "typed_closure_verified": true,
+  "versions": {
+    "akash_lease_core": "0.18.0",
+    "just_akash_candidate": "1.49.0",
+    "python": "3.12.12"
+  },
+  "wheels_used_for_these_candidate_observations": {
+    "SDK_package_files_verified": 52,
+    "akash_lease_core_0.18.0_sha256": "7d9ccb117b1cf2f30ebea17018371902ed063daa6c087e2c64e109fe00788070",
+    "core_package_files_verified": 17,
+    "just_akash_1.49.0_sha256": "2850bfffa7f0de45809c2092be03cc3a9e4b8f77a37d64ec9da67ed19e6783bb",
+    "published_release_wheel_claimed": false
+  }
+}
