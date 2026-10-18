@@ -65,8 +65,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   reference is block form so `stamp_run` rewrites it with the placement. The in-place update
   pre-stamps the run id already on chain, so `update` names the deployment's own group. The
   orphan sweep reads the orphan's group from chain (inside its per-deployment error handler)
-  and passes that exact name to the destroy. Below the 1h floor (`--min-age 0`) it reaps only a
-  probe this job stamped, read from the job's own deployment receipts. The legacy `akash` is
+  and passes that exact name to the destroy. Below the 1h floor (`--min-age 0`) it reaps a probe
+  only when one of this run attempt's own create receipts names that exact dseq and stamped
+  group. In CI the smoke's receipt operation ids carry `gh<run id>.<attempt>`, and only a
+  `create_response_received` receipt counts, with the same owner and received no earlier than its
+  dseq was minted. Outside CI, no young probe is reaped. The legacy `akash` is
   still reaped, but only past 1h. A `{probe}` service under an unreadable group, or one the
   probe never creates, is left and flagged.
 

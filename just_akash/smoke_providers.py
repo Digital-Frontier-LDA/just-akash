@@ -608,25 +608,62 @@ def _is_probe_group(name: str) -> bool:
     return _STAMPED_PROBE_GROUP_RE.fullmatch(name) is not None
 
 
-def _this_run_probe_groups(owner: str) -> set[str]:
-    """The probe group names THIS job's deploys stamped, from its own deployment receipts.
+def _smoke_run_tag() -> str | None:
+    """`gh<run id>.<attempt>` for the GitHub Actions run attempt this process belongs to.
 
-    Every smoke deploy writes a receipt under $RUNNER_TEMP before it creates anything
-    (paid_create.receipt_environment), and the receipt's group population is the stamped
-    SDL's, so it names exactly `just-akash-probe.<run id>` for each probe this job opened.
-    A run id is per deploy PROCESS (deploy._RUN_ID), so nothing else can name them. Empty
-    outside CI or when no receipt is readable: then no young probe is this run's.
+    The smoke step and the end-of-job reap step are SEPARATE processes in one job, so
+    nothing held in memory survives from one to the other; the run attempt is what they
+    share and what no other run, attempt or developer shell can claim. None outside CI.
     """
+    run = os.environ.get("GITHUB_RUN_ID", "")
+    attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+    if re.fullmatch(r"[1-9][0-9]{0,19}", run) and re.fullmatch(r"[1-9][0-9]{0,5}", attempt):
+        return f"gh{run}.{attempt}"
+    return None
+
+
+def _smoke_receipt_label() -> str:
+    """The receipt label a smoke deploy uses. In CI it carries the run tag, so every
+    operation id this run attempt mints reads `provider-smoke-gh<run>.<attempt>-<hex>`
+    (paid_create.receipt_environment); the file still matches `provider-smoke-*.json`."""
+    tag = _smoke_run_tag()
+    return f"provider-smoke-{tag}" if tag else "provider-smoke"
+
+
+# How far a receipt's create-response time may precede the dseq's own timestamp (the dseq
+# is the Console's ms clock, the receipt the runner's): clock skew, not a freshness window.
+_RECEIPT_CLOCK_SKEW_SECONDS = 120
+
+
+def _this_run_probe_receipts(owner: str) -> set[tuple[str, str]]:
+    """(dseq, group) for every probe THIS run attempt created, proven by its own receipts.
+
+    Young-close authority (below the 1h floor) rests on this, so a receipt counts only if
+    ALL of these hold, else it proves nothing:
+      * its operation id was minted by this run attempt: `provider-smoke-<run tag>-<hex>`
+        (a receipt from another run, attempt, or a shell with no run tag never matches);
+      * it reached `create_response_received`, the stage that carries a DSEQ;
+      * its owner is this sweep's owner;
+      * its group population is exactly one stamped probe group;
+      * its create response was received no earlier than its own dseq was minted (minus
+        clock skew), so a stale receipt cannot vouch for a dseq it predates.
+    The sweep then requires the CANDIDATE's (dseq, group) to be one of these pairs.
+    Empty outside CI or when nothing qualifies: then no young probe is this run's.
+    """
+    tag = _smoke_run_tag()
     runner_temp = os.environ.get("RUNNER_TEMP")
-    if not runner_temp:
+    if not tag or not runner_temp:
         return set()
+    minted = re.compile(rf"{re.escape(f'provider-smoke-{tag}-')}[0-9a-f]{{16}}")
     try:
         paths = list(
-            (Path(runner_temp) / "just-akash-deployment-receipts").glob("provider-smoke-*.json")
+            (Path(runner_temp) / "just-akash-deployment-receipts").glob(
+                f"provider-smoke-{tag}-*.json"
+            )
         )
     except OSError:
         return set()
-    groups: set[str] = set()
+    pairs: set[tuple[str, str]] = set()
     for path in paths:
         try:
             receipt = decode_receipt(path.read_bytes())
@@ -638,13 +675,29 @@ def _this_run_probe_groups(owner: str) -> set[str]:
                 f"its probe is not treated as this run's{RESET}"
             )
             continue
-        if receipt.get("expected_owner") != owner:
+        if receipt["state"] != "create_response_received":
             continue
-        for entry in receipt.get("group_population") or []:
-            name = entry.get("name") if isinstance(entry, dict) else None
-            if isinstance(name, str) and _STAMPED_PROBE_GROUP_RE.fullmatch(name):
-                groups.add(name)
-    return groups
+        if not minted.fullmatch(receipt["operation_id"]) or receipt["expected_owner"] != owner:
+            continue
+        population = receipt["group_population"]
+        if len(population) != 1:
+            continue
+        group = population[0].get("name")
+        if not isinstance(group, str) or not _STAMPED_PROBE_GROUP_RE.fullmatch(group):
+            continue
+        dseq = str(receipt["dseq"])
+        created = _probe_age_seconds(dseq, time.time())
+        try:
+            received = datetime.fromisoformat(receipt["response_received_at"]).timestamp()
+        except (TypeError, ValueError):
+            continue
+        if created is None:
+            continue
+        minted_at = time.time() - created
+        if received < minted_at - _RECEIPT_CLOCK_SKEW_SECONDS:
+            continue
+        pairs.add((dseq, group))
+    return pairs
 
 
 def _probe_group_on_chain(owner: str, dseq: str) -> str | None:
@@ -689,8 +742,8 @@ def sweep_orphan_probes(
         print(f"  {YELLOW}orphan sweep skipped: list_deployments failed: {e}{RESET}")
         return []
     # Only read when the floor is below the 1h orphan age (the end-of-job reap).
-    this_run_groups = (
-        _this_run_probe_groups(owner) if min_age_seconds < MIN_ORPHAN_AGE_SECONDS else set()
+    this_run_probes = (
+        _this_run_probe_receipts(owner) if min_age_seconds < MIN_ORPHAN_AGE_SECONDS else set()
     )
     found: list[str] = []  # orphans identified
     swept: list[str] = []  # orphans confirmed destroyed (or, in dry-run, matched)
@@ -721,12 +774,13 @@ def sweep_orphan_probes(
             print(f"  {YELLOW}orphan sweep: could not read {dseq}'s group: {str(e)[:120]}{RESET}")
             continue
         # Below the 1h floor (the end-of-job reap runs --min-age 0) a probe is reaped only
-        # when THIS job stamped it. A concurrent run's or a developer's live probe carries
-        # another run id, and the legacy `akash` name proves no run at all.
+        # when THIS run attempt's own create receipt names this exact dseq and group. A
+        # concurrent run's or a developer's live probe has no such receipt, and the legacy
+        # `akash` name proves no run at all.
         if (
             group is not None
             and (age is None or age < MIN_ORPHAN_AGE_SECONDS)
-            and not (_STAMPED_PROBE_GROUP_RE.fullmatch(group) and group in this_run_groups)
+            and not (_STAMPED_PROBE_GROUP_RE.fullmatch(group) and (dseq, group) in this_run_probes)
         ):
             print(
                 f"  orphan sweep: spared {dseq} ({age_note}, group {group}): younger than "
@@ -1137,7 +1191,9 @@ def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, s
     rather than a lease that never formed. ``dseq_ref`` is populated whenever a dseq
     was seen at all — including on failure — so cleanup can never miss one.
     """
-    receipt_path, operation_id, receipt_env = receipt_environment("provider-smoke", unique=True)
+    receipt_path, operation_id, receipt_env = receipt_environment(
+        _smoke_receipt_label(), unique=True
+    )
     dseq_ref["receipt_path"] = receipt_path
     command = [
         "uv",

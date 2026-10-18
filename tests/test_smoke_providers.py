@@ -1337,7 +1337,7 @@ class TestOrphanProbeSweep:
         api = self._fake_api([{"dseq": dseq}], {dseq: self._detail([service])})
         with (
             patch.object(sp, "_api", return_value=api),
-            patch.object(sp, "_this_run_probe_groups", return_value=set(this_run)),
+            patch.object(sp, "_this_run_probe_receipts", return_value=set(this_run)),
             patch.object(sp, "robust_destroy", return_value=True) as rd,
             patch.object(sp.time, "time", return_value=self.NOW),
         ):
@@ -1346,7 +1346,7 @@ class TestOrphanProbeSweep:
 
     def test_min_age_zero_reaps_a_young_probe_this_run_stamped(self):
         d = self._dseq_aged(5)
-        swept, rd = self._sweep_young(d, self.STAMPED, {self.STAMPED})
+        swept, rd = self._sweep_young(d, self.STAMPED, {(d, self.STAMPED)})
         assert swept == [d]
         rd.assert_called_once_with(d, owner=OWNER, group=self.STAMPED)
 
@@ -1354,7 +1354,7 @@ class TestOrphanProbeSweep:
         """Codex P1: a concurrent run's (or a developer's) live probe carries ANOTHER run
         id. Under --min-age 0 it must not reach robust_destroy."""
         d = self._dseq_aged(5)
-        swept, rd = self._sweep_young(d, "just-akash-probe.fedcba987654", {self.STAMPED})
+        swept, rd = self._sweep_young(d, "just-akash-probe.fedcba987654", {(d, self.STAMPED)})
         assert swept == []
         rd.assert_not_called()
         assert "spared" in capsys.readouterr().out
@@ -1363,13 +1363,13 @@ class TestOrphanProbeSweep:
         """Codex P1: `akash` proves no run. Under --min-age 0 a 5-second-old one is NOT
         reaped; the legacy name needs the 1h floor unconditionally."""
         d = self._dseq_aged(5)
-        swept, rd = self._sweep_young(d, "akash", {self.STAMPED, "akash"})
+        swept, rd = self._sweep_young(d, "akash", {(d, self.STAMPED), (d, "akash")})
         assert swept == []
         rd.assert_not_called()
 
     def test_min_age_zero_spares_a_young_unstamped_probe(self):
         d = self._dseq_aged(5)
-        swept, rd = self._sweep_young(d, sp.PROBE_GROUP, {self.STAMPED})
+        swept, rd = self._sweep_young(d, sp.PROBE_GROUP, {(d, self.STAMPED), (d, sp.PROBE_GROUP)})
         assert swept == []
         rd.assert_not_called()
 
@@ -1407,27 +1407,114 @@ class TestOrphanProbeSweep:
         assert f"could not read {bad}" in out
         assert "INCOMPLETE" in out
 
-    def test_this_run_groups_come_from_this_jobs_receipts(self, monkeypatch, tmp_path):
+    # ── young-close authority: this run attempt's own receipts (REAL decoder) ──
+    RUN_TAG = "gh123.1"
+
+    def _receipt(self, tmp_path, *, operation_id, dseq=None, group=None, stale=False):
+        """A real receipt written by deployment_receipt's own writers, so the sweep's
+        reader is exercised through decode_receipt, not a stub."""
+        import json
+
+        from just_akash.deployment_receipt import (
+            mark_create_response_received,
+            mark_submitting,
+            prepare_receipt,
+        )
+        from just_akash.provenance import stamp_run
+
         receipts = tmp_path / "just-akash-deployment-receipts"
-        receipts.mkdir()
-        payloads = {
-            "provider-smoke-a.json": (OWNER, self.STAMPED),
-            "provider-smoke-b.json": ("akash1someoneelse", "just-akash-probe.111111111111"),
-            "provider-smoke-c.json": (OWNER, "just-akash-probe.research.abcdef"),
-            "other-label.json": (OWNER, "just-akash-probe.222222222222"),
-        }
-        for name in payloads:
-            (receipts / name).write_text(name)
+        receipts.mkdir(mode=0o700, exist_ok=True)
+        receipts.chmod(0o700)
+        group = group or self.STAMPED
+        sdl, _ = stamp_run(sp.PROBE_SDL, group.rpartition(".")[2])
+        path = receipts / f"{operation_id}.json"
+        prepared = prepare_receipt(
+            str(path), operation_id=operation_id, owner=OWNER, sdl_content=sdl
+        )
+        if dseq is not None:
+            submitting = mark_submitting(*prepared)
+            mark_create_response_received(
+                *submitting, dseq=dseq, deployment_response={"dseq": dseq}
+            )
+        if stale:
+            doc = json.loads(path.read_text())
+            for key in ("prepared_at", "submitting_at", "response_received_at"):
+                if key in doc:
+                    doc[key] = "2020-01-01T00:00:00+00:00"
+            path.write_text(json.dumps(doc))
+        return path
 
-        def decode(payload):
-            owner, group = payloads[payload.decode()]
-            return {"expected_owner": owner, "group_population": [{"gseq": 1, "name": group}]}
-
+    def _sweep_with_receipts(self, monkeypatch, tmp_path, dseq):
         monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
-        monkeypatch.setattr(sp, "decode_receipt", decode)
-        assert sp._this_run_probe_groups(OWNER) == {self.STAMPED}
-        monkeypatch.delenv("RUNNER_TEMP")
-        assert sp._this_run_probe_groups(OWNER) == set()
+        monkeypatch.setenv("GITHUB_RUN_ID", "123")
+        monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "1")
+        self.groups[dseq] = [self.STAMPED]
+        api = self._fake_api([{"dseq": dseq}], {dseq: self._detail(["probe"])})
+        with (
+            patch.object(sp, "_api", return_value=api),
+            patch.object(sp, "robust_destroy", return_value=True) as rd,
+            patch.object(sp, "_delete_resolved_provider_smoke_receipts"),
+            patch.object(sp.time, "time", return_value=self.NOW),
+        ):
+            swept = sp.sweep_orphan_probes(min_age_seconds=0)
+        return swept, rd
+
+    def _op(self, tag=None):
+        return f"provider-smoke-{tag or self.RUN_TAG}-0123456789abcdef"
+
+    def test_this_runs_create_confirmed_receipt_for_this_dseq_authorizes_a_young_close(
+        self, monkeypatch, tmp_path
+    ):
+        d = self._dseq_aged(5)
+        self._receipt(tmp_path, operation_id=self._op(), dseq=d)
+        swept, rd = self._sweep_with_receipts(monkeypatch, tmp_path, d)
+        assert swept == [d]
+        rd.assert_called_once_with(d, owner=OWNER, group=self.STAMPED)
+
+    def test_a_prepared_receipt_without_a_dseq_authorizes_nothing(self, monkeypatch, tmp_path):
+        """Codex round 2: a valid 2020 `prepared` receipt, no dseq, authorized a destroy."""
+        d = self._dseq_aged(5)
+        self._receipt(tmp_path, operation_id=self._op(), stale=True)
+        swept, rd = self._sweep_with_receipts(monkeypatch, tmp_path, d)
+        assert swept == []
+        rd.assert_not_called()
+
+    def test_a_receipt_for_another_dseq_authorizes_nothing(self, monkeypatch, tmp_path):
+        """Codex round 2: a create_response_received receipt naming ANOTHER dseq did too."""
+        d = self._dseq_aged(5)
+        self._receipt(tmp_path, operation_id=self._op(), dseq=self._dseq_aged(9))
+        swept, rd = self._sweep_with_receipts(monkeypatch, tmp_path, d)
+        assert swept == []
+        rd.assert_not_called()
+
+    def test_a_receipt_from_another_run_attempt_authorizes_nothing(self, monkeypatch, tmp_path):
+        d = self._dseq_aged(5)
+        self._receipt(tmp_path, operation_id=self._op("gh123.2"), dseq=d)  # a retry attempt
+        self._receipt(tmp_path, operation_id="provider-smoke-0123456789abcdef", dseq=d)  # no tag
+        swept, rd = self._sweep_with_receipts(monkeypatch, tmp_path, d)
+        assert swept == []
+        rd.assert_not_called()
+
+    def test_a_receipt_older_than_its_own_dseq_authorizes_nothing(self, monkeypatch, tmp_path):
+        d = self._dseq_aged(5)
+        self._receipt(tmp_path, operation_id=self._op(), dseq=d, stale=True)
+        swept, rd = self._sweep_with_receipts(monkeypatch, tmp_path, d)
+        assert swept == []
+        rd.assert_not_called()
+
+    def test_without_a_run_tag_no_receipt_is_this_runs(self, monkeypatch, tmp_path):
+        d = self._dseq_aged(5)
+        self._receipt(tmp_path, operation_id=self._op(), dseq=d)
+        monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+        monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
+        assert sp._this_run_probe_receipts(OWNER) == set()
+
+    def test_the_smoke_receipt_label_carries_the_run_tag(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_RUN_ID", "123")
+        monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "1")
+        assert sp._smoke_receipt_label() == f"provider-smoke-{self.RUN_TAG}"
+        monkeypatch.delenv("GITHUB_RUN_ID")
+        assert sp._smoke_receipt_label() == "provider-smoke"
 
     # ── in-place update keeps the run id already on chain ─────────────
     def test_update_sdl_carries_the_on_chain_stamped_key(self, tmp_path):
