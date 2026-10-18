@@ -10,6 +10,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- `close-backtest.yml` + `python -m just_akash.close_backtest` (Flynn openmix-0tce): close ONE
+  named, leased, leaked e2e backtest. Nothing else could: close-orphans closes only lease-less
+  deployments, and cleanup-stale and `robust_destroy(owner=, group=)` both need the signed
+  creation tx, which public LCDs have pruned for any lease older than their history
+  (openmix-hxlg). It refuses unless the deployment is this key's wallet's, active, running
+  exactly `{backtest}`, at least 48 h old, and carries exactly the typed `expected_group`
+  (`just-akash-backtest.<12 hex>`) as its only group on >= 2 agreeing LCD sources; it re-checks
+  all of that at the close and counts the close only on a terminal read-back. Two jobs: `plan`
+  verifies and closes nothing; `close` runs only with `execute=true`, after `plan`, behind the
+  `production` environment, and `plan` refuses `execute=true` unless that environment already
+  exists with a required reviewer (GitHub creates a named environment unprotected on first use).
 - Lease charters for placements Flynn counts as ours (`flynn-*`, `fleet-*`, exactly
   `dcloud`/`akash`; openmix-pvr6.1). `deploy --charter FILE.json` (or
   `JUST_AKASH_CHARTER_JSON`) POSTs the charter to Flynn before the credit probe and refuses
