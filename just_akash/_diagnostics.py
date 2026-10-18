@@ -83,6 +83,12 @@ class Code:
     SDL_ERROR = "SDL_ERROR"
     CONFIG_ERROR = "CONFIG_ERROR"  # missing API key / bad deposit / bad --env
 
+    # Lease charters (openmix-pvr6.1) — a placement of ours (flynn-/fleet-/dcloud/akash).
+    CHARTER_MISSING = "CHARTER_MISSING"  # no charter; warn mode proceeds, enforce refuses
+    CHARTER_POST_FAILED = "CHARTER_POST_FAILED"  # Flynn refused/unreachable → nothing created
+    CHARTER_DEPOSIT_FAILED = "CHARTER_DEPOSIT_FAILED"  # top-up/top-up-off failed → lease closed
+    CHARTER_BIND_FAILED = "CHARTER_BIND_FAILED"  # lease kept, Flynn sees it as uncharted
+
     # Reliability — post-deploy / smoke; the "external sweep reaps the lease" symptom.
     LEASE_DOWN = "LEASE_DOWN"
     # A result frame carried a null or absent exit_code, so the command's real exit

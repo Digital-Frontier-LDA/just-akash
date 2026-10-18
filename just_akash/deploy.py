@@ -24,11 +24,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypedDict, cast
 
+import yaml
 from akash_lease_core import Auction, AuctionPolicy, AuctionStatus, BidObservation
 from akash_lease_core.auction import PreferredSelection
 from akash_lease_core.capacity import ProviderCapacity, ResourceProfile
 
 from . import chain
+from . import charter as charter_mod
 from ._confidential import (
     active,
     canonical_dseq,
@@ -48,13 +50,25 @@ from .api import (
     _extract_gseq,
     _extract_provider,
 )
+from .charter import Charter
 from .deployment_receipt import (
     credential_binding_for,
     mark_create_response_received,
     mark_submitting,
     prepare_receipt,
 )
-from .provenance import PLACEMENT_PREFIX, SIBLING_REAPED_PREFIX, run_id_of, stamp_run
+from .provenance import (
+    CHARTER_ID_RE,
+    CHARTER_SEPARATOR,
+    OURS_PREFIXES,
+    PLACEMENT_PREFIX,
+    SIBLING_REAPED_PREFIX,
+    placement_keys,
+    run_id_of,
+    stamp_charter,
+    stamp_run,
+    uncharted_key,
+)
 from .provider_capacity import capacity_by_provider
 from .request_profile import attach_profile, derive_resource_profiles, observed_gseq
 from .sdl_validate import SDLValidationError, validate_sdl
@@ -1014,6 +1028,178 @@ def _check_wallet_credit(client: AkashConsoleAPI, deposit: float) -> None:
         )
 
 
+def _yaml_placement_keys(text: str) -> list[str]:
+    """``profiles.placement`` keys as YAML reads them; [] when the text does not parse (a
+    templated SDL) or has no such mapping."""
+    try:
+        doc = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return []
+    profiles = doc.get("profiles") if isinstance(doc, dict) else None
+    placement = profiles.get("placement") if isinstance(profiles, dict) else None
+    return [str(k) for k in placement] if isinstance(placement, dict) else []
+
+
+def _sdl_placement_keys(sdl_path: str, gpu: bool) -> tuple[list[str], list[str]]:
+    """(placement keys, the ones of ours only YAML sees) of the SDL deploy() will read, for
+    the charter gate. An unreadable file yields none: Step 1 raises on it anyway, and still
+    before anything is spent.
+
+    ⛔ THE LINE SCANNER IS NOT THE ONLY READER. ``placement_keys`` (which stamp_charter
+    rewrites by) reads only the canonical layout: ``  placement:`` at 2 spaces with nothing
+    after it, unquoted keys at 4. A valid SDL with a 4-space indent, a trailing comment or a
+    quoted key yields nothing there, and the gate would let a placement of ours out with no
+    charter and no CHARTER_MISSING. So YAML is asked too, and every key of ours it alone
+    sees is returned in the second list: gated like any other, and refused when a charter
+    would have to stamp it."""
+    p = Path(sdl_path)
+    if gpu:
+        variant = p.with_name(f"{p.stem}-gpu{p.suffix}")
+        if variant.exists():
+            p = variant
+    try:
+        text = p.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return [], []
+    keys = placement_keys(text)
+    unscanned = [
+        k for k in _yaml_placement_keys(text) if k not in keys and charter_mod.is_ours_placement(k)
+    ]
+    return keys + unscanned, unscanned
+
+
+def _stamp_charter_or_refuse(sdl_content: str, charter_id: str) -> tuple[str, list[str]]:
+    """stamp_charter, with its ValueError (a placement-group clash, a malformed charter id)
+    turned into the RuntimeError every entry point reports, and a typed SDL_ERROR."""
+    try:
+        return stamp_charter(sdl_content, charter_id)
+    except ValueError as e:
+        emit(Code.SDL_ERROR, "error", error_text(e))
+        raise RuntimeError(error_text(e)) from e
+
+
+def _charter_wallet_label(charter: Charter, wallet, client) -> str:
+    """The bind label of the wallet the pool SELECTED — checked against it, not assumed."""
+    address = wallet.account
+    # The address is only needed to read the label map; one key and a charter label needs
+    # no Console round-trip.
+    if not address and (not charter.wallet_label or os.environ.get(charter_mod.WALLET_LABELS_ENV)):
+        address = client.account_address()
+    return charter_mod.wallet_label_for(
+        charter, address, configured_keys=getattr(wallet, "configured_keys", 1) or 1
+    )
+
+
+def _post_charter(charter: Charter) -> tuple[charter_mod.FlynnCharterClient, str]:
+    """Write the charter to Flynn. Any failure refuses the deploy: nothing is created yet."""
+    try:
+        flynn = charter_mod.FlynnCharterClient()
+        charter_id = flynn.post(charter)
+    except charter_mod.CharterError as e:
+        _log(logging.ERROR, f"CHARTER not accepted: {error_text(e)} — nothing created")
+        emit(
+            Code.CHARTER_POST_FAILED,
+            "error",
+            f"lease charter not accepted: {error_text(e)}",
+            bead=charter.bead,
+        )
+        raise
+    return flynn, charter_id
+
+
+def _close_charter_deployment(client, dseq: str) -> bool:
+    """Best-effort close after a charter refusal. True only when the close call returned:
+    a caller must never report "closed" for a deployment that may still be live."""
+    try:
+        client.close_deployment(dseq)
+    except Exception as cleanup_err:
+        _log(
+            logging.ERROR,
+            f"Cleanup of {display(dseq, 'dseq')} also failed: {error_text(cleanup_err)}",
+        )
+        return False
+    return True
+
+
+def _fund_charter_lease(
+    client, charter: Charter, dseq: str, price_amount, price_denom: str
+) -> float:
+    """Top the minimum-deposit order up to the charter's lifetime, then switch auto top-up
+    OFF (ON when prod_pinned) — read back by set_auto_top_up. Returns the total deposit.
+
+    ⛔ ANY FAILURE CLOSES THE LEASE. Underfunded, it dies early and reads as a provider
+    fault; with auto top-up still on, it never expires — the uncapped lease a charter
+    exists to prevent. Neither is worth keeping.
+    """
+    minimum = charter_mod.MIN_DEPOSIT
+    try:
+        if price_denom != "uact":
+            raise RuntimeError(f"bid priced in {price_denom!r}, not uact")
+        target = charter_mod.deposit_for(charter.max_hours, price_amount, charter.max_act)
+        top_up = round(target - minimum, 6)
+        # The Console refuses a deposit below its minimum: round a small remainder up when
+        # the budget has room for it, else leave it (under-funded by < 0.5 ACT).
+        if 0 < top_up < minimum:
+            top_up = minimum if minimum * 2 <= charter.max_act else 0.0
+        if top_up > 0:
+            client.deposit_deployment(dseq, top_up)
+            _log(logging.INFO, f"CHARTER deposit +{top_up:g} USD (total {minimum + top_up:g})")
+        # Written in BOTH cases: a new deployment has no settings at all (the Console
+        # 404s them, which reads as OFF), so a prod-pinned lease left alone would run out
+        # at max_hours exactly like a job lease.
+        client.set_auto_top_up(dseq, charter.prod_pinned)
+        _log(
+            logging.INFO,
+            f"CHARTER auto top-up {'ON (prod_pinned)' if charter.prod_pinned else 'OFF'} "
+            "(verified by read-back)",
+        )
+    except Exception as e:
+        _log(
+            logging.ERROR,
+            f"CHARTER funding failed for {display(dseq, 'dseq')}: {error_text(e)} — closing",
+        )
+        closed = _close_charter_deployment(client, dseq)
+        outcome = "lease closed" if closed else "lease close FAILED; close it manually"
+        emit(
+            Code.CHARTER_DEPOSIT_FAILED,
+            "error",
+            f"charter deposit/auto top-up failed; {outcome}: {error_text(e)}",
+            dseq=dseq,
+            closed=closed,
+        )
+        raise RuntimeError(
+            f"charter deposit/auto top-up failed for {display(dseq, 'dseq')}; "
+            f"{outcome}: {error_text(e)}"
+        ) from e
+    return minimum + top_up
+
+
+def _bind_charter(flynn, charter_id: str, charter: Charter, wallet_label: str, dseq: str) -> bool:
+    """Bind the charter to the lease. A failure KEEPS the lease (it is funded and capped;
+    Flynn shows it as uncharted and pages) — closing a healthy lease over a ledger write
+    would trade a bookkeeping gap for a lost workload."""
+    try:
+        flynn.bind(
+            charter_id,
+            wallet=wallet_label,
+            dseq=dseq,
+            endpoint_url=charter.endpoint_url,
+            telemetry_url=charter.telemetry_url,
+        )
+    except charter_mod.CharterError as e:
+        _log(logging.ERROR, f"CHARTER {charter_id} NOT bound: {error_text(e)} — lease kept")
+        emit(
+            Code.CHARTER_BIND_FAILED,
+            "error",
+            f"charter bind failed; lease kept: {error_text(e)}",
+            dseq=dseq,
+            charter_id=charter_id,
+        )
+        return False
+    _log(logging.INFO, f"CHARTER {charter_id} bound to {display(dseq, 'dseq')} ({wallet_label})")
+    return True
+
+
 @sdl_operation
 def deploy(
     sdl_path: str,
@@ -1030,6 +1216,7 @@ def deploy(
     receipt_path: str | None = None,
     receipt_operation_id: str | None = None,
     quiet_wallet: bool | None = None,
+    charter: Charter | None = None,
 ) -> dict:
     # deposit is user-controlled (--deposit); reject non-finite/non-positive
     # values before they reach json.dumps (which would emit invalid NaN/Infinity).
@@ -1068,9 +1255,68 @@ def deploy(
         fallback_window_seconds=fallback_wait,
     )
 
+    # ⛔ LEASE CHARTER GATE (openmix-pvr6.1), before the wallet is even chosen: under
+    # enforce, an uncharted placement of ours must cost nothing. Read from the file as
+    # given; Step 1's transforms only ever stamp just-akash- keys, which are not ours.
+    _charter_mode = charter_mod.mode()
+    _charter_keys, _unscanned = _sdl_placement_keys(sdl_path, gpu)
+    _ours = any(charter_mod.is_ours_placement(k) for k in _charter_keys)
+    if charter is not None and charter.ambient and not _ours:
+        # JUST_AKASH_CHARTER_JSON is a job-wide default: a dfci-*/just-akash-* deploy in the
+        # same job is not refused for it, it simply has no charter (AC1: unchanged).
+        _log(
+            logging.INFO,
+            f"{charter_mod.CHARTER_JSON_ENV} ignored: placement "
+            f"{_charter_keys or '(none)'} is not ours",
+        )
+        charter = None
+    if charter is not None and not _ours:
+        raise RuntimeError(
+            f"a lease charter was given, but placement {_charter_keys or '(none)'} is not one "
+            "Flynn attributes to us (flynn-*, fleet-*, dcloud, akash); the charter could never "
+            "be matched to the lease"
+        )
+    _unstampable = [k for k in _unscanned if uncharted_key(k).startswith(OURS_PREFIXES)]
+    if charter is not None and _unstampable:
+        msg = (
+            f"placement {', '.join(_unstampable)} is in an SDL layout the charter stamp cannot "
+            "rewrite (it needs `  placement:` at 2 spaces with no trailing comment, and "
+            "unquoted keys at 4); the lease could not carry its charter id. Reformat the SDL"
+        )
+        emit(Code.SDL_ERROR, "error", msg, placements=_unstampable)
+        raise RuntimeError(msg)
+    try:
+        _uncharted = charter_mod.gate(_charter_keys, charter, _charter_mode)
+    except charter_mod.CharterMissing as e:
+        emit(Code.CHARTER_MISSING, "error", error_text(e), mode=_charter_mode)
+        raise
+    if _uncharted:
+        _log(
+            logging.WARNING,
+            f"CHARTER missing for placement {', '.join(_uncharted)} — proceeding "
+            f"({charter_mod.MODE_ENV}=warn; enforce will refuse this deploy)",
+        )
+        emit(
+            Code.CHARTER_MISSING,
+            "warning",
+            f"no lease charter for placement {', '.join(_uncharted)}",
+            mode=_charter_mode,
+            placements=_uncharted,
+        )
+    # A chartered order is created at the Console minimum and topped up once the winning
+    # bid's price is known; the wallet is still chosen, and probed, for the whole budget
+    # the charter may spend. Without a charter all three are --deposit, as before.
+    if charter is not None and deposit != 5.0:
+        _log(
+            logging.WARNING,
+            f"--deposit {deposit:g} is ignored: the charter sizes the escrow from max_hours",
+        )
+    create_deposit = charter_mod.MIN_DEPOSIT if charter is not None else deposit
+    budget = charter.max_act if charter is not None else deposit
+
     from .wallet_pool import select_client_for_create
 
-    required_uact = math.ceil(deposit * 1_000_000)
+    required_uact = math.ceil(budget * 1_000_000)
     # openmix-wxs8: OPT-IN (--quiet-wallet / AKASH_QUIET_WALLET=1; None reads the env): with
     # several keys, the wallet must be funded AND quiet. Default: funding-only, as before.
     wallet = select_client_for_create(
@@ -1110,7 +1356,25 @@ def deploy(
     _log(logging.INFO, "STEP 1: Preparing SDL")
     sdl_content = _prepare_sdl_content(sdl_path, image=image, env_vars=env_vars)
     protect_content(sdl_content)
-    _check_wallet_credit(client, deposit)
+    charter_id = flynn = charter_wallet_label = None
+    if charter is not None:
+        # The label is resolved BEFORE the charter is written: a lease that cannot be bound
+        # is an uncharted lease, and finding that out after the spend is too late.
+        charter_wallet_label = _charter_wallet_label(charter, wallet, client)
+        # Stamping can only fail on the KEYS (a merge of two placement groups), never on
+        # the id, so a dry run with a placeholder id refuses before anything is written.
+        _stamp_charter_or_refuse(sdl_content, "ch-" + "0" * 10)
+        flynn, charter_id = _post_charter(charter)
+        sdl_content, _stamped = _stamp_charter_or_refuse(sdl_content, charter_id)
+        validate_sdl(sdl_content)
+        protect_content(sdl_content)
+        _log(
+            logging.INFO,
+            f"CHARTER {charter_id}  bead={charter.bead}  kind={charter.kind}  "
+            f"max_hours={charter.max_hours:g}  max_act={charter.max_act:g}  "
+            f"placement={', '.join(_stamped) or ', '.join(_charter_keys)}",
+        )
+    _check_wallet_credit(client, budget)
     # ⛔ RE-CHECK QUIET AS LATE AS POSSIBLE, BUT BEFORE THE RECEIPT. The receipt binds the
     # owner, so a re-selection after it would record the wrong wallet. It runs AFTER the
     # credit probe (an LCD round-trip) so that probe is not inside the window. What remains
@@ -1130,7 +1394,9 @@ def deploy(
             )
             wallet = rechecked
             client = wallet.client
-            _check_wallet_credit(client, deposit)  # the probe described the OLD wallet
+            _check_wallet_credit(client, budget)  # the probe described the OLD wallet
+            if charter is not None:
+                charter_wallet_label = _charter_wallet_label(charter, wallet, client)
 
     prepared_receipt = None
     if receipt_path is not None:
@@ -1152,7 +1418,7 @@ def deploy(
     # Step 2: Create deployment (with stale-deployment recovery)
     _log(
         logging.INFO,
-        f"STEP 2: Creating deployment via Console API (escrow deposit: {deposit} USD)...",
+        f"STEP 2: Creating deployment via Console API (escrow deposit: {create_deposit} USD)...",
     )
     # Stamped BEFORE the request so a deployment created by THIS call can be told from
     # one that already existed. See _report_suspected_orphans.
@@ -1160,7 +1426,7 @@ def deploy(
     if prepared_receipt is not None:
         prepared_receipt = mark_submitting(*prepared_receipt)
     try:
-        deployment_response = client.create_deployment(sdl_content, deposit=deposit)
+        deployment_response = client.create_deployment(sdl_content, deposit=create_deposit)
     except RuntimeError as e:
         if "already exists" in error_text(e).lower():
             if prepared_receipt is not None:
@@ -1186,7 +1452,7 @@ def deploy(
                 _log(logging.ERROR, f"Stale deployment cleanup failed: {error_text(cleanup_err)}")
             # Retry once after cleanup
             try:
-                deployment_response = client.create_deployment(sdl_content, deposit=deposit)
+                deployment_response = client.create_deployment(sdl_content, deposit=create_deposit)
             except RuntimeError as retry_err:
                 _log(
                     logging.ERROR, f"Create deployment FAILED after retry: {error_text(retry_err)}"
@@ -2177,7 +2443,7 @@ def deploy(
         # one here doubles the cost of the failure it is trying to recover from.
         _redeploy_started = time.time()
         try:
-            redeploy_response = client.create_deployment(sdl_content, deposit=deposit)
+            redeploy_response = client.create_deployment(sdl_content, deposit=create_deposit)
         except RuntimeError as redeploy_err:
             _report_suspected_orphans(client, _redeploy_started, _RUN_ID)
             raise RuntimeError(
@@ -2263,6 +2529,28 @@ def deploy(
     attempt = 0
     while True:
         attempt += 1
+        if charter is not None and price_denom != "uact":
+            # Refused BEFORE the lease: the deposit formula is uact/block, and a guessed
+            # conversion is how a budget silently ends up a factor of 10^6 wrong. Checked on
+            # EVERY attempt: a stale-bid retry or the issue-#19 re-deploy can switch bids.
+            _log(logging.ERROR, f"Bid priced in {price_denom}, not uact — cannot size the charter")
+            closed = _close_charter_deployment(client, str(dseq))
+            outcome = (
+                "deployment closed before lease"
+                if closed
+                else "deployment close FAILED before lease; close it manually"
+            )
+            emit(
+                Code.CHARTER_DEPOSIT_FAILED,
+                "error",
+                f"selected bid is priced in {price_denom}, not uact; {outcome}",
+                dseq=str(dseq),
+                closed=closed,
+            )
+            raise RuntimeError(
+                f"selected bid is priced in {price_denom!r}, not uact: a chartered deposit cannot "
+                f"be sized from it; {outcome}"
+            )
         try:
             lease_response = client.create_lease(
                 dseq=str(dseq),
@@ -2396,6 +2684,15 @@ def deploy(
             raise RuntimeError(f"Failed to create lease: {error_text(e)}") from e
 
     _log(logging.INFO, "Lease created successfully!")
+    charter_deposit = charter_bound = None
+    if charter is not None:
+        # Bound to the FINAL dseq: the issue-#19 round above may have replaced the order.
+        charter_deposit = _fund_charter_lease(
+            client, charter, str(dseq), price_amount, price_denom
+        )
+        charter_bound = _bind_charter(
+            flynn, str(charter_id), charter, str(charter_wallet_label), str(dseq)
+        )
     _log(
         logging.INFO,
         f"DEPLOYMENT SUMMARY  DSEQ={display(dseq, 'dseq')}  "
@@ -2420,7 +2717,7 @@ def deploy(
         print(f"  Wallet available: {wallet.available_uact} uact")
     print(f"\nUse 'just-akash status --dseq {display(dseq, 'dseq')}' to check deployment status")
 
-    return {
+    result = {
         "dseq": dseq,
         "provider": provider,
         "price": price_amount,
@@ -2429,6 +2726,56 @@ def deploy(
         "wallet_account": wallet_account,
         "wallet_policy": wallet.policy_version,
     }
+    if charter is not None:
+        result.update(charter_id=charter_id, deposit=charter_deposit, charter_bound=charter_bound)
+    return result
+
+
+def _charter_ids_in(doc: Any) -> set[str]:
+    """Charter ids carried by any ``flynn-``/``fleet-`` group name in a Console deployment
+    document. Walked, not indexed: only the name strings matter, wherever they sit."""
+    found: set[str] = set()
+    if isinstance(doc, dict):
+        for value in doc.values():
+            found |= _charter_ids_in(value)
+    elif isinstance(doc, list):
+        for value in doc:
+            found |= _charter_ids_in(value)
+    elif isinstance(doc, str):
+        head, sep, tail = doc.rpartition(CHARTER_SEPARATOR)
+        if sep and head.startswith(OURS_PREFIXES) and CHARTER_ID_RE.fullmatch(tail):
+            found.add(tail)
+    return found
+
+
+def _restamp_charter_for_update(
+    client, dseq: str, sdl_content: str, charter_id: str | None
+) -> str:
+    """Re-apply the charter stamp deploy() put on the placement keys, so the PUT manifest
+    names the SAME groups as the chain. Not ours (no flynn-/fleet- key): unchanged."""
+    if not any(uncharted_key(k).startswith(OURS_PREFIXES) for k in placement_keys(sdl_content)):
+        return sdl_content
+    if charter_id is None:
+        try:
+            ids = _charter_ids_in(client.get_deployment(dseq))
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"cannot read deployment {display(dseq, 'dseq')} to recover its charter id "
+                f"({error_text(e)}); pass --charter-id"
+            ) from e
+        if len(ids) > 1:
+            raise RuntimeError(
+                f"deployment {display(dseq, 'dseq')} carries several charter ids "
+                f"({', '.join(sorted(ids))}); pass --charter-id"
+            )
+        if not ids:
+            return sdl_content  # an uncharted lease: its group names are the SDL's own
+        charter_id = ids.pop()
+    sdl_content, stamped = _stamp_charter_or_refuse(sdl_content, charter_id)
+    validate_sdl(sdl_content)
+    if stamped:
+        _log(logging.INFO, f"CHARTER {charter_id} re-stamped: {', '.join(stamped)}")
+    return sdl_content
 
 
 @sdl_operation
@@ -2438,12 +2785,17 @@ def update(
     image: str | None = None,
     env_vars: list[str] | None = None,
     api_key: str | None = None,
+    charter_id: str | None = None,
 ) -> dict:
     """Update an active deployment in place with a revised SDL.
 
     Reuses the same SDL preparation as deploy() (validation, image/SSH/env
     overrides) then PUTs to the Console API. The DSEQ and existing lease are
     preserved — no re-bid or new lease is created.
+
+    A chartered lease's placement group is named ``<key>.ch-<id>`` on chain, so its own
+    SDL file no longer matches it: the charter id (``charter_id``, else read back from the
+    deployment's group names) is stamped again before the PUT.
     """
     api_key = api_key or os.environ.get("AKASH_API_KEY")
     if not api_key:
@@ -2463,6 +2815,7 @@ def update(
     # Step 1: Read + validate + transform SDL (identical to deploy).
     _log(logging.INFO, "STEP 1: Preparing SDL")
     sdl_content = _prepare_sdl_content(sdl_path, image=image, env_vars=env_vars)
+    sdl_content = _restamp_charter_for_update(client, str(dseq), sdl_content, charter_id)
     protect_content(sdl_content)
 
     # Step 2: Submit the in-place update.
@@ -2547,6 +2900,14 @@ def deploy_main():
     )
     parser.add_argument("--receipt-path")
     parser.add_argument("--receipt-operation-id")
+    # Mirrors `just-akash deploy --charter` (cli.py): without it, enforce would refuse every
+    # flynn-*/fleet-* deploy here with advice this entry point could not follow.
+    parser.add_argument(
+        "--charter",
+        metavar="FILE.json",
+        help="Lease charter for a placement of ours (flynn-*, fleet-*, dcloud, akash). "
+        "Falls back to JUST_AKASH_CHARTER_JSON; see `just-akash deploy --help`.",
+    )
     # Mirrors the flag on `just-akash deploy` (cli.py). Both entry points reach the same
     # deploy(), so a flag on only one of them is a trap for whoever uses the other.
     parser.add_argument(
@@ -2599,6 +2960,7 @@ def deploy_main():
             backup_providers=[] if args.no_backup_fallback else args.backup_providers,
             receipt_path=args.receipt_path,
             receipt_operation_id=args.receipt_operation_id,
+            charter=charter_mod.load_charter(args.charter),
         )
         sys.exit(0)
     except RuntimeError as e:

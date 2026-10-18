@@ -13,6 +13,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 from just_akash.provenance import (
     PLACEMENT_PREFIX,
     SIBLING_REAPED_PREFIX,
@@ -542,3 +544,170 @@ def test_the_template_predicate_agrees_with_the_scanner():
         assert is_templated(key), f"predicate disagrees with the scanner on {key}"
     for key in ("just-akash-runner", "borduas", "dcloud"):
         assert not is_templated(key), f"{key} is a literal, not a template"
+
+
+# --------------------------------------------------------------------------
+# Charter stamping (just-akash-3sq / openmix-pvr6.1 AC3) — the charter id rides in OUR
+# placement name, and Flynn must still attribute the stamped name to the same class
+# --------------------------------------------------------------------------
+
+CHARTER = "ch-0123456789"
+
+# A mirror of Flynn's attribution (openmix 8943c379, app/background/leases.py): exact names
+# first, then prefixes, first match wins. Vendored on purpose — the point is to catch a
+# stamp that would move a lease from one class to another in THAT code, not in ours.
+_FLYNN_NAME_EXACT = {"dcloud": "RND_FLEET", "akash": "RND_FLEET", "borduas": "OTHER_TEAM_CI"}
+_FLYNN_NAME_PREFIXES = (
+    ("flynn-burst-", "FLYNN_BURST"),
+    ("flynn-", "FLYNN_UNREGISTERED"),
+    ("fleet-", "RND_FLEET"),
+    ("dfci-", "OTHER_TEAM_CI"),
+    ("just-akash-", "JUST_AKASH"),
+    ("borduas-", "OTHER_TEAM_CI"),
+)
+
+
+def _flynn_attribute(name: str) -> str:
+    if name in _FLYNN_NAME_EXACT:
+        return _FLYNN_NAME_EXACT[name]
+    for prefix, cls in _FLYNN_NAME_PREFIXES:
+        if name.startswith(prefix):
+            return cls
+    return "UNATTRIBUTED"
+
+
+def _sdl(key: str) -> str:
+    return (
+        "services:\n"
+        "  web:\n"
+        "    image: nginx\n"
+        "    args:\n"
+        "      - |\n"
+        "        profiles:\n"
+        "          placement:\n"
+        f"            {key}:\n"
+        "profiles:\n"
+        "  placement:\n"
+        f"    {key}:\n"
+        "      pricing: {}\n"
+        "deployment:\n"
+        "  web:\n"
+        f"    {key}:  # ours\n"
+        "      profile: web\n"
+    )
+
+
+def test_stamp_charter_appends_the_id_to_both_copies():
+    from just_akash.provenance import stamp_charter
+
+    out, keys = stamp_charter(_sdl("fleet-serve-qwen"), CHARTER)
+    assert keys == ["fleet-serve-qwen.ch-0123456789"]
+    assert placement_keys(out) == keys
+    assert out.count("    fleet-serve-qwen.ch-0123456789:") == 2
+    assert "fleet-serve-qwen.ch-0123456789:  # ours" in out, "the comment must survive"
+    # The block scalar is string content handed to a container; it must not move.
+    assert "            fleet-serve-qwen:\n" in out
+
+
+def test_a_long_key_is_cut_in_its_workload_part_to_exactly_62():
+    from just_akash.provenance import stamp_charter
+
+    key = "fleet-" + "w" * 54  # 60 chars
+    _, (stamped,) = stamp_charter(_sdl(key), CHARTER)
+    assert len(stamped) == 62
+    assert stamped.startswith("fleet-") and stamped.endswith("." + CHARTER)
+
+
+@pytest.mark.parametrize(
+    "key", ["fleet-serve-qwen", "flynn-x", "flynn-burst-a", "fleet-" + "w" * 54, "dcloud", "akash"]
+)
+def test_a_stamped_name_attributes_like_the_unstamped_one(key):
+    """Flynn's is_ours reads the class, and the class reads the NAME. dcloud/akash are exact
+    names there: `dcloud.ch-...` would fall through to UNATTRIBUTED, so they are not stamped
+    at all — their charter reaches Flynn through the bind alone."""
+    from just_akash.provenance import stamp_charter
+
+    _, keys = stamp_charter(_sdl(key), CHARTER)
+    stamped = keys[0] if keys else key
+    assert _flynn_attribute(stamped) == _flynn_attribute(key) != "UNATTRIBUTED"
+    if key in ("dcloud", "akash"):
+        assert keys == []
+
+
+@pytest.mark.parametrize("key", ["just-akash-runner", "dfci-infra-r", "borduas"])
+def test_charter_stamping_leaves_other_keys_alone(key):
+    from just_akash.provenance import stamp_charter
+
+    sdl = _sdl(key)
+    assert stamp_charter(sdl, CHARTER) == (sdl, [])
+
+
+def test_charter_stamping_is_idempotent():
+    from just_akash.provenance import stamp_charter
+
+    once, _ = stamp_charter(_sdl("flynn-x"), CHARTER)
+    assert stamp_charter(once, CHARTER) == (once, [])
+
+
+def test_a_malformed_charter_id_is_refused():
+    from just_akash.provenance import stamp_charter
+
+    with pytest.raises(ValueError):
+        stamp_charter(_sdl("flynn-x"), "ch-NOTHEX")
+
+
+def _sdl2(a: str, b: str) -> str:
+    return (
+        "services:\n"
+        "  web:\n"
+        "    image: nginx\n"
+        "  api:\n"
+        "    image: nginx\n"
+        "profiles:\n"
+        "  placement:\n"
+        f"    {a}:\n"
+        "      pricing: {}\n"
+        f"    {b}:\n"
+        "      pricing: {}\n"
+        "deployment:\n"
+        "  web:\n"
+        f"    {a}:\n"
+        "      profile: web\n"
+        "  api:\n"
+        f"    {b}:\n"
+        "      profile: api\n"
+    )
+
+
+def test_two_long_keys_sharing_a_prefix_stay_two_placement_groups():
+    """Review F1: cutting both to their first 48 characters made them ONE key (a duplicate
+    YAML key: one placement group dropped while the lease is still funded)."""
+    from just_akash.provenance import stamp_charter
+
+    a = "fleet-serve-qwen3-coder-480b-a35b-instruct-fp8-variant-a"
+    b = "fleet-serve-qwen3-coder-480b-a35b-instruct-fp8-variant-b"
+    out, keys = stamp_charter(_sdl2(a, b), CHARTER)
+    assert len(set(keys)) == 2
+    assert all(len(k) == 62 and k.startswith("fleet-") for k in keys)
+    assert sorted(placement_keys(out)) == sorted(keys)
+    assert out.count(keys[0] + ":") == 2 and out.count(keys[1] + ":") == 2
+
+
+def test_a_stamp_that_would_hit_an_existing_key_is_refused():
+    """flynn-x would become flynn-x.ch-0123456789, which the SDL already declares as a
+    SEPARATE group: refused, never merged."""
+    from just_akash.provenance import stamp_charter
+
+    with pytest.raises(ValueError, match="merge placement groups"):
+        stamp_charter(_sdl2("flynn-x", "flynn-x.ch-0123456789"), CHARTER)
+
+
+def test_a_key_stamped_by_an_earlier_charter_is_restamped():
+    """Review (fallback, decabfe): an SDL reused from an earlier chartered deploy must not
+    go on chain naming the OLD charter while the new one is posted and bound."""
+    from just_akash.provenance import stamp_charter
+
+    out, keys = stamp_charter(_sdl("fleet-serve-qwen.ch-aaaaaaaaaa"), CHARTER)
+    assert keys == ["fleet-serve-qwen.ch-0123456789"]
+    assert placement_keys(out) == keys
+    assert out.count("fleet-serve-qwen.ch-0123456789:") == 2

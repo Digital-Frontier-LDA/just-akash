@@ -1,0 +1,112 @@
+# just-akash-3sq evidence (openmix-pvr6.1 lease charters)
+
+# RED at base c6ec122d (no implementation), 2026-10-17T21:33:47Z
+$ pytest tests/test_charter_gate.py tests/test_charter_flynn_order.py tests/test_charter_deposit.py
+==================================== ERRORS ====================================
+_________________ ERROR collecting tests/test_charter_gate.py __________________
+______________ ERROR collecting tests/test_charter_flynn_order.py ______________
+________________ ERROR collecting tests/test_charter_deposit.py ________________
+ERROR tests/test_charter_gate.py
+ERROR tests/test_charter_flynn_order.py
+ERROR tests/test_charter_deposit.py
+!!!!!!!!!!!!!!!!!!! Interrupted: 3 errors during collection !!!!!!!!!!!!!!!!!!!!
+3 errors in 0.22s
+$ pytest tests/test_provenance.py
+  13 E       ImportError: cannot import name 'stamp_charter' from 'just_akash.provenance' (just_akash/provenance.py)
+   1 FAILED tests/test_provenance.py::test_stamp_charter_appends_the_id_to_both_copies
+   1 FAILED tests/test_provenance.py::test_charter_stamping_leaves_other_keys_alone[just-akash-runner]
+   1 FAILED tests/test_provenance.py::test_charter_stamping_leaves_other_keys_alone[dfci-infra-r]
+   1 FAILED tests/test_provenance.py::test_charter_stamping_leaves_other_keys_alone[borduas]
+   1 FAILED tests/test_provenance.py::test_charter_stamping_is_idempotent - Import...
+   1 FAILED tests/test_provenance.py::test_a_stamped_name_attributes_like_the_unstamped_one[flynn-x]
+   1 FAILED tests/test_provenance.py::test_a_stamped_name_attributes_like_the_unstamped_one[flynn-burst-a]
+   1 FAILED tests/test_provenance.py::test_a_stamped_name_attributes_like_the_unstamped_one[fleet-wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww]
+   1 FAILED tests/test_provenance.py::test_a_stamped_name_attributes_like_the_unstamped_one[fleet-serve-qwen]
+   1 FAILED tests/test_provenance.py::test_a_stamped_name_attributes_like_the_unstamped_one[dcloud]
+   1 FAILED tests/test_provenance.py::test_a_stamped_name_attributes_like_the_unstamped_one[akash]
+   1 FAILED tests/test_provenance.py::test_a_malformed_charter_id_is_refused - Imp...
+   1 FAILED tests/test_provenance.py::test_a_long_key_is_cut_in_its_workload_part_to_exactly_62
+   1 13 failed, 36 passed in 1.44s
+
+# GREEN after implementation, 2026-10-17T22:48:04Z
+$ pytest tests/test_charter_gate.py tests/test_charter_flynn_order.py tests/test_charter_deposit.py tests/test_provenance.py
+112 passed in 36.68s
+
+# MUTATION CHECKS (each mutation applied alone to the implementation, then reverted)
+## M1: gate() never refuses (returns [] always)
+8 failed, 31 deselected in 5.91s
+## M2: charter POST moved after the credit probe
+4 failed, 7 deselected in 6.01s
+## M3: chartered create at the full --deposit, no top-up
+3 failed, 21 deselected in 7.64s
+## M4: auto top-up left on
+1 failed, 1 passed, 11 deselected in 5.24s
+## M5: failed deposit does not close the lease
+2 failed, 11 deselected in 5.05s
+
+# RELATED SUBSET (54 test files touching deploy/provenance/cli/diagnostics/_fake_akash/repo invariants;
+#  excludes test_smoke_providers.py and test_runner_pool_workflow.py, whose run exceeds the 10-min local cap
+#  on the BASE commit too — those run in CI, the full-suite evidence)
+1491 passed in 209.17s (0:03:29)
+
+# POLLUTION FOUND (pre-existing, filed as just-akash-o69): test_adversarial.py then test_balance_check.py leaves
+# just_akash.deploy.AkashConsoleAPI as a MagicMock; the charter harness pins the real class.
+
+== FEEDBACK run 05d0d97e (review aa81bbcc F1-F6 + fallback review of decabfe) ==
+New tests, run against decabfee code (temp worktree, branch tests copied in):
+  9 failed, 100 passed
+  FAILED test_charter_gate::TestWalletLabel::test_the_charter_field_confirmed_by_the_map_is_used  (TypeError: no configured_keys)
+  FAILED test_charter_gate::TestWalletLabel::test_a_charter_label_naming_another_wallet_is_refused  (DID NOT RAISE)
+  FAILED test_charter_gate::TestWalletLabel::test_a_charter_label_that_cannot_be_confirmed_with_several_keys_is_refused  (TypeError)
+  FAILED test_charter_gate::TestWalletLabel::test_deploy_resolves_the_label_of_the_selected_wallet  (DID NOT RAISE)
+  FAILED test_charter_deposit::test_a_prod_pinned_charter_switches_auto_top_up_on_and_reads_it_back  (no set_auto_top_up True)
+  FAILED test_charter_deposit::test_a_retry_bid_not_priced_in_uact_is_refused_before_its_lease  (create_lease ran, then close)
+  FAILED test_provenance::test_two_long_keys_sharing_a_prefix_stay_two_placement_groups  (assert 1 == 2)
+  FAILED test_provenance::test_a_stamp_that_would_hit_an_existing_key_is_refused  (DID NOT RAISE)
+  FAILED test_provenance::test_a_key_stamped_by_an_earlier_charter_is_restamped  (assert [] == [...])
+Same tests on the fixed code: test_charter_deposit + test_provenance 66 passed; all 4 charter/provenance files + census + cli 160 passed.
+Related subset (charter*, provenance, close-site census, cli, cli_dispatch, deploy*, receipt, diagnostics,
+wallet_pool*, chain_provenance, runner_native_diagnostics): 466 passed in 63.47s.
+ruff check + format: clean; pyright charter/deploy/provenance: 0 errors.
+Full suite: PR #460 CI on the pushed head (recorded on the bead).
+
+== FEEDBACK run 5959a944 (CodeRabbit review of a1eab31 + fallback review of a1eab31) ==
+New/changed tests, run against a1eab317 code (temp worktree, branch tests copied in; base messages
+in the failures confirm the base tree was imported):
+  17 failed, 151 passed in 32.79s
+  FAILED test_runner_pool_dseq_recovery::test_a_charter_deposit_failure_dseq_is_recovered  (assert '' == '777001')
+  FAILED test_update_flow::TestUpdateKeepsTheCharterStamp::test_the_charter_id_is_read_back_and_restamped
+  FAILED test_update_flow::TestUpdateKeepsTheCharterStamp::test_an_explicit_charter_id_wins_without_a_read  (TypeError charter_id)
+  FAILED test_update_flow::TestUpdateKeepsTheCharterStamp::test_several_charter_ids_refuse_before_the_put  (DID NOT RAISE)
+  FAILED test_extra_coverage::TestDeployMainCharter::{test_charter_file_is_loaded_and_passed, test_charter_env_is_honoured,
+         test_an_invalid_charter_exits_1_before_deploy}  (no --charter; no charter kw)
+  FAILED test_cli_extensions::TestCliUpdate::{test_update_success, test_update_passes_charter_id}  (no charter_id)
+  FAILED test_charter_gate::TestCharterDocument::test_prod_pinned_must_be_a_json_boolean[false|true|0|1|no]  (DID NOT RAISE)
+  FAILED test_charter_deposit::{test_a_failed_close_after_failed_funding_is_not_reported_as_closed,
+         test_a_failed_close_after_a_non_uact_refusal_is_not_reported_as_closed, test_a_successful_close_reports_closed_true}
+         (base says "the lease was closed" even when the close raised; no closed context)
+Same tests on the fix: all pass. Related subset (update_flow, extra_coverage, cli_extensions, charter_gate/deposit/
+flynn_order, provenance, cli, close-site census, runner_pool_dseq_recovery): see bead note.
+Close-site census manifest: _fund_charter_lease(1) + one deploy() site merged into _close_charter_deployment(1); deploy 8 -> 7.
+
+== RESOLVER run fc3cada2 (fallback review of 0759ccb: 3 findings) ==
+New tests, run against 0759ccb6 code (just_akash/ reverted to HEAD, new tests kept):
+  17 failed, 80 passed (tests/test_charter_gate.py + tests/test_update_flow.py)
+  FAILED tests/test_charter_gate.py::test_the_scanner_misses_these_layouts_and_yaml_does_not[commented] - AssertionError: assert [] == (['flynn-x'], ['flynn-x'])
+  FAILED tests/test_charter_gate.py::test_the_scanner_misses_these_layouts_and_yaml_does_not[four-space] - AssertionError: assert [] == (['flynn-x'], ['flynn-x'])
+  FAILED tests/test_charter_gate.py::test_the_scanner_misses_these_layouts_and_yaml_does_not[quoted] - AssertionError: assert [] == (['flynn-x'], ['flynn-x'])
+  FAILED tests/test_charter_gate.py::test_enforce_refuses_ours_in_any_valid_layout[commented] - tests.test_charter_gate._StopAtCreate
+  FAILED tests/test_charter_gate.py::test_enforce_refuses_ours_in_any_valid_layout[four-space] - tests.test_charter_gate._StopAtCreate
+  FAILED tests/test_charter_gate.py::test_enforce_refuses_ours_in_any_valid_layout[quoted] - tests.test_charter_gate._StopAtCreate
+  FAILED tests/test_charter_gate.py::test_warn_reports_ours_in_any_valid_layout[commented] - AssertionError: assert 'CHARTER_MISSING' in ''
+  FAILED tests/test_charter_gate.py::test_warn_reports_ours_in_any_valid_layout[four-space] - AssertionError: assert 'CHARTER_MISSING' in ''
+  FAILED tests/test_charter_gate.py::test_warn_reports_ours_in_any_valid_layout[quoted] - AssertionError: assert 'CHARTER_MISSING' in ''
+  FAILED tests/test_charter_gate.py::test_a_charter_that_could_not_be_stamped_refuses_before_any_spend[commented] - AssertionError: Regex pattern did not match.
+  FAILED tests/test_charter_gate.py::test_a_charter_that_could_not_be_stamped_refuses_before_any_spend[four-space] - AssertionError: Regex pattern did not match.
+  FAILED tests/test_charter_gate.py::test_a_charter_that_could_not_be_stamped_refuses_before_any_spend[quoted] - AssertionError: Regex pattern did not match.
+  FAILED tests/test_charter_gate.py::test_an_ambient_charter_is_ignored_for_other_callers[dfci-infra-r] - RuntimeError: a lease charter was given, but placement ['dfci-infr
+  FAILED tests/test_charter_gate.py::test_an_ambient_charter_is_ignored_for_other_callers[just-akash-runner] - RuntimeError: a lease charter was given, but placement ['just
+  FAILED tests/test_charter_gate.py::test_only_the_env_charter_is_ambient_and_flynn_never_sees_the_flag - AttributeError: 'Charter' object has no attribute 'ambient'
+  FAILED tests/test_charter_gate.py::test_a_placement_group_clash_is_a_runtime_error_with_a_diagnostic - ValueError: charter stamping would merge placement groups into flyn
+  FAILED tests/test_update_flow.py::TestUpdateKeepsTheCharterStamp::test_a_malformed_charter_id_is_a_runtime_error_before_the_put - ValueError: not a charter id: 'ch-NOTHEX
+Same tests on the fix: 97 passed.

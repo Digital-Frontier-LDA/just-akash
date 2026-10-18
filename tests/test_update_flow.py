@@ -155,6 +155,87 @@ class TestUpdate:
         client.update_deployment.assert_not_called()
 
 
+class TestUpdateKeepsTheCharterStamp:
+    """Review (fallback, a1eab31): deploy() renames a chartered fleet-/flynn- placement to
+    `<key>.ch-<id>`. update() from the same SDL file must PUT the SAME group name, or the
+    provider rejects the manifest."""
+
+    ID = "ch-0123456789"
+
+    def _sdl(self, tmp_path, key="fleet-serve-qwen"):
+        from tests._charter_harness import sdl_text
+
+        f = tmp_path / "s.yaml"
+        f.write_text(sdl_text(key))
+        return str(f)
+
+    @staticmethod
+    def _onchain(name):
+        return {"deployment": {"id": {"dseq": "123"}}, "groups": [{"group_spec": {"name": name}}]}
+
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_the_charter_id_is_read_back_and_restamped(self, MockAPI, tmp_path, monkeypatch):
+        monkeypatch.setenv("AKASH_API_KEY", "k")
+        client = MockAPI.return_value
+        client.get_deployment.return_value = self._onchain(f"fleet-serve-qwen.{self.ID}")
+        update(dseq="123", sdl_path=self._sdl(tmp_path))
+        _, sent = client.update_deployment.call_args[0]
+        assert f"fleet-serve-qwen.{self.ID}:" in sent
+        assert "fleet-serve-qwen:" not in sent
+
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_an_explicit_charter_id_wins_without_a_read(self, MockAPI, tmp_path, monkeypatch):
+        monkeypatch.setenv("AKASH_API_KEY", "k")
+        client = MockAPI.return_value
+        update(dseq="123", sdl_path=self._sdl(tmp_path), charter_id=self.ID)
+        client.get_deployment.assert_not_called()
+        _, sent = client.update_deployment.call_args[0]
+        assert sent.count(f"fleet-serve-qwen.{self.ID}:") == 2
+
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_an_uncharted_lease_is_left_alone(self, MockAPI, tmp_path, monkeypatch):
+        monkeypatch.setenv("AKASH_API_KEY", "k")
+        client = MockAPI.return_value
+        client.get_deployment.return_value = self._onchain("fleet-serve-qwen")
+        update(dseq="123", sdl_path=self._sdl(tmp_path))
+        _, sent = client.update_deployment.call_args[0]
+        assert ".ch-" not in sent
+
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_several_charter_ids_refuse_before_the_put(self, MockAPI, tmp_path, monkeypatch):
+        monkeypatch.setenv("AKASH_API_KEY", "k")
+        client = MockAPI.return_value
+        client.get_deployment.return_value = {
+            "groups": [
+                {"group_spec": {"name": "fleet-a.ch-0123456789"}},
+                {"group_spec": {"name": "fleet-b.ch-abcdefabcd"}},
+            ]
+        }
+        with pytest.raises(RuntimeError, match="several charter ids"):
+            update(dseq="123", sdl_path=self._sdl(tmp_path))
+        client.update_deployment.assert_not_called()
+
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_a_malformed_charter_id_is_a_runtime_error_before_the_put(
+        self, MockAPI, tmp_path, monkeypatch
+    ):
+        """Review (fallback, 0759ccb): stamp_charter's ValueError escaped cli.py, which
+        catches RuntimeError only, as a traceback."""
+        monkeypatch.setenv("AKASH_API_KEY", "k")
+        client = MockAPI.return_value
+        with pytest.raises(RuntimeError, match="not a charter id") as exc:
+            update(dseq="123", sdl_path=self._sdl(tmp_path), charter_id="ch-NOTHEX")
+        assert not isinstance(exc.value, ValueError)
+        client.update_deployment.assert_not_called()
+
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_a_placement_not_ours_is_never_read(self, MockAPI, tmp_path, monkeypatch):
+        monkeypatch.setenv("AKASH_API_KEY", "k")
+        client = MockAPI.return_value
+        update(dseq="123", sdl_path=self._sdl(tmp_path, key="just-akash-runner"))
+        client.get_deployment.assert_not_called()
+
+
 class TestDeployDepositGuard:
     @patch("just_akash.deploy.AkashConsoleAPI")
     def test_nan_deposit_rejected_before_api(self, MockAPI, monkeypatch):

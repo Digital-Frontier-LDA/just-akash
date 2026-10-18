@@ -10,6 +10,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Lease charters for placements Flynn counts as ours (`flynn-*`, `fleet-*`, exactly
+  `dcloud`/`akash`; openmix-pvr6.1). `deploy --charter FILE.json` (or
+  `JUST_AKASH_CHARTER_JSON`) POSTs the charter to Flynn before the credit probe and refuses
+  the deploy if Flynn does not accept it, stamps `.<charter_id>` into `flynn-`/`fleet-`
+  placement names (≤ 62 chars, prefix kept, a cut key ends in a short hash so two long keys
+  never merge into one group, a key carrying an older charter id is re-stamped; `dcloud`/
+  `akash` are exact names in Flynn and stay unstamped), creates the order at the 0.5 minimum
+  and tops it up after the lease to `max_hours × bid uact/block × 600 × 1.15` (capped at
+  `max_act`; a bid not in uact is refused before every lease attempt), switches auto top-up
+  off, or ON when `prod_pinned` (read back either way), and binds the charter to the final
+  dseq. A failed top-up closes the lease; a failed bind keeps it and emits
+  `CHARTER_BIND_FAILED`. Without
+  a charter, `JUST_AKASH_CHARTER=warn` (default) emits `CHARTER_MISSING` and proceeds;
+  `enforce` refuses before any create. `dfci-*`/`just-akash-*` deploys are unchanged.
+  Needs `FLYNN_API_URL` + `FLYNN_INTERNAL_API_KEY`, and the wallet label from the charter's
+  `wallet_label` or `JUST_AKASH_WALLET_LABELS`; with several keys the label must be confirmed
+  for the wallet the pool selected (by the map), or the deploy refuses before the POST.
+  `prod_pinned` must be a JSON boolean. `CHARTER_DEPOSIT_FAILED` carries `closed` and says
+  "close FAILED; close it manually" when the close itself failed; runner-pool recovers its
+  dseq for teardown. `update` re-stamps the charter id (`--charter-id`, else read back from
+  the deployment's group names) so the PUT names the same placement group as the chain.
+  `python -m just_akash.deploy` takes `--charter` / `JUST_AKASH_CHARTER_JSON` too.
+  The gate also reads placement keys with YAML, so a 4-space, commented or quoted
+  `placement:` block of ours is gated too, and refused (`SDL_ERROR`) when a charter would
+  have to stamp it. A charter from `JUST_AKASH_CHARTER_JSON` is ignored for a placement
+  that is not ours; a stamping refusal is an error message, not a traceback.
 - `lease-intent-backfill.yml` (Flynn openmix-h2l7): the dispatch-only caller of
   `lease_intent backfill`, for canaries that were already running when intents landed
   (provider-canary.yml registers one only at deploy). Inputs reach the shell through env and

@@ -62,8 +62,17 @@ Silent in an interactive terminal (humans keep the existing `_log`/`Error:` pros
 | `NO_DSEQ_RETURNED` | Create succeeded but no DSEQ in response. |
 | `LEASE_CREATE_FAILED` | Lease creation failed (incl. 404 "no lease for deployment"). |
 | `REDEPLOY_FAILED` | The issue-#19 re-deploy round exhausted. |
-| `SDL_ERROR` | SDL validation/missing/placeholder (reserved). |
+| `SDL_ERROR` | SDL validation/missing/placeholder. Emitted when a charter cannot be stamped into the placement keys (a group clash, a malformed charter id, or a placement of ours in a layout the stamp cannot rewrite); nothing is created. |
 | `CONFIG_ERROR` | Missing API key / bad deposit / bad `--env` (reserved). |
+
+### Lease charters (openmix-pvr6.1 — placements Flynn counts as ours: `flynn-*`, `fleet-*`, `dcloud`, `akash`)
+
+| Code | Condition |
+|---|---|
+| `CHARTER_MISSING` | No charter for a placement of ours. `JUST_AKASH_CHARTER=warn` (default) proceeds; `enforce` refuses before any create. |
+| `CHARTER_POST_FAILED` | Flynn refused or could not be reached for the charter POST; nothing was created. |
+| `CHARTER_DEPOSIT_FAILED` | The follow-up deposit, or setting auto top-up (off; on for `prod_pinned`), failed after the lease and the lease was closed — or the bid about to be leased is not priced in uact and the deployment was closed before the lease. `context.closed` is `false` (and the message says "close FAILED; close it manually") when that close itself failed: the deployment may still be live. |
+| `CHARTER_BIND_FAILED` | The bind to the final dseq failed after retries; the lease is kept and reads as uncharted in Flynn. |
 
 ### Reliability (post-deploy / smoke — "external sweep reaps the lease")
 
