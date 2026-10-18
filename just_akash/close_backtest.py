@@ -52,14 +52,16 @@ WHAT IT REFUSES
       - an age, ``(pin - created_at) x wallet_pool.SECONDS_PER_BLOCK`` (never from the dseq,
         which the deployer chooses), under ``cleanup_stale.STALE_E2E_AGE_SECONDS`` (48 h);
   * with the KEY (only the gated ``close`` job): a key whose wallet is not ``owner``; a
-    Console record whose owner, dseq or state disagrees; any malformed lease row (no state, no
-    id); anything but EXACTLY ONE active lease, with this owner and dseq in its id, whose
-    status was read and whose complete service set is ``{backtest}``.
+    Console record whose owner, dseq or state disagrees; any lease row without an id or in a
+    state outside ``KNOWN_LEASE_STATES``; anything but EXACTLY ONE active lease, with this
+    owner and dseq in its id, whose status was read and whose complete service set is
+    ``{backtest}``.
 
 The Console read of the active lease is the LAST thing before the DELETE, after the chain
 view. ⚠ A race remains and is not closable here: Console's DELETE takes the dseq only, with
 no precondition, so a change between that last read and the DELETE is not seen. The window is
-the DELETE call itself, bounded by the Console timeout (``api.CONSOLE_HTTP_TIMEOUT``, 180 s).
+the DELETE call itself, and it has NO overall deadline: ``api.CONSOLE_HTTP_TIMEOUT`` (180 s)
+is a per-read SOCKET timeout, so a reply that keeps trickling bytes can take longer.
 
 A close counts only when the deployment reads back with this owner, this dseq and state
 exactly ``closed``. If the DELETE itself errors, the read-back still runs: the close may have
@@ -97,6 +99,10 @@ GROUP_RE = re.compile(r"just-akash-backtest\.[0-9a-f]{12}")
 OWNER_RE = re.compile(r"akash1[a-z0-9]{38,58}")
 HEIGHT_RE = re.compile(r"[1-9][0-9]{0,19}")
 CHAIN_ID = "akashnet-2"
+# Every lease state this repo recognises: the same set _lease_verification.lease_snapshot
+# refuses outside of. A row in any other state ("", "ACTIVE", "unknown", a new enum) could be
+# the live lease under a name we do not read, so it is a refusal, not a skip.
+KNOWN_LEASE_STATES = frozenset({"active", "closed", "insufficient_funds"})
 # The registry's finality rule, `committed-tip-minus-2`: read state two blocks under the tip.
 FINALITY_DEPTH = 2
 # Our clock against a block's timestamp: a block may look a little "from the future".
@@ -277,12 +283,10 @@ def console_refusal(client, owner: str, dseq: str) -> str | None:
         return "the Console record has no lease list"
     for lease in leases:
         # A row we cannot classify could be the live one: refuse rather than skip it.
-        if (
-            not isinstance(lease, dict)
-            or not isinstance(lease.get("state"), str)
-            or not isinstance(lease.get("id"), dict)
-        ):
-            return "a lease row has no state or no id"
+        if not isinstance(lease, dict) or not isinstance(lease.get("id"), dict):
+            return "a lease row has no id"
+        if lease.get("state") not in KNOWN_LEASE_STATES:
+            return f"a lease row is in unknown state {lease.get('state')!r}"
     active = [x for x in leases if x["state"] == "active"]
     if len(active) != 1:
         return f"{len(active)} active lease(s); exactly one is required"

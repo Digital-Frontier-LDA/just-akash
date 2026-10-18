@@ -414,7 +414,7 @@ def test_a_console_record_that_disagrees_is_refused(detail, needle):
             {**_lease(), "id": {"owner": OWNER, "dseq": "1", "provider": "akash1p"}},
             "another owner",
         ),
-        ({k: v for k, v in _lease().items() if k != "id"}, "no state or no id"),
+        ({k: v for k, v in _lease().items() if k != "id"}, "has no id"),
     ],
 )
 def test_the_active_lease_must_name_this_owner_and_dseq(lease, needle):
@@ -427,7 +427,21 @@ def test_a_vllm_lease_with_no_state_beside_a_backtest_lease_is_refused():
     """Codex round 2, P2-e: a row we cannot classify could be the live one."""
     stateless = {k: v for k, v in _lease(services=("vllm",)).items() if k != "state"}
     why = cb.console_refusal(_Client(_detail(leases=[_lease(), stateless])), OWNER, DSEQ)
-    assert why is not None and "no state or no id" in why
+    assert why is not None and "unknown state" in why
+
+
+@pytest.mark.parametrize("state", ["", "ACTIVE", "unknown", "Active", "paused", None, 1])
+def test_a_lease_row_in_an_unknown_state_beside_a_backtest_lease_is_refused(state):
+    """Codex round 3: [active backtest, state="" vllm] used to pass and send a DELETE."""
+    odd = {**_lease(services=("vllm",)), "state": state}
+    why = cb.console_refusal(_Client(_detail(leases=[_lease(), odd])), OWNER, DSEQ)
+    assert why is not None and "unknown state" in why
+
+
+@pytest.mark.parametrize("state", ["closed", "insufficient_funds"])
+def test_a_finished_lease_beside_the_active_backtest_is_fine(state):
+    finished = {**_lease(services=("vllm",)), "state": state}
+    assert cb.console_refusal(_Client(_detail(leases=[_lease(), finished])), OWNER, DSEQ) is None
 
 
 # ── run(): plan holds no key; execute orders the reads and proves the close ──────────────
@@ -551,6 +565,14 @@ def test_an_abbreviated_execute_flag_is_rejected():
     """Codex round 2: argparse would read `--exec` as --execute."""
     with pytest.raises(SystemExit):
         cb.main(["--owner", OWNER, "--dseq", DSEQ, "--expected-group", GROUP, "--exec"])
+
+
+@pytest.mark.parametrize("state", ["", "ACTIVE", "unknown"])
+def test_an_unknown_lease_state_sends_no_delete(wired, state):
+    odd = {**_lease(services=("vllm",)), "state": state}
+    client = wired["use"](_Client(_detail(leases=[_lease(), odd])))
+    assert _run() == cb.EXIT_REFUSED
+    assert client.closed == []
 
 
 def test_malformed_input_is_usage_and_sends_nothing(wired):
