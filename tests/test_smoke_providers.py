@@ -1444,6 +1444,26 @@ class TestOrphanProbeSweep:
             path.write_text(json.dumps(doc))
         return path
 
+    def _issue(self, monkeypatch, tmp_path, *ops, started_offset_s=-60.0):
+        """Write this producer's authority manifest with the REAL writer, as _deploy does
+        before each create. A fresh producer identity and start per test."""
+        from datetime import datetime, timedelta, timezone
+
+        monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+        monkeypatch.setenv("GITHUB_RUN_ID", "123")
+        monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "1")
+        monkeypatch.setattr(sp, "_ISSUED_OPERATIONS", [])
+        monkeypatch.setattr(sp, "_PRODUCER_ID", "00000000deadbeef")
+        monkeypatch.setattr(
+            sp,
+            "_PRODUCER_STARTED_AT",
+            datetime.now(timezone.utc) + timedelta(seconds=started_offset_s),
+        )
+        receipts = tmp_path / "just-akash-deployment-receipts"
+        receipts.mkdir(mode=0o700, exist_ok=True)
+        for op in ops:
+            sp._record_issued_operation(op)
+
     def _sweep_with_receipts(self, monkeypatch, tmp_path, dseq):
         monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
         monkeypatch.setenv("GITHUB_RUN_ID", "123")
@@ -1466,6 +1486,7 @@ class TestOrphanProbeSweep:
         self, monkeypatch, tmp_path
     ):
         d = self._dseq_aged(5)
+        self._issue(monkeypatch, tmp_path, self._op())
         self._receipt(tmp_path, operation_id=self._op(), dseq=d)
         swept, rd = self._sweep_with_receipts(monkeypatch, tmp_path, d)
         assert swept == [d]
@@ -1474,6 +1495,7 @@ class TestOrphanProbeSweep:
     def test_a_prepared_receipt_without_a_dseq_authorizes_nothing(self, monkeypatch, tmp_path):
         """Codex round 2: a valid 2020 `prepared` receipt, no dseq, authorized a destroy."""
         d = self._dseq_aged(5)
+        self._issue(monkeypatch, tmp_path, self._op())
         self._receipt(tmp_path, operation_id=self._op(), stale=True)
         swept, rd = self._sweep_with_receipts(monkeypatch, tmp_path, d)
         assert swept == []
@@ -1482,6 +1504,7 @@ class TestOrphanProbeSweep:
     def test_a_receipt_for_another_dseq_authorizes_nothing(self, monkeypatch, tmp_path):
         """Codex round 2: a create_response_received receipt naming ANOTHER dseq did too."""
         d = self._dseq_aged(5)
+        self._issue(monkeypatch, tmp_path, self._op())
         self._receipt(tmp_path, operation_id=self._op(), dseq=self._dseq_aged(9))
         swept, rd = self._sweep_with_receipts(monkeypatch, tmp_path, d)
         assert swept == []
@@ -1489,6 +1512,7 @@ class TestOrphanProbeSweep:
 
     def test_a_receipt_from_another_run_attempt_authorizes_nothing(self, monkeypatch, tmp_path):
         d = self._dseq_aged(5)
+        self._issue(monkeypatch, tmp_path, self._op())
         self._receipt(tmp_path, operation_id=self._op("gh123.2"), dseq=d)  # a retry attempt
         self._receipt(tmp_path, operation_id="provider-smoke-0123456789abcdef", dseq=d)  # no tag
         swept, rd = self._sweep_with_receipts(monkeypatch, tmp_path, d)
@@ -1497,6 +1521,7 @@ class TestOrphanProbeSweep:
 
     def test_a_receipt_older_than_its_own_dseq_authorizes_nothing(self, monkeypatch, tmp_path):
         d = self._dseq_aged(5)
+        self._issue(monkeypatch, tmp_path, self._op())
         self._receipt(tmp_path, operation_id=self._op(), dseq=d, stale=True)
         swept, rd = self._sweep_with_receipts(monkeypatch, tmp_path, d)
         assert swept == []
@@ -1504,10 +1529,90 @@ class TestOrphanProbeSweep:
 
     def test_without_a_run_tag_no_receipt_is_this_runs(self, monkeypatch, tmp_path):
         d = self._dseq_aged(5)
+        self._issue(monkeypatch, tmp_path, self._op())
         self._receipt(tmp_path, operation_id=self._op(), dseq=d)
         monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
         monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
         assert sp._this_run_probe_receipts(OWNER) == set()
+
+    # ── Codex round 3: authority is what a producer ISSUED, not what a receipt spells ──
+    def test_an_unissued_operation_with_the_same_run_tag_authorizes_nothing(
+        self, monkeypatch, tmp_path
+    ):
+        """Round-3 repro: the producer issued op A; a receipt for op B (same run tag, valid
+        spelling, this dseq) sat beside it. The pattern check accepted B and destroyed."""
+        d = self._dseq_aged(5)
+        self._issue(monkeypatch, tmp_path, self._op())  # issued A
+        op_b = f"provider-smoke-{self.RUN_TAG}-fedcba9876543210"  # pragma: allowlist secret
+        self._receipt(tmp_path, operation_id=op_b, dseq=d)
+        swept, rd = self._sweep_with_receipts(monkeypatch, tmp_path, d)
+        assert swept == []
+        rd.assert_not_called()
+
+    def test_a_receipt_older_than_its_producer_authorizes_nothing(self, monkeypatch, tmp_path):
+        """Round 3: a receipt prepared BEFORE the producer that issued its id started (here,
+        a producer that starts 590 s after the receipt) is not that producer's."""
+        d = self._dseq_aged(5)
+        self._receipt(tmp_path, operation_id=self._op(), dseq=d)
+        self._issue(monkeypatch, tmp_path, self._op(), started_offset_s=590.0)
+        swept, rd = self._sweep_with_receipts(monkeypatch, tmp_path, d)
+        assert swept == []
+        rd.assert_not_called()
+
+    def test_a_missing_manifest_grants_no_young_close(self, monkeypatch, tmp_path):
+        d = self._dseq_aged(5)
+        self._receipt(tmp_path, operation_id=self._op(), dseq=d)  # nothing issued it
+        swept, rd = self._sweep_with_receipts(monkeypatch, tmp_path, d)
+        assert swept == []
+        rd.assert_not_called()
+
+    def test_a_manifest_others_can_read_or_write_grants_nothing(self, monkeypatch, tmp_path):
+        d = self._dseq_aged(5)
+        self._issue(monkeypatch, tmp_path, self._op())
+        self._receipt(tmp_path, operation_id=self._op(), dseq=d)
+        manifest = next((tmp_path / "just-akash-deployment-receipts").glob("smoke-authority-*"))
+        manifest.chmod(0o644)
+        swept, rd = self._sweep_with_receipts(monkeypatch, tmp_path, d)
+        assert swept == []
+        rd.assert_not_called()
+
+    def test_the_manifest_is_owner_only_and_lists_exactly_what_was_issued(
+        self, monkeypatch, tmp_path
+    ):
+        import json
+        import stat
+
+        self._issue(monkeypatch, tmp_path, self._op(), self._op("gh123.1").replace("0123", "9999"))
+        [manifest] = (tmp_path / "just-akash-deployment-receipts").glob("smoke-authority-*")
+        assert stat.S_IMODE(manifest.stat().st_mode) == 0o600
+        doc = json.loads(manifest.read_text())
+        assert doc["run_tag"] == self.RUN_TAG
+        assert doc["operation_ids"] == sp._ISSUED_OPERATIONS and len(doc["operation_ids"]) == 2
+        assert not list(manifest.parent.glob(".*.tmp")), "the atomic write left a temp file"
+
+    def test_a_fresh_consumer_process_honours_its_producers_manifest(self, monkeypatch, tmp_path):
+        """The end-of-job reap is a SEPARATE process. Run the reader in a real new interpreter:
+        it holds no producer state, so the manifest on disk is the only authority."""
+        import os
+        import sys
+        import time
+
+        d = str(int((time.time() - 5) * 1000))
+        self._issue(monkeypatch, tmp_path, self._op())
+        self._receipt(tmp_path, operation_id=self._op(), dseq=d)
+        code = (
+            "import just_akash.smoke_providers as sp;"
+            f"print(sorted(sp._this_run_probe_receipts({OWNER!r})))"
+        )
+        env = {**os.environ, "RUNNER_TEMP": str(tmp_path)}
+        out = (
+            subprocess.run(
+                [sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True
+            )
+            .stdout.strip()
+            .splitlines()[-1]
+        )
+        assert out == str([(d, self.STAMPED)])
 
     def test_the_smoke_receipt_label_carries_the_run_tag(self, monkeypatch):
         monkeypatch.setenv("GITHUB_RUN_ID", "123")

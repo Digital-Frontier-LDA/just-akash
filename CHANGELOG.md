@@ -67,11 +67,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   orphan sweep reads the orphan's group from chain (inside its per-deployment error handler)
   and passes that exact name to the destroy. Below the 1h floor (`--min-age 0`) it reaps a probe
   only when one of this run attempt's own create receipts names that exact dseq and stamped
-  group. In CI the smoke's receipt operation ids carry `gh<run id>.<attempt>`, and only a
-  `create_response_received` receipt counts, with the same owner and received no earlier than its
-  dseq was minted. Outside CI, no young probe is reaped. The legacy `akash` is
+  group. The receipt's operation id must be listed in the authority manifest of the smoke
+  process that issued it: a 0600 file written atomically next to the receipts, before each
+  create. It must also be prepared no earlier than that process started, be in state
+  `create_response_received` with the same owner, and be received no earlier than its dseq was
+  minted. A missing or unreadable manifest grants nothing, so the probe falls to the 1h floor.
+  Outside CI, no young probe is reaped. The legacy `akash` is
   still reaped, but only past 1h. A `{probe}` service under an unreadable group, or one the
   probe never creates, is left and flagged.
+  Residual risk (openmix-hxlg): after this rename, `cleanup_identity`'s legacy single-group
+  exception accepts `just-akash-probe.<hex>`, so `cleanup_stale` classifies such a probe as
+  `STALE-probe` after 1h, with no check that whatever holds it has finished. The scheduled
+  sweep cannot close it (`CLEANUP_AUTO_EXECUTE=false`), but a manual `cleanup-stale.yml`
+  dispatch with `execute=true` can close an independently running probe older than 1h.
 
 ## [1.49.0] — 2026-10-18
 

@@ -50,6 +50,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -635,13 +636,108 @@ def _smoke_receipt_label() -> str:
 _RECEIPT_CLOCK_SKEW_SECONDS = 120
 
 
+# ── producer authority manifest ─────────────────────────────────────────────────────
+# The ONLY thing that grants young-close authority (a destroy below the 1h floor). A smoke
+# process records every receipt operation id it ISSUES, before the create call, in its own
+# manifest next to the receipts: `smoke-authority-<run tag>-<producer id>.json`, mode 0600,
+# replaced atomically. The end-of-job reap is a different process, so it reads the manifest
+# from disk; a receipt whose operation id no producer of this run attempt issued, or that
+# predates the producer that issued it, proves nothing. The name matches neither receipt glob
+# (`provider-smoke-*.json`), so no receipt reader ever decodes it.
+_PRODUCER_ID = secrets.token_hex(8)
+_PRODUCER_STARTED_AT = datetime.now(timezone.utc)
+_ISSUED_OPERATIONS: list[str] = []
+_AUTHORITY_PREFIX = "smoke-authority-"
+
+
+def _authority_dir() -> Path | None:
+    runner_temp = os.environ.get("RUNNER_TEMP")
+    return Path(runner_temp) / "just-akash-deployment-receipts" if runner_temp else None
+
+
+def _record_issued_operation(operation_id: str) -> None:
+    """Persist ``operation_id`` in this producer's authority manifest, before the create.
+
+    Atomic (write a 0600 temp file, fsync, rename over the manifest) so a reader sees the old
+    list or the new one, never half of one. Only in CI with a run tag. A failed write is
+    said, not swallowed: this deploy's probe then has no young-close authority and falls to
+    the 1h floor, which delays a reap but can never cause one.
+    """
+    tag = _smoke_run_tag()
+    directory = _authority_dir()
+    if not tag or directory is None:
+        return
+    _ISSUED_OPERATIONS.append(operation_id)
+    manifest = {
+        "run_tag": tag,
+        "producer_id": _PRODUCER_ID,
+        "producer_started_at": _PRODUCER_STARTED_AT.isoformat(),
+        "operation_ids": list(_ISSUED_OPERATIONS),
+    }
+    final = directory / f"{_AUTHORITY_PREFIX}{tag}-{_PRODUCER_ID}.json"
+    temporary = directory / f".{final.name}.{secrets.token_hex(4)}.tmp"
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(manifest, f, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, final)
+    except OSError as e:
+        print(
+            f"  {YELLOW}authority manifest not written ({e}); probe {operation_id} has no "
+            f"young-close authority and is reaped only past the 1h floor{RESET}"
+        )
+        temporary.unlink(missing_ok=True)
+
+
+def _issued_operations(tag: str) -> dict[str, datetime]:
+    """operation id -> start of the producer that issued it, from this run attempt's
+    manifests. A manifest that is unreadable, malformed, for another run tag, or readable by
+    anyone but its owner contributes nothing (said, not swallowed)."""
+    directory = _authority_dir()
+    if directory is None:
+        return {}
+    minted = re.compile(rf"{re.escape(f'provider-smoke-{tag}-')}[0-9a-f]{{16}}")
+    issued: dict[str, datetime] = {}
+    try:
+        paths = list(directory.glob(f"{_AUTHORITY_PREFIX}{tag}-*.json"))
+    except OSError:
+        return {}
+    for path in paths:
+        try:
+            if path.lstat().st_mode & 0o077 or not path.is_file() or path.is_symlink():
+                raise ValueError("not an owner-only regular file")
+            doc = json.loads(path.read_text())
+            started = datetime.fromisoformat(doc["producer_started_at"])
+            ops = doc["operation_ids"]
+            if (
+                doc.get("run_tag") != tag
+                or started.tzinfo is None
+                or not isinstance(ops, list)
+                or not all(isinstance(o, str) and minted.fullmatch(o) for o in ops)
+            ):
+                raise ValueError("manifest fields do not match this run attempt")
+        except Exception as e:  # noqa: BLE001 - an unreadable manifest grants nothing
+            print(
+                f"  {YELLOW}orphan sweep: authority manifest {path.name} rejected "
+                f"({str(e)[:80]}); it grants no young-close authority{RESET}"
+            )
+            continue
+        for op in ops:
+            issued[op] = started
+    return issued
+
+
 def _this_run_probe_receipts(owner: str) -> set[tuple[str, str]]:
     """(dseq, group) for every probe THIS run attempt created, proven by its own receipts.
 
     Young-close authority (below the 1h floor) rests on this, so a receipt counts only if
     ALL of these hold, else it proves nothing:
-      * its operation id was minted by this run attempt: `provider-smoke-<run tag>-<hex>`
-        (a receipt from another run, attempt, or a shell with no run tag never matches);
+      * its operation id is one a producer of this run attempt ISSUED, per that producer's
+        authority manifest (a matching spelling is not enough), and it was prepared no
+        earlier than that producer started;
       * it reached `create_response_received`, the stage that carries a DSEQ;
       * its owner is this sweep's owner;
       * its group population is exactly one stamped probe group;
@@ -654,7 +750,9 @@ def _this_run_probe_receipts(owner: str) -> set[tuple[str, str]]:
     runner_temp = os.environ.get("RUNNER_TEMP")
     if not tag or not runner_temp:
         return set()
-    minted = re.compile(rf"{re.escape(f'provider-smoke-{tag}-')}[0-9a-f]{{16}}")
+    issued = _issued_operations(tag)
+    if not issued:
+        return set()
     try:
         paths = list(
             (Path(runner_temp) / "just-akash-deployment-receipts").glob(
@@ -677,7 +775,14 @@ def _this_run_probe_receipts(owner: str) -> set[tuple[str, str]]:
             continue
         if receipt["state"] != "create_response_received":
             continue
-        if not minted.fullmatch(receipt["operation_id"]) or receipt["expected_owner"] != owner:
+        producer_started = issued.get(receipt["operation_id"])
+        if producer_started is None or receipt["expected_owner"] != owner:
+            continue
+        try:
+            prepared = datetime.fromisoformat(receipt["prepared_at"])
+        except (TypeError, ValueError):
+            continue
+        if prepared < producer_started:
             continue
         population = receipt["group_population"]
         if len(population) != 1:
@@ -1194,6 +1299,9 @@ def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, s
     receipt_path, operation_id, receipt_env = receipt_environment(
         _smoke_receipt_label(), unique=True
     )
+    # Before the create: a receipt only grants young-close authority when this producer is
+    # on record as having issued its operation id.
+    _record_issued_operation(operation_id)
     dseq_ref["receipt_path"] = receipt_path
     command = [
         "uv",
