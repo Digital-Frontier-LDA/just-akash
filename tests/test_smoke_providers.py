@@ -1113,6 +1113,19 @@ class TestOrphanProbeSweep:
     """
 
     NOW = 1_783_930_000.0  # a fixed "now" (~mid-2026, ms-epoch dseq era)
+    # What deploy.py's stamp_run puts on chain for the probe SDL: `just-akash-smoke.<run id>`.
+    STAMPED = "just-akash-smoke.0123456789ab"
+
+    @pytest.fixture(autouse=True)
+    def _chain_groups(self, monkeypatch):
+        """Every sweep test reads the orphan's group from chain; none may touch the network.
+        Default: the run-scoped probe group. A test overrides `self.groups` per dseq."""
+        self.groups: dict[str, list[str]] = {}
+        monkeypatch.setattr(
+            sp.chain,
+            "deployment_group_names",
+            lambda owner, dseq: self.groups.get(dseq, [self.STAMPED]),
+        )
 
     def _detail(self, service_names):
         """A get_deployment() detail whose lease reports these service names."""
@@ -1234,7 +1247,74 @@ class TestOrphanProbeSweep:
         ):
             swept = sp.sweep_orphan_probes()
         assert swept == [old_probe]
-        rd.assert_called_once_with(old_probe, owner=OWNER, group=sp.PROBE_GROUP)
+        # The destroy expects the EXACT group read from chain: a run-scoped key cannot be
+        # known ahead of time, and --expected-group compares for equality.
+        rd.assert_called_once_with(old_probe, owner=OWNER, group=self.STAMPED)
+
+    def test_a_probe_leaked_under_the_legacy_akash_key_is_still_reaped(self):
+        """openmix-nnqg transition: a probe opened before the rename carries group `akash`.
+        The sweep must still close it, passing `akash` as the group the destroy expects."""
+        legacy = self._dseq_aged(7200)
+        self.groups[legacy] = ["akash"]
+        api = self._fake_api([{"dseq": legacy}], {legacy: self._detail(["probe"])})
+        with (
+            patch.object(sp, "_api", return_value=api),
+            patch.object(sp, "robust_destroy", return_value=True) as rd,
+            patch.object(sp.time, "time", return_value=self.NOW),
+        ):
+            swept = sp.sweep_orphan_probes()
+        assert swept == [legacy]
+        rd.assert_called_once_with(legacy, owner=OWNER, group="akash")
+
+    def test_a_foreign_akash_deployment_that_is_not_a_probe_is_never_reaped(self):
+        """The legacy `akash` name is Flynn's R&D fleet SDL key too. A fleet deployment
+        under it is not a {probe} service, so the sweep never even reads its group."""
+        fleet = self._dseq_aged(90000)
+        self.groups[fleet] = ["akash"]
+        api = self._fake_api([{"dseq": fleet}], {fleet: self._detail(["vllm"])})
+        with (
+            patch.object(sp, "_api", return_value=api),
+            patch.object(sp, "robust_destroy", return_value=True) as rd,
+            patch.object(sp.time, "time", return_value=self.NOW),
+        ):
+            assert sp.sweep_orphan_probes() == []
+        rd.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "groups",
+        [
+            [],  # unreadable from every endpoint: UNKNOWN, not "not ours"
+            ["dfci-infra-probe"],  # another repo's probe-shaped workload
+            ["just-akash-smokey"],  # shares the prefix, is not the probe's key
+            ["just-akash-smoke.NOT-A-RUN-ID"],
+            ["just-akash-smoke.0123456789ab", "just-akash-smoke.0123456789ab"],  # two groups
+        ],
+    )
+    def test_a_probe_service_under_a_group_the_probe_never_creates_is_left(self, groups, capsys):
+        odd = self._dseq_aged(7200)
+        self.groups[odd] = groups
+        api = self._fake_api([{"dseq": odd}], {odd: self._detail(["probe"])})
+        with (
+            patch.object(sp, "_api", return_value=api),
+            patch.object(sp, "robust_destroy", return_value=True) as rd,
+            patch.object(sp.time, "time", return_value=self.NOW),
+        ):
+            assert sp.sweep_orphan_probes() == []
+        rd.assert_not_called()
+        out = capsys.readouterr().out
+        assert "left alone" in out
+        # Found but not swept: the summary must flag it for a human, never read as clean.
+        assert "could NOT be destroyed" in out
+
+    def test_the_probe_sdl_declares_the_provenance_key(self):
+        """Flynn attributes a lease by its group name; the SDL's placement key IS that name."""
+        from just_akash.provenance import PLACEMENT_PREFIX, placement_keys, stamp_run
+
+        assert placement_keys(sp.PROBE_SDL) == [sp.PROBE_GROUP]
+        assert sp.PROBE_GROUP.startswith(PLACEMENT_PREFIX)
+        stamped, keys = stamp_run(sp.PROBE_SDL, "0123456789ab")
+        assert keys == [self.STAMPED] and sp._is_probe_group(keys[0])
+        assert placement_keys(stamped) == [self.STAMPED]
 
     def test_successful_sweep_deletes_only_its_resolved_receipt(self, monkeypatch, tmp_path):
         old_probe = self._dseq_aged(7200)

@@ -61,6 +61,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import chain
 from ._diagnostics import Code, emit
 from ._e2e import (
     GREEN,
@@ -84,6 +85,7 @@ from .paid_create import (
     reconcile_receipt,
     verified_cleanup,
 )
+from .provenance import PLACEMENT_PREFIX, RUN_SEPARATOR, run_id_of
 
 # The baseline HTTP marker the probe serves; the update check changes it and
 # re-reads it through the ingress to prove a new revision went live.
@@ -219,12 +221,12 @@ profiles:
         memory: { size: 1Gi }
         storage: [{ size: 5Gi }]
   placement:
-    akash:
+    just-akash-smoke:
       pricing:
         probe: { denom: uact, amount: 10000 }
 deployment:
   probe:
-    akash: { profile: probe, count: 1 }
+    just-akash-smoke: { profile: probe, count: 1 }
 """.replace("__SMOKE_MARKER__", INGRESS_BASELINE).replace(
     # The death-cause beacon ships DARK: BEACON_URL reaches the container only when
     # the operator sets SMOKE_BEACON_URL in the smoke's environment (a collector on
@@ -471,7 +473,20 @@ def _hdr(msg: str) -> None:
 # The probe SDL's sole service name. A deployment whose service set is exactly
 # {PROBE_SERVICE} is unambiguously a leaked smoke probe, never a user workload.
 PROBE_SERVICE = "probe"
-PROBE_GROUP = "akash"
+# The probe SDL's placement key (``profiles.placement.<KEY>``), and so its on-chain
+# ``group_spec.name``. It carries just-akash's provenance prefix so Flynn's lease snapshot
+# attributes the probe to just_akash by its existing `just-akash-` rule (Flynn
+# app/background/leases.py _NAME_PREFIXES). deploy.py run-scopes every key with that
+# prefix (provenance.stamp_run), so what lands on chain is `just-akash-smoke.<run id>`;
+# the in-run destroy reads that exact name from the deploy receipt's group population.
+PROBE_GROUP = PLACEMENT_PREFIX + "smoke"
+# The key every probe used before openmix-nnqg: the SDL default `akash`, which Flynn maps
+# EXACTLY to its R&D fleet, so each daily probe read as a Flynn fleet lease (run
+# 39107604489: 1792308348418, 1792308552194, 1792308760818). The orphan sweep still
+# accepts it so a probe leaked under the old key is reaped after this ships. Probes live
+# minutes and the sweep runs first on every daily run, so it can go once no active
+# deployment on our wallets carries it with a {probe} service.
+LEGACY_PROBE_GROUP = "akash"
 
 # Don't reap a probe younger than this: a concurrent smoke run could still be
 # using it (a run holds one probe for up to the whole matrix, ~tens of minutes).
@@ -572,6 +587,28 @@ def _is_orphan_probe(
     return age is not None and age >= min_age_seconds
 
 
+def _is_probe_group(name: str) -> bool:
+    """True for a group name only the smoke probe SDL creates: the legacy ``akash``, or
+    ``just-akash-smoke`` bare or run-scoped (``just-akash-smoke.<run id>``)."""
+    if name in (LEGACY_PROBE_GROUP, PROBE_GROUP):
+        return True
+    return name.startswith(PROBE_GROUP + RUN_SEPARATOR) and bool(run_id_of(name))
+
+
+def _probe_group_on_chain(owner: str, dseq: str) -> str | None:
+    """The orphan's one on-chain group name, when it is a probe group; None otherwise.
+
+    The destroy is told the exact group to expect (``--expected-group``), and a run-scoped
+    key cannot be known ahead of time, so it is read back from chain. Unreadable, more
+    than one group, or a name the probe SDL never creates -> None: the sweep leaves it and
+    says so. An empty read means UNKNOWN (chain.deployment_group_names), never "not ours".
+    """
+    names = chain.deployment_group_names(owner, dseq)
+    if len(names) == 1 and _is_probe_group(names[0]):
+        return names[0]
+    return None
+
+
 def _is_not_found_error(exc: Exception) -> bool:
     """True only for a 404 (deployment already gone), not any other API error.
 
@@ -622,6 +659,16 @@ def sweep_orphan_probes(
         found.append(dseq)
         age = _probe_age_seconds(dseq, now)
         age_note = f"{int(age // 60)}m old" if age is not None else "age unknown"
+        group = _probe_group_on_chain(owner, dseq)
+        if group is None:
+            # A {probe} service under a group the probe SDL never creates, or one we could
+            # not read: not provably ours, so it is left, and counted as found-not-swept so
+            # the summary below flags it for a human.
+            print(
+                f"  {YELLOW}orphaned probe {dseq} ({age_note}) — its on-chain group is "
+                f"unreadable or not a smoke probe group; left alone{RESET}"
+            )
+            continue
         # In dry-run we only report; say so, so the per-probe line can't be read
         # as "this was destroyed" for a safety-critical cleanup that did nothing.
         action = "would reap (dry-run)" if dry_run else "reaping"
@@ -629,7 +676,7 @@ def sweep_orphan_probes(
             f"  {YELLOW}orphaned probe {dseq} ({age_note}) — leaked by an earlier "
             f"run; {action}{RESET}"
         )
-        if dry_run or robust_destroy(dseq, owner=owner, group=PROBE_GROUP):
+        if dry_run or robust_destroy(dseq, owner=owner, group=group):
             swept.append(dseq)
             if not dry_run:
                 _delete_resolved_provider_smoke_receipts(dseq, owner)

@@ -70,6 +70,15 @@ GPU_PROBE_MODELS: tuple[str, ...] = (
     "m4000",
 )
 
+# The placement key every probe SDL below declares, and so the order's on-chain
+# ``group_spec.name``. It carries just-akash's provenance prefix (provenance.PLACEMENT_PREFIX)
+# so Flynn's lease snapshot attributes a probe order to just_akash by its existing
+# `just-akash-` rule (Flynn app/background/leases.py _NAME_PREFIXES). It was the SDL default
+# `akash` until openmix-nnqg, which Flynn maps EXACTLY to its own R&D fleet, so every probe
+# order read as a Flynn lease. probe_order_sdl creates through the Console client, not
+# deploy.py, so no run id is stamped onto it: this exact name is what lands on chain.
+BID_PROBE_GROUP = "just-akash-bidprobe"
+
 _SDL_CPU = """\
 ---
 version: "2.0"
@@ -93,14 +102,14 @@ profiles:
         storage:
           size: 128Mi
   placement:
-    akash:
+    just-akash-bidprobe:
       pricing:
         probe:
           denom: uact
           amount: 1000000
 deployment:
   probe:
-    akash:
+    just-akash-bidprobe:
       profile: probe
       count: 1
 """
@@ -134,14 +143,14 @@ profiles:
               nvidia:
 {models}
   placement:
-    akash:
+    just-akash-bidprobe:
       pricing:
         probe:
           denom: uact
           amount: 5000000
 deployment:
   probe:
-    akash:
+    just-akash-bidprobe:
       profile: probe
       count: 1
 """.format(models="\n".join(f"                - model: {m}" for m in GPU_PROBE_MODELS))
@@ -189,14 +198,14 @@ profiles:
               nvidia:
 {models}
   placement:
-    akash:
+    just-akash-bidprobe:
       pricing:
         probe:
           denom: uact
           amount: 5000000
 deployment:
   probe:
-    akash:
+    just-akash-bidprobe:
       profile: probe
       count: 1
 """.format(models="\n".join(f"                - model: {m}" for m in GPU_PROBE_MODELS))
@@ -233,14 +242,14 @@ profiles:
               persistent: true
               class: beta3
   placement:
-    akash:
+    just-akash-bidprobe:
       pricing:
         probe:
           denom: uact
           amount: 2000000
 deployment:
   probe:
-    akash:
+    just-akash-bidprobe:
       profile: probe
       count: 1
 """
@@ -272,14 +281,14 @@ profiles:
         storage:
           size: 128Mi
   placement:
-    akash:
+    just-akash-bidprobe:
       pricing:
         probe:
           denom: uact
           amount: 1500000
 deployment:
   probe:
-    akash:
+    just-akash-bidprobe:
       profile: probe
       count: 1
 """
@@ -329,14 +338,14 @@ profiles:
         storage:
           size: 128Mi
   placement:
-    akash:
+    just-akash-bidprobe:
       pricing:
         probe:
           denom: uact
           amount: 1000000
 deployment:
   probe:
-    akash:
+    just-akash-bidprobe:
       profile: probe
       count: 1
 """
@@ -502,7 +511,7 @@ def eligible_pairs(
 
 
 def inject_placement_attributes(sdl_text: str, attrs: dict[str, str]) -> str:
-    """Inject ``placement.akash.attributes`` so only matching providers may bid.
+    """Inject ``placement.<BID_PROBE_GROUP>.attributes`` so only matching providers may bid.
 
     Ported from the in-cluster probe. Without it a public probe order attracts
     20+ unrelated providers and ours loses Akash's per-order bid cap race
@@ -519,13 +528,13 @@ def inject_placement_attributes(sdl_text: str, attrs: dict[str, str]) -> str:
     attrs_yaml = (
         "      attributes:\n" + "\n".join(f"        {k}: {v}" for k, v in attrs.items()) + "\n"
     )
-    needle = "  placement:\n    akash:\n      pricing:"
+    needle = f"  placement:\n    {BID_PROBE_GROUP}:\n      pricing:"
     if needle not in sdl_text:
         raise ValueError(
             "SDL placement block not in the expected shape — cannot pin the order "
             "to a single provider, so the run would produce meaningless NO-BIDs"
         )
-    replacement = f"  placement:\n    akash:\n{attrs_yaml}      pricing:"
+    replacement = f"  placement:\n    {BID_PROBE_GROUP}:\n{attrs_yaml}      pricing:"
     return sdl_text.replace(needle, replacement, 1)
 
 

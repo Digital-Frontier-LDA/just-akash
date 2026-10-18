@@ -53,6 +53,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   Registered observations refuse redirects and missing height echoes. Financial
   settlement remains separate; runner migration and durable broker wiring remain gated.
 
+### Changed
+
+- The provider smoke probe and the bid probe declare a just-akash placement key instead of
+  the SDL default `akash` (Flynn openmix-nnqg): `just-akash-smoke` (run-scoped on chain to
+  `just-akash-smoke.<run id>` by `deploy`) and `just-akash-bidprobe`. Flynn maps `akash`
+  exactly to its R&D fleet, so every daily probe read as a Flynn fleet lease, and
+  `is_ours_placement` put it in Flynn's charter scope. Placement name only: resources, pricing,
+  providers and attributes are unchanged. The smoke's orphan sweep now reads the orphan's group
+  from chain and passes that exact name to the destroy; it still accepts the legacy `akash` so a
+  probe leaked before this change is reaped, and it leaves (and flags) a `{probe}` service whose
+  group is unreadable or one the probe never creates.
+
 ## [1.49.0] — 2026-10-18
 
 ### Changed
