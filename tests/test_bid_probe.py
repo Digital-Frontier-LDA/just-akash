@@ -120,6 +120,19 @@ def test_attributes_inject_into_every_scenario_sdl(name):
     assert "      pricing:" in out
 
 
+@pytest.mark.parametrize("name", sorted(SCENARIOS))
+def test_every_scenario_declares_the_provenance_placement_key(name):
+    """openmix-nnqg: the order's group name is its placement key, and Flynn attributes it by
+    that name. `akash` (the SDL default) is Flynn's R&D fleet; `just-akash-*` is just-akash."""
+    from just_akash.bid_probe import BID_PROBE_GROUP
+    from just_akash.provenance import PLACEMENT_PREFIX, placement_keys
+
+    assert BID_PROBE_GROUP.startswith(PLACEMENT_PREFIX)
+    assert placement_keys(SCENARIOS[name].sdl) == [BID_PROBE_GROUP]
+    out = inject_placement_attributes(SCENARIOS[name].sdl, {"region": "eu-west"})
+    assert placement_keys(out) == [BID_PROBE_GROUP]
+
+
 def test_injection_refuses_an_unpinned_order():
     with pytest.raises(ValueError, match="unpinned"):
         inject_placement_attributes(SCENARIOS["cpu"].sdl, {})

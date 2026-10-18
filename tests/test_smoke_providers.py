@@ -1113,6 +1113,19 @@ class TestOrphanProbeSweep:
     """
 
     NOW = 1_783_930_000.0  # a fixed "now" (~mid-2026, ms-epoch dseq era)
+    # What deploy.py's stamp_run puts on chain for the probe SDL: `just-akash-probe.<run id>`.
+    STAMPED = "just-akash-probe.0123456789ab"
+
+    @pytest.fixture(autouse=True)
+    def _chain_groups(self, monkeypatch):
+        """Every sweep test reads the orphan's group from chain; none may touch the network.
+        Default: the run-scoped probe group. A test overrides `self.groups` per dseq."""
+        self.groups: dict[str, list[str]] = {}
+        monkeypatch.setattr(
+            sp.chain,
+            "deployment_group_names",
+            lambda owner, dseq: self.groups.get(dseq, [self.STAMPED]),
+        )
 
     def _detail(self, service_names):
         """A get_deployment() detail whose lease reports these service names."""
@@ -1234,7 +1247,419 @@ class TestOrphanProbeSweep:
         ):
             swept = sp.sweep_orphan_probes()
         assert swept == [old_probe]
-        rd.assert_called_once_with(old_probe, owner=OWNER, group=sp.PROBE_GROUP)
+        # The destroy expects the EXACT group read from chain: a run-scoped key cannot be
+        # known ahead of time, and --expected-group compares for equality.
+        rd.assert_called_once_with(old_probe, owner=OWNER, group=self.STAMPED)
+
+    def test_a_probe_leaked_under_the_legacy_akash_key_is_still_reaped(self):
+        """openmix-nnqg transition: a probe opened before the rename carries group `akash`.
+        The sweep must still close it, passing `akash` as the group the destroy expects."""
+        legacy = self._dseq_aged(7200)
+        self.groups[legacy] = ["akash"]
+        api = self._fake_api([{"dseq": legacy}], {legacy: self._detail(["probe"])})
+        with (
+            patch.object(sp, "_api", return_value=api),
+            patch.object(sp, "robust_destroy", return_value=True) as rd,
+            patch.object(sp.time, "time", return_value=self.NOW),
+        ):
+            swept = sp.sweep_orphan_probes()
+        assert swept == [legacy]
+        rd.assert_called_once_with(legacy, owner=OWNER, group="akash")
+
+    def test_a_foreign_akash_deployment_that_is_not_a_probe_is_never_reaped(self):
+        """The legacy `akash` name is Flynn's R&D fleet SDL key too. A fleet deployment
+        under it is not a {probe} service, so the sweep never even reads its group."""
+        fleet = self._dseq_aged(90000)
+        self.groups[fleet] = ["akash"]
+        api = self._fake_api([{"dseq": fleet}], {fleet: self._detail(["vllm"])})
+        with (
+            patch.object(sp, "_api", return_value=api),
+            patch.object(sp, "robust_destroy", return_value=True) as rd,
+            patch.object(sp.time, "time", return_value=self.NOW),
+        ):
+            assert sp.sweep_orphan_probes() == []
+        rd.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "groups",
+        [
+            [],  # unreadable from every endpoint: UNKNOWN, not "not ours"
+            ["dfci-infra-probe"],  # another repo's probe-shaped workload
+            ["just-akash-probey"],  # shares the prefix, is not the probe's key
+            ["just-akash-probe.NOT-A-RUN-ID"],
+            # run_id_of() validates only the LAST component; the whole suffix must be one id
+            ["just-akash-probe.research.abcdef"],
+            ["just-akash-probe.0123456789ab", "just-akash-probe.0123456789ab"],  # two groups
+        ],
+    )
+    def test_a_probe_service_under_a_group_the_probe_never_creates_is_left(self, groups, capsys):
+        odd = self._dseq_aged(7200)
+        self.groups[odd] = groups
+        api = self._fake_api([{"dseq": odd}], {odd: self._detail(["probe"])})
+        with (
+            patch.object(sp, "_api", return_value=api),
+            patch.object(sp, "robust_destroy", return_value=True) as rd,
+            patch.object(sp.time, "time", return_value=self.NOW),
+        ):
+            assert sp.sweep_orphan_probes() == []
+        rd.assert_not_called()
+        out = capsys.readouterr().out
+        assert "left alone" in out
+        # Found but not swept: the summary must flag it for a human, never read as clean.
+        assert "could NOT be destroyed" in out
+
+    def test_the_real_stamp_run_stamps_both_key_lines_and_the_receipt_accepts_it(self):
+        """Codex P1 on f4d4a659: stamp_run rewrites key LINES, so an inline
+        `{ profile: probe, count: 1 }` reference stayed unstamped and artifact_identity
+        refused every smoke deploy. placement_keys() reads only the definition, so it
+        cannot see that; this runs the real stamp_run and the real receipt check."""
+        from just_akash.deployment_receipt import artifact_identity
+        from just_akash.provenance import PLACEMENT_PREFIX, placement_keys, stamp_run
+
+        assert placement_keys(sp.PROBE_SDL) == [sp.PROBE_GROUP]
+        assert sp.PROBE_GROUP.startswith(PLACEMENT_PREFIX)
+        stamped, keys = stamp_run(sp.PROBE_SDL, "0123456789ab")
+        assert keys == [self.STAMPED] and sp._is_probe_group(keys[0])
+        key_lines = [ln.strip() for ln in stamped.splitlines() if "just-akash-probe" in ln]
+        assert key_lines == [f"{self.STAMPED}:", f"{self.STAMPED}:"], key_lines
+        population, _, _ = artifact_identity(stamped)
+        assert population == [{"gseq": 1, "name": self.STAMPED}]
+
+    def test_the_probe_name_is_the_one_cleanup_identity_treats_as_a_probe(self):
+        from just_akash.cleanup_identity import CleanupIntent, _legacy_name
+
+        assert _legacy_name("just-akash-", CleanupIntent.PROBE, self.STAMPED)
+        assert _legacy_name("just-akash-", CleanupIntent.PROBE, sp.PROBE_GROUP)
+
+    # ── min-age below the 1h floor: the end-of-job reap (`--sweep-only --min-age 0`) ──
+    def _sweep_young(self, dseq, group, this_run, service="probe", age_s=5):
+        self.groups[dseq] = [group]
+        api = self._fake_api([{"dseq": dseq}], {dseq: self._detail([service])})
+        with (
+            patch.object(sp, "_api", return_value=api),
+            patch.object(sp, "_this_run_probe_receipts", return_value=set(this_run)),
+            patch.object(sp, "robust_destroy", return_value=True) as rd,
+            patch.object(sp.time, "time", return_value=self.NOW),
+        ):
+            swept = sp.sweep_orphan_probes(min_age_seconds=0)
+        return swept, rd
+
+    def test_min_age_zero_reaps_a_young_probe_this_run_stamped(self):
+        d = self._dseq_aged(5)
+        swept, rd = self._sweep_young(d, self.STAMPED, {(d, self.STAMPED)})
+        assert swept == [d]
+        rd.assert_called_once_with(d, owner=OWNER, group=self.STAMPED)
+
+    def test_min_age_zero_spares_another_runs_live_probe(self, capsys):
+        """Codex P1: a concurrent run's (or a developer's) live probe carries ANOTHER run
+        id. Under --min-age 0 it must not reach robust_destroy."""
+        d = self._dseq_aged(5)
+        swept, rd = self._sweep_young(d, "just-akash-probe.fedcba987654", {(d, self.STAMPED)})
+        assert swept == []
+        rd.assert_not_called()
+        assert "spared" in capsys.readouterr().out
+
+    def test_min_age_zero_never_reaps_a_young_legacy_akash_probe(self):
+        """Codex P1: `akash` proves no run. Under --min-age 0 a 5-second-old one is NOT
+        reaped; the legacy name needs the 1h floor unconditionally."""
+        d = self._dseq_aged(5)
+        swept, rd = self._sweep_young(d, "akash", {(d, self.STAMPED), (d, "akash")})
+        assert swept == []
+        rd.assert_not_called()
+
+    def test_min_age_zero_spares_a_young_unstamped_probe(self):
+        d = self._dseq_aged(5)
+        swept, rd = self._sweep_young(d, sp.PROBE_GROUP, {(d, self.STAMPED), (d, sp.PROBE_GROUP)})
+        assert swept == []
+        rd.assert_not_called()
+
+    def test_another_runs_probe_past_the_floor_is_reaped_under_min_age_zero(self):
+        d = self._dseq_aged(7200)
+        swept, rd = self._sweep_young(d, "just-akash-probe.fedcba987654", set(), age_s=7200)
+        assert swept == [d]
+        rd.assert_called_once_with(d, owner=OWNER, group="just-akash-probe.fedcba987654")
+
+    def test_a_chain_read_that_raises_flags_the_candidate_and_the_sweep_continues(
+        self, monkeypatch, capsys
+    ):
+        """Codex P2: a truthy non-object group_spec makes the chain parser raise. That
+        must leave the candidate, flag the sweep INCOMPLETE, and reap the others."""
+        bad, good = self._dseq_aged(7200), self._dseq_aged(7300)
+
+        def read(owner, dseq):
+            if dseq == bad:
+                raise AttributeError("'str' object has no attribute 'get'")
+            return [self.STAMPED]
+
+        monkeypatch.setattr(sp.chain, "deployment_group_names", read)
+        api = self._fake_api(
+            [{"dseq": bad}, {"dseq": good}],
+            {bad: self._detail(["probe"]), good: self._detail(["probe"])},
+        )
+        with (
+            patch.object(sp, "_api", return_value=api),
+            patch.object(sp, "robust_destroy", return_value=True) as rd,
+            patch.object(sp.time, "time", return_value=self.NOW),
+        ):
+            assert sp.sweep_orphan_probes() == [good]
+        rd.assert_called_once_with(good, owner=OWNER, group=self.STAMPED)
+        out = capsys.readouterr().out
+        assert f"could not read {bad}" in out
+        assert "INCOMPLETE" in out
+
+    # ── young-close authority: this run attempt's own receipts (REAL decoder) ──
+    RUN_TAG = "gh123.1"
+
+    def _receipt(self, tmp_path, *, operation_id, dseq=None, group=None, stale=False):
+        """A real receipt written by deployment_receipt's own writers, so the sweep's
+        reader is exercised through decode_receipt, not a stub."""
+        import json
+
+        from just_akash.deployment_receipt import (
+            mark_create_response_received,
+            mark_submitting,
+            prepare_receipt,
+        )
+        from just_akash.provenance import stamp_run
+
+        receipts = tmp_path / "just-akash-deployment-receipts"
+        receipts.mkdir(mode=0o700, exist_ok=True)
+        receipts.chmod(0o700)
+        group = group or self.STAMPED
+        sdl, _ = stamp_run(sp.PROBE_SDL, group.rpartition(".")[2])
+        path = receipts / f"{operation_id}.json"
+        prepared = prepare_receipt(
+            str(path), operation_id=operation_id, owner=OWNER, sdl_content=sdl
+        )
+        if dseq is not None:
+            submitting = mark_submitting(*prepared)
+            mark_create_response_received(
+                *submitting, dseq=dseq, deployment_response={"dseq": dseq}
+            )
+        if stale:
+            doc = json.loads(path.read_text())
+            for key in ("prepared_at", "submitting_at", "response_received_at"):
+                if key in doc:
+                    doc[key] = "2020-01-01T00:00:00+00:00"
+            path.write_text(json.dumps(doc))
+        return path
+
+    def _issue(self, monkeypatch, tmp_path, *ops, started_offset_s=-60.0):
+        """Write this producer's authority manifest with the REAL writer, as _deploy does
+        before each create. A fresh producer identity and start per test."""
+        from datetime import datetime, timedelta, timezone
+
+        monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+        monkeypatch.setenv("GITHUB_RUN_ID", "123")
+        monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "1")
+        monkeypatch.setattr(sp, "_ISSUED_OPERATIONS", [])
+        monkeypatch.setattr(sp, "_PRODUCER_ID", "00000000deadbeef")
+        monkeypatch.setattr(
+            sp,
+            "_PRODUCER_STARTED_AT",
+            datetime.now(timezone.utc) + timedelta(seconds=started_offset_s),
+        )
+        receipts = tmp_path / "just-akash-deployment-receipts"
+        receipts.mkdir(mode=0o700, exist_ok=True)
+        for op in ops:
+            sp._record_issued_operation(op)
+
+    def _sweep_with_receipts(self, monkeypatch, tmp_path, dseq):
+        monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+        monkeypatch.setenv("GITHUB_RUN_ID", "123")
+        monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "1")
+        self.groups[dseq] = [self.STAMPED]
+        api = self._fake_api([{"dseq": dseq}], {dseq: self._detail(["probe"])})
+        with (
+            patch.object(sp, "_api", return_value=api),
+            patch.object(sp, "robust_destroy", return_value=True) as rd,
+            patch.object(sp, "_delete_resolved_provider_smoke_receipts"),
+            patch.object(sp.time, "time", return_value=self.NOW),
+        ):
+            swept = sp.sweep_orphan_probes(min_age_seconds=0)
+        return swept, rd
+
+    def _op(self, tag=None):
+        return f"provider-smoke-{tag or self.RUN_TAG}-0123456789abcdef"
+
+    def test_this_runs_create_confirmed_receipt_for_this_dseq_authorizes_a_young_close(
+        self, monkeypatch, tmp_path
+    ):
+        d = self._dseq_aged(5)
+        self._issue(monkeypatch, tmp_path, self._op())
+        self._receipt(tmp_path, operation_id=self._op(), dseq=d)
+        swept, rd = self._sweep_with_receipts(monkeypatch, tmp_path, d)
+        assert swept == [d]
+        rd.assert_called_once_with(d, owner=OWNER, group=self.STAMPED)
+
+    def test_a_prepared_receipt_without_a_dseq_authorizes_nothing(self, monkeypatch, tmp_path):
+        """Codex round 2: a valid 2020 `prepared` receipt, no dseq, authorized a destroy."""
+        d = self._dseq_aged(5)
+        self._issue(monkeypatch, tmp_path, self._op())
+        self._receipt(tmp_path, operation_id=self._op(), stale=True)
+        swept, rd = self._sweep_with_receipts(monkeypatch, tmp_path, d)
+        assert swept == []
+        rd.assert_not_called()
+
+    def test_a_receipt_for_another_dseq_authorizes_nothing(self, monkeypatch, tmp_path):
+        """Codex round 2: a create_response_received receipt naming ANOTHER dseq did too."""
+        d = self._dseq_aged(5)
+        self._issue(monkeypatch, tmp_path, self._op())
+        self._receipt(tmp_path, operation_id=self._op(), dseq=self._dseq_aged(9))
+        swept, rd = self._sweep_with_receipts(monkeypatch, tmp_path, d)
+        assert swept == []
+        rd.assert_not_called()
+
+    def test_a_receipt_from_another_run_attempt_authorizes_nothing(self, monkeypatch, tmp_path):
+        d = self._dseq_aged(5)
+        self._issue(monkeypatch, tmp_path, self._op())
+        self._receipt(tmp_path, operation_id=self._op("gh123.2"), dseq=d)  # a retry attempt
+        self._receipt(tmp_path, operation_id="provider-smoke-0123456789abcdef", dseq=d)  # no tag
+        swept, rd = self._sweep_with_receipts(monkeypatch, tmp_path, d)
+        assert swept == []
+        rd.assert_not_called()
+
+    def test_a_receipt_older_than_its_own_dseq_authorizes_nothing(self, monkeypatch, tmp_path):
+        d = self._dseq_aged(5)
+        self._issue(monkeypatch, tmp_path, self._op())
+        self._receipt(tmp_path, operation_id=self._op(), dseq=d, stale=True)
+        swept, rd = self._sweep_with_receipts(monkeypatch, tmp_path, d)
+        assert swept == []
+        rd.assert_not_called()
+
+    def test_without_a_run_tag_no_receipt_is_this_runs(self, monkeypatch, tmp_path):
+        d = self._dseq_aged(5)
+        self._issue(monkeypatch, tmp_path, self._op())
+        self._receipt(tmp_path, operation_id=self._op(), dseq=d)
+        monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+        monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
+        assert sp._this_run_probe_receipts(OWNER) == set()
+
+    # ── Codex round 3: authority is what a producer ISSUED, not what a receipt spells ──
+    def test_an_unissued_operation_with_the_same_run_tag_authorizes_nothing(
+        self, monkeypatch, tmp_path
+    ):
+        """Round-3 repro: the producer issued op A; a receipt for op B (same run tag, valid
+        spelling, this dseq) sat beside it. The pattern check accepted B and destroyed."""
+        d = self._dseq_aged(5)
+        self._issue(monkeypatch, tmp_path, self._op())  # issued A
+        op_b = f"provider-smoke-{self.RUN_TAG}-fedcba9876543210"  # pragma: allowlist secret
+        self._receipt(tmp_path, operation_id=op_b, dseq=d)
+        swept, rd = self._sweep_with_receipts(monkeypatch, tmp_path, d)
+        assert swept == []
+        rd.assert_not_called()
+
+    def test_a_receipt_older_than_its_producer_authorizes_nothing(self, monkeypatch, tmp_path):
+        """Round 3: a receipt prepared BEFORE the producer that issued its id started (here,
+        a producer that starts 590 s after the receipt) is not that producer's."""
+        d = self._dseq_aged(5)
+        self._receipt(tmp_path, operation_id=self._op(), dseq=d)
+        self._issue(monkeypatch, tmp_path, self._op(), started_offset_s=590.0)
+        swept, rd = self._sweep_with_receipts(monkeypatch, tmp_path, d)
+        assert swept == []
+        rd.assert_not_called()
+
+    def test_a_missing_manifest_grants_no_young_close(self, monkeypatch, tmp_path):
+        d = self._dseq_aged(5)
+        self._receipt(tmp_path, operation_id=self._op(), dseq=d)  # nothing issued it
+        swept, rd = self._sweep_with_receipts(monkeypatch, tmp_path, d)
+        assert swept == []
+        rd.assert_not_called()
+
+    def test_a_manifest_others_can_read_or_write_grants_nothing(self, monkeypatch, tmp_path):
+        d = self._dseq_aged(5)
+        self._issue(monkeypatch, tmp_path, self._op())
+        self._receipt(tmp_path, operation_id=self._op(), dseq=d)
+        manifest = next((tmp_path / "just-akash-deployment-receipts").glob("smoke-authority-*"))
+        manifest.chmod(0o644)
+        swept, rd = self._sweep_with_receipts(monkeypatch, tmp_path, d)
+        assert swept == []
+        rd.assert_not_called()
+
+    def test_the_manifest_is_owner_only_and_lists_exactly_what_was_issued(
+        self, monkeypatch, tmp_path
+    ):
+        import json
+        import stat
+
+        self._issue(monkeypatch, tmp_path, self._op(), self._op("gh123.1").replace("0123", "9999"))
+        [manifest] = (tmp_path / "just-akash-deployment-receipts").glob("smoke-authority-*")
+        assert stat.S_IMODE(manifest.stat().st_mode) == 0o600
+        doc = json.loads(manifest.read_text())
+        assert doc["run_tag"] == self.RUN_TAG
+        assert doc["operation_ids"] == sp._ISSUED_OPERATIONS and len(doc["operation_ids"]) == 2
+        assert not list(manifest.parent.glob(".*.tmp")), "the atomic write left a temp file"
+
+    def test_a_fresh_consumer_process_honours_its_producers_manifest(self, monkeypatch, tmp_path):
+        """The end-of-job reap is a SEPARATE process. Run the reader in a real new interpreter:
+        it holds no producer state, so the manifest on disk is the only authority."""
+        import os
+        import sys
+        import time
+
+        d = str(int((time.time() - 5) * 1000))
+        self._issue(monkeypatch, tmp_path, self._op())
+        self._receipt(tmp_path, operation_id=self._op(), dseq=d)
+        code = (
+            "import just_akash.smoke_providers as sp;"
+            f"print(sorted(sp._this_run_probe_receipts({OWNER!r})))"
+        )
+        env = {**os.environ, "RUNNER_TEMP": str(tmp_path)}
+        out = (
+            subprocess.run(
+                [sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True
+            )
+            .stdout.strip()
+            .splitlines()[-1]
+        )
+        assert out == str([(d, self.STAMPED)])
+
+    def test_the_smoke_receipt_label_carries_the_run_tag(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_RUN_ID", "123")
+        monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "1")
+        assert sp._smoke_receipt_label() == f"provider-smoke-{self.RUN_TAG}"
+        monkeypatch.delenv("GITHUB_RUN_ID")
+        assert sp._smoke_receipt_label() == "provider-smoke"
+
+    # ── in-place update keeps the run id already on chain ─────────────
+    def test_update_sdl_carries_the_on_chain_stamped_key(self, tmp_path):
+        """`just-akash update` re-prepares the SDL in a NEW process, whose stamp_run would
+        give the probe key a NEW run id: an update naming a group the deployment does not
+        have. Pre-stamped with the on-chain id, deploy's stamp_run leaves it alone."""
+        from just_akash.deployment_receipt import artifact_identity
+        from just_akash.provenance import stamp_run
+
+        src = tmp_path / "probe.yaml"
+        src.write_text(sp.PROBE_SDL)
+        path, temp = sp._update_sdl_for(str(src), [{"gseq": 1, "name": self.STAMPED}])
+        assert temp == path and path != str(src)
+        text = Path(path).read_text()
+        # deploy's own re-stamp (a different run id) is a no-op on the pre-stamped key.
+        assert stamp_run(text, "fedcba987654") == (text, [])  # pragma: allowlist secret
+        assert artifact_identity(text)[0] == [{"gseq": 1, "name": self.STAMPED}]
+        # Nothing readable -> the original SDL, unchanged (the pre-rename behaviour).
+        for groups in (None, [], [{"gseq": 1, "name": "akash"}], "x"):
+            assert sp._update_sdl_for(str(src), groups) == (str(src), None)
+
+    def test_check_update_sends_the_stamped_sdl_and_removes_it(self, tmp_path):
+        src = tmp_path / "probe.yaml"
+        src.write_text(sp.PROBE_SDL)
+        seen = {}
+
+        def fake_run(cmd, timeout):
+            path = cmd[cmd.index("--sdl") + 1]
+            seen["path"], seen["text"] = path, Path(path).read_text()
+            return subprocess.CompletedProcess(cmd, 1, "", "boom")
+
+        with patch.object(sp, "_run", side_effect=fake_run):
+            assert (
+                sp._check_update(
+                    "123456", str(src), "uri", groups=[{"gseq": 1, "name": self.STAMPED}]
+                )
+                is False
+            )
+        assert f"{self.STAMPED}:" in seen["text"]
+        assert not Path(seen["path"]).exists()
 
     def test_successful_sweep_deletes_only_its_resolved_receipt(self, monkeypatch, tmp_path):
         old_probe = self._dseq_aged(7200)

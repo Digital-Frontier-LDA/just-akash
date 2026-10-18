@@ -50,6 +50,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -61,6 +62,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import chain
 from ._diagnostics import Code, emit
 from ._e2e import (
     GREEN,
@@ -84,6 +86,7 @@ from .paid_create import (
     reconcile_receipt,
     verified_cleanup,
 )
+from .provenance import PLACEMENT_PREFIX, RUN_SEPARATOR, run_id_of, stamp_run
 
 # The baseline HTTP marker the probe serves; the update check changes it and
 # re-reads it through the ingress to prove a new revision went live.
@@ -219,12 +222,14 @@ profiles:
         memory: { size: 1Gi }
         storage: [{ size: 5Gi }]
   placement:
-    akash:
+    just-akash-probe:
       pricing:
         probe: { denom: uact, amount: 10000 }
 deployment:
   probe:
-    akash: { profile: probe, count: 1 }
+    just-akash-probe:
+      profile: probe
+      count: 1
 """.replace("__SMOKE_MARKER__", INGRESS_BASELINE).replace(
     # The death-cause beacon ships DARK: BEACON_URL reaches the container only when
     # the operator sets SMOKE_BEACON_URL in the smoke's environment (a collector on
@@ -471,7 +476,29 @@ def _hdr(msg: str) -> None:
 # The probe SDL's sole service name. A deployment whose service set is exactly
 # {PROBE_SERVICE} is unambiguously a leaked smoke probe, never a user workload.
 PROBE_SERVICE = "probe"
-PROBE_GROUP = "akash"
+# The probe SDL's placement key (``profiles.placement.<KEY>``), and so its on-chain
+# ``group_spec.name``. It carries just-akash's provenance prefix so Flynn's lease snapshot
+# attributes the probe to just_akash by its existing `just-akash-` rule (Flynn
+# app/background/leases.py _NAME_PREFIXES), and it is the name cleanup_identity already
+# recognises as a disposable probe (`just-akash-probe[.<run id>]`, _legacy_name). deploy.py
+# run-scopes every key with that prefix (provenance.stamp_run), so what lands on chain is
+# `just-akash-probe.<run id>`; the in-run destroy reads that exact name from the deploy
+# receipt's group population. The deployment reference below the placement is BLOCK form
+# on purpose: stamp_run rewrites a key line, and an inline `{ profile: ... }` mapping
+# would leave the reference unstamped, an SDL whose groups disagree, which the receipt
+# (deployment_receipt.artifact_identity) refuses before any create.
+PROBE_GROUP = PLACEMENT_PREFIX + "probe"
+# Exactly the run-scoped name stamp_run writes: the key, one separator, one run id.
+_STAMPED_PROBE_GROUP_RE = re.compile(rf"{re.escape(PROBE_GROUP + RUN_SEPARATOR)}[a-f0-9]{{6,32}}")
+# The key every probe used before openmix-nnqg: the SDL default `akash`, which Flynn maps
+# EXACTLY to its R&D fleet, so each daily probe read as a Flynn fleet lease (run
+# 39107604489: 1792308348418, 1792308552194, 1792308760818). The orphan sweep still
+# accepts it so a probe leaked under the old key is reaped after this ships, but ONLY past
+# MIN_ORPHAN_AGE_SECONDS whatever --min-age says: `akash` is also Flynn's fleet SDL key, so
+# a young one is never presumed to be this run's. Probes live minutes and the sweep runs
+# first on every daily run, so it can go once no active deployment on our wallets carries
+# it with a {probe} service.
+LEGACY_PROBE_GROUP = "akash"
 
 # Don't reap a probe younger than this: a concurrent smoke run could still be
 # using it (a run holds one probe for up to the whole matrix, ~tens of minutes).
@@ -572,6 +599,226 @@ def _is_orphan_probe(
     return age is not None and age >= min_age_seconds
 
 
+def _is_probe_group(name: str) -> bool:
+    """True for a group name only the smoke probe SDL creates: the legacy ``akash``, or
+    ``just-akash-probe`` bare or run-scoped with exactly one run id
+    (``just-akash-probe.<run id>``). ``just-akash-probe.research.abcdef`` is not one:
+    run_id_of() validates only the last component, so the whole suffix is matched here."""
+    if name in (LEGACY_PROBE_GROUP, PROBE_GROUP):
+        return True
+    return _STAMPED_PROBE_GROUP_RE.fullmatch(name) is not None
+
+
+def _smoke_run_tag() -> str | None:
+    """`gh<run id>.<attempt>` for the GitHub Actions run attempt this process belongs to.
+
+    The smoke step and the end-of-job reap step are SEPARATE processes in one job, so
+    nothing held in memory survives from one to the other; the run attempt is what they
+    share and what no other run, attempt or developer shell can claim. None outside CI.
+    """
+    run = os.environ.get("GITHUB_RUN_ID", "")
+    attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+    if re.fullmatch(r"[1-9][0-9]{0,19}", run) and re.fullmatch(r"[1-9][0-9]{0,5}", attempt):
+        return f"gh{run}.{attempt}"
+    return None
+
+
+def _smoke_receipt_label() -> str:
+    """The receipt label a smoke deploy uses. In CI it carries the run tag, so every
+    operation id this run attempt mints reads `provider-smoke-gh<run>.<attempt>-<hex>`
+    (paid_create.receipt_environment); the file still matches `provider-smoke-*.json`."""
+    tag = _smoke_run_tag()
+    return f"provider-smoke-{tag}" if tag else "provider-smoke"
+
+
+# How far a receipt's create-response time may precede the dseq's own timestamp (the dseq
+# is the Console's ms clock, the receipt the runner's): clock skew, not a freshness window.
+_RECEIPT_CLOCK_SKEW_SECONDS = 120
+
+
+# ── producer authority manifest ─────────────────────────────────────────────────────
+# The ONLY thing that grants young-close authority (a destroy below the 1h floor). A smoke
+# process records every receipt operation id it ISSUES, before the create call, in its own
+# manifest next to the receipts: `smoke-authority-<run tag>-<producer id>.json`, mode 0600,
+# replaced atomically. The end-of-job reap is a different process, so it reads the manifest
+# from disk; a receipt whose operation id no producer of this run attempt issued, or that
+# predates the producer that issued it, proves nothing. The name matches neither receipt glob
+# (`provider-smoke-*.json`), so no receipt reader ever decodes it.
+_PRODUCER_ID = secrets.token_hex(8)
+_PRODUCER_STARTED_AT = datetime.now(timezone.utc)
+_ISSUED_OPERATIONS: list[str] = []
+_AUTHORITY_PREFIX = "smoke-authority-"
+
+
+def _authority_dir() -> Path | None:
+    runner_temp = os.environ.get("RUNNER_TEMP")
+    return Path(runner_temp) / "just-akash-deployment-receipts" if runner_temp else None
+
+
+def _record_issued_operation(operation_id: str) -> None:
+    """Persist ``operation_id`` in this producer's authority manifest, before the create.
+
+    Atomic (write a 0600 temp file, fsync, rename over the manifest) so a reader sees the old
+    list or the new one, never half of one. Only in CI with a run tag. A failed write is
+    said, not swallowed: this deploy's probe then has no young-close authority and falls to
+    the 1h floor, which delays a reap but can never cause one.
+    """
+    tag = _smoke_run_tag()
+    directory = _authority_dir()
+    if not tag or directory is None:
+        return
+    _ISSUED_OPERATIONS.append(operation_id)
+    manifest = {
+        "run_tag": tag,
+        "producer_id": _PRODUCER_ID,
+        "producer_started_at": _PRODUCER_STARTED_AT.isoformat(),
+        "operation_ids": list(_ISSUED_OPERATIONS),
+    }
+    final = directory / f"{_AUTHORITY_PREFIX}{tag}-{_PRODUCER_ID}.json"
+    temporary = directory / f".{final.name}.{secrets.token_hex(4)}.tmp"
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(manifest, f, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, final)
+    except OSError as e:
+        print(
+            f"  {YELLOW}authority manifest not written ({e}); probe {operation_id} has no "
+            f"young-close authority and is reaped only past the 1h floor{RESET}"
+        )
+        temporary.unlink(missing_ok=True)
+
+
+def _issued_operations(tag: str) -> dict[str, datetime]:
+    """operation id -> start of the producer that issued it, from this run attempt's
+    manifests. A manifest that is unreadable, malformed, for another run tag, or readable by
+    anyone but its owner contributes nothing (said, not swallowed)."""
+    directory = _authority_dir()
+    if directory is None:
+        return {}
+    minted = re.compile(rf"{re.escape(f'provider-smoke-{tag}-')}[0-9a-f]{{16}}")
+    issued: dict[str, datetime] = {}
+    try:
+        paths = list(directory.glob(f"{_AUTHORITY_PREFIX}{tag}-*.json"))
+    except OSError:
+        return {}
+    for path in paths:
+        try:
+            if path.lstat().st_mode & 0o077 or not path.is_file() or path.is_symlink():
+                raise ValueError("not an owner-only regular file")
+            doc = json.loads(path.read_text())
+            started = datetime.fromisoformat(doc["producer_started_at"])
+            ops = doc["operation_ids"]
+            if (
+                doc.get("run_tag") != tag
+                or started.tzinfo is None
+                or not isinstance(ops, list)
+                or not all(isinstance(o, str) and minted.fullmatch(o) for o in ops)
+            ):
+                raise ValueError("manifest fields do not match this run attempt")
+        except Exception as e:  # noqa: BLE001 - an unreadable manifest grants nothing
+            print(
+                f"  {YELLOW}orphan sweep: authority manifest {path.name} rejected "
+                f"({str(e)[:80]}); it grants no young-close authority{RESET}"
+            )
+            continue
+        for op in ops:
+            issued[op] = started
+    return issued
+
+
+def _this_run_probe_receipts(owner: str) -> set[tuple[str, str]]:
+    """(dseq, group) for every probe THIS run attempt created, proven by its own receipts.
+
+    Young-close authority (below the 1h floor) rests on this, so a receipt counts only if
+    ALL of these hold, else it proves nothing:
+      * its operation id is one a producer of this run attempt ISSUED, per that producer's
+        authority manifest (a matching spelling is not enough), and it was prepared no
+        earlier than that producer started;
+      * it reached `create_response_received`, the stage that carries a DSEQ;
+      * its owner is this sweep's owner;
+      * its group population is exactly one stamped probe group;
+      * its create response was received no earlier than its own dseq was minted (minus
+        clock skew), so a stale receipt cannot vouch for a dseq it predates.
+    The sweep then requires the CANDIDATE's (dseq, group) to be one of these pairs.
+    Empty outside CI or when nothing qualifies: then no young probe is this run's.
+    """
+    tag = _smoke_run_tag()
+    runner_temp = os.environ.get("RUNNER_TEMP")
+    if not tag or not runner_temp:
+        return set()
+    issued = _issued_operations(tag)
+    if not issued:
+        return set()
+    try:
+        paths = list(
+            (Path(runner_temp) / "just-akash-deployment-receipts").glob(
+                f"provider-smoke-{tag}-*.json"
+            )
+        )
+    except OSError:
+        return set()
+    pairs: set[tuple[str, str]] = set()
+    for path in paths:
+        try:
+            receipt = decode_receipt(path.read_bytes())
+        except Exception as e:  # noqa: BLE001 - an unreadable receipt proves nothing
+            # Said, not swallowed: a probe this receipt named is then NOT this run's, so
+            # the sweep spares it below the 1h floor and the next run's sweep reaps it.
+            print(
+                f"  {YELLOW}orphan sweep: receipt {path.name} unreadable ({str(e)[:80]}); "
+                f"its probe is not treated as this run's{RESET}"
+            )
+            continue
+        if receipt["state"] != "create_response_received":
+            continue
+        producer_started = issued.get(receipt["operation_id"])
+        if producer_started is None or receipt["expected_owner"] != owner:
+            continue
+        try:
+            prepared = datetime.fromisoformat(receipt["prepared_at"])
+        except (TypeError, ValueError):
+            continue
+        if prepared < producer_started:
+            continue
+        population = receipt["group_population"]
+        if len(population) != 1:
+            continue
+        group = population[0].get("name")
+        if not isinstance(group, str) or not _STAMPED_PROBE_GROUP_RE.fullmatch(group):
+            continue
+        dseq = str(receipt["dseq"])
+        created = _probe_age_seconds(dseq, time.time())
+        try:
+            received = datetime.fromisoformat(receipt["response_received_at"]).timestamp()
+        except (TypeError, ValueError):
+            continue
+        if created is None:
+            continue
+        minted_at = time.time() - created
+        if received < minted_at - _RECEIPT_CLOCK_SKEW_SECONDS:
+            continue
+        pairs.add((dseq, group))
+    return pairs
+
+
+def _probe_group_on_chain(owner: str, dseq: str) -> str | None:
+    """The orphan's one on-chain group name, when it is a probe group; None otherwise.
+
+    The destroy is told the exact group to expect (``--expected-group``), and a run-scoped
+    key cannot be known ahead of time, so it is read back from chain. Unreadable, more
+    than one group, or a name the probe SDL never creates -> None: the sweep leaves it and
+    says so. An empty read means UNKNOWN (chain.deployment_group_names), never "not ours".
+    """
+    names = chain.deployment_group_names(owner, dseq)
+    if len(names) == 1 and _is_probe_group(names[0]):
+        return names[0]
+    return None
+
+
 def _is_not_found_error(exc: Exception) -> bool:
     """True only for a 404 (deployment already gone), not any other API error.
 
@@ -599,6 +846,10 @@ def sweep_orphan_probes(
     except Exception as e:  # noqa: BLE001 -- sweep must never abort the run
         print(f"  {YELLOW}orphan sweep skipped: list_deployments failed: {e}{RESET}")
         return []
+    # Only read when the floor is below the 1h orphan age (the end-of-job reap).
+    this_run_probes = (
+        _this_run_probe_receipts(owner) if min_age_seconds < MIN_ORPHAN_AGE_SECONDS else set()
+    )
     found: list[str] = []  # orphans identified
     swept: list[str] = []  # orphans confirmed destroyed (or, in dry-run, matched)
     uninspected: list[str] = []  # listed but detail fetch genuinely failed
@@ -619,9 +870,38 @@ def sweep_orphan_probes(
             continue
         if not _is_orphan_probe(detail, dseq, min_age_seconds=min_age_seconds, now=now):
             continue
-        found.append(dseq)
         age = _probe_age_seconds(dseq, now)
         age_note = f"{int(age // 60)}m old" if age is not None else "age unknown"
+        try:
+            group = _probe_group_on_chain(owner, dseq)
+        except Exception as e:  # noqa: BLE001 -- one bad chain read must not abort the sweep
+            uninspected.append(dseq)
+            print(f"  {YELLOW}orphan sweep: could not read {dseq}'s group: {str(e)[:120]}{RESET}")
+            continue
+        # Below the 1h floor (the end-of-job reap runs --min-age 0) a probe is reaped only
+        # when THIS run attempt's own create receipt names this exact dseq and group. A
+        # concurrent run's or a developer's live probe has no such receipt, and the legacy
+        # `akash` name proves no run at all.
+        if (
+            group is not None
+            and (age is None or age < MIN_ORPHAN_AGE_SECONDS)
+            and not (_STAMPED_PROBE_GROUP_RE.fullmatch(group) and (dseq, group) in this_run_probes)
+        ):
+            print(
+                f"  orphan sweep: spared {dseq} ({age_note}, group {group}): younger than "
+                f"{MIN_ORPHAN_AGE_SECONDS // 60}m and not stamped by this run"
+            )
+            continue
+        found.append(dseq)
+        if group is None:
+            # A {probe} service under a group the probe SDL never creates, or one we could
+            # not read: not provably ours, so it is left, and counted as found-not-swept so
+            # the summary below flags it for a human.
+            print(
+                f"  {YELLOW}orphaned probe {dseq} ({age_note}) — its on-chain group is "
+                f"unreadable or not a smoke probe group; left alone{RESET}"
+            )
+            continue
         # In dry-run we only report; say so, so the per-probe line can't be read
         # as "this was destroyed" for a safety-critical cleanup that did nothing.
         action = "would reap (dry-run)" if dry_run else "reaping"
@@ -629,7 +909,7 @@ def sweep_orphan_probes(
             f"  {YELLOW}orphaned probe {dseq} ({age_note}) — leaked by an earlier "
             f"run; {action}{RESET}"
         )
-        if dry_run or robust_destroy(dseq, owner=owner, group=PROBE_GROUP):
+        if dry_run or robust_destroy(dseq, owner=owner, group=group):
             swept.append(dseq)
             if not dry_run:
                 _delete_resolved_provider_smoke_receipts(dseq, owner)
@@ -1016,7 +1296,12 @@ def _deploy(sdl_path: str, provider: str, dseq_ref: dict) -> tuple[str | None, s
     rather than a lease that never formed. ``dseq_ref`` is populated whenever a dseq
     was seen at all — including on failure — so cleanup can never miss one.
     """
-    receipt_path, operation_id, receipt_env = receipt_environment("provider-smoke", unique=True)
+    receipt_path, operation_id, receipt_env = receipt_environment(
+        _smoke_receipt_label(), unique=True
+    )
+    # Before the create: a receipt only grants young-close authority when this producer is
+    # on record as having issued its operation id.
+    _record_issued_operation(operation_id)
     dseq_ref["receipt_path"] = receipt_path
     command = [
         "uv",
@@ -1903,7 +2188,34 @@ def _record_ingress_timeout(
     )
 
 
-def _check_update(dseq: str, sdl_path: str, uri: str, diag: dict | None = None) -> bool:
+def _update_sdl_for(sdl_path: str, groups: object) -> tuple[str, str | None]:
+    """The SDL to PUT for an in-place update, and a temp path to remove afterwards.
+
+    `just-akash update` prepares the SDL like a deploy, so it would stamp a NEW run id (a
+    run id is per process) onto the probe's key, and the update would name a placement
+    group the deployment does not have. Pre-stamping the key with the run id already on
+    chain (from the deploy receipt's group population) makes stamp_run leave it alone.
+    Without a readable stamped name the original SDL is used unchanged.
+    """
+    names = (
+        [g.get("name") for g in groups if isinstance(g, dict)] if isinstance(groups, list) else []
+    )
+    if len(names) != 1 or not isinstance(names[0], str):
+        return sdl_path, None
+    if not _STAMPED_PROBE_GROUP_RE.fullmatch(names[0]):
+        return sdl_path, None
+    text = Path(sdl_path).read_text()
+    stamped, keys = stamp_run(text, run_id_of(names[0]))
+    if keys != [names[0]]:
+        return sdl_path, None
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+        f.write(stamped)
+    return f.name, f.name
+
+
+def _check_update(
+    dseq: str, sdl_path: str, uri: str, diag: dict | None = None, groups: object = None
+) -> bool:
     """In-place manifest update: change the served marker and confirm the new
     revision goes live at the same ingress (lease preserved).
 
@@ -1912,21 +2224,26 @@ def _check_update(dseq: str, sdl_path: str, uri: str, diag: dict | None = None) 
     the run log + telemetry and any later cap change is data-driven, not a guess. The
     diagnostics never flip the verdict: a genuine provider defect must stay visible."""
     token = f"probe-updated-{dseq[-6:]}"
-    r = _run(
-        [
-            "uv",
-            "run",
-            "just-akash",
-            "update",
-            "--dseq",
-            dseq,
-            "--sdl",
-            sdl_path,
-            "--env",
-            f"SMOKE_MARKER={token}",
-        ],
-        timeout=120,
-    )
+    update_sdl, temp_sdl = _update_sdl_for(sdl_path, groups)
+    try:
+        r = _run(
+            [
+                "uv",
+                "run",
+                "just-akash",
+                "update",
+                "--dseq",
+                dseq,
+                "--sdl",
+                update_sdl,
+                "--env",
+                f"SMOKE_MARKER={token}",
+            ],
+            timeout=120,
+        )
+    finally:
+        if temp_sdl:
+            Path(temp_sdl).unlink(missing_ok=True)
     if r.returncode != 0:
         err = " ".join((r.stderr or r.stdout or "").split())
         print(f"  update command failed (rc={r.returncode}): {err[:200]}")
@@ -2129,7 +2446,11 @@ def smoke_provider(
             run_check(
                 "update",
                 lambda: _check_update(
-                    dseq, sdl_path, uri, diag=diagnostics.setdefault("update", {})
+                    dseq,
+                    sdl_path,
+                    uri,
+                    diag=diagnostics.setdefault("update", {}),
+                    groups=dseq_ref.get("groups"),
                 ),
             )
         else:
