@@ -73,6 +73,13 @@
     "callee": "close_deployment",
     "count": 1,
     "kind": "python",
+    "path": "just_akash/close_backtest.py",
+    "scope": "run"
+  },
+  {
+    "callee": "close_deployment",
+    "count": 1,
+    "kind": "python",
     "path": "just_akash/close_orphans.py",
     "scope": "run"
   },

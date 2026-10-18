@@ -10,6 +10,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- `close-backtest.yml` + `python -m just_akash.close_backtest` (Flynn openmix-0tce): close ONE
+  named, leased, leaked e2e backtest. Nothing else could: close-orphans closes only lease-less
+  deployments, and cleanup-stale and `robust_destroy(owner=, group=)` both need the signed
+  creation tx, which public LCDs have pruned for any lease older than their history
+  (openmix-hxlg). The authority is a person (the operator names `owner`, `dseq` and
+  `expected_group`; a reviewer approves `production`); the checks stop a wrong dseq, not a
+  same-wallet actor. `plan` (ungated) loads NO secret and reads the public chain only: sources
+  from >= 2 distinct registered operators on `akashnet-2` (the registry's independence claim;
+  no DNS claim), read without redirects, with fresh tips (judged on each response's arrival)
+  within the skew; then each is read at ONE pinned height (lowest tip - 2) whose echoed
+  `x-cosmos-block-height` must match, and must agree the deployment is active, its only group
+  is exactly `just-akash-backtest.<12 hex>`, and its positive `created_at` height; age >= 48 h
+  from that HEIGHT (not the deployer-chosen dseq). `close` (execute=true, after plan, behind `production`, the only
+  job that decrypts the key) re-runs that, checks the key's wallet, then as the LAST read
+  before the DELETE requires well-formed lease rows and exactly one active lease, naming this
+  owner and dseq, whose status was read and whose complete service set is `{backtest}`. A close counts only on a read-back with this owner,
+  this dseq and state exactly `closed`; a DELETE that errors is still read back, and an
+  unproven outcome exits 3 ("outcome UNKNOWN"); reporting after a proven close only warns.
+  `--execute` cannot be abbreviated. `plan` refuses execute=true unless
+  `production` already exists with a required reviewer (GitHub creates a named environment
+  unprotected on first use).
 - Lease charters for placements Flynn counts as ours (`flynn-*`, `fleet-*`, exactly
   `dcloud`/`akash`; openmix-pvr6.1). `deploy --charter FILE.json` (or
   `JUST_AKASH_CHARTER_JSON`) POSTs the charter to Flynn before the credit probe and refuses

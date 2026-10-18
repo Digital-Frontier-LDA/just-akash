@@ -1,0 +1,143 @@
+name: Close a leaked backtest
+
+# Close ONE leased just-akash backtest deployment that an e2e run leaked, by name.
+#
+# Nothing else in this repo can: close-orphans.yml closes only deployments with NO lease,
+# and cleanup-stale.yml HOLDs every lease older than the public LCDs' history because its
+# live close needs the signed creation tx, which they have pruned (Flynn openmix-hxlg). The
+# module docstring (just_akash/close_backtest.py) has the whole argument.
+#
+# THE AUTHORITY IS A PERSON: the operator names the dseq and its group, and a reviewer
+# approves `production` for this run. The module's checks stop a WRONG dseq (a typo, a fleet
+# or canary lease, another wallet's, a recent one under the 48 h floor); they do not stop
+# someone who holds this wallet's key. just_akash/close_backtest.py lists them.
+#
+# TWO JOBS. `plan` reads the PUBLIC chain only and closes nothing; it always runs and loads
+# NO secret: an ungated job runs branch-controlled code, so it must not hold the wallet key.
+# `close` runs only with execute=true, after `plan` passed, behind the `production`
+# environment; it alone decrypts the key, re-runs the chain checks, reads the Console's
+# active lease last, and closes. The approver reads the plan's verdict before approving.
+#
+# ⛔ THE GATE MUST EXIST BEFORE IT IS TRUSTED. GitHub creates an environment that a job
+# names on first use, UNPROTECTED. So `plan` refuses execute=true unless `production` already
+# exists with a required-reviewers rule; without that check the first execute run would
+# create an open door and walk through it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      owner:
+        description: "Console wallet that owns it (just_akash.lease_intent.WALLET_LABELS)"
+        type: choice
+        default: akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee # pragma: allowlist secret
+        options:
+          - akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee # pragma: allowlist secret
+          - akash1cklqag0e0v794msgqkr6uwf7sr6zyy42gm78f0 # pragma: allowlist secret
+          - akash14n4rkmz64rn0tey0r5g07l8q5x0fh2h4hu44kt # pragma: allowlist secret
+      dseq:
+        description: "The leaked backtest deployment to close (one dseq). Required."
+        type: string
+        required: true
+      expected_group:
+        description: "The group it must carry on chain: just-akash-backtest.<12 hex>. Required."
+        type: string
+        required: true
+      execute:
+        description: "Close it after approval (false = verify and report only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Same group as every workflow that spends from the Console wallet: one Cosmos account,
+# one sequence number. cancel-in-progress: false, because a half-finished close is worse
+# than queueing behind one.
+concurrency:
+  group: akash-wallet
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Verify the named backtest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read # GET /environments/production, for the gate check below
+    steps:
+      # Every input reaches the shell through the environment, never `${{ }}` interpolation
+      # into `run:` (same rule as close-orphans.yml).
+      - name: Inputs are one dseq and one backtest group
+        env:
+          DSEQ: ${{ inputs.dseq }}
+          GROUP: ${{ inputs.expected_group }}
+        run: |
+          set -euo pipefail
+          [[ "$DSEQ" =~ ^[1-9][0-9]{0,19}$ ]] || { echo "::error::dseq must be one plain dseq"; exit 1; }
+          [[ "$GROUP" =~ ^just-akash-backtest\.[0-9a-f]{12}$ ]] \
+            || { echo "::error::expected_group must be just-akash-backtest.<12 hex>"; exit 1; }
+      - name: The production gate exists and requires a reviewer
+        if: ${{ inputs.execute }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          reviewers=$(gh api "repos/$REPO/environments/production" \
+            --jq '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[]?] | length' 2>/dev/null) \
+            || { echo "::error::environment 'production' does not exist: create it with required reviewers first"; exit 1; }
+          if [ "${reviewers:-0}" -lt 1 ]; then
+            echo "::error::environment 'production' has no required reviewer: the close would run unapproved"
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: uv sync
+      # No SOPS step here, on purpose: the chain reads are public.
+      - name: Verify on chain (closes nothing)
+        env:
+          OWNER: ${{ inputs.owner }}
+          DSEQ: ${{ inputs.dseq }}
+          GROUP: ${{ inputs.expected_group }}
+        run: |
+          uv run python -m just_akash.close_backtest \
+            --owner "$OWNER" --dseq "$DSEQ" --expected-group "$GROUP"
+
+  close:
+    name: Close the verified backtest
+    needs: plan
+    if: ${{ inputs.execute }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: uv sync
+      - name: Load SOPS secrets
+        uses: ./.github/actions/sops-env
+        with:
+          age-key: ${{ secrets.SOPS_AGE_KEY }}
+      # The module re-runs the chain checks, reads the active lease last, and reads back.
+      - name: Close
+        env:
+          OWNER: ${{ inputs.owner }}
+          DSEQ: ${{ inputs.dseq }}
+          GROUP: ${{ inputs.expected_group }}
+        run: |
+          set -euo pipefail
+          uv run python -m just_akash.close_backtest \
+            --owner "$OWNER" --dseq "$DSEQ" --expected-group "$GROUP" --execute
