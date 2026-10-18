@@ -1442,7 +1442,8 @@ class TestOrphanProbeSweep:
         path, temp = sp._update_sdl_for(str(src), [{"gseq": 1, "name": self.STAMPED}])
         assert temp == path and path != str(src)
         text = Path(path).read_text()
-        assert stamp_run(text, "fedcba987654") == (text, [])  # deploy's re-stamp: no-op
+        # deploy's own re-stamp (a different run id) is a no-op on the pre-stamped key.
+        assert stamp_run(text, "fedcba987654") == (text, [])  # pragma: allowlist secret
         assert artifact_identity(text)[0] == [{"gseq": 1, "name": self.STAMPED}]
         # Nothing readable -> the original SDL, unchanged (the pre-rename behaviour).
         for groups in (None, [], [{"gseq": 1, "name": "akash"}], "x"):
