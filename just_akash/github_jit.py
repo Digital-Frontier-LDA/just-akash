@@ -140,6 +140,7 @@ class JitPolicy:
                 "deploy-env",
                 "ci-akash-qualification",
                 "ci-akash-qualification-v2",
+                "ci-akash-qualification-v3",
             )
         ):
             raise JitHold("invalid immutable JIT policy")
