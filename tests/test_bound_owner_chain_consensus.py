@@ -208,15 +208,15 @@ def test_default_runtime_sources_are_exactly_two_eligible_destructive_voters(mon
     hosts = {urllib.parse.urlsplit(source["url"]).hostname for source in sources}
 
     assert len(sources) == len(hosts) == 2
-    assert {s["source_id"] for s in sources} == {"quad", "c29r3"}
+    assert {s["source_id"] for s in sources} == {"crouton", "polkachu"}
     assert all("pocket" not in s["source_id"] for s in sources)
     assert len({s["operator"] for s in sources}) == 2
     assert len({s["gateway_ancestry"] for s in sources}) == 2
     assert len({s["cache_ancestry"] for s in sources}) == 2
     assert {s["chain_id"] for s in sources} == {"akashnet-2"}
-    assert chain.OWNER_CORROBORATION_REGISTRY_VERSION == 2
+    assert chain.OWNER_CORROBORATION_REGISTRY_VERSION == 3
     assert "akash/chain.json" in chain.OWNER_CORROBORATION_REGISTRY_PROVENANCE
-    assert "c67c94a5f5c41ad1b116b1b847ef8b5f196b6405" in (
+    assert "cc1ed04b31326bc79f3208e571fb71fa0fddb987" in (
         chain.OWNER_CORROBORATION_REGISTRY_PROVENANCE
     )
     assert len(chain.OWNER_CORROBORATION_REGISTRY_SHA256) == 64
