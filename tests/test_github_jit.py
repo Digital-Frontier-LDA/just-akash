@@ -586,22 +586,28 @@ def test_nested_jit_file_corruption_or_root_escape_is_unknown(filename, content)
 
 
 @pytest.mark.parametrize(
-    "selected_branch", ["main", "master", "deploy-env", "ci-akash-qualification"]
+    "selected_branch",
+    ["main", "master", "deploy-env", "ci-akash-qualification", "ci-akash-qualification-v2"],
 )
 @pytest.mark.parametrize("producer", ["a" * 40, "c" * 40])
-def test_fixed_snapshot_branch_keeps_group_and_producer_binding(selected_branch, producer):
+@pytest.mark.parametrize(
+    "snapshot_branch", ["ci-akash-qualification", "ci-akash-qualification-v2"]
+)
+def test_fixed_snapshot_branch_keeps_group_and_producer_binding(
+    selected_branch, producer, snapshot_branch
+):
     policy = replace(
         branch_policy(),
         workflows=(
-            REPO + "/.github/workflows/ci-observability.yml@refs/heads/ci-akash-qualification",
+            REPO + "/.github/workflows/ci-observability.yml@refs/heads/" + snapshot_branch,
         ),
-        source_workflow_branch="ci-akash-qualification",
+        source_workflow_branch=snapshot_branch,
     )
     github = GitHub()
     github.group["selected_workflows"] = [
         REPO + "/.github/workflows/ci-observability.yml@refs/heads/" + selected_branch
     ]
-    if selected_branch == "ci-akash-qualification" and producer == "a" * 40:
+    if selected_branch == snapshot_branch and producer == "a" * 40:
         handoff = jit.mint_jit(
             policy,
             NAME,
@@ -629,6 +635,10 @@ def test_fixed_snapshot_branch_keeps_group_and_producer_binding(selected_branch,
     "branch",
     [
         "ci-akash-qualification-other",
+        "ci-akash-qualification-v2-other",
+        "ci-akash-qualification-v3",
+        "refs/heads/ci-akash-qualification-v2",
+        "ci-akash-qualification-v2\n",
         "refs/heads/ci-akash-qualification",
         "ci-akash-qualification\n",
     ],
@@ -638,6 +648,7 @@ def test_snapshot_branch_is_not_a_pattern_or_arbitrary_ref(branch):
         replace(branch_policy(), source_workflow_branch=branch)
 
 
-def test_snapshot_branch_cannot_change_reusable_workflow_scope():
+@pytest.mark.parametrize("branch", ["ci-akash-qualification", "ci-akash-qualification-v2"])
+def test_snapshot_branch_cannot_change_reusable_workflow_scope(branch):
     with pytest.raises(jit.JitHold):
-        replace(POLICY, source_workflow_branch="ci-akash-qualification")
+        replace(POLICY, source_workflow_branch=branch)
