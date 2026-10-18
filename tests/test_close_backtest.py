@@ -430,7 +430,9 @@ def test_a_vllm_lease_with_no_state_beside_a_backtest_lease_is_refused():
     assert why is not None and "unknown state" in why
 
 
-@pytest.mark.parametrize("state", ["", "ACTIVE", "unknown", "Active", "paused", None, 1])
+@pytest.mark.parametrize(
+    "state", ["", "ACTIVE", "unknown", "Active", "paused", "reclaiming", None, 1, [], {}]
+)
 def test_a_lease_row_in_an_unknown_state_beside_a_backtest_lease_is_refused(state):
     """Codex round 3: [active backtest, state="" vllm] used to pass and send a DELETE."""
     odd = {**_lease(services=("vllm",)), "state": state}
@@ -567,7 +569,7 @@ def test_an_abbreviated_execute_flag_is_rejected():
         cb.main(["--owner", OWNER, "--dseq", DSEQ, "--expected-group", GROUP, "--exec"])
 
 
-@pytest.mark.parametrize("state", ["", "ACTIVE", "unknown"])
+@pytest.mark.parametrize("state", ["", "ACTIVE", "unknown", [], {}])
 def test_an_unknown_lease_state_sends_no_delete(wired, state):
     odd = {**_lease(services=("vllm",)), "state": state}
     client = wired["use"](_Client(_detail(leases=[_lease(), odd])))

@@ -101,7 +101,9 @@ HEIGHT_RE = re.compile(r"[1-9][0-9]{0,19}")
 CHAIN_ID = "akashnet-2"
 # Every lease state this repo recognises: the same set _lease_verification.lease_snapshot
 # refuses outside of. A row in any other state ("", "ACTIVE", "unknown", a new enum) could be
-# the live lease under a name we do not read, so it is a refusal, not a skip.
+# the live lease under a name we do not read, so it is a refusal, not a skip. Upstream Akash
+# also has `reclaiming` (chain-sdk LeaseState); it is refused on purpose: conservative, and
+# consistent with requiring exactly one active lease.
 KNOWN_LEASE_STATES = frozenset({"active", "closed", "insufficient_funds"})
 # The registry's finality rule, `committed-tip-minus-2`: read state two blocks under the tip.
 FINALITY_DEPTH = 2
@@ -285,7 +287,9 @@ def console_refusal(client, owner: str, dseq: str) -> str | None:
         # A row we cannot classify could be the live one: refuse rather than skip it.
         if not isinstance(lease, dict) or not isinstance(lease.get("id"), dict):
             return "a lease row has no id"
-        if lease.get("state") not in KNOWN_LEASE_STATES:
+        state = lease.get("state")
+        # isinstance first: a JSON list or object state is unhashable in the set lookup.
+        if not isinstance(state, str) or state not in KNOWN_LEASE_STATES:
             return f"a lease row is in unknown state {lease.get('state')!r}"
     active = [x for x in leases if x["state"] == "active"]
     if len(active) != 1:
