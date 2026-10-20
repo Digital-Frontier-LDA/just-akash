@@ -482,7 +482,7 @@ jobs:
     timeout-minutes: 120
     outputs:
       dseq: ${{ steps.provision.outputs.dseq }}
-      deployment_outcome: ${{ steps.provision.outputs.deployment_outcome || steps.public_profile.outputs.deployment_outcome || steps.private_profile.outputs.deployment_outcome || (steps.pat.outputs.native_pre_create_refused == 'true' && 'no-deployment' || '') }}
+      deployment_outcome: ${{ steps.provision.outputs.deployment_outcome || steps.public_profile.outputs.deployment_outcome || steps.private_profile.outputs.deployment_outcome || (steps.pat.outputs.native_pre_create_refused == 'true' && 'no-deployment' || '') || (steps.pat.outcome == 'failure' && steps.provision.outcome == 'skipped' && steps.provision.conclusion == 'skipped' && steps.provision.outputs.dseq == '' && steps.provision.outputs.create_ambiguous != 'true' && 'no-deployment' || '') }}
       create_ambiguous: ${{ steps.provision.outputs.create_ambiguous }}
       provision_healthy: ${{ steps.provision.outputs.provision_healthy }}
       runners_online: ${{ steps.provision.outputs.runners_online }}

@@ -26,16 +26,26 @@ def test_typed_outcome_is_published_through_both_workflow_boundaries() -> None:
         "${{ steps.provision.outputs.deployment_outcome || "
         "steps.public_profile.outputs.deployment_outcome || "
         "steps.private_profile.outputs.deployment_outcome || "
-        "(steps.pat.outputs.native_pre_create_refused == 'true' && 'no-deployment' || '') }}"
+        "(steps.pat.outputs.native_pre_create_refused == 'true' && 'no-deployment' || '') || "
+        "(steps.pat.outcome == 'failure' && steps.provision.outcome == 'skipped' && "
+        "steps.provision.conclusion == 'skipped' && steps.provision.outputs.dseq == '' && "
+        "steps.provision.outputs.create_ambiguous != 'true' && 'no-deployment' || '') }}"
     )
     teardown_with = DOC["jobs"]["teardown"]["with"]
-    assert teardown_with["deployment-outcome"] == ("${{ needs.pool.outputs.deployment_outcome }}")
+    assert teardown_with["deployment-outcome"] == (
+        "${{ needs.pool.outputs.deployment_outcome }}"
+    )
     # The last KNOWN lease always reaches teardown; a later ambiguous create travels
     # beside it and makes teardown hold after closing it (#348).
     assert teardown_with["dseq"] == "${{ needs.pool.outputs.dseq }}"
-    assert teardown_with["create-ambiguous"] == "${{ needs.pool.outputs.create_ambiguous }}"
+    assert (
+        teardown_with["create-ambiguous"]
+        == "${{ needs.pool.outputs.create_ambiguous }}"
+    )
     assert DOC["jobs"]["pool"]["outputs"]["create_ambiguous"] == (
         "${{ steps.provision.outputs.create_ambiguous }}"
     )
     for key in ("held_reason", "held_dseq", "held_deployment_group"):
-        assert CALL["outputs"][key]["value"] == f"${{{{ jobs.teardown.outputs.{key} }}}}"
+        assert (
+            CALL["outputs"][key]["value"] == f"${{{{ jobs.teardown.outputs.{key} }}}}"
+        )
