@@ -70,20 +70,20 @@ DEFAULT_REST_FALLBACKS = (
 )
 
 # Destructive identity reads use trust paths, not the availability/credit endpoints above.
-# Registry 3 source labels and URLs: pinned cosmos/chain-registry akash/chain.json.
+# Registry 4 candidate source labels and URLs: pinned cosmos/chain-registry akash/chain.json.
 # Route names describe observed operator/gateway/cache boundaries, not an assertion
 # that either response is uncached. See docs/owner-corroboration-registry.md.
 # Bump the registry version when any entry or proof contract changes.
 # Keep the V2 Python symbol for callers of the existing proof API. The registry
-# identity below is version 3; this does not alias or accept historical registry 2.
+# identity below is version 4; this does not alias historical registries 2 or 3.
 OWNER_CORROBORATION_SOURCES_V2 = (
     {
-        "source_id": "crouton",
-        "url": "https://akash-mainnet-api.crouton.digital",
+        "source_id": "allnodes",
+        "url": "https://akash-rest.publicnode.com",
         "chain_id": "akashnet-2",
-        "operator": "crouton-digital",
-        "gateway_ancestry": "crouton-api-148.251.53.24",
-        "cache_ancestry": "crouton-api-route",
+        "operator": "allnodes",
+        "gateway_ancestry": "allnodes-publicnode-rest",
+        "cache_ancestry": "allnodes-publicnode-rest-route",
         "proof_mode": "fresh-common-height-and-complete-creation-block",
         "finality_rule": "committed-tip-minus-2",
         "max_age_seconds": 180,
@@ -118,7 +118,7 @@ def _source_registry_digest(sources) -> str:
     ).hexdigest()
 
 
-OWNER_CORROBORATION_REGISTRY_VERSION = 3
+OWNER_CORROBORATION_REGISTRY_VERSION = 4
 OWNER_CORROBORATION_REGISTRY_PROVENANCE = (
     "https://github.com/cosmos/chain-registry/blob/"
     "cc1ed04b31326bc79f3208e571fb71fa0fddb987/akash/chain.json"

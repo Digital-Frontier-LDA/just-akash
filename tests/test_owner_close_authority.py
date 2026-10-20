@@ -217,7 +217,7 @@ def test_fresh_common_height_and_complete_signed_create_produce_bounded_evidence
     assert evidence["population_digest"]
     assert evidence["population_count"] == 1
     assert evidence["evidence_version"] == 2
-    assert evidence["registry_version"] == 3
+    assert evidence["registry_version"] == 4
     assert evidence["registry_digest"] == chain.OWNER_CORROBORATION_REGISTRY_SHA256
     assert evidence["registry_provenance_digest"] == (
         chain.OWNER_CORROBORATION_REGISTRY_PROVENANCE_SHA256

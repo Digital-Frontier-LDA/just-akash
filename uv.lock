@@ -160,7 +160,7 @@ wheels = [
 
 [[package]]
 name = "just-akash"
-version = "1.49.0"
+version = "1.50.0"
 source = { editable = "." }
 dependencies = [
     { name = "akash-lease-core" },

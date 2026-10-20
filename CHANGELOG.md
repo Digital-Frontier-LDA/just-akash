@@ -53,6 +53,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   Registered observations refuse redirects and missing height echoes. Financial
   settlement remains separate; runner migration and durable broker wiring remain gated.
 
+## [1.50.0] — 2026-10-20
+
+### Changed
+
+- Prepare SDK 1.50.0 with owner corroboration registry 4: replace Crouton
+  Digital with Allnodes' PublicNode route and retain the exact Polkachu entry.
+  Preserve the observation algorithms, proof mode, source provenance, core 0.18.0
+  pin and existing budgets. Public archive capability and candidate observations
+  do not establish consumer activation: regenerate and authenticate the required
+  execution history, catalog and owner creation bundles before adoption. Preserve
+  registry 3 and registry 2 artifacts as dated evidence; do not relabel them as
+  registry 4. See [registry migration](docs/owner-corroboration-registry.md).
+  This preparation does not declare a released or fully qualified consumer.
+
 ## [1.49.0] — 2026-10-18
 
 ### Changed
