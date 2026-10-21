@@ -53,6 +53,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   Registered observations refuse redirects and missing height echoes. Financial
   settlement remains separate; runner migration and durable broker wiring remain gated.
 
+### Fixed
+
+- The bid probe's chain cross-check could not confirm a no-bid, so every no-bid since
+  2026-08-30 was `no-bid-unverified` (a skip) and the autobidder's `bidprobe-nobid` page
+  could not fire. Two causes, each enough on its own: the owner filter was read from the
+  Console create response, which has no owner (`{dseq, manifest, signTx}`), so the query
+  went out by dseq alone and timed out; and the request used urllib's default
+  `Python-urllib` User-Agent, which Cloudflare in front of both default LCDs answers with
+  HTTP 403. The probe now resolves the owner once per run from `account_address()`, and
+  `_chain_bids_exist` sends its own User-Agent.
+
 ## [1.50.0] — 2026-10-20
 
 ### Changed

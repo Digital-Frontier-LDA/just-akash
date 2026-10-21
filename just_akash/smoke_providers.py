@@ -979,8 +979,17 @@ def _chain_bids_exist(dseq: str, owner: str | None = None) -> bool | None:
         # this function exists to avoid, at worst returning another account's
         # bids as evidence about ours.
         url = f"{base}/akash/market/v1beta5/bids/list?{urllib.parse.urlencode(params)}"
+        # ⛔ AN EXPLICIT USER-AGENT IS LOAD-BEARING. Both default LCDs sit behind
+        # Cloudflare, which answers urllib's default `Python-urllib/3.x` with
+        # HTTP 403 "error code: 1010" — measured 2026-10-21 on both, while the
+        # identical query with any other agent returned the bid. A 403 is no
+        # evidence, so without this header every verdict was None, even with the
+        # owner filter. Every other LCD caller in this package sets one already.
+        req = urllib.request.Request(
+            url, headers={"Accept": "application/json", "User-Agent": "just-akash-bid-check/1.0"}
+        )
         try:
-            with urllib.request.urlopen(url, timeout=8) as resp:  # noqa: S310 — scheme-validated above
+            with urllib.request.urlopen(req, timeout=8) as resp:  # noqa: S310 — scheme-validated above
                 payload = json.load(resp)
         except (OSError, ValueError):
             # URLError/HTTPError/timeouts are OSError; JSONDecodeError is

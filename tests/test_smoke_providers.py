@@ -2459,14 +2459,29 @@ class TestChainCrossCheckUsesTheOwnerFilter:
             def read(self_inner):
                 return b'{"bids": []}'
 
-        def fake_urlopen(url, timeout=0):
-            seen.append(url)
+        def fake_urlopen(req, timeout=0):
+            seen.append(getattr(req, "full_url", req))
+            self.requests.append(req)
             return _Resp()
 
+        self.requests: list = []
         monkeypatch.setattr(sp.urllib.request, "urlopen", fake_urlopen)
         monkeypatch.setattr(sp.json, "load", lambda fh: {"bids": []})
         sp._chain_bids_exist("12345", owner)
         return seen
+
+    def test_requests_carry_an_explicit_user_agent(self, monkeypatch):
+        """Cloudflare in front of both default LCDs 403s urllib's default
+        `Python-urllib/3.x` agent (error 1010, measured 2026-10-21), and a 403
+        is no evidence, so every verdict came back None."""
+        self._capture(monkeypatch, "akash1owner")
+        assert self.requests, "no LCD request was made"
+        for req in self.requests:
+            agent = req.get_header("User-agent") if hasattr(req, "get_header") else None
+            assert agent and not agent.startswith("Python-urllib"), (
+                f"LCD request sent without an explicit User-Agent ({agent!r}); "
+                "Cloudflare answers the urllib default with 403"
+            )
 
     def test_owner_is_sent_when_known(self, monkeypatch):
         urls = self._capture(monkeypatch, "akash1owner")
