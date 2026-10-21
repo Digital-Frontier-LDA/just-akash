@@ -154,16 +154,32 @@ class FakeClient:
     Payload shapes mirror the real Console responses that `_extract_dseq` and
     `_is_open_bid` actually parse (see tests/test_capacity.py) — a fake with an
     invented shape passes while the production path fails.
+
+    That warning was ignored here once: create_deployment used to return a
+    nested `deployment.id.owner` that the Console never sends, so the chain
+    cross-check's owner looked wired while every real run queried without one
+    (2026-08-30 → 10-21). The real body is `{dseq, manifest, signTx}`
+    (Akash-Console deployment.schema.ts CreateDeploymentResponseSchema); the
+    owner comes from account_address(), as it does in production.
     """
 
     def __init__(self, bidders_per_call):
         self._bidders = list(bidders_per_call)
         self.created = 0
         self.closed: list[str] = []
+        self.address_calls = 0
 
     def create_deployment(self, sdl, deposit=0.5):
         self.created += 1
-        return {"deployment": {"id": {"owner": "akash1me", "dseq": str(1000 + self.created)}}}
+        return {
+            "dseq": str(1000 + self.created),
+            "manifest": "[]",
+            "signTx": {"code": 0, "transactionHash": "ABC", "rawLog": ""},
+        }
+
+    def account_address(self):
+        self.address_calls += 1
+        return "akash1me"
 
     def get_bids(self, dseq):
         return self._bidders.pop(0) if self._bidders else []
@@ -577,6 +593,81 @@ class TestUnverifiableCrossCheckIsNotAProviderFault:
         # retry_delay_s rather than coincidentally matching whatever the
         # default happens to be today.
         assert slept == [17]
+
+
+class TestCrossCheckCarriesTheOwner:
+    """The cross-check is only able to answer when it filters by owner.
+
+    `bids/list` by dseq alone times out on both default LCDs; owner+dseq answers
+    in about a second. The owner used to come from the create response, which
+    the Console never puts it in, so from 2026-08-30 every no-bid went out
+    without one and came back unverifiable, a skip: bidprobe-nobid could not
+    fire for seven weeks while alphavps and onidc had multi-hour bid outages.
+    """
+
+    @staticmethod
+    def _targets():
+        return [
+            ProviderTarget(
+                "hetzner_hel", HETZNER.wallet, frozenset({"cpu", "nodeport"}), HETZNER.attributes
+            )
+        ]
+
+    @staticmethod
+    def _recording(monkeypatch, verdict):
+        calls: list[tuple[str, Any]] = []
+
+        def fake(dseq, owner=None):
+            calls.append((dseq, owner))
+            return verdict
+
+        monkeypatch.setattr("just_akash.smoke_providers._chain_bids_exist", fake)
+        return calls
+
+    def test_the_cross_check_filters_by_the_account_owner(self, monkeypatch):
+        calls = self._recording(monkeypatch, False)
+        client = FakeClient([[], []])
+        recs = run_probe(client, providers=self._targets()[:1], sleep=lambda _s: None, wait_s=0)
+        assert calls, "a no-bid must be cross-checked against the chain"
+        assert {owner for _, owner in calls} == {"akash1me"}, (
+            "the cross-check went out without the owner, so the LCD query scans, "
+            "times out, and every no-bid is unverifiable"
+        )
+        assert recs[0].outcome == OUTCOME_NO_BID
+
+    def test_the_owner_is_resolved_once_per_run(self, monkeypatch):
+        self._recording(monkeypatch, False)
+        # Two pairs, each a no-bid with its confirming retry: four orders.
+        client = FakeClient([[], [], [], []])
+        run_probe(client, providers=self._targets(), sleep=lambda _s: None, wait_s=0)
+        assert client.created == 4
+        assert client.address_calls == 1
+
+    def test_an_unresolvable_owner_is_unverifiable_and_says_why(self, monkeypatch):
+        calls = self._recording(monkeypatch, None)
+
+        class NoAddress(FakeClient):
+            def account_address(self):
+                raise RuntimeError("API Error (503): unavailable")
+
+        client = NoAddress([[], []])
+        recs = run_probe(client, providers=self._targets()[:1], sleep=lambda _s: None, wait_s=0)
+        assert {owner for _, owner in calls} == {None}
+        assert recs[0].outcome == OUTCOME_NO_BID_UNVERIFIED
+        assert recs[0].skipped is True
+        assert "owner unknown" in recs[0].note
+
+    def test_a_malformed_address_is_not_used_as_an_owner(self, monkeypatch):
+        calls = self._recording(monkeypatch, None)
+
+        class Garbled(FakeClient):
+            def account_address(self):
+                return "not-an-address"
+
+        run_probe(
+            Garbled([[], []]), providers=self._targets()[:1], sleep=lambda _s: None, wait_s=0
+        )
+        assert {owner for _, owner in calls} == {None}
 
 
 # --------------------------------------------------------------------------
