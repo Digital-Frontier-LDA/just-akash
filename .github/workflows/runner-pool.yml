@@ -326,7 +326,22 @@ on:
         required: false
         type: string
         default: '90'
+      credentials-sops:
+        description: >-
+          Read AKASH_API_KEY, AKASH_API_KEYS and GH_RUNNER_PAT from the caller's
+          secrets/akash-runner.sops.env (decrypted with CREDENTIALS_AGE_KEY) instead of
+          from workflow_call secrets. For orgs whose baseline allows only SOPS-sourced
+          credentials (Digital-Frontier-LDA). A secret passed directly still wins. The
+          caller's teardown must set the same value; the pool's own rollback does.
+        required: false
+        type: boolean
+        default: false
     secrets:
+      CREDENTIALS_AGE_KEY:
+        required: false
+        description: >-
+          Age key for the caller's secrets/akash-runner.sops.env. Used only with
+          credentials-sops; a missing key fails before any preflight or create.
       AKASH_API_KEY:
         required: false
         description: >-
@@ -527,6 +542,27 @@ jobs:
           path: .just-akash
           persist-credentials: false
 
+      # credentials-sops: only the ciphertext, from the caller's exact revision, decrypted by
+      # this repo's own action at just-akash-ref (checked out above). Every value is masked
+      # before it reaches GITHUB_ENV; the credential reads below are secrets.X || env.X, so a
+      # caller that passes secrets directly is unchanged. Before the PAT preflight on purpose.
+      - name: Check out the caller encrypted runner credentials
+        if: inputs.credentials-sops
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: .akash-runner-credentials
+          sparse-checkout: secrets/akash-runner.sops.env
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Load the caller runner credentials from SOPS
+        if: inputs.credentials-sops
+        uses: ./.just-akash/.github/actions/sops-env
+        with:
+          age-key: ${{ secrets.CREDENTIALS_AGE_KEY }}
+          file: .akash-runner-credentials/secrets/akash-runner.sops.env
+
       # A PAT EXPIRY MUST NOT BE SILENT. Without this the runner simply never registers,
       # the pool times out after ~15 minutes, and the run reports RUNNER_NEVER_REGISTERED
       # — indistinguishable from a provider that leases and never schedules. That reading
@@ -565,7 +601,7 @@ jobs:
       - name: Preflight — the runner PAT must still be valid
         id: pat
         env:
-          GH_TOKEN: ${{ secrets.GH_RUNNER_PAT }}
+          GH_TOKEN: ${{ secrets.GH_RUNNER_PAT || env.GH_RUNNER_PAT }}
           ORG: ${{ inputs.github-org }}
           RUNNER_NATIVE_PULL_READER: ${{ inputs.runner-native-pull-reader }}
           RUNNER_NATIVE_REPOSITORY_SCOPE: ${{ inputs.runner-native-repository-scope }}
@@ -1267,9 +1303,9 @@ jobs:
       - name: Provision (retry down candidates, tag before waiting)
         id: provision
         env:
-          AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
-          AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}
-          GH_TOKEN: ${{ secrets.GH_RUNNER_PAT }}
+          AKASH_API_KEY: ${{ secrets.AKASH_API_KEY || env.AKASH_API_KEY }}
+          AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS || env.AKASH_API_KEYS }}
+          GH_TOKEN: ${{ secrets.GH_RUNNER_PAT || env.GH_RUNNER_PAT }}
           PREFERRED_CANDIDATES_CSV: ${{ steps.candidates.outputs.preferred_candidates }}
           FALLBACK_CANDIDATES_CSV: ${{ steps.candidates.outputs.fallback_candidates }}
           STANDING_EXCLUDED_CSV: ${{ steps.candidates.outputs.excluded_candidates }}
@@ -2450,7 +2486,11 @@ jobs:
       # reusable, so the broken graph is only ever built in a consumer. Same blind spot
       # as the `./` defect in #248, one input along.
       just-akash-ref: ${{ inputs.runner-native-pull-reader && '810e75fb5cd0963f80329d54d11e1b00cecf527f' || inputs.just-akash-ref }}  # pragma: allowlist secret
+      # A SOPS-credentialed caller has no direct secrets to hand on; the rollback must read
+      # the same caller file, or a failed provision is the one lease it cannot close.
+      credentials-sops: ${{ inputs.credentials-sops }}
     secrets:
+      CREDENTIALS_AGE_KEY: ${{ secrets.CREDENTIALS_AGE_KEY }}
       AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
       AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}
       GH_RUNNER_PAT: ${{ secrets.GH_RUNNER_PAT }}
