@@ -115,7 +115,10 @@ def probe_order_sdl(
     there must be exactly one implementation of it.
 
     Returns ``{placeable, bidders, dseq, owner, waited_s}``. Never creates a
-    lease. ``owner`` is carried so the chain cross-check can filter by it.
+    lease. ``owner`` is whatever the create response carried, and the Console's
+    carries none (``{dseq, manifest, signTx}``), so against the real API it is
+    None. A caller that needs the owner resolves it from the client
+    (``account_address()``); see bid_probe._account_owner.
     """
     from .api import _extract_bid_price, _extract_dseq, _extract_owner, _extract_provider
     from .deploy import _is_open_bid
@@ -128,8 +131,8 @@ def probe_order_sdl(
 
     dep = client.create_deployment(sdl, deposit=deposit)
     dseq = _extract_dseq(dep)
-    # Carried so the chain cross-check can filter by owner; without it the LCD
-    # query scans and times out. See _extract_owner.
+    # None from the Console (its create response has no owner); kept for
+    # response shapes that do carry one. See the docstring.
     owner = _extract_owner(dep)
     bidders: list[dict[str, Any]] = []
     waited = 0

@@ -1014,6 +1014,10 @@ def _extract_owner(deployment: dict[str, Any]) -> str | None:
     scans, and both public endpoints time out past 30s on it. Adding
     filters.owner makes the same query a selective lookup — measured 2026-08-30
     at ~0.2s against >30s — with identical semantics (any bid, any state).
+
+    ⚠ Console's own create response (POST /v1/deployments) is
+    ``{dseq, manifest, signTx}``, so this returns None for it. Use
+    ``account_address()`` for the owner of orders this client creates.
     """
     if not isinstance(deployment, dict):
         return None
