@@ -556,6 +556,14 @@ OUTCOME_NO_GPU_CAPACITY = "no-gpu-capacity"
 # 480-record history carried note="chain cross-check unverifiable" and ZERO
 # were chain-confirmed — i.e. every critical page this rule has ever produced
 # was false.
+# ⚠ THAT LAST INFERENCE WAS WRONG. Zero were confirmed because the cross-check
+# could not answer at all: it went out without an owner (see _account_owner) and
+# with urllib's default User-Agent, which Cloudflare in front of both LCDs
+# rejects (see smoke_providers._chain_bids_exist). Not because the no-bids were
+# false. Measured 2026-10-21 against the autobidder's own pending_bids: 53 of 56
+# unverified no-bids on alphavps since 08-30 were orders the provider never
+# priced, most of them inside multi-hour total bid outages. Unverified stays a
+# skip; the fix was making verification work, not paging on the unverified.
 _SKIPPED_OUTCOMES = frozenset(
     {
         OUTCOME_INDEX_LAG,
@@ -702,6 +710,36 @@ def _gpu_probe_is_answerable(client: Any, target: ProviderTarget) -> tuple[bool,
     return True, "ok"
 
 
+def _account_owner(client: Any) -> str | None:
+    """The account that owns every order this run creates, or None.
+
+    The chain cross-check needs it: `bids/list` filtered by dseq alone times out
+    on both default LCDs, while owner+dseq answers in about a second.
+
+    ⛔ THE CREATE RESPONSE DOES NOT CARRY IT. Console's POST /v1/deployments
+    returns `{dseq, manifest, signTx}` and nothing else, so probe_order_sdl's
+    `owner` is None for every real order. #229 read it from there, against a test
+    fake that invented a nested `deployment.id.owner`; the cross-check therefore
+    went out without an owner on every run from 2026-08-30, could never
+    confirm, and bidprobe-nobid could not fire for seven weeks (the LCDs'
+    Cloudflare also 403'd the request's agent; both are fixed). One API key
+    means one account, so the run resolves it once from the key itself.
+
+    Best effort: a failure here only costs the verdict (no-bid-unverified, a
+    skip), never the run.
+    """
+    try:
+        addr = client.account_address()
+    except Exception as exc:  # noqa: BLE001 - degrades to unverifiable, never aborts
+        print(
+            f"  chain cross-check: account owner unknown ({type(exc).__name__}: {exc}); "
+            "every no-bid this run will be unverifiable",
+            file=sys.stderr,
+        )
+        return None
+    return addr if isinstance(addr, str) and addr.startswith("akash1") else None
+
+
 def probe_pair(
     client: Any,
     target: ProviderTarget,
@@ -711,11 +749,14 @@ def probe_pair(
     poll_s: int = 5,
     deposit: float = 0.5,
     now: float | None = None,
+    owner: str | None = None,
 ) -> ProbeRecord:
     """Submit one pinned order, wait for THIS provider's bid, always close it.
 
     Never raises for an ordinary probe failure — the failure IS the datum. It
     re-raises only a credit error, which the caller must treat as fleet-wide.
+    ``owner`` is the account behind ``client`` (see _account_owner); without it
+    a no-bid cannot be chain-confirmed.
     """
     from .capacity import probe_order_sdl
 
@@ -777,7 +818,8 @@ def probe_pair(
     # "nobody bid" (2026-07-23 audit). An index lag is NOT a provider fault.
     from .smoke_providers import _chain_bids_exist
 
-    on_chain = _chain_bids_exist(str(res.get("dseq") or ""), res.get("owner"))
+    owner = res.get("owner") or owner
+    on_chain = _chain_bids_exist(str(res.get("dseq") or ""), owner)
     if on_chain is True:
         return ProbeRecord(
             cluster=target.cluster,
@@ -804,7 +846,11 @@ def probe_pair(
         outcome=OUTCOME_NO_BID if on_chain is False else OUTCOME_NO_BID_UNVERIFIED,
         dseq=res.get("dseq"),
         waited_s=int(res.get("waited_s") or 0),
-        note="" if on_chain is False else "chain cross-check unverifiable",
+        note=(
+            ""
+            if on_chain is False
+            else "chain cross-check unverifiable" + ("" if owner else " (owner unknown)")
+        ),
         ts=ts,
     )
 
@@ -834,6 +880,8 @@ def run_probe(
     pairs = eligible_pairs(providers)
     records: list[ProbeRecord] = []
     credit_exhausted_note = ""
+    # Once per run, not per order: every order below is created with this client.
+    owner = _account_owner(client) if pairs else None
 
     for idx, (target, scenario) in enumerate(pairs):
         if credit_exhausted_note:
@@ -858,6 +906,7 @@ def run_probe(
                 poll_s=poll_s,
                 deposit=deposit,
                 now=now(),
+                owner=owner,
             )
         except Exception as exc:  # noqa: BLE001 - credit only, per probe_pair
             credit_exhausted_note = f"{type(exc).__name__}: {exc}"[:300]
@@ -888,6 +937,7 @@ def run_probe(
                     poll_s=poll_s,
                     deposit=deposit,
                     now=now(),
+                    owner=owner,
                 )
                 confirm.retried = True
                 rec = confirm
