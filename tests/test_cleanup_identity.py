@@ -566,3 +566,38 @@ def test_a_complete_multi_group_ci_population_is_bound_whole_and_closed(setup, m
     expected = [{"gseq": 1, "name": names[0]}, {"gseq": 2, "name": names[1]}]
     assert len(asked) == 2, "selection and the pre-send recheck each prove the population"
     assert asked == [expected, expected]
+
+
+@pytest.mark.parametrize(
+    "names",
+    [
+        # The three live fleet canaries' names on 2026-10-22. Before the canary exclusion
+        # these were HELD (legacy role `canary` is not a migration exception), which made
+        # every scheduled sweep exit 2.
+        [PREFIX + "canary.09a75b4f3236"],
+        # The worst case: a canary stamped with a CLOSABLE CI identity whose run completed.
+        # The identity policy alone would authorise this close.
+        [format_identity(_identity(), REGISTER)],
+    ],
+)
+@pytest.mark.parametrize("execute", [True, False])
+def test_a_live_canary_is_never_closed_and_never_held(setup, capsys, names, execute):
+    client, doc, _ = setup
+    client.get_deployment.return_value = {"leases": [{"status": {"services": {"canary": {}}}}]}
+    doc.update(_document(names))
+    assert (
+        cs.run(
+            execute=execute,
+            now=NOW,
+            placement_prefix=PREFIX,
+            ownership_register=REGISTER,
+            reap_runners=True,
+            reap_owned=True,
+        )
+        == 0
+    )
+    client.close_deployment.assert_not_called()
+    out = capsys.readouterr().out
+    assert "LEAVE-canary" in out
+    assert f"{DSEQ} HELD" not in out
+    assert "identity HELD: 0" in out

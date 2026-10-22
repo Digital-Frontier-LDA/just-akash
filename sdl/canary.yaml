@@ -20,8 +20,14 @@
 # ⚠️ MUST NOT BE REAPED — and the real mechanism is the SERVICE NAME, not the tag.
 # `cleanup_stale` and the smoke startup sweep classify by SERVICE SET, verified in
 # just_akash/cleanup_stale.py: services == {probe} is stale after 1h, {backtest} after
-# 48h, and {} is left alone as unclassifiable. This deployment's service is `canary`, so
-# it matches no stale rule and is not reaped.
+# 48h. This deployment's service is `canary`, which classify() returns as LEAVE-canary
+# BEFORE any age or ownership test, so no stale rule can reach it.
+#
+# "Matches no stale rule" used to be an accident of the allowlist, and #241's owned age
+# rule (any owned service older than 48h) quietly broke it: from 2026-09-09 every
+# scheduled sweep judged all three live canaries STALE-owned, and only the identity hold
+# stood between that and a close. The exclusion is now explicit and pinned by
+# tests/test_cleanup_leaves_live_canaries.py.
 #
 # The service name now carries a SECOND job: it is also how the next run recognises this
 # lease as ours. canary/ensure.py adopts a deployment whose service set is exactly {canary}
