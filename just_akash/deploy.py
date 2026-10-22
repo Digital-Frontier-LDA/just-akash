@@ -859,6 +859,45 @@ def _inject_env_into_sdl(sdl_content: str, env_vars: list[str]) -> str:
     return sdl_content
 
 
+#: Flynn's Console wallets (OpenMix app/settings/config.py lease_owner_wallets). A deploy from one
+#: of them NEVER runs without a provider allowlist (openmix-zgt4r PR-B, TEAMLEAD-flynn
+#: 2026-10-22): with none, deploy takes ANY bid, which is how Flynn fleet leases landed on
+#: third-party providers (9 leases, 2026-10-05..08).
+FLYNN_WALLETS = frozenset(
+    {
+        "akash1cklqag0e0v794msgqkr6uwf7sr6zyy42gm78f0",  # console-1
+        "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee",  # console-2
+        "akash14n4rkmz64rn0tey0r5g07l8q5x0fh2h4hu44kt",  # console-3
+    }
+)
+#: Flynn's own providers, named in the refusal. GPU lanes: h4i, h6i; 0-GPU lanes may add
+#: hetzner_hel (ours per akash-providers-IaC clusters/hetzner_hel/vat-provider-sts-patch.yaml:98).
+FLYNN_OWN_PROVIDERS = {
+    "h4i": "akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",
+    "h6i": "akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z",
+    "hetzner_hel (CPU lanes only)": "akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x",
+}
+
+
+def _wallet_account(wallet, client) -> str | None:
+    """The account a create will spend from: the pool's choice, else the API key's own (its
+    JWT). None when it cannot be determined."""
+    if isinstance(getattr(wallet, "account", None), str):
+        return wallet.account
+    try:
+        account = client.account_address()
+    except Exception as exc:
+        # Not swallowed: an unknown account is treated as Flynn's (the caller fails closed),
+        # and the reason is said out loud.
+        _log(
+            logging.WARNING,
+            f"wallet account could not be resolved ({type(exc).__name__}); "
+            "treated as a Flynn wallet: a provider allowlist is required",
+        )
+        return None
+    return account if isinstance(account, str) else None
+
+
 def _resolve_tier(arg_value: list[str] | None, env_name: str) -> list[str]:
     """CLI args (when not None) override env var; trim & drop empties."""
     if arg_value is not None:
@@ -1355,6 +1394,20 @@ def deploy(
             "only what --backup-provider names",
         )
     has_allowlist = bool(preferred or backup)
+    if not has_allowlist:
+        account = _wallet_account(wallet, client)
+        if account is None or account in FLYNN_WALLETS:
+            # Refused BEFORE anything is created: a Flynn wallet (or one we cannot identify --
+            # fail closed) never deploys into an open auction.
+            allowed = ", ".join(f"{name} {addr}" for name, addr in FLYNN_OWN_PROVIDERS.items())
+            who = "could not be determined" if account is None else account
+            raise RuntimeError(
+                "No provider allowlist: AKASH_PROVIDERS (or --provider) is not set, and the "
+                f"wallet ({who}) is Flynn's or unknown. Set AKASH_PROVIDERS to Flynn's "
+                f"providers: {allowed}. A third-party provider needs a reviewed exception "
+                "(inference-benchmark ops/leases/provider_policy.py PROVIDER_EXCEPTIONS) and "
+                "is then named explicitly."
+            )
 
     _log(
         logging.INFO,
