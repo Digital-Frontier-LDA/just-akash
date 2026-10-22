@@ -1333,7 +1333,17 @@ def deploy(
         )
 
     preferred = _resolve_tier(preferred_providers, "AKASH_PROVIDERS")
-    backup = _resolve_tier(backup_providers, "AKASH_PROVIDERS_BACKUP")
+    # The backup tier is EXPLICIT ONLY: a provider the caller names with --backup-provider.
+    # AKASH_PROVIDERS_BACKUP in the environment is never consulted -- an inherited backup tier
+    # (.env.example once shipped 10 third-party providers there) is how deploys that never asked
+    # for one landed on providers nobody chose (Flynn fleet leases, 2026-10-05..08).
+    backup = [p.strip() for p in (backup_providers or []) if p and p.strip()]
+    if os.environ.get("AKASH_PROVIDERS_BACKUP", "").strip() and backup_providers is None:
+        _log(
+            logging.WARNING,
+            "AKASH_PROVIDERS_BACKUP is set in the environment and ignored: the backup tier is "
+            "only what --backup-provider names",
+        )
     has_allowlist = bool(preferred or backup)
 
     _log(
