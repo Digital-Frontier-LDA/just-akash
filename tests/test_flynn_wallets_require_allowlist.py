@@ -156,3 +156,85 @@ def test_real_a_pooled_value_that_is_not_an_address_falls_back_to_the_key(pooled
 def test_real_a_pooled_address_wins():
     client = SimpleNamespace(account_address=lambda: OTHER)
     assert REAL_WALLET_ACCOUNT(SimpleNamespace(account=CONSOLE_2), client) == CONSOLE_2
+
+
+# CodeRabbit (#477): the quiet-wallet re-check can swap the wallet AFTER the guard. The guard
+# must hold for the wallet that actually creates: a swap onto a Flynn wallet with no allowlist
+# is refused before the receipt and before create_deployment.
+
+
+class _Stop(Exception):
+    pass
+
+
+class _QClient:
+    def __init__(self, account, created):
+        self.account, self.created = account, created
+
+    def account_address(self):
+        return self.account
+
+    def create_deployment(self, sdl_content, deposit=5.0):
+        self.created.append(self.account)
+        raise _Stop(self.account)
+
+    def list_deployments(self, active_only=True):
+        return []
+
+
+def _qsel(client):
+    from just_akash.wallet_pool import WalletClientSelection
+
+    return WalletClientSelection(client, client.account, 10**9, 2, 2, "v1+quiet", True)
+
+
+def _swap(monkeypatch, tmp_path, first, second, providers=None):
+    from just_akash import wallet_pool
+
+    monkeypatch.setattr(deploy_mod, "_wallet_account", REAL_WALLET_ACCOUNT)
+    monkeypatch.setattr(deploy_mod, "_check_wallet_credit", lambda *a, **k: None)
+    monkeypatch.delenv("AKASH_PROVIDERS_BACKUP", raising=False)
+    if providers is None:
+        monkeypatch.delenv("AKASH_PROVIDERS", raising=False)
+    else:
+        monkeypatch.setenv("AKASH_PROVIDERS", providers)
+    monkeypatch.setattr(wallet_pool, "select_client_for_create", lambda *a, **k: _qsel(first))
+    monkeypatch.setattr(wallet_pool, "confirm_quiet_or_reselect", lambda *a, **k: _qsel(second))
+    p = tmp_path / "deploy.yaml"
+    p.write_text("version: '2.0'\n")
+    return str(p)
+
+
+def test_a_quiet_recheck_that_swaps_onto_a_flynn_wallet_is_refused(monkeypatch, tmp_path):
+    created = []
+    sdl = _swap(monkeypatch, tmp_path, _QClient(OTHER, created), _QClient(CONSOLE_2, created))
+    with pytest.raises(RuntimeError, match="No provider allowlist"):
+        deploy(sdl_path=sdl, bid_wait=2, bid_wait_retry=3)
+    assert created == []
+
+
+def test_a_swap_onto_a_flynn_wallet_with_an_allowlist_creates(monkeypatch, tmp_path):
+    created = []
+    sdl = _swap(
+        monkeypatch,
+        tmp_path,
+        _QClient(OTHER, created),
+        _QClient(CONSOLE_2, created),
+        providers=H4I,
+    )
+    with pytest.raises(_Stop):
+        deploy(sdl_path=sdl, bid_wait=2, bid_wait_retry=3)
+    assert created == [CONSOLE_2]
+
+
+def test_a_swap_between_non_flynn_wallets_is_unchanged(monkeypatch, tmp_path):
+    created = []
+    sdl = _swap(
+        monkeypatch,
+        tmp_path,
+        _QClient(OTHER, created),
+        _QClient("akash1anotherxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", created),
+    )
+    with pytest.raises(_Stop):
+        deploy(sdl_path=sdl, bid_wait=2, bid_wait_retry=3)
+    assert created == ["akash1anotherxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"]

@@ -872,10 +872,12 @@ FLYNN_WALLETS = frozenset(
 )
 #: Flynn's own providers, named in the refusal. GPU lanes: h4i, h6i; 0-GPU lanes may add
 #: hetzner_hel (ours per akash-providers-IaC clusters/hetzner_hel/vat-provider-sts-patch.yaml:98).
+#: hetzner_hel: a public on-chain provider address, not a key (detect-secrets reads entropy)
+_HETZNER_HEL = "akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x"  # pragma: allowlist secret
 FLYNN_OWN_PROVIDERS = {
     "h4i": "akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk",
     "h6i": "akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z",
-    "hetzner_hel (CPU lanes only)": "akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x",
+    "hetzner_hel (CPU lanes only)": _HETZNER_HEL,
 }
 
 
@@ -903,6 +905,23 @@ def _wallet_account(wallet, client) -> str | None:
         )
         return None
     return account if _is_account(account) else None
+
+
+def _refuse_open_auction(wallet, client) -> None:
+    """With no provider allowlist, refuse a Flynn wallet -- or one we cannot identify (fail
+    closed) -- BEFORE anything is created: it never deploys into an open auction."""
+    account = _wallet_account(wallet, client)
+    if account is not None and account not in FLYNN_WALLETS:
+        return
+    allowed = ", ".join(f"{name} {addr}" for name, addr in FLYNN_OWN_PROVIDERS.items())
+    who = "could not be determined" if account is None else account
+    raise RuntimeError(
+        "No provider allowlist: AKASH_PROVIDERS (or --provider) is not set, and the "
+        f"wallet ({who}) is Flynn's or unknown. Set AKASH_PROVIDERS to Flynn's "
+        f"providers: {allowed}. A third-party provider needs a reviewed exception "
+        "(inference-benchmark ops/leases/provider_policy.py PROVIDER_EXCEPTIONS) and "
+        "is then named explicitly."
+    )
 
 
 def _resolve_tier(arg_value: list[str] | None, env_name: str) -> list[str]:
@@ -1402,19 +1421,7 @@ def deploy(
         )
     has_allowlist = bool(preferred or backup)
     if not has_allowlist:
-        account = _wallet_account(wallet, client)
-        if account is None or account in FLYNN_WALLETS:
-            # Refused BEFORE anything is created: a Flynn wallet (or one we cannot identify --
-            # fail closed) never deploys into an open auction.
-            allowed = ", ".join(f"{name} {addr}" for name, addr in FLYNN_OWN_PROVIDERS.items())
-            who = "could not be determined" if account is None else account
-            raise RuntimeError(
-                "No provider allowlist: AKASH_PROVIDERS (or --provider) is not set, and the "
-                f"wallet ({who}) is Flynn's or unknown. Set AKASH_PROVIDERS to Flynn's "
-                f"providers: {allowed}. A third-party provider needs a reviewed exception "
-                "(inference-benchmark ops/leases/provider_policy.py PROVIDER_EXCEPTIONS) and "
-                "is then named explicitly."
-            )
+        _refuse_open_auction(wallet, client)
 
     _log(
         logging.INFO,
@@ -1474,6 +1481,10 @@ def deploy(
             )
             wallet = rechecked
             client = wallet.client
+            # The guard holds for the wallet that CREATES: a swap onto a Flynn wallet with no
+            # allowlist is refused here, before the receipt (CodeRabbit, #477).
+            if not has_allowlist:
+                _refuse_open_auction(wallet, client)
             _check_wallet_credit(client, budget)  # the probe described the OLD wallet
             if charter is not None:
                 charter_wallet_label = _charter_wallet_label(charter, wallet, client)
