@@ -10,6 +10,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- `credentials-sops` for `runner-pool.yml` and `runner-teardown.yml` (#472): with it set and
+  `CREDENTIALS_AGE_KEY` passed, both read `AKASH_API_KEY`, `AKASH_API_KEYS` and `GH_RUNNER_PAT`
+  from the caller's `secrets/akash-runner.sops.env` (teardown through `.github/actions/sops-env`,
+  the pool in one step with the checksum-pinned SOPS, exporting only those three names), so a
+  caller under a SOPS-only secrets rule passes only its age key. A directly passed secret still
+  wins. The pool forwards the input to its rollback teardown, whose nested pin moves to #472's
+  merge commit. Default false: existing callers are unchanged.
 - Lease charters for placements Flynn counts as ours (`flynn-*`, `fleet-*`, exactly
   `dcloud`/`akash`; openmix-pvr6.1). `deploy --charter FILE.json` (or
   `JUST_AKASH_CHARTER_JSON`) POSTs the charter to Flynn before the credit probe and refuses

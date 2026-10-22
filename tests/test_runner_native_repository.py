@@ -66,10 +66,10 @@ def test_all_pool_api_sites_and_rollback_share_fixed_scope():
     assert '"${RUNNER_COLLECTION}?per_page=100"' in provision
     assert "verify_native_reader_admission()" in provision
     rollback = doc["jobs"]["teardown"]["with"]
-    assert doc["jobs"]["teardown"]["uses"].endswith("@810e75fb5cd0963f80329d54d11e1b00cecf527f")
+    assert doc["jobs"]["teardown"]["uses"].endswith("@4318e32d4c2c2434ad9d8f672352a9f546ff80e2")
     assert rollback["just-akash-ref"] == (
         "${{ inputs.runner-native-pull-reader && '"
-        "810e75fb5cd0963f80329d54d11e1b00cecf527f' "  # pragma: allowlist secret
+        "4318e32d4c2c2434ad9d8f672352a9f546ff80e2' "  # pragma: allowlist secret
         "|| inputs.just-akash-ref }}"
     )
     assert (
