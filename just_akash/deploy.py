@@ -1333,7 +1333,27 @@ def deploy(
         )
 
     preferred = _resolve_tier(preferred_providers, "AKASH_PROVIDERS")
-    backup = _resolve_tier(backup_providers, "AKASH_PROVIDERS_BACKUP")
+    # The backup tier is EXPLICIT ONLY: a provider the caller names with --backup-provider.
+    # AKASH_PROVIDERS_BACKUP in the environment is never consulted -- an inherited backup tier
+    # (.env.example once shipped 10 third-party providers there) is how deploys that never asked
+    # for one landed on providers nobody chose (Flynn fleet leases, 2026-10-05..08).
+    backup = [p.strip() for p in (backup_providers or []) if p and p.strip()]
+    env_backup = [a for a in os.environ.get("AKASH_PROVIDERS_BACKUP", "").split(",") if a.strip()]
+    if env_backup and backup_providers is None:
+        if not preferred:
+            # A legacy backup-only environment: ignoring it would leave BOTH tiers empty, an
+            # open auction -- the opposite of the restriction it used to mean. Refuse before
+            # anything is created; the caller names the tier it wants.
+            raise RuntimeError(
+                "AKASH_PROVIDERS_BACKUP is set but no longer read, and no preferred provider is "
+                "set: refusing to deploy with no allowlist. Name the providers with --provider "
+                "(or AKASH_PROVIDERS) and/or --backup-provider."
+            )
+        _log(
+            logging.WARNING,
+            "AKASH_PROVIDERS_BACKUP is set in the environment and ignored: the backup tier is "
+            "only what --backup-provider names",
+        )
     has_allowlist = bool(preferred or backup)
 
     _log(

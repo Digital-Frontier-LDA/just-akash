@@ -108,7 +108,7 @@ def e2e(monkeypatch, tmp_path: Path):
 def _just_up(monkeypatch, state: dict, *, dseq: str | None, outcome):
     """Stub `just up`: write the real receipt, then return or raise as `outcome` says."""
 
-    def just_up(env: dict, timeout: int = 300):
+    def just_up(env: dict, timeout: int = 300, cmd: list | None = None):
         path = Path(env["JUST_AKASH_RECEIPT_PATH"])
         state["receipt"] = path
         submitting = mark_submitting(

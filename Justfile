@@ -4,7 +4,7 @@ set dotenv-load
 
 # Start a new Akash instance (SSH-enabled, key-auth only)
 # Usage: just up [tag]
-up tag="":
+up tag="" backup="":
     #!/bin/bash
     set -euo pipefail
     mkdir -p "{{log_dir}}"
@@ -25,6 +25,20 @@ up tag="":
             --receipt-path "$JUST_AKASH_RECEIPT_PATH"
             --receipt-operation-id "$JUST_AKASH_RECEIPT_OPERATION_ID"
         )
+    fi
+    # The backup tier is explicit only (deploy no longer reads AKASH_PROVIDERS_BACKUP): a caller
+    # that wants one passes the `backup` PARAMETER (comma-separated), forwarded as flags. Never an
+    # environment variable: `set dotenv-load` would let a .env supply it (openmix-wqz2y).
+    # Guarded: an empty array under `set -u` is "unbound" in macOS /bin/bash 3.2.
+    _backup_csv={{quote(backup)}}   # just-quoted: the value can never break out into code
+    case "$_backup_csv" in
+        *[!a-z0-9,\ ]*) echo "backup must be comma-separated akash1... addresses" >&2; exit 1 ;;
+    esac
+    if [ -n "$_backup_csv" ]; then
+        IFS=',' read -r -a _backup <<< "$_backup_csv"
+        for p in ${_backup[@]+"${_backup[@]}"}; do
+            if [ -n "${p// /}" ]; then args+=(--backup-provider "${p// /}"); fi
+        done
     fi
     "${args[@]}" | tee /tmp/.akash-last-deploy.log
     dseq=$(sed -n 's/.*DSEQ: \([0-9]*\).*/\1/p' /tmp/.akash-last-deploy.log | head -1)
