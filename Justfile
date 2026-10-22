@@ -12,7 +12,9 @@ up tag="" backup="":
     log_file="{{log_dir}}/up-${timestamp}.log"
     exec > >(tee -a "$log_file") 2>&1
     trap 'status=$?; echo "[INFO] recipe=up finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
-    echo "[INFO] recipe=up started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file tag={{tag}}"
+    # just-quoted once (just-akash-t1q): the tag pasted raw into this script let a quote in it run as code.
+    _tag={{quote(tag)}}
+    echo "[INFO] recipe=up started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file tag=$_tag"
     set -x
     args=(uv run just-akash deploy --sdl sdl/cpu-backtest-ssh.yaml --bid-wait 60 --bid-wait-retry 120)
     if { [ -n "${JUST_AKASH_RECEIPT_PATH:-}" ] && [ -z "${JUST_AKASH_RECEIPT_OPERATION_ID:-}" ]; } || \
@@ -42,8 +44,8 @@ up tag="" backup="":
     fi
     "${args[@]}" | tee /tmp/.akash-last-deploy.log
     dseq=$(sed -n 's/.*DSEQ: \([0-9]*\).*/\1/p' /tmp/.akash-last-deploy.log | head -1)
-    if [ -n "{{tag}}" ] && [ -n "$dseq" ]; then
-        uv run just-akash tag --dseq "$dseq" --name "{{tag}}"
+    if [ -n "$_tag" ] && [ -n "$dseq" ]; then
+        uv run just-akash tag --dseq "$dseq" --name "$_tag"
     fi
 
 # Connect to a running instance via lease-shell (default) or SSH

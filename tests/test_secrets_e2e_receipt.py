@@ -421,8 +421,8 @@ def test_just_up_rejects_each_half_configured_receipt_before_paid_deploy(tmp_pat
     )
     recipe = (
         recipe.replace("{{log_dir}}", ".logs/just")
-        .replace("{{tag}}", "")
-        .replace("{{quote(backup)}}", "''")  # just renders quote("") as ''
+        .replace("{{quote(tag)}}", "''")  # just renders quote("") as ''
+        .replace("{{quote(backup)}}", "''")
     )
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
