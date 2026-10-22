@@ -23,7 +23,7 @@ from just_akash.runner_repository import (
 
 NATIVE_READER_IMAGE = (
     "docker.io/digitalfrontierunipessoallda/akash-runner@sha256:"
-    "aaf3799b5e138abef0831bb8467ded7325164316f0cfde5c183fe6e129eae79e"  # pragma: allowlist secret
+    "e71bf4be0e3a59a57ff791b0fc3bc3a31f216f66807b6ac41f1a23346321baa4"  # pragma: allowlist secret
 )
 NATIVE_READER_PROVIDERS = frozenset(
     {
