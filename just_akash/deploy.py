@@ -42,6 +42,7 @@ from ._confidential import (
 )
 from ._diagnostics import Code, enabled
 from ._diagnostics import emit as _raw_emit
+from .address import is_canonical_akash_address
 from .api import (
     AkashAPIError,
     AkashConsoleAPI,
@@ -882,9 +883,10 @@ FLYNN_OWN_PROVIDERS = {
 
 
 def _is_account(value) -> bool:
-    """An akash1 address; anything else (an empty string, a non-str) is no account at all, so it
-    can never pass as "someone else's" wallet."""
-    return isinstance(value, str) and value.startswith("akash1")
+    """A canonical (checksummed bech32) akash1 address; anything else -- an empty string, a
+    non-str, a prefix-only "akash1invalid" -- is no account at all, so it can never pass as
+    "someone else's" wallet and open the auction (CodeRabbit, #477)."""
+    return is_canonical_akash_address(value)
 
 
 def _wallet_account(wallet, client) -> str | None:

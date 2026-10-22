@@ -24,7 +24,10 @@ from tests.test_deploy import SDL_YAML, _make_bid, _time_mock
 CONSOLE_3 = "akash14n4rkmz64rn0tey0r5g07l8q5x0fh2h4hu44kt"
 H4I = "akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk"
 CONSOLE_2 = "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee"
-OTHER = "akash1someoneelsexxxxxxxxxxxxxxxxxxxxxxxxx"
+OTHER = "akash1rja3y2ctj3tzmesvh0zfhzzx95rfjw405hwt8d"  # canonical, not Flynn
+ANOTHER = "akash127x6cuk44ul3azferg8wy9fju686kcf6x2dhz7"  # canonical, not Flynn
+#: prefix-only, not canonical bech32: must never pass as "someone else's" wallet (CodeRabbit)
+PREFIX_ONLY = ("akash1invalid", "akash1someoneelsexxxxxxxxxxxxxxxxxxxxxxxxx")
 
 
 def _run(MockAPI, mock_time, tmp_path, monkeypatch, account, providers=None):
@@ -73,9 +76,7 @@ def test_a_flynn_wallet_with_an_allowlist_deploys(MockAPI, mock_time, tmp_path, 
 def test_another_wallet_without_an_allowlist_is_unchanged(
     MockAPI, mock_time, tmp_path, monkeypatch
 ):
-    client, sdl = _run(
-        MockAPI, mock_time, tmp_path, monkeypatch, "akash1someoneelsexxxxxxxxxxxxxxxxxxxxxxxxx"
-    )
+    client, sdl = _run(MockAPI, mock_time, tmp_path, monkeypatch, OTHER)
     result = deploy(sdl_path=str(sdl), bid_wait=10, bid_wait_retry=10)
     assert result["provider"] == H4I
 
@@ -123,7 +124,7 @@ def test_real_an_unresolvable_account_is_refused_before_create_and_says_why(
     ), [r.getMessage() for r in caplog.records]
 
 
-@pytest.mark.parametrize("resolved", [CONSOLE_2, "", "not-an-address", None])
+@pytest.mark.parametrize("resolved", [CONSOLE_2, "", "not-an-address", None, *PREFIX_ONLY])
 @patch("just_akash.deploy.time")
 @patch("just_akash.deploy.AkashConsoleAPI")
 def test_real_a_flynn_or_non_address_account_is_refused(
@@ -146,7 +147,7 @@ def test_real_someone_elses_key_still_deploys_without_an_allowlist(
     client.account_address.assert_called()
 
 
-@pytest.mark.parametrize("pooled", ["", "not-an-address", None, 7])
+@pytest.mark.parametrize("pooled", ["", "not-an-address", None, 7, *PREFIX_ONLY])
 def test_real_a_pooled_value_that_is_not_an_address_falls_back_to_the_key(pooled):
     """Only an akash1 address counts as the pool's choice; anything else asks the key itself."""
     client = SimpleNamespace(account_address=lambda: CONSOLE_2)
@@ -233,8 +234,8 @@ def test_a_swap_between_non_flynn_wallets_is_unchanged(monkeypatch, tmp_path):
         monkeypatch,
         tmp_path,
         _QClient(OTHER, created),
-        _QClient("akash1anotherxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", created),
+        _QClient(ANOTHER, created),
     )
     with pytest.raises(_Stop):
         deploy(sdl_path=sdl, bid_wait=2, bid_wait_retry=3)
-    assert created == ["akash1anotherxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"]
+    assert created == [ANOTHER]
