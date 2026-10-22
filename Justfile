@@ -53,16 +53,18 @@ up tag="" backup="":
 connect dseq="" transport="":
     #!/bin/bash
     set -euo pipefail
+    _dseq={{quote(dseq)}}
+    _transport={{quote(transport)}}
     mkdir -p "{{log_dir}}"
     timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
     log_file="{{log_dir}}/connect-${timestamp}.log"
     exec > >(tee -a "$log_file") 2>&1
     trap 'status=$?; echo "[INFO] recipe=connect finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
-    echo "[INFO] recipe=connect started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq={{dseq}}"
+    echo "[INFO] recipe=connect started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq=${_dseq}"
     set -x
     args=(uv run just-akash connect)
-    if [ -n "{{dseq}}" ]; then args+=(--dseq "{{dseq}}"); fi
-    if [ -n "{{transport}}" ]; then args+=(--transport "{{transport}}"); fi
+    if [ -n "${_dseq}" ]; then args+=(--dseq "${_dseq}"); fi
+    if [ -n "${_transport}" ]; then args+=(--transport "${_transport}"); fi
     "${args[@]}"
 
 # Update a running instance in place with a revised SDL (no re-bid, keeps DSEQ).
@@ -72,31 +74,35 @@ connect dseq="" transport="":
 update sdl dseq="" image="":
     #!/bin/bash
     set -euo pipefail
+    _sdl={{quote(sdl)}}
+    _dseq={{quote(dseq)}}
+    _image={{quote(image)}}
     mkdir -p "{{log_dir}}"
     timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
     log_file="{{log_dir}}/update-${timestamp}.log"
     exec > >(tee -a "$log_file") 2>&1
     trap 'status=$?; echo "[INFO] recipe=update finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
-    echo "[INFO] recipe=update started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file sdl={{sdl}} dseq={{dseq}} image={{image}}"
+    echo "[INFO] recipe=update started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file sdl=${_sdl} dseq=${_dseq} image=${_image}"
     set -x
-    args=(uv run just-akash update --sdl "{{sdl}}")
-    if [ -n "{{dseq}}" ]; then args+=(--dseq "{{dseq}}"); fi
-    if [ -n "{{image}}" ]; then args+=(--image "{{image}}"); fi
+    args=(uv run just-akash update --sdl "${_sdl}")
+    if [ -n "${_dseq}" ]; then args+=(--dseq "${_dseq}"); fi
+    if [ -n "${_image}" ]; then args+=(--image "${_image}"); fi
     "${args[@]}"
 
 # Destroy an instance (picks interactively if no DSEQ given)
 destroy dseq="":
     #!/bin/bash
     set -euo pipefail
+    _dseq={{quote(dseq)}}
     mkdir -p "{{log_dir}}"
     timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
     log_file="{{log_dir}}/destroy-${timestamp}.log"
     exec > >(tee -a "$log_file") 2>&1
     trap 'status=$?; echo "[INFO] recipe=destroy finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
-    echo "[INFO] recipe=destroy started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq={{dseq}}"
+    echo "[INFO] recipe=destroy started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq=${_dseq}"
     set -x
-    if [ -n "{{dseq}}" ]; then
-        uv run just-akash destroy --dseq={{dseq}}
+    if [ -n "${_dseq}" ]; then
+        uv run just-akash destroy --dseq="${_dseq}"
     else
         uv run just-akash destroy
     fi
@@ -119,14 +125,16 @@ destroy-all:
 tag dseq name:
     #!/bin/bash
     set -euo pipefail
+    _dseq={{quote(dseq)}}
+    _name={{quote(name)}}
     mkdir -p "{{log_dir}}"
     timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
     log_file="{{log_dir}}/tag-${timestamp}.log"
     exec > >(tee -a "$log_file") 2>&1
     trap 'status=$?; echo "[INFO] recipe=tag finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
-    echo "[INFO] recipe=tag started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq={{dseq}} name={{name}}"
+    echo "[INFO] recipe=tag started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq=${_dseq} name=${_name}"
     set -x
-    uv run just-akash tag --dseq={{dseq}} --name "{{name}}"
+    uv run just-akash tag --dseq="${_dseq}" --name "${_name}"
 
 # Inject secrets into a running instance via lease-shell (default) or SSH
 # Usage: just inject [dseq] [env-file] [transport=lease-shell|ssh]
@@ -135,16 +143,19 @@ tag dseq name:
 inject dseq="" env-file=".env.secrets" transport="":
     #!/bin/bash
     set -euo pipefail
+    _dseq={{quote(dseq)}}
+    _env_file={{quote(env-file)}}
+    _transport={{quote(transport)}}
     mkdir -p "{{log_dir}}"
     timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
     log_file="{{log_dir}}/inject-${timestamp}.log"
     exec > >(tee -a "$log_file") 2>&1
     trap 'status=$?; echo "[INFO] recipe=inject finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
-    echo "[INFO] recipe=inject started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq={{dseq}} env_file={{env-file}}"
+    echo "[INFO] recipe=inject started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq=${_dseq} env_file=${_env_file}"
     set -x
-    args=(uv run just-akash inject --env-file "{{env-file}}")
-    if [ -n "{{dseq}}" ]; then args+=(--dseq "{{dseq}}"); fi
-    if [ -n "{{transport}}" ]; then args+=(--transport "{{transport}}"); fi
+    args=(uv run just-akash inject --env-file "${_env_file}")
+    if [ -n "${_dseq}" ]; then args+=(--dseq "${_dseq}"); fi
+    if [ -n "${_transport}" ]; then args+=(--transport "${_transport}"); fi
     "${args[@]}"
 
 # Execute a command on a running instance via lease-shell (default) or SSH
@@ -152,17 +163,20 @@ inject dseq="" env-file=".env.secrets" transport="":
 exec dseq="" command="" transport="":
     #!/bin/bash
     set -euo pipefail
+    _dseq={{quote(dseq)}}
+    _command={{quote(command)}}
+    _transport={{quote(transport)}}
     mkdir -p "{{log_dir}}"
     timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
     log_file="{{log_dir}}/exec-${timestamp}.log"
     exec > >(tee -a "$log_file") 2>&1
     trap 'status=$?; echo "[INFO] recipe=exec finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
-    echo "[INFO] recipe=exec started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq={{dseq}} command={{command}}"
+    echo "[INFO] recipe=exec started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq=${_dseq} command=${_command}"
     set -x
     args=(uv run just-akash exec)
-    if [ -n "{{dseq}}" ]; then args+=(--dseq "{{dseq}}"); fi
-    if [ -n "{{transport}}" ]; then args+=(--transport "{{transport}}"); fi
-    args+=("{{command}}")
+    if [ -n "${_dseq}" ]; then args+=(--dseq "${_dseq}"); fi
+    if [ -n "${_transport}" ]; then args+=(--transport "${_transport}"); fi
+    args+=("${_command}")
     "${args[@]}"
 
 # ── Info ─────────────────────────────────────────────
@@ -184,15 +198,16 @@ list:
 status dseq="":
     #!/bin/bash
     set -euo pipefail
+    _dseq={{quote(dseq)}}
     mkdir -p "{{log_dir}}"
     timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
     log_file="{{log_dir}}/status-${timestamp}.log"
     exec > >(tee -a "$log_file") 2>&1
     trap 'status=$?; echo "[INFO] recipe=status finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
-    echo "[INFO] recipe=status started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq={{dseq}}"
+    echo "[INFO] recipe=status started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq=${_dseq}"
     set -x
-    if [ -n "{{dseq}}" ]; then
-        uv run just-akash status --dseq={{dseq}}
+    if [ -n "${_dseq}" ]; then
+        uv run just-akash status --dseq="${_dseq}"
     else
         uv run just-akash status
     fi
@@ -204,16 +219,18 @@ status dseq="":
 logs dseq="" follow="":
     #!/bin/bash
     set -euo pipefail
+    _dseq={{quote(dseq)}}
+    _follow={{quote(follow)}}
     mkdir -p "{{log_dir}}"
     timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
     log_file="{{log_dir}}/logs-${timestamp}.log"
     exec > >(tee -a "$log_file") 2>&1
     trap 'status=$?; echo "[INFO] recipe=logs finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
-    echo "[INFO] recipe=logs started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq={{dseq}} follow={{follow}}"
+    echo "[INFO] recipe=logs started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq=${_dseq} follow=${_follow}"
     set -x
     args=(uv run just-akash logs)
-    if [ -n "{{dseq}}" ]; then args+=(--dseq "{{dseq}}"); fi
-    if [ -n "{{follow}}" ]; then args+=(--follow); fi
+    if [ -n "${_dseq}" ]; then args+=(--dseq "${_dseq}"); fi
+    if [ -n "${_follow}" ]; then args+=(--follow); fi
     "${args[@]}"
 
 # Stream Kubernetes events for a deployment (debug why it won't start).
@@ -221,15 +238,16 @@ logs dseq="" follow="":
 events dseq="":
     #!/bin/bash
     set -euo pipefail
+    _dseq={{quote(dseq)}}
     mkdir -p "{{log_dir}}"
     timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
     log_file="{{log_dir}}/events-${timestamp}.log"
     exec > >(tee -a "$log_file") 2>&1
     trap 'status=$?; echo "[INFO] recipe=events finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
-    echo "[INFO] recipe=events started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq={{dseq}}"
+    echo "[INFO] recipe=events started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq=${_dseq}"
     set -x
     args=(uv run just-akash events)
-    if [ -n "{{dseq}}" ]; then args+=(--dseq "{{dseq}}"); fi
+    if [ -n "${_dseq}" ]; then args+=(--dseq "${_dseq}"); fi
     "${args[@]}"
 
 # ── Escrow / funding ─────────────────────────────────
@@ -240,15 +258,17 @@ events dseq="":
 add-funds amount dseq="":
     #!/bin/bash
     set -euo pipefail
+    _amount={{quote(amount)}}
+    _dseq={{quote(dseq)}}
     mkdir -p "{{log_dir}}"
     timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
     log_file="{{log_dir}}/add-funds-${timestamp}.log"
     exec > >(tee -a "$log_file") 2>&1
     trap 'status=$?; echo "[INFO] recipe=add-funds finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
-    echo "[INFO] recipe=add-funds started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file amount={{amount}} dseq={{dseq}}"
+    echo "[INFO] recipe=add-funds started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file amount=${_amount} dseq=${_dseq}"
     set -x
-    args=(uv run just-akash add-funds --deposit "{{amount}}")
-    if [ -n "{{dseq}}" ]; then args+=(--dseq "{{dseq}}"); fi
+    args=(uv run just-akash add-funds --deposit "${_amount}")
+    if [ -n "${_dseq}" ]; then args+=(--dseq "${_dseq}"); fi
     "${args[@]}"
 
 # Show or toggle auto top-up for a deployment.
@@ -257,17 +277,19 @@ add-funds amount dseq="":
 auto-topup dseq="" toggle="":
     #!/bin/bash
     set -euo pipefail
+    _dseq={{quote(dseq)}}
+    _toggle={{quote(toggle)}}
     mkdir -p "{{log_dir}}"
     timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
     log_file="{{log_dir}}/auto-topup-${timestamp}.log"
     exec > >(tee -a "$log_file") 2>&1
     trap 'status=$?; echo "[INFO] recipe=auto-topup finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
-    echo "[INFO] recipe=auto-topup started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq={{dseq}} toggle={{toggle}}"
+    echo "[INFO] recipe=auto-topup started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file dseq=${_dseq} toggle=${_toggle}"
     set -x
     args=(uv run just-akash auto-topup)
-    if [ -n "{{dseq}}" ]; then args+=(--dseq "{{dseq}}"); fi
-    if [ "{{toggle}}" = "on" ]; then args+=(--on); fi
-    if [ "{{toggle}}" = "off" ]; then args+=(--off); fi
+    if [ -n "${_dseq}" ]; then args+=(--dseq "${_dseq}"); fi
+    if [ "${_toggle}" = "on" ]; then args+=(--on); fi
+    if [ "${_toggle}" = "off" ]; then args+=(--off); fi
     "${args[@]}"
 
 # ── Testing ──────────────────────────────────────────
@@ -334,6 +356,7 @@ test-shell:
 # provider, exercise every provider-facing feature (exec, inject, logs, events,
 # SSH transport, connect, HTTP ingress, in-place update), destroy, and print a
 # pass/fail matrix. Pass args through, e.g. `just smoke-providers --all`.
+[positional-arguments]
 smoke-providers *args:
     #!/bin/bash
     set -euo pipefail
@@ -344,7 +367,7 @@ smoke-providers *args:
     trap 'status=$?; echo "[INFO] recipe=smoke-providers finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
     echo "[INFO] recipe=smoke-providers started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file"
     set -x
-    uv run python -m just_akash.smoke_providers {{args}}
+    uv run python -m just_akash.smoke_providers "$@"
 
 # Aggregate accrued smoke telemetry into per-(provider,feature) latency
 # percentiles + success rate. With no FILE, pulls the live `telemetry` branch.
@@ -353,8 +376,9 @@ smoke-providers *args:
 smoke-telemetry-report file="":
     #!/bin/bash
     set -euo pipefail
-    if [ -n "{{file}}" ]; then
-        uv run python -m just_akash.analyze_telemetry "{{file}}"
+    _file={{quote(file)}}
+    if [ -n "${_file}" ]; then
+        uv run python -m just_akash.analyze_telemetry "${_file}"
     else
         tmp="$(mktemp)"
         trap 'rm -f "$tmp"' EXIT   # clean up on every exit path, not just success
@@ -372,8 +396,9 @@ smoke-telemetry-report file="":
 smoke-shim-survey file="":
     #!/bin/bash
     set -euo pipefail
-    if [ -n "{{file}}" ]; then
-        uv run python -m just_akash.analyze_telemetry "{{file}}" --shim-survey
+    _file={{quote(file)}}
+    if [ -n "${_file}" ]; then
+        uv run python -m just_akash.analyze_telemetry "${_file}" --shim-survey
     else
         tmp="$(mktemp)"
         trap 'rm -f "$tmp"' EXIT
@@ -394,11 +419,15 @@ smoke-shim-survey file="":
 export-metrics file="" output="" with-credit="":
     #!/bin/bash
     set -euo pipefail
+    _file={{quote(file)}}
+    _output={{quote(output)}}
+    _with_credit={{quote(with-credit)}}
+    # Guarded expansions below: an empty array under `set -u` is "unbound" in macOS bash 3.2.
     args=()
-    if [ -n "{{output}}" ]; then args+=(--output "{{output}}"); fi
-    if [ -n "{{with-credit}}" ]; then args+=(--with-credit); fi
-    if [ -n "{{file}}" ]; then
-        uv run just-akash export-metrics "{{file}}" "${args[@]}"
+    if [ -n "${_output}" ]; then args+=(--output "${_output}"); fi
+    if [ -n "${_with_credit}" ]; then args+=(--with-credit); fi
+    if [ -n "${_file}" ]; then
+        uv run just-akash export-metrics "${_file}" ${args[@]+"${args[@]}"}
     else
         tmp="$(mktemp)"; bench_tmp="$(mktemp)"
         trap 'rm -f "$tmp" "$bench_tmp"' EXIT   # clean up on every exit path
@@ -408,7 +437,7 @@ export-metrics file="" output="" with-credit="":
         if git show origin/telemetry:smoke-benchmark.jsonl > "$bench_tmp" 2>/dev/null && [ -s "$bench_tmp" ]; then
             args+=(--benchmark "$bench_tmp")
         fi
-        uv run just-akash export-metrics "$tmp" "${args[@]}"
+        uv run just-akash export-metrics "$tmp" ${args[@]+"${args[@]}"}
     fi
 
 # ── Lint & Quality ───────────────────────────────────
@@ -457,15 +486,17 @@ audit:
 deploy sdl="sdl/cpu-backtest-ssh.yaml" image="":
     #!/bin/bash
     set -euo pipefail
+    _sdl={{quote(sdl)}}
+    _image={{quote(image)}}
     mkdir -p "{{log_dir}}"
     timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
     log_file="{{log_dir}}/deploy-${timestamp}.log"
     exec > >(tee -a "$log_file") 2>&1
     trap 'status=$?; echo "[INFO] recipe=deploy finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
-    echo "[INFO] recipe=deploy started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file sdl={{sdl}} image={{image}}"
+    echo "[INFO] recipe=deploy started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file sdl=${_sdl} image=${_image}"
     set -x
-    args=(uv run just-akash deploy --sdl "{{sdl}}")
-    if [ -n "{{image}}" ]; then args+=(--image "{{image}}"); fi
+    args=(uv run just-akash deploy --sdl "${_sdl}")
+    if [ -n "${_image}" ]; then args+=(--image "${_image}"); fi
     "${args[@]}"
 
 # ── Akash node (personal LCD/RPC) ────────────────────
