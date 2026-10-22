@@ -89,11 +89,11 @@ def run(
 
 
 def _run_just_up(
-    env: dict[str, str], timeout: int = 300
+    env: dict[str, str], timeout: int = 300, cmd: list[str] | None = None
 ) -> tuple[subprocess.CompletedProcess, bool]:
     """Run the paid create in its own process group so timeout contains every child."""
     process = subprocess.Popen(
-        ["just", "up"],
+        cmd or ["just", "up"],
         shell=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -114,11 +114,15 @@ def _run_just_up(
 
     try:
         stdout, stderr = process.communicate(timeout=timeout)
-        result = subprocess.CompletedProcess(["just", "up"], process.returncode, stdout, stderr)
+        result = subprocess.CompletedProcess(
+            cmd or ["just", "up"], process.returncode, stdout, stderr
+        )
         return result, False
     except subprocess.TimeoutExpired:
         stdout, stderr = terminate_group()
-        result = subprocess.CompletedProcess(["just", "up"], process.returncode, stdout, stderr)
+        result = subprocess.CompletedProcess(
+            cmd or ["just", "up"], process.returncode, stdout, stderr
+        )
         return result, True
     except BaseException:
         # SIGINT/SIGTERM handlers raise SystemExit, and KeyboardInterrupt plus any
@@ -303,8 +307,8 @@ def main():
     # receipt before POST, then records the response DSEQ before auction work.
     api_key = os.environ["AKASH_API_KEY"]
     receipt_path, receipt_operation_id, receipt_env = _receipt_environment()
-    # The backup tier is explicit only: `just up` forwards it as --backup-provider flags.
-    receipt_env["JUST_UP_BACKUP_PROVIDERS"] = ",".join(backup)
+    # The backup tier is explicit only: passed to `just up` as its `backup` parameter.
+    up_cmd = ["just", "up", "", ",".join(backup)]
     dseq_ref["receipt_path"] = receipt_path
 
     # ── Step 2: Deploy SSH instance ────────────────────
@@ -312,7 +316,7 @@ def main():
 
     deploy_started_at = time.time()
     try:
-        r, timed_out = _run_just_up({**os.environ, **receipt_env}, timeout=300)
+        r, timed_out = _run_just_up({**os.environ, **receipt_env}, timeout=300, cmd=up_cmd)
     except BaseException:
         # The child group is dead before this read. Preserve an unresolved receipt;
         # remove it only after authoritative pre-submit state or verified closure.

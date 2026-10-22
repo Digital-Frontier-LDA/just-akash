@@ -538,8 +538,8 @@ def main():
     preferred, backup, _ = resolve_tiers()
     install_signal_cleanup(dseq_ref)
     receipt_path, receipt_operation_id, receipt_env = receipt_environment("e2e-shell")
-    # The backup tier is explicit only: `just up` forwards it as --backup-provider flags.
-    receipt_env["JUST_UP_BACKUP_PROVIDERS"] = ",".join(backup)
+    # The backup tier is explicit only: passed to `just up` as its `backup` parameter.
+    up_cmd = ["just", "up", "", ",".join(backup)]
     dseq_ref["receipt_path"] = receipt_path
 
     # ── Step 2: Deploy via `just up` ─────────────────────────
@@ -565,9 +565,7 @@ def main():
     # when that is nothing.
     deploy_started_at = time.time()
     try:
-        r, timed_out = run_process_group(
-            ["just", "up"], env={**os.environ, **receipt_env}, timeout=300
-        )
+        r, timed_out = run_process_group(up_cmd, env={**os.environ, **receipt_env}, timeout=300)
         deploy_out, deploy_err, returncode = r.stdout, r.stderr, r.returncode
     except BaseException:
         try:
