@@ -1,4 +1,4 @@
-"""`just up` takes the backup tier ONLY as its `backup` parameter (CodeRabbit + openmix-dd, PR #475).
+"""`just up` takes the backup tier ONLY as its `backup` parameter (CodeRabbit, openmix-dd, #475).
 
 deploy no longer reads AKASH_PROVIDERS_BACKUP. The first fix forwarded an env var
 (JUST_UP_BACKUP_PROVIDERS), but the Justfile's `set dotenv-load` lets any .env supply it -- the
@@ -77,5 +77,6 @@ def test_the_recipe_reads_no_backup_environment_variable():
 def test_both_e2e_callers_pass_their_backup_tier_as_the_parameter():
     for f in ("just_akash/test_secrets_e2e.py", "just_akash/test_shell_e2e.py"):
         src = (ROOT / f).read_text()
-        assert 'up_cmd = ["just", "up", "", ",".join(backup)]' in src, f
+        assert 'up_tag, up_backup = "", ",".join(backup)' in src, f
+        assert '["just", "up", up_tag, up_backup]' in src, f
         assert "JUST_UP_BACKUP_PROVIDERS" not in src, f

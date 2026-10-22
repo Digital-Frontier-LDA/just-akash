@@ -397,7 +397,7 @@ def test_receipt_and_reconciliation_surround_every_just_up_exit() -> None:
 
 def test_just_up_passes_the_complete_receipt_identity() -> None:
     source = (Path(__file__).parents[1] / "Justfile").read_text(encoding="utf-8")
-    start = source.index('up tag="":')
+    start = source.index('up tag="" backup="":')
     end = source.index("\n# Connect to a running instance", start)
     recipe = source[start:end]
     for flag in ("--receipt-path", "--receipt-operation-id"):
@@ -413,13 +413,17 @@ def test_just_up_passes_the_complete_receipt_identity() -> None:
 def test_just_up_rejects_each_half_configured_receipt_before_paid_deploy(tmp_path: Path) -> None:
     root = Path(__file__).parents[1]
     justfile = (root / "Justfile").read_text(encoding="utf-8")
-    start = justfile.index('up tag="":')
+    start = justfile.index('up tag="" backup="":')
     end = justfile.index("\n# Connect to a running instance", start)
     recipe = "\n".join(
         line[4:] if line.startswith("    ") else line
         for line in justfile[start:end].splitlines()[1:]
     )
-    recipe = recipe.replace("{{log_dir}}", ".logs/just").replace("{{tag}}", "")
+    recipe = (
+        recipe.replace("{{log_dir}}", ".logs/just")
+        .replace("{{tag}}", "")
+        .replace("{{quote(backup)}}", "''")  # just renders quote("") as ''
+    )
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     marker = tmp_path / "deploy-called"
