@@ -2132,7 +2132,7 @@ MUTATIONS = [
     (
         "pool image matches the probe",
         lambda s: s.replace(
-            "df-akash-runner@sha256:aaf3799b5e138abef0831bb8467ded7325164316f0cfde5c183fe6e129eae79e",
+            "df-akash-runner@sha256:e71bf4be0e3a59a57ff791b0fc3bc3a31f216f66807b6ac41f1a23346321baa4",
             # ⚠ SAME repository, de-pinned. Replacing with "github-runner:latest" left the
             # `ghcr.io/digital-frontier-lda/` prefix intact and produced a DIFFERENT repo,
             # so the mutation tested "wrong image" rather than the "`:latest` can move

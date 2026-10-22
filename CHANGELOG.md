@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Security
+
+- Runner pool, provider probe and native reader move to `df-akash-runner@sha256:e71bf4be…`, rebuilt for the eMudhra/emSign intermediate-CA compromise (CVE-2026-111943; df-cicd-rpi.1). Pool and probe move together, so providers stay qualified against the image the pool runs. The native reader moves with them, because the public BB template requires the pool image to carry its digest. The separate BB ce1 profile is unchanged.
+
 ### Added
 
 - Lease charters for placements Flynn counts as ours (`flynn-*`, `fleet-*`, exactly
