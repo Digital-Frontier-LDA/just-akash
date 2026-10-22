@@ -906,7 +906,17 @@ def _wallet_account(wallet, client) -> str | None:
             "treated as a Flynn wallet: a provider allowlist is required",
         )
         return None
-    return account if _is_account(account) else None
+    if not _is_account(account):
+        # Fail closed out loud (CodeRabbit, #477), naming the shape, never the raw value.
+        size = len(account) if isinstance(account, str) else "-"
+        _log(
+            logging.WARNING,
+            f"wallet account from the API key is not a canonical akash address "
+            f"({type(account).__name__}, length {size}); "
+            "treated as a Flynn wallet: a provider allowlist is required",
+        )
+        return None
+    return account
 
 
 def _refuse_open_auction(wallet, client) -> None:

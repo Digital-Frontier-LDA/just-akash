@@ -239,3 +239,25 @@ def test_a_swap_between_non_flynn_wallets_is_unchanged(monkeypatch, tmp_path):
     with pytest.raises(_Stop):
         deploy(sdl_path=sdl, bid_wait=2, bid_wait_retry=3)
     assert created == [ANOTHER]
+
+
+# CodeRabbit (#477): an account_address() that returns a non-canonical value fails closed, and
+# says so -- a WARNING naming the reason, never the raw value.
+
+
+@pytest.mark.parametrize("bad", ["akash1invalid", "", 7, "not-an-address"])
+def test_real_a_non_canonical_key_account_is_unknown_and_logged_without_its_value(bad, caplog):
+    client = SimpleNamespace(account_address=lambda: bad)
+    with caplog.at_level(logging.WARNING):
+        assert REAL_WALLET_ACCOUNT(SimpleNamespace(account=None), client) is None
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("not a canonical akash address" in m for m in warnings), warnings
+    if isinstance(bad, str) and bad:
+        assert not any(bad in m for m in warnings), "the raw value must not be logged"
+
+
+def test_real_a_canonical_key_account_logs_nothing(caplog):
+    client = SimpleNamespace(account_address=lambda: OTHER)
+    with caplog.at_level(logging.WARNING):
+        assert REAL_WALLET_ACCOUNT(SimpleNamespace(account=None), client) == OTHER
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
