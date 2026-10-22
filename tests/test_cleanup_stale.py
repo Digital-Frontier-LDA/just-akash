@@ -86,14 +86,24 @@ class TestClassify:
         excluded by SERVICE IDENTITY, never by a name filter — so it survives even with
         `reap_runners=True`, even carrying OUR OWN placement prefix, and even at an age
         far past every stale floor. A prefix-based guard would not give that.
+
+        ⛔ AND THIS TEST MISSED THE FLAG THAT BROKE IT. It passed only `reap_runners`, while
+        the scheduled sweep also passes `--reap-owned`, whose age rule (#241) judged every
+        live canary STALE-owned from 2026-09-09 (tests/test_cleanup_leaves_live_canaries.py).
+        Both flags now, and the explicit verdict rather than the catch-all.
         """
         ancient = _dseq(30 * 86400)
         ours = ["just-akash-canary"]
         verdict, _, _ = cs.classify(
-            _detail(["canary"]), ancient, NOW, reap_runners=True, group_names=ours
+            _detail(["canary"]),
+            ancient,
+            NOW,
+            reap_runners=True,
+            group_names=ours,
+            reap_owned=True,
         )
-        assert verdict == "LEAVE-real-or-unknown", (
-            "the canary must never be classified stale: flag on, our prefix, 30 days old"
+        assert verdict == "LEAVE-canary", (
+            "the canary must never be classified stale: both flags on, our prefix, 30 days old"
         )
 
     def test_a_mixed_service_set_containing_the_runner_is_NOT_reaped(self):

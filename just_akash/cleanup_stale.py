@@ -32,6 +32,8 @@ disposable test residue; when in doubt, leave it and say so:
     --reap-owned proves OURS on chain, then STALE-provider-closed at the 1h probe floor
     (#1763: provider-stopped, escrow recoverable only by close; unowned/unreadable/young
     stay LEAVE — the safe default is not widened, it is preceded by a proof)
+  * services == {canary}     -> LEAVE-canary, ALWAYS, whatever its age or ownership
+    (the persistent canary lives for weeks by design; see CANARY_SERVICE)
   * anything else (node, runner, train, ...) -> LEAVE (real or unknown workload)
   * unknown age -> LEAVE (never mis-age and reap wrongly)
 
@@ -102,6 +104,25 @@ STALE_E2E_AGE_SECONDS = 48 * 3600
 # rule for ANY service, so the promise in stamp_run's docstring becomes true.
 STALE_OWNED_AGE_SECONDS = 48 * 3600
 
+# ⛔ THE PERSISTENT CANARY IS NEVER STALE, AND THE RULE ABOVE MADE IT SO. sdl/canary.yaml
+# rests its "MUST NOT BE REAPED" on one fact: service `canary` "matches no stale rule".
+# That was true until #241 let STALE-owned reach ANY owned service older than 48h — and
+# a canary is owned, and lives for weeks by design. From 2026-09-09 every scheduled sweep
+# classified all three live fleet canaries STALE-owned. The only thing between that verdict
+# and a close was the identity policy (#317), which happened to hold their legacy group
+# names. Holding is also exit 2, so the sweep went red on every run for six weeks while
+# reporting nothing closable: a standing failure that read as noise.
+#
+# A canary that newer tooling stamps with a closable CI identity would no longer be held,
+# and the next --execute would close the canary it exists to keep. So the exclusion lives
+# here, before any age or ownership test. A canary orphaned by a replacement race is a
+# human close decision on purpose (canary/ensure.py names the dseqs; the canary's own
+# orphan-escrow alert pages, #386) and this reaper must not second-guess it.
+#
+# Mirrors canary.ensure.CANARY_SERVICE; tests/test_cleanup_leaves_live_canaries.py pins
+# the two together, because a rename on either side alone silently re-arms the close.
+CANARY_SERVICE = "canary"
+
 RUNNER_SERVICE = "runner"
 STALE_RUNNER_AGE_SECONDS = 6 * 3600
 
@@ -150,6 +171,7 @@ KNOWN_VERDICTS = frozenset(
         "STALE-runner",
         "STALE-owned",
         "STALE-provider-closed",
+        "LEAVE-canary",
         "LEAVE-not-ours",
         "LEAVE-not-ours-provider-closed",
         "LEAVE-real-or-unknown",
@@ -224,7 +246,8 @@ def _wants_owned_provenance(detail: dict, dseq: str, now: float | None = None) -
 
     Probe, backtest and runner are only candidate selectors here.  They still
     require the independent typed cleanup policy before any close, but their
-    service/age classifier does not consume the names itself.
+    service/age classifier does not consume the names itself. The canary returns before
+    any branch reads them (see CANARY_SERVICE), so its read is skipped too.
 
     The EMPTY set is judged by the reap_owned branch too (provider-closed), but at the
     PROBE floor rather than the owned floor — see classify for why the two floors differ.
@@ -234,7 +257,7 @@ def _wants_owned_provenance(detail: dict, dseq: str, now: float | None = None) -
     account that is the majority case and where most of the saving is.
     """
     services = _deployment_service_names(detail)
-    if services in ({PROBE_SERVICE}, {E2E_SERVICE}, {RUNNER_SERVICE}):
+    if services in ({PROBE_SERVICE}, {E2E_SERVICE}, {RUNNER_SERVICE}, {CANARY_SERVICE}):
         return False
     age = _probe_age_seconds(dseq, now)
     # An UNAGED deployment (undecodable dseq) still needs the read: classify cannot rule on
@@ -263,6 +286,9 @@ def classify(
     """
     services = sorted(_deployment_service_names(detail))
     age = _probe_age_seconds(dseq, now)
+    if services == [CANARY_SERVICE]:
+        # First, before any age or ownership test: see CANARY_SERVICE.
+        return "LEAVE-canary", services, age
     if services == [PROBE_SERVICE]:
         if age is not None and age >= MIN_ORPHAN_AGE_SECONDS:
             return "STALE-probe", services, age

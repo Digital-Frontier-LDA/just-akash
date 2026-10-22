@@ -55,6 +55,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- `cleanup_stale` judged the three live persistent canaries `STALE-owned`, and the
+  scheduled sweep has failed every run since 2026-09-09. `--reap-owned`'s age rule (#241)
+  reaches any owned service older than 48h, and a canary is owned and meant to live for
+  weeks, against `sdl/canary.yaml`'s "matches no stale rule". The only thing stopping a
+  close was the identity policy holding their legacy group names. That hold made each dry
+  run exit 2 while reporting `stale (closable): 0`. A canary stamped with a closable CI
+  identity would not have been held, and `--execute` would have closed it. Service set
+  exactly `{canary}` is now `LEAVE-canary`, ahead of every age and ownership test, with no
+  provenance read. Orphaned canaries stay a human close decision (#386).
 - The bid probe's chain cross-check could not confirm a no-bid, so every no-bid since
   2026-08-30 was `no-bid-unverified` (a skip) and the autobidder's `bidprobe-nobid` page
   could not fire. Two causes, each enough on its own: the owner filter was read from the
