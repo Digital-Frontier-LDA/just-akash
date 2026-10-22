@@ -1,4 +1,4 @@
-"""`just up`'s `tag` is just-quoted, never raw-interpolated into the recipe's bash (just-akash-t1q).
+"""`just up` just-quotes its `tag`; it is never raw-interpolated into the bash (just-akash-t1q).
 
 `{{tag}}` was pasted into the script text in three places, so a tag holding a quote ran as code:
 `just up 'x"; touch pwned; "'` executed `touch`. The recipe now binds `_tag={{quote(tag)}}` once
