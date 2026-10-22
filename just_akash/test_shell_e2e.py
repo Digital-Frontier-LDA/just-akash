@@ -538,6 +538,8 @@ def main():
     preferred, backup, _ = resolve_tiers()
     install_signal_cleanup(dseq_ref)
     receipt_path, receipt_operation_id, receipt_env = receipt_environment("e2e-shell")
+    # The backup tier is explicit only: `just up` forwards it as --backup-provider flags.
+    receipt_env["JUST_UP_BACKUP_PROVIDERS"] = ",".join(backup)
     dseq_ref["receipt_path"] = receipt_path
 
     # ── Step 2: Deploy via `just up` ─────────────────────────

@@ -26,6 +26,15 @@ up tag="":
             --receipt-operation-id "$JUST_AKASH_RECEIPT_OPERATION_ID"
         )
     fi
+    # The backup tier is explicit only (deploy no longer reads AKASH_PROVIDERS_BACKUP): a caller
+    # that wants one names it in JUST_UP_BACKUP_PROVIDERS (comma-separated), forwarded as flags.
+    # Guarded: an empty array under `set -u` is "unbound" in macOS /bin/bash 3.2.
+    if [ -n "${JUST_UP_BACKUP_PROVIDERS:-}" ]; then
+        IFS=',' read -r -a _backup <<< "$JUST_UP_BACKUP_PROVIDERS"
+        for p in ${_backup[@]+"${_backup[@]}"}; do
+            if [ -n "${p// /}" ]; then args+=(--backup-provider "${p// /}"); fi
+        done
+    fi
     "${args[@]}" | tee /tmp/.akash-last-deploy.log
     dseq=$(sed -n 's/.*DSEQ: \([0-9]*\).*/\1/p' /tmp/.akash-last-deploy.log | head -1)
     if [ -n "{{tag}}" ] && [ -n "$dseq" ]; then

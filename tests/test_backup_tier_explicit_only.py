@@ -71,3 +71,26 @@ def test_env_example_ships_no_backup_providers():
     text = (Path(__file__).resolve().parents[1] / ".env.example").read_text()
     line = next(ln for ln in text.splitlines() if ln.startswith("AKASH_PROVIDERS_BACKUP="))
     assert line == "AKASH_PROVIDERS_BACKUP=", line
+
+
+@patch("just_akash.deploy.time")
+@patch("just_akash.deploy.AkashConsoleAPI")
+def test_a_legacy_backup_only_env_is_refused_before_any_deployment_is_created(
+    MockAPI, mock_time, tmp_path, monkeypatch
+):
+    """CodeRabbit (PR #475): with AKASH_PROVIDERS unset and AKASH_PROVIDERS_BACKUP set, ignoring
+    the backup env would leave BOTH tiers empty -- an open auction, the opposite of what that
+    environment used to mean. Refuse it before anything is created; the caller names a tier."""
+    monkeypatch.setenv("AKASH_API_KEY", "test-key")
+    monkeypatch.delenv("AKASH_PROVIDERS", raising=False)
+    monkeypatch.setenv("AKASH_PROVIDERS_BACKUP", "akash1legacyback")
+    sdl = tmp_path / "sdl.yaml"
+    sdl.write_text(SDL_YAML)
+    client = MockAPI.return_value
+    mock_time.time.side_effect = _time_mock()
+    mock_time.sleep.return_value = None
+    with pytest.raises(RuntimeError) as err:
+        deploy(sdl_path=str(sdl), bid_wait=10, bid_wait_retry=10)
+    msg = str(err.value)
+    assert "AKASH_PROVIDERS_BACKUP" in msg and "--backup-provider" in msg and "--provider" in msg
+    client.create_deployment.assert_not_called()

@@ -1394,7 +1394,7 @@ class TestBackupOnlyAllowlistAcceptsBackupBid:
     ):
         monkeypatch.setenv("AKASH_API_KEY", "test-key")
         monkeypatch.delenv("AKASH_PROVIDERS", raising=False)
-        monkeypatch.setenv("AKASH_PROVIDERS_BACKUP", "akash1back")
+        monkeypatch.delenv("AKASH_PROVIDERS_BACKUP", raising=False)
         sdl_file = tmp_path / "sdl.yaml"
         sdl_file.write_text(SDL_YAML)
 
@@ -1407,7 +1407,12 @@ class TestBackupOnlyAllowlistAcceptsBackupBid:
         mock_time.time.side_effect = t
         mock_time.sleep.return_value = None
 
-        result = deploy(sdl_path=str(sdl_file), bid_wait=10, bid_wait_retry=10)
+        result = deploy(
+            sdl_path=str(sdl_file),
+            bid_wait=10,
+            bid_wait_retry=10,
+            backup_providers=["akash1back"],  # explicit: the env backup tier is not read
+        )
         # Backup wins via phase-3 fallback even with no preferred configured.
         assert result["provider"] == "akash1back"
         assert result["price"] == 75.0

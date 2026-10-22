@@ -303,6 +303,8 @@ def main():
     # receipt before POST, then records the response DSEQ before auction work.
     api_key = os.environ["AKASH_API_KEY"]
     receipt_path, receipt_operation_id, receipt_env = _receipt_environment()
+    # The backup tier is explicit only: `just up` forwards it as --backup-provider flags.
+    receipt_env["JUST_UP_BACKUP_PROVIDERS"] = ",".join(backup)
     dseq_ref["receipt_path"] = receipt_path
 
     # ── Step 2: Deploy SSH instance ────────────────────
