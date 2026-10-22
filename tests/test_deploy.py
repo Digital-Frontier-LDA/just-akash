@@ -769,8 +769,12 @@ class TestPhase3BackupFallback:
         mock_time.time.side_effect = t
         mock_time.sleep.return_value = None
 
-        result = deploy(sdl_path=str(sdl_file), bid_wait=10, bid_wait_retry=10,
-                        backup_providers=["akash1back1", "akash1back2"])
+        result = deploy(
+            sdl_path=str(sdl_file),
+            bid_wait=10,
+            bid_wait_retry=10,
+            backup_providers=["akash1back1", "akash1back2"],
+        )
         assert result["provider"] == "akash1back1"
         assert result["price"] == 120.0
 
