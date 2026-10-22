@@ -10,16 +10,21 @@ treated as Flynn's (fail closed). Other wallets are unchanged.
 
 from __future__ import annotations
 
+import logging
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
 from just_akash import deploy as deploy_mod
+from just_akash.deploy import _wallet_account as REAL_WALLET_ACCOUNT  # before conftest patches
 from just_akash.deploy import deploy
 from tests.test_deploy import SDL_YAML, _make_bid, _time_mock
 
 CONSOLE_3 = "akash14n4rkmz64rn0tey0r5g07l8q5x0fh2h4hu44kt"
 H4I = "akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk"
+CONSOLE_2 = "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee"
+OTHER = "akash1someoneelsexxxxxxxxxxxxxxxxxxxxxxxxx"
 
 
 def _run(MockAPI, mock_time, tmp_path, monkeypatch, account, providers=None):
@@ -82,3 +87,72 @@ def test_the_flynn_wallets_and_providers_are_the_known_ones():
         CONSOLE_3,  # console-3
     } == deploy_mod.FLYNN_WALLETS
     assert H4I in deploy_mod.FLYNN_OWN_PROVIDERS.values()
+
+
+# openmix-15 (stand-in review): every test above replaces `_wallet_account`, so a fail-OPEN
+# mutant of its except branch passed them all. These run the REAL function: one API key (the pool
+# names no account), so the account comes from the mocked client's `account_address()`.
+
+
+def _real(MockAPI, mock_time, tmp_path, monkeypatch, resolved):
+    client, sdl = _run(MockAPI, mock_time, tmp_path, monkeypatch, None)
+    monkeypatch.setattr(deploy_mod, "_wallet_account", REAL_WALLET_ACCOUNT)
+    monkeypatch.delenv("AKASH_API_KEYS", raising=False)
+    if isinstance(resolved, Exception):
+        client.account_address.side_effect = resolved
+    else:
+        client.account_address.return_value = resolved
+    return client, sdl
+
+
+@patch("just_akash.deploy.time")
+@patch("just_akash.deploy.AkashConsoleAPI")
+def test_real_an_unresolvable_account_is_refused_before_create_and_says_why(
+    MockAPI, mock_time, tmp_path, monkeypatch, caplog
+):
+    client, sdl = _real(MockAPI, mock_time, tmp_path, monkeypatch, RuntimeError("jwt down"))
+    with (
+        caplog.at_level(logging.WARNING),
+        pytest.raises(RuntimeError, match="could not be determined"),
+    ):
+        deploy(sdl_path=str(sdl), bid_wait=10, bid_wait_retry=10)
+    client.create_deployment.assert_not_called()
+    assert any(
+        r.levelno == logging.WARNING and "could not be resolved" in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]
+
+
+@pytest.mark.parametrize("resolved", [CONSOLE_2, "", "not-an-address", None])
+@patch("just_akash.deploy.time")
+@patch("just_akash.deploy.AkashConsoleAPI")
+def test_real_a_flynn_or_non_address_account_is_refused(
+    MockAPI, mock_time, tmp_path, monkeypatch, resolved
+):
+    client, sdl = _real(MockAPI, mock_time, tmp_path, monkeypatch, resolved)
+    with pytest.raises(RuntimeError, match="AKASH_PROVIDERS"):
+        deploy(sdl_path=str(sdl), bid_wait=10, bid_wait_retry=10)
+    client.create_deployment.assert_not_called()
+
+
+@patch("just_akash.deploy.time")
+@patch("just_akash.deploy.AkashConsoleAPI")
+def test_real_someone_elses_key_still_deploys_without_an_allowlist(
+    MockAPI, mock_time, tmp_path, monkeypatch
+):
+    client, sdl = _real(MockAPI, mock_time, tmp_path, monkeypatch, OTHER)
+    result = deploy(sdl_path=str(sdl), bid_wait=10, bid_wait_retry=10)
+    assert result["provider"] == H4I
+    client.account_address.assert_called()
+
+
+@pytest.mark.parametrize("pooled", ["", "not-an-address", None, 7])
+def test_real_a_pooled_value_that_is_not_an_address_falls_back_to_the_key(pooled):
+    """Only an akash1 address counts as the pool's choice; anything else asks the key itself."""
+    client = SimpleNamespace(account_address=lambda: CONSOLE_2)
+    assert REAL_WALLET_ACCOUNT(SimpleNamespace(account=pooled), client) == CONSOLE_2
+
+
+def test_real_a_pooled_address_wins():
+    client = SimpleNamespace(account_address=lambda: OTHER)
+    assert REAL_WALLET_ACCOUNT(SimpleNamespace(account=CONSOLE_2), client) == CONSOLE_2

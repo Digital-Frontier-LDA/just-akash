@@ -879,11 +879,18 @@ FLYNN_OWN_PROVIDERS = {
 }
 
 
+def _is_account(value) -> bool:
+    """An akash1 address; anything else (an empty string, a non-str) is no account at all, so it
+    can never pass as "someone else's" wallet."""
+    return isinstance(value, str) and value.startswith("akash1")
+
+
 def _wallet_account(wallet, client) -> str | None:
     """The account a create will spend from: the pool's choice, else the API key's own (its
     JWT). None when it cannot be determined."""
-    if isinstance(getattr(wallet, "account", None), str):
-        return wallet.account
+    pooled = getattr(wallet, "account", None)
+    if _is_account(pooled):
+        return pooled
     try:
         account = client.account_address()
     except Exception as exc:
@@ -895,7 +902,7 @@ def _wallet_account(wallet, client) -> str | None:
             "treated as a Flynn wallet: a provider allowlist is required",
         )
         return None
-    return account if isinstance(account, str) else None
+    return account if _is_account(account) else None
 
 
 def _resolve_tier(arg_value: list[str] | None, env_name: str) -> list[str]:
