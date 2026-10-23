@@ -326,7 +326,22 @@ on:
         required: false
         type: string
         default: '90'
+      credentials-sops:
+        description: >-
+          Read AKASH_API_KEY, AKASH_API_KEYS and GH_RUNNER_PAT from the caller's
+          secrets/akash-runner.sops.env (decrypted with CREDENTIALS_AGE_KEY) instead of
+          from workflow_call secrets. For orgs whose baseline allows only SOPS-sourced
+          credentials (Digital-Frontier-LDA). A secret passed directly still wins. The
+          caller's teardown must set the same value; the pool's own rollback does.
+        required: false
+        type: boolean
+        default: false
     secrets:
+      CREDENTIALS_AGE_KEY:
+        required: false
+        description: >-
+          Age key for the caller's secrets/akash-runner.sops.env. Used only with
+          credentials-sops; a missing key fails before any preflight or create.
       AKASH_API_KEY:
         required: false
         description: >-
@@ -527,6 +542,77 @@ jobs:
           path: .just-akash
           persist-credentials: false
 
+      # credentials-sops: only the ciphertext, from the caller's exact revision. ONE run step,
+      # on purpose. It must precede the PAT preflight (which reads the PAT it loads), and the
+      # preflight must precede every outcome writer, the public-profile admission among them,
+      # which in turn precedes any sparse checkout. A checkout step here would break that
+      # chain, and a local `uses:` breaks the sha-pin rule, so the file comes from the
+      # contents API and is decrypted with the same checksum-pinned SOPS the reader bundle
+      # uses. Only the three credential names are exported, each masked first; the reads
+      # below are secrets.X || env.X, so a caller that passes secrets directly is unchanged.
+      - name: Load the caller runner credentials from SOPS
+        id: credentials_sops
+        if: inputs.credentials-sops
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CALLER: ${{ github.repository }}
+          CALLER_SHA: ${{ github.sha }}
+          # Not named SOPS_AGE_KEY: only the reader-bundle step holds that, and here the key
+          # reaches the one sops call below and nothing else in the script.
+          CREDENTIALS_AGE_KEY: ${{ secrets.CREDENTIALS_AGE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CREDENTIALS_AGE_KEY// /}" ]; then
+            echo "::error title=credentials-sops::CREDENTIALS_AGE_KEY is empty, so secrets/akash-runner.sops.env cannot be decrypted. NOT a provider fault."
+            exit 1
+          fi
+          umask 077
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          curl --fail --silent --show-error --location --retry 3 --max-time 120 \
+            https://github.com/getsops/sops/releases/download/v3.13.1/sops-v3.13.1.linux.amd64 \
+            --output "$work/sops"
+          echo "620a9d7e3352ababeca6908cea24a6e8b14ce89a448ddbd3f94f1ef3398f470a  $work/sops" | sha256sum --check --quiet
+          chmod 0755 "$work/sops"
+          if ! gh api -H 'Accept: application/vnd.github.raw' \
+              "repos/${CALLER}/contents/secrets/akash-runner.sops.env?ref=${CALLER_SHA}" \
+              > "$work/akash-runner.sops.env"; then
+            echo "::error title=credentials-sops::${CALLER}@${CALLER_SHA} has no readable secrets/akash-runner.sops.env."
+            exit 1
+          fi
+          # Decrypt to a private file, never to stdout. JSON, not dotenv: sops' dotenv output
+          # escapes a newline as a literal backslash-n, so a newline-separated AKASH_API_KEYS
+          # would reach wallet_pool.py (which splits on real newlines, commas, semicolons) as
+          # ONE broken key. JSON carries the real newline.
+          SOPS_AGE_KEY="$CREDENTIALS_AGE_KEY" "$work/sops" --decrypt --input-type dotenv --output-type json \
+            "$work/akash-runner.sops.env" > "$work/plain.json"
+          # Into a file, not `< <(jq ...)`: set -e does not see a process substitution fail.
+          jq -r 'keys_unsorted[]' "$work/plain.json" > "$work/keys"
+          loaded=0
+          while IFS= read -r key; do
+            case "$key" in
+              AKASH_API_KEY|AKASH_API_KEYS|GH_RUNNER_PAT) ;;
+              *) continue ;;
+            esac
+            jq -j --arg k "$key" '.[$k]' "$work/plain.json" > "$work/value"
+            [ -s "$work/value" ] || continue
+            # Mask every piece the pool can split out (newline, comma, semicolon), never the
+            # raw value: a multi-line value in one ::add-mask:: would print its second line.
+            tr ',;' '\n\n' < "$work/value" | while IFS= read -r piece || [ -n "$piece" ]; do
+              piece="${piece#"${piece%%[![:space:]]*}"}"
+              piece="${piece%"${piece##*[![:space:]]}"}"
+              [ -z "$piece" ] || echo "::add-mask::$piece"
+            done
+            delim="CREDENTIALS_$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+            { printf '%s<<%s\n' "$key" "$delim"; cat "$work/value"; printf '\n%s\n' "$delim"; } >> "$GITHUB_ENV"
+            loaded=$((loaded + 1))
+          done < "$work/keys"
+          if [ "$loaded" -eq 0 ]; then
+            echo "::error title=credentials-sops::secrets/akash-runner.sops.env holds none of AKASH_API_KEY, AKASH_API_KEYS, GH_RUNNER_PAT."
+            exit 1
+          fi
+          echo "Loaded ${loaded} runner credential(s) from ${CALLER}@${CALLER_SHA}."
+
       # A PAT EXPIRY MUST NOT BE SILENT. Without this the runner simply never registers,
       # the pool times out after ~15 minutes, and the run reports RUNNER_NEVER_REGISTERED
       # — indistinguishable from a provider that leases and never schedules. That reading
@@ -565,7 +651,7 @@ jobs:
       - name: Preflight — the runner PAT must still be valid
         id: pat
         env:
-          GH_TOKEN: ${{ secrets.GH_RUNNER_PAT }}
+          GH_TOKEN: ${{ secrets.GH_RUNNER_PAT || env.GH_RUNNER_PAT }}
           ORG: ${{ inputs.github-org }}
           RUNNER_NATIVE_PULL_READER: ${{ inputs.runner-native-pull-reader }}
           RUNNER_NATIVE_REPOSITORY_SCOPE: ${{ inputs.runner-native-repository-scope }}
@@ -1248,7 +1334,7 @@ jobs:
           RUNNER_NATIVE_PULL_READER: ${{ inputs.runner-native-pull-reader }}
           RUNNER_NATIVE_REPOSITORY_SCOPE: ${{ inputs.runner-native-repository-scope }}
           NATIVE_READER_CALLER: ${{ github.repository }}
-          GH_TOKEN: ${{ inputs.runner-native-pull-reader && secrets.GH_RUNNER_PAT || '' }}
+          GH_TOKEN: ${{ inputs.runner-native-pull-reader && (secrets.GH_RUNNER_PAT || env.GH_RUNNER_PAT) || '' }}
           NATIVE_READER_RUN_ID: ${{ github.run_id }}
           NATIVE_READER_RUN_ATTEMPT: ${{ github.run_attempt }}
           NATIVE_READER_SOURCE: ${{ inputs.just-akash-repository }}
@@ -1267,9 +1353,9 @@ jobs:
       - name: Provision (retry down candidates, tag before waiting)
         id: provision
         env:
-          AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
-          AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}
-          GH_TOKEN: ${{ secrets.GH_RUNNER_PAT }}
+          AKASH_API_KEY: ${{ secrets.AKASH_API_KEY || env.AKASH_API_KEY }}
+          AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS || env.AKASH_API_KEYS }}
+          GH_TOKEN: ${{ secrets.GH_RUNNER_PAT || env.GH_RUNNER_PAT }}
           PREFERRED_CANDIDATES_CSV: ${{ steps.candidates.outputs.preferred_candidates }}
           FALLBACK_CANDIDATES_CSV: ${{ steps.candidates.outputs.fallback_candidates }}
           STANDING_EXCLUDED_CSV: ${{ steps.candidates.outputs.excluded_candidates }}
@@ -2450,7 +2536,11 @@ jobs:
       # reusable, so the broken graph is only ever built in a consumer. Same blind spot
       # as the `./` defect in #248, one input along.
       just-akash-ref: ${{ inputs.runner-native-pull-reader && '4318e32d4c2c2434ad9d8f672352a9f546ff80e2' || inputs.just-akash-ref }}  # pragma: allowlist secret
+      # A SOPS-credentialed caller has no direct secrets to hand on; the rollback must read
+      # the same caller file, or a failed provision is the one lease it cannot close.
+      credentials-sops: ${{ inputs.credentials-sops }}
     secrets:
+      CREDENTIALS_AGE_KEY: ${{ secrets.CREDENTIALS_AGE_KEY }}
       AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
       AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}
       GH_RUNNER_PAT: ${{ secrets.GH_RUNNER_PAT }}
