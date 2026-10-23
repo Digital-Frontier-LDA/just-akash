@@ -59,6 +59,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- `.github/actions/sops-env` decrypts to JSON instead of dotenv (df-grafana-3nk). sops' dotenv
+  output escapes a newline as a literal `\n`, so a newline-separated `AKASH_API_KEYS` reached
+  `runner-teardown.yml`'s `credentials-sops` (and any other reader) as one broken key. Every
+  line of a value is now masked on its own (a single `::add-mask::` printed a multi-line
+  value's second line), wallet keys are masked one by one, the heredoc delimiter is random (a
+  value line equal to the old fixed `__SOPS_EOF__` could inject variables), and a jq failure
+  fails the step. Teardown callers get it through `just-akash-ref`; the pool's native-reader
+  literal moves in a follow-up repin.
+
 - `cleanup_stale` judged the three live persistent canaries `STALE-owned`, and the
   scheduled sweep has failed every run since 2026-09-09. `--reap-owned`'s age rule (#241)
   reaches any owned service older than 48h, and a canary is owned and meant to live for
