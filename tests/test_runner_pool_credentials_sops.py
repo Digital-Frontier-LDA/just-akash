@@ -7,6 +7,9 @@ secret must still win, and the pool's own rollback must read the same file: othe
 failed provision is the one lease nothing can close.
 """
 
+import json
+import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -49,12 +52,20 @@ def test_decrypt_precedes_the_pat_preflight_in_one_step_with_no_checkout_or_loca
     }
 
 
-def _run(tmp_path, *, plain, age_key="AGE-SECRET-KEY-1STUB", gh_rc=0, sum_rc=0):
-    """Execute the real step script with stub curl, sha256sum, gh and sops on PATH."""
+def _run(tmp_path, *, plain, age_key="AGE-SECRET-KEY-1STUB", gh_rc=0, sum_rc=0, raw=None):
+    """Execute the real step script with stub curl, sha256sum, gh and sops on PATH.
+
+    `plain` is the decrypted file as sops --output-type json prints it: a dict, or a
+    dotenv string split on the first `=` per line for brevity.
+    """
     bindir = tmp_path / "bin"
     bindir.mkdir()
     log = tmp_path / "calls.txt"
-    (tmp_path / "plain.env").write_text(plain)
+    if isinstance(plain, str):
+        plain = dict(line.split("=", 1) for line in plain.splitlines() if line)
+    (tmp_path / "plain.json").write_text(json.dumps(plain) if raw is None else raw)
+    # The step reads the decrypted JSON with jq, which the hosted runner image ships.
+    (bindir / "jq").symlink_to(shutil.which("jq"))
     stubs = {
         # curl writes a fake sops binary that prints the plaintext fixture.
         "curl": (
@@ -62,7 +73,7 @@ def _run(tmp_path, *, plain, age_key="AGE-SECRET-KEY-1STUB", gh_rc=0, sum_rc=0):
             '[ "$prev" = "--output" ] && out="$a"; prev="$a"; done\n'
             "printf '#!/bin/bash\\n"
             f'echo "sops key=${{SOPS_AGE_KEY:-}} $*" >> {log}\\n'
-            f'cat {tmp_path}/plain.env\\n\' > "$out"\n'
+            f'cat {tmp_path}/plain.json\\n\' > "$out"\n'
         ),
         "sha256sum": f'echo "sha256sum $*" >> {log}; exit {sum_rc}\n',
         "gh": f'echo "gh $*" >> {log}; echo ciphertext; exit {gh_rc}\n',
@@ -91,7 +102,10 @@ def _exported_keys(exported):
 def test_only_the_three_credentials_are_exported_each_masked_first(tmp_path):
     proc, exported, calls = _run(
         tmp_path,
-        plain="AKASH_API_KEY=ak-1\nGH_RUNNER_PAT=ghp-2\nUNRELATED=keep-out\nAKASH_API_KEYS=k3\n",
+        plain=(
+            "AKASH_API_KEY=ak-1\nGH_RUNNER_PAT=ghp-2\n"  # pragma: allowlist secret
+            "UNRELATED=keep-out\nAKASH_API_KEYS=k3\n"  # pragma: allowlist secret
+        ),
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert _exported_keys(exported) == ["AKASH_API_KEY", "GH_RUNNER_PAT", "AKASH_API_KEYS"]
@@ -106,6 +120,36 @@ def test_only_the_three_credentials_are_exported_each_masked_first(tmp_path):
     assert "sha256sum --check" in calls
     # The age key reaches sops, and only through the one call.
     assert "sops key=AGE-SECRET-KEY-1STUB --decrypt" in calls
+    # JSON, not dotenv: sops' dotenv output escapes a newline as a literal backslash-n.
+    assert "--input-type dotenv --output-type json" in calls
+
+
+def _exported_value(exported, key):
+    _, rest = exported.split(f"{key}<<", 1)
+    delim, rest = rest.split("\n", 1)
+    return rest.split(f"\n{delim}\n", 1)[0]
+
+
+@pytest.mark.parametrize("sep", ["\n", ",", ";", "\n\n", " , "])
+def test_a_multi_key_wallet_pool_reaches_the_pool_as_separate_keys(tmp_path, sep):
+    keys = ["wallet-key-one", "wallet-key-two", "wallet-key-three"]
+    proc, exported, _ = _run(tmp_path, plain={"AKASH_API_KEYS": sep.join(keys)})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    value = _exported_value(exported, "AKASH_API_KEYS")
+    assert "\\n" not in value
+    # wallet_pool.configured_api_keys() splits exactly this way.
+    assert [p.strip() for p in re.split(r"[\n,;]", value) if p.strip()] == keys
+    for key in keys:
+        # Each piece is masked on its own, and appears nowhere else on stdout: a raw
+        # multi-line value in one ::add-mask:: would print its second line unmasked.
+        assert f"::add-mask::{key}\n" in proc.stdout
+        assert proc.stdout.count(key) == 1
+
+
+def test_an_undecodable_decrypt_fails_the_step_not_the_credential_check(tmp_path):
+    proc, exported, _ = _run(tmp_path, plain={}, raw="not json\n")
+    assert proc.returncode != 0
+    assert "holds none of" not in proc.stdout
 
 
 @pytest.mark.parametrize("age_key", ["", "   "])

@@ -580,23 +580,33 @@ jobs:
             echo "::error title=credentials-sops::${CALLER}@${CALLER_SHA} has no readable secrets/akash-runner.sops.env."
             exit 1
           fi
-          # Decrypt to a private file, never to stdout.
-          SOPS_AGE_KEY="$CREDENTIALS_AGE_KEY" "$work/sops" --decrypt --input-type dotenv --output-type dotenv \
-            "$work/akash-runner.sops.env" > "$work/plain"
+          # Decrypt to a private file, never to stdout. JSON, not dotenv: sops' dotenv output
+          # escapes a newline as a literal backslash-n, so a newline-separated AKASH_API_KEYS
+          # would reach wallet_pool.py (which splits on real newlines, commas, semicolons) as
+          # ONE broken key. JSON carries the real newline.
+          SOPS_AGE_KEY="$CREDENTIALS_AGE_KEY" "$work/sops" --decrypt --input-type dotenv --output-type json \
+            "$work/akash-runner.sops.env" > "$work/plain.json"
+          # Into a file, not `< <(jq ...)`: set -e does not see a process substitution fail.
+          jq -r 'keys_unsorted[]' "$work/plain.json" > "$work/keys"
           loaded=0
-          while IFS= read -r line || [ -n "$line" ]; do
-            key=${line%%=*}
-            val=${line#*=}
+          while IFS= read -r key; do
             case "$key" in
               AKASH_API_KEY|AKASH_API_KEYS|GH_RUNNER_PAT) ;;
               *) continue ;;
             esac
-            [ -n "$val" ] || continue
-            echo "::add-mask::$val"
+            jq -j --arg k "$key" '.[$k]' "$work/plain.json" > "$work/value"
+            [ -s "$work/value" ] || continue
+            # Mask every piece the pool can split out (newline, comma, semicolon), never the
+            # raw value: a multi-line value in one ::add-mask:: would print its second line.
+            tr ',;' '\n\n' < "$work/value" | while IFS= read -r piece || [ -n "$piece" ]; do
+              piece="${piece#"${piece%%[![:space:]]*}"}"
+              piece="${piece%"${piece##*[![:space:]]}"}"
+              [ -z "$piece" ] || echo "::add-mask::$piece"
+            done
             delim="CREDENTIALS_$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
-            printf '%s<<%s\n%s\n%s\n' "$key" "$delim" "$val" "$delim" >> "$GITHUB_ENV"
+            { printf '%s<<%s\n' "$key" "$delim"; cat "$work/value"; printf '\n%s\n' "$delim"; } >> "$GITHUB_ENV"
             loaded=$((loaded + 1))
-          done < "$work/plain"
+          done < "$work/keys"
           if [ "$loaded" -eq 0 ]; then
             echo "::error title=credentials-sops::secrets/akash-runner.sops.env holds none of AKASH_API_KEY, AKASH_API_KEYS, GH_RUNNER_PAT."
             exit 1
