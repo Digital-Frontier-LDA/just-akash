@@ -68,6 +68,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- `runner-pool.yml` declares `GH_RUNNER_PAT` optional (df-grafana-2tr). #481's `credentials-sops`
+  supplies it from the caller's SOPS file, but the secret was still `required: true`, so a
+  SOPS-only caller (which may not reference it) could only call the pool by omitting a required
+  secret: a startup failure with zero jobs. The PAT preflight already refuses an empty token from
+  either source (`RUNNER_PAT_MISSING`) before any lease; a test now executes that refusal.
+
 - `.github/actions/sops-env` decrypts to JSON instead of dotenv (df-grafana-3nk). sops' dotenv
   output escapes a newline as a literal `\n`, so a newline-separated `AKASH_API_KEYS` reached
   `runner-teardown.yml`'s `credentials-sops` (and any other reader) as one broken key. Every
