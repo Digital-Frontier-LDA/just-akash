@@ -8,15 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Security
+
+- Runner pool, provider probe and native reader move to `df-akash-runner@sha256:e71bf4be…`, rebuilt for the eMudhra/emSign intermediate-CA compromise (CVE-2026-111943; df-cicd-rpi.1). Pool and probe move together, so providers stay qualified against the image the pool runs. The native reader moves with them, because the public BB template requires the pool image to carry its digest. The separate BB ce1 profile is unchanged.
+
 ### Added
 
-- `credentials-sops` for `runner-pool.yml` and `runner-teardown.yml` (#472): with it set and
-  `CREDENTIALS_AGE_KEY` passed, both read `AKASH_API_KEY`, `AKASH_API_KEYS` and `GH_RUNNER_PAT`
-  from the caller's `secrets/akash-runner.sops.env` (teardown through `.github/actions/sops-env`,
-  the pool in one step with the checksum-pinned SOPS, exporting only those three names), so a
-  caller under a SOPS-only secrets rule passes only its age key. A directly passed secret still
-  wins. The pool forwards the input to its rollback teardown, whose nested pin moves to #472's
-  merge commit. Default false: existing callers are unchanged.
+- `credentials-sops` for `runner-pool.yml` (df-grafana-2tr; teardown got it in #472): with it
+  set and `CREDENTIALS_AGE_KEY` passed, the pool reads `AKASH_API_KEY`, `AKASH_API_KEYS` and
+  `GH_RUNNER_PAT` from the caller's `secrets/akash-runner.sops.env` in one step with the
+  checksum-pinned SOPS, exporting only those three names, so a caller under a SOPS-only secrets
+  rule passes only its age key. A directly passed secret still wins. The pool forwards the input
+  and key to its rollback teardown (already pinned to #472's merge commit by #474). Default
+  false: existing callers are unchanged.
 - Lease charters for placements Flynn counts as ours (`flynn-*`, `fleet-*`, exactly
   `dcloud`/`akash`; openmix-pvr6.1). `deploy --charter FILE.json` (or
   `JUST_AKASH_CHARTER_JSON`) POSTs the charter to Flynn before the credit probe and refuses
@@ -62,6 +66,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- `cleanup_stale` judged the three live persistent canaries `STALE-owned`, and the
+  scheduled sweep has failed every run since 2026-09-09. `--reap-owned`'s age rule (#241)
+  reaches any owned service older than 48h, and a canary is owned and meant to live for
+  weeks, against `sdl/canary.yaml`'s "matches no stale rule". The only thing stopping a
+  close was the identity policy holding their legacy group names. That hold made each dry
+  run exit 2 while reporting `stale (closable): 0`. A canary stamped with a closable CI
+  identity would not have been held, and `--execute` would have closed it. Service set
+  exactly `{canary}` is now `LEAVE-canary`, ahead of every age and ownership test, with no
+  provenance read. Orphaned canaries stay a human close decision (#386).
 - The bid probe's chain cross-check could not confirm a no-bid, so every no-bid since
   2026-08-30 was `no-bid-unverified` (a skip) and the autobidder's `bidprobe-nobid` page
   could not fire. Two causes, each enough on its own: the owner filter was read from the

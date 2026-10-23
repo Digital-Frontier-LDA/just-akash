@@ -1139,7 +1139,7 @@ jobs:
               # means the pool trusts a measurement taken of something else. ':latest'
               # made that gap permanent and silent — the tag can move between the
               # qualification and the run that relies on it.
-              image: ghcr.io/digital-frontier-lda/df-akash-runner@sha256:aaf3799b5e138abef0831bb8467ded7325164316f0cfde5c183fe6e129eae79e
+              image: ghcr.io/digital-frontier-lda/df-akash-runner@sha256:e71bf4be0e3a59a57ff791b0fc3bc3a31f216f66807b6ac41f1a23346321baa4
               env:
                 - RUNNER_TOKEN=@@RUNNER_TOKEN@@
                 - ORG_NAME=${ORG}
@@ -1324,7 +1324,7 @@ jobs:
           RUNNER_NATIVE_PULL_READER: ${{ inputs.runner-native-pull-reader }}
           RUNNER_NATIVE_REPOSITORY_SCOPE: ${{ inputs.runner-native-repository-scope }}
           NATIVE_READER_CALLER: ${{ github.repository }}
-          GH_TOKEN: ${{ inputs.runner-native-pull-reader && secrets.GH_RUNNER_PAT || '' }}
+          GH_TOKEN: ${{ inputs.runner-native-pull-reader && (secrets.GH_RUNNER_PAT || env.GH_RUNNER_PAT) || '' }}
           NATIVE_READER_RUN_ID: ${{ github.run_id }}
           NATIVE_READER_RUN_ATTEMPT: ${{ github.run_attempt }}
           NATIVE_READER_SOURCE: ${{ inputs.just-akash-repository }}

@@ -48,7 +48,18 @@ def _time_mock():
     return advance
 
 
+#: The backup tier the last _setup named. The backup tier is EXPLICIT ONLY (deploy no longer
+#: reads AKASH_PROVIDERS_BACKUP), so _deploy passes it as backup_providers, as a caller must.
+_BACKUP: list | None = None
+
+
+def _deploy(**kw):
+    return deploy(**kw, backup_providers=_BACKUP)
+
+
 def _setup(MockAPI, mock_time, tmp_path, monkeypatch, providers=None, backup=None):
+    global _BACKUP
+    _BACKUP = [b.strip() for b in backup.split(",") if b.strip()] if backup else None
     monkeypatch.setenv("AKASH_API_KEY", "test-key")
     if providers is None:
         monkeypatch.delenv("AKASH_PROVIDERS", raising=False)
@@ -112,7 +123,7 @@ class TestSelectionSkipsStaleBids:
             _make_bid("akash1live", 50),
         ]
 
-        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+        result = _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
         assert result["provider"] == "akash1live"
 
     @patch("just_akash.deploy.time")
@@ -134,7 +145,7 @@ class TestSelectionSkipsStaleBids:
         # The bid is from an ALLOWED provider, just stale — the failure must say
         # "none are still open", not misattribute it to non-allowed providers.
         with pytest.raises(RuntimeError, match="none are still open") as exc:
-            deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+            _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
         assert "NONE from our providers" not in str(exc.value)
         client.create_lease.assert_not_called()
 
@@ -149,7 +160,7 @@ class TestSelectionSkipsStaleBids:
         ]
 
         with pytest.raises(RuntimeError, match="none are still open") as exc:
-            deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+            _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
         assert "NONE from our providers" not in str(exc.value)
         client.create_lease.assert_not_called()
 
@@ -172,7 +183,7 @@ class TestBoundedTwoWindowSelection:
         )
         client.get_bids.return_value = [_make_bid("akash1back", 20)]
 
-        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=125)
+        result = _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=125)
         assert result["provider"] == "akash1back"
         out = capsys.readouterr().out
         assert "Cutting preferred-grace short" not in out
@@ -198,7 +209,7 @@ class TestBoundedTwoWindowSelection:
         client.get_bids.return_value = [_make_bid("akash1foreign", 20)]
 
         with pytest.raises(RuntimeError):
-            deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=30)
+            _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=30)
         out = capsys.readouterr().out
         assert "Cutting preferred-grace short" not in out
 
@@ -222,7 +233,7 @@ class TestLeaseStaleRetry:
         ]
         client.create_lease.side_effect = [self.STALE_ERR, {"lease": "ok"}]
 
-        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+        result = _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
         assert result["provider"] == "akash1b"
         assert client.create_lease.call_count == 2
         client.close_deployment.assert_not_called()
@@ -244,7 +255,7 @@ class TestLeaseStaleRetry:
         client.create_lease.side_effect = self.STALE_ERR
 
         with pytest.raises(RuntimeError, match="Failed to create lease"):
-            deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+            _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
         # 1 lease attempt on the original order + 1 on the re-created order.
         assert client.create_lease.call_count == 2
         # Closed twice: the stale order (111) at re-deploy, the new order (222)
@@ -267,7 +278,7 @@ class TestLeaseStaleRetry:
         client.get_bids.return_value = [_make_bid("akash1a", 10)]
         client.create_lease.side_effect = [self.STALE_ERR, {"lease": "ok"}]
 
-        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+        result = _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
 
         assert result["dseq"] == "222"
         assert result["provider"] == "akash1a"
@@ -297,7 +308,7 @@ class TestLeaseStaleRetry:
             {"lease": "ok"},
         ]
 
-        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+        result = _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
 
         assert result["dseq"] == "222"
         assert client.create_lease.call_count == 3
@@ -317,7 +328,7 @@ class TestLeaseStaleRetry:
         client.create_lease.side_effect = RuntimeError("API Error (500): provider exploded")
 
         with pytest.raises(RuntimeError, match="Failed to create lease"):
-            deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+            _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
         assert client.create_lease.call_count == 1
         client.close_deployment.assert_called_once_with("12345")
 
@@ -335,7 +346,7 @@ class TestLeaseStaleRetry:
         client.get_bids.return_value = [_make_bid("akash1a", 10)]
         client.create_lease.side_effect = [self.STALE_ERR, {"lease": "ok"}]
 
-        deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5, deposit=12.0)
+        _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5, deposit=12.0)
 
         assert client.create_deployment.call_count == 2
         # Both the original order and the re-deploy use the same deposit.
@@ -361,7 +372,7 @@ class TestLeaseStaleRetry:
         client.create_lease.side_effect = self.STALE_ERR
 
         with pytest.raises(RuntimeError, match="no fresh open bid on re-created order 222"):
-            deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+            _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
 
         assert client.create_lease.call_count == 1  # round 2 never reached
         # Closed twice: stale order 111 at re-deploy, new order 222 on timeout.
@@ -384,7 +395,7 @@ class TestLeaseStaleRetry:
         # First close attempt flaps, second succeeds.
         client.close_deployment.side_effect = [RuntimeError("transient flap"), None]
 
-        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+        result = _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
 
         assert result["dseq"] == "222"
         assert client.create_deployment.call_count == 2  # re-deploy happened
@@ -408,7 +419,7 @@ class TestLeaseStaleRetry:
         client.close_deployment.side_effect = RuntimeError("close exploded")
 
         with pytest.raises(RuntimeError, match="just-akash destroy --dseq 111"):
-            deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+            _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
 
         # Aborted before re-deploy: only the ORIGINAL order was ever created,
         # so no second (double-funded) order exists.
@@ -436,7 +447,7 @@ class TestLeaseTransientJWTRetry:
         ]
         client.create_lease.side_effect = [self.JWT_ERR, {"lease": "ok"}]
 
-        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+        result = _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
         # Same provider on the retry — the bid was never the problem.
         assert result["provider"] == "akash1a"
         assert client.create_lease.call_count == 2
@@ -450,7 +461,7 @@ class TestLeaseTransientJWTRetry:
         client.create_lease.side_effect = self.JWT_ERR
 
         with pytest.raises(RuntimeError, match="Failed to create lease"):
-            deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+            _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
         # 3 attempts, all on the same (only) provider, then cleanup.
         assert client.create_lease.call_count == 3
         client.close_deployment.assert_called_once_with("12345")
@@ -484,7 +495,7 @@ class TestLeaseTransientJWTRetry:
         )
         client.create_lease.side_effect = [stale_err, {"lease": "ok"}]
 
-        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+        result = _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
 
         assert result["dseq"] == "222"
         assert result["provider"] == "akash1back"  # backup tier selected post-redeploy
@@ -511,7 +522,7 @@ class TestLeaseNoOrder404Retry:
         client.get_bids.return_value = [_make_bid("akash1a", 10)]
         client.create_lease.side_effect = [self.NO_ORDER_ERR, {"lease": "ok"}]
 
-        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+        result = _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
 
         assert result["dseq"] == "222"
         assert result["provider"] == "akash1a"
@@ -538,7 +549,7 @@ class TestLeaseNoOrder404Retry:
         client.get_bids.return_value = [_make_bid("akash1a", 10)]
         client.create_lease.side_effect = [self.NO_ORDER_ERR, {"lease": "ok"}]
 
-        deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+        _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
         out = capsys.readouterr().out
         # The stale-bid same-order re-fetch was NOT taken:
         assert "re-fetching open bids" not in out
@@ -561,7 +572,7 @@ class TestLeaseNoOrder404Retry:
         client.create_lease.side_effect = self.NO_ORDER_ERR  # always 404
 
         with pytest.raises(RuntimeError, match="Failed to create lease"):
-            deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+            _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
         assert client.create_lease.call_count == 2  # one attempt per order
         assert client.close_deployment.call_count == 2  # both orders torn down
 
@@ -607,7 +618,7 @@ class TestRedeployProviderDiversification:
         client.get_bids.return_value = [_make_bid("akash1bad", 10), _make_bid("akash1good", 50)]
         client.create_lease.side_effect = [self.NO_ORDER_ERR, {"lease": "ok"}]
 
-        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+        result = _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
 
         assert result["dseq"] == "222"
         assert result["provider"] == "akash1good"  # NOT the cheapest — the one that works
@@ -626,7 +637,7 @@ class TestRedeployProviderDiversification:
         client.get_bids.return_value = [_make_bid("akash1a", 10)]
         client.create_lease.side_effect = [self.NO_ORDER_ERR, {"lease": "ok"}]
 
-        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+        result = _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
 
         assert result["dseq"] == "222"
         assert result["provider"] == "akash1a"  # leased anyway — soft, not a ban
@@ -651,7 +662,7 @@ class TestRedeployProviderDiversification:
         client.get_bids.return_value = [_make_bid("akash1a", 10)]
         client.create_lease.side_effect = [self.NO_ORDER_ERR, {"lease": "ok"}]
 
-        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+        result = _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
 
         assert result["dseq"] == "222"
         assert result["provider"] == "akash1a"  # leased, not banned by a bad window
@@ -684,7 +695,7 @@ class TestRedeployProviderDiversification:
             {"lease": "ok"},
         ]
 
-        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+        result = _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
 
         assert result["provider"] == "akash1pref"  # tier beats price, as everywhere else
 
@@ -707,7 +718,7 @@ class TestRedeployProviderDiversification:
         client.get_bids.return_value = [_make_bid("akash1pref", 5), _make_bid("akash1back", 90)]
         client.create_lease.side_effect = [self.NO_ORDER_ERR, {"lease": "ok"}]
 
-        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+        result = _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
 
         assert result["provider"] == "akash1back"  # not-just-failed beats tier AND price
 
@@ -738,7 +749,7 @@ class TestRedeployProviderDiversification:
         client.get_bids.side_effect = _bids
         client.create_lease.side_effect = [self.NO_ORDER_ERR, {"lease": "ok"}]
 
-        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+        result = _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
 
         assert seen["n"] > 1  # the flap really did happen after the good poll
         assert result["provider"] == "akash1a"
@@ -758,7 +769,7 @@ class TestRedeployProviderDiversification:
         client.get_bids.return_value = [_make_bid("akash1pref", 10), _make_bid("akash1back", 50)]
         client.create_lease.side_effect = [self.NO_ORDER_ERR, {"lease": "ok"}]
 
-        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+        result = _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
 
         assert result["provider"] == "akash1back"
 
@@ -776,7 +787,7 @@ class TestRedeployProviderDiversification:
         client.get_bids.return_value = [_make_bid("akash1bad", 10), _make_bid("akash1good", 50)]
         client.create_lease.side_effect = [self.NO_ORDER_ERR, {"lease": "ok"}]
 
-        deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+        _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
         out = capsys.readouterr().out
         assert "Preferring a provider other than akash1bad" in out
         assert "still leasable if nothing else bids" in out
@@ -816,7 +827,7 @@ class TestRedeployProviderDiversification:
         client.get_bids.side_effect = _bids
         client.create_lease.side_effect = _lease
 
-        result = deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+        result = _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
 
         assert result["dseq"] == "222"
         assert result["provider"] == "akash1a"  # cheapest, NOT skipped

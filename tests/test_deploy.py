@@ -769,7 +769,12 @@ class TestPhase3BackupFallback:
         mock_time.time.side_effect = t
         mock_time.sleep.return_value = None
 
-        result = deploy(sdl_path=str(sdl_file), bid_wait=10, bid_wait_retry=10)
+        result = deploy(
+            sdl_path=str(sdl_file),
+            bid_wait=10,
+            bid_wait_retry=10,
+            backup_providers=["akash1back1", "akash1back2"],
+        )
         assert result["provider"] == "akash1back1"
         assert result["price"] == 120.0
 
@@ -1389,7 +1394,7 @@ class TestBackupOnlyAllowlistAcceptsBackupBid:
     ):
         monkeypatch.setenv("AKASH_API_KEY", "test-key")
         monkeypatch.delenv("AKASH_PROVIDERS", raising=False)
-        monkeypatch.setenv("AKASH_PROVIDERS_BACKUP", "akash1back")
+        monkeypatch.delenv("AKASH_PROVIDERS_BACKUP", raising=False)
         sdl_file = tmp_path / "sdl.yaml"
         sdl_file.write_text(SDL_YAML)
 
@@ -1402,7 +1407,12 @@ class TestBackupOnlyAllowlistAcceptsBackupBid:
         mock_time.time.side_effect = t
         mock_time.sleep.return_value = None
 
-        result = deploy(sdl_path=str(sdl_file), bid_wait=10, bid_wait_retry=10)
+        result = deploy(
+            sdl_path=str(sdl_file),
+            bid_wait=10,
+            bid_wait_retry=10,
+            backup_providers=["akash1back"],  # explicit: the env backup tier is not read
+        )
         # Backup wins via phase-3 fallback even with no preferred configured.
         assert result["provider"] == "akash1back"
         assert result["price"] == 75.0
@@ -1578,12 +1588,12 @@ class TestTiedPriceAcrossTiers:
 
 
 class TestPreferredOnlyCliOverrideBackupFromEnv:
-    """CLI overrides one tier; the OTHER tier must still resolve from env.
-    The complementary case to `test_backup_arg_overrides_env`: here we pass
-    `preferred_providers=["akash1cli_pref"]` while leaving
-    `backup_providers=None`, with AKASH_PROVIDERS_BACKUP set in env. The
-    backup tier must come from env, and the env's AKASH_PROVIDERS must NOT
-    bleed into the CLI-resolved preferred list."""
+    """CLI overrides the preferred tier; the backup tier is EXPLICIT ONLY.
+    `preferred_providers=["akash1cli_pref"]` with `backup_providers=None` and
+    AKASH_PROVIDERS_BACKUP set in env: the env's AKASH_PROVIDERS must NOT bleed into
+    the CLI-resolved preferred list, and the env backup is NOT consulted any more
+    (an inherited backup tier is how deploys landed on providers nobody chose).
+    So both bids are FOREIGN and the deploy refuses rather than lease either."""
 
     @patch("just_akash.deploy.time")
     @patch("just_akash.deploy.AkashConsoleAPI")
@@ -1611,17 +1621,18 @@ class TestPreferredOnlyCliOverrideBackupFromEnv:
         mock_time.time.side_effect = t
         mock_time.sleep.return_value = None
 
-        result = deploy(
-            sdl_path=str(sdl_file),
-            bid_wait=10,
-            bid_wait_retry=10,
-            preferred_providers=["akash1cli_pref"],
-            # backup_providers=None → falls through to AKASH_PROVIDERS_BACKUP env
-        )
-        # If env preferred bled into CLI (bug), akash1env_pref @ 10 would win
-        # via phase 1. Correct: backup fallback selects env backup at 60.
-        assert result["provider"] == "akash1env_back"
-        assert result["price"] == 60.0
+        with pytest.raises(RuntimeError) as err:
+            deploy(
+                sdl_path=str(sdl_file),
+                bid_wait=10,
+                bid_wait_retry=10,
+                preferred_providers=["akash1cli_pref"],
+                # backup_providers=None → NO backup tier; the env one is ignored
+            )
+        # If env preferred bled into CLI (bug), akash1env_pref @ 10 would win via
+        # phase 1; if the env backup were still read, akash1env_back @ 60 would.
+        assert "akash1env_pref" in str(err.value) and "akash1env_back" in str(err.value)
+        client.create_lease.assert_not_called()
 
 
 class TestSelectedBidIdentityMarkerInRankingLog:

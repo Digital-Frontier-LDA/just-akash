@@ -144,6 +144,13 @@ def test_preflight_and_provision_fall_back_to_the_sops_value_and_a_direct_secret
     assert env["AKASH_API_KEY"] == "${{ secrets.AKASH_API_KEY || env.AKASH_API_KEY }}"
     assert env["AKASH_API_KEYS"] == "${{ secrets.AKASH_API_KEYS || env.AKASH_API_KEYS }}"
     assert env["GH_TOKEN"] == "${{ secrets.GH_RUNNER_PAT || env.GH_RUNNER_PAT }}"
+    # The native-reader decrypt step (#427) reads the same PAT; a SOPS caller must reach it too.
+    reader = next(
+        s for s in pool()["jobs"]["pool"]["steps"] if s.get("name", "").endswith("mirror from SOPS")
+    )
+    assert reader["env"]["GH_TOKEN"] == (
+        "${{ inputs.runner-native-pull-reader && (secrets.GH_RUNNER_PAT || env.GH_RUNNER_PAT) || '' }}"
+    )
 
 
 def test_the_rollback_teardown_reads_the_same_caller_file():
