@@ -956,7 +956,7 @@ jobs:
           install -m 0755 "$task_dir/sops" "$RUNNER_TEMP/runner-pull-bin/sops"
           printf '%s\n' "$RUNNER_TEMP/runner-pull-bin" >> "$GITHUB_PATH"
 
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       # runner_deny removed, proven hosts first. NOT continue-on-error: a malformed
       # spec must not fall through to defaults and silently re-select a provider the
