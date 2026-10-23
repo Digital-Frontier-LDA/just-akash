@@ -20,12 +20,17 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        if command -v sops >/dev/null 2>&1; then exit 0; fi
+        # Always this exact, checksum-verified binary: it receives the age key. No
+        # "already on PATH" shortcut, which would trust whatever sops the image carries.
+        # Same pin as runner-pool.yml's own SOPS steps.
         VERSION=3.13.1
-        curl -sSfL -o /tmp/sops \
+        SHA256=620a9d7e3352ababeca6908cea24a6e8b14ce89a448ddbd3f94f1ef3398f470a
+        DL=$(mktemp -d)
+        trap 'rm -rf "$DL"' EXIT
+        curl -sSfL -o "$DL/sops" \
           "https://github.com/getsops/sops/releases/download/v${VERSION}/sops-v${VERSION}.linux.amd64"
-        sudo install -m 0755 /tmp/sops /usr/local/bin/sops
-        rm -f /tmp/sops
+        echo "${SHA256}  $DL/sops" | sha256sum --check --quiet
+        sudo install -m 0755 "$DL/sops" /usr/local/bin/sops
         sops --version
 
     - name: Decrypt and export

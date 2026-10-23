@@ -65,8 +65,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   line of a value is now masked on its own (a single `::add-mask::` printed a multi-line
   value's second line), wallet keys are masked one by one, the heredoc delimiter is random (a
   value line equal to the old fixed `__SOPS_EOF__` could inject variables), and a jq failure
-  fails the step. Teardown callers get it through `just-akash-ref`; the pool's native-reader
-  literal moves in a follow-up repin.
+  fails the step. Its sops is now always the checksum-pinned 3.13.1 (`620a9d7e…`, as in
+  `runner-pool.yml`), never whatever `sops` is already on PATH. Teardown callers get it
+  through `just-akash-ref`; the pool's native-reader literal moves in a follow-up repin.
 
 - `cleanup_stale` judged the three live persistent canaries `STALE-owned`, and the
   scheduled sweep has failed every run since 2026-09-09. `--reap-owned`'s age rule (#241)

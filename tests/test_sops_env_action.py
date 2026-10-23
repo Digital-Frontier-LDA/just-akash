@@ -23,6 +23,14 @@ def _script():
     return next(s for s in action["runs"]["steps"] if s["name"] == "Decrypt and export")["run"]
 
 
+def test_sops_is_the_checksum_pinned_binary_never_whatever_is_on_path():
+    action = yaml.safe_load((ROOT / ".github/actions/sops-env/action.yml").read_text())
+    install = next(s for s in action["runs"]["steps"] if s["name"] == "Install sops")["run"]
+    assert "command -v sops" not in install
+    assert "SHA256=620a9d7e3352ababeca6908cea24a6e8b14ce89a448ddbd3f94f1ef3398f470a" in install
+    assert install.index("sha256sum --check") < install.index("sudo install")
+
+
 def _run(tmp_path, plain, *, age_key="AGE-SECRET-KEY-1STUB", raw=None):
     """Execute the real step with a stub sops that prints `plain` as its JSON output."""
     bindir = tmp_path / "bin"
@@ -65,7 +73,7 @@ def _exported(exported):
 
 def test_decrypts_dotenv_to_json_and_exports_every_value_unchanged(tmp_path):
     plain = {
-        "AKASH_API_KEY": "ak-single",
+        "AKASH_API_KEY": "ak-single",  # pragma: allowlist secret
         "SSH_PUBKEY": "ssh-ed25519 AAAAC3Nza fixture@ci",
         "AKASH_PROVIDERS": "akash1aaa,akash1bbb",
     }
