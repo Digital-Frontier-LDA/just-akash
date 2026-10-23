@@ -28,9 +28,7 @@ def test_opt_in_and_only_the_age_key_is_added():
 
 
 def _step():
-    return next(
-        s for s in pool()["jobs"]["pool"]["steps"] if s.get("id") == "credentials_sops"
-    )
+    return next(s for s in pool()["jobs"]["pool"]["steps"] if s.get("id") == "credentials_sops")
 
 
 def test_decrypt_precedes_the_pat_preflight_in_one_step_with_no_checkout_or_local_action():
@@ -60,8 +58,11 @@ def _run(tmp_path, *, plain, age_key="AGE-SECRET-KEY-1STUB", gh_rc=0, sum_rc=0):
     stubs = {
         # curl writes a fake sops binary that prints the plaintext fixture.
         "curl": (
-            'out=""; prev=""; for a in "$@"; do [ "$prev" = "--output" ] && out="$a"; prev="$a"; done\n'
-            f'printf \'#!/bin/bash\\necho "sops key=${{SOPS_AGE_KEY:-}} $*" >> {log}\\ncat {tmp_path}/plain.env\\n\' > "$out"\n'
+            'out=""; prev=""; for a in "$@"; do '
+            '[ "$prev" = "--output" ] && out="$a"; prev="$a"; done\n'
+            "printf '#!/bin/bash\\n"
+            f'echo "sops key=${{SOPS_AGE_KEY:-}} $*" >> {log}\\n'
+            f'cat {tmp_path}/plain.env\\n\' > "$out"\n'
         ),
         "sha256sum": f'echo "sha256sum $*" >> {log}; exit {sum_rc}\n',
         "gh": f'echo "gh $*" >> {log}; echo ciphertext; exit {gh_rc}\n',
@@ -77,9 +78,7 @@ def _run(tmp_path, *, plain, age_key="AGE-SECRET-KEY-1STUB", gh_rc=0, sum_rc=0):
         "CREDENTIALS_AGE_KEY": age_key,
         "GITHUB_ENV": str(tmp_path / "github_env"),
     }
-    proc = subprocess.run(
-        ["bash", "-c", _step()["run"]], env=env, capture_output=True, text=True
-    )
+    proc = subprocess.run(["bash", "-c", _step()["run"]], env=env, capture_output=True, text=True)
     exported = (tmp_path / "github_env").read_text() if (tmp_path / "github_env").exists() else ""
     calls = log.read_text() if log.exists() else ""
     return proc, exported, calls
@@ -146,10 +145,13 @@ def test_preflight_and_provision_fall_back_to_the_sops_value_and_a_direct_secret
     assert env["GH_TOKEN"] == "${{ secrets.GH_RUNNER_PAT || env.GH_RUNNER_PAT }}"
     # The native-reader decrypt step (#427) reads the same PAT; a SOPS caller must reach it too.
     reader = next(
-        s for s in pool()["jobs"]["pool"]["steps"] if s.get("name", "").endswith("mirror from SOPS")
+        s
+        for s in pool()["jobs"]["pool"]["steps"]
+        if s.get("name", "").endswith("mirror from SOPS")
     )
     assert reader["env"]["GH_TOKEN"] == (
-        "${{ inputs.runner-native-pull-reader && (secrets.GH_RUNNER_PAT || env.GH_RUNNER_PAT) || '' }}"
+        "${{ inputs.runner-native-pull-reader && "
+        "(secrets.GH_RUNNER_PAT || env.GH_RUNNER_PAT) || '' }}"
     )
 
 

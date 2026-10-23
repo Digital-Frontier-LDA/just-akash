@@ -449,7 +449,8 @@ def test_native_workflow_uses_only_scoped_hosted_sops_step():
     assert decrypt_step["env"]["NATIVE_READER_RUN_ATTEMPT"] == "${{ github.run_attempt }}"
     assert decrypt_step["env"]["NATIVE_READER_OWNED_PROVIDERS"] == "${{ inputs.owned-providers }}"
     assert decrypt_step["env"]["GH_TOKEN"] == (
-        "${{ inputs.runner-native-pull-reader && (secrets.GH_RUNNER_PAT || env.GH_RUNNER_PAT) || '' }}"
+        "${{ inputs.runner-native-pull-reader && "
+        "(secrets.GH_RUNNER_PAT || env.GH_RUNNER_PAT) || '' }}"
     )
     assert (
         "SOPS_AGE_KEY" not in next(s for s in pool["steps"] if s.get("id") == "provision")["env"]
