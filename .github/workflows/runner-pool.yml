@@ -356,8 +356,14 @@ on:
           pool for the account that owns the DSEQ, so key order and balance changes cannot
           redirect a close. Empty or unset preserves single-key behaviour.
       GH_RUNNER_PAT:
-        required: true
-        description: 'Registers runners into the org and polls their status.'
+        # Optional at the call boundary, not in fact: a credentials-sops caller (DF-LDA,
+        # secrets-only-sops) cannot pass it, and a reusable called without a REQUIRED secret
+        # never starts (startup_failure, zero jobs). The PAT preflight refuses an empty token
+        # by name (RUNNER_PAT_MISSING) before any lease, whichever source it came from.
+        required: false
+        description: >-
+          Registers runners into the org and polls their status. Required unless
+          credentials-sops supplies it from the caller's secrets/akash-runner.sops.env.
       RUNNER_REGISTRY_PASSWORD:
         required: false
         description: 'Read-only registry pull token or base64 service-account key. Never pass the org runner PAT.'

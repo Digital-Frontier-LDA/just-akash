@@ -28,6 +28,29 @@ def test_opt_in_and_only_the_age_key_is_added():
     assert call["inputs"]["credentials-sops"]["type"] == "boolean"
     assert call["inputs"]["credentials-sops"]["default"] is False
     assert call["secrets"]["CREDENTIALS_AGE_KEY"]["required"] is False
+    # A credentials-sops caller passes none of these; a REQUIRED one would make every such
+    # call a startup_failure with zero jobs. The preflight enforces the PAT instead.
+    for name in ("AKASH_API_KEY", "AKASH_API_KEYS", "GH_RUNNER_PAT"):
+        assert call["secrets"][name]["required"] is False, name
+
+
+def test_a_missing_pat_from_either_source_refuses_before_any_lease(tmp_path):
+    steps = pool()["jobs"]["pool"]["steps"]
+    preflight = next(s for s in steps if s.get("id") == "pat")
+    assert preflight["env"]["GH_TOKEN"] == "${{ secrets.GH_RUNNER_PAT || env.GH_RUNNER_PAT }}"
+    out = tmp_path / "out"
+    proc = subprocess.run(
+        ["bash", "-c", preflight["run"]],
+        env={"PATH": "/usr/bin:/bin", "GH_TOKEN": "", "GITHUB_OUTPUT": str(out)},
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0
+    assert "failure_reason=RUNNER_PAT_MISSING" in out.read_text()
+    assert "GH_RUNNER_PAT is not set" in proc.stdout
+    # The preflight precedes every step that could lease.
+    ids = [s.get("id") for s in steps]
+    assert ids.index("pat") < ids.index("provision")
 
 
 def _step():
