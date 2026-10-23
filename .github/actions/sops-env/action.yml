@@ -20,12 +20,17 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        if command -v sops >/dev/null 2>&1; then exit 0; fi
+        # Always this exact, checksum-verified binary: it receives the age key. No
+        # "already on PATH" shortcut, which would trust whatever sops the image carries.
+        # Same pin as runner-pool.yml's own SOPS steps.
         VERSION=3.13.1
-        curl -sSfL -o /tmp/sops \
+        SHA256=620a9d7e3352ababeca6908cea24a6e8b14ce89a448ddbd3f94f1ef3398f470a
+        DL=$(mktemp -d)
+        trap 'rm -rf "$DL"' EXIT
+        curl -sSfL -o "$DL/sops" \
           "https://github.com/getsops/sops/releases/download/v${VERSION}/sops-v${VERSION}.linux.amd64"
-        sudo install -m 0755 /tmp/sops /usr/local/bin/sops
-        rm -f /tmp/sops
+        echo "${SHA256}  $DL/sops" | sha256sum --check --quiet
+        sudo install -m 0755 "$DL/sops" /usr/local/bin/sops
         sops --version
 
     - name: Decrypt and export
@@ -41,25 +46,33 @@ runs:
         fi
         # Decrypt to a private tmpfile, never to stdout: a decrypted value echoed
         # into the log would defeat the whole point of encrypting it at rest.
+        # JSON, not dotenv: sops' dotenv output escapes a newline as a literal
+        # backslash-n, so a multi-line value (a newline-separated AKASH_API_KEYS
+        # wallet list) would reach its reader as ONE broken value.
         umask 077
-        PLAIN=$(mktemp)
-        trap 'rm -f "$PLAIN"' EXIT
-        sops -d "$SOPS_FILE" > "$PLAIN"
-
-        # Mask every value BEFORE exporting, so any later accidental echo is
-        # redacted by the runner, then append to $GITHUB_ENV.
-        while IFS= read -r line; do
-          case "$line" in ''|\#*) continue ;; esac
-          key=${line%%=*}
-          val=${line#*=}
-          [ -z "$key" ] && continue
-          echo "::add-mask::$val"
-          # Multi-line-safe heredoc form (SSH_PUBKEY can carry newlines).
-          {
-            echo "$key<<__SOPS_EOF__"
-            echo "$val"
-            echo "__SOPS_EOF__"
-          } >> "$GITHUB_ENV"
-        done < "$PLAIN"
-
-        echo "Loaded $(grep -cE '^[A-Za-z_][A-Za-z_0-9]*=' "$PLAIN") secret(s) from ${SOPS_FILE}"
+        WORK=$(mktemp -d)
+        trap 'rm -rf "$WORK"' EXIT
+        sops --decrypt --input-type dotenv --output-type json "$SOPS_FILE" > "$WORK/plain.json"
+        # Into a file, not `< <(jq ...)`: set -e does not see a process substitution fail.
+        jq -r 'keys_unsorted[]' "$WORK/plain.json" > "$WORK/keys"
+        loaded=0
+        while IFS= read -r key; do
+          jq -j --arg k "$key" '.[$k]' "$WORK/plain.json" > "$WORK/value"
+          # Mask every line BEFORE exporting, so any later accidental echo is redacted
+          # by the runner. One ::add-mask:: per line: a multi-line value in a single
+          # command would print its second line. A wallet list is also masked per key,
+          # because a log line may print one key alone.
+          if [ "$key" = AKASH_API_KEYS ]; then
+            tr ',;' '\n\n' < "$WORK/value"
+          else
+            cat "$WORK/value"
+          fi | while IFS= read -r piece || [ -n "$piece" ]; do
+            piece="${piece#"${piece%%[![:space:]]*}"}"
+            piece="${piece%"${piece##*[![:space:]]}"}"
+            [ -z "$piece" ] || echo "::add-mask::$piece"
+          done
+          delim="SOPS_EOF_$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+          { printf '%s<<%s\n' "$key" "$delim"; cat "$WORK/value"; printf '\n%s\n' "$delim"; } >> "$GITHUB_ENV"
+          loaded=$((loaded + 1))
+        done < "$WORK/keys"
+        echo "Loaded ${loaded} secret(s) from ${SOPS_FILE}"
