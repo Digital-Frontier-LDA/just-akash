@@ -73,6 +73,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   SOPS-only caller (which may not reference it) could only call the pool by omitting a required
   secret: a startup failure with zero jobs. The PAT preflight already refuses an empty token from
   either source (`RUNNER_PAT_MISSING`) before any lease; a test now executes that refusal.
+- The pool's rollback teardown pin and its native-reader `just-akash-ref` literal move from
+  `4318e32d` to `f69f612d` (#482's merge commit; `runner-teardown.yml` is byte-identical), so a
+  native-reader rollback loads the JSON-decrypting `sops-env` action and a newline-separated
+  `AKASH_API_KEYS` reaches the teardown as separate keys (df-grafana-3nk).
 
 - `.github/actions/sops-env` decrypts to JSON instead of dotenv (df-grafana-3nk). sops' dotenv
   output escapes a newline as a literal `\n`, so a newline-separated `AKASH_API_KEYS` reached

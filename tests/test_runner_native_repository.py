@@ -66,16 +66,44 @@ def test_all_pool_api_sites_and_rollback_share_fixed_scope():
     assert '"${RUNNER_COLLECTION}?per_page=100"' in provision
     assert "verify_native_reader_admission()" in provision
     rollback = doc["jobs"]["teardown"]["with"]
-    assert doc["jobs"]["teardown"]["uses"].endswith("@4318e32d4c2c2434ad9d8f672352a9f546ff80e2")
+    assert doc["jobs"]["teardown"]["uses"].endswith("@f69f612dfe69da2df01ded082352d53f1edc28a0")
     assert rollback["just-akash-ref"] == (
         "${{ inputs.runner-native-pull-reader && '"
-        "4318e32d4c2c2434ad9d8f672352a9f546ff80e2' "  # pragma: allowlist secret
+        "f69f612dfe69da2df01ded082352d53f1edc28a0' "  # pragma: allowlist secret
         "|| inputs.just-akash-ref }}"
     )
     assert (
         rollback["github-repository"]
         == "${{ inputs.runner-native-repository-scope && 'Borduas-Holdings/blazing' || '' }}"
     )
+
+
+def test_the_native_reader_rollback_ref_carries_the_json_sops_env_action():
+    """The literal ref is where the rollback teardown loads .github/actions/sops-env from.
+
+    Before #482 that action decrypted dotenv, which escapes a newline as a literal
+    backslash-n: a newline-separated AKASH_API_KEYS reached the teardown as ONE broken key,
+    and it could not close leases held by the other wallets. Pinning a ref that predates the
+    fix keeps the bug for every native-reader rollback, so the pinned action is read and
+    checked, not just the SHA string.
+    """
+    import subprocess
+
+    from tests.test_runner_pool_workflow import _prepared_reference, _self_pins_and_root
+
+    root, pins = _self_pins_and_root()
+    _prepared_reference(root, pins)  # full history or skip off CI; never skips under CI
+    rollback = workflow("runner-pool.yml")["jobs"]["teardown"]["with"]["just-akash-ref"]
+    ref = rollback.split("'")[1]
+    action = subprocess.run(
+        ["git", "show", f"{ref}:.github/actions/sops-env/action.yml"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "--input-type dotenv --output-type json" in action
+    assert "sha256sum --check" in action
 
 
 @pytest.mark.parametrize(

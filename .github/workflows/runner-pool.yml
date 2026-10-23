@@ -2510,7 +2510,7 @@ jobs:
     # not touch runner-teardown.yml or this line skips identity with a note naming the
     # pending repin. Every self-pin must be a 40-hex SHA, never a branch or tag, and never a
     # commit that exists only on a PR branch.
-    uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@4318e32d4c2c2434ad9d8f672352a9f546ff80e2
+    uses: Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml@f69f612dfe69da2df01ded082352d53f1edc28a0
     with:
       # The last KNOWN lease always reaches teardown so it is closed and proven. An
       # ambiguous later create travels beside it as create-ambiguous: teardown closes
@@ -2541,7 +2541,7 @@ jobs:
       # ⚠ THIS REPO'S OWN CI CANNOT SEE IT. Nothing here calls runner-pool.yml as a
       # reusable, so the broken graph is only ever built in a consumer. Same blind spot
       # as the `./` defect in #248, one input along.
-      just-akash-ref: ${{ inputs.runner-native-pull-reader && '4318e32d4c2c2434ad9d8f672352a9f546ff80e2' || inputs.just-akash-ref }}  # pragma: allowlist secret
+      just-akash-ref: ${{ inputs.runner-native-pull-reader && 'f69f612dfe69da2df01ded082352d53f1edc28a0' || inputs.just-akash-ref }}  # pragma: allowlist secret
       # A SOPS-credentialed caller has no direct secrets to hand on; the rollback must read
       # the same caller file, or a failed provision is the one lease it cannot close.
       credentials-sops: ${{ inputs.credentials-sops }}
