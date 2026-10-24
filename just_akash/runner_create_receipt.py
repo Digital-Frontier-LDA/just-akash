@@ -23,6 +23,7 @@ import types
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Any, cast
 
 CONTRACT = "sentry-private-production/v1"
 REPOSITORY = "Borduas-Holdings/Blazing-Back"
@@ -270,7 +271,7 @@ def native(context, env, getter=get):
             and row["id"] == REPOSITORY_ID
             and row.get("full_name") == REPOSITORY
         )
-    references = run.get("referenced_workflows")
+    references = cast(list[dict[str, Any]], run.get("referenced_workflows"))
     require(
         type(references) is list
         and len(references) <= 100
@@ -294,11 +295,15 @@ def native(context, env, getter=get):
         and branch.get("protected") is True
         and branch.get("commit", {}).get("sha") == context["source_sha"]
     )
-    rows, total = [], None
+    rows: list[dict[str, Any]] = []
+    total = None
     for page in range(1, 100):
-        value = getter(
-            f"{base}/actions/runs/{context['run_id']}/attempts/{context['run_attempt']}/jobs?per_page=100&page={page}",
-            token,
+        value = cast(
+            dict[str, Any],
+            getter(
+                f"{base}/actions/runs/{context['run_id']}/attempts/{context['run_attempt']}/jobs?per_page=100&page={page}",
+                token,
+            ),
         )
         require(
             type(value) is dict
@@ -403,6 +408,8 @@ def journal_decoder(context, root):
         prior = sys.modules.get(module_name)
         sys.modules[module_name] = module
         try:
+            # Captured fixed public paths must match the admitted immutable SDK commit.
+            # nosemgrep: python.lang.security.audit.exec-detected.exec-detected
             exec(  # noqa: S102 - exact captured native SDK commit bytes, closed modules
                 compile(sources["just_akash/" + name + ".py"], module.__file__, "exec"),
                 module.__dict__,
@@ -420,7 +427,9 @@ def journal_decoder(context, root):
 def context_for(env):
     expected = identity(env)
     folder = directory(storage(env, expected))
-    value = document(held(folder / "source.json", RECEIPT_LIMIT, private=True))
+    value = cast(
+        dict[str, Any], document(held(folder / "source.json", RECEIPT_LIMIT, private=True))
+    )
     require(type(value) is dict and all(value.get(k) == v for k, v in expected.items()))
     require(
         type(value.get("native_job_id")) is int
@@ -546,6 +555,8 @@ def _execute_captured(sources, root, argv):
             module.__file__ = str(root / filename)
             if name == "just_akash":
                 module.__path__ = []
+            # Execute only the closed SDK modules already captured and source-authenticated.
+            # nosemgrep: python.lang.security.audit.exec-detected.exec-detected
             exec(compile(modules[name], module.__file__, "exec"), module.__dict__)  # noqa: S102
 
     old = {

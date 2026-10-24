@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Optional source-bound create-receipt artifacts for owned Sentry production callers reuse the existing deployment journal and preserve rollback commands. Candidate receipts never authorize closure or replay. The helper retains its runtime validation while satisfying the type checker and documenting its two authenticated-code execution sites.
 - `credentials-sops` for `runner-pool.yml` (df-grafana-2tr; teardown got it in #472): with it
   set and `CREDENTIALS_AGE_KEY` passed, the pool reads `AKASH_API_KEY`, `AKASH_API_KEYS` and
   `GH_RUNNER_PAT` from the caller's `secrets/akash-runner.sops.env` in one step with the
