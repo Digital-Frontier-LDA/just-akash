@@ -854,10 +854,16 @@ def _creation_group_snapshot(groups: object) -> tuple[tuple[str, str], ...] | No
 
 
 def _deployment_snapshot_at_height(
-    data: dict[str, Any], owner: str, dseq: str
+    data: dict[str, Any], owner: str, dseq: str, *, expected_version: str | None = None
 ) -> tuple[tuple[tuple[str, str], ...], int] | None:
     snapshot = _deployment_group_snapshot(data, owner, dseq)
     deployment = data.get("deployment")
+    if expected_version is not None and (
+        _manifest_version(expected_version) is None
+        or not isinstance(deployment, dict)
+        or deployment.get("hash") != expected_version
+    ):
+        return None
     raw_created_at = deployment.get("created_at") if isinstance(deployment, dict) else None
     if (
         snapshot is None
@@ -1096,6 +1102,7 @@ def _signed_creation_population(
     block_population: dict,
     *,
     state_height: int | None = None,
+    expected_version: str | None = None,
 ) -> dict | None:
     """Bind one successful signed create to complete raw and indexed populations."""
     indexed = _indexed_transaction_population(
@@ -1145,6 +1152,10 @@ def _signed_creation_population(
         or any(not isinstance(info, dict) for info in signer_infos)
     ):
         raise ChainResponseError("matching create was not a successful signed transaction")
+    if expected_version is not None and (
+        _manifest_version(expected_version) is None or message.get("hash") != expected_version
+    ):
+        raise ChainResponseError("signed creation manifest version did not match")
     snapshot = _creation_group_snapshot(message.get("groups"))
     if snapshot is None:
         raise ChainResponseError("matching create carried an unreadable group population")
@@ -1165,6 +1176,7 @@ def _owner_close_evidence(
     reader,
     now: datetime,
     expected_population: tuple[tuple[str, str], ...] | None = None,
+    expected_version: str | None = None,
 ) -> dict[str, Any] | None:
     """Fresh authority plus a complete signed creation population, or ``None``.
 
@@ -1174,6 +1186,8 @@ def _owner_close_evidence(
     their totals, raw hashes, decoded order, execution result, and signed create groups
     must agree. Tests inject transport and time only through this private boundary.
     """
+    if expected_version is not None and _manifest_version(expected_version) is None:
+        return None
     target_population = expected_population or (("1", expected_group),)
     target_names = [name for _gseq, name in target_population]
     # Validate the closed registry and exact population before doing the authority reads.
@@ -1274,7 +1288,9 @@ def _owner_close_evidence(
             return None
         if info is None:
             continue
-        current = _deployment_snapshot_at_height(info, owner, dseq)
+        current = _deployment_snapshot_at_height(
+            info, owner, dseq, expected_version=expected_version
+        )
         if current is None:
             return None
         current_snapshot, current_created_at = current
@@ -1294,6 +1310,7 @@ def _owner_close_evidence(
                 dseq,
                 block_population,
                 state_height=height,
+                expected_version=expected_version,
             )
         except ChainResponseError:
             return None
@@ -1333,7 +1350,7 @@ def _owner_close_evidence(
     expires = min(now.timestamp() + 30, block_time.timestamp() + 180)
     if expires <= now.timestamp():
         return None
-    return {
+    evidence = {
         "evidence_version": 2,
         "registry_version": OWNER_CORROBORATION_REGISTRY_VERSION,
         "registry_digest": OWNER_CORROBORATION_REGISTRY_SHA256,
@@ -1360,6 +1377,13 @@ def _owner_close_evidence(
         "evaluated_at": now.isoformat(),
         "expires_at": datetime.fromtimestamp(expires, timezone.utc).isoformat(),
     }
+    if expected_version is not None:
+        evidence.update(
+            evidence_version=3,
+            creation_manifest_version=expected_version,
+            current_manifest_version=expected_version,
+        )
+    return evidence
 
 
 def owner_close_evidence(owner: str, dseq: str, expected_group: str) -> dict[str, Any] | None:
@@ -1435,6 +1459,64 @@ def owner_close_population_evidence(
         reader=_lcd_get,
         now=datetime.now(timezone.utc),
         expected_population=tuple(population),
+    )
+
+
+def _manifest_version(value: object) -> str | None:
+    """Exactly one canonical base64-encoded 32-byte official SDL manifest version."""
+    decoded = _canonical_base64_bytes(value)
+    return value if isinstance(value, str) and decoded is not None and len(decoded) == 32 else None
+
+
+def creation_version_population_evidence(
+    owner: str, dseq: str, expected_population: list[dict[str, object]], expected_version: str
+) -> dict[str, Any] | None:
+    """Read-only signed creation/state proof for exact owner/DSEQ/groups/version.
+
+    Expected version must come from the official SDL primitive, never raw SDL SHA.
+    This function performs no close, mutation, receipt rewrite, or retry authorization.
+    """
+    if _manifest_version(expected_version) is None:
+        return None
+    if (
+        not isinstance(dseq, str)
+        or not re.fullmatch(r"[1-9][0-9]{0,19}", dseq)
+        or int(dseq) > 2**64 - 1
+        or not isinstance(owner, str)
+        or not re.fullmatch(r"akash1[a-z0-9]{38,58}", owner)
+        or not isinstance(expected_population, list)
+        or not expected_population
+    ):
+        return None
+    population: list[tuple[str, str]] = []
+    for index, entry in enumerate(expected_population, start=1):
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"gseq", "name"}
+            or type(entry.get("gseq")) is not int
+            or entry["gseq"] != index
+        ):
+            return None
+        name = entry.get("name")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+            return None
+        population.append((str(index), name))
+    if os.environ.get("AKASH_REST_URL") is not None:
+        return None
+    if (
+        _source_registry_digest(OWNER_CORROBORATION_SOURCES_V2)
+        != OWNER_CORROBORATION_REGISTRY_SHA256
+    ):
+        return None
+    return _owner_close_evidence(
+        owner,
+        dseq,
+        population[0][1],
+        sources=OWNER_CORROBORATION_SOURCES_V2,
+        reader=_lcd_get,
+        now=datetime.now(timezone.utc),
+        expected_population=tuple(population),
+        expected_version=expected_version,
     )
 
 

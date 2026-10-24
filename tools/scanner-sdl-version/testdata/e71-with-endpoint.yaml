@@ -1,0 +1,40 @@
+version: '2.0'
+services:
+  runner:
+    image: docker.io/digitalfrontierunipessoallda/akash-runner@sha256:e71bf4be0e3a59a57ff791b0fc3bc3a31f216f66807b6ac41f1a23346321baa4
+    credentials:
+      host: https://index.docker.io/v1/
+      username: jobordu
+      password: SYNTHETIC_PULL_SECRET
+    env:
+    - RUNNER_JIT_CONFIG=SYNTHETIC_JIT_SECRET
+    - EPHEMERAL=true
+    - RUNNER_EXECUTION_USER=root
+    - RUNNER_NAME=dfci-bb-th-42-a2-r1
+    expose:
+    - port: 65535
+      as: 65535
+      proto: tcp
+      to:
+      - global: true
+profiles:
+  compute:
+    runner:
+      resources:
+        cpu:
+          units: '4'
+        memory:
+          size: 16Gi
+        storage:
+        - size: 96Gi
+  placement:
+    borduas-th-run-42-a2-r1-end:
+      pricing:
+        runner:
+          denom: uact
+          amount: 100000
+deployment:
+  runner:
+    borduas-th-run-42-a2-r1-end:
+      profile: runner
+      count: 1

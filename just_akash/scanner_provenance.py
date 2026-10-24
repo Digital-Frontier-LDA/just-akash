@@ -24,7 +24,7 @@ PROVIDERS = frozenset(
         "akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x",
     }
 )
-Kind = Literal["jit", "lease", "lease_bind"]
+Kind = Literal["jit", "lease", "lease_bind", "lease_reconcile"]
 Phase = Literal["NO_WIRE", "UNKNOWN", "ACK"]
 
 
@@ -271,11 +271,20 @@ def _details(
         "public_request_sha256",
         "wire_request_sha256",
     }
-    expected = (jit if kind == "jit" else lease if kind == "lease" else lease_bind) | (
+    reconcilable = lease | {"expected_manifest_version", "precreate_baseline", "payload_profile"}
+    expected = (
+        jit
+        if kind == "jit"
+        else lease
+        if kind == "lease"
+        else reconcilable
+        if kind == "lease_reconcile"
+        else lease_bind
+    ) | (
         {"runner_id"}
         if kind == "jit" and phase == "ACK"
         else {"dseq"}
-        if kind == "lease" and phase == "ACK"
+        if kind in ("lease", "lease_reconcile") and phase == "ACK"
         else {"lease_response_received"}
         if kind == "lease_bind" and phase == "ACK"
         else set()
@@ -322,6 +331,12 @@ def _details(
         digest(result["jit_ack_record_sha256"])
         positive(result["returned_runner_id"])
         require(result["deposit_usd"] == "6")
+        if kind == "lease_reconcile":
+            from .scanner_create_observation import manifest_version, validate_baseline
+
+            manifest_version(result["expected_manifest_version"])
+            validate_baseline(result["precreate_baseline"], result["owner"])
+            require(result["payload_profile"] == "scanner-private-e71-tcp65535/v1")
         if phase == "ACK":
             require(
                 type(result["dseq"]) is str
@@ -337,13 +352,15 @@ class ScannerOperation:
     def __init__(
         self, binding: Mapping[str, object], kind: Kind, recorder: DurableRecorder | None = None
     ):
-        require(kind in ("jit", "lease", "lease_bind"))
+        require(kind in ("jit", "lease", "lease_bind", "lease_reconcile"))
         self._binding = validate_binding(binding)
         self._kind: Kind = kind
         self._recorder = recorder if recorder is not None else MissingDurableRecorder()
+        # Same irreversible create slot across schema versions: old phases veto a second create.
+        slot = "lease" if kind == "lease_reconcile" else kind
         self._operation_id = (
             f"scanner-v2-{self._binding['repository_id']}-{self._binding['run_id']}"
-            f"-a{self._binding['run_attempt']}-r{self._binding['sdk_round']}-{kind}"
+            f"-a{self._binding['run_attempt']}-r{self._binding['sdk_round']}-{slot}"
         )
         self._state = "NEW"
         self._record: dict[str, object] | None = None
@@ -371,7 +388,7 @@ class ScannerOperation:
                 "runner_id"
                 if self._kind == "jit"
                 else "dseq"
-                if self._kind == "lease"
+                if self._kind in ("lease", "lease_reconcile")
                 else "lease_response_received",
                 None,
             )
@@ -389,6 +406,8 @@ class ScannerOperation:
             "details": data,
             "authority": "candidate",
         }
+        if self._kind == "lease_reconcile":
+            require(len(canonical_bytes(record)) <= 65536)
         accepted: DurableAck | None = None
         try:
             accepted = validate_ack(
@@ -450,10 +469,14 @@ def validate_record(value: object) -> dict[str, Any]:
     require(row["schema"] == "just-akash/scanner-operation/v2" and row["authority"] == "candidate")
     binding = validate_binding(row["binding"])
     kind, phase = row["kind"], row["phase"]
-    require(kind in ("jit", "lease", "lease_bind") and phase in ("NO_WIRE", "UNKNOWN", "ACK"))
+    require(
+        kind in ("jit", "lease", "lease_bind", "lease_reconcile")
+        and phase in ("NO_WIRE", "UNKNOWN", "ACK")
+    )
+    slot = "lease" if kind == "lease_reconcile" else kind
     expected = (
         f"scanner-v2-{binding['repository_id']}-{binding['run_id']}"
-        f"-a{binding['run_attempt']}-r{binding['sdk_round']}-{kind}"
+        f"-a{binding['run_attempt']}-r{binding['sdk_round']}-{slot}"
     )
     require(row["operation_id"] == expected)
     require(

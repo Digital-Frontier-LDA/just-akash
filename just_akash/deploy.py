@@ -1555,7 +1555,7 @@ def deploy(
     # Stamped BEFORE the request so a deployment created by THIS call can be told from
     # one that already existed. See _report_suspected_orphans.
     if scanner_provenance is not None:
-        scanner_provenance.prepare(prepared_receipt, sdl_content)
+        scanner_provenance.prepare(prepared_receipt, sdl_content, client=client)
         client = scanner_provenance.bound_client(client)
 
     _create_started = time.time()

@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, NoReturn, cast
 
@@ -182,6 +183,7 @@ class ScannerLeaseProvenance:
         encoded_jit_config: str,
         recorder: DurableRecorder,
         admission: Callable[[], None],
+        reconciliation: Any = None,
     ):
         self.binding = ScannerBinding(binding.to_dict())
         positive(returned_runner_id)
@@ -198,7 +200,10 @@ class ScannerLeaseProvenance:
         self._admission = admission
         self._runner = returned_runner_id
         self._jit_sha = record_sha256(row)
-        self.operation = ScannerOperation(binding, "lease", recorder)
+        self._reconciliation = reconciliation
+        self.operation = ScannerOperation(
+            binding, "lease_reconcile" if reconciliation is not None else "lease", recorder
+        )
         self.lease_operation = ScannerOperation(binding, "lease_bind", recorder)
         self._details: dict[str, object] | None = None
         self._lease_details: dict[str, object] | None = None
@@ -248,14 +253,25 @@ class ScannerLeaseProvenance:
         self._admit()
 
     def prepare(
-        self, prepared: tuple[Path, PreparedDeploymentReceipt, bytes] | None, content: str
+        self,
+        prepared: tuple[Path, PreparedDeploymentReceipt, bytes] | None,
+        content: str,
+        *,
+        client: Any = None,
     ) -> None:
         require(self._details is None and prepared is not None)
         row = cast(tuple[Path, PreparedDeploymentReceipt, bytes], prepared)[1]
         require(row["state"] == "prepared" and row["operation_id"] == self.operation.operation_id)
         require(row["artifact_digest"] == hashlib.sha256(content.encode()).hexdigest())
         require(row["group_population"] == [{"gseq": 1, "name": self.binding.akash_group}])
-        public = public_sdl_request(content, self.binding, self._config)
+        if self._reconciliation is None:
+            public = public_sdl_request(content, self.binding, self._config)
+            captured = {}
+        else:
+            require(client is not None)
+            public = public_sdl_request_reconcilable(content, self.binding, self._config)
+            self._admit()
+            captured = self._reconciliation.prepare(client, row["expected_owner"], content)
         # The complete SDL was validated above. Keep the reader and JIT material
         # only in memory so a credential-shaped transaction echo is also rejected.
         password = yaml.safe_load(content)["services"]["runner"]["credentials"]["password"]
@@ -270,6 +286,7 @@ class ScannerLeaseProvenance:
             "jit_ack_record_sha256": self._jit_sha,
             "deposit_usd": "6",
         }
+        self._details.update(captured)
         self._admit()
         self.operation.no_wire(self._details)
 
@@ -421,6 +438,11 @@ class _ScannerClient:
             result = self._client.create_deployment(sdl_content, deposit=deposit)
         except Exception:
             result = None
+        if type(result) is not dict and self._provenance._reconciliation is not None:
+            # Only this new producer can observe its acknowledged pre-create intent.
+            # Observation errors stay fixed/private and never permit a second POST.
+            with suppress(Exception):
+                self._provenance._reconciliation.observe_unknown(self._client, self._provenance)
         require(type(result) is dict)
         self._provenance._create_returned = True
         self._provenance._manifest = cast(dict, result).get("manifest")
@@ -459,6 +481,7 @@ def deploy_scanner_v2(
     recorder: DurableRecorder,
     receipt_path: str,
     admission: Callable[[], None],
+    reconciliation: Any = None,
 ) -> dict[str, object]:
     """Invoke the real installed SDK deploy path, never an injected fake deploy callable."""
     from .deploy import deploy
@@ -471,16 +494,82 @@ def deploy_scanner_v2(
         encoded_jit_config=encoded_jit_config,
         recorder=recorder,
         admission=admission,
+        reconciliation=reconciliation,
     )
-    result = deploy(
-        sdl_path,
-        preferred_providers=sorted(PROVIDERS),
-        backup_providers=[],
-        deposit=6,
-        select="cheapest",
-        quiet_wallet=True,
-        receipt_path=receipt_path,
-        receipt_operation_id=provenance.operation.operation_id,
-        scanner_provenance=provenance,
+    if reconciliation is None:
+        result = deploy(
+            sdl_path,
+            preferred_providers=sorted(PROVIDERS),
+            backup_providers=[],
+            deposit=6,
+            select="cheapest",
+            quiet_wallet=True,
+            receipt_path=receipt_path,
+            receipt_operation_id=provenance.operation.operation_id,
+            scanner_provenance=provenance,
+        )
+        return provenance.public_result(result)
+    # A response may be syntactically present but fail before candidate ACK.
+    # Observe only this invocation's already acknowledged UNKNOWN, never retry it.
+    result = None
+    try:
+        result = deploy(
+            sdl_path,
+            preferred_providers=sorted(PROVIDERS),
+            backup_providers=[],
+            deposit=6,
+            select="cheapest",
+            quiet_wallet=True,
+            receipt_path=receipt_path,
+            receipt_operation_id=provenance.operation.operation_id,
+            scanner_provenance=provenance,
+        )
+    except Exception:
+        with suppress(Exception):
+            reconciliation.observe_current_unknown(provenance)
+    require(type(result) is dict)
+    return provenance.public_result(cast(dict, result))
+
+
+def public_sdl_request_reconcilable(
+    content: str, binding: ScannerBinding, config: str
+) -> dict[str, object]:
+    """Versioned exact TCP65535 tenant graph; original no-port validator stays strict."""
+    doc = None
+    try:
+        require(0 < len(content.encode()) <= 65536)
+        require(not any(isinstance(event, yaml.AliasEvent) for event in yaml.parse(content)))
+        doc = yaml.load(content, Loader=_UniqueLoader)  # noqa: S506 -- SafeLoader subclass
+    except Exception:
+        doc = None
+    require(type(doc) is dict)
+    doc = cast(dict[str, Any], doc)
+    require(type(doc.get("services")) is dict and type(doc["services"].get("runner")) is dict)
+    service = doc["services"]["runner"]
+    expected = [{"port": 65535, "as": 65535, "proto": "tcp", "to": [{"global": True}]}]
+    require(service.get("expose") == expected)
+    require(type(service["expose"][0]["port"]) is int and type(service["expose"][0]["as"]) is int)
+    require(service["expose"][0]["to"][0]["global"] is True)
+    del service["expose"]
+    public = public_sdl_request(yaml.safe_dump(doc), binding, config)
+    cast(dict, cast(dict, public["services"])["runner"])["expose"] = expected
+    return public
+
+
+def deploy_scanner_v2_reconcilable(
+    *, helper_path: str, expected_binary_sha256: str, environment: Any, token: str, **kwargs: Any
+) -> dict[str, object]:
+    """New attempts only; real pre-create version/baseline is mandatory, no retrofits."""
+    from .scanner_create_observation import PrecreateCapture
+
+    require("reconciliation" not in kwargs)
+    return deploy_scanner_v2(
+        **kwargs,
+        reconciliation=PrecreateCapture(
+            helper_path,
+            expected_binary_sha256,
+            environment=environment,
+            token=token,
+            observation_path=kwargs["receipt_path"] + ".reconciliation-DATA.json",
+        ),
     )
-    return provenance.public_result(result)

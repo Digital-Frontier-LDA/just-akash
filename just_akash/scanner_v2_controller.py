@@ -39,6 +39,7 @@ NATIVE_STEP = "Run the acknowledged scanner-v2 controller"
 SDK_REPOSITORY = "Digital-Frontier-LDA/just-akash"
 SDK_WORKFLOW = ".github/workflows/runner-pool.yml"
 ORGANIZATION_ID = 208689568
+RECONCILED_PROFILE = "bb-native-trufflehog-v2-reconciled"
 
 
 class ControllerHeld(RuntimeError):
@@ -58,7 +59,7 @@ def number(value: str) -> int:
 
 
 def inputs(environment: Mapping[str, str]) -> dict[str, Any]:
-    require(environment.get("RUNNER_PRIVATE_PROFILE") == PROFILE)
+    require(environment.get("RUNNER_PRIVATE_PROFILE") in (PROFILE, RECONCILED_PROFILE))
     exact = {
         "SCANNER_PUBLIC_PROFILE": "",
         "SCANNER_IMAGE": "",
@@ -312,7 +313,12 @@ def admit_native(binding: ScannerBinding, environment: Mapping[str, str], token:
 
 
 def write_sdl(
-    path: Path, binding: ScannerBinding, environment: dict[str, str], password: str
+    path: Path,
+    binding: ScannerBinding,
+    environment: dict[str, str],
+    password: str,
+    *,
+    reconciled: bool = False,
 ) -> None:
     import yaml
 
@@ -360,6 +366,11 @@ def write_sdl(
         },
         "deployment": {"runner": {group: {"profile": "runner", "count": 1}}},
     }
+    require(type(reconciled) is bool)
+    if reconciled:
+        document["services"]["runner"]["expose"] = [
+            {"port": 65535, "as": 65535, "proto": "tcp", "to": [{"global": True}]}
+        ]
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as stream:
         yaml.safe_dump(document, stream, sort_keys=False)
@@ -447,9 +458,15 @@ def wait_for_returned_runner(
 def provision(environment: Mapping[str, str]) -> dict[str, Any]:
     from .runner_image import read_pull_credentials, verify_native_reader_role
     from .scanner_durable_pipe import PipeDurableRecorder
-    from .scanner_lease_provenance import deploy_scanner_v2
+    from .scanner_lease_provenance import deploy_scanner_v2, deploy_scanner_v2_reconcilable
 
     binding = ScannerBinding(inputs(environment))
+    reconciled = environment.get("RUNNER_PRIVATE_PROFILE") == RECONCILED_PROFILE
+    if reconciled:
+        helper_path = environment.get("SCANNER_SDL_VERSION_HELPER", "")
+        helper_sha256 = environment.get("SCANNER_SDL_VERSION_HELPER_SHA256", "")
+        require(Path(helper_path).is_absolute() and Path(helper_path).is_file())
+        require(re.fullmatch(r"[a-f0-9]{64}", helper_sha256) is not None)
     token = environment.get("GH_TOKEN", "")
     require(bool(token))
     require(bool(environment.get("AKASH_API_KEY") or environment.get("AKASH_API_KEYS")))
@@ -483,13 +500,16 @@ def provision(environment: Mapping[str, str]) -> dict[str, Any]:
     temporary = Path(tempfile.mkdtemp(prefix="scanner-v2-", dir=parent))
     path = temporary / "private-runner.yaml"
     try:
-        write_sdl(path, binding, guest, password)
+        if reconciled:
+            write_sdl(path, binding, guest, password, reconciled=True)
+        else:
+            write_sdl(path, binding, guest, password)
         with (
             open(os.devnull, "w", encoding="utf-8") as sink,
             contextlib.redirect_stdout(sink),
             contextlib.redirect_stderr(sink),
         ):
-            result = deploy_scanner_v2(
+            deploy_arguments: dict[str, Any] = dict(
                 sdl_path=str(path),
                 binding=binding,
                 returned_runner_id=minted.handoff.runner_id,
@@ -500,6 +520,16 @@ def provision(environment: Mapping[str, str]) -> dict[str, Any]:
                 receipt_path=str(Path(temporary) / "local-deploy-receipt.json"),
                 admission=admission,
             )
+            if reconciled:
+                result = deploy_scanner_v2_reconcilable(
+                    helper_path=helper_path,
+                    expected_binary_sha256=helper_sha256,
+                    environment=environment,
+                    token=token,
+                    **deploy_arguments,
+                )
+            else:
+                result = deploy_scanner_v2(**deploy_arguments)
     finally:
         path.unlink(missing_ok=True)
     require(

@@ -1,7 +1,7 @@
 'use strict';
 const fs=require('node:fs');const path=require('node:path');const {spawn}=require('node:child_process');
 const crypto=require('node:crypto');const vm=require('node:vm');const {createRequire}=require('node:module');
-const CODE_PINS={"backend.cjs":"92a30c53acc5ddfc56dc5b873980b0e82bec79cab8c29321a29726bf28ecf265","schema.cjs":"c209d0a327ca7c62f998d694f9573e8610fcb2b3dcbf6db20032fc970bd6e1bd","worker.cjs":"1ebd2007cb1964c2f8b153b38e2cedf51c6b827a2c0fe2e2a621a50c102ba3ff"};
+const CODE_PINS={"backend.cjs":"92a30c53acc5ddfc56dc5b873980b0e82bec79cab8c29321a29726bf28ecf265","schema.cjs":"e5f285321733a06ff64b7a490c2e880bf475948d0ece96c458b4edfc674e23ff","worker.cjs":"1ebd2007cb1964c2f8b153b38e2cedf51c6b827a2c0fe2e2a621a50c102ba3ff"};
 function capture(name){
  const file=path.join(__dirname,name),fd=fs.openSync(file,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);
  try{const a=fs.fstatSync(fd,{bigint:true});if(!a.isFile()||a.nlink!==1n||a.size<1n||a.size>131072n)throw new Error('ACTION_SOURCE_HOLD');const raw=fs.readFileSync(fd),b=fs.fstatSync(fd,{bigint:true}),c=fs.lstatSync(file,{bigint:true});for(const key of ['dev','ino','mode','uid','nlink','size','mtimeNs','ctimeNs'])if(a[key]!==b[key]||b[key]!==c[key])throw new Error('ACTION_SOURCE_HOLD');if(raw.length!==Number(a.size)||crypto.createHash('sha256').update(raw).digest('hex')!==CODE_PINS[name])throw new Error('ACTION_SOURCE_HOLD');return raw.toString('utf8');}finally{fs.closeSync(fd);}

@@ -40,18 +40,26 @@ function binding(b){
 }
 function validate(record){
  object(record,['schema','operation_id','kind','phase','phase_index','parent_record_sha256','profile_sha256','binding','details','authority']);
- need(record.schema==='just-akash/scanner-operation/v2'&&record.authority==='candidate'&&['jit','lease','lease_bind'].includes(record.kind));
+ need(record.schema==='just-akash/scanner-operation/v2'&&record.authority==='candidate'&&['jit','lease','lease_bind','lease_reconcile'].includes(record.kind));
  const indexes={NO_WIRE:0,UNKNOWN:1,ACK:2};need(Object.hasOwn(indexes,record.phase)&&record.phase_index===indexes[record.phase]);
  need(record.phase==='NO_WIRE'?record.parent_record_sha256===null:typeof sha(record.parent_record_sha256)==='string');
  need(binding(record.binding)===record.profile_sha256);
- const b=record.binding;need(record.operation_id===`scanner-v2-${b.repository_id}-${b.run_id}-a${b.run_attempt}-r${b.sdk_round}-${record.kind}`);
+ const b=record.binding;need(record.operation_id===`scanner-v2-${b.repository_id}-${b.run_id}-a${b.run_attempt}-r${b.sdk_round}-${record.kind==='lease_reconcile'?'lease':record.kind}`);
  const d=record.details;
  if(record.kind==='jit'){
   object(d,['runner_name','runner_group_id','labels','request_body_sha256',...(record.phase==='ACK'?['runner_id']:[])]);
   need(d.runner_name===b.runner_name&&d.runner_group_id===b.runner_group_id&&canonical(d.labels)===canonical(['self-hosted','linux','akash',b.runner_label]));sha(d.request_body_sha256);if(record.phase==='ACK')positive(d.runner_id);
- }else if(record.kind==='lease'){
-  object(d,['owner','group_population','public_request_sha256','wire_request_sha256','returned_runner_id','jit_ack_record_sha256','deposit_usd',...(record.phase==='ACK'?['dseq']:[])]);
+ }else if(record.kind==='lease'||record.kind==='lease_reconcile'){
+  object(d,['owner','group_population','public_request_sha256','wire_request_sha256','returned_runner_id','jit_ack_record_sha256','deposit_usd',...(record.kind==='lease_reconcile'?['expected_manifest_version','precreate_baseline','payload_profile']:[]),...(record.phase==='ACK'?['dseq']:[])]);
   akash(d.owner);need(canonical(d.group_population)===canonical([{gseq:1,name:b.akash_group}]));sha(d.public_request_sha256);sha(d.wire_request_sha256);sha(d.jit_ack_record_sha256);positive(d.returned_runner_id);need(d.deposit_usd==='6');
+  if(record.kind==='lease_reconcile'){
+   need(typeof d.expected_manifest_version==='string');const version=Buffer.from(d.expected_manifest_version,'base64');need(version.length===32&&version.toString('base64')===d.expected_manifest_version);
+   need(d.payload_profile==='scanner-private-e71-tcp65535/v1');const baseline=d.precreate_baseline;object(baseline,['schema','owner','states','dseqs']);
+   need(baseline.schema==='just-akash/scanner-precreate-baseline/v1'&&baseline.owner===d.owner&&canonical(baseline.states)===canonical(['active','closed']));
+   need(Array.isArray(baseline.dseqs)&&baseline.dseqs.length<=1000);let previous=0n;
+   for(const value of baseline.dseqs){need(typeof value==='string'&&/^[1-9][0-9]{0,19}$/.test(value));const id=BigInt(value);need(id>previous&&id<=18446744073709551615n);previous=id;}
+   need(Buffer.byteLength(canonical(baseline))<=32768);
+  }
   if(record.phase==='ACK'){need(typeof d.dseq==='string'&&/^[1-9][0-9]{0,19}$/.test(d.dseq)&&BigInt(d.dseq)<=18446744073709551615n);}
  }
  if(record.kind==='lease_bind'){
@@ -62,7 +70,7 @@ function validate(record){
  const raw=Buffer.from(canonical(record));need(raw.length<=65536);return {record,raw,sha256:hash(raw),name:record.operation_id+'-j'+record.binding.producer_job_id+'-'+record.phase.toLowerCase()};
 }
 function producer(b){return Object.fromEntries(['repository_id','run_id','run_attempt','workflow_sha','native_head_sha','producer_job_id'].map(k=>[k,b[k]]));}
-function intent(record){const d={...record.details};if(record.kind==='jit')delete d.runner_id;else if(record.kind==='lease')delete d.dseq;else delete d.lease_response_received;return canonical(d);}
+function intent(record){const d={...record.details};if(record.kind==='jit')delete d.runner_id;else if(record.kind==='lease'||record.kind==='lease_reconcile')delete d.dseq;else delete d.lease_response_received;return canonical(d);}
 class PhaseSession{
  constructor(){this.records=new Map();this.held=false;}
  reserve(record){
