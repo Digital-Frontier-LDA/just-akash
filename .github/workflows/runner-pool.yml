@@ -71,6 +71,11 @@ name: Akash runner pool
 on:
   workflow_call:
     inputs:
+      native-caller-contract:
+        description: 'Optional fixed M06 hosted native caller admission; empty preserves legacy behavior.'
+        required: false
+        type: string
+        default: ''
       runner-label:
         description: 'Unique label for this pool; carries run identity into runs-on.'
         required: true
@@ -502,6 +507,7 @@ jobs:
     # headroom above every observed pool run while still ending a stuck one.
     timeout-minutes: 120
     outputs:
+      native-caller-admitted: ${{ steps.native_caller.outputs.admitted }}
       dseq: ${{ steps.provision.outputs.dseq }}
       deployment_outcome: ${{ steps.provision.outputs.deployment_outcome || steps.public_profile.outputs.deployment_outcome || steps.private_profile.outputs.deployment_outcome || (steps.pat.outputs.native_pre_create_refused == 'true' && 'no-deployment' || '') }}
       create_ambiguous: ${{ steps.provision.outputs.create_ambiguous }}
@@ -547,6 +553,47 @@ jobs:
           ref: ${{ inputs.just-akash-ref }}
           path: .just-akash
           persist-credentials: false
+
+      - name: Admit the optional hosted native caller
+        id: native_caller
+        if: inputs.native-caller-contract != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_RUNNER_PAT }}
+          NATIVE_CALLER_CONTRACT: ${{ inputs.native-caller-contract }}
+          NATIVE_CALLER_SDK_REF: ${{ inputs.just-akash-ref }}
+          NATIVE_CALLER_SDK_REPOSITORY: ${{ inputs.just-akash-repository }}
+          NATIVE_CALLER_REPOSITORY_SCOPE: ${{ inputs.runner-native-repository-scope }}
+          NATIVE_CALLER_PULL_READER: ${{ inputs.runner-native-pull-reader }}
+          NATIVE_CALLER_REGISTRY_SOPS: ${{ inputs.runner-registry-sops }}
+          NATIVE_CALLER_CREDENTIALS_SOPS: ${{ inputs.credentials-sops }}
+        run: |
+          set -euo pipefail
+          python3 -I -B - <<'PYCALLER'
+          import hashlib,os,stat
+          from pathlib import Path
+          def identity(info):
+              values=(info.st_dev,info.st_ino,info.st_mode,info.st_uid,info.st_gid,info.st_nlink,info.st_size,info.st_mtime_ns,info.st_ctime_ns)
+              if not all(type(value) is int for value in values):
+                  raise SystemExit('Optional hosted caller source was not verified')
+              return values
+          path=Path('just_akash/runner_hosted_caller.py')
+          fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC)
+          try:
+              before=os.fstat(fd)
+              if identity(path.lstat())!=identity(before):
+                  raise SystemExit('Optional hosted caller source was not verified')
+              raw=os.pread(fd,65537,0)
+              if not stat.S_ISREG(before.st_mode) or before.st_uid!=os.getuid() or before.st_nlink!=1 or not 0<len(raw)<=65536 or len(raw)!=before.st_size:
+                  raise SystemExit('Optional hosted caller source was not verified')
+              if hashlib.sha256(raw).hexdigest()!='fa08f8cd2b44e32a3c7e7665511928d4373c80c910e42e98493be9dfad162f6b' or identity(os.fstat(fd))!=identity(before) or identity(path.lstat())!=identity(before):
+                  raise SystemExit('Optional hosted caller source was not verified')
+              namespace={'__name__':'fixed_hosted_caller','__file__':str(path)}
+              exec(compile(raw,str(path),'exec'),namespace)
+              namespace['main']()
+          finally:
+              os.close(fd)
+          PYCALLER
+          echo admitted=true >> "$GITHUB_OUTPUT"
 
       # credentials-sops: only the ciphertext, from the caller's exact revision. ONE run step,
       # on purpose. It must precede the PAT preflight (which reads the PAT it loads), and the
@@ -2461,7 +2508,7 @@ jobs:
   teardown:
     name: Roll back failed or cancelled pool provisioning
     needs: [pool]
-    if: always() && needs.pool.result != 'success'
+    if: always() && needs.pool.result != 'success' && (inputs.native-caller-contract == '' || needs.pool.outputs.native-caller-admitted == 'true')
     # ⛔ FULL PATH AT A PINNED SHA, NEVER `./`. A reusable workflow's job runs in the
     # CALLER's context, so a bare `./` resolves inside the CALLER's tree — where this
     # file does not exist. The job then cannot be created, the graph cannot be built,
