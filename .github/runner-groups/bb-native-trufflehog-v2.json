@@ -1,0 +1,11 @@
+{
+  "name": "bb-native-trufflehog-v2",
+  "visibility": "selected",
+  "selected_repository_ids": [1071436278],
+  "runners": [],
+  "allows_public_repositories": false,
+  "restricted_to_workflows": true,
+  "selected_workflows": [
+    "Borduas-Holdings/Blazing-Back/.github/workflows/secret-scanning.yml@refs/heads/main"
+  ]
+}

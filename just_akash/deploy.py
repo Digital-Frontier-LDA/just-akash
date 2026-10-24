@@ -22,7 +22,10 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, TypedDict, cast
+from typing import TYPE_CHECKING, Any, TypedDict, cast
+
+if TYPE_CHECKING:
+    from .scanner_lease_provenance import ScannerLeaseProvenance
 
 import yaml
 from akash_lease_core import Auction, AuctionPolicy, AuctionStatus, BidObservation
@@ -1294,7 +1297,21 @@ def deploy(
     receipt_operation_id: str | None = None,
     quiet_wallet: bool | None = None,
     charter: Charter | None = None,
+    scanner_provenance: "ScannerLeaseProvenance | None" = None,
 ) -> dict:
+    if scanner_provenance is not None:
+        scanner_provenance.validate_call(
+            gpu=gpu,
+            image=image,
+            env_vars=env_vars,
+            preferred_providers=preferred_providers,
+            backup_providers=backup_providers,
+            deposit=deposit,
+            select=select,
+            charter=charter,
+            receipt_path=receipt_path,
+            receipt_operation_id=receipt_operation_id,
+        )
     # deposit is user-controlled (--deposit); reject non-finite/non-positive
     # values before they reach json.dumps (which would emit invalid NaN/Infinity).
     if not math.isfinite(deposit) or deposit <= 0:
@@ -1397,7 +1414,13 @@ def deploy(
     # openmix-wxs8: OPT-IN (--quiet-wallet / AKASH_QUIET_WALLET=1; None reads the env): with
     # several keys, the wallet must be funded AND quiet. Default: funding-only, as before.
     wallet = select_client_for_create(
-        required_uact, client_factory=AkashConsoleAPI, quiet=quiet_wallet
+        required_uact,
+        client_factory=(
+            scanner_provenance.client_factory
+            if scanner_provenance is not None
+            else AkashConsoleAPI
+        ),
+        quiet=quiet_wallet,
     )
     client = wallet.client
     if wallet.configured_keys > 1:
@@ -1483,7 +1506,13 @@ def deploy(
         from .wallet_pool import confirm_quiet_or_reselect
 
         rechecked = confirm_quiet_or_reselect(
-            wallet, required_uact, client_factory=AkashConsoleAPI
+            wallet,
+            required_uact,
+            client_factory=(
+                scanner_provenance.client_factory
+                if scanner_provenance is not None
+                else AkashConsoleAPI
+            ),
         )
         if rechecked is not wallet:
             _log(
@@ -1525,6 +1554,10 @@ def deploy(
     )
     # Stamped BEFORE the request so a deployment created by THIS call can be told from
     # one that already existed. See _report_suspected_orphans.
+    if scanner_provenance is not None:
+        scanner_provenance.prepare(prepared_receipt, sdl_content)
+        client = scanner_provenance.bound_client(client)
+
     _create_started = time.time()
     if prepared_receipt is not None:
         prepared_receipt = mark_submitting(*prepared_receipt)
@@ -1648,7 +1681,11 @@ def deploy(
             mark_create_response_received(
                 *prepared_receipt,
                 dseq=dseq,
-                deployment_response=deployment_response,
+                deployment_response=(
+                    scanner_provenance.local_create_response(dseq, deployment_response)
+                    if scanner_provenance is not None
+                    else deployment_response
+                ),
             )
         except Exception as receipt_error:
             raise RuntimeError(
@@ -1659,6 +1696,9 @@ def deploy(
                 "its owner and complete group identity against the chain before any retry. "
                 f"Receipt error: {error_text(receipt_error)}"
             ) from receipt_error
+
+    if scanner_provenance is not None:
+        scanner_provenance.created(str(dseq))
 
     _manifest_raw = deployment_response.get("manifest", "")
     manifest = _manifest_raw if isinstance(_manifest_raw, str) else ""
@@ -2663,6 +2703,8 @@ def deploy(
             )
             break
         except RuntimeError as e:
+            if scanner_provenance is not None:
+                scanner_provenance.hold_unknown()
             err_str = error_text(e).lower()
             stale = "no longer open" in err_str
             # 404 "no lease for deployment": the deployment's order became
