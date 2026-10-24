@@ -1,0 +1,8 @@
+{
+  "name": "scanner-hosted-durable-artifact-receipts",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Hosted-only public scanner receipt upload/readback before effect hooks",
+  "engines": {"node": ">=20"},
+  "dependencies": {"@actions/artifact": "2.3.2", "@actions/core": "1.11.1"}
+}

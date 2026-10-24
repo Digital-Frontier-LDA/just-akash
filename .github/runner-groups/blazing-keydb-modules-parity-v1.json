@@ -1,0 +1,13 @@
+{
+  "name": "blazing-keydb-modules-parity-v1",
+  "visibility": "selected",
+  "selected_repository_ids": [
+    1074974924
+  ],
+  "runners": [],
+  "allows_public_repositories": false,
+  "restricted_to_workflows": true,
+  "selected_workflows": [
+    "Borduas-Holdings/blazing/.github/workflows/keydb-modules-parity.yml@refs/heads/main"
+  ]
+}
