@@ -696,8 +696,70 @@ def validate_private_blazing_profile(profile: str) -> str:
     return label
 
 
+def validate_private_scanner_profile(profile: str) -> str:
+    """The BB native scanner uses private E71, hosted SOPS, and no reader secret in the guest."""
+    values = os.environ
+    expected = {
+        "RUNNER_PRIVATE_PROFILE": "bb-native-trufflehog",
+        "RUNNER_PUBLIC_PROFILE": "",
+        "RUNNER_IMAGE": "",
+        "RUNNER_REGISTRY_HOST": "https://index.docker.io/v1/",
+        "RUNNER_REGISTRY_USERNAME": "jobordu",
+        "RUNNER_REGISTRY_PASSWORD": "",
+        "PRIVATE_PROFILE_SOPS": "true",
+        "PRIVATE_PROFILE_AGE_PRESENT": "true",
+        "PRIVATE_PROFILE_PASSWORD_PRESENT": "false",
+        "RUNNER_NATIVE_PULL_READER": "false",
+        "RUNNER_NATIVE_REPOSITORY_SCOPE": "false",
+        "RUNNER_ENVIRONMENT": "github-hosted",
+        "GITHUB_REPOSITORY": "Borduas-Holdings/Blazing-Back",
+        "PRIVATE_PROFILE_SOURCE": "Digital-Frontier-LDA/just-akash",
+        "PRIVATE_PROFILE_ORG": "Borduas-Holdings",
+        "PRIVATE_PROFILE_EPHEMERAL": "true",
+        "PRIVATE_PROFILE_POOL_SIZE": "1",
+        "PRIVATE_PROFILE_MIN_POOL_SIZE": "1",
+        "PRIVATE_PROFILE_CPU": "4",
+        "PRIVATE_PROFILE_MEMORY": "16Gi",
+        "PRIVATE_PROFILE_STORAGE": "96Gi",
+        "SCANNER_NATIVE_ADMITTED": "true",
+    }
+    if profile != "bb-native-trufflehog" or any(
+        values.get(k, "") != v for k, v in expected.items()
+    ):
+        raise ValueError("Private native scanner profile was not verified")
+    run, attempt = values.get("GITHUB_RUN_ID", ""), values.get("GITHUB_RUN_ATTEMPT", "")
+    if any(
+        re.fullmatch(r"[1-9][0-9]{0,19}", v) is None or int(v) > 2**64 - 1 for v in (run, attempt)
+    ):
+        raise ValueError("Private native scanner profile was not verified")
+    if (
+        values.get("PRIVATE_PROFILE_LABEL"),
+        values.get("PRIVATE_PROFILE_PLACEMENT"),
+        values.get("PRIVATE_PROFILE_TAG_PREFIX"),
+    ) != (
+        f"trufflehog-{run}-{attempt}",
+        f"borduas-native-trufflehog-run-{run}-end",
+        "ci-blazing-back-native-trufflehog",
+    ):
+        raise ValueError("Private native scanner profile was not verified")
+    try:
+        owners = json.loads(values.get("PRIVATE_PROFILE_OWNED_PROVIDERS", ""))
+    except (ValueError, TypeError):
+        raise ValueError("Private native scanner profile was not verified") from None
+    if (
+        not isinstance(owners, list)
+        or len(owners) != 3
+        or any(type(v) is not str for v in owners)
+        or set(owners) != NATIVE_READER_PROVIDERS
+    ):
+        raise ValueError("Private native scanner profile was not verified")
+    return f"trufflehog-{run}-{attempt}"
+
+
 def validate_private_profile(profile: str) -> str:
     """Admit fixed BB roles with hosted SOPS transport and standard SDL credentials."""
+    if profile == "bb-native-trufflehog":
+        return validate_private_scanner_profile(profile)
     if profile == "blazing-aaf":
         return validate_private_blazing_profile(profile)
     values = os.environ
@@ -944,7 +1006,9 @@ def configure(
                 path,
                 label,
                 selected_image=(
-                    PRIVATE_BLAZING_AAF_IMAGE
+                    NATIVE_READER_IMAGE
+                    if private_profile == "bb-native-trufflehog"
+                    else PRIVATE_BLAZING_AAF_IMAGE
                     if private_profile == "blazing-aaf"
                     else PRIVATE_BB_CE1_IMAGE
                 ),

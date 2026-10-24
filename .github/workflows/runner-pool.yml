@@ -502,6 +502,7 @@ jobs:
     # headroom above every observed pool run while still ending a stuck one.
     timeout-minutes: 120
     outputs:
+      scanner-native-admitted: ${{ steps.scanner_caller.outputs.admitted }}
       dseq: ${{ steps.provision.outputs.dseq }}
       deployment_outcome: ${{ steps.provision.outputs.deployment_outcome || steps.public_profile.outputs.deployment_outcome || steps.private_profile.outputs.deployment_outcome || (steps.pat.outputs.native_pre_create_refused == 'true' && 'no-deployment' || '') }}
       create_ambiguous: ${{ steps.provision.outputs.create_ambiguous }}
@@ -547,6 +548,63 @@ jobs:
           ref: ${{ inputs.just-akash-ref }}
           path: .just-akash
           persist-credentials: false
+
+      - name: Admit the private scanner native caller
+        id: scanner_caller
+        if: inputs.runner-private-profile == 'bb-native-trufflehog'
+        env:
+          GH_TOKEN: ${{ secrets.GH_RUNNER_PAT }}
+          SCANNER_ADMISSION_STEP: Admit the private scanner native caller
+          ORG: ${{ inputs.github-org }}
+          RUNNER_PRIVATE_PROFILE: ${{ inputs.runner-private-profile }}
+          NATIVE_CALLER_CONTRACT: ${{ 'bb-native-trufflehog/v1' }}
+          NATIVE_CALLER_SDK_REF: ${{ inputs.just-akash-ref }}
+          NATIVE_CALLER_SDK_REPOSITORY: ${{ inputs.just-akash-repository }}
+          NATIVE_CALLER_REPOSITORY_SCOPE: ${{ inputs.runner-native-repository-scope }}
+          NATIVE_CALLER_PULL_READER: ${{ inputs.runner-native-pull-reader }}
+          NATIVE_CALLER_REGISTRY_SOPS: ${{ inputs.runner-registry-sops }}
+          NATIVE_CALLER_CREDENTIALS_SOPS: ${{ inputs.credentials-sops }}
+          SCANNER_POOL_SIZE: ${{ inputs.pool-size }}
+          SCANNER_MIN_POOL_SIZE: ${{ inputs.min-pool-size }}
+          SCANNER_CPU: ${{ inputs.cpu }}
+          SCANNER_MEMORY: ${{ inputs.memory }}
+          SCANNER_STORAGE: ${{ inputs.storage }}
+          SCANNER_EPHEMERAL: ${{ inputs.ephemeral }}
+          SCANNER_PROVIDER_SELECT: ${{ inputs.provider-select }}
+          SCANNER_IMAGE: ${{ inputs.runner-image }}
+          SCANNER_REGISTRY_HOST: ${{ inputs.runner-registry-host }}
+          SCANNER_REGISTRY_USERNAME: ${{ inputs.runner-registry-username }}
+          SCANNER_AGE_PRESENT: ${{ secrets.RUNNER_REGISTRY_AGE_KEY != '' }}
+          SCANNER_PASSWORD_PRESENT: ${{ secrets.RUNNER_REGISTRY_PASSWORD != '' }}
+          SCANNER_LABEL: ${{ inputs.runner-label }}
+          SCANNER_PLACEMENT: ${{ inputs.placement-key }}
+          SCANNER_TAG_PREFIX: ${{ inputs.tag-prefix }}
+          SCANNER_OWNED_PROVIDERS: ${{ inputs.owned-providers }}
+        run: |
+          python3 -I -B -c 'import hashlib,os,stat
+          from pathlib import Path
+          def identity(info):
+              values=(info.st_dev,info.st_ino,info.st_mode,info.st_uid,info.st_gid,info.st_nlink,info.st_size,info.st_mtime_ns,info.st_ctime_ns)
+              if not all(type(value) is int for value in values):
+                  raise SystemExit('"'"'Optional hosted caller source was not verified'"'"')
+              return values
+          path=Path('"'"'just_akash/runner_scanner_caller.py'"'"')
+          fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC)
+          try:
+              before=os.fstat(fd)
+              if identity(path.lstat())!=identity(before):
+                  raise SystemExit('"'"'Optional hosted caller source was not verified'"'"')
+              raw=os.pread(fd,65537,0)
+              if not stat.S_ISREG(before.st_mode) or before.st_uid!=os.getuid() or before.st_nlink!=1 or not 0<len(raw)<=65536 or len(raw)!=before.st_size:
+                  raise SystemExit('"'"'Optional hosted caller source was not verified'"'"')
+              if hashlib.sha256(raw).hexdigest()!='"'"'4875674d499a72f3385e13fafc1e5d6471a52573f6c5c263dc68e151392fa1cc'"'"' or identity(os.fstat(fd))!=identity(before) or identity(path.lstat())!=identity(before):
+                  raise SystemExit('"'"'Optional hosted caller source was not verified'"'"')
+              namespace={'"'"'__name__'"'"':'"'"'fixed_hosted_caller'"'"','"'"'__file__'"'"':str(path)}
+              exec(compile(raw,str(path),'"'"'exec'"'"'),namespace)
+              namespace['"'"'main'"'"']()
+          finally:
+              os.close(fd)'
+          echo admitted=true >> "$GITHUB_OUTPUT"
 
       # credentials-sops: only the ciphertext, from the caller's exact revision. ONE run step,
       # on purpose. It must precede the PAT preflight (which reads the PAT it loads), and the
@@ -657,6 +715,31 @@ jobs:
       - name: Preflight — the runner PAT must still be valid
         id: pat
         env:
+          RUNNER_PRIVATE_PROFILE: ${{ inputs.runner-private-profile }}
+          NATIVE_CALLER_CONTRACT: ${{ 'bb-native-trufflehog/v1' }}
+          NATIVE_CALLER_SDK_REF: ${{ inputs.just-akash-ref }}
+          NATIVE_CALLER_SDK_REPOSITORY: ${{ inputs.just-akash-repository }}
+          NATIVE_CALLER_REPOSITORY_SCOPE: ${{ inputs.runner-native-repository-scope }}
+          NATIVE_CALLER_PULL_READER: ${{ inputs.runner-native-pull-reader }}
+          NATIVE_CALLER_REGISTRY_SOPS: ${{ inputs.runner-registry-sops }}
+          NATIVE_CALLER_CREDENTIALS_SOPS: ${{ inputs.credentials-sops }}
+          SCANNER_POOL_SIZE: ${{ inputs.pool-size }}
+          SCANNER_MIN_POOL_SIZE: ${{ inputs.min-pool-size }}
+          SCANNER_CPU: ${{ inputs.cpu }}
+          SCANNER_MEMORY: ${{ inputs.memory }}
+          SCANNER_STORAGE: ${{ inputs.storage }}
+          SCANNER_EPHEMERAL: ${{ inputs.ephemeral }}
+          SCANNER_PROVIDER_SELECT: ${{ inputs.provider-select }}
+          SCANNER_IMAGE: ${{ inputs.runner-image }}
+          SCANNER_REGISTRY_HOST: ${{ inputs.runner-registry-host }}
+          SCANNER_REGISTRY_USERNAME: ${{ inputs.runner-registry-username }}
+          SCANNER_AGE_PRESENT: ${{ secrets.RUNNER_REGISTRY_AGE_KEY != '' }}
+          SCANNER_PASSWORD_PRESENT: ${{ secrets.RUNNER_REGISTRY_PASSWORD != '' }}
+          SCANNER_LABEL: ${{ inputs.runner-label }}
+          SCANNER_PLACEMENT: ${{ inputs.placement-key }}
+          SCANNER_TAG_PREFIX: ${{ inputs.tag-prefix }}
+          SCANNER_OWNED_PROVIDERS: ${{ inputs.owned-providers }}
+          SCANNER_ADMISSION_STEP: Preflight — the runner PAT must still be valid
           GH_TOKEN: ${{ secrets.GH_RUNNER_PAT || env.GH_RUNNER_PAT }}
           ORG: ${{ inputs.github-org }}
           RUNNER_NATIVE_PULL_READER: ${{ inputs.runner-native-pull-reader }}
@@ -664,6 +747,31 @@ jobs:
           READER_SOPS: ${{ inputs.runner-registry-sops }}
           CALLER: ${{ github.repository }}
         run: |
+          if [ "${RUNNER_PRIVATE_PROFILE:-}" = bb-native-trufflehog ]; then
+            python3 -I -B -c 'import hashlib,os,stat
+            from pathlib import Path
+            def identity(info):
+                values=(info.st_dev,info.st_ino,info.st_mode,info.st_uid,info.st_gid,info.st_nlink,info.st_size,info.st_mtime_ns,info.st_ctime_ns)
+                if not all(type(value) is int for value in values):
+                    raise SystemExit('"'"'Optional hosted caller source was not verified'"'"')
+                return values
+            path=Path('"'"'just_akash/runner_scanner_caller.py'"'"')
+            fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC)
+            try:
+                before=os.fstat(fd)
+                if identity(path.lstat())!=identity(before):
+                    raise SystemExit('"'"'Optional hosted caller source was not verified'"'"')
+                raw=os.pread(fd,65537,0)
+                if not stat.S_ISREG(before.st_mode) or before.st_uid!=os.getuid() or before.st_nlink!=1 or not 0<len(raw)<=65536 or len(raw)!=before.st_size:
+                    raise SystemExit('"'"'Optional hosted caller source was not verified'"'"')
+                if hashlib.sha256(raw).hexdigest()!='"'"'4875674d499a72f3385e13fafc1e5d6471a52573f6c5c263dc68e151392fa1cc'"'"' or identity(os.fstat(fd))!=identity(before) or identity(path.lstat())!=identity(before):
+                    raise SystemExit('"'"'Optional hosted caller source was not verified'"'"')
+                namespace={'"'"'__name__'"'"':'"'"'fixed_hosted_caller'"'"','"'"'__file__'"'"':str(path)}
+                exec(compile(raw,str(path),'"'"'exec'"'"'),namespace)
+                namespace['"'"'main'"'"']()
+            finally:
+                os.close(fd)'
+          fi
           set -uo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
             echo "failure_reason=RUNNER_PAT_MISSING" >> "$GITHUB_OUTPUT"
@@ -906,6 +1014,7 @@ jobs:
         env:
           RUNNER_PUBLIC_PROFILE: ${{ inputs.runner-public-profile }}
           RUNNER_PRIVATE_PROFILE: ${{ inputs.runner-private-profile }}
+          SCANNER_NATIVE_ADMITTED: ${{ steps.scanner_caller.outputs.admitted }}
           PRIVATE_PROFILE_SOURCE: ${{ inputs.just-akash-repository }}
           PRIVATE_PROFILE_ORG: ${{ inputs.github-org }}
           PRIVATE_PROFILE_POOL_SIZE: ${{ inputs.pool-size }}
@@ -1267,6 +1376,7 @@ jobs:
         env:
           RUNNER_PUBLIC_PROFILE: ${{ inputs.runner-public-profile }}
           RUNNER_PRIVATE_PROFILE: ${{ inputs.runner-private-profile }}
+          SCANNER_NATIVE_ADMITTED: ${{ steps.scanner_caller.outputs.admitted }}
           PRIVATE_PROFILE_SOURCE: ${{ inputs.just-akash-repository }}
           PRIVATE_PROFILE_ORG: ${{ inputs.github-org }}
           PRIVATE_PROFILE_POOL_SIZE: ${{ inputs.pool-size }}
@@ -1306,6 +1416,7 @@ jobs:
         env:
           RUNNER_PUBLIC_PROFILE: ${{ inputs.runner-public-profile }}
           RUNNER_PRIVATE_PROFILE: ${{ inputs.runner-private-profile }}
+          SCANNER_NATIVE_ADMITTED: ${{ steps.scanner_caller.outputs.admitted }}
           PRIVATE_PROFILE_SOURCE: ${{ inputs.just-akash-repository }}
           PRIVATE_PROFILE_ORG: ${{ inputs.github-org }}
           PRIVATE_PROFILE_POOL_SIZE: ${{ inputs.pool-size }}
@@ -1359,6 +1470,31 @@ jobs:
       - name: Provision (retry down candidates, tag before waiting)
         id: provision
         env:
+          RUNNER_PRIVATE_PROFILE: ${{ inputs.runner-private-profile }}
+          NATIVE_CALLER_CONTRACT: ${{ 'bb-native-trufflehog/v1' }}
+          NATIVE_CALLER_SDK_REF: ${{ inputs.just-akash-ref }}
+          NATIVE_CALLER_SDK_REPOSITORY: ${{ inputs.just-akash-repository }}
+          NATIVE_CALLER_REPOSITORY_SCOPE: ${{ inputs.runner-native-repository-scope }}
+          NATIVE_CALLER_PULL_READER: ${{ inputs.runner-native-pull-reader }}
+          NATIVE_CALLER_REGISTRY_SOPS: ${{ inputs.runner-registry-sops }}
+          NATIVE_CALLER_CREDENTIALS_SOPS: ${{ inputs.credentials-sops }}
+          SCANNER_POOL_SIZE: ${{ inputs.pool-size }}
+          SCANNER_MIN_POOL_SIZE: ${{ inputs.min-pool-size }}
+          SCANNER_CPU: ${{ inputs.cpu }}
+          SCANNER_MEMORY: ${{ inputs.memory }}
+          SCANNER_STORAGE: ${{ inputs.storage }}
+          SCANNER_EPHEMERAL: ${{ inputs.ephemeral }}
+          SCANNER_PROVIDER_SELECT: ${{ inputs.provider-select }}
+          SCANNER_IMAGE: ${{ inputs.runner-image }}
+          SCANNER_REGISTRY_HOST: ${{ inputs.runner-registry-host }}
+          SCANNER_REGISTRY_USERNAME: ${{ inputs.runner-registry-username }}
+          SCANNER_AGE_PRESENT: ${{ secrets.RUNNER_REGISTRY_AGE_KEY != '' }}
+          SCANNER_PASSWORD_PRESENT: ${{ secrets.RUNNER_REGISTRY_PASSWORD != '' }}
+          SCANNER_LABEL: ${{ inputs.runner-label }}
+          SCANNER_PLACEMENT: ${{ inputs.placement-key }}
+          SCANNER_TAG_PREFIX: ${{ inputs.tag-prefix }}
+          SCANNER_OWNED_PROVIDERS: ${{ inputs.owned-providers }}
+          SCANNER_ADMISSION_STEP: Provision (retry down candidates, tag before waiting)
           AKASH_API_KEY: ${{ secrets.AKASH_API_KEY || env.AKASH_API_KEY }}
           AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS || env.AKASH_API_KEYS }}
           GH_TOKEN: ${{ secrets.GH_RUNNER_PAT || env.GH_RUNNER_PAT }}
@@ -1381,6 +1517,34 @@ jobs:
           RUNNER_NATIVE_REPOSITORY_SCOPE: ${{ inputs.runner-native-repository-scope }}
         run: |
           set -uo pipefail
+
+          verify_scanner_caller() {
+            if [ "${RUNNER_PRIVATE_PROFILE:-}" = bb-native-trufflehog ]; then
+              python3 -I -B -c 'import hashlib,os,stat
+              from pathlib import Path
+              def identity(info):
+                  values=(info.st_dev,info.st_ino,info.st_mode,info.st_uid,info.st_gid,info.st_nlink,info.st_size,info.st_mtime_ns,info.st_ctime_ns)
+                  if not all(type(value) is int for value in values):
+                      raise SystemExit('"'"'Optional hosted caller source was not verified'"'"')
+                  return values
+              path=Path('"'"'just_akash/runner_scanner_caller.py'"'"')
+              fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC)
+              try:
+                  before=os.fstat(fd)
+                  if identity(path.lstat())!=identity(before):
+                      raise SystemExit('"'"'Optional hosted caller source was not verified'"'"')
+                  raw=os.pread(fd,65537,0)
+                  if not stat.S_ISREG(before.st_mode) or before.st_uid!=os.getuid() or before.st_nlink!=1 or not 0<len(raw)<=65536 or len(raw)!=before.st_size:
+                      raise SystemExit('"'"'Optional hosted caller source was not verified'"'"')
+                  if hashlib.sha256(raw).hexdigest()!='"'"'4875674d499a72f3385e13fafc1e5d6471a52573f6c5c263dc68e151392fa1cc'"'"' or identity(os.fstat(fd))!=identity(before) or identity(path.lstat())!=identity(before):
+                      raise SystemExit('"'"'Optional hosted caller source was not verified'"'"')
+                  namespace={'"'"'__name__'"'"':'"'"'fixed_hosted_caller'"'"','"'"'__file__'"'"':str(path)}
+                  exec(compile(raw,str(path),'"'"'exec'"'"'),namespace)
+                  namespace['"'"'main'"'"']()
+              finally:
+                  os.close(fd)'
+            fi
+          }
 
           # Fail closed before the first possible submit. Every branch inherits UNKNOWN;
           # only the enumerated no-broadcast sites below may narrow it to no-deployment.
@@ -1616,6 +1780,7 @@ jobs:
               echo '::endgroup::'; exit 1
             fi
             RC=0
+            verify_scanner_caller || exit 1
             RESP=$(gh api --method POST "${RUNNER_COLLECTION}/registration-token" -i 2>&1) || RC=$?
             RUNNER_TOKEN=""
             if [[ "$RESP" =~ \"token\"\ *:\ *\"([^\"]*)\" ]]; then RUNNER_TOKEN="${BASH_REMATCH[1]}"; fi
@@ -1672,6 +1837,7 @@ jobs:
             fi
             rm -f /tmp/ja.log
             DEPLOY_RC=0
+            verify_scanner_caller || exit 1
             AKASH_PROVIDERS='' AKASH_PROVIDERS_BACKUP='' "${JA[@]}" deploy --sdl /tmp/runner-sdl.minted.yaml --deposit "$REQUIRED_DEPOSIT_USD" --bid-wait 60 \
               --bid-wait-retry 120 "${SELECT_ARGS[@]}" "${PROV_ARGS[@]}" 2>&1 | tee /tmp/ja.log || DEPLOY_RC=${PIPESTATUS[0]}
             rm -f /tmp/runner-sdl.minted.yaml
@@ -2246,6 +2412,7 @@ jobs:
             # accused a host that did nothing wrong. A preflight failing a run is
             # recoverable; a fabricated provider fault is somebody else's reputation.
             VERDICT_RC=0
+            verify_scanner_caller || exit 1
             VERDICT_RESP=$(gh api --method POST "${RUNNER_COLLECTION}/registration-token" -i 2>&1) || VERDICT_RC=$?
             # Same live-credential masking as the preflight; this response body carries
             # a registration token on success.
@@ -2461,7 +2628,7 @@ jobs:
   teardown:
     name: Roll back failed or cancelled pool provisioning
     needs: [pool]
-    if: always() && needs.pool.result != 'success'
+    if: ${{ always() && needs.pool.result != 'success' && (inputs.runner-private-profile != 'bb-native-trufflehog' || needs.pool.outputs.scanner-native-admitted == 'true') }}
     # ⛔ FULL PATH AT A PINNED SHA, NEVER `./`. A reusable workflow's job runs in the
     # CALLER's context, so a bare `./` resolves inside the CALLER's tree — where this
     # file does not exist. The job then cannot be created, the graph cannot be built,
