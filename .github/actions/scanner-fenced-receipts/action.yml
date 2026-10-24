@@ -1,0 +1,49 @@
+name: Scanner durable receipts
+description: Run the fixed hosted scanner-v2 controller with acknowledged immutable public receipts
+inputs:
+  python-path:
+    description: Fixed RUNNER_TEMP/scanner-v2-python/bin/python venv; reviewed hosted uv Python 3.13.9
+    required: true
+  sdk-sha:
+    description: Exact reviewed SDK source revision; also verified in native referenced workflows
+    required: true
+  producer-job-id:
+    description: Actual current hosted scanner-v2 native job ID, independently resolved by the workflow
+    required: true
+  github-token:
+    description: Hosted actions-read token used only for native producer and artifact metadata readback
+    required: true
+runs:
+  using: node20
+  main: index.cjs
+outputs:
+  dseq:
+    description: Candidate deployment DSEQ from the acknowledged controller; never standalone close authority
+  wallet_address:
+    description: Candidate public owner address
+  returned_runner_id:
+    description: Native runner ID returned by the acknowledged JIT request
+  runner-targets:
+    description: Exact public current-run runner target labels
+  deployment_outcome:
+    description: Controller's typed deployment observation
+  create_ambiguous:
+    description: Whether create remains UNKNOWN
+  provision_healthy:
+    description: Controller's actual readiness observation
+  cleanup_qualified:
+    description: Explicit cleanup observation; source publication does not qualify cleanup
+  jit_ack_record_sha256:
+    description: Public JIT ACK record commitment
+  deployment_ack_record_sha256:
+    description: Public deployment ACK record commitment
+  lease_ack_record_sha256:
+    description: Public lease-binding ACK record commitment
+  deployment_group:
+    description: Exact run, attempt and SDK-round placement group
+  runners_online:
+    description: Exact returned-ID readiness observation
+  no_create_record_sha256:
+    description: Public terminal fence body commitment; never authority alone
+  no_create_artifact_id:
+    description: Public immutable terminal receipt ID; requires native reader joins

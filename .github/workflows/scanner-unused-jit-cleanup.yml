@@ -1,0 +1,119 @@
+name: Positively fenced unused-JIT cleanup
+on:
+  workflow_call:
+    inputs:
+      just-akash-ref:
+        type: string
+        required: true
+      mode:
+        type: string
+        required: true
+      target-run-id:
+        type: string
+        required: true
+      target-run-attempt:
+        type: string
+        required: true
+      target-sdk-round:
+        type: string
+        default: '1'
+    secrets:
+      GH_RUNNER_PAT:
+        required: false
+    outputs:
+      unused_jit_qualified:
+        value: ${{ jobs.cleanup.outputs.unused_jit_qualified }}
+      registration_absent:
+        value: ${{ jobs.cleanup.outputs.registration_absent }}
+      returned_runner_id:
+        value: ${{ jobs.cleanup.outputs.returned_runner_id }}
+permissions:
+  contents: read
+jobs:
+  cleanup:
+    name: Close scanner-v2 known identities scanner-v2-${{ inputs.target-run-id }}-a${{ inputs.target-run-attempt }}-r${{ inputs.target-sdk-round }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+    concurrency:
+      group: bb-native-trufflehog-v2-cleanup-${{ inputs.target-run-id }}-a${{ inputs.target-run-attempt }}-r${{ inputs.target-sdk-round }}
+      cancel-in-progress: false
+    outputs:
+      unused_jit_qualified: ${{ steps.cleanup.outputs.unused_jit_qualified }}
+      registration_absent: ${{ steps.cleanup.outputs.registration_absent }}
+      returned_runner_id: ${{ steps.cleanup.outputs.returned_runner_id }}
+    steps:
+      - name: Refuse unsupported cleanup caller before checkout or management credentials
+        shell: bash
+        env:
+          SDK_SHA: ${{ inputs.just-akash-ref }}
+          MODE: ${{ inputs.mode }}
+          TARGET_RUN: ${{ inputs.target-run-id }}
+          TARGET_ATTEMPT: ${{ inputs.target-run-attempt }}
+          TARGET_ROUND: ${{ inputs.target-sdk-round }}
+        run: |
+          set -euo pipefail
+          [[ "$SDK_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$TARGET_RUN" =~ ^[1-9][0-9]{0,18}$ && "$TARGET_ATTEMPT" =~ ^[1-9][0-9]{0,18}$ && "$TARGET_ROUND" =~ ^[1-3]$ ]]
+          [[ "$GITHUB_REPOSITORY" == 'Borduas-Holdings/Blazing-Back' && "$GITHUB_REF" == 'refs/heads/main' && "$GITHUB_JOB" == 'cleanup' && "$RUNNER_ENVIRONMENT" == 'github-hosted' ]]
+          case "$MODE:$GITHUB_EVENT_NAME" in
+            terminal:workflow_run)
+              [[ "$GITHUB_WORKFLOW_REF" == 'Borduas-Holdings/Blazing-Back/.github/workflows/native-scanner-v2-cleanup.yml@refs/heads/main' ]]
+              ;;
+            *) exit 1 ;;
+          esac
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Digital-Frontier-LDA/just-akash
+          ref: ${{ inputs.just-akash-ref }}
+          path: .just-akash
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4
+      - name: Install the same pinned cleanup SDK in a private hosted interpreter
+        id: python
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv python install 3.13.9
+          uv venv --python 3.13.9 "$RUNNER_TEMP/scanner-v2-cleanup-python"
+          uv pip install --python "$RUNNER_TEMP/scanner-v2-cleanup-python/bin/python" ./.just-akash
+          printf 'python-path=%s\n' "$RUNNER_TEMP/scanner-v2-cleanup-python/bin/python" >> "$GITHUB_OUTPUT"
+      - name: Resolve actual current actor native job and head
+        id: actor
+        shell: bash
+        env:
+          NATIVE_READ_TOKEN: ${{ github.token }}
+          CLEANUP_PYTHON: ${{ steps.python.outputs.python-path }}
+          SCANNER_CLEANUP_SDK_SHA: ${{ inputs.just-akash-ref }}
+          SCANNER_TARGET_RUN_ID: ${{ inputs.target-run-id }}
+          SCANNER_TARGET_RUN_ATTEMPT: ${{ inputs.target-run-attempt }}
+          SCANNER_TARGET_ROUND: ${{ inputs.target-sdk-round }}
+        run: |
+          set -euo pipefail
+          "$CLEANUP_PYTHON" -I -c 'import os; from just_akash.scanner_unused_cleanup_native import NativeGET,resolve_actor_job; values=resolve_actor_job(os.environ,NativeGET(os.environ["NATIVE_READ_TOKEN"])); output=open(os.environ["GITHUB_OUTPUT"],"a",encoding="utf-8"); [output.write(k+"="+v+"\n") for k,v in values.items()]; output.close()'
+      - name: Install the immutable cleanup receipt action dependencies
+        working-directory: .just-akash/.github/actions/scanner-unused-jit-cleanup-receipts
+        shell: bash
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Run the acknowledged scanner-v2 cleanup controller
+        id: cleanup
+        uses: ./.just-akash/.github/actions/scanner-unused-jit-cleanup-receipts
+        with:
+          python-path: ${{ steps.python.outputs.python-path }}
+          sdk-sha: ${{ inputs.just-akash-ref }}
+          actor-job-id: ${{ steps.actor.outputs.actor-job-id }}
+          native-head-sha: ${{ steps.actor.outputs.native-head-sha }}
+          mode: ${{ inputs.mode }}
+          target-run-id: ${{ inputs.target-run-id }}
+          target-run-attempt: ${{ inputs.target-run-attempt }}
+          target-sdk-round: ${{ inputs.target-sdk-round }}
+          github-token: ${{ github.token }}
+        env:
+          SCANNER_CLEANUP_SDK_SHA: ${{ inputs.just-akash-ref }}
+          SCANNER_ACTOR_JOB_ID: ${{ steps.actor.outputs.actor-job-id }}
+          SCANNER_TARGET_RUN_ID: ${{ inputs.target-run-id }}
+          SCANNER_TARGET_RUN_ATTEMPT: ${{ inputs.target-run-attempt }}
+          SCANNER_TARGET_ROUND: ${{ inputs.target-sdk-round }}
+          GH_TOKEN: ${{ secrets.GH_RUNNER_PAT }}

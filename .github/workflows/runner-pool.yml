@@ -378,18 +378,18 @@ on:
     outputs:
       dseq:
         description: 'Deployment sequence number; empty when no lease survived.'
-        value: ${{ (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled') && jobs.scanner_v2.outputs.dseq || jobs.pool.outputs.dseq }}
+        value: ${{ (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-fenced') && jobs.scanner_v2.outputs.dseq || jobs.pool.outputs.dseq }}
       deployment_outcome:
         description: >-
           Typed create outcome: created only with a parsed DSEQ, no-deployment only on
           an authoritative pre-create/no-broadcast branch, unknown otherwise.
-        value: ${{ (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled') && jobs.scanner_v2.outputs.deployment_outcome || jobs.pool.outputs.deployment_outcome }}
+        value: ${{ (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-fenced') && jobs.scanner_v2.outputs.deployment_outcome || jobs.pool.outputs.deployment_outcome }}
       create_ambiguous:
         description: >-
           'true' when a later create request may have committed without returning an
           identity. The published dseq is then only the last KNOWN lease: teardown must
           close it and still fail HELD, because a second deployment may exist.
-        value: ${{ (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled') && jobs.scanner_v2.outputs.create_ambiguous || jobs.pool.outputs.create_ambiguous }}
+        value: ${{ (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-fenced') && jobs.scanner_v2.outputs.create_ambiguous || jobs.pool.outputs.create_ambiguous }}
       held_reason:
         description: 'Why rollback was HELD without closure authority.'
         value: ${{ jobs.teardown.outputs.held_reason }}
@@ -401,15 +401,15 @@ on:
         value: ${{ jobs.teardown.outputs.held_deployment_group }}
       provision_healthy:
         description: "'true' iff a usable pool came online. Key your fallback on this."
-        value: ${{ (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled') && jobs.scanner_v2.outputs.provision_healthy || jobs.pool.outputs.provision_healthy }}
+        value: ${{ (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-fenced') && jobs.scanner_v2.outputs.provision_healthy || jobs.pool.outputs.provision_healthy }}
       runners_online:
         description: 'Distinct online runners as "K/N".'
-        value: ${{ (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled') && jobs.scanner_v2.outputs.runners_online || jobs.pool.outputs.runners_online }}
+        value: ${{ (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-fenced') && jobs.scanner_v2.outputs.runners_online || jobs.pool.outputs.runners_online }}
       runner-targets:
         description: >-
           JSON array for the caller's runs-on: the pool's labels when healthy, else
           ["ubuntu-latest"]. Consume with fromJSON.
-        value: ${{ (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled') && jobs.scanner_v2.outputs.runner-targets || jobs.pool.outputs.runner-targets }}
+        value: ${{ (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-fenced') && jobs.scanner_v2.outputs.runner-targets || jobs.pool.outputs.runner-targets }}
       failure_reason:
         description: >-
           WHY a fallback happened, when it did. One of RUNNER_PAT_MISSING,
@@ -480,12 +480,12 @@ on:
         description: >-
           The Akash account that actually provisioned this pool. Teardown locates the
           DSEQ owner across the supplied pool instead of re-deriving a positional choice.
-        value: ${{ (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled') && jobs.scanner_v2.outputs.wallet_address || jobs.pool.outputs.wallet_address }}
+        value: ${{ (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-fenced') && jobs.scanner_v2.outputs.wallet_address || jobs.pool.outputs.wallet_address }}
       deployment_group:
         description: >-
           The final submitted group_spec.name after runner-pool applies its run stamp.
           Published independently of provisioning success for bound rollback and teardown.
-        value: ${{ (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled') && jobs.scanner_v2.outputs.deployment_group || jobs.pool.outputs.deployment_group }}
+        value: ${{ (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-fenced') && jobs.scanner_v2.outputs.deployment_group || jobs.pool.outputs.deployment_group }}
       runner_hosts_proven:
         description: >-
           Supplied providers marked runner_host and not runner_deny. Below 3, one silent
@@ -513,7 +513,7 @@ permissions:
 
 jobs:
   pool:
-    if: inputs.runner-private-profile != 'bb-native-trufflehog-v2' && inputs.runner-private-profile != 'bb-native-trufflehog-v2-reconciled'
+    if: inputs.runner-private-profile != 'bb-native-trufflehog-v2' && inputs.runner-private-profile != 'bb-native-trufflehog-v2-reconciled' && inputs.runner-private-profile != 'bb-native-trufflehog-v2-fenced'
     name: Provision ephemeral runner pool on Akash
     runs-on: ubuntu-latest
     # ⛔ MUST EXCEED the owner-lookup deadline + close/audit margin (see
@@ -2649,7 +2649,7 @@ jobs:
   # this predicate does not make cancellation delivery or output retention reliable.
   scanner_v2:
     name: Provision scanner-v2 through acknowledged JIT
-    if: (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled')
+    if: (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-fenced')
     runs-on: ubuntu-latest
     timeout-minutes: 40
     permissions:
@@ -2701,14 +2701,14 @@ jobs:
           uv pip install --python "$RUNNER_TEMP/scanner-v2-python/bin/python" ./.just-akash
           printf 'python-path=%s\n' "$RUNNER_TEMP/scanner-v2-python/bin/python" >> "$GITHUB_OUTPUT"
       - name: Set up pinned hosted protocol compiler
-        if: inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled'
+        if: inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-fenced'
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
         with:
           go-version: '1.25.4'
           check-latest: false
           cache: false
       - name: Build the pinned official SDL version validator
-        if: inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled'
+        if: inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-fenced'
         id: sdl-version
         shell: bash
         run: bash .just-akash/tools/scanner-sdl-version/install-hosted.sh
@@ -2741,12 +2741,12 @@ jobs:
           install -m 0755 "$task_dir/sops" "$RUNNER_TEMP/runner-pull-bin/sops"
           printf '%s\n' "$RUNNER_TEMP/runner-pull-bin" >> "$GITHUB_PATH"
       - name: Install the hosted immutable receipt action dependencies
-        working-directory: .just-akash/.github/actions/scanner-durable-receipts
+        working-directory: .just-akash/.github/actions/scanner-fenced-receipts
         shell: bash
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Run the acknowledged scanner-v2 controller
         id: controller
-        uses: ./.just-akash/.github/actions/scanner-durable-receipts
+        uses: ./.just-akash/.github/actions/scanner-fenced-receipts
         with:
           python-path: ${{ steps.python.outputs.python-path }}
           sdk-sha: ${{ inputs.just-akash-ref }}
@@ -2788,7 +2788,7 @@ jobs:
   teardown:
     name: Roll back failed or cancelled pool provisioning
     needs: [pool]
-    if: ${{ always() && inputs.runner-private-profile != 'bb-native-trufflehog-v2' && inputs.runner-private-profile != 'bb-native-trufflehog-v2-reconciled' && needs.pool.result != 'success' && (inputs.runner-private-profile != 'bb-native-trufflehog' || needs.pool.outputs.scanner-native-admitted == 'true') }}
+    if: ${{ always() && inputs.runner-private-profile != 'bb-native-trufflehog-v2' && inputs.runner-private-profile != 'bb-native-trufflehog-v2-reconciled' && inputs.runner-private-profile != 'bb-native-trufflehog-v2-fenced' && needs.pool.result != 'success' && (inputs.runner-private-profile != 'bb-native-trufflehog' || needs.pool.outputs.scanner-native-admitted == 'true') }}
     # ⛔ FULL PATH AT A PINNED SHA, NEVER `./`. A reusable workflow's job runs in the
     # CALLER's context, so a bare `./` resolves inside the CALLER's tree — where this
     # file does not exist. The job then cannot be created, the graph cannot be built,
