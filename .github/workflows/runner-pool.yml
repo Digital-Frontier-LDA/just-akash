@@ -1054,7 +1054,7 @@ jobs:
           set -euo pipefail
           case "$RUNNER_LABEL/$PLACEMENT_KEY" in
             dfc-images-*|*/borduas-dfc-images-*)
-              if [ "${RUNNER_PRIVATE_PROFILE:-}" != bb-ce1 ] || [ "${RUNNER_PUBLIC_PROFILE:-}" != "" ] || [ "${GITHUB_REPOSITORY:-}" != Borduas-Holdings/Blazing-Back ] || [ "$ORG" != Borduas-Holdings ] || [ "$RUNNER_LABEL" != "dfc-images-${GH_RUN_ID}-${GITHUB_RUN_ATTEMPT:-}" ] || [ "$PLACEMENT_KEY" != "borduas-dfc-images-run-${GH_RUN_ID}-end" ] || [ "$POOL_SIZE" != 1 ] || [ "$EPHEMERAL" != true ] || [ "$CPU" != 4 ] || [ "$MEMORY" != 16Gi ] || [ "$STORAGE" != 96Gi ]; then
+              if { [ "${RUNNER_PRIVATE_PROFILE:-}" != bb-ce1 ] && [ "${RUNNER_PRIVATE_PROFILE:-}" != bb-dfc-e71 ]; } || [ "${RUNNER_PUBLIC_PROFILE:-}" != "" ] || [ "${GITHUB_REPOSITORY:-}" != Borduas-Holdings/Blazing-Back ] || [ "$ORG" != Borduas-Holdings ] || [ "$RUNNER_LABEL" != "dfc-images-${GH_RUN_ID}-${GITHUB_RUN_ATTEMPT:-}" ] || [ "$PLACEMENT_KEY" != "borduas-dfc-images-run-${GH_RUN_ID}-end" ] || [ "$POOL_SIZE" != 1 ] || [ "$EPHEMERAL" != true ] || [ "$CPU" != 4 ] || [ "$MEMORY" != 16Gi ] || [ "$STORAGE" != 96Gi ]; then
                 printf '%s\n' 'Private DFC runner render was not verified' >&2
                 exit 2
               fi ;;

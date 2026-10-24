@@ -696,8 +696,30 @@ def validate_private_blazing_profile(profile: str) -> str:
     return label
 
 
+def validate_private_dfc_e71_profile(profile: str) -> str:
+    """Keep current private e71 restricted to the protected DFC producer."""
+    values = os.environ
+    run = values.get("GITHUB_RUN_ID", "")
+    attempt = values.get("GITHUB_RUN_ATTEMPT", "")
+    if (
+        profile != "bb-dfc-e71"
+        or values.get("GITHUB_REPOSITORY_ID") != "1071436278"
+        or values.get("GITHUB_REF") != "refs/heads/main"
+        or values.get("GITHUB_EVENT_NAME") not in ("push", "workflow_dispatch")
+        or values.get("GITHUB_WORKFLOW_REF")
+        != "Borduas-Holdings/Blazing-Back/.github/workflows/build-dfc-images.yml@refs/heads/main"
+        or values.get("PRIVATE_PROFILE_LABEL") != f"dfc-images-{run}-{attempt}"
+    ):
+        raise ValueError("Private DFC e71 profile was not verified")
+    # Reuse all original DFC resource, placement, provider and reader guards.
+    # The legacy role remains available with its original image and behavior.
+    return validate_private_profile("bb-ce1")
+
+
 def validate_private_profile(profile: str) -> str:
     """Admit fixed BB roles with hosted SOPS transport and standard SDL credentials."""
+    if profile == "bb-dfc-e71":
+        return validate_private_dfc_e71_profile(profile)
     if profile == "blazing-aaf":
         return validate_private_blazing_profile(profile)
     values = os.environ
@@ -932,7 +954,11 @@ def configure(
             checked = _public_profile_payload(
                 path,
                 label,
-                selected_image=PRIVATE_BB_CE1_IMAGE,
+                selected_image=(
+                    NATIVE_READER_IMAGE
+                    if private_profile == "bb-dfc-e71"
+                    else PRIVATE_BB_CE1_IMAGE
+                ),
                 ephemeral=os.environ["PRIVATE_PROFILE_EPHEMERAL"],
             )
             _private_dfc_template(checked)
