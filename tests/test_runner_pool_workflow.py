@@ -613,7 +613,7 @@ def test_diag_last_code_is_fail_open_when_the_helper_cannot_be_run():
     )
 
 
-def test_diagnostic_preserved_when_a_subsequent_attempt_wipes_the_log():
+def test_diagnostic_preserved_when_a_subsequent_attempt_wipes_the_log(tmp_path):
     """LAST_KNOWN_DIAG preserves the cause across attempts whose log has been wiped.
 
     #389 follow-up. The original defect: `diag_last_code` is fail-open
@@ -792,12 +792,15 @@ EOF
         esac
         """
     )
+    # Rebase only the fixture's log paths; keep workflow source assertions intact.
+    script = script.replace("/tmp/ja.log", "./ja.log")
     proc = subprocess.run(
         [shutil.which("bash") or "/bin/bash", "-c", script],
         capture_output=True,
         text=True,
         timeout=15,
         env={**os.environ, "PATH": os.environ.get("PATH", "")},
+        cwd=tmp_path,
     )
     assert proc.returncode == 0, (
         f"diagnostic-preservation loop aborted unexpectedly. "
@@ -815,7 +818,7 @@ EOF
     )
 
 
-def test_no_provider_capacity_misattribution_when_malformed_event_precedes_valid_one():
+def test_no_provider_capacity_misattribution_when_malformed_event_precedes_valid_one(tmp_path):
     """The helper's skip-and-log-at-warning behaviour must propagate to the workflow.
 
     #389 follow-up. The helper accepts the trailing valid code even when a
@@ -852,13 +855,18 @@ EOF
         esac
         """
     )
+    script = script.replace("/tmp/ja.log", "./ja.log")
     proc = subprocess.run(
         [shutil.which("bash") or "/bin/bash", "-c", script],
         capture_output=True,
         text=True,
         timeout=15,
-        env={**os.environ, "PATH": os.environ.get("PATH", "")},
-        cwd=Path(__file__).resolve().parents[1],
+        env={
+            **os.environ,
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+        },
+        cwd=tmp_path,
     )
     assert proc.returncode == 0, (
         f"workflow-level helper invocation failed. rc={proc.returncode} "
@@ -880,7 +888,7 @@ EOF
     )
 
 
-def test_archive_walk_recovers_priors_after_helper_fail_open():
+def test_archive_walk_recovers_priors_after_helper_fail_open(tmp_path):
     """LAST_KNOWN_DIAG closes the helper-succeeded-but-DIAG_CODE-was-empty gap.
     The archive walk closes the OTHER gap: when the helper itself fails on the
     live log (uv run error → DIAG_CODE="" via fail-open), the prior attempts'
@@ -1040,12 +1048,14 @@ EOF
         esac
         """
     )
+    script = script.replace("/tmp/ja.log", "./ja.log")
     proc = subprocess.run(
         [shutil.which("bash") or "/bin/bash", "-c", script],
         capture_output=True,
         text=True,
         timeout=15,
         env={**os.environ, "PATH": os.environ.get("PATH", "")},
+        cwd=tmp_path,
     )
     assert proc.returncode == 0, (
         f"archive-walk loop aborted unexpectedly. rc={proc.returncode} "
@@ -1130,16 +1140,16 @@ def test_archive_walk_prefers_newest_at_ten_plus_attempts(tmp_path):
         f"exact path.\nBlock:\n{production_block}"
     )
 
-    # Write the production block to a temp file so its workflow
-    # indentation does not burden the Python source's line-length budget.
+    # Preserve the production control flow, rebasing only its log paths into
+    # this test's working directory so concurrent cases never share archives.
     block_file = tmp_path / "production_archive_walk.sh"
-    block_file.write_text(production_block)
+    block_file.write_text(production_block.replace("/tmp/ja.log", "./ja.log"))
 
     # Driver script (also written to a file for the same reason). Stubs
     # diag_last_code with a JSON-line parser mirroring the real helper,
     # seeds 11 archives, sources the production block, asserts the
-    # newest wins. Cleanup runs on EXIT so a mid-script failure does not
-    # leak /tmp/ja.log.* into sibling tests.
+    # newest wins. Both driver and production block use the same isolated
+    # working directory; pytest owns its cleanup even if the shell fails.
     driver_file = tmp_path / "driver.sh"
     driver_file.write_text(
         "#!/usr/bin/env bash\n"
@@ -1192,12 +1202,14 @@ def test_archive_walk_prefers_newest_at_ten_plus_attempts(tmp_path):
         'echo "POST_DIAG=$POST_DIAG"\n'
     )
 
+    driver_file.write_text(driver_file.read_text().replace("/tmp/ja.log", "./ja.log"))
     proc = subprocess.run(
         [shutil.which("bash") or "/bin/bash", str(driver_file)],
         capture_output=True,
         text=True,
         timeout=15,
         env={**os.environ, "PATH": os.environ.get("PATH", "")},
+        cwd=tmp_path,
     )
     assert proc.returncode == 0, (
         f"production archive-walk block failed. rc={proc.returncode} "
