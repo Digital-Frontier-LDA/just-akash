@@ -85,6 +85,11 @@ on:
         required: false
         type: string
         default: ''
+      runner-create-receipt-contract:
+        description: 'Optional closed Sentry production candidate journal transport; empty preserves existing callers. Upload ACK is required for callback recovery.'
+        required: false
+        type: string
+        default: ''
       runner-image:
         description: 'Optional private mirror reference. Must retain the qualified runner image digest.'
         required: false
@@ -481,6 +486,12 @@ on:
           The final submitted group_spec.name after runner-pool applies its run stamp.
           Published independently of provisioning success for bound rollback and teardown.
         value: ${{ jobs.pool.outputs.deployment_group }}
+      create-receipt-artifact-id:
+        description: 'Native uploaded source-bound create candidates, never close authority; empty is HOLD.'
+        value: ${{ jobs.pool.outputs.create-receipt-artifact-id }}
+      create-receipt-artifact-digest:
+        description: 'Complete compressed artifact SHA256; callback must verify actual native metadata before parsing.'
+        value: ${{ jobs.pool.outputs.create-receipt-artifact-digest }}
       runner_hosts_proven:
         description: >-
           Supplied providers marked runner_host and not runner_deny. Below 3, one silent
@@ -494,6 +505,12 @@ jobs:
   pool:
     name: Provision ephemeral runner pool on Akash
     runs-on: ubuntu-latest
+    env:
+      RUNNER_CREATE_RECEIPT_CONTRACT: ${{ inputs.runner-create-receipt-contract }}
+      RUNNER_RECEIPT_SDK_REF: ${{ inputs.just-akash-ref }}
+      RUNNER_RECEIPT_LABEL: ${{ inputs.runner-label }}
+      RUNNER_RECEIPT_GROUP: ${{ inputs.placement-key }}
+      RUNNER_RECEIPT_TAG: ${{ inputs.tag-prefix }}
     # ⛔ MUST EXCEED the owner-lookup deadline + close/audit margin (see
     # just_akash/owner_lookup.py: 10 + 4 = 14 min at the time of writing), pinned by
     # tests/test_owner_lookup_deadline.py. A job killed mid-cleanup by its own
@@ -502,6 +519,8 @@ jobs:
     # headroom above every observed pool run while still ending a stuck one.
     timeout-minutes: 120
     outputs:
+      create-receipt-artifact-id: ${{ steps.receipt_artifact.outputs.artifact-id }}
+      create-receipt-artifact-digest: ${{ steps.receipt_artifact.outputs.artifact-digest }}
       dseq: ${{ steps.provision.outputs.dseq }}
       deployment_outcome: ${{ steps.provision.outputs.deployment_outcome || steps.public_profile.outputs.deployment_outcome || steps.private_profile.outputs.deployment_outcome || (steps.pat.outputs.native_pre_create_refused == 'true' && 'no-deployment' || '') }}
       create_ambiguous: ${{ steps.provision.outputs.create_ambiguous }}
@@ -618,6 +637,13 @@ jobs:
             exit 1
           fi
           echo "Loaded ${loaded} runner credential(s) from ${CALLER}@${CALLER_SHA}."
+
+      - name: Admit the exact source-bound Sentry candidate receipt transport
+        id: receipt_guard
+        if: inputs.runner-create-receipt-contract != ''
+        env:
+          RUNNER_RECEIPT_READ_TOKEN: ${{ secrets.GH_RUNNER_PAT || env.GH_RUNNER_PAT }}
+        run: python3 -I just_akash/runner_create_receipt.py begin
 
       # A PAT EXPIRY MUST NOT BE SILENT. Without this the runner simply never registers,
       # the pool times out after ~15 minutes, and the run reports RUNNER_NEVER_REGISTERED
@@ -1359,6 +1385,7 @@ jobs:
       - name: Provision (retry down candidates, tag before waiting)
         id: provision
         env:
+          RUNNER_RECEIPT_READ_TOKEN: ${{ inputs.runner-create-receipt-contract != '' && (secrets.GH_RUNNER_PAT || env.GH_RUNNER_PAT) || '' }}
           AKASH_API_KEY: ${{ secrets.AKASH_API_KEY || env.AKASH_API_KEY }}
           AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS || env.AKASH_API_KEYS }}
           GH_TOKEN: ${{ secrets.GH_RUNNER_PAT || env.GH_RUNNER_PAT }}
@@ -1671,9 +1698,26 @@ jobs:
               cp /tmp/ja.log /tmp/ja.log."$attempt"
             fi
             rm -f /tmp/ja.log
+            RECEIPT_ARGS=()
+            if [ -n "${RUNNER_CREATE_RECEIPT_CONTRACT:-}" ]; then
+              # runner_create_receipt authorize is the pre-create source/native gate.
+              python3 -I just_akash/runner_create_receipt.py authorize --round "$attempt" || {
+                printf '%s\n' 'deployment_outcome=unknown' 'failure_reason=CREATE_OUTCOME_AMBIGUOUS' >> "$GITHUB_OUTPUT"
+                echo '::error::Current owned create source is unqualified; no new create'
+                exit 1
+              }
+              # Optional-mode CLI runs only authenticated captured SDK module bytes.
+              DEPLOY_JA=(uv run --with . python -I just_akash/runner_create_receipt.py execute --round "$attempt" --)
+              RECEIPT_ARGS=(--receipt-path "$RUNNER_TEMP/owned-sentry-create-${RUN_ID}-${GITHUB_RUN_ATTEMPT}/round-${attempt}.json" --receipt-operation-id "gh:1071436278:${RUN_ID}:${GITHUB_RUN_ATTEMPT}:${attempt}")
+            fi
             DEPLOY_RC=0
-            AKASH_PROVIDERS='' AKASH_PROVIDERS_BACKUP='' "${JA[@]}" deploy --sdl /tmp/runner-sdl.minted.yaml --deposit "$REQUIRED_DEPOSIT_USD" --bid-wait 60 \
-              --bid-wait-retry 120 "${SELECT_ARGS[@]}" "${PROV_ARGS[@]}" 2>&1 | tee /tmp/ja.log || DEPLOY_RC=${PIPESTATUS[0]}
+            if [ -n "${RUNNER_CREATE_RECEIPT_CONTRACT:-}" ]; then
+              AKASH_PROVIDERS='' AKASH_PROVIDERS_BACKUP='' "${DEPLOY_JA[@]}" deploy --sdl /tmp/runner-sdl.minted.yaml --deposit "$REQUIRED_DEPOSIT_USD" --bid-wait 60 \
+              --bid-wait-retry 120 "${SELECT_ARGS[@]}" "${PROV_ARGS[@]}" "${RECEIPT_ARGS[@]}" 2>&1 | tee /tmp/ja.log || DEPLOY_RC=${PIPESTATUS[0]}
+            else
+              AKASH_PROVIDERS='' AKASH_PROVIDERS_BACKUP='' "${JA[@]}" deploy --sdl /tmp/runner-sdl.minted.yaml --deposit "$REQUIRED_DEPOSIT_USD" --bid-wait 60 \
+              --bid-wait-retry 120 "${SELECT_ARGS[@]}" "${PROV_ARGS[@]}" "${RECEIPT_ARGS[@]}" 2>&1 | tee /tmp/ja.log || DEPLOY_RC=${PIPESTATUS[0]}
+            fi
             rm -f /tmp/runner-sdl.minted.yaml
             # ⛔ A FAILED LEASE STILL HOLDS A DEPLOYMENT (#348). just-akash prints the
             # "DSEQ:" summary only after a lease succeeds. When lease creation fails it
@@ -1688,6 +1732,20 @@ jobs:
               }
               END { if (found) print summary; else if (recovered != "") print recovered }
             ' /tmp/ja.log || true)
+            RECEIPT_OWNER=""
+            if [ -n "${RUNNER_CREATE_RECEIPT_CONTRACT:-}" ]; then
+              # The existing SDK journal already records PREPARED/SUBMITTING/ACK.
+              # Missing, submitting or mismatched identity can never fall through to
+              # the original outer retry loop, even if diagnostics look transient.
+              # runner_create_receipt round must resolve the original journal before DSEQ publication.
+              RECEIPT_IDENTITY=$(python3 -I just_akash/runner_create_receipt.py round --round "$attempt" --observed-dseq "$DSEQ") || {
+                printf '%s\n' 'deployment_outcome=unknown' 'create_ambiguous=true' 'failure_reason=CREATE_OUTCOME_AMBIGUOUS' >> "$GITHUB_OUTPUT"
+                echo '::error::Owned candidate receipt is unresolved; no replay or new create'
+                exit 1
+              }
+              read -r DSEQ RECEIPT_OWNER <<< "$RECEIPT_IDENTITY"
+              unset RECEIPT_IDENTITY
+            fi
             # ⭐ PUBLISH THE DSEQ THE MOMENT IT EXISTS — before tagging, before the
             # registration wait, before anything can fail or be cancelled. The
             # success block below also writes it, but a run that dies mid-wait
@@ -1703,6 +1761,14 @@ jobs:
             [ -n "$DSEQ" ] && CREATED_DSEQ="$DSEQ"
             PROVIDER=$(awk -F': +' '/^[[:space:]]*Provider:/{print $2; exit}' /tmp/ja.log || true)
             WALLET=$(awk -F': +' '/^[[:space:]]*Wallet:/{print $2; exit}' /tmp/ja.log || true)
+            if [ -n "${RUNNER_CREATE_RECEIPT_CONTRACT:-}" ]; then
+              if [ -n "$WALLET" ] && [ "$WALLET" != "$RECEIPT_OWNER" ]; then
+                printf '%s\n' 'deployment_outcome=unknown' 'create_ambiguous=true' 'failure_reason=CREATE_OUTCOME_AMBIGUOUS' >> "$GITHUB_OUTPUT"
+                echo '::error::Create candidate owner disagrees; no replay or new create'
+                exit 1
+              fi
+              WALLET="$RECEIPT_OWNER"
+            fi
             # Publish the create-time owner as soon as it is available. Internal
             # rollback runs only on a failed handoff, so a success-only publication
             # leaves precisely that teardown without the bound-owner fallback.
@@ -2444,6 +2510,28 @@ jobs:
             rm -f /tmp/ja.log.*
           fi
           exit 1
+
+      - name: Seal the exact local source-bound create candidate records
+        id: receipt_seal
+        if: always() && inputs.runner-create-receipt-contract != '' && steps.receipt_guard.outcome == 'success'
+        run: python3 -I just_akash/runner_create_receipt.py seal
+
+      - name: Upload only the sealed candidate envelope using the native supported action
+        id: receipt_artifact
+        if: always() && inputs.runner-create-receipt-contract != '' && steps.receipt_seal.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: owned-sentry-create-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/owned-sentry-create-${{ github.run_id }}-${{ github.run_attempt }}/create-candidates.json
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 7
+
+      - name: Remove local candidate journals only after native artifact upload acknowledgment
+        if: always() && inputs.runner-create-receipt-contract != '' && steps.receipt_guard.outcome == 'success'
+        env:
+          RECEIPT_UPLOAD_OUTCOME: ${{ steps.receipt_artifact.outcome }}
+        run: python3 -I just_akash/runner_create_receipt.py cleanup --upload-outcome "$RECEIPT_UPLOAD_OUTCOME"
 
       - name: Remove task-owned credential-bearing runner templates
         if: always()

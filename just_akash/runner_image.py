@@ -763,6 +763,29 @@ def validate_private_profile(profile: str) -> str:
     pool_size = values.get("PRIVATE_PROFILE_POOL_SIZE")
     minimum = values.get("PRIVATE_PROFILE_MIN_POOL_SIZE", "")
     if identity == (
+        f"sentry-production-{run}-{attempt}",
+        f"borduas-owned-sentry-a{attempt}-run-{run}-end",
+        "ci-blazing-back-sentry-production",
+        "true",
+    ):
+        if (
+            values.get("RUNNER_CREATE_RECEIPT_CONTRACT") != "sentry-private-production/v1"
+            or values.get("GITHUB_REF") != "refs/heads/main"
+            or values.get("GITHUB_EVENT_NAME") not in {"push", "workflow_dispatch"}
+            or values.get("GITHUB_WORKFLOW_REF")
+            != (
+                "Borduas-Holdings/Blazing-Back/"
+                ".github/workflows/build-sentry-cli.yml@refs/heads/main"
+            )
+            or pool_size != "1"
+            or minimum != "1"
+            or values.get("PRIVATE_PROFILE_CPU") != "2"
+            or values.get("PRIVATE_PROFILE_MEMORY") != "6Gi"
+            or values.get("PRIVATE_PROFILE_STORAGE") != "40Gi"
+        ):
+            raise ValueError("Private Sentry production receipt profile was not verified")
+        return label
+    if identity == (
         f"dfc-images-{run}-{attempt}",
         f"borduas-dfc-images-run-{run}-end",
         "ci-blazing-back-dfc-images",
