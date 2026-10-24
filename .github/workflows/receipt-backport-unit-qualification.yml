@@ -1,0 +1,180 @@
+name: Receipt backport Linux unit qualification
+
+on:
+  push:
+    branches: [qualify/receipt-single-create-linux-04e-20261024]
+
+# Qualification only: no SOPS key, API credentials, deployment commands, or
+# container builds. The checkout is the frozen SDK candidate, not this workflow
+# branch. This does not replace upstream required CI or qualify native leases.
+permissions:
+  contents: read
+
+concurrency:
+  group: receipt-backport-unit-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  full-sdk-unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Prepare private scratch before setup actions
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/sdk-unit-tmp"
+          {
+            printf 'UV_PROJECT_ENVIRONMENT=%s/sdk-unit-env\n' "$RUNNER_TEMP"
+            printf 'UV_CACHE_DIR=%s/sdk-unit-cache\n' "$RUNNER_TEMP"
+            printf 'TMPDIR=%s/sdk-unit-tmp\n' "$RUNNER_TEMP"
+            printf 'SDK_UNIT_OUTCOME=%s/sdk-unit-outcome\n' "$RUNNER_TEMP"
+            printf 'SDK_UNIT_XML=%s/sdk-unit.xml\n' "$RUNNER_TEMP"
+            printf 'SDK_UNIT_RECEIPT=%s/sdk-unit-qualification.json\n' "$RUNNER_TEMP"
+          } >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 04e2f1e00ffdfc057a642c7266eb5b24cf8d77b6
+          persist-credentials: false
+      - name: Verify frozen source and prepare private scratch
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 04e2f1e00ffdfc057a642c7266eb5b24cf8d77b6
+          mkdir -p "$TMPDIR"
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Install the candidate's locked unit dependencies
+        run: timeout --kill-after=5s 180s uv sync --locked --dev --python 3.13
+      - name: Run the full SDK unit suite with ordinary fixtures and plugins
+        id: unit
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          timeout --kill-after=5s 600s uv run --no-sync pytest tests/ --tb=short -q \
+            --basetemp="$TMPDIR/pytest" --junitxml="$SDK_UNIT_XML" \
+            -o "cache_dir=$TMPDIR/pytest-cache" > "$RUNNER_TEMP/sdk-unit-output.log" 2>&1
+          rc=$?
+          printf '%s\n' "$rc" > "$SDK_UNIT_OUTCOME"
+          printf 'sdk_unit_pytest_exit=%s\n' "$rc"
+          exit "$rc"
+      - name: Retain a bounded numeric qualification receipt
+        if: always()
+        env:
+          UNIT_STEP_OUTCOME: ${{ steps.unit.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import tempfile
+          import xml.etree.ElementTree as ET
+
+          expected = "04e2f1e00ffdfc057a642c7266eb5b24cf8d77b6"
+          report = {
+              "schema": "sdk-unit-qualification-v1",
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "workflow_commit": os.environ["GITHUB_SHA"],
+              "candidate_commit": expected,
+              "unit_step_outcome": os.environ["UNIT_STEP_OUTCOME"],
+              "status": "UNMEASURED",
+              "counts": None,
+              "failed_test_ids": [],
+              "native_e2e_qualified": False,
+              "consumer_activation_qualified": False,
+              "savings_verified": False,
+          }
+          try:
+              source = subprocess.run(
+                  ["git", "rev-parse", "HEAD"], check=True,
+                  capture_output=True, text=True, timeout=10,
+              ).stdout.strip()
+              if source != expected:
+                  raise ValueError("SOURCE_MISMATCH")
+              outcome = Path(os.environ["SDK_UNIT_OUTCOME"])
+              if outcome.stat().st_size > 4:
+                  raise ValueError("OUTCOME_LIMIT")
+              code = int(outcome.read_text().strip())
+              report["pytest_exit"] = code
+              path = Path(os.environ["SDK_UNIT_XML"])
+              if path.stat().st_size > 8 * 1024 * 1024:
+                  raise ValueError("XML_LIMIT")
+              root = ET.parse(path).getroot()
+              cases = list(root.iter("testcase"))
+              if not 1 <= len(cases) <= 20000:
+                  raise ValueError("CASE_POPULATION")
+              failed = [c for c in cases if c.find("failure") is not None]
+              errors = [c for c in cases if c.find("error") is not None]
+              skipped = [c for c in cases if c.find("skipped") is not None]
+              report["counts"] = {
+                  "cases": len(cases), "failed": len(failed),
+                  "errors": len(errors), "skipped": len(skipped),
+                  "passed": len(cases) - len(failed) - len(errors) - len(skipped),
+              }
+              for case in (failed + errors)[:50]:
+                  # Omit parameter IDs as well as exception/stdout/stderr bodies.
+                  module = case.get("classname", "")
+                  function = case.get("name", "").split("[", 1)[0]
+                  if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{0,255}", module):
+                      raise ValueError("TEST_ID_REFUSED")
+                  if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,255}", function):
+                      raise ValueError("TEST_ID_REFUSED")
+                  report["failed_test_ids"].append(module + "::" + function)
+              report["failure_ids_truncated"] = len(failed) + len(errors) > 50
+              passed = (
+                  code == 0 and not failed and not errors
+                  and report["counts"]["passed"] > 0
+                  and os.environ["UNIT_STEP_OUTCOME"] == "success"
+              )
+              report["status"] = (
+                  "UNIT_PASS_WITH_SKIPS" if passed and skipped else
+                  "UNIT_PASS" if passed else
+                  "UNIT_INCOMPLETE" if code == 0 and not failed and not errors else
+                  "UNIT_FAILED"
+              )
+          except Exception:
+              report["status"] = "UNMEASURED"
+          target = Path(os.environ["SDK_UNIT_RECEIPT"])
+          fd, temporary = tempfile.mkstemp(dir=target.parent, prefix="sdk-unit-receipt-")
+          try:
+              with os.fdopen(fd, "w") as stream:
+                  json.dump(report, stream, sort_keys=True)
+                  stream.write("\n")
+              os.replace(temporary, target)
+          finally:
+              Path(temporary).unlink(missing_ok=True)
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: sdk-unit-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sdk-unit-qualification.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Require the real test step and complete numeric unit outcome
+        if: always()
+        env:
+          UNIT_STEP_OUTCOME: ${{ steps.unit.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          report = json.loads(Path(os.environ["SDK_UNIT_RECEIPT"]).read_text())
+          assert os.environ["UNIT_STEP_OUTCOME"] == "success"
+          assert report["candidate_commit"] == "04e2f1e00ffdfc057a642c7266eb5b24cf8d77b6"
+          assert report["pytest_exit"] == 0
+          assert report["status"] in {"UNIT_PASS", "UNIT_PASS_WITH_SKIPS"}
+          assert report["counts"]["cases"] > 0
+          assert report["counts"]["passed"] > 0
+          assert report["counts"]["failed"] == report["counts"]["errors"] == 0
+          PY
