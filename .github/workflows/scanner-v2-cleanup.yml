@@ -111,12 +111,12 @@ jobs:
           set -euo pipefail
           "$CLEANUP_PYTHON" -I -c 'import os; from just_akash.scanner_cleanup_native import NativeGET,resolve_actor_job; values=resolve_actor_job(os.environ,NativeGET(os.environ["NATIVE_READ_TOKEN"])); output=open(os.environ["GITHUB_OUTPUT"],"a",encoding="utf-8"); [output.write(k+"="+v+"\n") for k,v in values.items()]; output.close()'
       - name: Install the immutable cleanup receipt action dependencies
-        working-directory: .just-akash/.github/actions/scanner-cleanup-receipts
+        working-directory: .just-akash/.github/actions/scanner-recovery-cleanup-receipts
         shell: bash
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Run the acknowledged scanner-v2 cleanup controller
         id: cleanup
-        uses: ./.just-akash/.github/actions/scanner-cleanup-receipts
+        uses: ./.just-akash/.github/actions/scanner-recovery-cleanup-receipts
         with:
           python-path: ${{ steps.python.outputs.python-path }}
           sdk-sha: ${{ inputs.just-akash-ref }}
