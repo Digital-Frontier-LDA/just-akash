@@ -1,0 +1,137 @@
+name: Known-ID keydb-qualification-v1 cleanup
+on:
+  workflow_call:
+    inputs:
+      just-akash-ref:
+        type: string
+        required: true
+      mode:
+        type: string
+        required: true
+      target-run-id:
+        type: string
+        required: true
+      target-run-attempt:
+        type: string
+        required: true
+      target-sdk-round:
+        type: string
+        default: '1'
+    secrets:
+      GH_RUNNER_PAT:
+        required: false
+      AKASH_API_KEY:
+        required: false
+      AKASH_API_KEYS:
+        required: false
+    outputs:
+      cleanup_qualified:
+        value: ${{ jobs.cleanup.outputs.cleanup_qualified }}
+      lease_closed:
+        value: ${{ jobs.cleanup.outputs.lease_closed }}
+      registration_absent:
+        value: ${{ jobs.cleanup.outputs.registration_absent }}
+      returned_runner_id:
+        value: ${{ jobs.cleanup.outputs.returned_runner_id }}
+      dseq:
+        value: ${{ jobs.cleanup.outputs.dseq }}
+      wallet_address:
+        value: ${{ jobs.cleanup.outputs.wallet_address }}
+permissions:
+  contents: read
+jobs:
+  cleanup:
+    name: Close KeyDB qualification known identities keydb-qualification-v1-${{ inputs.target-run-id }}-a${{ inputs.target-run-attempt }}-r${{ inputs.target-sdk-round }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+    concurrency:
+      group: blazing-keydb-qualification-cleanup-${{ inputs.target-run-id }}-a${{ inputs.target-run-attempt }}-r${{ inputs.target-sdk-round }}
+      cancel-in-progress: false
+    outputs:
+      cleanup_qualified: ${{ steps.cleanup.outputs.cleanup_qualified }}
+      lease_closed: ${{ steps.cleanup.outputs.lease_closed }}
+      registration_absent: ${{ steps.cleanup.outputs.registration_absent }}
+      returned_runner_id: ${{ steps.cleanup.outputs.returned_runner_id }}
+      dseq: ${{ steps.cleanup.outputs.dseq }}
+      wallet_address: ${{ steps.cleanup.outputs.wallet_address }}
+    steps:
+      - name: Refuse unsupported cleanup caller before checkout or management credentials
+        shell: bash
+        env:
+          SDK_SHA: ${{ inputs.just-akash-ref }}
+          MODE: ${{ inputs.mode }}
+          TARGET_RUN: ${{ inputs.target-run-id }}
+          TARGET_ATTEMPT: ${{ inputs.target-run-attempt }}
+          TARGET_ROUND: ${{ inputs.target-sdk-round }}
+        run: |
+          set -euo pipefail
+          [[ "$SDK_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$TARGET_RUN" =~ ^[1-9][0-9]{0,18}$ && "$TARGET_ATTEMPT" =~ ^[1-9][0-9]{0,18}$ && "$TARGET_ROUND" =~ ^[1-3]$ ]]
+          [[ "$GITHUB_REPOSITORY" == 'Borduas-Holdings/blazing' && "$GITHUB_REF" == 'refs/heads/codex/keydb-parity-owned-d8ab-20261024' && "$GITHUB_JOB" == 'cleanup' && "$RUNNER_ENVIRONMENT" == 'github-hosted' ]]
+          [[ "$GITHUB_WORKFLOW_REF" == 'Borduas-Holdings/blazing/.github/workflows/keydb-modules-parity.yml@refs/heads/codex/keydb-parity-owned-d8ab-20261024' ]]
+          [[ "$GITHUB_EVENT_NAME" == 'workflow_dispatch' ]]
+          case "$MODE" in
+            normal) [[ "$TARGET_RUN" == "$GITHUB_RUN_ID" && "$TARGET_ATTEMPT" == "$GITHUB_RUN_ATTEMPT" ]] ;;
+            recover) [[ "$TARGET_RUN" != "$GITHUB_RUN_ID" ]] ;;
+            *) exit 1 ;;
+          esac
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Digital-Frontier-LDA/just-akash
+          ref: ${{ inputs.just-akash-ref }}
+          path: .just-akash
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4
+      - name: Install the same pinned cleanup SDK in a private hosted interpreter
+        id: python
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv python install 3.13.9
+          uv venv --python 3.13.9 "$RUNNER_TEMP/keydb-qualification-v1-cleanup-python"
+          uv pip install --python "$RUNNER_TEMP/keydb-qualification-v1-cleanup-python/bin/python" ./.just-akash
+          printf 'python-path=%s\n' "$RUNNER_TEMP/keydb-qualification-v1-cleanup-python/bin/python" >> "$GITHUB_OUTPUT"
+      - name: Resolve actual current actor native job and head
+        id: actor
+        shell: bash
+        env:
+          NATIVE_READ_TOKEN: ${{ github.token }}
+          CLEANUP_PYTHON: ${{ steps.python.outputs.python-path }}
+          KEYDB_QUALIFICATION_CLEANUP_MODE: ${{ inputs.mode }}
+          KEYDB_QUALIFICATION_CLEANUP_SDK_SHA: ${{ inputs.just-akash-ref }}
+          KEYDB_QUALIFICATION_TARGET_RUN_ID: ${{ inputs.target-run-id }}
+          KEYDB_QUALIFICATION_TARGET_RUN_ATTEMPT: ${{ inputs.target-run-attempt }}
+          KEYDB_QUALIFICATION_TARGET_ROUND: ${{ inputs.target-sdk-round }}
+        run: |
+          set -euo pipefail
+          "$CLEANUP_PYTHON" -I -c 'import os; from just_akash.keydb_qualification_cleanup_native import NativeGET,resolve_actor_job; values=resolve_actor_job(os.environ,NativeGET(os.environ["NATIVE_READ_TOKEN"])); output=open(os.environ["GITHUB_OUTPUT"],"a",encoding="utf-8"); [output.write(k+"="+v+"\n") for k,v in values.items()]; output.close()'
+      - name: Install the immutable cleanup receipt action dependencies
+        working-directory: .just-akash/.github/actions/keydb-qualification-cleanup-receipts
+        shell: bash
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Run the acknowledged KeyDB qualification cleanup controller
+        id: cleanup
+        uses: ./.just-akash/.github/actions/keydb-qualification-cleanup-receipts
+        with:
+          python-path: ${{ steps.python.outputs.python-path }}
+          sdk-sha: ${{ inputs.just-akash-ref }}
+          actor-job-id: ${{ steps.actor.outputs.actor-job-id }}
+          native-head-sha: ${{ steps.actor.outputs.native-head-sha }}
+          mode: ${{ inputs.mode }}
+          target-run-id: ${{ inputs.target-run-id }}
+          target-run-attempt: ${{ inputs.target-run-attempt }}
+          target-sdk-round: ${{ inputs.target-sdk-round }}
+          github-token: ${{ github.token }}
+        env:
+          KEYDB_QUALIFICATION_CLEANUP_MODE: ${{ inputs.mode }}
+          KEYDB_QUALIFICATION_CLEANUP_SDK_SHA: ${{ inputs.just-akash-ref }}
+          KEYDB_QUALIFICATION_ACTOR_JOB_ID: ${{ steps.actor.outputs.actor-job-id }}
+          KEYDB_QUALIFICATION_TARGET_RUN_ID: ${{ inputs.target-run-id }}
+          KEYDB_QUALIFICATION_TARGET_RUN_ATTEMPT: ${{ inputs.target-run-attempt }}
+          KEYDB_QUALIFICATION_TARGET_ROUND: ${{ inputs.target-sdk-round }}
+          GH_TOKEN: ${{ secrets.GH_RUNNER_PAT }}
+          AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
+          AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}

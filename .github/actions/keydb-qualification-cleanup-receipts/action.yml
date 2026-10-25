@@ -1,0 +1,62 @@
+name: KeyDB qualification known-identity cleanup receipts
+description: Authenticate current cleanup actor and immutable historical producer evidence for the fixed hosted cleanup module
+inputs:
+  python-path:
+    description: Fixed RUNNER_TEMP/keydb-qualification-v1-cleanup-python/bin/python venv, Python 3.13.9
+    required: true
+  sdk-sha:
+    description: Exact SDK cleanup callee source pin from native referenced workflows
+    required: true
+  actor-job-id:
+    description: Actual current cleanup native job ID
+    required: true
+  native-head-sha:
+    description: Native current actor run head, resolved independently of workflow source SHA
+    required: true
+  mode:
+    description: Closed normal or distinct manual recover actor mode
+    required: true
+  target-run-id:
+    description: Historical KeyDB qualification producer native run ID
+    required: true
+  target-run-attempt:
+    description: Exact historical producer attempt
+    required: true
+  target-sdk-round:
+    description: Exact historical producer round, one through three
+    required: true
+  github-token:
+    description: Ephemeral hosted actions-read token for native metadata and immutable artifact readback
+    required: true
+runs:
+  using: node20
+  main: index.cjs
+outputs:
+  outcome:
+    description: Fixed cleanup controller public outcome
+  cleanup_qualified:
+    description: Controller measurement of both actual independent final states; artifact ACK alone never qualifies cleanup
+  lease_closed:
+    description: Actual independent closed-deployment and lease-absence observation
+  registration_absent:
+    description: Actual complete native all-status and direct lookup absence observation
+  returned_runner_id:
+    description: Historical returned native runner identity
+  dseq:
+    description: Historical acknowledged deployment candidate
+  wallet_address:
+    description: Exact acknowledged public owner
+  target_run_id:
+    description: Historical producer native run
+  target_run_attempt:
+    description: Historical producer exact attempt
+  target_sdk_round:
+    description: Historical producer exact SDK round
+  close_wire_attempted:
+    description: Whether the actual close request boundary was entered, never proof of server receipt
+  remove_wire_attempted:
+    description: Whether the actual exact-ID removal request boundary was entered
+  close_ack_received:
+    description: Whether the immutable close response acknowledgement was read back
+  remove_ack_received:
+    description: Whether the immutable removal response acknowledgement was read back

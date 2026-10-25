@@ -346,6 +346,10 @@ on:
         type: string
         required: false
         default: ''
+      keydb-qualification-runner-group-id:
+        type: string
+        default: ''
+        description: Dedicated fixed-branch KeyDB qualification group native ID
     secrets:
       CREDENTIALS_AGE_KEY:
         required: false
@@ -383,18 +387,18 @@ on:
     outputs:
       dseq:
         description: 'Deployment sequence number; empty when no lease survived.'
-        value: ${{ inputs.runner-private-profile == 'blazing-keydb-modules-parity-v1' && jobs.keydb_parity_v1.outputs.dseq || (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled') && jobs.scanner_v2.outputs.dseq || jobs.pool.outputs.dseq }}
+        value: ${{ inputs.runner-private-profile == 'blazing-keydb-parity-qualification-v1' && jobs.keydb_qualification_v1.outputs.dseq || inputs.runner-private-profile == 'blazing-keydb-modules-parity-v1' && jobs.keydb_parity_v1.outputs.dseq || (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled') && jobs.scanner_v2.outputs.dseq || jobs.pool.outputs.dseq }}
       deployment_outcome:
         description: >-
           Typed create outcome: created only with a parsed DSEQ, no-deployment only on
           an authoritative pre-create/no-broadcast branch, unknown otherwise.
-        value: ${{ inputs.runner-private-profile == 'blazing-keydb-modules-parity-v1' && jobs.keydb_parity_v1.outputs.deployment_outcome || (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled') && jobs.scanner_v2.outputs.deployment_outcome || jobs.pool.outputs.deployment_outcome }}
+        value: ${{ inputs.runner-private-profile == 'blazing-keydb-parity-qualification-v1' && jobs.keydb_qualification_v1.outputs.deployment_outcome || inputs.runner-private-profile == 'blazing-keydb-modules-parity-v1' && jobs.keydb_parity_v1.outputs.deployment_outcome || (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled') && jobs.scanner_v2.outputs.deployment_outcome || jobs.pool.outputs.deployment_outcome }}
       create_ambiguous:
         description: >-
           'true' when a later create request may have committed without returning an
           identity. The published dseq is then only the last KNOWN lease: teardown must
           close it and still fail HELD, because a second deployment may exist.
-        value: ${{ inputs.runner-private-profile == 'blazing-keydb-modules-parity-v1' && jobs.keydb_parity_v1.outputs.create_ambiguous || (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled') && jobs.scanner_v2.outputs.create_ambiguous || jobs.pool.outputs.create_ambiguous }}
+        value: ${{ inputs.runner-private-profile == 'blazing-keydb-parity-qualification-v1' && jobs.keydb_qualification_v1.outputs.create_ambiguous || inputs.runner-private-profile == 'blazing-keydb-modules-parity-v1' && jobs.keydb_parity_v1.outputs.create_ambiguous || (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled') && jobs.scanner_v2.outputs.create_ambiguous || jobs.pool.outputs.create_ambiguous }}
       held_reason:
         description: 'Why rollback was HELD without closure authority.'
         value: ${{ jobs.teardown.outputs.held_reason }}
@@ -406,15 +410,15 @@ on:
         value: ${{ jobs.teardown.outputs.held_deployment_group }}
       provision_healthy:
         description: "'true' iff a usable pool came online. Key your fallback on this."
-        value: ${{ inputs.runner-private-profile == 'blazing-keydb-modules-parity-v1' && jobs.keydb_parity_v1.outputs.provision_healthy || (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled') && jobs.scanner_v2.outputs.provision_healthy || jobs.pool.outputs.provision_healthy }}
+        value: ${{ inputs.runner-private-profile == 'blazing-keydb-parity-qualification-v1' && jobs.keydb_qualification_v1.outputs.provision_healthy || inputs.runner-private-profile == 'blazing-keydb-modules-parity-v1' && jobs.keydb_parity_v1.outputs.provision_healthy || (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled') && jobs.scanner_v2.outputs.provision_healthy || jobs.pool.outputs.provision_healthy }}
       runners_online:
         description: 'Distinct online runners as "K/N".'
-        value: ${{ inputs.runner-private-profile == 'blazing-keydb-modules-parity-v1' && jobs.keydb_parity_v1.outputs.runners_online || (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled') && jobs.scanner_v2.outputs.runners_online || jobs.pool.outputs.runners_online }}
+        value: ${{ inputs.runner-private-profile == 'blazing-keydb-parity-qualification-v1' && jobs.keydb_qualification_v1.outputs.runners_online || inputs.runner-private-profile == 'blazing-keydb-modules-parity-v1' && jobs.keydb_parity_v1.outputs.runners_online || (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled') && jobs.scanner_v2.outputs.runners_online || jobs.pool.outputs.runners_online }}
       runner-targets:
         description: >-
           JSON array for the caller's runs-on: the pool's labels when healthy, else
           ["ubuntu-latest"]. Consume with fromJSON.
-        value: ${{ inputs.runner-private-profile == 'blazing-keydb-modules-parity-v1' && jobs.keydb_parity_v1.outputs.runner-targets || (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled') && jobs.scanner_v2.outputs.runner-targets || jobs.pool.outputs.runner-targets }}
+        value: ${{ inputs.runner-private-profile == 'blazing-keydb-parity-qualification-v1' && jobs.keydb_qualification_v1.outputs.runner-targets || inputs.runner-private-profile == 'blazing-keydb-modules-parity-v1' && jobs.keydb_parity_v1.outputs.runner-targets || (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled') && jobs.scanner_v2.outputs.runner-targets || jobs.pool.outputs.runner-targets }}
       failure_reason:
         description: >-
           WHY a fallback happened, when it did. One of RUNNER_PAT_MISSING,
@@ -485,12 +489,12 @@ on:
         description: >-
           The Akash account that actually provisioned this pool. Teardown locates the
           DSEQ owner across the supplied pool instead of re-deriving a positional choice.
-        value: ${{ inputs.runner-private-profile == 'blazing-keydb-modules-parity-v1' && jobs.keydb_parity_v1.outputs.wallet_address || (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled') && jobs.scanner_v2.outputs.wallet_address || jobs.pool.outputs.wallet_address }}
+        value: ${{ inputs.runner-private-profile == 'blazing-keydb-parity-qualification-v1' && jobs.keydb_qualification_v1.outputs.wallet_address || inputs.runner-private-profile == 'blazing-keydb-modules-parity-v1' && jobs.keydb_parity_v1.outputs.wallet_address || (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled') && jobs.scanner_v2.outputs.wallet_address || jobs.pool.outputs.wallet_address }}
       deployment_group:
         description: >-
           The final submitted group_spec.name after runner-pool applies its run stamp.
           Published independently of provisioning success for bound rollback and teardown.
-        value: ${{ inputs.runner-private-profile == 'blazing-keydb-modules-parity-v1' && jobs.keydb_parity_v1.outputs.deployment_group || (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled') && jobs.scanner_v2.outputs.deployment_group || jobs.pool.outputs.deployment_group }}
+        value: ${{ inputs.runner-private-profile == 'blazing-keydb-parity-qualification-v1' && jobs.keydb_qualification_v1.outputs.deployment_group || inputs.runner-private-profile == 'blazing-keydb-modules-parity-v1' && jobs.keydb_parity_v1.outputs.deployment_group || (inputs.runner-private-profile == 'bb-native-trufflehog-v2' || inputs.runner-private-profile == 'bb-native-trufflehog-v2-reconciled') && jobs.scanner_v2.outputs.deployment_group || jobs.pool.outputs.deployment_group }}
       runner_hosts_proven:
         description: >-
           Supplied providers marked runner_host and not runner_deny. Below 3, one silent
@@ -499,26 +503,26 @@ on:
 
       returned_runner_id:
         description: 'Scanner-v2 server-returned registration ID, emitted only after acknowledged readiness.'
-        value: ${{ inputs.runner-private-profile == 'blazing-keydb-modules-parity-v1' && jobs.keydb_parity_v1.outputs.returned_runner_id || jobs.scanner_v2.outputs.returned_runner_id }}
+        value: ${{ inputs.runner-private-profile == 'blazing-keydb-parity-qualification-v1' && jobs.keydb_qualification_v1.outputs.returned_runner_id || inputs.runner-private-profile == 'blazing-keydb-modules-parity-v1' && jobs.keydb_parity_v1.outputs.returned_runner_id || jobs.scanner_v2.outputs.returned_runner_id }}
       cleanup_qualified:
         description: 'Scanner-v2 deliberately remains false until separate close/remove/readback proof.'
-        value: ${{ inputs.runner-private-profile == 'blazing-keydb-modules-parity-v1' && jobs.keydb_parity_v1.outputs.cleanup_qualified || jobs.scanner_v2.outputs.cleanup_qualified }}
+        value: ${{ inputs.runner-private-profile == 'blazing-keydb-parity-qualification-v1' && jobs.keydb_qualification_v1.outputs.cleanup_qualified || inputs.runner-private-profile == 'blazing-keydb-modules-parity-v1' && jobs.keydb_parity_v1.outputs.cleanup_qualified || jobs.scanner_v2.outputs.cleanup_qualified }}
       jit_ack_record_sha256:
         description: 'Public scanner-v2 native registration ACK record commitment.'
-        value: ${{ inputs.runner-private-profile == 'blazing-keydb-modules-parity-v1' && jobs.keydb_parity_v1.outputs.jit_ack_record_sha256 || jobs.scanner_v2.outputs.jit_ack_record_sha256 }}
+        value: ${{ inputs.runner-private-profile == 'blazing-keydb-parity-qualification-v1' && jobs.keydb_qualification_v1.outputs.jit_ack_record_sha256 || inputs.runner-private-profile == 'blazing-keydb-modules-parity-v1' && jobs.keydb_parity_v1.outputs.jit_ack_record_sha256 || jobs.scanner_v2.outputs.jit_ack_record_sha256 }}
       deployment_ack_record_sha256:
         description: 'Public scanner-v2 create-deployment ACK record commitment.'
-        value: ${{ inputs.runner-private-profile == 'blazing-keydb-modules-parity-v1' && jobs.keydb_parity_v1.outputs.deployment_ack_record_sha256 || jobs.scanner_v2.outputs.deployment_ack_record_sha256 }}
+        value: ${{ inputs.runner-private-profile == 'blazing-keydb-parity-qualification-v1' && jobs.keydb_qualification_v1.outputs.deployment_ack_record_sha256 || inputs.runner-private-profile == 'blazing-keydb-modules-parity-v1' && jobs.keydb_parity_v1.outputs.deployment_ack_record_sha256 || jobs.scanner_v2.outputs.deployment_ack_record_sha256 }}
       lease_ack_record_sha256:
         description: 'Public scanner-v2 create-lease ACK record commitment.'
-        value: ${{ inputs.runner-private-profile == 'blazing-keydb-modules-parity-v1' && jobs.keydb_parity_v1.outputs.lease_ack_record_sha256 || jobs.scanner_v2.outputs.lease_ack_record_sha256 }}
+        value: ${{ inputs.runner-private-profile == 'blazing-keydb-parity-qualification-v1' && jobs.keydb_qualification_v1.outputs.lease_ack_record_sha256 || inputs.runner-private-profile == 'blazing-keydb-modules-parity-v1' && jobs.keydb_parity_v1.outputs.lease_ack_record_sha256 || jobs.scanner_v2.outputs.lease_ack_record_sha256 }}
 
 permissions:
   contents: read
 
 jobs:
   pool:
-    if: inputs.runner-private-profile != 'bb-native-trufflehog-v2' && inputs.runner-private-profile != 'bb-native-trufflehog-v2-reconciled' && inputs.runner-private-profile != 'blazing-keydb-modules-parity-v1'
+    if: inputs.runner-private-profile != 'bb-native-trufflehog-v2' && inputs.runner-private-profile != 'bb-native-trufflehog-v2-reconciled' && inputs.runner-private-profile != 'blazing-keydb-modules-parity-v1' && inputs.runner-private-profile != 'blazing-keydb-parity-qualification-v1'
     name: Provision ephemeral runner pool on Akash
     runs-on: ubuntu-latest
     # ⛔ MUST EXCEED the owner-lookup deadline + close/audit margin (see
@@ -2914,10 +2918,134 @@ jobs:
           AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
           AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}
 
+  keydb_qualification_v1:
+    name: Provision KeyDB qualification through acknowledged JIT
+    if: inputs.runner-private-profile == 'blazing-keydb-parity-qualification-v1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      dseq: ${{ steps.controller.outputs.dseq }}
+      deployment_outcome: ${{ steps.controller.outputs.deployment_outcome }}
+      create_ambiguous: ${{ steps.controller.outputs.create_ambiguous }}
+      provision_healthy: ${{ steps.controller.outputs.provision_healthy }}
+      runners_online: ${{ steps.controller.outputs.runners_online }}
+      runner-targets: ${{ steps.controller.outputs.runner-targets }}
+      wallet_address: ${{ steps.controller.outputs.wallet_address }}
+      deployment_group: ${{ steps.controller.outputs.deployment_group }}
+      returned_runner_id: ${{ steps.controller.outputs.returned_runner_id }}
+      cleanup_qualified: ${{ steps.controller.outputs.cleanup_qualified }}
+      jit_ack_record_sha256: ${{ steps.controller.outputs.jit_ack_record_sha256 }}
+      deployment_ack_record_sha256: ${{ steps.controller.outputs.deployment_ack_record_sha256 }}
+      lease_ack_record_sha256: ${{ steps.controller.outputs.lease_ack_record_sha256 }}
+    steps:
+      - name: Require the fixed keydb-qualification-v1 source and private caller
+        shell: bash
+        env:
+          SDK_REPOSITORY: ${{ inputs.just-akash-repository }}
+          SDK_SHA: ${{ inputs.just-akash-ref }}
+        run: |
+          set -euo pipefail
+          [[ "$SDK_REPOSITORY" == 'Digital-Frontier-LDA/just-akash' ]]
+          [[ "$SDK_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$GITHUB_REPOSITORY" == 'Borduas-Holdings/blazing' ]]
+          [[ "$GITHUB_EVENT_NAME" == 'workflow_dispatch' && "$GITHUB_REF" == 'refs/heads/codex/keydb-parity-owned-d8ab-20261024' ]]
+          [[ "$GITHUB_WORKFLOW_REF" == 'Borduas-Holdings/blazing/.github/workflows/keydb-modules-parity.yml@refs/heads/codex/keydb-parity-owned-d8ab-20261024' ]]
+          [[ "$GITHUB_WORKFLOW_SHA" == "$GITHUB_SHA" && "$GITHUB_JOB" == 'keydb_qualification_v1' ]]
+          [[ "$RUNNER_ENVIRONMENT" == 'github-hosted' ]]
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Digital-Frontier-LDA/just-akash
+          ref: ${{ inputs.just-akash-ref }}
+          path: .just-akash
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4
+      - name: Install the same fixed SDK in an isolated hosted interpreter
+        id: python
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv python install 3.13.9
+          uv venv --python 3.13.9 "$RUNNER_TEMP/keydb-qualification-v1-python"
+          uv pip install --python "$RUNNER_TEMP/keydb-qualification-v1-python/bin/python" ./.just-akash
+          printf 'python-path=%s\n' "$RUNNER_TEMP/keydb-qualification-v1-python/bin/python" >> "$GITHUB_OUTPUT"
+      - name: Resolve native keydb-qualification-v1 producer ID
+        id: producer
+        shell: bash
+        env:
+          NATIVE_READ_TOKEN: ${{ github.token }}
+          KEYDB_QUALIFICATION_PYTHON: ${{ steps.python.outputs.python-path }}
+        run: |
+          set -euo pipefail
+          "$KEYDB_QUALIFICATION_PYTHON" -I -c 'import os; from just_akash.keydb_qualification_controller import resolve_producer; value=resolve_producer(os.environ,os.environ["NATIVE_READ_TOKEN"]); open(os.environ["GITHUB_OUTPUT"],"a",encoding="utf-8").write("producer-job-id="+str(value)+"\n")'
+      - name: Check out the caller encrypted reader bundle
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: .runner-registry-source
+          sparse-checkout: secrets/registry-pull.sops.env
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Install checksum-pinned SOPS for private runner pulls
+        shell: bash
+        run: |
+          set -euo pipefail
+          task_dir=$(mktemp -d)
+          trap 'rm -rf "$task_dir"' EXIT
+          curl --fail --silent --show-error --location --retry 3 --max-time 120             https://github.com/getsops/sops/releases/download/v3.13.1/sops-v3.13.1.linux.amd64             --output "$task_dir/sops"
+          echo "620a9d7e3352ababeca6908cea24a6e8b14ce89a448ddbd3f94f1ef3398f470a  $task_dir/sops" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/runner-pull-bin"
+          install -m 0755 "$task_dir/sops" "$RUNNER_TEMP/runner-pull-bin/sops"
+          printf '%s\n' "$RUNNER_TEMP/runner-pull-bin" >> "$GITHUB_PATH"
+      - name: Install the hosted immutable receipt action dependencies
+        working-directory: .just-akash/.github/actions/keydb-qualification-durable-receipts
+        shell: bash
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Run the acknowledged KeyDB qualification controller
+        id: controller
+        uses: ./.just-akash/.github/actions/keydb-qualification-durable-receipts
+        with:
+          python-path: ${{ steps.python.outputs.python-path }}
+          sdk-sha: ${{ inputs.just-akash-ref }}
+          producer-job-id: ${{ steps.producer.outputs.producer-job-id }}
+          github-token: ${{ github.token }}
+        env:
+          RUNNER_PRIVATE_PROFILE: ${{ inputs.runner-private-profile }}
+          KEYDB_QUALIFICATION_SDK_SHA: ${{ inputs.just-akash-ref }}
+          KEYDB_QUALIFICATION_PRODUCER_JOB_ID: ${{ steps.producer.outputs.producer-job-id }}
+          KEYDB_QUALIFICATION_RUNNER_GROUP_ID: ${{ inputs.keydb-qualification-runner-group-id }}
+          KEYDB_QUALIFICATION_SDK_ROUND: '1'
+          KEYDB_QUALIFICATION_PUBLIC_PROFILE: ${{ inputs.runner-public-profile }}
+          KEYDB_QUALIFICATION_IMAGE: ${{ inputs.runner-image }}
+          KEYDB_QUALIFICATION_REGISTRY_HOST: ${{ inputs.runner-registry-host }}
+          KEYDB_QUALIFICATION_REGISTRY_USERNAME: ${{ inputs.runner-registry-username }}
+          KEYDB_QUALIFICATION_REGISTRY_SOPS: ${{ inputs.runner-registry-sops }}
+          KEYDB_QUALIFICATION_NATIVE_PULL_READER: ${{ inputs.runner-native-pull-reader }}
+          KEYDB_QUALIFICATION_NATIVE_REPOSITORY_SCOPE: ${{ inputs.runner-native-repository-scope }}
+          KEYDB_QUALIFICATION_CREDENTIALS_SOPS: ${{ inputs.credentials-sops }}
+          KEYDB_QUALIFICATION_EPHEMERAL: ${{ inputs.ephemeral }}
+          KEYDB_QUALIFICATION_POOL_SIZE: ${{ inputs.pool-size }}
+          KEYDB_QUALIFICATION_MIN_POOL_SIZE: ${{ inputs.min-pool-size }}
+          KEYDB_QUALIFICATION_CPU: ${{ inputs.cpu }}
+          KEYDB_QUALIFICATION_MEMORY: ${{ inputs.memory }}
+          KEYDB_QUALIFICATION_STORAGE: ${{ inputs.storage }}
+          KEYDB_QUALIFICATION_SELECT: ${{ inputs.provider-select }}
+          KEYDB_QUALIFICATION_ORG: ${{ inputs.github-org }}
+          KEYDB_QUALIFICATION_DIRECT_PASSWORD_PRESENT: ${{ secrets.RUNNER_REGISTRY_PASSWORD != '' }}
+          KEYDB_QUALIFICATION_PROVIDERS: ${{ inputs.providers }}
+          KEYDB_QUALIFICATION_OWNED_PROVIDERS: ${{ inputs.owned-providers }}
+          KEYDB_QUALIFICATION_REGISTRY_SOPS_PATH: ${{ github.workspace }}/.runner-registry-source/secrets/registry-pull.sops.env
+          GH_TOKEN: ${{ secrets.GH_RUNNER_PAT }}
+          SOPS_AGE_KEY: ${{ secrets.RUNNER_REGISTRY_AGE_KEY }}
+          AKASH_API_KEY: ${{ secrets.AKASH_API_KEY }}
+          AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS }}
+
   teardown:
     name: Roll back failed or cancelled pool provisioning
     needs: [pool]
-    if: ${{ always() && inputs.runner-private-profile != 'bb-native-trufflehog-v2' && inputs.runner-private-profile != 'bb-native-trufflehog-v2-reconciled' && inputs.runner-private-profile != 'blazing-keydb-modules-parity-v1' && needs.pool.result != 'success' && (inputs.runner-private-profile != 'bb-native-trufflehog' || needs.pool.outputs.scanner-native-admitted == 'true') }}
+    if: ${{ always() && inputs.runner-private-profile != 'bb-native-trufflehog-v2' && inputs.runner-private-profile != 'bb-native-trufflehog-v2-reconciled' && inputs.runner-private-profile != 'blazing-keydb-modules-parity-v1' && inputs.runner-private-profile != 'blazing-keydb-parity-qualification-v1' && needs.pool.result != 'success' && (inputs.runner-private-profile != 'bb-native-trufflehog' || needs.pool.outputs.scanner-native-admitted == 'true') }}
     # ⛔ FULL PATH AT A PINNED SHA, NEVER `./`. A reusable workflow's job runs in the
     # CALLER's context, so a bare `./` resolves inside the CALLER's tree — where this
     # file does not exist. The job then cannot be created, the graph cannot be built,
