@@ -1,0 +1,52 @@
+name: Positively fenced unused-JIT cleanup receipts
+description: Authenticate current cleanup actor and immutable historical producer evidence for the fixed hosted cleanup module
+inputs:
+  python-path:
+    description: Fixed RUNNER_TEMP/keydb-qualification-v1-cleanup-python/bin/python venv, Python 3.13.9
+    required: true
+  sdk-sha:
+    description: Exact SDK cleanup callee source pin from native referenced workflows
+    required: true
+  actor-job-id:
+    description: Actual current cleanup native job ID
+    required: true
+  native-head-sha:
+    description: Native current actor run head, resolved independently of workflow source SHA
+    required: true
+  mode:
+    description: Terminal workflow_run actor mode only
+    required: true
+  target-run-id:
+    description: Historical scanner producer native run ID
+    required: true
+  target-run-attempt:
+    description: Exact historical producer attempt
+    required: true
+  target-sdk-round:
+    description: Exact historical producer round, one through three
+    required: true
+  github-token:
+    description: Ephemeral hosted actions-read token for native metadata and immutable artifact readback
+    required: true
+runs:
+  using: node20
+  main: index.cjs
+outputs:
+  outcome:
+    description: Public positive-fence exact-ID observation
+  unused_jit_qualified:
+    description: Public positive-fence exact-ID observation
+  registration_absent:
+    description: Public positive-fence exact-ID observation
+  returned_runner_id:
+    description: Public positive-fence exact-ID observation
+  target_run_id:
+    description: Public positive-fence exact-ID observation
+  target_run_attempt:
+    description: Public positive-fence exact-ID observation
+  target_sdk_round:
+    description: Public positive-fence exact-ID observation
+  remove_wire_attempted:
+    description: Public positive-fence exact-ID observation
+  remove_ack_received:
+    description: Public positive-fence exact-ID observation

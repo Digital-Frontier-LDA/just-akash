@@ -1,0 +1,619 @@
+"""Fixed hosted keydb-qualification-v1 entry; no arbitrary JSON-to-effect command interface."""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any, cast
+
+from .github_jit import _json
+from .keydb_qualification_fence import EXIT, Interrupted, PreleaseFence, PreparationFenced
+from .keydb_qualification_jit import (
+    ENTRYPOINT_SHA256,
+    PRIVATE_IMAGE,
+    PROFILE,
+    NativeJitRequest,
+    mint_keydb_qualification_jit,
+    tenant_environment,
+    verify_group,
+)
+from .keydb_qualification_provenance import PROVIDERS, KeyDBQualificationBinding, validate_ack
+
+FENCED_PROFILE = "blazing-keydb-parity-qualification-fenced-v1"
+
+REPOSITORY = "Borduas-Holdings/blazing"
+REPOSITORY_ID = 1074974924
+ROOT = "/repos/" + REPOSITORY
+WORKFLOW = ".github/workflows/keydb-modules-parity.yml"
+NATIVE_JOB = (
+    "Provision one owned KeyDB parity qualification runner / "
+    # One fixed native identity across caller and callee names.
+    "Provision KeyDB qualification through acknowledged JIT"
+)
+NATIVE_STEP = "Run the acknowledged KeyDB qualification controller"
+SDK_REPOSITORY = "Digital-Frontier-LDA/just-akash"
+SDK_WORKFLOW = ".github/workflows/runner-pool.yml"
+ORGANIZATION_ID = 208689568
+
+
+class ControllerHeld(RuntimeError):
+    pass
+
+
+def require(value: object) -> None:
+    if not value:
+        raise ControllerHeld("Hosted keydb-qualification-v1 context or result was not verified")
+
+
+def number(value: str) -> int:
+    require(type(value) is str and re.fullmatch(r"[1-9][0-9]{0,18}", value) is not None)
+    result = int(value)
+    require(0 < result < 2**63)
+    return result
+
+
+def inputs(environment: Mapping[str, str]) -> dict[str, Any]:
+    require(environment.get("RUNNER_PRIVATE_PROFILE") == PROFILE)
+    exact = {
+        "KEYDB_QUALIFICATION_PUBLIC_PROFILE": "",
+        "KEYDB_QUALIFICATION_IMAGE": "",
+        "KEYDB_QUALIFICATION_REGISTRY_HOST": "https://index.docker.io/v1/",
+        "KEYDB_QUALIFICATION_REGISTRY_USERNAME": "jobordu",
+        "KEYDB_QUALIFICATION_REGISTRY_SOPS": "true",
+        "KEYDB_QUALIFICATION_NATIVE_PULL_READER": "false",
+        "KEYDB_QUALIFICATION_NATIVE_REPOSITORY_SCOPE": "false",
+        "KEYDB_QUALIFICATION_CREDENTIALS_SOPS": "false",
+        "KEYDB_QUALIFICATION_EPHEMERAL": "true",
+        "KEYDB_QUALIFICATION_POOL_SIZE": "1",
+        "KEYDB_QUALIFICATION_MIN_POOL_SIZE": "1",
+        "KEYDB_QUALIFICATION_CPU": "4",
+        "KEYDB_QUALIFICATION_MEMORY": "16Gi",
+        "KEYDB_QUALIFICATION_STORAGE": "96Gi",
+        "KEYDB_QUALIFICATION_SELECT": "cheapest",
+        "KEYDB_QUALIFICATION_ORG": "Borduas-Holdings",
+        "KEYDB_QUALIFICATION_DIRECT_PASSWORD_PRESENT": "false",
+    }
+    require(all(environment.get(k) == v for k, v in exact.items()))
+    for key in ("KEYDB_QUALIFICATION_PROVIDERS", "KEYDB_QUALIFICATION_OWNED_PROVIDERS"):
+        raw = environment.get(key, "")
+        require(0 < len(raw) <= 512)
+        rows = json.loads(raw)
+        require(
+            type(rows) is list
+            and len(rows) == 3
+            and all(type(x) is str for x in rows)
+            and set(rows) == PROVIDERS
+        )
+    require(environment.get("GITHUB_REPOSITORY") == REPOSITORY)
+    require(
+        environment.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+        and environment.get("GITHUB_REF") == "refs/heads/codex/keydb-parity-owned-d8ab-20261024"
+    )
+    require(
+        environment.get("RUNNER_ENVIRONMENT") == "github-hosted"
+        and environment.get("GITHUB_JOB") == "keydb_qualification_v1"
+    )
+    source, sdk = (
+        environment.get("GITHUB_SHA", ""),
+        environment.get("KEYDB_QUALIFICATION_SDK_SHA", ""),
+    )
+    require(
+        re.fullmatch(r"[0-9a-f]{40}", source) is not None
+        and re.fullmatch(r"[0-9a-f]{40}", sdk) is not None
+    )
+    require(environment.get("GITHUB_WORKFLOW_SHA") == source)
+    require(
+        environment.get("GITHUB_WORKFLOW_REF")
+        == REPOSITORY + "/" + WORKFLOW + "@refs/heads/codex/keydb-parity-owned-d8ab-20261024"
+    )
+    run, attempt = (
+        number(environment.get("GITHUB_RUN_ID", "")),
+        number(environment.get("GITHUB_RUN_ATTEMPT", "")),
+    )
+    sdk_round = number(environment.get("KEYDB_QUALIFICATION_SDK_ROUND", ""))
+    require(1 <= sdk_round <= 3)
+    name = f"dfci-bl-keydb-qualification-{run}-a{attempt}-r{sdk_round}"
+    return dict(
+        repository=REPOSITORY,
+        repository_id=REPOSITORY_ID,
+        workflow_path=WORKFLOW,
+        workflow_sha=source,
+        native_head_sha=source,
+        sdk_sha=sdk,
+        event="workflow_dispatch",
+        ref="refs/heads/codex/keydb-parity-owned-d8ab-20261024",
+        run_id=run,
+        run_attempt=attempt,
+        sdk_round=sdk_round,
+        producer_job_id=number(environment.get("KEYDB_QUALIFICATION_PRODUCER_JOB_ID", "")),
+        role=PROFILE,
+        image=PRIVATE_IMAGE,
+        providers=sorted(PROVIDERS),
+        resources=dict(cpu="4", memory="16Gi", storage="96Gi", count=1),
+        runner_name=name,
+        runner_label=name,
+        akash_group=f"borduas-keydb-qualification-run-{run}-a{attempt}-r{sdk_round}-end",
+        runner_group_id=number(environment.get("KEYDB_QUALIFICATION_RUNNER_GROUP_ID", "")),
+    )
+
+
+def resolve_producer(environment: Mapping[str, str], token: str) -> int:
+    """Read-only locator; the executing controller independently admits the job."""
+    from .keydb_qualification_native import NativeGET
+
+    require(environment.get("GITHUB_REPOSITORY") == REPOSITORY)
+    run = number(environment.get("GITHUB_RUN_ID", ""))
+    attempt = number(environment.get("GITHUB_RUN_ATTEMPT", ""))
+    get = NativeGET(token)
+    rows: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    total = None
+    for page in range(1, 5):
+        document = get(
+            ROOT + f"/actions/runs/{run}/attempts/{attempt}/jobs?per_page=100&page={page}"
+        )
+        count, batch = document.get("total_count"), document.get("jobs")
+        require(type(count) is int and 0 <= count <= 400 and (total is None or total == count))
+        require(type(batch) is list and len(batch) <= 100)
+        total = cast(int, count)
+        batch = cast(list[dict[str, Any]], batch)
+        for row in batch:
+            require(
+                type(row) is dict
+                and type(row.get("id")) is int
+                and row["id"] > 0
+                and row["id"] not in seen
+            )
+            seen.add(cast(int, row["id"]))
+            rows.append(row)
+        if len(rows) == total:
+            break
+        require(len(batch) == 100 and len(rows) < total)
+    require(len(rows) == total)
+    matches = [row for row in rows if row.get("name") == NATIVE_JOB]
+    require(len(matches) == 1)
+    row = matches[0]
+    require(row.get("status") == "in_progress" and row.get("conclusion") is None)
+    require(row.get("run_id") == run and row.get("run_attempt") == attempt)
+    require(row.get("head_sha") == environment.get("GITHUB_SHA"))
+    require(
+        row.get("runner_name") == environment.get("RUNNER_NAME")
+        and type(row.get("runner_id")) is int
+        and row["runner_id"] > 0
+    )
+    return row["id"]
+
+
+def admit_native(
+    binding: KeyDBQualificationBinding, environment: Mapping[str, str], token: str
+) -> None:
+    from .keydb_qualification_native import NativeGET
+
+    get = NativeGET(token)
+    values = binding.to_dict()
+    run, attempt = values["run_id"], values["run_attempt"]
+    repo = get(ROOT)
+    require(
+        type(repo.get("id")) is int
+        and repo["id"] == REPOSITORY_ID
+        and repo.get("full_name") == REPOSITORY
+        and repo.get("private") is True
+    )
+    require(
+        type(repo.get("owner")) is dict
+        and type(repo["owner"].get("id")) is int
+        and repo["owner"]["id"] == ORGANIZATION_ID
+        and repo["owner"].get("login") == "Borduas-Holdings"
+    )
+
+    def context():
+        value = get(ROOT + f"/actions/runs/{run}")
+        require(
+            type(value.get("id")) is int
+            and value["id"] == run
+            and type(value.get("run_attempt")) is int
+            and value["run_attempt"] == attempt
+        )
+        require(
+            value.get("event") == "workflow_dispatch"
+            and value.get("path") == WORKFLOW
+            and type(value.get("workflow_id")) is int
+            and value["workflow_id"] == 308813680
+            and value.get("head_sha") == values["workflow_sha"]
+            and value.get("head_branch") == "codex/keydb-parity-owned-d8ab-20261024"
+            and value.get("status") == "in_progress"
+            and value.get("conclusion") is None
+        )
+        require(
+            all(
+                type(value.get(k)) is dict
+                and type(value[k].get("id")) is int
+                and value[k]["id"] == REPOSITORY_ID
+                for k in ("repository", "head_repository")
+            )
+        )
+        require(
+            get(ROOT + "/git/ref/heads/codex/keydb-parity-owned-d8ab-20261024")
+            .get("object", {})
+            .get("sha")
+            == values["workflow_sha"]
+        )
+        refs = value.get("referenced_workflows")
+        require(type(refs) is list and 1 <= len(refs) <= 64)
+        matches = [
+            x
+            for x in cast(list[dict[str, Any]], refs)
+            if type(x) is dict
+            and x.get("path") == SDK_REPOSITORY + "/" + SDK_WORKFLOW + "@" + values["sdk_sha"]
+        ]
+        require(len(matches) == 1 and matches[0].get("sha") == values["sdk_sha"])
+
+    context()
+    jobs, seen, total = [], set(), None
+    for page in range(1, 5):
+        doc = get(ROOT + f"/actions/runs/{run}/attempts/{attempt}/jobs?per_page=100&page={page}")
+        count, batch = doc.get("total_count"), doc.get("jobs")
+        require(
+            type(count) is int
+            and 0 <= count <= 400
+            and (total is None or total == count)
+            and type(batch) is list
+            and len(batch) <= 100
+        )
+        total = cast(int, count)
+        batch = cast(list[dict[str, Any]], batch)
+        for row in batch:
+            require(
+                type(row) is dict
+                and type(row.get("id")) is int
+                and row["id"] > 0
+                and row["id"] not in seen
+            )
+            seen.add(cast(int, row["id"]))
+            jobs.append(row)
+        if len(jobs) == total:
+            break
+        require(len(batch) == 100 and len(jobs) < total)
+    require(len(jobs) == total)
+
+    def job(row):
+        require(
+            type(row.get("id")) is int
+            and row["id"] == values["producer_job_id"]
+            and row.get("name") == NATIVE_JOB
+        )
+        require(
+            type(row.get("run_id")) is int
+            and row["run_id"] == run
+            and type(row.get("run_attempt")) is int
+            and row["run_attempt"] == attempt
+            and row.get("head_sha") == values["workflow_sha"]
+        )
+        require(
+            row.get("status") == "in_progress"
+            and row.get("conclusion") is None
+            and row.get("runner_name") == environment.get("RUNNER_NAME")
+            and type(row.get("runner_id")) is int
+            and row["runner_id"] > 0
+            and row.get("labels") == ["ubuntu-latest"]
+        )
+        steps = row.get("steps")
+        require(type(steps) is list and len(steps) <= 256)
+        active = [x for x in steps if type(x) is dict and x.get("name") == NATIVE_STEP]
+        require(
+            len(active) == 1
+            and active[0].get("status") == "in_progress"
+            and active[0].get("conclusion") is None
+        )
+        return row["id"], row["runner_id"], row["runner_name"]
+
+    matches = [r for r in jobs if r.get("id") == values["producer_job_id"]]
+    require(len(matches) == 1)
+    first = job(matches[0])
+    require(job(get(ROOT + f"/actions/jobs/{values['producer_job_id']}")) == first)
+    context()
+    require(job(get(ROOT + f"/actions/jobs/{values['producer_job_id']}")) == first)
+    verify_group(values["runner_group_id"], NativeJitRequest(lambda: None), token)
+
+
+def write_sdl(
+    path: Path, binding: KeyDBQualificationBinding, environment: dict[str, str], password: str
+) -> None:
+    import yaml
+
+    values = binding.to_dict()
+    require(
+        set(environment)
+        == {"RUNNER_JIT_CONFIG", "EPHEMERAL", "RUNNER_EXECUTION_USER", "RUNNER_NAME"}
+    )
+    require(
+        environment["EPHEMERAL"] == "true"
+        and environment["RUNNER_EXECUTION_USER"] == "root"
+        and environment["RUNNER_NAME"] == values["runner_name"]
+    )
+    require(
+        type(password) is str
+        and 0 < len(password) <= 4096
+        and "\n" not in password
+        and "\r" not in password
+    )
+    group = values["akash_group"]
+    document = {
+        "version": "2.0",
+        "services": {
+            "runner": {
+                "image": PRIVATE_IMAGE,
+                "credentials": {
+                    "host": "https://index.docker.io/v1/",
+                    "username": "jobordu",
+                    "password": password,
+                },
+                "env": [k + "=" + v for k, v in environment.items()],
+            }
+        },
+        "profiles": {
+            "compute": {
+                "runner": {
+                    "resources": {
+                        "cpu": {"units": "4"},
+                        "memory": {"size": "16Gi"},
+                        "storage": [{"size": "96Gi"}],
+                    }
+                }
+            },
+            "placement": {group: {"pricing": {"runner": {"denom": "uact", "amount": 100000}}}},
+        },
+        "deployment": {"runner": {group: {"profile": "runner", "count": 1}}},
+    }
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        yaml.safe_dump(document, stream, sort_keys=False)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def native_runner_read(runner_id: int, token: str) -> dict[str, Any] | None:
+    from .keydb_qualification_jit import _NoRedirect
+
+    require(type(runner_id) is int and 0 < runner_id < 2**63)
+    require(
+        type(token) is str and 0 < len(token) <= 4096 and all(33 <= ord(c) < 127 for c in token)
+    )
+    result = None
+    not_found = False
+    try:
+        request = urllib.request.Request(
+            f"https://api.github.com/orgs/Borduas-Holdings/actions/runners/{runner_id}",
+            headers={
+                "Authorization": "Bearer " + token,
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            method="GET",
+        )
+        with urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect()).open(
+            request, timeout=10
+        ) as response:
+            require(response.status == 200)
+            raw = response.read(65537)
+        require(len(raw) <= 65536)
+        parsed = _json(raw)
+        require(type(parsed) is dict)
+        result = parsed
+    except urllib.error.HTTPError as error:
+        not_found = error.code == 404
+    except Exception:
+        result = None
+    require(result is not None or not_found)
+    return result
+
+
+def wait_for_returned_runner(
+    runner_id,
+    binding,
+    token,
+    admission,
+    *,
+    read=native_runner_read,
+    clock=time.monotonic,
+    sleep=time.sleep,
+) -> None:
+    """No hosted fallback; only the already acknowledged native ID may be ready."""
+    deadline = clock() + 240
+    for _ in range(120):
+        require(clock() < deadline)
+        value = read(runner_id, token)
+        if value is not None:
+            require(type(value.get("id")) is int and value["id"] == runner_id)
+            require(
+                value.get("name") == binding.runner_name
+                and value.get("status") in ("online", "offline")
+            )
+            require(type(value.get("busy")) is bool)
+            labels = value.get("labels")
+            require(
+                type(labels) is list
+                and all(type(x) is dict and type(x.get("name")) is str for x in labels)
+            )
+            require(
+                {"self-hosted", "linux", "akash", binding.runner_label}
+                <= {x["name"].lower() for x in cast(list[dict[str, Any]], labels)}
+            )
+            if value["status"] == "online" and value["busy"] is False:
+                admission()
+                require(clock() < deadline)
+                return
+        remaining = deadline - clock()
+        require(remaining > 0)
+        sleep(min(2, remaining))
+    raise ControllerHeld(
+        "The acknowledged keydb-qualification-v1 native runner did not become ready"
+    )
+
+
+def enable_runtime() -> None:
+    raise ControllerHeld("Captured bootstrap is required before runtime entry")
+
+
+def provision(environment: Mapping[str, str]) -> dict[str, Any]:
+    # No unsafe/helper/deploy imports occur in the positive-fence-capable phase.
+    from .keydb_qualification_fenced_pipe import PipeFencedRecorder
+
+    binding = KeyDBQualificationBinding(inputs(environment))
+    token = environment.get("GH_TOKEN", "")
+    require(bool(token))
+    require(bool(environment.get("AKASH_API_KEY") or environment.get("AKASH_API_KEYS")))
+    require(bool(environment.get("SOPS_AGE_KEY")))
+    # Preserve the original metadata-only pre-mint refusal. Repeat this after
+    # the actual acknowledged JIT response so a preparation-time drift can be
+    # fenced without intentionally minting for an already invalid static input.
+    source = Path(environment.get("KEYDB_QUALIFICATION_REGISTRY_SOPS_PATH", ""))
+    require(source.is_absolute() and source.is_file() and not source.is_symlink())
+    parent = Path(environment.get("RUNNER_TEMP", ""))
+    require(parent.is_absolute() and parent.is_dir())
+    recorder = PipeFencedRecorder()
+
+    def admission():
+        admit_native(binding, environment, token)
+
+    admission()
+    minted = mint_keydb_qualification_jit(binding, token, recorder=recorder, before_post=admission)
+    with PreleaseFence(binding, minted, recorder, admission) as fence:
+        stage = "guest_contract"
+        temporary = None
+        try:
+            guest = tenant_environment(
+                minted, binding, image=PRIVATE_IMAGE, entrypoint_sha256=ENTRYPOINT_SHA256
+            )
+            stage = "private_scratch"
+            parent = Path(environment.get("RUNNER_TEMP", ""))
+            require(parent.is_absolute() and parent.is_dir())
+            temporary = Path(tempfile.mkdtemp(prefix="keydb-qualification-fenced-", dir=parent))
+            path = temporary / "private-runner.yaml"
+            stage = "reader_path_preflight"
+            source = Path(environment.get("KEYDB_QUALIFICATION_REGISTRY_SOPS_PATH", ""))
+            require(source.is_absolute() and source.is_file() and not source.is_symlink())
+        except Exception:
+            if temporary is not None:
+                temporary.rmdir()  # exact own empty directory; no credential SDL exists
+            # Only these fixed pure functions ran. No SOPS/compiler/create helper
+            # was imported or launched and no encoded config left this process.
+            fence.failure(stage)
+            raise ControllerHeld("Unreachable positive-fence boundary") from None
+        # Conservative irreversible poison before ANY unsafe/helper/deploy entry.
+        # A later failure, even before an actual create, can NEVER emit NO_CREATE.
+        fence.may_create()
+        enable_runtime()
+        from .keydb_qualification_lease import deploy_keydb_qualification
+        from .runner_image import read_pull_credentials, verify_native_reader_role
+
+        try:
+            with (
+                open(os.devnull, "w", encoding="utf-8") as sink,
+                contextlib.redirect_stdout(sink),
+                contextlib.redirect_stderr(sink),
+            ):
+                username, password = read_pull_credentials(
+                    source, username="jobordu", password="", native_reader=False
+                )
+                verify_native_reader_role(username, password)
+                write_sdl(path, binding, guest, password)
+                result = deploy_keydb_qualification(
+                    sdl_path=str(path),
+                    binding=binding,
+                    returned_runner_id=minted.handoff.runner_id,
+                    jit_ack_record=minted.public_record,
+                    jit_ack=minted.ack,
+                    encoded_jit_config=minted.handoff.encoded_config,
+                    recorder=recorder,
+                    receipt_path=str(temporary / "local-deploy-receipt.json"),
+                    admission=admission,
+                )
+        finally:
+            path.unlink(missing_ok=True)
+    require(
+        type(result) is dict
+        and result.get("schema") == "keydb-qualification-v1-deploy-result/v1"
+        and result.get("returned_runner_id") == minted.handoff.runner_id
+        and result.get("cleanup_qualified") is False
+    )
+    result = cast(dict[str, Any], result)
+    for prefix in ("deployment", "lease"):
+        validate_ack(result[prefix + "_ack_record"], result[prefix + "_ack"])
+    wait_for_returned_runner(minted.handoff.runner_id, binding, token, admission)
+    return dict(
+        schema="keydb-qualification-v1-provision-candidate/v1",
+        dseq=result["dseq"],
+        owner=result["owner"],
+        provider=result["provider"],
+        gseq=result["gseq"],
+        returned_runner_id=minted.handoff.runner_id,
+        runner_targets=["self-hosted", "linux", "akash", binding.runner_label],
+        jit_ack_record_sha256=minted.ack["record_sha256"],
+        deployment_ack_record_sha256=result["deployment_ack"]["record_sha256"],
+        lease_ack_record_sha256=result["lease_ack"]["record_sha256"],
+        deployment_outcome="created",
+        create_ambiguous=False,
+        provision_healthy=True,
+        cleanup_qualified=False,
+        runtime_qualified=False,
+    )
+
+
+def main() -> None:
+    require(len(sys.argv) == 1)
+    result = None
+    try:
+        result = provision(os.environ)
+    except PreparationFenced:
+        raise SystemExit(EXIT) from None
+    except Interrupted:
+        raise SystemExit(77) from None
+    except Exception:
+        result = None
+    if result is None:
+        raise SystemExit("Scanner-v2 controller held; no successful handoff or cleanup claim")
+    with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as stream:
+        public = {
+            "dseq": result["dseq"],
+            "wallet_address": result["owner"],
+            "returned_runner_id": str(result["returned_runner_id"]),
+            "runner-targets": json.dumps(result["runner_targets"], separators=(",", ":")),
+            "deployment_outcome": "created",
+            "create_ambiguous": "false",
+            "provision_healthy": "true",
+            "cleanup_qualified": "false",
+            "deployment_group": "borduas-keydb-qualification-run-"
+            + str(number(os.environ["GITHUB_RUN_ID"]))
+            + "-a"
+            + str(number(os.environ["GITHUB_RUN_ATTEMPT"]))
+            + "-r"
+            + str(number(os.environ["KEYDB_QUALIFICATION_SDK_ROUND"]))
+            + "-end",
+            "runners_online": "1/1",
+            **{
+                key: result[key]
+                for key in (
+                    "jit_ack_record_sha256",
+                    "deployment_ack_record_sha256",
+                    "lease_ack_record_sha256",
+                )
+            },
+        }
+        for key, value in public.items():
+            text = str(value)
+            require("\r" not in text and "\n" not in text)
+            stream.write(key + "=" + text + "\n")
+
+
+if __name__ == "__main__":
+    main()

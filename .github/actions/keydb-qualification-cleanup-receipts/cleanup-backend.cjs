@@ -122,8 +122,8 @@ async function handlerHistory(c,bundle,currentRecords,deps){
   const run=listedRun.id===n.run.id?listedRun:await deps.native(`${REPO}/actions/runs/${positive(listedRun.id)}/attempts/${positive(listedRun.run_attempt)}`);
   need(['id','run_attempt','head_sha','event','path'].every(k=>run[k]===listedRun[k]));
   const list=run.id===n.run.id?n.all_jobs:await jobs(deps.native,run.id,positive(run.run_attempt));let metadata=artifactCache.get(run.id);if(!metadata){metadata=await artifacts(deps.native,run.id);artifactCache.set(run.id,metadata);}const prefix=slot(a.target_locator)+'-';for(const row of metadata.filter(x=>typeof x.name==='string'&&x.name.startsWith(prefix)))candidateArtifacts.set(row.id,row);
-  const names=Object.values(S.PREFIX).map(prefix=>prefix+slot(a.target_locator));const found=list.filter(x=>names.includes(x.name));need(found.length<=1);if(!found.length){need(list.length>0||run.status==='queued');continue;}
-  const job=found[0];const direct=await deps.native(`${REPO}/actions/jobs/${positive(job.id)}`);need(jobProjection(job)===jobProjection(direct));const did=executed(job,STEP);
+  const names=[...Object.values(S.PREFIX),'Recover positively unused KeyDB parity qualification / Retire positively unused KeyDB qualification '].map(prefix=>prefix+slot(a.target_locator));const found=list.filter(x=>names.includes(x.name));need(found.length<=names.length&&new Set(found.map(x=>x.name)).size===found.length);if(!found.length){need(list.length>0||run.status==='queued');continue;}
+  for(const job of found){const direct=await deps.native(`${REPO}/actions/jobs/${positive(job.id)}`);need(jobProjection(job)===jobProjection(direct));const did=executed(job,STEP);
   need(job.run_id===run.id&&job.run_attempt===run.run_attempt&&job.head_sha===run.head_sha);handlers.push({run_id:run.id,run_attempt:run.run_attempt,job_id:job.id,job_name:job.name,status:job.status,conclusion:job.conclusion,executed:did});
   if(!did)continue;
   const isCurrent=run.id===a.run_id&&run.run_attempt===a.run_attempt&&job.id===a.job_id;need(isCurrent||job.status==='completed');
@@ -143,6 +143,7 @@ async function handlerHistory(c,bundle,currentRecords,deps){
    const chain=records.filter(x=>x.record.kind===kind).sort((x,y)=>x.record.phase_index-y.record.phase_index);
    if(!chain.length){if(!(currentHandler&&heldOnly))missing.push({run_id:run.id,job_id:job.id,kind});continue;}
    for(let i=0;i<chain.length;i++){const r=chain[i].record;need(r.phase_index===i&&r.parent_record_sha256===(i?hash(chain[i-1].record):null));if(i){const first={...chain[0].record.details},later={...r.details};delete first.response_received;delete later.response_received;need(canonical(first)===canonical(later));}}
+  }
   }
  }
  need([...candidateArtifacts.keys()].every(id=>seenEffectArtifacts.has(id)));need(missing.length===0);for(const row of prior)if(row.record.phase!=='NO_WIRE')clear[row.record.kind]=false;

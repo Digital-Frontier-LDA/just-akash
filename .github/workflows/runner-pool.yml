@@ -2940,6 +2940,8 @@ jobs:
       jit_ack_record_sha256: ${{ steps.controller.outputs.jit_ack_record_sha256 }}
       deployment_ack_record_sha256: ${{ steps.controller.outputs.deployment_ack_record_sha256 }}
       lease_ack_record_sha256: ${{ steps.controller.outputs.lease_ack_record_sha256 }}
+      no_create_record_sha256: ${{ steps.controller.outputs.no_create_record_sha256 }}
+      no_create_artifact_id: ${{ steps.controller.outputs.no_create_artifact_id }}
     steps:
       - name: Require the fixed keydb-qualification-v1 source and private caller
         shell: bash
@@ -3000,12 +3002,12 @@ jobs:
           install -m 0755 "$task_dir/sops" "$RUNNER_TEMP/runner-pull-bin/sops"
           printf '%s\n' "$RUNNER_TEMP/runner-pull-bin" >> "$GITHUB_PATH"
       - name: Install the hosted immutable receipt action dependencies
-        working-directory: .just-akash/.github/actions/keydb-qualification-durable-receipts
+        working-directory: .just-akash/.github/actions/keydb-qualification-fenced-receipts
         shell: bash
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Run the acknowledged KeyDB qualification controller
         id: controller
-        uses: ./.just-akash/.github/actions/keydb-qualification-durable-receipts
+        uses: ./.just-akash/.github/actions/keydb-qualification-fenced-receipts
         with:
           python-path: ${{ steps.python.outputs.python-path }}
           sdk-sha: ${{ inputs.just-akash-ref }}
