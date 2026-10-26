@@ -149,7 +149,7 @@ def test_legacy_error_contract_is_preserved_but_payload_logging_is_removed(monke
     caplog.set_level(logging.DEBUG, logger="akash.api")
     body = json.dumps({"message": f"already exists {JIT}"})
     monkeypatch.setattr(
-        "urllib.request.urlopen",
+        "just_akash.api._console_open",
         MagicMock(
             side_effect=urllib.error.HTTPError(
                 "https://console.invalid", 409, "Conflict", Message(), io.BytesIO(body.encode())
@@ -192,32 +192,68 @@ def test_redirect_never_sends_controller_key_to_another_origin(monkeypatch, capl
     assert_private(caplog, caught.value)
 
 
-def test_default_redirect_positive_control_forwards_the_key(monkeypatch):
-    calls = []
-
+def _redirecting_https_open(calls, location):
     def https_open(_handler, request):
         calls.append(request)
         headers = Message()
         status = 200 if len(calls) > 1 else 302
         if status == 302:
-            headers["Location"] = "https://another.invalid/"
+            headers["Location"] = location
         response = HTTPResponse(
             io.BytesIO(b'{"data":{"dseq":"123"}}'), headers, request.full_url, status
         )
         response.msg = "OK"
         return response
 
-    monkeypatch.setattr("urllib.request.HTTPSHandler.https_open", https_open)
+    return https_open
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "https://another.invalid/",
+        "http://console-api.akash.network/v1/deployments",  # downgrade
+        "https://console-api.akash.network:8443/v1/deployments",  # another port
+        "https://evil.akash.network/v1/deployments",  # exact host, not a suffix
+    ],
+)
+def test_legacy_client_never_follows_a_redirect_off_its_origin(monkeypatch, location):
+    """just-akash-ra3. This used to be a POSITIVE CONTROL asserting the legacy client
+    forwarded x-api-key to another.invalid on a 302 -- i.e. it pinned the bug. The
+    legacy client carries the SPENDING key, so a redirect off the Console origin is
+    now refused: exactly one request is made, and nothing reaches the target."""
+    calls = []
+    monkeypatch.setattr(
+        "urllib.request.HTTPSHandler.https_open", _redirecting_https_open(calls, location)
+    )
+    monkeypatch.setattr(
+        "urllib.request.HTTPHandler.http_open", _redirecting_https_open(calls, location)
+    )
+    with pytest.raises(AkashAPIError) as caught:
+        AkashConsoleAPI(KEY).create_deployment(SDL)
+    assert caught.value.status == 302
+    assert len(calls) == 1, [c.full_url for c in calls]
+
+
+def test_legacy_client_still_follows_a_same_origin_redirect(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "urllib.request.HTTPSHandler.https_open",
+        _redirecting_https_open(calls, "/v1/deployments/moved"),
+    )
     assert AkashConsoleAPI(KEY).create_deployment(SDL) == {"dseq": "123"}
-    assert len(calls) == 2
-    assert calls[1].full_url == "https://another.invalid/"
+    assert [c.full_url for c in calls][1] == (
+        "https://console-api.akash.network/v1/deployments/moved"
+    )
     assert calls[1].get_header("X-api-key") == KEY
 
 
 def test_ci_origin_is_not_selected_by_ambient_environment(monkeypatch):
     monkeypatch.setenv("AKASH_CONSOLE_URL", "https://another.invalid")
     assert CIConsoleAPI(KEY).base_url == "https://console-api.akash.network"
-    assert AkashConsoleAPI(KEY).base_url == "https://another.invalid"
+    # just-akash-ra3: the legacy client no longer accepts an off-Console base at all.
+    with pytest.raises(ValueError, match="refusing a Console base URL"):
+        AkashConsoleAPI(KEY)
 
 
 @pytest.mark.parametrize("key", ["", "a\nb", "a\rb", "a b", "é", None])

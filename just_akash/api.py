@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,6 +42,60 @@ CI_CONSOLE_ORIGIN = "https://console-api.akash.network"
 class _NoConsoleRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+# just-akash-ra3: the legacy client carries the SPENDING key in x-api-key. Its base URL
+# is overridable (AKASH_CONSOLE_URL, TransportConfig.console_url), and urllib's default
+# redirect handler follows a 30x to ANY host -- https -> http included -- re-sending
+# every header. So: the base must be the Console origin (or loopback, for the local
+# fakes), and a redirect is followed only to the request's own origin.
+CONSOLE_HOSTS = frozenset({"console-api.akash.network"})
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+# TEST-ONLY opt-in, False in production: a loopback base (the local fakes) is otherwise
+# refused, wherever it comes from (AKASH_CONSOLE_URL, TransportConfig.console_url,
+# base_url=). Allowing it by default let any local listener -- or an HTTP_PROXY, since
+# the fakes are plain http -- read x-api-key in cleartext (review of #488). Flipped only
+# by the `loopback_console` fixture in tests/conftest.py.
+_ALLOW_LOOPBACK_CONSOLE_FOR_TESTS = False
+
+
+def _origin(url: str) -> tuple[str, str | None, int | None]:
+    u = urllib.parse.urlsplit(url)
+    port = u.port or {"https": 443, "http": 80}.get(u.scheme)
+    return (u.scheme, u.hostname, port)
+
+
+def console_base_ok(url: str) -> bool:
+    """True iff the x-api-key may be sent to this base URL."""
+    try:
+        u = urllib.parse.urlsplit(url)
+        u.port  # noqa: B018 -- raises ValueError on a malformed port
+    except ValueError:
+        return False
+    if "@" in u.netloc:  # any userinfo, the empty 'https://@host' included
+        return False
+    if u.scheme == "https" and u.hostname in CONSOLE_HOSTS:
+        return u.port in (None, 443)
+    return (
+        _ALLOW_LOOPBACK_CONSOLE_FOR_TESTS
+        and u.scheme in ("http", "https")
+        and u.hostname in _LOOPBACK_HOSTS
+    )
+
+
+class _SameOriginRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urllib.parse.urljoin(req.full_url, newurl)
+        if _origin(target) != _origin(req.full_url) or not console_base_ok(target):
+            raise urllib.error.HTTPError(
+                req.full_url, code, "refused: redirect leaves the Console origin", headers, fp
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _console_open(request: urllib.request.Request, timeout: float) -> Any:
+    """The legacy client's one transport seam: a redirect may not leave the origin."""
+    return urllib.request.build_opener(_SameOriginRedirect()).open(request, timeout=timeout)
 
 
 def _ts() -> str:
@@ -228,6 +283,12 @@ class AkashConsoleAPI:
         self.base_url = base_url or os.environ.get(
             "AKASH_CONSOLE_URL", "https://console-api.akash.network"
         )
+        if not console_base_ok(self.base_url):
+            raise ValueError(
+                "refusing a Console base URL outside https://"
+                + "|".join(sorted(CONSOLE_HOSTS))
+                + ": the x-api-key would be sent there"
+            )
         self.api_key = api_key
         self.headers = {
             "x-api-key": api_key,
@@ -242,6 +303,9 @@ class AkashConsoleAPI:
         endpoint: str,
         data: dict[str, Any] | None = None,
     ) -> Any:
+        if not endpoint.startswith("/"):
+            # f"{base}{endpoint}" with "@evil.example/x" would make the host evil.example.
+            raise ValueError("Console endpoint must be an absolute path")
         url = f"{self.base_url}{endpoint}"
         confidential = self._protect_runtime_payloads or request_is_confidential(data)
         if method.upper() == "GET":
@@ -393,8 +457,8 @@ class AkashConsoleAPI:
             raise
 
     def _open_request(self, request: urllib.request.Request) -> Any:
-        # S310: the URL is built from the operator-configured Console origin.
-        return urllib.request.urlopen(request, timeout=CONSOLE_HTTP_TIMEOUT)  # noqa: S310
+        # The base is checked in __init__; _console_open re-checks every redirect.
+        return _console_open(request, timeout=CONSOLE_HTTP_TIMEOUT)
 
     def list_deployments(
         self, active_only: bool = True, max_pages: int | None = None
