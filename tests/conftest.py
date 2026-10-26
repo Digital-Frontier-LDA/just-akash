@@ -17,3 +17,12 @@ def _a_non_flynn_wallet(monkeypatch):
     monkeypatch.setattr(
         deploy_mod, "_wallet_account", lambda wallet, client: NON_FLYNN_TEST_WALLET
     )
+
+
+@pytest.fixture
+def loopback_console(monkeypatch):
+    """TEST-ONLY: let AkashConsoleAPI accept a loopback base (the local fakes).
+    Production refuses it (just-akash-ra3, review of #488)."""
+    from just_akash import api
+
+    monkeypatch.setattr(api, "_ALLOW_LOOPBACK_CONSOLE_FOR_TESTS", True)

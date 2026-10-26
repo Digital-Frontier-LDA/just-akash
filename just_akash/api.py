@@ -51,6 +51,12 @@ class _NoConsoleRedirect(urllib.request.HTTPRedirectHandler):
 # fakes), and a redirect is followed only to the request's own origin.
 CONSOLE_HOSTS = frozenset({"console-api.akash.network"})
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+# TEST-ONLY opt-in, False in production: a loopback base (the local fakes) is otherwise
+# refused, wherever it comes from (AKASH_CONSOLE_URL, TransportConfig.console_url,
+# base_url=). Allowing it by default let any local listener -- or an HTTP_PROXY, since
+# the fakes are plain http -- read x-api-key in cleartext (review of #488). Flipped only
+# by the `loopback_console` fixture in tests/conftest.py.
+_ALLOW_LOOPBACK_CONSOLE_FOR_TESTS = False
 
 
 def _origin(url: str) -> tuple[str, str | None, int | None]:
@@ -69,8 +75,12 @@ def console_base_ok(url: str) -> bool:
     if "@" in u.netloc:  # any userinfo, the empty 'https://@host' included
         return False
     if u.scheme == "https" and u.hostname in CONSOLE_HOSTS:
-        return True
-    return u.scheme in ("http", "https") and u.hostname in _LOOPBACK_HOSTS
+        return u.port in (None, 443)
+    return (
+        _ALLOW_LOOPBACK_CONSOLE_FOR_TESTS
+        and u.scheme in ("http", "https")
+        and u.hostname in _LOOPBACK_HOSTS
+    )
 
 
 class _SameOriginRedirect(urllib.request.HTTPRedirectHandler):
@@ -277,7 +287,7 @@ class AkashConsoleAPI:
             raise ValueError(
                 "refusing a Console base URL outside https://"
                 + "|".join(sorted(CONSOLE_HOSTS))
-                + " (or loopback): the x-api-key would be sent there"
+                + ": the x-api-key would be sent there"
             )
         self.api_key = api_key
         self.headers = {

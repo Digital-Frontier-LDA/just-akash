@@ -60,6 +60,8 @@ def fake_akash(monkeypatch):
 
     monkeypatch.setenv("AKASH_API_KEY", "test-key")
     monkeypatch.setenv("AKASH_CONSOLE_URL", fa.console_url)
+    # the fake console is loopback http: a test-only opt-in (just-akash-ra3)
+    monkeypatch.setattr("just_akash.api._ALLOW_LOOPBACK_CONSOLE_FOR_TESTS", True)
     try:
         yield fa
     finally:

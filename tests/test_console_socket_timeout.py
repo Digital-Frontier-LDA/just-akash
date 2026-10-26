@@ -307,7 +307,9 @@ class _StalledEndpoint:
             self._listener.close()
 
 
-def test_a_stalled_console_endpoint_raises_TimeoutError_not_a_hang(monkeypatch) -> None:
+def test_a_stalled_console_endpoint_raises_TimeoutError_not_a_hang(
+    monkeypatch, loopback_console
+) -> None:
     monkeypatch.setattr(api, "CONSOLE_HTTP_TIMEOUT", 0.5)
     with _StalledEndpoint() as endpoint:
         # ⚠ Key passed POSITIONALLY, never as `api_key="…"`: detect-secrets'

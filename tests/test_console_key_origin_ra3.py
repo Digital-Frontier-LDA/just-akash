@@ -10,8 +10,12 @@ be an absolute path. The end-to-end test uses two local servers and no external 
 
 from __future__ import annotations
 
+import io
 import json
 import threading
+import urllib.error
+import urllib.request
+from http.client import HTTPMessage
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
@@ -22,16 +26,48 @@ from just_akash.api import AkashAPIError, AkashConsoleAPI, console_base_ok
 KEY = "ra3-fake-spending-key"
 
 
+LOOPBACK = [
+    "http://127.0.0.1:8080",
+    "http://localhost:9",
+    "https://[::1]:8443",
+    "http://127.0.0.1:1",
+]
+
+
 @pytest.mark.parametrize(
-    "base",
-    [
-        "https://console-api.akash.network",
-        "http://127.0.0.1:8080",
-        "http://localhost:9",
-        "https://[::1]:8443",
-    ],
+    "base", ["https://console-api.akash.network", "https://console-api.akash.network:443"]
 )
-def test_the_console_origin_and_loopback_are_accepted(base):
+def test_the_console_origin_is_accepted(base):
+    assert console_base_ok(base)
+    assert AkashConsoleAPI(KEY, base_url=base).base_url == base
+
+
+@pytest.mark.parametrize("base", LOOPBACK)
+def test_loopback_is_refused_in_production_by_default(base, monkeypatch):
+    """Review of #488 (blocking): AKASH_CONSOLE_URL=http://127.0.0.1:1 was accepted by the
+    production constructor, so any local listener (or an HTTP_PROXY) read the key in
+    cleartext. Without the test-only opt-in, loopback is refused from every source."""
+    assert api._ALLOW_LOOPBACK_CONSOLE_FOR_TESTS is False
+    monkeypatch.setattr(api, "_console_open", lambda *a, **k: pytest.fail("a request was made"))
+    assert not console_base_ok(base)
+    with pytest.raises(ValueError, match="refusing a Console base URL"):
+        AkashConsoleAPI(KEY, base_url=base)
+    monkeypatch.setenv("AKASH_CONSOLE_URL", base)
+    with pytest.raises(ValueError, match="refusing a Console base URL"):
+        AkashConsoleAPI(KEY)
+
+
+def test_loopback_from_transport_config_is_refused_by_default():
+    from just_akash.transport.base import TransportConfig
+    from just_akash.transport.lease_shell import LeaseShellTransport
+
+    cfg = TransportConfig(dseq="1", api_key=KEY, console_url="http://127.0.0.1:1")
+    with pytest.raises(ValueError, match="refusing a Console base URL"):
+        LeaseShellTransport(cfg)._get_api_client()
+
+
+@pytest.mark.parametrize("base", LOOPBACK)
+def test_loopback_is_accepted_only_with_the_test_opt_in(base, loopback_console):
     assert console_base_ok(base)
     assert AkashConsoleAPI(KEY, base_url=base).base_url == base
 
@@ -48,6 +84,7 @@ def test_the_console_origin_and_loopback_are_accepted(base):
         "https://127.0.0.1@evil.example",
         "ftp://127.0.0.1",
         "https://console-api.akash.network:notaport",
+        "https://console-api.akash.network:8443",  # the Console origin is port 443 only
     ],
 )
 def test_any_other_base_is_refused_before_a_request(base, monkeypatch):
@@ -84,7 +121,7 @@ def _quiet(cls):
     return cls
 
 
-def test_a_302_to_another_host_never_delivers_the_key():
+def test_a_302_to_another_host_never_delivers_the_key(loopback_console):
     seen = []
 
     @_quiet
@@ -118,7 +155,7 @@ def test_a_302_to_another_host_never_delivers_the_key():
         b.shutdown()
 
 
-def test_a_302_within_the_origin_still_works():
+def test_a_302_within_the_origin_still_works(loopback_console):
     @_quiet
     class A(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -138,3 +175,23 @@ def test_a_302_within_the_origin_still_works():
         assert client._request("GET", "/v1/old") == {"path": "/v1/new", "key": KEY}
     finally:
         a.shutdown()
+
+
+# ── the two survivors of #488's first review ──────────────────────────────────────────
+
+
+def _redirect(base, newurl):
+    req = urllib.request.Request(base + "/v1/x", headers={"x-api-key": KEY})
+    return api._SameOriginRedirect().redirect_request(
+        req, io.BytesIO(), 302, "Found", HTTPMessage(), newurl
+    )
+
+
+def test_a_same_origin_redirect_carrying_userinfo_is_refused():
+    with pytest.raises(urllib.error.HTTPError, match="redirect leaves the Console origin"):
+        _redirect("https://console-api.akash.network", "https://u@console-api.akash.network/v1/y")
+
+
+def test_a_loopback_https_to_http_redirect_is_refused(loopback_console):
+    with pytest.raises(urllib.error.HTTPError, match="redirect leaves the Console origin"):
+        _redirect("https://127.0.0.1:8443", "http://127.0.0.1:8443/v1/y")
