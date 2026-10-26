@@ -229,9 +229,28 @@ def test_the_console_urlopen_reads_the_one_module_constant() -> None:
     urlopen's timeout argument must be the constant's name, so shrinking the constant
     (the behavioural test below) actually reaches the socket."""
     source = (REPO / "just_akash" / "api.py").read_text(encoding="utf-8")
-    calls = urlopen_calls(source)
-    assert calls, "no urlopen call left in api.py — the Console client moved; re-pin it"
+    # just-akash-ra3: the legacy client no longer calls urlopen (the default opener follows
+    # off-host redirects with x-api-key). Its one choke point is _console_open(...), called
+    # from _open_request; _console_open passes its `timeout` straight to the opener.
+    assert not urlopen_calls(source), "api.py calls urlopen again: off-host redirects follow"
+    tree = ast.parse(source)
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and _call_callee_name(node) == "_console_open"
+    ]
+    assert calls, "no _console_open call left in api.py — the Console client moved; re-pin it"
     assert len(calls) == 1, f"expected the single Console choke point, found {len(calls)}"
+    seam = next(
+        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_console_open"
+    )
+    opens = [
+        n for n in ast.walk(seam) if isinstance(n, ast.Call) and _call_callee_name(n) == "open"
+    ]
+    assert len(opens) == 1 and any(
+        kw.arg == "timeout" and isinstance(kw.value, ast.Name) and kw.value.id == "timeout"
+        for kw in opens[0].keywords
+    ), "_console_open must hand its timeout to the opener unchanged"
     timeout_kw = next((kw for kw in calls[0].keywords if kw.arg == "timeout"), None)
     assert timeout_kw is not None, "the Console urlopen lost its timeout= again"
     assert isinstance(timeout_kw.value, ast.Name), (

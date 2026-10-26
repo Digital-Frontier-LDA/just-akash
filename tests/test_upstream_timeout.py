@@ -52,7 +52,7 @@ def _raise_http(monkeypatch, client, code: int, body: str):
     # Caught as RuntimeError ON PURPOSE — that is the type every caller in the
     # tree catches today, so catching the subclass here would stop proving it.
     # Tests needing the extra fields narrow with an explicit isinstance.
-    monkeypatch.setattr("urllib.request.urlopen", _boom)
+    monkeypatch.setattr("just_akash.api._console_open", _boom)
     with pytest.raises(RuntimeError) as exc:
         client._request("POST", "/v1/deployments", {"x": 1})
     return exc.value

@@ -80,7 +80,7 @@ def console(monkeypatch):
             raise _http_error(url, result)
         return _Response(result)
 
-    monkeypatch.setattr(api.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(api, "_console_open", urlopen)
     return state
 
 

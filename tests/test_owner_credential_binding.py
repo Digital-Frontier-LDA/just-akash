@@ -427,7 +427,7 @@ def real_console(monkeypatch):
         state["closes"].append((request.get_method(), url.rsplit("/", 1)[-1]))
         return _Response(b"{}")
 
-    monkeypatch.setattr(api.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(api, "_console_open", urlopen)
     return state
 
 
