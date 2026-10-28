@@ -595,3 +595,4 @@
 {"run_id":"40608226642","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-10-28T00:21:26Z","attempt":"1","accrued_at":"2026-10-28T00:27:16Z","published":true}
 {"run_id":"40625112044","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-10-28T03:10:03Z","attempt":"1","accrued_at":"2026-10-28T03:16:12Z","published":true}
 {"run_id":"40642567219","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-10-28T06:13:44Z","attempt":"1","accrued_at":"2026-10-28T06:19:59Z","published":true}
+{"run_id":"40661991176","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-10-28T09:09:05Z","attempt":"1","accrued_at":"2026-10-28T09:14:39Z","published":true}
