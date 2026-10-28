@@ -386,10 +386,51 @@ def test_noncanonical_policy_data_holds(field, value):
 
 
 @pytest.mark.parametrize(
+    "name",
+    [
+        "dfl--flynn--ci--snapshot-second-cpu-40469409460-1-3",
+        "dfl--" + "a" * 90,
+        "dfci-" + "a" * 90,
+    ],
+)
+def test_project_namespace_runner_name_is_minted_like_the_original(name):
+    github = GitHub()
+    github.result = {"runner": {"id": 789, "name": name}, "encoded_jit_config": CONFIG}
+    handoff = jit.mint_jit(
+        POLICY, name, (name, "linux", "akash"), "installation-fixture", request=github
+    )
+    assert handoff.runner_id == 789
+    assert github.calls[-1][3]["name"] == name
+
+
+@pytest.mark.parametrize(
     "name,labels,token",
     [
         ("", LABELS, "fixture"),
         ("sentinel-host", LABELS, "fixture"),
+        (
+            "dfl-flynn--ci--cpu-123-1-1",
+            ("dfl-flynn--ci--cpu-123-1-1", "linux", "akash"),
+            "fixture",
+        ),
+        ("dfl--", ("dfl--", "linux", "akash"), "fixture"),
+        (
+            "DFL--flynn--ci--cpu-123-1-1",
+            ("DFL--flynn--ci--cpu-123-1-1", "linux", "akash"),
+            "fixture",
+        ),
+        ("dfl--" + "a" * 91, ("dfl--" + "a" * 91, "linux", "akash"), "fixture"),
+        ("dfci-" + "a" * 91, ("dfci-" + "a" * 91, "linux", "akash"), "fixture"),
+        (
+            "dfl--Flynn--ci--cpu-123-1-1",
+            ("dfl--Flynn--ci--cpu-123-1-1", "linux", "akash"),
+            "fixture",
+        ),
+        (
+            "dfl--flynn--ci--cpu-123-1-1.abc",
+            ("dfl--flynn--ci--cpu-123-1-1.abc", "linux", "akash"),
+            "fixture",
+        ),
         (None, LABELS, "fixture"),
         (NAME, (), "fixture"),
         (NAME, list(LABELS), "fixture"),

@@ -269,7 +269,10 @@ def mint_jit(
     if (
         not isinstance(policy, JitPolicy)
         or not isinstance(runner_name, str)
-        or re.fullmatch(r"dfci-[a-z0-9-]{1,90}", runner_name) is None
+        # dfci-<…> is the original runner namespace; dfl--<repo>--<env>--<…> is the
+        # owner-approved org/project namespace (df-cicd hz4.1.3, owner item 129).
+        # Both are accepted so callers can move one at a time.
+        or re.fullmatch(r"(?:dfci-|dfl--)[a-z0-9-]{1,90}", runner_name) is None
         or type(labels) is not tuple
         or not 1 <= len(labels) <= 100
         or any(
