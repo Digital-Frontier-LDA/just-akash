@@ -593,3 +593,4 @@
 {"run_id":"40528580315","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-10-27T15:12:02Z","attempt":"1","accrued_at":"2026-10-27T15:18:39Z","published":true}
 {"run_id":"40557297898","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-10-27T18:09:29Z","attempt":"1","accrued_at":"2026-10-27T18:18:08Z","published":true}
 {"run_id":"40608226642","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-10-28T00:21:26Z","attempt":"1","accrued_at":"2026-10-28T00:27:16Z","published":true}
+{"run_id":"40625112044","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-10-28T03:10:03Z","attempt":"1","accrued_at":"2026-10-28T03:16:12Z","published":true}
