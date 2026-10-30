@@ -84,6 +84,7 @@ from .paid_create import (
     reconcile_receipt,
     verified_cleanup,
 )
+from .provenance import RUN_SEPARATOR, run_id_of
 
 # The baseline HTTP marker the probe serves; the update check changes it and
 # re-reads it through the ingress to prove a new revision went live.
@@ -219,12 +220,12 @@ profiles:
         memory: { size: 1Gi }
         storage: [{ size: 5Gi }]
   placement:
-    akash:
+    just-akash-smoke:
       pricing:
         probe: { denom: uact, amount: 10000 }
 deployment:
   probe:
-    akash: { profile: probe, count: 1 }
+    just-akash-smoke: { profile: probe, count: 1 }
 """.replace("__SMOKE_MARKER__", INGRESS_BASELINE).replace(
     # The death-cause beacon ships DARK: BEACON_URL reaches the container only when
     # the operator sets SMOKE_BEACON_URL in the smoke's environment (a collector on
@@ -471,7 +472,13 @@ def _hdr(msg: str) -> None:
 # The probe SDL's sole service name. A deployment whose service set is exactly
 # {PROBE_SERVICE} is unambiguously a leaked smoke probe, never a user workload.
 PROBE_SERVICE = "probe"
-PROBE_GROUP = "akash"
+# The probe SDL's placement key (openmix-me5w). It carries PLACEMENT_PREFIX, so Flynn and the
+# IB leak audit attribute the probe to just-akash: as plain `akash` it read as Flynn's own
+# rnd_fleet and paged lease-leaks DOWN on every daily smoke. `just-akash deploy` run-stamps it,
+# so on chain it is `just-akash-smoke.<run id>`.
+PROBE_GROUP = "just-akash-smoke"
+# Probes created before the rename are named `akash` on chain; the sweep still reaps them.
+LEGACY_PROBE_GROUP = "akash"
 
 # Don't reap a probe younger than this: a concurrent smoke run could still be
 # using it (a run holds one probe for up to the whole matrix, ~tens of minutes).
@@ -572,6 +579,33 @@ def _is_orphan_probe(
     return age is not None and age >= min_age_seconds
 
 
+def _probe_group_names(owner: str, dseq: str) -> list[str]:
+    """The deployment's on-chain group names ([] = unknown, never "not ours")."""
+    from . import chain
+
+    return chain.deployment_group_names(owner, dseq)
+
+
+def _probe_group(names: list[str]) -> str | None:
+    """The exact on-chain group to close a leaked probe under, or None to leave it alone.
+
+    The destroy refuses unless `--expected-group` equals the chain name exactly, and
+    `just-akash deploy` run-stamps PROBE_GROUP, so the sweep must pass the name the chain
+    holds: PROBE_GROUP, PROBE_GROUP.<run id>, or LEGACY_PROBE_GROUP (created before
+    openmix-me5w). A single group is required; anything else is not a probe this sweep
+    may close.
+    """
+    if len(names) != 1:
+        return None
+    name = names[0]
+    if name in (PROBE_GROUP, LEGACY_PROBE_GROUP):
+        return name
+    head, sep, _ = name.rpartition(RUN_SEPARATOR)
+    if sep and head == PROBE_GROUP and run_id_of(name):
+        return name
+    return None
+
+
 def _is_not_found_error(exc: Exception) -> bool:
     """True only for a 404 (deployment already gone), not any other API error.
 
@@ -619,6 +653,20 @@ def sweep_orphan_probes(
             continue
         if not _is_orphan_probe(detail, dseq, min_age_seconds=min_age_seconds, now=now):
             continue
+        # openmix-me5w: close it under the group name the chain actually holds.
+        try:
+            names = _probe_group_names(owner, dseq)
+            why = "no group readable on chain"
+        except Exception as e:  # noqa: BLE001 -- must not abort the sweep
+            names, why = [], str(e)[:120]
+        if not names:
+            # Unknown, not "not a probe": the sweep is incomplete, exactly as for detail.
+            uninspected.append(dseq)
+            print(f"  {YELLOW}orphan sweep: could not read the group of {dseq}: {why}{RESET}")
+            continue
+        group = _probe_group(names)
+        if group is None:
+            continue
         found.append(dseq)
         age = _probe_age_seconds(dseq, now)
         age_note = f"{int(age // 60)}m old" if age is not None else "age unknown"
@@ -629,7 +677,7 @@ def sweep_orphan_probes(
             f"  {YELLOW}orphaned probe {dseq} ({age_note}) — leaked by an earlier "
             f"run; {action}{RESET}"
         )
-        if dry_run or robust_destroy(dseq, owner=owner, group=PROBE_GROUP):
+        if dry_run or robust_destroy(dseq, owner=owner, group=group):
             swept.append(dseq)
             if not dry_run:
                 _delete_resolved_provider_smoke_receipts(dseq, owner)
