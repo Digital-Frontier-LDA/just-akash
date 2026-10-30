@@ -42,6 +42,9 @@ select = ["E", "F", "I", "UP", "B", "SIM", "S"]
 "just_akash/api.py" = ["S603", "S606", "S607"]
 "just_akash/cli.py" = ["S603", "S606", "S607"]
 "just_akash/transport/ssh.py" = ["S603", "S606", "S607"]
+# The Secret Scan helper exists to run `git` (argv lists, never shell=True) over the
+# workflow's own checkout; SHAs are validated as 40-hex commits before use.
+".github/scripts/secret_scan.py" = ["S603", "S607"]
 # The persistent canary. Every ignore here is the thing the module EXISTS to do, and
 # each is scoped to a specific rule rather than blanket-disabling S:
 #   S310 - it opens URLs on purpose. That is the egress probe. Targets come from our own
