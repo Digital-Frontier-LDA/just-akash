@@ -59,6 +59,7 @@ def token(seed: int) -> str:
 class Repo:
     def __init__(self, path: Path):
         self.path = path
+        self.scans = 0
         path.mkdir()
         self.git("init", "-q", "-b", "main")
         self.commit({"README.md": "base\n"}, "base")
@@ -80,13 +81,18 @@ class Repo:
         return self.git("rev-parse", ref)
 
     def scan(self, rev: str, *, merges: str = "--diff-merges=remerge") -> int:
-        """gitleaks over `rev` with the workflow's options: 1 = leaks found, 0 = clean."""
+        """gitleaks over `rev` with the workflow's options: 1 = leaks found, 0 = clean.
+
+        The scanner must also have succeeded: its JSON report holds findings iff rc is 1, so
+        an rc of 0 from a scan that errored or saw nothing cannot pass as "clean"."""
         assert GITLEAKS, "gitleaks is required here (SECRET_SCAN_REQUIRE_GITLEAKS=1)"
         opts = (
             ss.log_opts(rev)
             if merges == "--diff-merges=remerge"
             else f"--full-history {merges} {rev}"
         )
+        out = self.path.parent / f"scan-{self.scans}.json"
+        self.scans += 1
         p = subprocess.run(
             [
                 GITLEAKS,
@@ -97,12 +103,22 @@ class Repo:
                 "--redact",
                 "--exit-code",
                 "1",
+                "--report-format",
+                "json",
+                "--report-path",
+                str(out),
                 f"--log-opts={opts}",
             ],
             capture_output=True,
             text=True,
         )
         assert p.returncode in (0, 1), p.stderr
+        findings = json.loads(out.read_text())
+        assert isinstance(findings, list) and (len(findings) > 0) == (p.returncode == 1), (
+            p.returncode,
+            findings,
+            p.stderr,
+        )
         return p.returncode
 
     def report(self, rev: str, out: Path) -> list[dict]:
@@ -214,7 +230,7 @@ def test_p2_a_token_on_another_branch_does_not_red_the_pr(repo, tmp_path):
         tmp_path / "gl.json",
         "success",
         main_ref="refs/remotes/origin/main",
-        refs_expected=3,
+        refs_path=_refs(tmp_path, 3),
         cwd=repo.path,
     )
     assert (n, on_main) == (len(found), 0) and n >= 1
@@ -289,29 +305,38 @@ def test_pin_config_writes_the_bases_files(repo):
 
 
 @pytest.mark.parametrize(
-    "lines",
-    [
-        [f"k = 'v'  # {ALLOW}"],
-        [f"k = 'v'  # {IGNORE}"],
-        [f"k = 'v'  # {PRAGMA} allowlist secret"],
-        [f"# {PRAGMA} allowlist nextline secret", "k = 'v'"],
-        [f"k = 'v'  # {PRAGMA}allowlist secret"],
-        [f"k = 'v'  # {PRAGMA} whitelist secret"],
-    ],
-    ids=[
-        "P5a-gitleaks",
-        "P5b-trufflehog",
-        "P5c-pragma",
-        "P5d-nextline",
-        "P5e-no-space",
-        "P5f-whitelist",
-    ],
+    "line", [f"k = 'v'  # {ALLOW}", f"k = 'v'  # {IGNORE}"], ids=["P5a-gitleaks", "P5b-trufflehog"]
 )
-def test_p5_an_added_inline_escape_is_red(repo, lines):
+def test_p5_an_added_inline_escape_is_red(repo, line):
     base = repo.sha()
-    head = repo.commit({"a.py": "\n".join(lines) + "\n"}, "escape")
+    head = repo.commit({"a.py": line + "\n"}, "escape")
     bad = ss.escape_violations(f"{base}..{head}", repo.path)
     assert len(bad) == 1 and "inline scanner escape" in bad[0]
+
+
+PRAGMAS = {
+    "P5c-pragma": [f"k = 'v'  # {PRAGMA} allowlist secret"],
+    "P5d-nextline": [f"# {PRAGMA} allowlist nextline secret", "k = 'v'"],
+    "P5e-no-space": [f"k = 'v'  # {PRAGMA}allowlist secret"],
+    "P5f-whitelist": [f"k = 'v'  # {PRAGMA} whitelist secret"],
+}
+
+
+@pytest.mark.parametrize("lines", PRAGMAS.values(), ids=PRAGMAS.keys())
+def test_p5_a_detect_secrets_pragma_passes_the_guard(repo, lines):
+    """The pragma escapes detect-secrets only, which the baseline audit (P8) already holds,
+    and main carries it on many lines: refusing it would red ordinary PRs."""
+    base = repo.sha()
+    head = repo.commit({"a.py": "\n".join(lines) + "\n"}, "pragma")
+    assert ss.escape_violations(f"{base}..{head}", repo.path) == []
+
+
+@needs_gitleaks
+def test_p5i_a_pragma_does_not_hide_a_token_from_gitleaks(repo):
+    base = repo.sha()
+    head = repo.commit({"a.py": f'key = "{token(5)}"  # {PRAGMA} allowlist secret\n'}, "pragma")
+    assert ss.escape_violations(f"{base}..{head}", repo.path) == []
+    assert repo.scan(f"{base}..{head}") == 1
 
 
 def test_p5g_no_escape_passes_the_guard(repo):
@@ -342,6 +367,74 @@ def test_a_secrets_baseline_update_may_land_with_its_code(repo):
     base = repo.sha()
     head = repo.commit({".secrets.baseline": "{}\n", "a.py": "x = 1\n"}, "fixture + baseline")
     assert ss.escape_violations(f"{base}..{head}", repo.path) == []
+    assert ss.baseline_violations(base, head, repo.path) == []
+
+
+# ── P8: a baseline cannot exempt a PR's own secret by regeneration ────────────────────
+
+
+def _baseline(**entries: dict) -> str:
+    """{filename: entry}, one detect-secrets result per file."""
+    return json.dumps({"version": "1.5.0", "results": {f: [e] for f, e in entries.items()}})
+
+
+_ENTRY = {"type": "Secret Keyword", "hashed_secret": "ab" * 20, "line_number": 3}
+
+
+def test_p8_an_unaudited_baseline_entry_is_red(repo, monkeypatch, capsys):
+    base = repo.commit({".secrets.baseline": _baseline()}, "empty baseline")
+    head = repo.commit(
+        {".secrets.baseline": _baseline(**{"cfg.py": _ENTRY}), "cfg.py": "x = 1\n"},
+        "regenerate over a new secret",
+    )
+    bad = ss.baseline_violations(base, head, repo.path)
+    assert len(bad) == 1 and "cfg.py gains an unaudited Secret Keyword" in bad[0]
+    monkeypatch.chdir(repo.path)  # the CLI runs in the workflow's checkout
+    assert ss.main(["escape-guard", "--rev", f"{base}..{head}"]) == 1
+    assert "::error::.secrets.baseline: cfg.py gains" in capsys.readouterr().out
+
+
+def test_p8_an_entry_marked_not_a_secret_passes(repo):
+    base = repo.commit({".secrets.baseline": _baseline()}, "empty baseline")
+    head = repo.commit(
+        {".secrets.baseline": _baseline(**{"cfg.py": {**_ENTRY, "is_secret": False}})},
+        "audited fixture",
+    )
+    assert ss.baseline_violations(base, head, repo.path) == []
+
+
+@pytest.mark.parametrize("verdict", [True, None], ids=["marked-secret", "null"])
+def test_p8_only_an_explicit_false_counts_as_audited(repo, verdict):
+    base = repo.commit({".secrets.baseline": _baseline()}, "empty baseline")
+    head = repo.commit(
+        {".secrets.baseline": _baseline(**{"cfg.py": {**_ENTRY, "is_secret": verdict}})}, "x"
+    )
+    assert len(ss.baseline_violations(base, head, repo.path)) == 1
+
+
+def test_p8_line_number_churn_on_a_known_entry_passes(repo):
+    base = repo.commit({".secrets.baseline": _baseline(**{"cfg.py": _ENTRY})}, "known")
+    head = repo.commit(
+        {".secrets.baseline": _baseline(**{"cfg.py": {**_ENTRY, "line_number": 9}})}, "moved"
+    )
+    assert ss.baseline_violations(base, head, repo.path) == []
+
+
+def test_p8_a_baseline_that_does_not_parse_fails_closed(repo):
+    base = repo.sha()
+    head = repo.commit({".secrets.baseline": "not json"}, "broken")
+    with pytest.raises(ss.ScanError, match="does not parse"):
+        ss.baseline_violations(base, head, repo.path)
+
+
+def test_baseline_equal_ignores_audit_fields_only(tmp_path):
+    committed, fresh = tmp_path / "committed", tmp_path / "fresh"
+    committed.write_text(_baseline(**{"a.py": {**_ENTRY, "is_secret": False}}))
+    fresh.write_text(_baseline(**{"a.py": _ENTRY}))
+    assert ss.baseline_equal(committed, fresh)
+    fresh.write_text(_baseline(**{"a.py": _ENTRY, "b.py": _ENTRY}))
+    assert not ss.baseline_equal(committed, fresh), "control: a new finding still differs"
+    assert ss.main(["baseline-equal", str(committed), str(fresh)]) == 1
 
 
 # ── P7: the daily report fails closed ─────────────────────────────────────────────────
@@ -351,12 +444,24 @@ def _origin(repo: Repo) -> None:
     repo.git("update-ref", "refs/remotes/origin/main", repo.sha("main"))
 
 
+def _refs(tmp_path: Path, branches: int, tags: int = 0, *, api: int | None = None) -> Path:
+    """refs.json as the scan job writes it: the API's counts and its own checkout's."""
+    out = tmp_path / "refs.json"
+    listed = {"branches": branches if api is None else api, "tags": tags}
+    out.write_text(json.dumps({"api": listed, "scanned": {"branches": branches, "tags": tags}}))
+    return out
+
+
 def test_p7_a_scan_that_did_not_succeed_fails(repo, tmp_path):
     (tmp_path / "gl.json").write_text("[]")
     for result in ("failure", "cancelled", "skipped", ""):
         with pytest.raises(ss.ScanError, match="not 'success'"):
             ss.report(
-                tmp_path / "gl.json", result, main_ref="main", refs_expected=0, cwd=repo.path
+                tmp_path / "gl.json",
+                result,
+                main_ref="main",
+                refs_path=_refs(tmp_path, 0),
+                cwd=repo.path,
             )
 
 
@@ -369,17 +474,51 @@ def test_p7_a_missing_or_bad_report_fails(repo, tmp_path, content, match):
     if content is not None:
         (tmp_path / "gl.json").write_text(content)
     with pytest.raises(ss.ScanError, match=match):
-        ss.report(tmp_path / "gl.json", "success", main_ref="main", refs_expected=0, cwd=repo.path)
+        ss.report(
+            tmp_path / "gl.json",
+            "success",
+            main_ref="main",
+            refs_path=_refs(tmp_path, 0),
+            cwd=repo.path,
+        )
 
 
-def test_p7_fewer_refs_than_the_repo_has_fails(repo, tmp_path):
-    _origin(repo)
+def test_p7_a_scan_that_saw_fewer_refs_than_the_api_lists_fails(repo, tmp_path):
     (tmp_path / "gl.json").write_text("[]")
-    assert ss.report(
-        tmp_path / "gl.json", "success", main_ref="main", refs_expected=1, cwd=repo.path
-    )[1:] == (0, 0)
-    with pytest.raises(ss.ScanError, match="narrowed"):
-        ss.report(tmp_path / "gl.json", "success", main_ref="main", refs_expected=2, cwd=repo.path)
+    ok = _refs(tmp_path, 2, 1)
+    assert ss.report(tmp_path / "gl.json", "success", main_ref="main", refs_path=ok)[1:] == (0, 0)
+    with pytest.raises(ss.ScanError, match="branches 2 < 3.*narrowed"):
+        ss.report(
+            tmp_path / "gl.json", "success", main_ref="main", refs_path=_refs(tmp_path, 2, api=3)
+        )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [None, "not json", '{"api": {"branches": 1, "tags": 0}}', '{"api": 1, "scanned": 1}'],
+    ids=["missing", "unparseable", "no-scanned", "wrong-shape"],
+)
+def test_p7_missing_or_bad_ref_counts_fail(tmp_path, content):
+    (tmp_path / "gl.json").write_text("[]")
+    refs = tmp_path / "refs.json"
+    if content is not None:
+        refs.write_text(content)
+    with pytest.raises(ss.ScanError, match="no usable ref counts"):
+        ss.report(tmp_path / "gl.json", "success", main_ref="main", refs_path=refs)
+
+
+def test_the_refs_cli_counts_the_checkout_it_runs_in(repo, tmp_path, monkeypatch):
+    _origin(repo)
+    repo.git("update-ref", "refs/remotes/origin/HEAD", repo.sha())
+    repo.git("tag", "v1")
+    repo.git("update-ref", "refs/remotes/pull/7/head", repo.sha())
+    assert ss.refs_in_checkout(repo.path) == {"branches": 1, "tags": 1, "pull_heads": 1}
+    monkeypatch.chdir(repo.path)
+    out = tmp_path / "refs.json"
+    assert ss.main(["refs", "--api-branches", "1", "--api-tags", "1", "--out", str(out)]) == 0
+    counts = json.loads(out.read_text())
+    assert counts["api"] == {"branches": 1, "tags": 1}
+    assert counts["scanned"]["branches"] == 1
 
 
 def test_p7_a_finding_on_main_is_counted_as_on_main(repo, tmp_path):
@@ -391,7 +530,11 @@ def test_p7_a_finding_on_main_is_counted_as_on_main(repo, tmp_path):
     }
     (tmp_path / "gl.json").write_text(json.dumps([finding]))
     body, n, on_main = ss.report(
-        tmp_path / "gl.json", "success", main_ref="main", refs_expected=1, cwd=repo.path
+        tmp_path / "gl.json",
+        "success",
+        main_ref="main",
+        refs_path=_refs(tmp_path, 1),
+        cwd=repo.path,
     )
     assert (n, on_main) == (1, 1) and "**yes**" in body
 
@@ -405,8 +548,8 @@ def test_p7_the_cli_exits_1_and_writes_no_body_when_the_report_is_missing(tmp_pa
             str(tmp_path / "none.json"),
             "--scan-result",
             "success",
-            "--refs-expected",
-            "0",
+            "--refs",
+            str(tmp_path / "refs.json"),
             "--body-out",
             str(out),
         ]
@@ -460,3 +603,22 @@ def test_exemptions_come_from_the_base_on_pull_requests_and_merge_groups():
 def test_the_daily_scan_runs_every_day():
     on = _wf()[True]  # YAML 1.1 reads the bare key `on` as a boolean
     assert on["schedule"] == [{"cron": "0 8 * * *"}] and "workflow_dispatch" in on
+
+
+def test_a_daily_run_and_a_push_to_main_never_share_a_concurrency_group():
+    """On schedule/dispatch github.ref is refs/heads/main too: without the event in the
+    group, a push to main cancels the daily scan (cancel-in-progress) or vice versa."""
+    assert "github.event_name" in _wf()["concurrency"]["group"]
+
+
+def test_the_report_reads_the_scan_jobs_own_ref_counts():
+    gl = _wf()["jobs"]["gitleaks"]["steps"]
+    names = [s.get("name") for s in gl]
+    api = names.index("Branch and tag counts the API lists (daily scan)")
+    assert api < names.index("Checkout"), "the API is asked before anything is fetched"
+    fetch = gl[names.index("Fetch closed-PR heads (daily scan)")]["run"]
+    assert "secret_scan.py refs" in fetch and "--out refs.json" in fetch
+    kept = gl[names.index("Keep the report")]["with"]["path"]
+    assert "refs.json" in kept and "gl.json" in kept
+    rep_steps = {s.get("name"): s for s in _wf()["jobs"]["report"]["steps"]}
+    assert "--refs refs.json" in rep_steps["Read the report (fails closed)"]["run"]

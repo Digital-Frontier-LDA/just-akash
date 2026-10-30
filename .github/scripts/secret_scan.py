@@ -24,14 +24,23 @@ Subcommands, each run as its own workflow step:
     request could exempt its own range.
 
 ``escape-guard``
-    Fail when the range ADDS an inline scanner escape, or changes an ignore
-    file together with anything else (an ignore change is its own PR).
+    Fail when the range ADDS an inline escape for gitleaks or TruffleHog,
+    changes a gitleaks exemption file together with anything else, or adds
+    an unaudited ``.secrets.baseline`` entry.
+
+``baseline-equal``
+    The detect-secrets job's comparison of the committed baseline with a fresh
+    scan, ignoring the audit fields a fresh scan never carries.
+
+``refs``
+    In the scanning job: the branch and tag counts the API lists (taken BEFORE
+    the checkout) and the refs the checkout actually holds.
 
 ``report``
     Read the daily scan's JSON report and fail closed: no report, a report
-    that does not parse, a scan that did not succeed, or fewer refs scanned
-    than the repo has. Otherwise write the issue body and say whether any
-    finding is reachable from main.
+    that does not parse, a scan that did not succeed, or a scan job whose
+    checkout held fewer refs than the API listed. Otherwise write the issue
+    body and say whether any finding is reachable from main.
 
 Run: ``python3 .github/scripts/secret_scan.py <subcommand> --help``
 """
@@ -55,17 +64,17 @@ ZERO_SHA = "0" * 40
 # baseline changes on main to 2026-10-30 did).
 IGNORE_FILES = (".gitleaks.toml", ".gitleaksignore")
 
-# Inline escapes the three scanners honour. Spelled in pieces so this file does
-# not itself add the strings the guard refuses.
-_ESCAPE = re.compile(
-    "|".join(
-        (
-            "gitleaks" + ":allow",
-            "trufflehog" + ":ignore",
-            "pragma" + r":\s*(?:allow|white)list",
-        )
-    )
-)
+# Inline escapes that blind the BACKSTOP scanners, gitleaks and TruffleHog;
+# none was ever added on main. Not the detect-secrets pragma: it blinds only
+# detect-secrets (gitleaks and TruffleHog still scan that line), it is a
+# per-line deliberate act, and main adds it routinely (144 lines in 33 of 348
+# commits to 2026-10-30). Spelled in pieces so this file does not itself add
+# the strings the guard refuses.
+_ESCAPE = re.compile("|".join(("gitleaks" + ":allow", "trufflehog" + ":ignore")))
+
+BASELINE = ".secrets.baseline"
+# Fields a fresh `detect-secrets scan` never writes: an audit adds them.
+_AUDIT_FIELDS = ("is_secret", "is_verified")
 
 MAX_REFS_SHOWN = 10
 MAX_REF_LEN = 100
@@ -167,6 +176,71 @@ def escape_violations(rev: str, cwd: Path | None = None) -> list[str]:
     return out
 
 
+def _baseline_entries(text: str | None) -> dict[tuple[str, str, str], dict]:
+    """{(filename, hashed_secret, type): entry} of a baseline; line numbers are not identity."""
+    if not text:
+        return {}
+    try:
+        results = json.loads(text).get("results") or {}
+    except (json.JSONDecodeError, AttributeError) as e:
+        raise ScanError(f"{BASELINE} does not parse: {e}") from e
+    return {
+        (fname, str(e.get("hashed_secret")), str(e.get("type"))): e
+        for fname, entries in results.items()
+        for e in entries or []
+    }
+
+
+def _show(rev: str, path: str, cwd: Path | None) -> str | None:
+    p = subprocess.run(["git", "show", f"{rev}:{path}"], cwd=cwd, capture_output=True, text=True)
+    return p.stdout if p.returncode == 0 else None
+
+
+def baseline_violations(base: str, head: str, cwd: Path | None = None) -> list[str]:
+    """Entries the head's .secrets.baseline adds over the base's must be audited as
+    not-a-secret (`"is_secret": false`). Otherwise a PR regenerates the baseline over
+    its own secret and the detect-secrets job goes green: the accidental path, one
+    bulk command, no per-secret act."""
+    old = _baseline_entries(_show(base, BASELINE, cwd))
+    new = _baseline_entries(_show(head, BASELINE, cwd))
+    return [
+        f"{BASELINE}: {fname} gains an unaudited {kind} entry; run "
+        f"`detect-secrets audit {BASELINE}` and mark it, or remove the secret"
+        for (fname, hashed, kind), e in sorted(new.items())
+        if (fname, hashed, kind) not in old and e.get("is_secret") is not False
+    ]
+
+
+def _without_audit(results: dict) -> str:
+    return json.dumps(
+        {
+            fname: [{k: v for k, v in e.items() if k not in _AUDIT_FIELDS} for e in entries]
+            for fname, entries in results.items()
+        },
+        sort_keys=True,
+    )
+
+
+def baseline_equal(committed: Path, fresh: Path) -> bool:
+    """The detect-secrets gate: a fresh scan finds exactly what the baseline records.
+    Audit fields are dropped first, or an audited baseline could never match."""
+    old = json.loads(committed.read_text()).get("results", {})
+    new = json.loads(fresh.read_text()).get("results", {})
+    return _without_audit(old) == _without_audit(new)
+
+
+def refs_in_checkout(cwd: Path | None = None) -> dict[str, int]:
+    def count(*patterns: str) -> int:
+        refs = git("for-each-ref", "--format=%(refname)", *patterns, cwd=cwd).split()
+        return len([r for r in refs if not r.endswith("/HEAD")])
+
+    return {
+        "branches": count("refs/remotes/origin"),
+        "tags": count("refs/tags"),
+        "pull_heads": count("refs/remotes/pull"),
+    }
+
+
 def _refs_containing(commit: str, cwd: Path | None) -> list[str]:
     p = subprocess.run(
         [
@@ -186,19 +260,12 @@ def _refs_containing(commit: str, cwd: Path | None) -> list[str]:
     return [r.replace("`", "")[:MAX_REF_LEN] for r in refs]
 
 
-def scanned_ref_count(cwd: Path | None = None) -> int:
-    refs = git(
-        "for-each-ref", "--format=%(refname)", "refs/remotes/origin", "refs/tags", cwd=cwd
-    ).split()
-    return len([r for r in refs if not r.endswith("/HEAD")])
-
-
 def report(
     report_path: Path,
     scan_result: str,
     *,
     main_ref: str,
-    refs_expected: int,
+    refs_path: Path,
     cwd: Path | None = None,
 ) -> tuple[str, int, int]:
     """(issue body, findings, findings reachable from main). Raises ScanError to fail closed."""
@@ -212,11 +279,19 @@ def report(
         raise ScanError(f"the scan report does not parse: {e}") from e
     if not isinstance(findings, list):
         raise ScanError("the scan report is not a JSON array of findings")
-    scanned = scanned_ref_count(cwd)
-    if scanned < refs_expected:
+    # The SCAN job's own counts (refs.json, written next to gl.json): this job's
+    # checkout says nothing about what the scan saw.
+    try:
+        counts = json.loads(refs_path.read_text())
+        api, scanned = counts["api"], counts["scanned"]
+        short = [k for k in ("branches", "tags") if int(scanned[k]) < int(api[k])]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        raise ScanError(f"no usable ref counts from the scan job at {refs_path}: {e}") from e
+    if short:
         raise ScanError(
-            f"scanned {scanned} branch and tag refs but the repo lists {refs_expected}: "
-            "the fetch narrowed the scan"
+            "the scan's checkout held fewer refs than the API listed ("
+            + ", ".join(f"{k} {scanned[k]} < {api[k]}" for k in short)
+            + "): the fetch narrowed the scan"
         )
     rows, on_main = [], 0
     for f in findings:
@@ -273,11 +348,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--base", required=True)
     e = sub.add_parser("escape-guard")
     e.add_argument("--rev", required=True)
+    be = sub.add_parser("baseline-equal")
+    be.add_argument("committed", type=Path)
+    be.add_argument("fresh", type=Path)
+    rf = sub.add_parser("refs")
+    rf.add_argument("--api-branches", required=True, type=int)
+    rf.add_argument("--api-tags", required=True, type=int)
+    rf.add_argument("--out", required=True, type=Path)
     rp = sub.add_parser("report")
     rp.add_argument("--report", required=True, type=Path)
     rp.add_argument("--scan-result", required=True)
     rp.add_argument("--main-ref", default="origin/main")
-    rp.add_argument("--refs-expected", required=True, type=int)
+    rp.add_argument("--refs", required=True, type=Path)
     rp.add_argument("--body-out", required=True, type=Path)
     a = ap.parse_args(argv)
     try:
@@ -294,14 +376,31 @@ def main(argv: list[str] | None = None) -> int:
                 print(line)
         elif a.cmd == "escape-guard":
             bad = escape_violations(a.rev)
+            if ".." in a.rev:  # a range with a base: its baseline additions must be audited
+                bad += baseline_violations(*a.rev.split("..", 1))
             for b in bad:
                 print(f"::error::{b}")
             if bad:
                 return 1
-            print("escape guard: no inline escape added, no mixed exemption change")
+            print(
+                "escape guard: no gitleaks/TruffleHog escape added, no mixed exemption "
+                "change, no unaudited baseline entry"
+            )
+        elif a.cmd == "baseline-equal":
+            if not baseline_equal(a.committed, a.fresh):
+                print("::error::detect-secrets found new secrets. Update .secrets.baseline")
+                return 1
+            print("No new secrets detected")
+        elif a.cmd == "refs":
+            refs = {
+                "api": {"branches": a.api_branches, "tags": a.api_tags},
+                "scanned": refs_in_checkout(),
+            }
+            a.out.write_text(json.dumps(refs) + "\n")
+            print(json.dumps(refs))
         else:
             body, n, on_main = report(
-                a.report, a.scan_result, main_ref=a.main_ref, refs_expected=a.refs_expected
+                a.report, a.scan_result, main_ref=a.main_ref, refs_path=a.refs
             )
             a.body_out.write_text(body)
             _output(findings=n, on_main=on_main)
