@@ -159,10 +159,18 @@ def escape_violations(rev: str, cwd: Path | None = None) -> list[str]:
     patch = git(
         "log", "-p", "-U0", "--diff-merges=remerge", "--format=", "--no-color", rev, cwd=cwd
     )
-    path = "?"
+    # "+++ " is a file header only in a file's header block (from "diff " to the
+    # first "@@"). Inside a hunk an added line that itself starts "++ " also reads
+    # "+++ …", and must be scanned, not taken for a header.
+    path, in_header = "?", False
     for line in patch.splitlines():
-        if line.startswith("+++ "):
-            path = line[6:] if line.startswith("+++ b/") else line[4:]
+        if line.startswith("diff "):
+            in_header = True
+        elif in_header and line.startswith("@@"):
+            in_header = False
+        elif in_header:
+            if line.startswith("+++ "):
+                path = line[6:] if line.startswith("+++ b/") else line[4:]
         elif line.startswith("+") and _ESCAPE.search(line):
             out.append(f"{path}: adds an inline scanner escape: {line[1:].strip()[:120]}")
     names = git("log", "--name-only", "--diff-merges=remerge", "--format=", rev, cwd=cwd).split()

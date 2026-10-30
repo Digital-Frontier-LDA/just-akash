@@ -339,6 +339,23 @@ def test_p5i_a_pragma_does_not_hide_a_token_from_gitleaks(repo):
     assert repo.scan(f"{base}..{head}") == 1
 
 
+def test_p5j_an_added_line_that_starts_with_plus_plus_is_content_not_a_header(repo):
+    """`++ x  # allow` is "+++ x …" in the patch: the guard must not take it for a header."""
+    base = repo.sha()
+    head = repo.commit({"a.py": "x = 1\n", "b.txt": f"++ key = 'v'  # {ALLOW}\n"}, "plus-plus")
+    bad = ss.escape_violations(f"{base}..{head}", repo.path)
+    assert len(bad) == 1 and bad[0].startswith("b.txt: adds an inline scanner escape")
+
+
+def test_p5k_a_file_header_is_not_scanned_as_content(repo):
+    """A path holding the escape text appears only as a "+++ b/<path>" header line."""
+    base = repo.sha()
+    head = repo.commit({f"{ALLOW}.py": "x = 1\n"}, "odd name")
+    patch = repo.git("log", "-p", "--format=", f"{base}..{head}")
+    assert f"+++ b/{ALLOW}.py" in patch, "control: the header carries the escape text"
+    assert ss.escape_violations(f"{base}..{head}", repo.path) == []
+
+
 def test_p5g_no_escape_passes_the_guard(repo):
     base = repo.sha()
     head = repo.commit({"a.py": "k = 'v'\n"}, "plain")
