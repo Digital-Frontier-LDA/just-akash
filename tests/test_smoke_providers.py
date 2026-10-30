@@ -1122,6 +1122,62 @@ class TestOrphanProbeSweep:
         """A ms-epoch dseq for a deployment created `seconds_old` before NOW."""
         return str(int((self.NOW - seconds_old) * 1000))
 
+    # What `just-akash deploy` puts on chain for PROBE_GROUP (provenance.stamp_run).
+    STAMPED = "just-akash-smoke.a1b2c3d4e5f6"
+
+    @pytest.fixture(autouse=True)
+    def _chain_group(self, monkeypatch):
+        """Every sweep test reads a run-stamped probe group unless it says otherwise: no chain
+        call ever leaves the test."""
+        monkeypatch.setattr(sp, "_probe_group_names", lambda owner, dseq: [self.STAMPED])
+
+    # ── the placement key (openmix-me5w) ─────────────────────────────
+    def test_the_probe_sdl_places_under_probe_group_and_deploy_stamps_it(self):
+        from just_akash.provenance import placement_keys, stamp_run
+
+        assert placement_keys(sp.PROBE_SDL) == [sp.PROBE_GROUP]
+        stamped, keys = stamp_run(sp.PROBE_SDL, "a1b2c3d4e5f6")
+        assert keys == [self.STAMPED] and placement_keys(stamped) == [self.STAMPED]
+        assert sp._probe_group(keys) == self.STAMPED
+        # the deployment must reference the STAMPED group too: an inline `{ profile: .. }`
+        # reference is not rewritten by stamp_run, and an SDL naming a missing group is refused
+        import yaml
+
+        for doc in (sp.PROBE_SDL, stamped):
+            parsed = yaml.safe_load(doc)
+            groups = set(parsed["profiles"]["placement"])
+            for svc, refs in parsed["deployment"].items():
+                assert set(refs) == groups, (svc, set(refs), groups)
+        assert set(yaml.safe_load(stamped)["deployment"]["probe"]) == {self.STAMPED}
+
+    def test_the_probe_group_is_attributed_to_just_akash_not_to_flynn(self):
+        """Flynn's /leases and the IB leak audit count plain `akash` as rnd_fleet (ours): a
+        daily smoke probe paged lease-leaks DOWN. The new key carries the repo prefix."""
+        from just_akash.charter import is_ours_placement
+        from just_akash.provenance import PLACEMENT_PREFIX
+
+        assert sp.PROBE_GROUP.startswith(PLACEMENT_PREFIX)
+        assert not is_ours_placement(sp.PROBE_GROUP) and not is_ours_placement(self.STAMPED)
+        assert is_ours_placement(sp.LEGACY_PROBE_GROUP)  # why it had to move
+
+    @pytest.mark.parametrize(
+        "names, group",
+        [
+            (["just-akash-smoke.a1b2c3d4e5f6"], "just-akash-smoke.a1b2c3d4e5f6"),
+            (["just-akash-smoke"], "just-akash-smoke"),
+            (["akash"], "akash"),  # created before the rename: still reaped
+            (["just-akash-smoke.NOT-A-RUN"], None),
+            (["just-akash-smoker.a1b2c3d4e5f6"], None),
+            (["just-akash-runner.a1b2c3d4e5f6"], None),
+            (["flynn-x"], None),
+            (["dcloud"], None),
+            (["just-akash-smoke.a1b2c3d4e5f6", "akash"], None),  # one group only
+            ([], None),
+        ],
+    )
+    def test_only_a_probe_group_is_closable(self, names, group):
+        assert sp._probe_group(names) == group
+
     # ── service-name extraction ──────────────────────────────────────
     def test_service_names_from_lease_status(self):
         assert sp._deployment_service_names(self._detail(["probe"])) == {"probe"}
@@ -1234,7 +1290,52 @@ class TestOrphanProbeSweep:
         ):
             swept = sp.sweep_orphan_probes()
         assert swept == [old_probe]
-        rd.assert_called_once_with(old_probe, owner=OWNER, group=sp.PROBE_GROUP)
+        rd.assert_called_once_with(old_probe, owner=OWNER, group=self.STAMPED)
+
+    def test_sweep_closes_a_legacy_akash_probe_under_its_own_name(self, monkeypatch):
+        old_probe = self._dseq_aged(7200)
+        api = self._fake_api([{"dseq": old_probe}], {old_probe: self._detail(["probe"])})
+        monkeypatch.setattr(sp, "_probe_group_names", lambda owner, dseq: ["akash"])
+        with (
+            patch.object(sp, "_api", return_value=api),
+            patch.object(sp, "robust_destroy", return_value=True) as rd,
+            patch.object(sp.time, "time", return_value=self.NOW),
+        ):
+            assert sp.sweep_orphan_probes() == [old_probe]
+        rd.assert_called_once_with(old_probe, owner=OWNER, group="akash")
+
+    def test_sweep_leaves_a_probe_shaped_deployment_of_another_group_alone(
+        self, monkeypatch, capsys
+    ):
+        old = self._dseq_aged(7200)
+        api = self._fake_api([{"dseq": old}], {old: self._detail(["probe"])})
+        monkeypatch.setattr(sp, "_probe_group_names", lambda owner, dseq: ["flynn-x"])
+        with (
+            patch.object(sp, "_api", return_value=api),
+            patch.object(sp, "robust_destroy", return_value=True) as rd,
+            patch.object(sp.time, "time", return_value=self.NOW),
+        ):
+            assert sp.sweep_orphan_probes() == []
+        rd.assert_not_called()
+        assert "no leaked probes found" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("lookup", [lambda owner, dseq: [], "raise"])
+    def test_an_unreadable_group_is_incomplete_never_closed(self, monkeypatch, capsys, lookup):
+        old = self._dseq_aged(7200)
+        api = self._fake_api([{"dseq": old}], {old: self._detail(["probe"])})
+
+        def boom(owner, dseq):
+            raise RuntimeError("chain unreachable")
+
+        monkeypatch.setattr(sp, "_probe_group_names", boom if lookup == "raise" else lookup)
+        with (
+            patch.object(sp, "_api", return_value=api),
+            patch.object(sp, "robust_destroy", return_value=True) as rd,
+            patch.object(sp.time, "time", return_value=self.NOW),
+        ):
+            assert sp.sweep_orphan_probes() == []
+        rd.assert_not_called()
+        assert "INCOMPLETE" in capsys.readouterr().out
 
     def test_successful_sweep_deletes_only_its_resolved_receipt(self, monkeypatch, tmp_path):
         old_probe = self._dseq_aged(7200)
