@@ -1,0 +1,11 @@
+# Gitleaks fingerprint allowlist: <commit>:<path>:<rule-id>:<line>. Each entry is ONE verified
+# false positive, so a new commit of the same file is scanned afresh. Prefer this to a path or
+# regex allowlist in .gitleaks.toml, which would also hide a real secret added to that file later.
+
+# a8343cb2 (branch codex/keydb-qualification-unused-recover-428cc-20261025, in no PR and not on
+# main). Line 2 is a generated manifest: module.exports maps eight just_akash.* module names to
+# hex digests, and each digest is the SHA-256 of that module's source at the commit (8/8 checked).
+# generic-api-key fires on the `keydb_*` names next to high-entropy hex. The Secret Scan job scans
+# every fetched branch (checkout fetch-depth 0 + gitleaks' default `git log --all`), so this one
+# branch turned Gitleaks red on every PR (#489, #490, #493).
+a8343cb26a0a71002f628a992b3749a2a1b6cc73:.github/actions/keydb-qualification-fenced-receipts/python-source.cjs:generic-api-key:2
