@@ -1139,6 +1139,16 @@ class TestOrphanProbeSweep:
         stamped, keys = stamp_run(sp.PROBE_SDL, "a1b2c3d4e5f6")
         assert keys == [self.STAMPED] and placement_keys(stamped) == [self.STAMPED]
         assert sp._probe_group(keys) == self.STAMPED
+        # the deployment must reference the STAMPED group too: an inline `{ profile: .. }`
+        # reference is not rewritten by stamp_run, and an SDL naming a missing group is refused
+        import yaml
+
+        for doc in (sp.PROBE_SDL, stamped):
+            parsed = yaml.safe_load(doc)
+            groups = set(parsed["profiles"]["placement"])
+            for svc, refs in parsed["deployment"].items():
+                assert set(refs) == groups, (svc, set(refs), groups)
+        assert set(yaml.safe_load(stamped)["deployment"]["probe"]) == {self.STAMPED}
 
     def test_the_probe_group_is_attributed_to_just_akash_not_to_flynn(self):
         """Flynn's /leases and the IB leak audit count plain `akash` as rnd_fleet (ours): a

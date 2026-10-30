@@ -225,7 +225,9 @@ profiles:
         probe: { denom: uact, amount: 10000 }
 deployment:
   probe:
-    just-akash-smoke: { profile: probe, count: 1 }
+    just-akash-smoke:
+      profile: probe
+      count: 1
 """.replace("__SMOKE_MARKER__", INGRESS_BASELINE).replace(
     # The death-cause beacon ships DARK: BEACON_URL reaches the container only when
     # the operator sets SMOKE_BEACON_URL in the smoke's environment (a collector on
