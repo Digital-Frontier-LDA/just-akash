@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 SPEC = importlib.util.spec_from_file_location(
     "release_source_guard", Path(__file__).parents[1] / ".github/scripts/verify_release_source.py"
@@ -178,3 +179,21 @@ def test_version_mismatch_refuses_before_external_reads(github, monkeypatch):
 def test_recorded_source_mismatch_cannot_replace_reviewed_commit(github):
     with pytest.raises(m.ReleaseHeld):
         m.verify_release_source(expected_source=MAIN, runner=github.runner)
+
+
+def _push_gated_jobs(workflow: str) -> set[str]:
+    """Named jobs of a workflow that run on a push to main: no job-level `if:`."""
+    wf = yaml.safe_load(
+        (Path(__file__).resolve().parents[1] / ".github/workflows" / workflow).read_text()
+    )
+    return {j["name"] for j in wf["jobs"].values() if "name" in j and "if" not in j}
+
+
+def test_every_secret_scan_job_that_runs_on_push_is_a_release_gate():
+    """openmix-g442m: a Secret Scan job that runs on push to main must gate a release, so a
+    red plant test cannot ship. The daily report job is excluded by construction: it has an
+    `if:` (schedule/dispatch only), so on push it is always `skipped`, and the fence holds
+    on any skipped expected job."""
+    assert m.EXPECTED_GATES["secrets.yml"] == _push_gated_jobs("secrets.yml")
+    assert "Secret Scan plant tests" in m.EXPECTED_GATES["secrets.yml"]
+    assert "Report all-branch scan" not in m.EXPECTED_GATES["secrets.yml"]

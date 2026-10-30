@@ -28,6 +28,7 @@ EXPECTED_GATES = {
         "Gitleaks",
         "TruffleHog",
         "detect-secrets",
+        "Secret Scan plant tests",
     },
     "security.yml": {"Semgrep SAST", "Dependency CVE audit"},
 }
