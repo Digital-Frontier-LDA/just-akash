@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
+- Gitleaks: `.gitleaksignore` allowlists one verified false positive by fingerprint. A generated SHA-256 digest manifest (`python-source.cjs` on the unmerged `codex/keydb-qualification-unused-recover-428cc-20261025` branch) matched `generic-api-key`, and because the scan covers every branch it failed Secret Scan on every PR.
 - Runner pool, provider probe and native reader move to `df-akash-runner@sha256:e71bf4be…`, rebuilt for the eMudhra/emSign intermediate-CA compromise (CVE-2026-111943; df-cicd-rpi.1). Pool and probe move together, so providers stay qualified against the image the pool runs. The native reader moves with them, because the public BB template requires the pool image to carry its digest. The separate BB ce1 profile is unchanged.
 
 ### Added
