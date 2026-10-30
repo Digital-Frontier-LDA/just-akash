@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 SPEC = importlib.util.spec_from_file_location(
     "release_source_guard", Path(__file__).parents[1] / ".github/scripts/verify_release_source.py"
@@ -178,3 +179,63 @@ def test_version_mismatch_refuses_before_external_reads(github, monkeypatch):
 def test_recorded_source_mismatch_cannot_replace_reviewed_commit(github):
     with pytest.raises(m.ReleaseHeld):
         m.verify_release_source(expected_source=MAIN, runner=github.runner)
+
+
+# Jobs a push to main never runs, each with its exact `if:`. Any other conditional job fails the
+# pin: it must be classified here (with a condition that excludes push) or made a release gate.
+NOT_ON_PUSH = {
+    "secrets.yml": {
+        "report": "always() && (github.event_name == 'schedule' || github.event_name == "
+        "'workflow_dispatch') && github.ref == 'refs/heads/main'",
+    },
+}
+REPO = Path(__file__).resolve().parents[1]
+
+
+def _push_gated_jobs(workflow: str, root: Path = REPO) -> set[str]:
+    """The check names of a workflow's jobs that run on a push to main.
+
+    A job without `name:` is checked under its job id, as GitHub names it. A job with an
+    `if:` must be in NOT_ON_PUSH with exactly that condition, and the condition must not
+    admit a push; otherwise this raises."""
+    wf = yaml.safe_load((root / ".github/workflows" / workflow).read_text(encoding="utf-8"))
+    known = NOT_ON_PUSH.get(workflow, {})
+    gated = set()
+    for job_id, job in wf["jobs"].items():
+        cond = job.get("if")
+        if cond is None:
+            gated.add(job.get("name", job_id))
+            continue
+        assert " ".join(str(cond).split()) == known.get(job_id), (
+            f"{workflow}: job {job_id!r} has an unclassified if: {cond!r}; add it to "
+            "NOT_ON_PUSH (if a push never runs it) or make it a release gate"
+        )
+        assert "'push'" not in cond and "github.event_name == 'schedule'" in cond
+    return gated
+
+
+def test_every_secret_scan_job_that_runs_on_push_is_a_release_gate():
+    """openmix-g442m: a Secret Scan job that runs on push to main must gate a release, so a
+    red plant test cannot ship. The daily report job is excluded only because its exact `if:`
+    (schedule/dispatch on main) is pinned in NOT_ON_PUSH: on push it is always `skipped`, and
+    the fence holds on any skipped expected job."""
+    assert m.EXPECTED_GATES["secrets.yml"] == _push_gated_jobs("secrets.yml")
+    assert "Secret Scan plant tests" in m.EXPECTED_GATES["secrets.yml"]
+    assert "Report all-branch scan" not in m.EXPECTED_GATES["secrets.yml"]
+
+
+def _gated_with(tmp_path: Path, jobs: dict) -> set[str]:
+    wf_dir = tmp_path / ".github/workflows"
+    wf_dir.mkdir(parents=True)
+    (wf_dir / "secrets.yml").write_text(yaml.safe_dump({"jobs": jobs}), encoding="utf-8")
+    return _push_gated_jobs("secrets.yml", root=tmp_path)
+
+
+def test_a_conditional_job_that_may_run_on_push_is_not_silently_excluded(tmp_path):
+    jobs = {"late": {"name": "Late scan", "if": "github.event_name == 'push'"}}
+    with pytest.raises(AssertionError, match="unclassified if"):
+        _gated_with(tmp_path, jobs)
+
+
+def test_a_job_without_a_name_is_gated_under_its_job_id(tmp_path):
+    assert _gated_with(tmp_path, {"lint": {"runs-on": "x"}}) == {"lint"}
