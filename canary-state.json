@@ -1,7 +1,7 @@
 {
   "alphavps": {
     "boot_id": "e1a98479655940b6",
-    "checks_total": 3595,
+    "checks_total": 3596,
     "closures": {
       "self": 15
     },
@@ -12,7 +12,7 @@
     "dseq": "1789100716448",
     "egress_fail": 1292.0,
     "egress_ok": 469965.0,
-    "last_collect": 1793352710.4798942,
+    "last_collect": 1793353136.5699778,
     "lease_lifetime_hours": 0.5709128088888888,
     "lease_replacements_total": 22,
     "raw_dns_fail": 0.0,
@@ -22,63 +22,63 @@
     "reachable": 0,
     "restarts_total": 52,
     "sched_jitter_seconds": 9.7e-05,
-    "scrape_seconds": 20.2008,
-    "unreachable_checks_total": 37,
+    "scrape_seconds": 20.2212,
+    "unreachable_checks_total": 38,
     "uptime_seconds": 1295306.996
   },
   "hetzner_hel": {
     "boot_id": "12c52b9c470c4263",
-    "checks_total": 3596,
+    "checks_total": 3597,
     "closures": {
       "open": 1,
       "self": 16
     },
     "deployed": 1,
-    "disk_write_seconds": 0.000466,
+    "disk_write_seconds": 0.000536,
     "dns_fail": 4.0,
-    "dns_ok": 473030.0,
+    "dns_ok": 473058.0,
     "dseq": "1789100804519",
     "egress_fail": 17.0,
-    "egress_ok": 473017.0,
-    "last_collect": 1793352710.4798942,
+    "egress_ok": 473045.0,
+    "last_collect": 1793353136.5699778,
     "lease_lifetime_hours": 0.5494101327777777,
     "lease_replacements_total": 23,
     "raw_dns_fail": 0.0,
-    "raw_dns_ok": 52030.0,
+    "raw_dns_ok": 52058.0,
     "raw_egress_fail": 0.0,
-    "raw_egress_ok": 52030.0,
+    "raw_egress_ok": 52058.0,
     "reachable": 1,
     "restarts_total": 28,
-    "sched_jitter_seconds": 0.000102,
-    "scrape_seconds": 0.6532,
+    "sched_jitter_seconds": 0.000126,
+    "scrape_seconds": 0.4877,
     "unreachable_checks_total": 49,
-    "uptime_seconds": 780456.665
+    "uptime_seconds": 780882.607
   },
   "onidc": {
     "boot_id": "dd3afc19fb284d3a",
-    "checks_total": 3546,
+    "checks_total": 3547,
     "closures": {
       "self": 15
     },
     "deployed": 1,
-    "disk_write_seconds": 0.041938,
+    "disk_write_seconds": 0.002485,
     "dns_fail": 444.0,
-    "dns_ok": 461474.0,
+    "dns_ok": 461502.0,
     "dseq": "1789100636167",
     "egress_fail": 765.0,
-    "egress_ok": 461153.0,
-    "last_collect": 1793352710.4798942,
+    "egress_ok": 461181.0,
+    "last_collect": 1793353136.5699778,
     "lease_lifetime_hours": 0.5916496544444444,
     "lease_replacements_total": 22,
     "raw_dns_fail": 1.0,
-    "raw_dns_ok": 92124.0,
+    "raw_dns_ok": 92152.0,
     "raw_egress_fail": 4.0,
-    "raw_egress_ok": 92121.0,
+    "raw_egress_ok": 92149.0,
     "reachable": 1,
     "restarts_total": 50,
-    "sched_jitter_seconds": 0.000164,
-    "scrape_seconds": 0.2885,
+    "sched_jitter_seconds": 6.7e-05,
+    "scrape_seconds": 0.4671,
     "unreachable_checks_total": 57,
-    "uptime_seconds": 1381875.943
+    "uptime_seconds": 1382302.063
   }
 }
