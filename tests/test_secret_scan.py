@@ -512,7 +512,9 @@ def test_the_refs_cli_counts_the_checkout_it_runs_in(repo, tmp_path, monkeypatch
     repo.git("update-ref", "refs/remotes/origin/HEAD", repo.sha())
     repo.git("tag", "v1")
     repo.git("update-ref", "refs/remotes/pull/7/head", repo.sha())
-    assert ss.refs_in_checkout(repo.path) == {"branches": 1, "tags": 1, "pull_heads": 1}
+    assert ss.refs_in_checkout(repo.path) == {"branches": 1, "tags": 1}, (
+        "origin/HEAD and closed-PR heads are not branches the API lists"
+    )
     monkeypatch.chdir(repo.path)
     out = tmp_path / "refs.json"
     assert ss.main(["refs", "--api-branches", "1", "--api-tags", "1", "--out", str(out)]) == 0
@@ -622,3 +624,53 @@ def test_the_report_reads_the_scan_jobs_own_ref_counts():
     assert "refs.json" in kept and "gl.json" in kept
     rep_steps = {s.get("name"): s for s in _wf()["jobs"]["report"]["steps"]}
     assert "--refs refs.json" in rep_steps["Read the report (fails closed)"]["run"]
+
+
+def test_the_refs_cli_refuses_a_zero_branch_count(tmp_path, capsys):
+    """A repository always has a branch: 0 is a failed count, and would pass any scan."""
+    out = tmp_path / "refs.json"
+    assert ss.main(["refs", "--api-branches", "0", "--api-tags", "0", "--out", str(out)]) == 1
+    assert "count failed" in capsys.readouterr().out and not out.exists()
+
+
+def _api_count_step() -> dict:
+    steps = {s.get("name"): s for s in _wf()["jobs"]["gitleaks"]["steps"]}
+    return steps["Branch and tag counts the API lists (daily scan)"]
+
+
+@pytest.mark.parametrize("failing", ["branches", "tags"])
+def test_a_failed_api_count_fails_the_step_instead_of_counting_0(tmp_path, failing):
+    """The step body runs as Actions runs it when no shell is given (`bash -e`), with a
+    fake `gh` that fails for one endpoint: the step must go red and export nothing."""
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    gh = bin_ / "gh"
+    gh.write_text(
+        "#!/bin/sh\n"
+        f'case "$2" in *{failing}*) echo "HTTP 502" >&2; exit 1;; esac\n'
+        "printf 'main\\nfeat\\n'\n"
+    )
+    gh.chmod(0o755)
+    env_file = tmp_path / "github_env"
+    env_file.write_text("")
+    step = _api_count_step()
+    assert "shell" not in step, "the test runs the default shell; update it with the step"
+    env = {**os.environ, "PATH": f"{bin_}:{os.environ['PATH']}"}
+    env |= {"GITHUB_ENV": str(env_file), "GITHUB_REPOSITORY": "o/r"}
+    p = subprocess.run(["bash", "-e", "-c", step["run"]], env=env, capture_output=True)
+    assert p.returncode != 0
+    assert env_file.read_text() == "", "a failed count must not reach the environment"
+
+
+def test_a_successful_api_count_exports_both_counts(tmp_path):
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    (bin_ / "gh").write_text("#!/bin/sh\nprintf 'main\\nfeat\\n'\n")
+    (bin_ / "gh").chmod(0o755)
+    env_file = tmp_path / "github_env"
+    env_file.write_text("")
+    env = {**os.environ, "PATH": f"{bin_}:{os.environ['PATH']}"}
+    env |= {"GITHUB_ENV": str(env_file), "GITHUB_REPOSITORY": "o/r"}
+    subprocess.run(["bash", "-e", "-c", _api_count_step()["run"]], env=env, check=True)
+    lines = [ln.replace(" ", "") for ln in env_file.read_text().splitlines()]
+    assert lines == ["API_BRANCHES=2", "API_TAGS=2"]

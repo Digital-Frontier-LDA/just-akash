@@ -234,11 +234,7 @@ def refs_in_checkout(cwd: Path | None = None) -> dict[str, int]:
         refs = git("for-each-ref", "--format=%(refname)", *patterns, cwd=cwd).split()
         return len([r for r in refs if not r.endswith("/HEAD")])
 
-    return {
-        "branches": count("refs/remotes/origin"),
-        "tags": count("refs/tags"),
-        "pull_heads": count("refs/remotes/pull"),
-    }
+    return {"branches": count("refs/remotes/origin"), "tags": count("refs/tags")}
 
 
 def _refs_containing(commit: str, cwd: Path | None) -> list[str]:
@@ -392,6 +388,14 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             print("No new secrets detected")
         elif a.cmd == "refs":
+            # Every repository has a default branch, so 0 can only be a count that
+            # failed; a 0 would make the narrowed-scan check pass vacuously. Tags
+            # can be 0 legitimately, so they are not floored.
+            if a.api_branches < 1:
+                raise ScanError(
+                    f"the API listed {a.api_branches} branches: the count failed, "
+                    "and the narrowed-scan check would pass vacuously"
+                )
             refs = {
                 "api": {"branches": a.api_branches, "tags": a.api_tags},
                 "scanned": refs_in_checkout(),
