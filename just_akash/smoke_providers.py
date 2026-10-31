@@ -1988,7 +1988,10 @@ def _check_update(dseq: str, sdl_path: str, uri: str, diag: dict | None = None) 
     )
     if r.returncode != 0:
         err = " ".join((r.stderr or r.stdout or "").split())
-        print(f"  update command failed (rc={r.returncode}): {err[:200]}")
+        # the error is at the END of the command's log (openmix-me5w: the head was all
+        # "STEP 1: Preparing SDL", and the reason was cut off)
+        shown = err if len(err) <= 400 else f"…{err[-400:]}"
+        print(f"  update command failed (rc={r.returncode}): {shown}")
         if diag is not None:
             diag["fail_mode"] = "update_command"
         return False

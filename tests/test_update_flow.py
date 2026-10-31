@@ -229,10 +229,95 @@ class TestUpdateKeepsTheCharterStamp:
         client.update_deployment.assert_not_called()
 
     @patch("just_akash.deploy.AkashConsoleAPI")
-    def test_a_placement_not_ours_is_never_read(self, MockAPI, tmp_path, monkeypatch):
+    def test_a_placement_not_ours_gets_no_charter_stamp(self, MockAPI, tmp_path, monkeypatch):
+        # openmix-me5w: a just-akash- key IS read now, for its run stamp
+        # (TestUpdateKeepsTheRunStamp), but never charter-stamped
         monkeypatch.setenv("AKASH_API_KEY", "k")
         client = MockAPI.return_value
+        client.get_deployment.return_value = self._onchain(f"fleet-serve-qwen.{self.ID}")
         update(dseq="123", sdl_path=self._sdl(tmp_path, key="just-akash-runner"))
+        _, sent = client.update_deployment.call_args[0]
+        assert ".ch-" not in sent
+
+
+class TestUpdateKeepsTheRunStamp:
+    """openmix-me5w: deploy() run-stamps every just-akash-* placement key, so on chain the group
+    is `<key>.<run>`. update() from the same SDL file must PUT THAT name, not one stamped with its
+    own fresh run id, or the provider rejects the manifest (smoke run 41180113005: update failed
+    on 3 of 3 providers once #493 moved the probe from `akash` to `just-akash-smoke`)."""
+
+    RUN = "0123456789ab"
+
+    def _sdl(self, tmp_path, key="just-akash-smoke"):
+        from tests._charter_harness import sdl_text
+
+        f = tmp_path / "s.yaml"
+        f.write_text(sdl_text(key))
+        return str(f)
+
+    @staticmethod
+    def _onchain(*names):
+        return {
+            "deployment": {"id": {"dseq": "123"}},
+            "groups": [{"group_spec": {"name": n}} for n in names],
+        }
+
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_the_run_id_is_read_back_and_restamped_at_both_occurrences(
+        self, MockAPI, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("AKASH_API_KEY", "k")
+        client = MockAPI.return_value
+        client.get_deployment.return_value = self._onchain(f"just-akash-smoke.{self.RUN}")
+        update(dseq="123", sdl_path=self._sdl(tmp_path))
+        _, sent = client.update_deployment.call_args[0]
+        # profiles.placement.<KEY> and deployment.<svc>.<KEY> both move
+        assert sent.count(f"just-akash-smoke.{self.RUN}:") == 2
+        assert "just-akash-smoke:" not in sent
+
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_a_lease_minted_before_run_scoping_is_left_alone(self, MockAPI, tmp_path, monkeypatch):
+        monkeypatch.setenv("AKASH_API_KEY", "k")
+        client = MockAPI.return_value
+        client.get_deployment.return_value = self._onchain("just-akash-smoke")
+        update(dseq="123", sdl_path=self._sdl(tmp_path))
+        _, sent = client.update_deployment.call_args[0]
+        assert sent.count("just-akash-smoke:") == 2
+
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_another_keys_run_id_is_not_borrowed(self, MockAPI, tmp_path, monkeypatch):
+        monkeypatch.setenv("AKASH_API_KEY", "k")
+        client = MockAPI.return_value
+        client.get_deployment.return_value = self._onchain(f"just-akash-runner.{self.RUN}")
+        update(dseq="123", sdl_path=self._sdl(tmp_path))
+        _, sent = client.update_deployment.call_args[0]
+        assert self.RUN not in sent
+
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_several_run_ids_refuse_before_the_put(self, MockAPI, tmp_path, monkeypatch):
+        monkeypatch.setenv("AKASH_API_KEY", "k")
+        client = MockAPI.return_value
+        client.get_deployment.return_value = self._onchain(
+            f"just-akash-smoke.{self.RUN}", "just-akash-smoke.abcdefabcdef"
+        )
+        with pytest.raises(RuntimeError, match="several run ids"):
+            update(dseq="123", sdl_path=self._sdl(tmp_path))
+        client.update_deployment.assert_not_called()
+
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_an_unreadable_deployment_refuses_before_the_put(self, MockAPI, tmp_path, monkeypatch):
+        monkeypatch.setenv("AKASH_API_KEY", "k")
+        client = MockAPI.return_value
+        client.get_deployment.side_effect = RuntimeError("HTTP 503")
+        with pytest.raises(RuntimeError, match="recover its run id"):
+            update(dseq="123", sdl_path=self._sdl(tmp_path))
+        client.update_deployment.assert_not_called()
+
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_a_placement_without_our_prefix_is_never_read(self, MockAPI, tmp_path, monkeypatch):
+        monkeypatch.setenv("AKASH_API_KEY", "k")
+        client = MockAPI.return_value
+        update(dseq="123", sdl_path=self._sdl(tmp_path, key="dfci-runner"))
         client.get_deployment.assert_not_called()
 
 
