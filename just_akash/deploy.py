@@ -2887,31 +2887,28 @@ def _restamp_charter_for_update(
     return sdl_content
 
 
-def _run_ids_in(doc: Any, keys: set[str]) -> set[str]:
-    """Run ids carried by any group name ``<key>.<run>`` in a Console deployment document,
-    for ``key`` in ``keys``. Walked like ``_charter_ids_in``: only the name strings matter."""
+def _run_ids_in(names: list[str], keys: set[str]) -> set[str]:
+    """Run ids carried by group names ``<key>.<run>``, for ``key`` in ``keys``."""
     found: set[str] = set()
-    if isinstance(doc, dict):
-        for value in doc.values():
-            found |= _run_ids_in(value, keys)
-    elif isinstance(doc, list):
-        for value in doc:
-            found |= _run_ids_in(value, keys)
-    elif isinstance(doc, str):
-        run_id = run_id_of(doc)
-        if run_id and doc[: -len(run_id) - 1] in keys:
+    for name in names:
+        run_id = run_id_of(name)
+        if run_id and name[: -len(run_id) - 1] in keys:
             found.add(run_id)
     return found
 
 
 def _restamp_run_for_update(client, dseq: str, sdl_content: str) -> str:
     """Re-apply the run stamp deploy() put on every ``just-akash-*`` placement key
-    (``stamp_run``), so the PUT manifest names the SAME groups as the chain. The run id is
-    read back from the deployment's group names; a lease minted before run-scoping carries
-    none and is left alone. No unstamped ``just-akash-`` key: nothing to read.
+    (``stamp_run``), so the PUT manifest names the SAME groups as the chain.
 
-    openmix-me5w: update() used to stamp THIS process's fresh run id, so once #493 moved the
-    smoke probe from ``akash`` (never stamped) to ``just-akash-smoke``, every smoke
+    The group names are read from CHAIN (``chain.deployment_group_names``), the
+    authoritative source: the Console deployment document need not carry them. An empty
+    read means UNKNOWN, so the update is refused rather than sent unstamped. Names
+    without a run id (a lease minted before run-scoping) leave the SDL alone. No
+    unstamped ``just-akash-`` key: nothing to read.
+
+    openmix-me5w: update() used to stamp THIS process's fresh run id, so once #493 moved
+    the smoke probe from ``akash`` (never stamped) to ``just-akash-smoke``, every smoke
     ``update`` PUT a group the chain did not have."""
     keys = {
         k
@@ -2920,17 +2917,23 @@ def _restamp_run_for_update(client, dseq: str, sdl_content: str) -> str:
     }
     if not keys:
         return sdl_content
+    where = f"deployment {display(dseq, 'dseq')}"
     try:
-        ids = _run_ids_in(client.get_deployment(dseq), keys)
-    except RuntimeError as e:
+        names = chain.deployment_group_names(client.account_address(), dseq)
+    except Exception as e:  # noqa: BLE001 — any read failure refuses the update
         raise RuntimeError(
-            f"cannot read deployment {display(dseq, 'dseq')} to recover its run id "
-            f"({error_text(e)})"
+            f"cannot read {where}'s group names to recover its run id ({error_text(e)})"
         ) from e
+    if not names:
+        raise RuntimeError(
+            f"cannot read {where}'s group names from chain to recover its run id; "
+            "no update submitted"
+        )
+    ids = _run_ids_in(names, keys)
     if len(ids) > 1:
         raise RuntimeError(
-            f"deployment {display(dseq, 'dseq')} carries several run ids "
-            f"({', '.join(sorted(ids))}) for {', '.join(sorted(keys))}"
+            f"{where} carries several run ids ({', '.join(sorted(ids))}) "
+            f"for {', '.join(sorted(keys))}"
         )
     if not ids:
         return sdl_content
