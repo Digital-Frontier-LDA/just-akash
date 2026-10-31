@@ -229,11 +229,105 @@ class TestUpdateKeepsTheCharterStamp:
         client.update_deployment.assert_not_called()
 
     @patch("just_akash.deploy.AkashConsoleAPI")
-    def test_a_placement_not_ours_is_never_read(self, MockAPI, tmp_path, monkeypatch):
+    def test_a_placement_not_ours_gets_no_charter_stamp(self, MockAPI, tmp_path, monkeypatch):
+        # openmix-me5w: a just-akash- key IS read now, for its run stamp
+        # (TestUpdateKeepsTheRunStamp), but never charter-stamped
         monkeypatch.setenv("AKASH_API_KEY", "k")
         client = MockAPI.return_value
+        client.get_deployment.return_value = self._onchain(f"fleet-serve-qwen.{self.ID}")
+        monkeypatch.setattr(
+            "just_akash.deploy.chain.deployment_group_names", lambda o, d: ["just-akash-runner"]
+        )
         update(dseq="123", sdl_path=self._sdl(tmp_path, key="just-akash-runner"))
-        client.get_deployment.assert_not_called()
+        _, sent = client.update_deployment.call_args[0]
+        assert ".ch-" not in sent
+
+
+class TestUpdateKeepsTheRunStamp:
+    """openmix-me5w: deploy() run-stamps every just-akash-* placement key, so on chain the group
+    is `<key>.<run>`. update() from the same SDL file must PUT THAT name, not one stamped with its
+    own fresh run id, or the provider rejects the manifest (smoke run 41180113005: update failed
+    on 3 of 3 providers once #493 moved the probe from `akash` to `just-akash-smoke`).
+
+    The names are read from CHAIN (CodeRabbit on #498: the Console deployment document need not
+    carry group names, and the fake Console's does not), and an empty read refuses."""
+
+    RUN = "0123456789ab"
+    OWNER = "akash1owner"
+
+    def _sdl(self, tmp_path, key="just-akash-smoke"):
+        from tests._charter_harness import sdl_text
+
+        f = tmp_path / "s.yaml"
+        f.write_text(sdl_text(key))
+        return str(f)
+
+    def _run(self, MockAPI, tmp_path, monkeypatch, names, key="just-akash-smoke"):
+        monkeypatch.setenv("AKASH_API_KEY", "k")
+        client = MockAPI.return_value
+        client.account_address.return_value = self.OWNER
+        # the Console document carries NO group names, as the real one need not
+        client.get_deployment.return_value = {"deployment": {"id": {"dseq": "123"}}, "leases": []}
+        calls = []
+
+        def fake_names(owner, dseq):
+            calls.append((owner, dseq))
+            if isinstance(names, Exception):
+                raise names
+            return list(names)
+
+        monkeypatch.setattr("just_akash.deploy.chain.deployment_group_names", fake_names)
+        update(dseq="123", sdl_path=self._sdl(tmp_path, key))
+        return client, calls
+
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_the_run_id_is_read_from_chain_and_restamped_at_both_occurrences(
+        self, MockAPI, tmp_path, monkeypatch
+    ):
+        client, calls = self._run(MockAPI, tmp_path, monkeypatch, [f"just-akash-smoke.{self.RUN}"])
+        assert calls == [(self.OWNER, "123")]  # owner-scoped chain read
+        _, sent = client.update_deployment.call_args[0]
+        # profiles.placement.<KEY> and deployment.<svc>.<KEY> both move
+        assert sent.count(f"just-akash-smoke.{self.RUN}:") == 2
+        assert "just-akash-smoke:" not in sent
+
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_a_lease_minted_before_run_scoping_is_left_alone(self, MockAPI, tmp_path, monkeypatch):
+        client, _ = self._run(MockAPI, tmp_path, monkeypatch, ["just-akash-smoke"])
+        _, sent = client.update_deployment.call_args[0]
+        assert sent.count("just-akash-smoke:") == 2
+
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_another_keys_run_id_is_not_borrowed(self, MockAPI, tmp_path, monkeypatch):
+        client, _ = self._run(MockAPI, tmp_path, monkeypatch, [f"just-akash-runner.{self.RUN}"])
+        _, sent = client.update_deployment.call_args[0]
+        assert self.RUN not in sent
+
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_several_run_ids_refuse_before_the_put(self, MockAPI, tmp_path, monkeypatch):
+        names = [f"just-akash-smoke.{self.RUN}", "just-akash-smoke.abcdefabcdef"]
+        with pytest.raises(RuntimeError, match="several run ids"):
+            self._run(MockAPI, tmp_path, monkeypatch, names)
+        MockAPI.return_value.update_deployment.assert_not_called()
+
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_an_empty_chain_read_refuses_before_the_put(self, MockAPI, tmp_path, monkeypatch):
+        # [] is UNKNOWN (chain.deployment_group_names' contract), never "no run id"
+        with pytest.raises(RuntimeError, match="from chain to recover its run id"):
+            self._run(MockAPI, tmp_path, monkeypatch, [])
+        MockAPI.return_value.update_deployment.assert_not_called()
+
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_a_failed_chain_read_refuses_before_the_put(self, MockAPI, tmp_path, monkeypatch):
+        with pytest.raises(RuntimeError, match="recover its run id"):
+            self._run(MockAPI, tmp_path, monkeypatch, RuntimeError("all LCD endpoints down"))
+        MockAPI.return_value.update_deployment.assert_not_called()
+
+    @patch("just_akash.deploy.AkashConsoleAPI")
+    def test_a_placement_without_our_prefix_is_never_read(self, MockAPI, tmp_path, monkeypatch):
+        client, calls = self._run(MockAPI, tmp_path, monkeypatch, [], key="dfci-runner")
+        assert calls == []
+        client.update_deployment.assert_called_once()
 
 
 class TestDeployDepositGuard:

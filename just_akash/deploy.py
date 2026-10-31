@@ -967,11 +967,17 @@ def _prepare_sdl_content(
     sdl_path: str,
     image: str | None = None,
     env_vars: list[str] | None = None,
+    run_id: str | None = _RUN_ID,
 ) -> str:
     """Read, validate, and apply image/SSH-key/env overrides to an SDL file.
 
     Shared by deploy() and update() so both paths transform the SDL identically.
     Returns the final SDL string ready to send to the Console API.
+
+    ``run_id`` stamps the ``just-akash-*`` placement keys (this process's run by default).
+    update() passes None: the run that matters is the one already on chain, which
+    ``_restamp_run_for_update`` reads back. Stamping THIS process's fresh id there named a
+    group the chain never had (openmix-me5w).
     """
     _log(logging.INFO, f"Reading SDL from {sdl_path}")
     sdl_path_obj = Path(sdl_path)
@@ -992,7 +998,7 @@ def _prepare_sdl_content(
     #
     # Stamped BEFORE validation so a bad rewrite fails here, against our own validator,
     # rather than as an opaque rejection from the Console API.
-    sdl_content, _run_keys = stamp_run(sdl_content, _RUN_ID)
+    sdl_content, _run_keys = stamp_run(sdl_content, run_id or "")
     if _run_keys:
         _log(logging.DEBUG, f"provenance keys for this run: {_run_keys}")
 
@@ -2881,6 +2887,64 @@ def _restamp_charter_for_update(
     return sdl_content
 
 
+def _run_ids_in(names: list[str], keys: set[str]) -> set[str]:
+    """Run ids carried by group names ``<key>.<run>``, for ``key`` in ``keys``."""
+    found: set[str] = set()
+    for name in names:
+        run_id = run_id_of(name)
+        if run_id and name[: -len(run_id) - 1] in keys:
+            found.add(run_id)
+    return found
+
+
+def _restamp_run_for_update(client, dseq: str, sdl_content: str) -> str:
+    """Re-apply the run stamp deploy() put on every ``just-akash-*`` placement key
+    (``stamp_run``), so the PUT manifest names the SAME groups as the chain.
+
+    The group names are read from CHAIN (``chain.deployment_group_names``), the
+    authoritative source: the Console deployment document need not carry them. An empty
+    read means UNKNOWN, so the update is refused rather than sent unstamped. Names
+    without a run id (a lease minted before run-scoping) leave the SDL alone. No
+    unstamped ``just-akash-`` key: nothing to read.
+
+    openmix-me5w: update() used to stamp THIS process's fresh run id, so once #493 moved
+    the smoke probe from ``akash`` (never stamped) to ``just-akash-smoke``, every smoke
+    ``update`` PUT a group the chain did not have."""
+    keys = {
+        k
+        for k in placement_keys(sdl_content)
+        if k.startswith(PLACEMENT_PREFIX) and not run_id_of(k)
+    }
+    if not keys:
+        return sdl_content
+    where = f"deployment {display(dseq, 'dseq')}"
+    try:
+        names = chain.deployment_group_names(client.account_address(), dseq)
+    except Exception as e:  # noqa: BLE001 — any read failure refuses the update
+        raise RuntimeError(
+            f"cannot read {where}'s group names to recover its run id ({error_text(e)})"
+        ) from e
+    if not names:
+        raise RuntimeError(
+            f"cannot read {where}'s group names from chain to recover its run id; "
+            "no update submitted"
+        )
+    ids = _run_ids_in(names, keys)
+    if len(ids) > 1:
+        raise RuntimeError(
+            f"{where} carries several run ids ({', '.join(sorted(ids))}) "
+            f"for {', '.join(sorted(keys))}"
+        )
+    if not ids:
+        return sdl_content
+    run_id = ids.pop()
+    sdl_content, stamped = stamp_run(sdl_content, run_id)
+    validate_sdl(sdl_content)
+    if stamped:
+        _log(logging.INFO, f"RUN {run_id} re-stamped: {', '.join(stamped)}")
+    return sdl_content
+
+
 @sdl_operation
 def update(
     dseq: str,
@@ -2898,7 +2962,8 @@ def update(
 
     A chartered lease's placement group is named ``<key>.ch-<id>`` on chain, so its own
     SDL file no longer matches it: the charter id (``charter_id``, else read back from the
-    deployment's group names) is stamped again before the PUT.
+    deployment's group names) is stamped again before the PUT. A ``just-akash-*`` group is
+    ``<key>.<run>`` on chain, and its run id is read back and stamped again the same way.
     """
     api_key = api_key or os.environ.get("AKASH_API_KEY")
     if not api_key:
@@ -2917,8 +2982,9 @@ def update(
 
     # Step 1: Read + validate + transform SDL (identical to deploy).
     _log(logging.INFO, "STEP 1: Preparing SDL")
-    sdl_content = _prepare_sdl_content(sdl_path, image=image, env_vars=env_vars)
+    sdl_content = _prepare_sdl_content(sdl_path, image=image, env_vars=env_vars, run_id=None)
     sdl_content = _restamp_charter_for_update(client, str(dseq), sdl_content, charter_id)
+    sdl_content = _restamp_run_for_update(client, str(dseq), sdl_content)
     protect_content(sdl_content)
 
     # Step 2: Submit the in-place update.
