@@ -29,7 +29,7 @@ from canary.ensure import load_details, name_for, plan, providers_from_env
 
 ALPHA = "alphavps"
 
-# Public provider addresses — the same three in .env.example / AKASH_PROVIDERS.
+# Public provider addresses — three of those in .env.example / AKASH_PROVIDERS.
 ADDR_ALPHAVPS = "akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z"  # pragma: allowlist secret
 ADDR_ONIDC = "akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk"  # pragma: allowlist secret
 ADDR_HETZNER = "akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x"  # pragma: allowlist secret
