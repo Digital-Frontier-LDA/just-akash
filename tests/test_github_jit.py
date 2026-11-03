@@ -587,11 +587,19 @@ def test_nested_jit_file_corruption_or_root_escape_is_unknown(filename, content)
 
 @pytest.mark.parametrize(
     "selected_branch",
-    ["main", "master", "deploy-env", "ci-akash-qualification", "ci-akash-qualification-v2"],
+    [
+        "main",
+        "master",
+        "deploy-env",
+        "ci-akash-qualification",
+        "ci-akash-qualification-v2",
+        "ci-akash-qualification-v3",
+    ],
 )
 @pytest.mark.parametrize("producer", ["a" * 40, "c" * 40])
 @pytest.mark.parametrize(
-    "snapshot_branch", ["ci-akash-qualification", "ci-akash-qualification-v2"]
+    "snapshot_branch",
+    ["ci-akash-qualification", "ci-akash-qualification-v2", "ci-akash-qualification-v3"],
 )
 def test_fixed_snapshot_branch_keeps_group_and_producer_binding(
     selected_branch, producer, snapshot_branch
@@ -636,7 +644,10 @@ def test_fixed_snapshot_branch_keeps_group_and_producer_binding(
     [
         "ci-akash-qualification-other",
         "ci-akash-qualification-v2-other",
-        "ci-akash-qualification-v3",
+        "ci-akash-qualification-v4",
+        "ci-akash-qualification-v3-other",
+        "refs/heads/ci-akash-qualification-v3",
+        "ci-akash-qualification-v3\n",
         "refs/heads/ci-akash-qualification-v2",
         "ci-akash-qualification-v2\n",
         "refs/heads/ci-akash-qualification",
@@ -648,7 +659,9 @@ def test_snapshot_branch_is_not_a_pattern_or_arbitrary_ref(branch):
         replace(branch_policy(), source_workflow_branch=branch)
 
 
-@pytest.mark.parametrize("branch", ["ci-akash-qualification", "ci-akash-qualification-v2"])
+@pytest.mark.parametrize(
+    "branch", ["ci-akash-qualification", "ci-akash-qualification-v2", "ci-akash-qualification-v3"]
+)
 def test_snapshot_branch_cannot_change_reusable_workflow_scope(branch):
     with pytest.raises(jit.JitHold):
         replace(POLICY, source_workflow_branch=branch)
