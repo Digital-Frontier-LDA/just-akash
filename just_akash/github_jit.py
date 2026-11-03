@@ -133,7 +133,8 @@ class JitPolicy:
             or not self.workflows
             or len(self.workflows) > 100
             or type(self.non_reusable_workflow) is not bool
-            or self.source_workflow_branch not in ("main", "master", "deploy-env")
+            or self.source_workflow_branch
+            not in ("main", "master", "deploy-env", "ci-akash-qualification")
         ):
             raise JitHold("invalid immutable JIT policy")
         if self.non_reusable_workflow:

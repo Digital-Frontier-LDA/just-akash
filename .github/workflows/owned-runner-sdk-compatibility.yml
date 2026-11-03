@@ -1,0 +1,193 @@
+# Original CI quality jobs copied exactly for the isolated compatible SDK release.
+# The original main CI and its paid Akash E2E jobs are unchanged.
+name: Owned runner SDK compatibility
+'on':
+  pull_request:
+    branches:
+    - release/owned-runner-sdk-06589
+permissions:
+  contents: read
+concurrency:
+  group: owned-runner-sdk-compatibility-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  lint:
+    name: Ruff lint + format
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+    - name: Set up uv
+      uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4
+      with:
+        enable-cache: true
+    - name: Set up Python
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.13'
+    - name: Install dependencies
+      run: uv sync --dev
+    - name: Ruff check
+      run: uv run ruff check .
+    - name: Ruff format check
+      run: uv run ruff format --check .
+  typecheck:
+    name: Pyright type check
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+    - name: Set up uv
+      uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4
+      with:
+        enable-cache: true
+    - name: Set up Python
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.13'
+    - name: Install dependencies
+      run: uv sync --dev
+    - name: Cache pyright
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      with:
+        path: ~/.cache/pyright
+        key: pyright-${{ runner.os }}-${{ hashFiles('**/pyproject.toml', '**/uv.lock') }}
+        restore-keys: 'pyright-${{ runner.os }}-
+
+          '
+    - name: Pyright type check
+      run: uv run pyright
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+    - name: Set up uv
+      uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4
+      with:
+        enable-cache: true
+    - name: Set up Python
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.13'
+    - name: Install dependencies
+      run: uv sync --dev
+    - name: Run unit tests
+      run: uv run pytest tests/ --tb=short -q
+  symbol-presence-check:
+    name: Symbol-presence check (Python files)
+    runs-on: ubuntu-latest
+    if: github.event_name != 'merge_group'
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout the PR head (the tree under check)
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        fetch-depth: 0
+        fetch-tags: true
+        ref: ${{ github.event.pull_request.head.sha || github.sha }}
+    - name: Checkout the PR base (for the checker script)
+      if: github.event_name == 'pull_request'
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        fetch-depth: 1
+        ref: ${{ github.base_ref }}
+        path: .check
+    - name: Set up Python
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.13'
+    - name: Probe base/head provenance for
+      if: github.event_name == 'pull_request'
+      run: 'set -euo pipefail
+
+        echo "github.event.pull_request.base.ref: ${{ github.event.pull_request.base.ref }}"
+
+        echo "github.event.pull_request.base.sha: ${{ github.event.pull_request.base.sha }}"
+
+        echo "github.event.pull_request.head.sha: ${{ github.event.pull_request.head.sha }}"
+
+        # Query the EXPLICIT base ref rather than the remote''s symbolic HEAD.
+
+        # The two are equal on just-akash today (default branch = main), but
+
+        # `git ls-remote origin HEAD` returns whatever the remote''s HEAD
+
+        # points to -- it is a mislabel to log that as "main tip" when the
+
+        # CI can run against any base ref. The label must match the lookup.
+
+        # SAFETY: ${{ github.event.pull_request.base.ref }} is interpolated
+
+        # into the `git ls-remote` arg below. Safe ONLY because
+
+        # `on.pull_request.branches: [main]` constrains the trigger -- git
+
+        # ref names allow `;`, `$`, `` ` ``, `&`, `|`; widening `branches:`
+
+        # live-wires shell injection. If widening, switch to
+
+        # `env: BASE_REF: ${{ github.event.pull_request.base.ref }}` and
+
+        # use `"$BASE_REF"` so the runner''s env layer shell-quotes it.
+
+        current_base_sha="$(git ls-remote origin "refs/heads/${{ github.event.pull_request.base.ref }}" | awk ''{print $1}'')"
+
+        echo "remote origin ${{ github.event.pull_request.base.ref }} tip (now): $current_base_sha"
+
+        '
+    - name: Run symbol-presence check (script from base, content from head)
+      run: "set -euo pipefail\nif [ \"$GITHUB_EVENT_NAME\" = \"pull_request\" ]; then\n  SCRIPT=.check/scripts/symbol_presence_check.py\n\
+        \  # BASE_REF on pull_request: this workflow's trigger restricts\n  # it to PRs targeting `main` (`on.pull_request.branches:\n\
+        \  # [main]`), so today `--base` and the `.check/` checkout\n  # agree by construction -- the literal `origin/main`\
+        \ would\n  # read the same as `origin/$GITHUB_BASE_REF`. The variable\n  # exists for two future-facing reasons: (1)\
+        \ if the\n  # `branches:` filter is ever widened, `--base` will already\n  # track the PR's actual base; (2) it removes\
+        \ a divergence\n  # between three places that read the base ref (`.check/`\n  # checkout, `--base`, the explicit `refs/heads/<base.ref>`\n\
+        \  # probe above), so they cannot drift. `GITHUB_BASE_REF` is\n  # only set on `pull_request` events, which is why\
+        \ the push\n  # branch below stays on `origin/main`.\n  BASE_REF=\"origin/$GITHUB_BASE_REF\"\n  base_commit=\"$(git\
+        \ -C .check rev-parse HEAD)\"\n  head_commit=\"$(git rev-parse HEAD)\"\n  base_tree=\"$(git -C .check rev-parse 'HEAD^{tree}')\"\
+        \n  head_tree=\"$(git rev-parse 'HEAD^{tree}')\"\n  echo \"checker script source: $SCRIPT\"\n  echo \"checker .check\
+        \ HEAD:    $base_commit\"\n  echo \"checker .check tree:    $base_tree\"\n  echo \"this PR head:           $head_commit\"\
+        \n  echo \"this PR head tree:      $head_tree\"\n  # No-diff PR (PR head == base tip, empty PRs, no-op pushes):\n\
+        \  # the script has nothing to inspect -- print both SHAs for the\n  # audit trail and exit 0 without firing the guard.\
+        \ The guard's\n  # purpose is to detect SILENT CHECKOUT FAILURE (the .check/\n  # checkout returned the wrong commit),\
+        \ which can only matter\n  # when there IS something to check. A guard that fires on\n  # benign empty PRs is the\
+        \ same defect as the tree-SHA guard\n  # Copilot flagged in #294: a name for an unmeasured cause.\n  #\n  # CRITICAL:\
+        \ the diff MUST be computed from SHAs independent of\n  # the .check/ checkout. If we used $base_commit..$head_commit\n\
+        \  # (the same pair the guard compares), the silent-checkout-\n  # failure mode collapses both to A..A = empty, and\
+        \ the skip\n  # branch fires before the guard can see the failure -- turning\n  # the guard into a fail-open silent\
+        \ skip. Use the event-payload\n  # base/head SHAs instead: those are committed to the event at\n  # trigger time and\
+        \ do not depend on any checkout resolving\n  # correctly. (Copilot on #294, comment 3948174510.)\n  event_base_sha=\"\
+        ${{ github.event.pull_request.base.sha }}\"\n  event_head_sha=\"${{ github.event.pull_request.head.sha }}\"\n  # Compute\
+        \ the no-diff PR check from event-payload SHAs (independent\n  # of any checkout resolving correctly) AND capture\
+        \ git's exit code.\n  # stdout-empty and git-failure produce the same empty string here,\n  # and the skip branch\
+        \ can't tell them apart -- that is the\n  # fail-open shape that would let any \"couldn't compute the diff\"\n  #\
+        \ path green out the job. Fail closed: a non-zero git exit means\n  # we cannot prove \"nothing to inspect\", so refuse\
+        \ to skip rather\n  # than guess. (Copilot on #294, comment 3948278713 -- thread 6;\n  # same defect class as #294\
+        \ itself / thread 5.)\n  #\n  # \u26A0 SHELL ERROR-HANDLING TRAP, same shape as runner-pool.yml\n  # pre-#253 / post-#253:\
+        \ under `set -e`, a bare `VAR=$(cmd)` whose\n  # command fails IS itself a failing command, so the shell exits\n \
+        \ # at the assignment and `RC=$?` on the next line never reaches.\n  # The carefully-written `::error::` below would\
+        \ then be\n  # unreachable exactly when it should print. The fix is the\n  # `RC=0; ... || RC=$?` form -- the `||`\
+        \ keeps the assignment\n  # inside a list that `set -e` does not act on, so the script\n  # reaches the explicit `if\
+        \ [ \"$RC\" -ne 0 ]` and can print a\n  # diagnostic. Do NOT simplify to a bare `$(...)` + `$?` on the\n  # next line;\
+        \ the diagnostic is the whole point.\n  pr_diff_rc=0\n  pr_diff_output=\"$(git diff --name-only \"$event_base_sha..$event_head_sha\"\
+        \ -- .)\" || pr_diff_rc=$?\n  if [ \"$pr_diff_rc\" -ne 0 ]; then\n    echo \"::error::git diff --name-only $event_base_sha..$event_head_sha\
+        \ exited $pr_diff_rc; refusing to skip. The 'no diff to inspect' decision is unprovable when git cannot compute the\
+        \ diff -- 'couldn't compute' and 'diff is empty' produce the same stdout, and conflating them is fail-open. Git's\
+        \ own stderr is in the runner log just above this line. See #294 / comment 3948278713.\"\n    exit 1\n  fi\n  pr_diff_files=\"\
+        $pr_diff_output\"\n  if [ -z \"$pr_diff_files\" ]; then\n    echo \"no diff between event-payload base ($event_base_sha)\
+        \ and head ($event_head_sha); symbol-presence check has nothing to inspect, skipping\"\n    exit 0\n  fi\n  if [ \"\
+        $base_commit\" = \"$head_commit\" ]; then\n    echo \"::error::.check/ commit ($base_commit) equals HEAD commit, AND\
+        \ there is a non-empty diff between them; refusing to run. The two checkouts resolved to the same commit despite the\
+        \ PR carrying changes -- the .check/ checkout silently failed (returned the wrong tree). The script provenance is\
+        \ unprovable; the check would otherwise be running a script the PR controls. See #294.\"\n    exit 1\n  fi\n  if [\
+        \ ! -f \"$SCRIPT\" ]; then\n    echo \"::error::$SCRIPT is missing on a pull_request event; refusing to fail-open.\
+        \ The base should always carry the checker once #283 has merged. See #294.\"\n    exit 1\n  fi\nelse\n  SCRIPT=scripts/symbol_presence_check.py\n\
+        \  # Push events are operator-controlled (a merged PR or a direct\n  # push); there is no PR base to compare against,\
+        \ so the\n  # pushed branch IS the new main and the script's --base is\n  # origin/main.\n  BASE_REF=\"origin/main\"\
+        \n  if [ ! -f \"$SCRIPT\" ]; then\n    echo \"::error::$SCRIPT is missing on a push event; refusing to fail-open.\"\
+        \n    exit 1\n  fi\nfi\n# The script only uses stdlib (ast, subprocess, argparse); no\n# project deps required. Run\
+        \ it directly with the system python.\npython \"$SCRIPT\" --repo . --base \"$BASE_REF\" --head HEAD\n"
