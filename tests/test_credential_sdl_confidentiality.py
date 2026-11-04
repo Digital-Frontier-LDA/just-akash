@@ -442,19 +442,39 @@ def test_existing_private_stale_bid_retry_keeps_order_and_moves_provider(
     assert ECHO_CANARY not in caplog.text + str(capsys.readouterr())
 
 
-def test_existing_private_no_order_redeploy_does_not_echo_second_response(
+def test_private_unleaseable_order_holds_with_a_fixed_dseq_free_message(
     private_deploy, caplog, capsys
 ):
+    # just-akash#332: no re-deploy round. One create, this deploy's own order closed once,
+    # bids polled on that order only, and a fixed hold that names no private detail.
     client, path = private_deploy
     client.create_deployment.side_effect = [
         {"dseq": "42", "manifest": PRIVATE},
-        {"manifest": PRIVATE, ECHO_CANARY: ECHO_CANARY},
+        {"dseq": ECHO_CANARY, "manifest": PRIVATE, ECHO_CANARY: ECHO_CANARY},
     ]
     client.create_lease.side_effect = RuntimeError(f"no lease for deployment: {ECHO_CANARY}")
     with pytest.raises(RuntimeError) as caught:
         dp.deploy(path, bid_wait=2, bid_wait_retry=2)
-    assert client.create_deployment.call_count == 2  # The existing, scoped recovery only.
+    assert str(caught.value) == dp.STALE_ORDER_HOLD.format(
+        reason=dp.STALE_ORDER_REASONS[0], dseq=dp.PRIVATE_DSEQ
+    )
+    assert client.create_deployment.call_count == 1
+    assert {call.args[0] for call in client.get_bids.call_args_list} == {"42"}
     client.close_deployment.assert_called_once_with("42")
+    assert ECHO_CANARY not in _visible(caught.value, caplog, capsys)
+
+
+def test_private_unleaseable_order_whose_close_fails_says_so(private_deploy, caplog, capsys):
+    client, path = private_deploy
+    client.create_lease.side_effect = RuntimeError("no lease for deployment")
+    client.close_deployment.side_effect = RuntimeError(ECHO_CANARY)
+    with pytest.raises(RuntimeError) as caught:
+        dp.deploy(path, bid_wait=2, bid_wait_retry=2)
+    assert str(caught.value) == dp.STALE_ORDER_CLOSE_FAILED_HOLD.format(
+        reason=dp.STALE_ORDER_REASONS[0], dseq=dp.PRIVATE_DSEQ
+    )
+    assert "was closed" not in str(caught.value)
+    assert client.create_deployment.call_count == 1
     assert ECHO_CANARY not in _visible(caught.value, caplog, capsys)
 
 
@@ -567,21 +587,6 @@ def test_invalid_private_create_identity_keeps_submitting_receipt(
     assert client.create_deployment.call_count == 1
     assert json.loads(receipt.read_text())["state"] == "submitting"
     client.get_bids.assert_not_called()
-    assert ECHO_CANARY not in _visible(caught.value, caplog, capsys)
-
-
-def test_invalid_private_redeploy_identity_is_not_logged_or_polled(private_deploy, caplog, capsys):
-    client, path = private_deploy
-    client.create_deployment.side_effect = [
-        {"dseq": "42", "manifest": PRIVATE},
-        {"dseq": ECHO_CANARY, "manifest": PRIVATE},
-    ]
-    client.create_lease.side_effect = RuntimeError("no lease for deployment")
-    with pytest.raises(RuntimeError, match="NON-RETRYABLE CREATE OUTCOME AMBIGUOUS") as caught:
-        dp.deploy(path, bid_wait=2, bid_wait_retry=2)
-    assert client.create_deployment.call_count == 2
-    assert {call.args[0] for call in client.get_bids.call_args_list} == {"42"}
-    client.close_deployment.assert_called_once_with("42")
     assert ECHO_CANARY not in _visible(caught.value, caplog, capsys)
 
 

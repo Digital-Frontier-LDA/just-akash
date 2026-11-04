@@ -20,6 +20,7 @@ import yaml
 from yaml.nodes import MappingNode, ScalarNode, SequenceNode
 
 from .address import is_canonical_akash_address
+from .create_gate import PRIVATE_FIXED_HOLDS
 
 _ACTIVE: ContextVar[bool] = ContextVar("akash_confidential_sdl", default=False)
 _READER_KEYS = ("DOCKERHUB_PULL_USERNAME", "DOCKERHUB_PULL_TOKEN")
@@ -160,6 +161,8 @@ def withheld_error(error: object) -> str:
         "Receipt-bound create already exists; reconcile the recorded operation before retrying"
     ):
         return message  # Fixed local refusal, not upstream prose or replay authority.
+    if message in PRIVATE_FIXED_HOLDS:
+        return message  # just-akash#332 holds: fixed text, no upstream prose, no dseq.
     text = message.lower()
     if "non-retryable create outcome ambiguous" in text:
         return "NON-RETRYABLE CREATE OUTCOME AMBIGUOUS: credential-bearing operation failed"

@@ -47,12 +47,18 @@ from .api import (
     AkashAPIError,
     AkashConsoleAPI,
     _extract_bid_price,
-    _extract_dseq,
     _extract_gseq,
     _extract_provider,
 )
 from .charter import Charter
-from .create_gate import require_plain_create_allowed
+from .create_gate import (
+    ALREADY_EXISTS_HOLD,
+    PRIVATE_DSEQ,
+    STALE_ORDER_CLOSE_FAILED_HOLD,
+    STALE_ORDER_HOLD,
+    STALE_ORDER_REASONS,
+    require_plain_create_allowed,
+)
 from .deployment_receipt import (
     credential_binding_for,
     mark_create_response_received,
@@ -77,19 +83,6 @@ from .sdl_validate import SDLValidationError, validate_sdl
 
 logger = logging.getLogger("akash.deploy")
 
-# just-akash#332: a deploy never sends a second create. These holds replace the old
-# "close stale deployments and retry" and "close the stale order and re-create" rounds.
-ALREADY_EXISTS_HOLD = (
-    "Deployment create HELD: the Console reports a matching deployment already exists. "
-    "No deployment was closed and no second create was sent (just-akash#332). "
-    "Next step: run `just-akash list`, close the deployment you no longer need with "
-    "`just-akash destroy --dseq <DSEQ>`, then re-run the deploy."
-)
-STALE_ORDER_HOLD = (
-    "Deploy HELD: no leaseable bid on this order ({reason}). This deploy's own order "
-    "{dseq} was closed and no replacement order was created (just-akash#332). "
-    "Next step: re-run the deploy; it creates one fresh order."
-)
 
 # One per PROCESS, not per call: a single `deploy` run creates at most one order; the id
 # also tags that order's on-chain residue for orphan attribution. Hex so
@@ -222,35 +215,6 @@ def _close_proven_orphan(client, dseq: str, key: str) -> bool:
         closed=True,
     )
     return True
-
-
-# ── stale-deployment recovery: guards, each covering what the others cannot ──
-#
-# ⛔ THE RECOVERY CLOSED ON ONE SIGNAL, FROM A LISTING THAT CANNOT SCOPE.
-# It called `client.list_deployments(active_only=True)` and closed EVERY
-# lease-less row. Three things were wrong at once, and this file already
-# documents every one of them for a NEIGHBOURING function:
-#
-#   * `list_deployments` does not scope by API key. cleanup_stale.py:391 records
-#     the measurement — three DISTINCT keys for three DISTINCT accounts returned
-#     byte-identical bodies, and the same key returned 44/27/0 minutes apart.
-#     `_report_suspected_orphans` tolerates that because it only NAMES; a path
-#     that CLOSES cannot.
-#   * No provenance. The shared wallet hosts other repos — a live read found six
-#     `dfci-infra-runner` among eleven active.
-#   * No age floor. `_report_suspected_orphans` says it outright: a concurrent
-#     run of THIS repo "is also leaseless mid-create, and lands in the same
-#     window". That is the collision ci.yml:150-155 attributes to this very
-#     function, and ci.yml's per-ref concurrency key does not prevent it across
-#     two PRs.
-#
-# The path that merely NAMES strangers was guarded with three signals; the path
-# that DESTROYS them had one. These guards are deliberately independent, so the
-# recovery is safe on its own merits rather than because a mutex happens to hold
-# (just-akash#267): a wider mutex would serialise the fleet's CI and still leave
-# a cross-ACCOUNT close reachable.
-STALE_RETRY_MIN_AGE_SECONDS = 15 * 60
-STALE_RETRY_MAX_CLOSE = 5
 
 
 def _report_suspected_orphans(client, since_epoch_s: float, run_id: str = "") -> list[str]:
@@ -2368,11 +2332,7 @@ def deploy(
                 _log(logging.WARNING, "  No other open bid available to retry with")
             held = None
             if stale or no_order:
-                reason = (
-                    "order un-leaseable (404 'no lease for deployment')"
-                    if no_order
-                    else "all bids stale"
-                )
+                reason = STALE_ORDER_REASONS[0] if no_order else STALE_ORDER_REASONS[1]
                 if prepared_receipt is not None:
                     # Receipt mode: the durable receipt binds THIS DSEQ, so it is neither
                     # closed nor replaced; it stays for exact reconciliation.
@@ -2382,11 +2342,13 @@ def deploy(
                     )
                     emit(Code.REDEPLOY_FAILED, "error", message, dseq=str(dseq))
                     raise RuntimeError(f"Failed to create lease: {message}") from e
-                held = STALE_ORDER_HOLD.format(reason=reason, dseq=display(dseq, "dseq"))
+                held = reason
             _log(logging.ERROR, f"Lease creation FAILED: {error_text(e)}")
             _log(logging.INFO, f"Cleaning up deployment {display(dseq, 'dseq')}...")
+            closed = False
             try:
                 client.close_deployment(str(dseq))
+                closed = True
                 _log(
                     logging.INFO, f"Deployment {display(dseq, 'dseq')} closed after lease failure"
                 )
@@ -2395,6 +2357,13 @@ def deploy(
                     logging.ERROR,
                     f"Cleanup of deployment {display(dseq, 'dseq')} "
                     f"also failed: {error_text(cleanup_err)}",
+                )
+            if held is not None:
+                # The hold states what happened to this deploy's own order, never a close
+                # that failed. A private operation names no dseq in the message.
+                template = STALE_ORDER_HOLD if closed else STALE_ORDER_CLOSE_FAILED_HOLD
+                held = template.format(
+                    reason=held, dseq=PRIVATE_DSEQ if active() else str(dseq)
                 )
             emit(
                 Code.LEASE_CREATE_FAILED,

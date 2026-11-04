@@ -31,6 +31,39 @@ GATE_ENV = "JUST_AKASH_REQUIRE_AUTHORIZED_CREATE"
 logger = logging.getLogger(__name__)
 
 
+# just-akash#332: a deploy never sends a second create. These holds replace the old
+# "close stale deployments and retry" and "close the stale order and re-create" rounds.
+# They live here, a module with no package imports, so the private-error boundary in
+# _confidential can let their exact fixed forms through.
+ALREADY_EXISTS_HOLD = (
+    "Deployment create HELD: the Console reports a matching deployment already exists. "
+    "No deployment was closed and no second create was sent (just-akash#332). "
+    "Next step: run `just-akash list`, close the deployment you no longer need with "
+    "`just-akash destroy --dseq <DSEQ>`, then re-run the deploy."
+)
+STALE_ORDER_HOLD = (
+    "Deploy HELD: no leaseable bid on this order ({reason}). This deploy's own order "
+    "{dseq} was closed and no replacement order was created (just-akash#332). "
+    "Next step: re-run the deploy; it creates one fresh order."
+)
+STALE_ORDER_CLOSE_FAILED_HOLD = (
+    "Deploy HELD: no leaseable bid on this order ({reason}). Closing this deploy's own "
+    "order {dseq} FAILED and no replacement order was created (just-akash#332). "
+    "Next step: close it with `just-akash destroy --dseq {dseq}`, then re-run the deploy."
+)
+STALE_ORDER_REASONS = ("order un-leaseable (404 'no lease for deployment')", "all bids stale")
+# A private (credential-bearing) operation names no dseq in an error message.
+PRIVATE_DSEQ = "<DSEQ withheld>"
+PRIVATE_FIXED_HOLDS = frozenset(
+    {ALREADY_EXISTS_HOLD}
+    | {
+        template.format(reason=reason, dseq=PRIVATE_DSEQ)
+        for template in (STALE_ORDER_HOLD, STALE_ORDER_CLOSE_FAILED_HOLD)
+        for reason in STALE_ORDER_REASONS
+    }
+)
+
+
 class PlainCreateRefused(RuntimeError):
     """No deployment create was sent: plain creates are refused by configuration."""
 

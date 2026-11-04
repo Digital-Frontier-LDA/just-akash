@@ -235,6 +235,41 @@ def test_a_stale_or_gone_order_closes_its_own_order_and_never_creates_another(
     assert client.create_deployment.call_count == 1
     client.close_deployment.assert_called_once_with("111")
     assert all(call.kwargs.get("dseq") == "111" for call in client.create_lease.call_args_list)
+    assert str(caught.value) == deploy_module.STALE_ORDER_HOLD.format(
+        reason=caught_reason(reason), dseq="111"
+    )
+
+
+def caught_reason(prefix):
+    (full,) = [r for r in deploy_module.STALE_ORDER_REASONS if r.startswith(prefix)]
+    return full
+
+
+@patch("just_akash.deploy.time")
+@patch("just_akash.deploy.AkashConsoleAPI")
+def test_a_gone_order_whose_close_fails_never_claims_it_was_closed(
+    MockAPI, mock_time, monkeypatch, tmp_path, capsys
+):
+    sdl = _deploy_setup(monkeypatch, tmp_path)
+    monkeypatch.delenv(GATE_ENV, raising=False)
+    counter = [0.0]
+
+    def advance():
+        counter[0] += 1
+        return counter[0]
+
+    mock_time.time.side_effect = advance
+    client = MockAPI.return_value
+    client.create_deployment.return_value = {"dseq": "111", "manifest": "m1"}
+    _bids(client)
+    client.create_lease.side_effect = NO_ORDER_ERR
+    client.close_deployment.side_effect = RuntimeError("close refused")
+    with pytest.raises(RuntimeError, match="Deploy HELD") as caught:
+        deploy_module.deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+    message = str(caught.value)
+    assert "was closed" not in message
+    assert "FAILED" in message and "just-akash destroy --dseq 111" in message
+    assert client.create_deployment.call_count == 1
 
 
 # --- site 4: the capacity probe -------------------------------------------------------
