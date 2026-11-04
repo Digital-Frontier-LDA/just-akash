@@ -126,7 +126,12 @@ OWNER_CORROBORATION_REGISTRY_PROVENANCE = (
 OWNER_CORROBORATION_REGISTRY_PROVENANCE_SHA256 = (
     "3720728bb01b964132cf1452678c6aaf20f0f5b2df098e2d56ceb577e741b1c2"
 )
-OWNER_CORROBORATION_REGISTRY_SHA256 = _source_registry_digest(OWNER_CORROBORATION_SOURCES_V2)
+# A literal, never computed from the sources above: a digest derived from the registry
+# it guards always matches it, so an edited entry would pass. Any change to
+# OWNER_CORROBORATION_SOURCES_V2 must bump the version and replace this digest.
+OWNER_CORROBORATION_REGISTRY_SHA256 = (
+    "ce7726373109617d75c04e5027d8a9ea131c3868d069345d358cad9f96741dbf"
+)
 
 # Akash's own escrow authorization type (custom, not a generic cosmos SendAuthorization).
 _DEPOSIT_AUTH_TYPE = "/akash.escrow.v1.DepositAuthorization"
