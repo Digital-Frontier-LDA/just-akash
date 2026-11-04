@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Security
+
+- The owner-corroboration source-registry digest (`OWNER_CORROBORATION_REGISTRY_SHA256`) is a literal (`ce772637…`), not computed at import from `OWNER_CORROBORATION_SOURCES_V2`. A digest derived from the registry it guards matched any edit to that registry, so the runtime digest check could never refuse. A changed voter now makes every destructive identity read refuse until the literal digest is replaced (bumping the registry version with it is a maintainer rule the code does not check); a test pins each voter's `source_id`, URL and chain id (just-akash-uwr).
+
 ### Added
 
 - Lease charters for placements Flynn counts as ours (`flynn-*`, `fleet-*`, exactly
