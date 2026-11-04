@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import inspect
 import re
 import time
@@ -221,6 +222,49 @@ def test_default_runtime_sources_are_exactly_two_eligible_destructive_voters(mon
     )
     assert len(chain.OWNER_CORROBORATION_REGISTRY_SHA256) == 64
     assert len(chain.OWNER_CORROBORATION_REGISTRY_PROVENANCE_SHA256) == 64
+
+
+def test_each_shipped_destructive_voter_is_pinned():
+    # A swapped URL keeps the source_id, operator and ancestry labels, so the population
+    # checks above still pass; only the pinned route itself notices.
+    sources = chain.OWNER_CORROBORATION_SOURCES_V2
+    pinned = [(s["source_id"], s["url"], s["chain_id"]) for s in sources]
+    assert pinned == [
+        ("allnodes", "https://akash-rest.publicnode.com", "akashnet-2"),
+        ("polkachu", "https://akash-api.polkachu.com", "akashnet-2"),
+    ]
+
+
+def test_registry_digest_is_a_literal_that_matches_the_shipped_sources():
+    # A digest computed from the registry it guards matches any edit to that registry.
+    tree = ast.parse(inspect.getsource(chain))
+    name = "OWNER_CORROBORATION_REGISTRY_SHA256"
+    values = [
+        node.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and [getattr(target, "id", None) for target in node.targets] == [name]
+    ]
+    assert len(values) == 1
+    assert isinstance(values[0], ast.Constant) and isinstance(values[0].value, str)
+    shipped = chain._source_registry_digest(chain.OWNER_CORROBORATION_SOURCES_V2)
+    assert shipped == chain.OWNER_CORROBORATION_REGISTRY_SHA256
+
+
+def test_an_edited_registry_entry_under_the_old_digest_refuses(monkeypatch):
+    urls = (*ENDPOINTS, "https://lcd-c.example")
+    reader = _reader_for({url: _info((1, "runner")) for url in urls})
+    monkeypatch.delenv("AKASH_REST_URL", raising=False)
+    monkeypatch.setattr(chain, "_lcd_get", reader)
+    monkeypatch.setattr(chain, "OWNER_CORROBORATION_SOURCES_V2", SOURCES)
+    monkeypatch.setattr(
+        chain, "OWNER_CORROBORATION_REGISTRY_SHA256", chain._source_registry_digest(SOURCES)
+    )
+    assert chain.corroborated_deployment_group_names(OWNER, DSEQ, "runner") == ["runner"]
+
+    edited = (SOURCES[0], {**SOURCES[1], "url": "https://lcd-c.example"})
+    monkeypatch.setattr(chain, "OWNER_CORROBORATION_SOURCES_V2", edited)
+    assert chain.corroborated_deployment_group_names(OWNER, DSEQ, "runner") == []
 
 
 def test_registry_population_cannot_silently_become_empty_or_one(monkeypatch):
