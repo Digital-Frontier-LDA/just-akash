@@ -65,6 +65,7 @@ LATENCY_METRIC = "just_akash_smoke_latency_ms"
 LAST_RUN_METRIC = "just_akash_smoke_last_run_timestamp"
 LATEST_OUTCOME_METRIC = "just_akash_smoke_latest_outcome_info"
 LATEST_LATENCY_METRIC = "just_akash_smoke_latest_latency_ms"
+LATEST_LATENCY_TS_METRIC = "just_akash_smoke_latest_latency_timestamp"
 CREDIT_METRIC = "just_akash_deploy_credit_usd"
 
 # Benchmark gauge families (hardware-quality grades from smoke-benchmark.jsonl).
@@ -241,6 +242,32 @@ def render_latest_outcomes(records: list[dict]) -> list[str]:
     return lines
 
 
+def _latest_passes(records: list[dict]) -> dict[tuple[str, str], tuple[float, int, float]]:
+    """(provider, feature) -> (epoch, file index, latency) of the most recent PASS with a
+    numeric latency. "Most recent" is by parsed ``ts`` with file position as tie-break,
+    as for the other latest-* gauges; an unparseable ``ts`` orders as epoch 0. Both
+    ``render_latest_latencies`` and ``render_latest_latency_timestamps`` read this one
+    map, so the two families always carry the same series set."""
+    latest: dict[tuple[str, str], tuple[float, int, float]] = {}
+    for idx, r in enumerate(records):
+        if r.get("outcome") != "PASS":
+            continue
+        provider = r.get("provider")
+        feature = r.get("feature")
+        value = r.get("latency_ms")
+        if not provider or not feature or not _is_number(value):
+            continue
+        epoch = _parse_ts(r.get("ts")) or 0.0
+        key = (str(provider), str(feature))
+        if key not in latest or (epoch, idx) >= latest[key][:2]:
+            latest[key] = (epoch, idx, float(value))  # type: ignore[arg-type]
+    return latest
+
+
+def _pair_labels(provider: str, feature: str) -> str:
+    return f'provider="{_escape_label_value(provider)}",feature="{_escape_label_value(feature)}"'
+
+
 def render_latest_latencies(records: list[dict]) -> list[str]:
     """``just_akash_smoke_latest_latency_ms{provider,feature}`` — the most recent
     PASSING run's latency per (provider, feature).
@@ -256,20 +283,9 @@ def render_latest_latencies(records: list[dict]) -> list[str]:
     time-to-failure, not the feature's cost, so on a failing run the series
     simply holds the previous passing value (failures already alert through
     the latest-outcome series — the timing chart should never double-report).
+    ``just_akash_smoke_latest_latency_timestamp`` says how old that value is.
     """
-    latest: dict[tuple[str, str], tuple[float, int, float]] = {}
-    for idx, r in enumerate(records):
-        if r.get("outcome") != "PASS":
-            continue
-        provider = r.get("provider")
-        feature = r.get("feature")
-        value = r.get("latency_ms")
-        if not provider or not feature or not _is_number(value):
-            continue
-        epoch = _parse_ts(r.get("ts")) or 0.0
-        key = (str(provider), str(feature))
-        if key not in latest or (epoch, idx) >= latest[key][:2]:
-            latest[key] = (epoch, idx, float(value))  # type: ignore[arg-type]
+    latest = _latest_passes(records)
     if not latest:
         return []
     lines = [
@@ -279,10 +295,37 @@ def render_latest_latencies(records: list[dict]) -> list[str]:
         f"# TYPE {LATEST_LATENCY_METRIC} gauge",
     ]
     for (provider, feature), (_, _, value) in sorted(latest.items()):
-        labels = (
-            f'provider="{_escape_label_value(provider)}",feature="{_escape_label_value(feature)}"'
+        lines.append(
+            f"{LATEST_LATENCY_METRIC}{{{_pair_labels(provider, feature)}}} {_fmt_num(value)}"
         )
-        lines.append(f"{LATEST_LATENCY_METRIC}{{{labels}}} {_fmt_num(value)}")
+    return lines
+
+
+def render_latest_latency_timestamps(records: list[dict]) -> list[str]:
+    """``just_akash_smoke_latest_latency_timestamp{provider,feature}`` — Unix time of the
+    smoke run whose PASS produced ``just_akash_smoke_latest_latency_ms`` for that pair.
+
+    ``latest_latency_ms`` holds the last good value across failing and never-reached
+    runs, and ``just_akash_smoke_last_run_timestamp`` is one time for the whole run, so a
+    consumer cannot tell a timing measured in the latest run from one carried forward
+    from an earlier run. When a provider leg aborts part-way, its unreached features
+    keep the earlier run's timings while the run itself reads fresh. This gauge gives
+    each timing its own age: same labels and same series set as ``latest_latency_ms``,
+    one sample per latency sample. A PASS whose ``ts`` does not parse is emitted as 0,
+    so a consumer reads it as old rather than as current.
+    """
+    latest = _latest_passes(records)
+    if not latest:
+        return []
+    lines = [
+        f"# HELP {LATEST_LATENCY_TS_METRIC} Unix time of the smoke run whose PASS produced "
+        f"{LATEST_LATENCY_METRIC} for this (provider, feature).",
+        f"# TYPE {LATEST_LATENCY_TS_METRIC} gauge",
+    ]
+    for (provider, feature), (epoch, _, _) in sorted(latest.items()):
+        lines.append(
+            f"{LATEST_LATENCY_TS_METRIC}{{{_pair_labels(provider, feature)}}} {_fmt_num(epoch)}"
+        )
     return lines
 
 
@@ -499,6 +542,7 @@ def render_metrics(
         render_latest_outcomes(records),
         render_latency_summary(records),
         render_latest_latencies(records),
+        render_latest_latency_timestamps(records),
         render_last_run(records),
     ]
     if benchmark_records:
