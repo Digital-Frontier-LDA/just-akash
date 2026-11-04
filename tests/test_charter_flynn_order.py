@@ -2,8 +2,8 @@
 
 The order is the contract. A charter written after the create leaves a window where an
 uncharted lease of ours is on chain; a bind written before the lease names a dseq that may
-not survive the auction (an un-leaseable order is closed and the deploy holds). So one event log, shared by
-the fake Console, the fake Flynn and the credit probe, must read:
+not survive the auction (an un-leaseable order is closed and the deploy holds). So one
+event log, shared by the fake Console, the fake Flynn and the credit probe, must read:
 
     flynn.post < credit_probe < create_deployment < create_lease < deposit < bind
 

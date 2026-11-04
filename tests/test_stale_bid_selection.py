@@ -238,9 +238,6 @@ class TestLeaseStaleRetry:
         assert client.create_lease.call_count == 2
         client.close_deployment.assert_not_called()
 
-
-
-
     @patch("just_akash.deploy.time")
     @patch("just_akash.deploy.AkashConsoleAPI")
     def test_non_stale_lease_error_does_not_retry(self, MockAPI, mock_time, tmp_path, monkeypatch):
@@ -258,10 +255,6 @@ class TestLeaseStaleRetry:
             _deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
         assert client.create_lease.call_count == 1
         client.close_deployment.assert_called_once_with("12345")
-
-
-
-
 
 
 class TestLeaseTransientJWTRetry:
@@ -302,8 +295,3 @@ class TestLeaseTransientJWTRetry:
         # 3 attempts, all on the same (only) provider, then cleanup.
         assert client.create_lease.call_count == 3
         client.close_deployment.assert_called_once_with("12345")
-
-
-
-
-

@@ -2362,9 +2362,7 @@ def deploy(
                 # The hold states what happened to this deploy's own order, never a close
                 # that failed. A private operation names no dseq in the message.
                 template = STALE_ORDER_HOLD if closed else STALE_ORDER_CLOSE_FAILED_HOLD
-                held = template.format(
-                    reason=held, dseq=PRIVATE_DSEQ if active() else str(dseq)
-                )
+                held = template.format(reason=held, dseq=PRIVATE_DSEQ if active() else str(dseq))
             emit(
                 Code.LEASE_CREATE_FAILED,
                 "error",
