@@ -3,8 +3,6 @@ name: CI
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
   # Merge-queue prerequisite. `Ruff lint + format`, `Pyright type check` and
   # `Unit tests` are required checks on main; with a merge queue required, a check
   # that does not also run on `merge_group` never reports for the queued commit, so
