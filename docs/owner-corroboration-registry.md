@@ -65,8 +65,9 @@ The existing `OWNER_CORROBORATION_SOURCES_V2` Python symbol remains available fo
 consumers of the existing proof API. Its candidate registry identity is explicitly
 **4**, with a different source registry digest. That digest is written in
 `chain.py` as a literal (`ce7726373109617d75c04e5027d8a9ea131c3868d069345d358cad9f96741dbf`),
-never computed from the sources it guards, so any edit to a voter refuses
-destructive reads until the version and digest are bumped together. The pinned provenance document
+never computed from the sources it guards. Any edit to a voter makes destructive
+reads refuse until the literal digest is replaced. Bumping the registry version
+with the digest is a maintainer rule; the code does not check it. The pinned provenance document
 and its digest are unchanged because that document already lists both operators.
 The symbol and proof envelope do not alias registry 3 or registry 2 evidence to
 registry 4.
