@@ -221,8 +221,9 @@ may remove it only after an exact owner-bound close is positively verified. The 
 digest covers the bytes after `just-akash` applies `--image`, `--env`, and automatic
 `just-akash-*` run stamping, so those transforms remain supported in receipt mode and are
 part of the recorded identity.
-Only an explicit Console `already exists` response enters the legacy stale-cleanup-and-one-
-retry path. Timeouts and all other unknown create outcomes are never retried. Once a
+A deploy sends exactly one create (just-akash#332): an explicit Console `already exists`
+response holds without closing anything, and timeouts and all other unknown create
+outcomes are never retried. Once a
 receipt exists, re-invocation with the same path is refused, including when the
 Console returned a DSEQ but the response-state fsync failed.
 

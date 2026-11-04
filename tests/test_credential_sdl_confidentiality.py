@@ -286,17 +286,19 @@ def test_private_ambiguous_create_never_replays(private_deploy, error, caplog, c
     assert not active()
 
 
-def test_existing_already_exists_retry_is_preserved(private_deploy, monkeypatch, caplog, capsys):
+def test_private_already_exists_holds_without_replay_or_close(private_deploy, caplog, capsys):
+    # just-akash#332: the old close-stale + re-POST is gone; the hold names no private detail.
     client, path = private_deploy
     client.create_deployment.side_effect = [
         RuntimeError(f"already exists {ECHO_CANARY}"),
         {"dseq": "42", "manifest": PRIVATE},
     ]
-    cleanup = Mock()
-    monkeypatch.setattr(dp, "_close_stale_for_retry", cleanup)
-    assert dp.deploy(path, bid_wait=2, bid_wait_retry=2)["dseq"] == "42"
-    assert client.create_deployment.call_count == 2 and cleanup.call_count == 1
-    assert ECHO_CANARY not in caplog.text + str(capsys.readouterr())
+    with pytest.raises(RuntimeError) as caught:
+        dp.deploy(path, bid_wait=2, bid_wait_retry=2)
+    assert str(caught.value) == dp.ALREADY_EXISTS_HOLD
+    assert client.create_deployment.call_count == 1
+    client.close_deployment.assert_not_called()
+    assert ECHO_CANARY not in _visible(caught.value, caplog, capsys)
 
 
 def test_private_readback_and_lease_cleanup_errors_are_sanitized(private_deploy, caplog, capsys):
@@ -520,15 +522,13 @@ def test_main_receipt_private_already_exists_refuses_replay_and_stale_sweep(
     parent.mkdir(mode=0o700)
     receipt = parent / "receipt.json"
     client.create_deployment.side_effect = RuntimeError(f"already exists {ECHO_CANARY}")
-    cleanup = Mock()
-    monkeypatch.setattr(dp, "_close_stale_for_retry", cleanup)
     with pytest.raises(RuntimeError, match="Receipt-bound create already exists") as caught:
         dp.deploy(path, receipt_path=str(receipt), receipt_operation_id="test-create-42")
     assert str(caught.value) == (
         "Receipt-bound create already exists; reconcile the recorded operation before retrying"
     )
     assert client.create_deployment.call_count == 1
-    cleanup.assert_not_called()
+    client.close_deployment.assert_not_called()
     assert json.loads(receipt.read_text())["state"] == "submitting"
     assert ECHO_CANARY not in _visible(caught.value, caplog, capsys)
 

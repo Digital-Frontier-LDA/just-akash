@@ -9,8 +9,9 @@ causes apart. Cross-references `exec-reliability-investigation.md` for the deep 
 |---|---|---|
 | `No bids received within …s` | SDL unsatisfiable, providers offline, deposit too low, no capacity on allowed providers | check the SDL (`just-akash validate-sdl sdl/…`); lower the price ceiling; widen the allowlist |
 | `Received N bid(s) but NONE from our providers` | bids arrived, all FOREIGN to your tiers | confirm `AKASH_PROVIDERS`/`AKASH_PROVIDERS_BACKUP` addresses; check provider on-chain status in the log |
-| `… bid(s) from your providers … no longer open (states seen: …)` | bids aged past the ~5min expiry (issue #14) | retry — the re-deploy round usually recovers; if persistent, the providers are slow |
-| `Deployment already exists` then retry fails | a stale lease-less deployment blocked the name | the recovery auto-closes lease-less stale deployments; if it persists, `just destroy <dseq>` the stale one |
+| `… bid(s) from your providers … no longer open (states seen: …)` | bids aged past the ~5min expiry (issue #14) | re-run the deploy (the deploy closes its own order and holds; it no longer re-creates); if persistent, the providers are slow |
+| `Deployment create HELD: … already exists` | a matching deployment exists; the deploy no longer closes it and retries | `just-akash list`, then `just-akash destroy --dseq <DSEQ>` the one you no longer need, and re-run |
+| `plain deployment create refused because JUST_AKASH_REQUIRE_AUTHORIZED_CREATE=1` (or `must be unset, '0' or '1'`) | the plain-create gate is on, or set to an unrecognised value | use the authorized create path, or unset the variable / set it to `0` |
 | `SDL validation failed: … signedBy … only … is allowed` | a `signedBy` address isn't the audit authority | use the authority address or drop `signedBy` |
 
 ## `just exec` returns nothing / wrong exit code

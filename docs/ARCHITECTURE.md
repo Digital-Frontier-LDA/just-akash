@@ -38,12 +38,12 @@ its final provider decision to the shared `akash-lease-core` auction state machi
 
 ```text
 1. prepare SDL     read → validate (sdl_validate) → image/SSH-key/env overrides
-2. create deploy   POST /v1/deployments (recovers from "already exists")
+2. create deploy   POST /v1/deployments (exactly one; "already exists" holds)
 3. select bid      collect for one [0, T] window (default/max 60s)
                    at T: cheapest PREFERRED, else cheapest eligible BACKUP
 4. tier tables     log PREFERRED / BACKUP / FOREIGN breakdown
 5. announce        which phase chose the winner + a ranked tier view
-6. create lease    POST /v1/leases — with stale-bid retry + one bounded re-deploy
+6. create lease    POST /v1/leases — with stale-bid retry on the same order
 ```
 
 Properties (each pinned by a test in `tests/test_deploy.py`):
@@ -74,10 +74,11 @@ Selection.
 
 ### Failure/recovery paths
 
-- **stale deployment** ("already exists") → close lease-less stale deployments, retry once.
+- **stale deployment** ("already exists") → HOLD: nothing is closed and no second create is sent (just-akash#332). Close the one you no longer need (`just-akash list`, `just-akash destroy --dseq <DSEQ>`) and re-run.
 - **stale bid at lease time** ("no longer open") → re-fetch open bids, tier order, next cheapest.
 - **transient Console auth flap** ("JWT has invalid claims") → retry same provider after backoff.
-- **all bids stale** → one bounded **re-deploy round**: close the order, re-create, lease a fresh bid immediately (no phased patience — that's what aged the first round). Issues #14/#18/#19.
+- **all bids stale / order gone (404)** → HOLD: this deploy closes its own order and creates no replacement (just-akash#332); re-run the deploy for one fresh order. The issue-#19 re-deploy round was removed.
+- **plain-create gate** → `JUST_AKASH_REQUIRE_AUTHORIZED_CREATE=1` refuses every plain create before any network I/O; unset or `0` allows it; any other value refuses. Every create site logs its `authorized-create gate:` state.
 
 ## Transport abstraction (`transport/`)
 

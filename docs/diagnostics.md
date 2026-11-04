@@ -61,7 +61,7 @@ Silent in an interactive terminal (humans keep the existing `_log`/`Error:` pros
 | `DEPLOY_CREATE_FAILED` | `create_deployment` raised. |
 | `NO_DSEQ_RETURNED` | Create succeeded but no DSEQ in response. |
 | `LEASE_CREATE_FAILED` | Lease creation failed (incl. 404 "no lease for deployment"). |
-| `REDEPLOY_FAILED` | The issue-#19 re-deploy round exhausted. |
+| `REDEPLOY_FAILED` | Receipt mode refused to replace a stale or un-leaseable order (the re-deploy round itself was removed, just-akash#332). |
 | `SDL_ERROR` | SDL validation/missing/placeholder. Emitted when a charter cannot be stamped into the placement keys (a group clash, a malformed charter id, or a placement of ours in a layout the stamp cannot rewrite); nothing is created. |
 | `CONFIG_ERROR` | Missing API key / bad deposit / bad `--env` (reserved). |
 

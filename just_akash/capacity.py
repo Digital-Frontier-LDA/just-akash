@@ -128,6 +128,10 @@ def probe_order_sdl(
     # an open deployment — the escrow leak this module exists to prevent.
     if poll_s <= 0 and wait_s > 0:
         raise ValueError("poll_s must be > 0 when wait_s > 0")
+    # just-akash#332: an opted-in consumer refuses this plain probe create before any I/O.
+    from .create_gate import require_plain_create_allowed
+
+    require_plain_create_allowed("capacity_probe")
 
     dep = client.create_deployment(sdl, deposit=deposit)
     dseq = _extract_dseq(dep)

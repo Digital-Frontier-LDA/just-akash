@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **A deploy never sends a second create (just-akash#332).** Behaviour change for CLI users:
+  - When the Console reports that a matching deployment **already exists**, `deploy` now HOLDS. It no longer closes "stale" deployments and posts a second create. The error reads: "Deployment create HELD: the Console reports a matching deployment already exists. No deployment was closed and no second create was sent (just-akash#332). Next step: run `just-akash list`, close the deployment you no longer need with `just-akash destroy --dseq <DSEQ>`, then re-run the deploy."
+  - When every bid on the order is stale, or the order becomes un-leaseable (404), `deploy` closes ITS OWN order and HOLDS. It no longer creates a replacement order (the issue-#19 re-deploy round is removed). Next step: re-run the deploy.
+  - Receipt mode is unchanged: it already refused both.
+
+### Added
+
+- `JUST_AKASH_REQUIRE_AUTHORIZED_CREATE` (just-akash#332): set to `1`, every plain deployment create (`deploy`, the capacity/bid probes, and `AkashConsoleAPI.create_deployment` itself) is refused BEFORE any network I/O. Unset or `0` allows it. Any other value (`true`, `yes`, an empty string, a typo) refuses, so a typo never reads as off. Every create site logs one `authorized-create gate: on|off (...)` line. The authorized create path (`AuthorizedConsoleCreate`) is unaffected. This gate only refuses; it is not authorization.
+
 ### Security
 
 - Gitleaks: `.gitleaksignore` allowlists one verified false positive by fingerprint. A generated SHA-256 digest manifest (`python-source.cjs` on the unmerged `codex/keydb-qualification-unused-recover-428cc-20261025` branch) matched `generic-api-key`, and because the scan covers every branch it failed Secret Scan on every PR.

@@ -82,7 +82,7 @@ lifetime/cleanup; passing `deposit=0.5` is no proof of a $0.50 limit. See the
 - `_classify_bid(provider, preferred, backup)` → `PREFERRED`/`BACKUP`/`FOREIGN`/`ACCEPTED`.
 - `_is_open_bid` — state filter (issue #14); leasing a non-open bid is a guaranteed 400.
 - `_backup_fallback_grace_s` — bounds phase 2 so it can't age backup bids past ~5min expiry.
-- `_redeploy_and_reselect` — the one bounded re-deploy round (issue #19).
+- `create_gate.require_plain_create_allowed` — the opt-in plain-create gate (just-akash#332); the issue-#19 re-deploy round was removed.
 
 Invariant: failure paths clean up the deployment they created (no funded orphans);
 cleanup failures are logged, not raised over the original error.
