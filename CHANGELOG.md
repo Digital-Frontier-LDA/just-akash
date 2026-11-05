@@ -17,7 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
-- `JUST_AKASH_REQUIRE_AUTHORIZED_CREATE` (just-akash#332): set to `1`, every plain deployment create (`deploy`, the capacity/bid probes, and `AkashConsoleAPI.create_deployment` itself) is refused BEFORE any network I/O. Unset or `0` allows it. Any other value (`true`, `yes`, an empty string, a typo) refuses, so a typo never reads as off. Every create site logs one `authorized-create gate: on|off (...)` line. The authorized create path (`AuthorizedConsoleCreate`) is unaffected. This gate only refuses; it is not authorization.
+- `JUST_AKASH_REQUIRE_AUTHORIZED_CREATE` (just-akash#332): set to `1`, every plain deployment create (`deploy`, the capacity/bid probes, and `AkashConsoleAPI.create_deployment` itself) is refused BEFORE any network I/O. Unset or `0` allows it. Any other value (`true`, `yes`, an empty string, a typo) refuses, so a typo never reads as off. `deploy` and the capacity/bid probes each log one `authorized-create gate: on|off (...)` line; the `AkashConsoleAPI.create_deployment` backstop refuses without logging, because `deploy` and the probes have logged before they reach it. The authorized create path (`AuthorizedConsoleCreate`) is unaffected. This gate only refuses; it is not authorization.
 
 ### Security
 

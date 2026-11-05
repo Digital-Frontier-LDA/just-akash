@@ -245,6 +245,60 @@ def caught_reason(prefix):
     return full
 
 
+def _open_bids(n):
+    return [
+        {
+            "id": {"provider": f"akash1p{i}"},
+            "price": {"amount": 10 + i, "denom": "uakt"},
+            "state": "open",
+        }
+        for i in range(n)
+    ]
+
+
+@pytest.mark.parametrize("path", ["refetch-failed", "budget-spent"])
+@patch("just_akash.deploy.time")
+@patch("just_akash.deploy.AkashConsoleAPI")
+def test_a_stale_hold_names_the_path_it_took_never_all_bids_stale_unverified(
+    MockAPI, mock_time, monkeypatch, tmp_path, path
+):
+    # #511 review: "all bids stale" was stated when the re-fetch failed or the retry budget
+    # ran out, with open bids possibly untried. Each path now names itself.
+    sdl = _deploy_setup(monkeypatch, tmp_path)
+    monkeypatch.setenv("AKASH_PROVIDERS", ",".join(f"akash1p{i}" for i in range(40)))
+    monkeypatch.delenv(GATE_ENV, raising=False)
+    counter = [0.0]
+
+    def advance():
+        counter[0] += 1
+        return counter[0]
+
+    mock_time.time.side_effect = advance
+    client = MockAPI.return_value
+    client.create_deployment.side_effect = [{"dseq": "111", "manifest": "m1"}]
+    if path == "refetch-failed":
+        bids = _open_bids(3)
+
+        def get_bids(_dseq):
+            # Selection polls succeed; once a lease has been tried, every re-fetch fails.
+            if client.create_lease.call_count:
+                raise RuntimeError("API Error (502): bad gateway")
+            return bids
+
+        client.get_bids.side_effect = get_bids
+        want = deploy_module.STALE_ORDER_REASONS[2]
+    else:
+        client.get_bids.return_value = _open_bids(40)  # always another open bid to try
+        want = deploy_module.STALE_ORDER_REASONS[3]
+    client.create_lease.side_effect = STALE_ERR
+    with pytest.raises(RuntimeError, match="Deploy HELD") as caught:
+        deploy_module.deploy(sdl_path=sdl, bid_wait=5, bid_wait_retry=5)
+    assert str(caught.value) == deploy_module.STALE_ORDER_HOLD.format(reason=want, dseq="111")
+    assert "all bids stale" not in str(caught.value)
+    assert client.create_deployment.call_count == 1
+    client.close_deployment.assert_called_once_with("111")
+
+
 @patch("just_akash.deploy.time")
 @patch("just_akash.deploy.AkashConsoleAPI")
 def test_a_gone_order_whose_close_fails_never_claims_it_was_closed(

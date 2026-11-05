@@ -2300,6 +2300,7 @@ def deploy(
                 )
                 time.sleep(5)
                 continue
+            refetch_failed = False
             if stale and attempt < max_lease_attempts:
                 failed_providers.add(provider)
                 _log(
@@ -2312,6 +2313,7 @@ def deploy(
                 except RuntimeError as poll_err:
                     _log(logging.WARNING, f"  Bid re-fetch failed: {error_text(poll_err)}")
                     fresh_bids = []
+                    refetch_failed = True
                 next_bid = _next_open_bid(fresh_bids, failed_providers)
                 if next_bid is not None:
                     provider = _extract_provider(next_bid) or ""
@@ -2332,7 +2334,14 @@ def deploy(
                 _log(logging.WARNING, "  No other open bid available to retry with")
             held = None
             if stale or no_order:
-                reason = STALE_ORDER_REASONS[0] if no_order else STALE_ORDER_REASONS[1]
+                if no_order:
+                    reason = STALE_ORDER_REASONS[0]
+                elif refetch_failed:
+                    reason = STALE_ORDER_REASONS[2]
+                elif attempt >= max_lease_attempts:
+                    reason = STALE_ORDER_REASONS[3]
+                else:
+                    reason = STALE_ORDER_REASONS[1]  # a re-fetch showed no other open bid
                 if prepared_receipt is not None:
                     # Receipt mode: the durable receipt binds THIS DSEQ, so it is neither
                     # closed nor replaced; it stays for exact reconciliation.

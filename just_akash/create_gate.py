@@ -42,16 +42,23 @@ ALREADY_EXISTS_HOLD = (
     "`just-akash destroy --dseq <DSEQ>`, then re-run the deploy."
 )
 STALE_ORDER_HOLD = (
-    "Deploy HELD: no leaseable bid on this order ({reason}). This deploy's own order "
+    "Deploy HELD: no lease was created on this order ({reason}). This deploy's own order "
     "{dseq} was closed and no replacement order was created (just-akash#332). "
     "Next step: re-run the deploy; it creates one fresh order."
 )
 STALE_ORDER_CLOSE_FAILED_HOLD = (
-    "Deploy HELD: no leaseable bid on this order ({reason}). Closing this deploy's own "
+    "Deploy HELD: no lease was created on this order ({reason}). Closing this deploy's own "
     "order {dseq} FAILED and no replacement order was created (just-akash#332). "
     "Next step: close it with `just-akash destroy --dseq {dseq}`, then re-run the deploy."
 )
-STALE_ORDER_REASONS = ("order un-leaseable (404 'no lease for deployment')", "all bids stale")
+# Each reason names the path the deploy took: "all bids stale" only when a re-fetch
+# showed no other open bid.
+STALE_ORDER_REASONS = (
+    "order un-leaseable (404 'no lease for deployment')",
+    "all bids stale",
+    "stale bid, and the bid re-fetch failed",
+    "stale bid, and the lease retry budget is spent",
+)
 # A private (credential-bearing) operation names no dseq in an error message.
 PRIVATE_DSEQ = "<DSEQ withheld>"
 PRIVATE_FIXED_HOLDS = frozenset(
