@@ -17,6 +17,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- `just_akash_smoke_latest_latency_timestamp{provider,feature}`: the Unix time of the smoke run whose PASS produced `just_akash_smoke_latest_latency_ms` for that pair (#507). The latency gauge holds the last good value across failing and never-reached runs, and the only freshness was the one run-wide `just_akash_smoke_last_run_timestamp`, so a leg that aborted part-way left its unreached features serving an earlier run's timings while the run read fresh. Consumers can now exclude a carried-forward timing by its own age. Same labels and series set as `latest_latency_ms`; existing families unchanged.
+
 - `credentials-sops` for `runner-pool.yml` (df-grafana-2tr; teardown got it in #472): with it
   set and `CREDENTIALS_AGE_KEY` passed, the pool reads `AKASH_API_KEY`, `AKASH_API_KEYS` and
   `GH_RUNNER_PAT` from the caller's `secrets/akash-runner.sops.env` in one step with the

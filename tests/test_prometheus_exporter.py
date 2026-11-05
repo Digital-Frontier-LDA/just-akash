@@ -496,3 +496,88 @@ class TestLatestLatencies:
     def test_included_in_full_document(self):
         recs = [_rec("p", "deploy", "PASS", 500, ts="2026-07-19T07:00:00+00:00")]
         assert px.LATEST_LATENCY_METRIC in px.render_metrics(recs)
+
+
+def _samples(lines, metric):
+    """{(provider, feature): value-string} for one family's sample lines."""
+    out = {}
+    for ln in lines:
+        if ln.startswith(metric + "{"):
+            labels, value = ln[len(metric) + 1 :].rsplit("} ", 1)
+            pairs = dict(kv.split("=", 1) for kv in labels.split(","))
+            out[(pairs["provider"].strip('"'), pairs["feature"].strip('"'))] = value
+    return out
+
+
+RUN1 = "2026-07-21T07:00:00+00:00"  # 1784617200
+RUN2 = "2026-07-22T07:00:00+00:00"  # 1784703600
+
+
+class TestLatestLatencyTimestamps:
+    def test_metric_name_is_the_consumer_contract(self):
+        # df-grafana's AkashSmokeLatency* rules read this exact name (just-akash#507).
+        assert px.LATEST_LATENCY_TS_METRIC == "just_akash_smoke_latest_latency_timestamp"
+
+    def test_a_carried_value_keeps_the_ts_of_the_pass_that_set_it(self):
+        # Run 2 aborts part-way: deploy passes again, exec is never reached ('-'),
+        # ingress fails. exec and ingress keep run 1's latency AND run 1's timestamp;
+        # deploy carries run 2's.
+        recs = [
+            _rec("p", "deploy", "PASS", 90000, ts=RUN1),
+            _rec("p", "exec", "PASS", 800, ts=RUN1),
+            _rec("p", "ingress", "PASS", 400, ts=RUN1),
+            _rec("p", "deploy", "PASS", 95000, ts=RUN2),
+            _rec("p", "exec", "-", None, ts=RUN2),
+            _rec("p", "ingress", "FAIL", 30000, ts=RUN2),
+        ]
+        lat = _samples(px.render_latest_latencies(recs), px.LATEST_LATENCY_METRIC)
+        tss = _samples(px.render_latest_latency_timestamps(recs), px.LATEST_LATENCY_TS_METRIC)
+        assert lat == {("p", "deploy"): "95000", ("p", "exec"): "800", ("p", "ingress"): "400"}
+        assert tss == {
+            ("p", "deploy"): "1784703600",
+            ("p", "exec"): "1784617200",
+            ("p", "ingress"): "1784617200",
+        }
+
+    def test_same_series_set_as_latest_latency(self):
+        # Never-passed, non-numeric and bool latencies are absent from BOTH families.
+        recs = [
+            _rec("a", "deploy", "PASS", 1, ts=RUN1),
+            _rec("b", "deploy", "NO-BID", None, ts=RUN1),
+            _rec("c", "exec", "PASS", True, ts=RUN1),
+            _rec("d", "exec", "PASS", "fast", ts=RUN1),
+            _rec("e", "logs", "PASS", 2.5, ts=RUN2),
+        ]
+        lat = _samples(px.render_latest_latencies(recs), px.LATEST_LATENCY_METRIC)
+        tss = _samples(px.render_latest_latency_timestamps(recs), px.LATEST_LATENCY_TS_METRIC)
+        assert set(lat) == set(tss) == {("a", "deploy"), ("e", "logs")}
+
+    def test_same_ts_tie_breaks_by_file_position_in_both(self):
+        recs = [_rec("p", "deploy", "PASS", 1, ts=RUN1), _rec("p", "deploy", "PASS", 2, ts=RUN1)]
+        assert _samples(px.render_latest_latencies(recs), px.LATEST_LATENCY_METRIC) == {
+            ("p", "deploy"): "2"
+        }
+        assert _samples(
+            px.render_latest_latency_timestamps(recs), px.LATEST_LATENCY_TS_METRIC
+        ) == {("p", "deploy"): "1784617200"}
+
+    def test_unparseable_ts_reads_as_old_not_current(self):
+        recs = [_rec("p", "deploy", "PASS", 5, ts="not-a-time")]
+        assert _samples(
+            px.render_latest_latency_timestamps(recs), px.LATEST_LATENCY_TS_METRIC
+        ) == {("p", "deploy"): "0"}
+
+    def test_no_pass_means_no_family(self):
+        assert px.render_latest_latency_timestamps([_rec("p", "deploy", "FAIL", 9, ts=RUN1)]) == []
+
+    def test_typed_and_in_the_full_document(self):
+        recs = [_rec("p", "deploy", "PASS", 500, ts=RUN1)]
+        lines = px.render_latest_latency_timestamps(recs)
+        assert f"# TYPE {px.LATEST_LATENCY_TS_METRIC} gauge" in lines
+        doc = px.render_metrics(recs)
+        assert (
+            'just_akash_smoke_latest_latency_timestamp{provider="p",feature="deploy"} 1784617200'
+            in doc
+        )
+        # The existing families are unchanged by the addition.
+        assert 'just_akash_smoke_latest_latency_ms{provider="p",feature="deploy"} 500' in doc
