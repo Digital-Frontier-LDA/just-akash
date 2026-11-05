@@ -907,6 +907,7 @@ def main():
     # ── deploy ─────────────────────────────────────────
     if args.command == "deploy":
         from .deploy import _resolve_tier, deploy
+        from .hosted_legacy_cli import HostedCLIUnknown, hosted_cli_context
 
         # Two flags that contradict each other must not resolve silently in favour of one.
         # Ignoring the explicit --backup-provider would do the safer thing while telling the
@@ -959,28 +960,33 @@ def main():
         try:
             from .charter import load_charter
 
-            deploy(
-                sdl_path=args.sdl,
-                gpu=args.gpu,
-                image=args.image,
-                bid_wait=args.bid_wait,
-                bid_wait_retry=args.bid_wait_retry,
-                env_vars=args.deploy_env_vars,
-                preferred_providers=args.preferred_providers,
-                # [] and None are NOT the same to _resolve_tier: [] means "no backups, do not
-                # look at the environment", None means "no opinion, read AKASH_PROVIDERS_BACKUP".
-                # The flag has to produce the former, which is why it cannot just leave the
-                # argument unset.
-                backup_providers=[] if args.no_backup_fallback else args.backup_providers,
-                deposit=args.deposit,
-                select=args.select,
-                already_selected=args.already_selected,
-                receipt_path=args.receipt_path,
-                receipt_operation_id=args.receipt_operation_id,
-                quiet_wallet=args.quiet_wallet,
-                charter=load_charter(args.charter),
-            )
+            with hosted_cli_context("deploy", args):
+                deploy(
+                    sdl_path=args.sdl,
+                    gpu=args.gpu,
+                    image=args.image,
+                    bid_wait=args.bid_wait,
+                    bid_wait_retry=args.bid_wait_retry,
+                    env_vars=args.deploy_env_vars,
+                    preferred_providers=args.preferred_providers,
+                    # [] and None are NOT the same to _resolve_tier: [] means "no backups, do not
+                    # look at the environment", None means "no opinion, read
+                    # AKASH_PROVIDERS_BACKUP".
+                    # The flag has to produce the former, which is why it cannot just leave the
+                    # argument unset.
+                    backup_providers=[] if args.no_backup_fallback else args.backup_providers,
+                    deposit=args.deposit,
+                    select=args.select,
+                    already_selected=args.already_selected,
+                    receipt_path=args.receipt_path,
+                    receipt_operation_id=args.receipt_operation_id,
+                    quiet_wallet=args.quiet_wallet,
+                    charter=load_charter(args.charter),
+                )
             sys.exit(0)
+        except HostedCLIUnknown:
+            print("hosted_cli=UNKNOWN; no replay", file=sys.stderr)
+            sys.exit(78)
         except RuntimeError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
@@ -1936,41 +1942,51 @@ def main():
             _load_tags,
             _save_tags,
         )
+        from .hosted_legacy_cli import HostedCLIUnknown, hosted_cli_context
+        from .legacy_capacity_cleanup import CleanupUnknown, close_deployment_with_cleanup
 
         try:
-            client, dseq = _resolve_deployment_client(
-                args.dseq,
-                args.expected_owner or None,
-                args.expected_group,
-            )
-            tag = _get_tag(dseq)
-            label = f"{dseq} ({tag})" if tag else dseq
-            if _confirm(f"Destroy deployment {label}? (y/N) ", yes=args.yes):
-                if args.expected_owner:
-                    import json as _json
+            with hosted_cli_context("destroy", args):
+                client, dseq = _resolve_deployment_client(
+                    args.dseq,
+                    args.expected_owner or None,
+                    args.expected_group,
+                )
+                tag = _get_tag(dseq)
+                label = f"{dseq} ({tag})" if tag else dseq
+                if _confirm(f"Destroy deployment {label}? (y/N) ", yes=args.yes):
+                    if args.expected_owner:
+                        import json as _json
 
-                    from .wallet_pool import (
-                        authorize_client_for_bound_owner,
-                    )
+                        from .wallet_pool import (
+                            authorize_client_for_bound_owner,
+                        )
 
-                    closer, evidence = authorize_client_for_bound_owner(
-                        dseq,
-                        args.expected_owner,
-                        args.expected_group,
-                    )
-                    print(
-                        "owner-close-evidence=" + _json.dumps(evidence, sort_keys=True),
-                        file=sys.stderr,
-                    )
-                    closer.close_deployment(dseq)
+                        closer, evidence = authorize_client_for_bound_owner(
+                            dseq,
+                            args.expected_owner,
+                            args.expected_group,
+                        )
+                        print(
+                            "owner-close-evidence=" + _json.dumps(evidence, sort_keys=True),
+                            file=sys.stderr,
+                        )
+                        close_deployment_with_cleanup(
+                            closer, dseq, expected_owner=args.expected_owner
+                        )
+                    else:
+                        close_deployment_with_cleanup(
+                            client, dseq, expected_owner=args.expected_owner or None
+                        )
+                    tags = _load_tags()
+                    tags.pop(dseq, None)
+                    _save_tags(tags)
+                    print(f"Deployment {label} destroyed.")
                 else:
-                    client.close_deployment(dseq)
-                tags = _load_tags()
-                tags.pop(dseq, None)
-                _save_tags(tags)
-                print(f"Deployment {label} destroyed.")
-            else:
-                print("Cancelled.")
+                    print("Cancelled.")
+        except (CleanupUnknown, HostedCLIUnknown):
+            print("capacity_cleanup=UNKNOWN; no destroy replay", file=sys.stderr)
+            sys.exit(78)
         except OwnerLookupUnresolved as e:
             # ⛔ UNREACHABLE IS ITS OWN EXIT CODE (#378): a retry loop must be able to
             # tell "the shared budget is gone — retrying is waste" from "failed, try

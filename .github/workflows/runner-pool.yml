@@ -71,6 +71,16 @@ name: Akash runner pool
 on:
   workflow_call:
     inputs:
+      shared-admission:
+        description: Default-off code-owned hosted Guardian admission; requires a separately registered bootstrap and caller cleanup contract.
+        type: boolean
+        required: false
+        default: false
+      shared-admission-operation-id:
+        description: Public operation locator; must equal owned-private-images-RUN_ID-RUN_ATTEMPT. Not a grant.
+        type: string
+        required: false
+        default: ''
       runner-label:
         description: 'Unique label for this pool; carries run identity into runs-on.'
         required: true
@@ -371,6 +381,12 @@ on:
         required: false
         description: 'Scoped age key for the caller registry-pull.sops.env. Never pass the management age key.'
     outputs:
+      shared-admission-artifact-id:
+        description: Signed-consume artifact locator only; absence remains UNKNOWN.
+        value: ${{ jobs.pool.outputs.shared-admission-artifact-id }}
+      shared-admission-artifact-digest:
+        description: Native archive digest output; not raw ZIP byte attestation or authority.
+        value: ${{ jobs.pool.outputs.shared-admission-artifact-digest }}
       dseq:
         description: 'Deployment sequence number; empty when no lease survived.'
         value: ${{ jobs.pool.outputs.dseq }}
@@ -493,6 +509,10 @@ permissions:
 jobs:
   pool:
     name: Provision ephemeral runner pool on Akash
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     runs-on: ubuntu-latest
     # ⛔ MUST EXCEED the owner-lookup deadline + close/audit margin (see
     # just_akash/owner_lookup.py: 10 + 4 = 14 min at the time of writing), pinned by
@@ -502,6 +522,8 @@ jobs:
     # headroom above every observed pool run while still ending a stuck one.
     timeout-minutes: 120
     outputs:
+      shared-admission-artifact-id: ${{ steps.shared_custody.outputs.artifact-id }}
+      shared-admission-artifact-digest: ${{ steps.shared_custody.outputs.artifact-digest }}
       dseq: ${{ steps.provision.outputs.dseq }}
       deployment_outcome: ${{ steps.provision.outputs.deployment_outcome || steps.public_profile.outputs.deployment_outcome || steps.private_profile.outputs.deployment_outcome || (steps.pat.outputs.native_pre_create_refused == 'true' && 'no-deployment' || '') }}
       create_ambiguous: ${{ steps.provision.outputs.create_ambiguous }}
@@ -1372,6 +1394,13 @@ jobs:
           TAG_PREFIX: ${{ inputs.tag-prefix }}
           RUN_ID: ${{ github.run_id }}
           MAX_ATTEMPTS: '3'
+          SHARED_ADMISSION: ${{ inputs.shared-admission }}
+          SHARED_OPERATION_ID: ${{ inputs.shared-admission-operation-id }}
+          SHARED_REPOSITORY: ${{ github.repository }}
+          SHARED_EVENT: ${{ github.event_name }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          GITHUB_TOKEN: ${{ github.token }}
+          HOSTED_CUSTODY_DIRECTORY: ${{ runner.temp }}/shared-admission/export
           RUNNER_WAIT_TRIES: ${{ inputs.runner-wait-tries }}
           EXPECTED_RUNNER_VERSION: ${{ inputs.expected-runner-version }}
           REQUIRED_DEPOSIT_USD: ${{ inputs.required-deposit-usd }}
@@ -1431,6 +1460,35 @@ jobs:
           # splitting, so quoting them breaks the command and NOT quoting them is SC2086.
           # Arrays are the only form that is both correct and lint-clean.
           JA=(uv run --with . just-akash)
+
+          DEPLOY_JA=("${JA[@]}")
+          SHARED_RECEIPT_ARGS=()
+          case "${SHARED_ADMISSION:-false}" in
+            false|'') ;;
+            true)
+              # Inputs select DATA plumbing, never a policy, credential or permit.
+              if [ "$SHARED_REPOSITORY" != Borduas-Holdings/blazing ] || [ "$SHARED_EVENT" != workflow_dispatch ] ||
+                 [ "$SHARED_OPERATION_ID" != "owned-private-images-${RUN_ID}-${RUN_ATTEMPT}" ]; then
+                echo "deployment_outcome=unknown" >> "$GITHUB_OUTPUT"
+                echo "failure_reason=SHARED_ADMISSION_UNKNOWN" >> "$GITHUB_OUTPUT"; exit 78
+              fi
+              MAX_ATTEMPTS=1
+              umask 077
+              install -d -m 700 "$RUNNER_TEMP/shared-admission/prepared" "$HOSTED_CUSTODY_DIRECTORY"
+              uv run --with . python -m just_akash.hosted_cli_custody prepare || exit 78
+              DEPLOY_JA=(uv run --with . python -m just_akash.hosted_cli_bootstrap)
+              SHARED_RECEIPT_ARGS=(--receipt-path "$RUNNER_TEMP/shared-admission/prepared/create.json" --receipt-operation-id "$SHARED_OPERATION_ID")
+              ;;
+            *) exit 78 ;;
+          esac
+          shared_hold_before_internal_destroy() {
+            if [ "${SHARED_ADMISSION:-false}" = true ]; then
+              echo "deployment_outcome=unknown" >> "$GITHUB_OUTPUT"
+              echo "failure_reason=SHARED_ADMISSION_UNKNOWN" >> "$GITHUB_OUTPUT"
+              # Only the caller's external always-close owns this opted transaction.
+              exit 78
+            fi
+          }
 
           # ⛔ KNOWN EFFECTS ARE MONOTONIC FOR THE RUN (#347). Once a round parses a
           # DSEQ, a later authoritative pre-broadcast failure cannot publish
@@ -1672,7 +1730,7 @@ jobs:
             fi
             rm -f /tmp/ja.log
             DEPLOY_RC=0
-            AKASH_PROVIDERS='' AKASH_PROVIDERS_BACKUP='' "${JA[@]}" deploy --sdl /tmp/runner-sdl.minted.yaml --deposit "$REQUIRED_DEPOSIT_USD" --bid-wait 60 \
+            AKASH_PROVIDERS='' AKASH_PROVIDERS_BACKUP='' "${DEPLOY_JA[@]}" deploy "${SHARED_RECEIPT_ARGS[@]}" --sdl /tmp/runner-sdl.minted.yaml --deposit "$REQUIRED_DEPOSIT_USD" --bid-wait 60 \
               --bid-wait-retry 120 "${SELECT_ARGS[@]}" "${PROV_ARGS[@]}" 2>&1 | tee /tmp/ja.log || DEPLOY_RC=${PIPESTATUS[0]}
             rm -f /tmp/runner-sdl.minted.yaml
             # ⛔ A FAILED LEASE STILL HOLDS A DEPLOYMENT (#348). just-akash prints the
@@ -1721,6 +1779,12 @@ jobs:
                 echo "::endgroup::"; exit 1
               fi
             fi
+            if [ "${SHARED_ADMISSION:-false}" = true ] && [ "$DEPLOY_RC" -ne 0 ]; then
+              echo "deployment_outcome=unknown" >> "$GITHUB_OUTPUT"
+              echo "failure_reason=SHARED_ADMISSION_UNKNOWN" >> "$GITHUB_OUTPUT"
+              # Any signed consume remains charged, regardless of HTTP or native text.
+              echo "::endgroup::"; exit 78
+            fi
             WALLET_UACT=$(awk '/^[[:space:]]*Wallet available:/{print $(NF-1); exit}' /tmp/ja.log || true)
 
             # A DSEQ with no PROVIDER is a REAL deployment we would otherwise walk away
@@ -1736,6 +1800,7 @@ jobs:
               export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
               for _try in 1 2 3; do
                 DESTROY_RC=0
+                shared_hold_before_internal_destroy
                 "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-orphan.log || DESTROY_RC=${PIPESTATUS[0]}
                 # ⛔ 75 = OWNER_LOOKUP_UNREACHABLE (owner_lookup.OWNER_LOOKUP_UNREACHABLE_EXIT_CODE):
                 # the step's shared lookup budget is exhausted — retrying re-spends a dead budget.
@@ -2075,6 +2140,7 @@ jobs:
               export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
               for _try in 1 2 3; do
                 DESTROY_RC=0
+                shared_hold_before_internal_destroy
                 "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-destroy.log || DESTROY_RC=${PIPESTATUS[0]}
                 # ⛔ 75 = OWNER_LOOKUP_UNREACHABLE (owner_lookup.OWNER_LOOKUP_UNREACHABLE_EXIT_CODE):
                 # the step's shared lookup budget is exhausted — retrying re-spends a dead budget.
@@ -2099,6 +2165,7 @@ jobs:
               export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
               for _try in 1 2 3; do
                 DESTROY_RC=0
+                shared_hold_before_internal_destroy
                 "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-destroy.log || DESTROY_RC=${PIPESTATUS[0]}
                 # ⛔ 75 = OWNER_LOOKUP_UNREACHABLE (owner_lookup.OWNER_LOOKUP_UNREACHABLE_EXIT_CODE):
                 # the step's shared lookup budget is exhausted — retrying re-spends a dead budget.
@@ -2147,6 +2214,7 @@ jobs:
               export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
               for _try in 1 2 3; do
                 DESTROY_RC=0
+                shared_hold_before_internal_destroy
                 "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-destroy.log || DESTROY_RC=${PIPESTATUS[0]}
                 # ⛔ 75 = OWNER_LOOKUP_UNREACHABLE (owner_lookup.OWNER_LOOKUP_UNREACHABLE_EXIT_CODE):
                 # the step's shared lookup budget is exhausted — retrying re-spends a dead budget.
@@ -2181,6 +2249,7 @@ jobs:
                 export OWNER_LOOKUP_DEADLINE_AT=$(( $(date +%s) + 600 ))
                 for _try in 1 2 3; do
                   DESTROY_RC=0
+                  shared_hold_before_internal_destroy
                   "${JA[@]}" destroy --dseq "$DSEQ" --expected-owner "$WALLET" --expected-group "$DEPLOYMENT_GROUP" -y 2>&1 | tee /tmp/ja-destroy.log || DESTROY_RC=${PIPESTATUS[0]}
                   # ⛔ 75 = OWNER_LOOKUP_UNREACHABLE (owner_lookup.OWNER_LOOKUP_UNREACHABLE_EXIT_CODE):
                   # the step's shared lookup budget is exhausted — retrying re-spends a dead budget.
@@ -2458,10 +2527,24 @@ jobs:
   # Abrupt cancellation can prevent GitHub from exposing job outputs or scheduling
   # cleanup despite always(). The independently scheduled backstop remains required;
   # this predicate does not make cancellation delivery or output retention reliable.
+      - name: Preserve signed consume custody even after failure
+        id: shared_custody
+        if: always() && inputs.shared-admission == true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: signed-consume-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/shared-admission/export/consume-custody.json
+          if-no-files-found: error
+          retention-days: 30
+
   teardown:
     name: Roll back failed or cancelled pool provisioning
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     needs: [pool]
-    if: always() && needs.pool.result != 'success'
+    if: always() && needs.pool.result != 'success' && inputs.shared-admission != true
     # ⛔ FULL PATH AT A PINNED SHA, NEVER `./`. A reusable workflow's job runs in the
     # CALLER's context, so a bare `./` resolves inside the CALLER's tree — where this
     # file does not exist. The job then cannot be created, the graph cannot be built,

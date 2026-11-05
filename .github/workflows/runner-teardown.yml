@@ -39,6 +39,26 @@ name: Akash runner teardown
 on:
   workflow_call:
     inputs:
+      shared-admission:
+        description: Default-off code-owned hosted Guardian admission; requires a separately registered bootstrap and caller cleanup contract.
+        type: boolean
+        required: false
+        default: false
+      shared-admission-operation-id:
+        description: Public operation locator; must equal owned-private-images-RUN_ID-RUN_ATTEMPT. Not a grant.
+        type: string
+        required: false
+        default: ''
+      shared-admission-artifact-id:
+        description: Exact same-run uploaded artifact ID, not a signed parent or grant.
+        type: string
+        required: false
+        default: ''
+      shared-admission-artifact-digest:
+        description: Exact upload-action SHA256 archive digest, not an extracted-file attestation.
+        type: string
+        required: false
+        default: ''
       just-akash-ref:
         description: >-
           REQUIRED, no default. The just-akash revision to close the lease WITH.
@@ -153,6 +173,9 @@ on:
       GH_RUNNER_PAT:
         required: false
     outputs:
+      shared-closed:
+        description: True only from the actual signed cleanup-service observation; UNKNOWN is not zero debt.
+        value: ${{ jobs.teardown.outputs.shared-closed }}
       closed:
         description: "'true' only when the lease was READ BACK as closed."
         value: ${{ jobs.teardown.outputs.closed }}
@@ -189,6 +212,10 @@ permissions:
 jobs:
   teardown:
     name: Close lease and de-register runners
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     runs-on: ubuntu-latest
     # ⛔ MUST EXCEED the owner-lookup deadline + close/audit margin (see
     # just_akash/owner_lookup.py: 10 + 4 = 14 min at the time of writing), pinned by
@@ -196,6 +223,7 @@ jobs:
     # timeout is the failure #370 exists to prevent.
     timeout-minutes: 30
     outputs:
+      shared-closed: ${{ steps.close.outputs.shared_closed }}
       closed: ${{ steps.close.outputs.closed }}
       held_reason: ${{ steps.close.outputs.held_reason }}
       held_dseq: ${{ steps.close.outputs.held_dseq }}
@@ -239,11 +267,43 @@ jobs:
           age-key: ${{ secrets.CREDENTIALS_AGE_KEY }}
           file: .akash-runner-credentials/secrets/akash-runner.sops.env
 
+      - name: Prepare private signed-consume extraction
+        if: inputs.shared-admission == true
+        env:
+          ARTIFACT_ID: ${{ inputs.shared-admission-artifact-id }}
+          ARTIFACT_DIGEST: ${{ inputs.shared-admission-artifact-digest }}
+          OPERATION_ID: ${{ inputs.shared-admission-operation-id }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          test "$REPOSITORY" = Borduas-Holdings/blazing
+          test "$EVENT" = workflow_dispatch
+          test "$OPERATION_ID" = "owned-private-images-${RUN_ID}-${RUN_ATTEMPT}"
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]{0,18}$ ]]
+          [[ "$ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          umask 077
+          install -d -m 700 "$RUNNER_TEMP/shared-admission/received"
+      - name: Download exact same-run signed consume DATA
+        if: inputs.shared-admission == true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.shared-admission-artifact-id }}
+          path: ${{ runner.temp }}/shared-admission/received
+          merge-multiple: true
       - name: Close the lease
         id: close
         env:
           AKASH_API_KEY: ${{ secrets.AKASH_API_KEY || env.AKASH_API_KEY }}
           AKASH_API_KEYS: ${{ secrets.AKASH_API_KEYS || env.AKASH_API_KEYS }}
+          SHARED_ADMISSION: ${{ inputs.shared-admission }}
+          SHARED_OPERATION_ID: ${{ inputs.shared-admission-operation-id }}
+          SHARED_ARTIFACT_ID: ${{ inputs.shared-admission-artifact-id }}
+          SHARED_ARTIFACT_DIGEST: sha256:${{ inputs.shared-admission-artifact-digest }}
+          HOSTED_CUSTODY_DIRECTORY: ${{ runner.temp }}/shared-admission/received
+          GITHUB_TOKEN: ${{ github.token }}
           DSEQ: ${{ inputs.dseq }}
           WALLET_ADDRESS: ${{ inputs.wallet-address }}
           DEPLOYMENT_GROUP: ${{ inputs.deployment-group }}
@@ -256,6 +316,20 @@ jobs:
           # An ARRAY: the command is multiple words, so a quoted string breaks it and an
           # unquoted one is SC2086.
           JA=(uv run --with . just-akash)
+          DESTROY_JA=("${JA[@]}")
+          case "${SHARED_ADMISSION:-false}" in
+            false|'') ;;
+            true)
+              # Root code-owned bootstrap must internally validate native artifact /
+              # exact attempt and signature before constructing cleanup registration.
+              DESTROY_JA=(uv run --with . python -m just_akash.hosted_cli_bootstrap)
+              if [ -z "$DSEQ" ] || [ -z "${WALLET_ADDRESS:-}" ]; then
+                echo "closed=unknown" >> "$GITHUB_OUTPUT"
+                echo "shared_closed=unknown" >> "$GITHUB_OUTPUT"; exit 78
+              fi
+              ;;
+            *) exit 78 ;;
+          esac
           # ⛔ ONE lookup budget for the WHOLE STEP (#378): every resolve-owner/destroy in
           # this step — including each retry — shares this absolute ceiling (epoch
           # seconds); just-akash honours it as min(own budget, ceiling).
@@ -475,7 +549,16 @@ jobs:
           for _try in 1 2 3; do
             DESTROY_TRIES=$_try
             DESTROY_RC=0
-            "${JA[@]}" destroy "${DESTROY_ARGS[@]}" 2>&1 | tee /tmp/destroy.log || DESTROY_RC=${PIPESTATUS[0]}
+            "${DESTROY_JA[@]}" destroy "${DESTROY_ARGS[@]}" 2>&1 | tee /tmp/destroy.log || DESTROY_RC=${PIPESTATUS[0]}
+            if [ "${SHARED_ADMISSION:-false}" = true ]; then
+              if [ "$DESTROY_RC" -ne 0 ]; then
+                echo "closed=unknown" >> "$GITHUB_OUTPUT"
+                echo "shared_closed=unknown" >> "$GITHUB_OUTPUT"; exit 78
+              fi
+              # Signature and identity checked on the actual service observation.
+              uv run --with . python -m just_akash.hosted_cli_custody assert-closed || exit 78
+              echo "shared_closed=true" >> "$GITHUB_OUTPUT"
+            fi
             # ⛔ 75 = OWNER_LOOKUP_UNREACHABLE (owner_lookup.OWNER_LOOKUP_UNREACHABLE_EXIT_CODE):
             # the step's shared lookup budget is exhausted — retrying re-spends a dead budget.
             [ "$DESTROY_RC" -eq 75 ] && break

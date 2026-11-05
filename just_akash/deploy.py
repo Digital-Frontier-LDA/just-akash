@@ -1669,6 +1669,10 @@ def deploy(
     _manifest_raw = deployment_response.get("manifest", "")
     manifest = _manifest_raw if isinstance(_manifest_raw, str) else ""
 
+    from .hosted_legacy_cli import capture_prepared_lease
+
+    capture_prepared_lease(client, prepared_receipt, dseq, sdl_content, _manifest_raw)
+
     _log(
         logging.INFO,
         f"Deployment created  DSEQ={display(dseq, 'dseq')}  manifest_len={len(manifest)}",
@@ -2569,6 +2573,7 @@ def deploy(
         _private_create_identity(new_dseq)
         _raw_manifest = redeploy_response.get("manifest", "")
         new_manifest = _raw_manifest if isinstance(_raw_manifest, str) else ""
+        capture_prepared_lease(client, prepared_receipt, new_dseq, sdl_content, _raw_manifest)
         _log(
             logging.INFO,
             f"  Re-deployed: new order DSEQ={display(new_dseq, 'dseq')} "

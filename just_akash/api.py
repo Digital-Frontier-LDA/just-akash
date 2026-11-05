@@ -24,6 +24,13 @@ from pathlib import Path
 from typing import Any
 
 from ._confidential import request_is_confidential, sanitize_exception, withheld_error
+from .atomic_lease_admission import (
+    AtomicAdmissionHeld,
+    LeaseAttempt,
+    LeaseWireUnknown,
+    UnknownKind,
+    prepare_lease_send,
+)
 
 logger = logging.getLogger("akash.api")
 
@@ -241,7 +248,14 @@ class AkashConsoleAPI:
         method: str,
         endpoint: str,
         data: dict[str, Any] | None = None,
+        *,
+        _lease_attempt: LeaseAttempt | None = None,
     ) -> Any:
+        if method.upper() == "POST" and endpoint == "/v1/leases":
+            if type(_lease_attempt) is not LeaseAttempt:
+                raise AtomicAdmissionHeld("atomic-admission-lease-boundary-required")
+        elif _lease_attempt is not None:
+            raise AtomicAdmissionHeld("atomic-admission-wire-mismatch")
         url = f"{self.base_url}{endpoint}"
         confidential = self._protect_runtime_payloads or request_is_confidential(data)
         if method.upper() == "GET":
@@ -269,6 +283,8 @@ class AkashConsoleAPI:
             method=method,
         )
 
+        if _lease_attempt is not None:
+            _lease_attempt.before_open(self, method, endpoint, request_body, api_source=__file__)
         try:
             t0 = datetime.now(timezone.utc)
             with self._open_request(req) as response:
@@ -283,6 +299,10 @@ class AkashConsoleAPI:
                         if not isinstance(result, (dict, list)):
                             result = {"raw": result}
                     except json.JSONDecodeError:
+                        if _lease_attempt is not None:
+                            raise LeaseWireUnknown(
+                                "atomic-lease-response-unparsed-no-retry"
+                            ) from None
                         result = {"raw": response_data}
                 else:
                     result = {}
@@ -290,9 +310,21 @@ class AkashConsoleAPI:
                     f"[{_ts()}] API {method} {log_endpoint} -> "
                     f"{response.status} ({elapsed_ms}ms) response_bytes={len(response_bytes)}"
                 )
+                if _lease_attempt is not None:
+                    _lease_attempt.capture_http(response.status)
                 return result
         except urllib.error.HTTPError as e:
-            error_body = e.read().decode("utf-8", errors="replace" if confidential else "strict")
+            if _lease_attempt is not None:
+                try:
+                    error_body = e.read().decode(
+                        "utf-8", errors="replace" if confidential else "strict"
+                    )
+                finally:
+                    e.close()
+            else:
+                error_body = e.read().decode(
+                    "utf-8", errors="replace" if confidential else "strict"
+                )
             elapsed_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
             logger.error(
                 f"[{_ts()}] API {method} {log_endpoint} -> HTTP {e.code} ({elapsed_ms}ms)"
@@ -809,21 +841,48 @@ class AkashConsoleAPI:
     def create_lease(
         self, dseq: str, provider: str, manifest: str, gseq: int = 1, oseq: int = 1
     ) -> dict[str, Any]:
-        response = self._request(
-            "POST",
-            "/v1/leases",
-            {
-                "manifest": manifest,
-                "leases": [
-                    {
-                        "dseq": str(dseq),
-                        "gseq": gseq,
-                        "oseq": oseq,
-                        "provider": provider,
-                    }
-                ],
-            },
+        attempt = prepare_lease_send(
+            self,
+            dseq=str(dseq),
+            provider=provider,
+            manifest=manifest,
+            gseq=gseq,
+            oseq=oseq,
         )
+        try:
+            response = self._request(
+                "POST",
+                "/v1/leases",
+                {
+                    "manifest": manifest,
+                    "leases": [
+                        {
+                            "dseq": str(dseq),
+                            "gseq": gseq,
+                            "oseq": oseq,
+                            "provider": provider,
+                        }
+                    ],
+                },
+                _lease_attempt=attempt,
+            )
+        except AkashAPIError as error:
+            # Actual received HTTP is observation, never no-land/settlement.
+            attempt.observed_http(error.status, effect_ambiguous=error.is_upstream_timeout())
+            raise
+        except BaseException as error:
+            if attempt.state == "PREPARED":
+                raise AtomicAdmissionHeld("atomic-admission-pre-wire-held") from None
+            cancelled = isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit))
+            attempt.unknown(
+                UnknownKind.CANCELLED if cancelled else UnknownKind.TRANSPORT_OR_RESPONSE
+            )
+            if cancelled:
+                if isinstance(error, SystemExit):
+                    raise SystemExit(error.code if type(error.code) is int else 1) from None
+                raise type(error)() from None
+            raise LeaseWireUnknown("atomic-lease-unknown-no-retry") from None
+        attempt.observed_http(attempt.http_status)
         if not isinstance(response, dict):
             return {}
         return response
