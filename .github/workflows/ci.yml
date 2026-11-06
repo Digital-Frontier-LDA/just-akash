@@ -488,6 +488,9 @@ jobs:
           # step-start 600s ceiling would go stale while the e2e runs. start + 30 min - 240s
           # of close/audit margin; tests/test_owner_lookup_deadline.py pins the literal.
           export OWNER_LOOKUP_STEP_DEADLINE_AT=$(( $(date +%s) + 30 * 60 - 240 ))
+          # Pin these CI proofs to owned suppliers after loading SOPS; clear its backup tier.
+          export AKASH_PROVIDERS='akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk,akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z,akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x'
+          export AKASH_PROVIDERS_BACKUP=''
           uv run python -m just_akash.test_shell_e2e
 
       - name: Preserve unresolved lease-shell deployment receipt
@@ -562,6 +565,9 @@ jobs:
           # step-start 600s ceiling would go stale while the e2e runs. start + 30 min - 240s
           # of close/audit margin; tests/test_owner_lookup_deadline.py pins the literal.
           export OWNER_LOOKUP_STEP_DEADLINE_AT=$(( $(date +%s) + 30 * 60 - 240 ))
+          # Pin these CI proofs to owned suppliers after loading SOPS; clear its backup tier.
+          export AKASH_PROVIDERS='akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk,akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z,akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x'
+          export AKASH_PROVIDERS_BACKUP=''
           uv run python -m just_akash.test_secrets_e2e
 
       - name: Preserve unresolved deployment receipt
