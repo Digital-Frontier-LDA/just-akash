@@ -77,8 +77,8 @@ Selection.
 - **stale deployment** ("already exists") → HOLD: nothing is closed and no second create is sent (just-akash#332). Close the one you no longer need (`just-akash list`, `just-akash destroy --dseq <DSEQ>`) and re-run.
 - **stale bid at lease time** ("no longer open") → re-fetch open bids, tier order, next cheapest.
 - **transient Console auth flap** ("JWT has invalid claims") → retry same provider after backoff.
-- **all bids stale / order gone (404)** → HOLD: this deploy closes its own order and creates no replacement (just-akash#332); re-run the deploy for one fresh order. The issue-#19 re-deploy round was removed.
-- **plain-create gate** → `JUST_AKASH_REQUIRE_AUTHORIZED_CREATE=1` refuses every plain create before any network I/O; unset or `0` allows it; any other value refuses. Every create site logs its `authorized-create gate:` state.
+- **all bids stale / stale bid with a failed bid re-fetch / lease retry budget spent / order gone (404)** → HOLD (the hold names which): this deploy closes its own order and creates no replacement (just-akash#332); re-run the deploy for one fresh order. The issue-#19 re-deploy round was removed.
+- **plain-create gate** → `JUST_AKASH_REQUIRE_AUTHORIZED_CREATE=1` refuses every plain create before any network I/O; unset or `0` allows it; any other value refuses. `deploy` and the capacity/bid probes each log their `authorized-create gate:` state; the `AkashConsoleAPI.create_deployment` backstop refuses without logging, because those sites have logged before they reach it.
 
 ## Transport abstraction (`transport/`)
 
