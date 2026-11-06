@@ -876,7 +876,16 @@ def run_probe(
     On a credit error every REMAINING pair is recorded as skipped rather than
     omitted, so a dry grant is visible immediately instead of looking like a
     run that never happened.
+
+    just-akash#332: an opted-in consumer refuses the whole run here, before any
+    client call (the account lookup below already reaches the Console). The
+    refusal propagates: a refused run is not a run whose pairs all failed, so it
+    writes no records rather than one probe-error per pair.
     """
+    from .create_gate import require_plain_create_allowed
+
+    require_plain_create_allowed("bid_probe")
+
     pairs = eligible_pairs(providers)
     records: list[ProbeRecord] = []
     credit_exhausted_note = ""

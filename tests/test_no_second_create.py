@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from just_akash import capacity
+from just_akash import bid_probe, capacity
 from just_akash import deploy as deploy_module
 from just_akash.api import AkashConsoleAPI, CIConsoleAPI
 from just_akash.create_gate import GATE_ENV, PlainCreateRefused, require_plain_create_allowed
@@ -357,6 +357,75 @@ def test_capacity_probe_gate_off_still_creates_and_closes(monkeypatch, capsys, v
     client.close_deployment.assert_called_once_with("333")
     lines = _gate_lines(capsys.readouterr().out)
     assert len(lines) == 1 and "gate: off" in lines[0], lines
+
+
+# --- site 5: the bid probe -----------------------------------------------------------
+# One check at the top of run_probe, before the run's account lookup (which already
+# reaches the Console). A refusal propagates: it is never spread into per-pair
+# probe-error records.
+
+
+@pytest.mark.parametrize("value", ["1", *INVALID_VALUES])
+def test_bid_probe_gate_on_refuses_the_run_before_any_client_call(
+    monkeypatch, no_network, capsys, value
+):
+    monkeypatch.setenv(GATE_ENV, value)
+    client = MagicMock(name="client")
+    assert len(bid_probe.eligible_pairs(bid_probe.PROVIDERS)) > 0
+    with pytest.raises(PlainCreateRefused):
+        bid_probe.run_probe(client, providers=bid_probe.PROVIDERS, sleep=lambda _s: None)
+    assert client.mock_calls == [], "a refused run touched the client (account lookup?)"
+    assert no_network == []
+    lines = _gate_lines(capsys.readouterr().out)
+    assert len(lines) == 1 and "gate: on" in lines[0] and "at bid_probe" in lines[0], lines
+
+
+def test_bid_probe_cli_refusal_propagates_and_writes_no_records(
+    monkeypatch, tmp_path, no_network, capsys
+):
+    monkeypatch.setenv(GATE_ENV, "1")
+    monkeypatch.setenv("AKASH_API_KEY", "test-key")
+    factory = MagicMock(name="AkashConsoleAPI")
+    monkeypatch.setattr("just_akash.api.AkashConsoleAPI", factory)
+    jsonl = tmp_path / "records.jsonl"
+    prom = tmp_path / "bid.prom"
+    with pytest.raises(PlainCreateRefused):
+        bid_probe.main(["--jsonl-out", str(jsonl), "--prom-out", str(prom), "--retry-delay", "0"])
+    assert factory.return_value.mock_calls == []
+    assert not jsonl.exists() and not prom.exists(), "a refused run wrote records"
+    assert no_network == []
+    out = capsys.readouterr().out
+    assert "probe-error" not in out
+
+
+@pytest.mark.parametrize("value", [None, "0"])
+def test_bid_probe_gate_off_still_looks_up_the_owner_and_creates(monkeypatch, capsys, value):
+    if value is None:
+        monkeypatch.delenv(GATE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(GATE_ENV, value)
+    target, scenario = bid_probe.eligible_pairs(bid_probe.PROVIDERS)[0]
+    one = bid_probe.ProviderTarget(
+        target.cluster, target.wallet, frozenset({scenario.name}), target.attributes
+    )
+    client = MagicMock(name="client")
+    client.account_address.return_value = "akash1me"
+    client.create_deployment.return_value = {"dseq": "555", "manifest": "[]", "signTx": {}}
+    client.get_bids.return_value = [
+        {
+            "id": {"provider": target.wallet},
+            "price": {"denom": "uact", "amount": "1"},
+            "state": "open",
+        }
+    ]
+    recs = bid_probe.run_probe(client, providers=[one], sleep=lambda _s: None, wait_s=0)
+    assert len(recs) == 1 and recs[0].outcome == bid_probe.OUTCOME_BID
+    client.account_address.assert_called_once_with()
+    assert client.create_deployment.call_count == 1
+    client.close_deployment.assert_called_once_with("555")
+    lines = _gate_lines(capsys.readouterr().out)
+    assert len(lines) == 2 and all("gate: off" in line for line in lines), lines
+    assert "at bid_probe" in lines[0] and "at capacity_probe" in lines[1], lines
 
 
 # --- backstop: the base client's own create ------------------------------------------
