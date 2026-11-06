@@ -76,7 +76,7 @@ jobs:
 
       # Cleanup (robust_destroy) shells out to `just destroy` / `just list`.
       - name: Install just
-        uses: taiki-e/install-action@26e9283f268b880168bdbd2c545dfcd60ec2c6ab # v2.87.13
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: just
 
