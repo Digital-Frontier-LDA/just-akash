@@ -56,7 +56,7 @@ def _http(monkeypatch, body, status=400):
             "https://console.invalid", status, ECHO_CANARY, Message(), io.BytesIO(body)
         )
 
-    monkeypatch.setattr("urllib.request.urlopen", fail)
+    monkeypatch.setattr("just_akash.api._console_open", fail)
 
 
 def _visible(error, caplog, capsys):
@@ -184,7 +184,7 @@ def test_private_socket_failures_keep_type_and_hide_remote_echo(
     def fail(*_args, **_kwargs):
         raise failure
 
-    monkeypatch.setattr("urllib.request.urlopen", fail)
+    monkeypatch.setattr("just_akash.api._console_open", fail)
     with pytest.raises(expected) as caught:
         AkashConsoleAPI("fake-console-key").create_deployment(PRIVATE)
     assert not isinstance(caught.value, AkashAPIError)
@@ -210,7 +210,7 @@ def test_successful_private_request_preserves_wire_and_result_not_debug_echo(mon
         seen.append((json.loads(request.data), kwargs))
         return response
 
-    monkeypatch.setattr("urllib.request.urlopen", send)
+    monkeypatch.setattr("just_akash.api._console_open", send)
     result = AkashConsoleAPI("fake-console-key").create_deployment(PRIVATE)
     assert result["manifest"] == PRIVATE  # Needed unchanged for the lease request.
     assert seen[0][0]["data"]["sdl"] == PRIVATE
@@ -654,7 +654,7 @@ def test_private_followup_endpoint_echo_is_hidden_without_rewriting_wire(
             "url", 400, ECHO_CANARY, Message(), io.BytesIO(ECHO_CANARY.encode())
         )
 
-    monkeypatch.setattr("urllib.request.urlopen", fail)
+    monkeypatch.setattr("just_akash.api._console_open", fail)
 
     @sdl_operation
     def read(sdl_path):

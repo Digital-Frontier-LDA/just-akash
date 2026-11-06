@@ -143,6 +143,8 @@ def start(monkeypatch, tmp_path) -> Harness:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("AKASH_API_KEY", "test-key")
     monkeypatch.setenv("AKASH_CONSOLE_URL", console.base_url)
+    # the fake console is loopback http: a test-only opt-in (just-akash-ra3)
+    monkeypatch.setattr("just_akash.api._ALLOW_LOOPBACK_CONSOLE_FOR_TESTS", True)
     monkeypatch.setenv("FLYNN_API_URL", flynn.base_url)
     monkeypatch.setenv("FLYNN_INTERNAL_API_KEY", "fake-internal-key")
     # The issue-#19 re-deploy round's fast-poll: no courtesy wait, tight interval.

@@ -161,7 +161,7 @@ def console(monkeypatch):
             raise result
         return _Response(result)
 
-    monkeypatch.setattr(api.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(api, "_console_open", urlopen)
     return state
 
 
@@ -226,7 +226,7 @@ def test_an_abandoned_late_answer_is_discarded(console, monkeypatch) -> None:
             return _Response(_jwt(OWNER))
         return _Response(_jwt(OTHER))
 
-    monkeypatch.setattr(api.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(api, "_console_open", urlopen)
     started = time.monotonic()
     with pytest.raises(OwnerLookupUnresolved) as excinfo:
         wallet_pool._raw_client_for_bound_owner(DSEQ, OWNER, "g")
@@ -249,7 +249,7 @@ def test_a_dseq_read_stall_ends_typed_with_attempts(console, monkeypatch) -> Non
         threading.Event().wait(30)  # Event, not time.sleep — abandoned workers linger
         raise AssertionError("unreachable: the join must abandon first")
 
-    monkeypatch.setattr(api.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(api, "_console_open", urlopen)
     started = time.monotonic()
     with pytest.raises(OwnerLookupUnresolved) as excinfo:
         wallet_pool.select_client_for_dseq(DSEQ)
@@ -337,7 +337,7 @@ def test_no_console_call_starts_after_the_deadline(console, monkeypatch) -> None
         raise urllib.error.URLError(ConnectionResetError(54, "Connection reset by peer"))
 
     monkeypatch.setattr(owner_lookup, "bounded_call", recording_bounded_call)
-    monkeypatch.setattr(api.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(api, "_console_open", urlopen)
     with pytest.raises(OwnerLookupUnresolved):
         wallet_pool._raw_client_for_bound_owner(DSEQ, OWNER, "g")
     assert starts, "no Console call was made — the test measured nothing"

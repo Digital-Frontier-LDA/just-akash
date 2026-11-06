@@ -271,7 +271,7 @@ class TestAkashConsoleAPI:
         assert client.base_url == "https://console-api.akash.network"
         assert client.headers["x-api-key"] == key
 
-    @patch("just_akash.api.urllib.request.urlopen")
+    @patch("just_akash.api._console_open")
     def test_request_success(self, mock_urlopen):
         mock_resp = MagicMock()
         mock_resp.read.return_value = b'{"data": {"result": "ok"}}'
@@ -284,7 +284,7 @@ class TestAkashConsoleAPI:
         result = client._request("GET", "/v1/test")
         assert result == {"data": {"result": "ok"}}
 
-    @patch("just_akash.api.urllib.request.urlopen")
+    @patch("just_akash.api._console_open")
     def test_request_empty_response(self, mock_urlopen):
         mock_resp = MagicMock()
         mock_resp.read.return_value = b""
@@ -297,7 +297,7 @@ class TestAkashConsoleAPI:
         result = client._request("GET", "/v1/test")
         assert result == {}
 
-    @patch("just_akash.api.urllib.request.urlopen")
+    @patch("just_akash.api._console_open")
     def test_request_http_error_json_body(self, mock_urlopen):
         import urllib.error
 
@@ -315,7 +315,7 @@ class TestAkashConsoleAPI:
         with pytest.raises(RuntimeError, match="API Error \\(400\\)"):
             client._request("POST", "/v1/deployments", {"data": {}})
 
-    @patch("just_akash.api.urllib.request.urlopen")
+    @patch("just_akash.api._console_open")
     def test_request_http_error_non_json_body(self, mock_urlopen):
         import urllib.error
 
@@ -333,7 +333,7 @@ class TestAkashConsoleAPI:
         with pytest.raises(RuntimeError, match="API Error \\(500\\)"):
             client._request("GET", "/v1/test")
 
-    @patch("just_akash.api.urllib.request.urlopen")
+    @patch("just_akash.api._console_open")
     def test_request_url_error(self, mock_urlopen):
         import urllib.error
 

@@ -345,7 +345,7 @@ services:
 class TestApiRequestNonJsonResponse:
     """FIXED: _request handles non-JSON response body gracefully."""
 
-    @patch("just_akash.api.urllib.request.urlopen")
+    @patch("just_akash.api._console_open")
     def test_request_returns_non_json(self, mock_urlopen):
         mock_resp = MagicMock()
         mock_resp.read.return_value = b"not json at all"
@@ -359,7 +359,7 @@ class TestApiRequestNonJsonResponse:
         assert "raw" in result
         assert result["raw"] == "not json at all"
 
-    @patch("just_akash.api.urllib.request.urlopen")
+    @patch("just_akash.api._console_open")
     def test_request_returns_none_body(self, mock_urlopen):
         mock_resp = MagicMock()
         mock_resp.read.return_value = b""
@@ -1217,7 +1217,7 @@ class TestCreateCloseDeploymentListResponse:
     """BUG: create_deployment / close_deployment crash with AttributeError
     when _request returns a JSON array (not a dict)."""
 
-    @patch("just_akash.api.urllib.request.urlopen")
+    @patch("just_akash.api._console_open")
     def test_create_deployment_returns_list(self, mock_urlopen):
         mock_resp = MagicMock()
         mock_resp.read.return_value = b'[{"dseq": "12345"}]'
@@ -1230,7 +1230,7 @@ class TestCreateCloseDeploymentListResponse:
         result = client.create_deployment("sdl")
         assert isinstance(result, dict)
 
-    @patch("just_akash.api.urllib.request.urlopen")
+    @patch("just_akash.api._console_open")
     def test_close_deployment_returns_list(self, mock_urlopen):
         mock_resp = MagicMock()
         mock_resp.read.return_value = b'[{"closed": true}]'
@@ -1289,7 +1289,7 @@ class TestRequestReturnsNull:
     """BUG: _request returns None when API returns JSON null.
     All callers crash on None.get()."""
 
-    @patch("just_akash.api.urllib.request.urlopen")
+    @patch("just_akash.api._console_open")
     def test_json_null_response(self, mock_urlopen):
         mock_resp = MagicMock()
         mock_resp.read.return_value = b"null"
@@ -1302,7 +1302,7 @@ class TestRequestReturnsNull:
         result = client._request("GET", "/v1/test")
         assert isinstance(result, dict)
 
-    @patch("just_akash.api.urllib.request.urlopen")
+    @patch("just_akash.api._console_open")
     def test_json_true_response(self, mock_urlopen):
         mock_resp = MagicMock()
         mock_resp.read.return_value = b"true"
@@ -1488,7 +1488,7 @@ class TestCreateLeaseReturnsNonDict:
     """BUG: create_lease returns raw non-dict (list/null) from _request
     with no isinstance guard. Callers expect dict."""
 
-    @patch("just_akash.api.urllib.request.urlopen")
+    @patch("just_akash.api._console_open")
     def test_returns_null(self, mock_urlopen):
         mock_resp = MagicMock()
         mock_resp.read.return_value = b"null"
@@ -1501,7 +1501,7 @@ class TestCreateLeaseReturnsNonDict:
         result = client.create_lease("12345", "akash1prov", "manifest")
         assert isinstance(result, dict)
 
-    @patch("just_akash.api.urllib.request.urlopen")
+    @patch("just_akash.api._console_open")
     def test_returns_list(self, mock_urlopen):
         mock_resp = MagicMock()
         mock_resp.read.return_value = b'[{"lease": "data"}]'
@@ -2809,7 +2809,7 @@ class TestMalformedSdlFiles:
 class TestHttpTimeoutAndRetries:
     """Test HTTP timeout and retry behavior."""
 
-    @patch("just_akash.api.urllib.request.urlopen")
+    @patch("just_akash.api._console_open")
     def test_http_timeout_handling(self, mock_urlopen):
         import urllib.error
 
@@ -2819,7 +2819,7 @@ class TestHttpTimeoutAndRetries:
         with pytest.raises(RuntimeError):
             client._request("GET", "/v1/test")
 
-    @patch("just_akash.api.urllib.request.urlopen")
+    @patch("just_akash.api._console_open")
     def test_http_5xx_errors(self, mock_urlopen):
         mock_resp = MagicMock()
         mock_resp.status = 500
@@ -3430,7 +3430,7 @@ services:
 class TestE2eNetworkEdgeCases:
     """E2E-style tests for network-related edge cases."""
 
-    @patch("just_akash.api.urllib.request.urlopen")
+    @patch("just_akash.api._console_open")
     def test_network_timeout_during_deployment_creation(self, mock_urlopen):
         """Test handling of network timeouts during critical operations."""
         import urllib.error
@@ -3457,7 +3457,7 @@ class TestE2eNetworkEdgeCases:
         with pytest.raises(RuntimeError):
             client.get_bids("12345")
 
-    @patch("just_akash.api.urllib.request.urlopen")
+    @patch("just_akash.api._console_open")
     def test_ssl_certificate_validation_bypass(self, mock_urlopen):
         """Test that SSL certificates are properly validated (or not bypassed)."""
         # This is more of a configuration test
