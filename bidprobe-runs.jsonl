@@ -671,3 +671,4 @@
 {"run_id":"42215602697","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-11-06T12:10:17Z","attempt":"1","accrued_at":"2026-11-06T12:16:40Z","published":true}
 {"run_id":"42239928018","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-11-06T15:06:31Z","attempt":"1","accrued_at":"2026-11-06T15:52:46Z","published":false}
 {"run_id":"42268163550","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-11-06T18:09:51Z","attempt":"1","accrued_at":"2026-11-06T18:56:03Z","published":false}
+{"run_id":"42293793436","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-11-06T21:05:25Z","attempt":"1","accrued_at":"2026-11-06T21:51:32Z","published":false}
