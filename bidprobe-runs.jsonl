@@ -676,3 +676,4 @@
 {"run_id":"42332496911","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-11-07T03:07:20Z","attempt":"1","accrued_at":"2026-11-07T03:53:25Z","published":false}
 {"run_id":"42345775747","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-11-07T06:10:02Z","attempt":"1","accrued_at":"2026-11-07T06:56:02Z","published":false}
 {"run_id":"42358336550","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-11-07T09:07:04Z","attempt":"1","accrued_at":"2026-11-07T09:53:15Z","published":false}
+{"run_id":"42364516525","event":"workflow_dispatch","schedule":"","started_at":"2026-11-07T10:34:24Z","attempt":"1","accrued_at":"2026-11-07T10:37:23Z","published":false}
