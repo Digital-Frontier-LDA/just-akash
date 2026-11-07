@@ -92,24 +92,10 @@
   },
   {
     "callee": "close_deployment",
-    "count": 1,
-    "kind": "python",
-    "path": "just_akash/deploy.py",
-    "scope": "_close_stale_for_retry"
-  },
-  {
-    "callee": "close_deployment",
     "count": 7,
     "kind": "python",
     "path": "just_akash/deploy.py",
     "scope": "deploy"
-  },
-  {
-    "callee": "close_deployment",
-    "count": 2,
-    "kind": "python",
-    "path": "just_akash/deploy.py",
-    "scope": "deploy._redeploy_and_reselect"
   },
   {
     "callee": "destroy",

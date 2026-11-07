@@ -47,11 +47,18 @@ from .api import (
     AkashAPIError,
     AkashConsoleAPI,
     _extract_bid_price,
-    _extract_dseq,
     _extract_gseq,
     _extract_provider,
 )
 from .charter import Charter
+from .create_gate import (
+    ALREADY_EXISTS_HOLD,
+    PRIVATE_DSEQ,
+    STALE_ORDER_CLOSE_FAILED_HOLD,
+    STALE_ORDER_HOLD,
+    STALE_ORDER_REASONS,
+    require_plain_create_allowed,
+)
 from .deployment_receipt import (
     credential_binding_for,
     mark_create_response_received,
@@ -73,12 +80,12 @@ from .provenance import (
 from .provider_capacity import capacity_by_provider
 from .request_profile import attach_profile, derive_resource_profiles, observed_gseq
 from .sdl_validate import SDLValidationError, validate_sdl
-from .smoke_providers import _probe_age_seconds
 
 logger = logging.getLogger("akash.deploy")
 
-# One per PROCESS, not per call: a single `deploy` run may create an order, fail, and
-# re-create (the issue-#19 re-deploy round), and both are the same run's residue. Hex so
+
+# One per PROCESS, not per call: a single `deploy` run creates at most one order; the id
+# also tags that order's on-chain residue for orphan attribution. Hex so
 # it survives `_KEY_RE`'s charset and reads back through provenance.run_id_of.
 _RUN_ID = uuid.uuid4().hex[:12]
 
@@ -208,151 +215,6 @@ def _close_proven_orphan(client, dseq: str, key: str) -> bool:
         closed=True,
     )
     return True
-
-
-# ── stale-deployment recovery: guards, each covering what the others cannot ──
-#
-# ⛔ THE RECOVERY CLOSED ON ONE SIGNAL, FROM A LISTING THAT CANNOT SCOPE.
-# It called `client.list_deployments(active_only=True)` and closed EVERY
-# lease-less row. Three things were wrong at once, and this file already
-# documents every one of them for a NEIGHBOURING function:
-#
-#   * `list_deployments` does not scope by API key. cleanup_stale.py:391 records
-#     the measurement — three DISTINCT keys for three DISTINCT accounts returned
-#     byte-identical bodies, and the same key returned 44/27/0 minutes apart.
-#     `_report_suspected_orphans` tolerates that because it only NAMES; a path
-#     that CLOSES cannot.
-#   * No provenance. The shared wallet hosts other repos — a live read found six
-#     `dfci-infra-runner` among eleven active.
-#   * No age floor. `_report_suspected_orphans` says it outright: a concurrent
-#     run of THIS repo "is also leaseless mid-create, and lands in the same
-#     window". That is the collision ci.yml:150-155 attributes to this very
-#     function, and ci.yml's per-ref concurrency key does not prevent it across
-#     two PRs.
-#
-# The path that merely NAMES strangers was guarded with three signals; the path
-# that DESTROYS them had one. These guards are deliberately independent, so the
-# recovery is safe on its own merits rather than because a mutex happens to hold
-# (just-akash#267): a wider mutex would serialise the fleet's CI and still leave
-# a cross-ACCOUNT close reachable.
-STALE_RETRY_MIN_AGE_SECONDS = 15 * 60
-STALE_RETRY_MAX_CLOSE = 5
-
-
-def _close_stale_for_retry(client, *, now: float | None = None) -> list[str]:
-    """Close OUR OWN abandoned, lease-less deployments so a create can retry.
-
-    Returns the dseqs closed. Never raises: this runs on an error path and must
-    not replace the caller's real failure with its own.
-
-    ⚠ IT FAILS TOWARDS NOT CLOSING. A leftover younger than the age floor is
-    left alone and the retry may fail — a recoverable outcome. Destroying a
-    concurrent run's in-flight deployment is not recoverable, and that is the
-    one this function used to produce.
-    """
-
-    now = time.time() if now is None else now
-    try:
-        owner = client.account_address()
-    except Exception as exc:  # noqa: BLE001 — never mask the caller's error
-        _log(
-            logging.WARNING,
-            f"Stale recovery: could not resolve the account ({error_text(exc)}) — skipped",
-        )
-        return []
-
-    # GUARD 1 — enumerate from the CHAIN, owner-scoped and authoritative.
-    # ⛔ None IS NOT []. "Could not ask the chain" must never be swept as "holds
-    # nothing": that collapse is how a broken enumeration reads as a clean account.
-    # ⛔ TWO FAILURE MODES, NOT ONE. An earlier cut handled only the one that
-    # RETURNS — `None`, "could not ask the chain" — and left the one that RAISES
-    # bare. `list_active_deployments` calls `rest_urls()` outside any try, and
-    # `rest_url()` raises RuntimeError on a bad or empty AKASH_REST_URL. It was
-    # the ONLY unwrapped external call of five, in a function whose docstring
-    # promises it never raises.
-    #
-    # ⚠ SEVERITY, STATED ACCURATELY. The single current caller ALSO wraps this
-    # function in `except Exception`, so a raise did NOT reach the operator in
-    # place of the create failure — it was logged as "Stale deployment cleanup
-    # failed" and the retry proceeded. The defect was that this function was safe
-    # only because something downstream covered it, while its own docstring
-    # claimed the guarantee. A contract that holds by luck is one refactor from
-    # not holding, and the next caller inherits a promise that was never true.
-    try:
-        active = chain.list_active_deployments(owner)
-    except Exception as exc:  # noqa: BLE001 — never mask the caller's error
-        _log(
-            logging.WARNING,
-            f"Stale recovery: chain enumeration raised ({error_text(exc)}) — skipped",
-        )
-        return []
-    if active is None:
-        _log(logging.WARNING, "Stale recovery: chain enumeration failed — closing nothing")
-        return []
-
-    candidates: list[tuple[float, str]] = []
-    for dep in active:
-        dseq = _extract_dseq(dep)
-        if not dseq:
-            continue
-        age = _probe_age_seconds(dseq, now)
-        # GUARD 2 — age floor. An unreadable age is NOT old enough: unknown must
-        # never be read as safe to destroy.
-        if age is None or age < STALE_RETRY_MIN_AGE_SECONDS:
-            continue
-        # GUARD 3 — no lease. A deployment holding a lease is somebody's live
-        # workload. Per-DSEQ Console reads are unaffected by the listing defect.
-        try:
-            detail = client.get_deployment(str(dseq))
-        except Exception as exc:  # noqa: BLE001 — unreadable is not closable
-            # DEBUG, matching _report_suspected_orphans: a skipped dseq must not
-            # appear in human-facing output, but a silent skip is untraceable.
-            _log(
-                logging.DEBUG,
-                f"  stale recovery: {display(dseq, 'dseq')} "
-                f"unreadable ({error_text(exc)}) — left alone",
-            )
-            continue
-        if (detail or {}).get("leases") or (detail or {}).get("lease"):
-            continue
-        # GUARD 4 — provenance, read from chain. Repo-level is enough HERE only
-        # because the age floor has already excluded our own concurrent runs;
-        # on its own it is not, and _report_suspected_orphans says so.
-        try:
-            names = chain.deployment_group_names(owner, str(dseq))
-        except Exception as exc:  # noqa: BLE001 — unreadable provenance is unproven
-            _log(
-                logging.DEBUG,
-                f"  stale recovery: {display(dseq, 'dseq')} "
-                f"provenance unreadable ({error_text(exc)})",
-            )
-            continue
-        if not any(n.startswith(PLACEMENT_PREFIX) for n in names):
-            continue
-        candidates.append((age, str(dseq)))
-
-    # GUARD 5 — cap, oldest first. Needing to close more than a handful to
-    # unblock ONE create means something else is wrong and wants looking at,
-    # not bulldozing.
-    candidates.sort(reverse=True)
-    closed: list[str] = []
-    for _age, dseq in candidates[:STALE_RETRY_MAX_CLOSE]:
-        try:
-            client.close_deployment(dseq)
-            closed.append(dseq)
-            _log(logging.INFO, f"Closed stale deployment {display(dseq, 'dseq')}")
-        except Exception as exc:  # noqa: BLE001 — keep going; report at the end
-            _log(
-                logging.WARNING,
-                f"Could not close stale deployment {display(dseq, 'dseq')}: {error_text(exc)}",
-            )
-    if len(candidates) > STALE_RETRY_MAX_CLOSE:
-        _log(
-            logging.WARNING,
-            f"Stale recovery: {len(candidates)} eligible, closed the "
-            f"{len(closed)} oldest (cap {STALE_RETRY_MAX_CLOSE}).",
-        )
-    return closed
 
 
 def _report_suspected_orphans(client, since_epoch_s: float, run_id: str = "") -> list[str]:
@@ -551,30 +413,6 @@ def _backup_fallback_grace_s() -> int:
         return int(os.environ.get("JUST_AKASH_BACKUP_FALLBACK_S", "240"))
     except ValueError:
         return 240
-
-
-def _redeploy_poll_window() -> tuple[float, float, float]:
-    """Fast-poll window for the issue-#19 re-deploy round: (total_wait,
-    backup_courtesy, poll_interval) in seconds.
-
-    Intentionally short — the phased patience of the normal selection path is
-    exactly what aged the first round's bid past its ~5-min expiry, so the
-    re-created order is leased aggressively (preferred wins instantly; backup
-    only after the courtesy window). Override via JUST_AKASH_REDEPLOY_WAIT_S,
-    JUST_AKASH_REDEPLOY_BACKUP_COURTESY_S, and JUST_AKASH_REDEPLOY_POLL_INTERVAL_S.
-    """
-
-    def _f(name: str, default: str) -> float:
-        try:
-            return float(os.environ.get(name, default))
-        except ValueError:
-            return float(default)
-
-    return (
-        _f("JUST_AKASH_REDEPLOY_WAIT_S", "75"),
-        _f("JUST_AKASH_REDEPLOY_BACKUP_COURTESY_S", "20"),
-        _f("JUST_AKASH_REDEPLOY_POLL_INTERVAL_S", "5"),
-    )
 
 
 def _is_open_bid(b) -> bool:
@@ -1318,6 +1156,9 @@ def deploy(
         raise RuntimeError(
             "deployment receipt arguments are all-or-none: receipt_path and receipt_operation_id"
         )
+    # just-akash#332: an opted-in consumer refuses every plain create, and it must refuse
+    # BEFORE any network I/O (wallet probes, credit checks, SDL reads that hit providers).
+    require_plain_create_allowed("deploy")
     fallback_wait = bid_wait_retry - bid_wait
     # ⛔ VALIDATE BEFORE YOU SPEND. This raises on a bad --select, and it must raise HERE:
     #   resolving it next to its use (just before the auction) put it AFTER
@@ -1538,43 +1379,20 @@ def deploy(
         deployment_response = client.create_deployment(sdl_content, deposit=create_deposit)
     except RuntimeError as e:
         if "already exists" in error_text(e).lower():
+            # ⛔ HOLD, NEVER A SECOND CREATE (just-akash#332). The response proves neither
+            # which create committed nor which older deployment may be closed; the account
+            # may serve other runs and purposes. This used to sweep "stale" deployments and
+            # POST again, an unbound second create that the creation-transaction standard
+            # forbids. Nothing is closed and nothing is re-sent here.
             if prepared_receipt is not None:
-                # Receipt-mode CI shares its wallet with other runs and purposes.
-                # This response proves neither which create committed nor which
-                # older deployment may be closed. Preserve the submitting receipt
-                # for exact reconciliation; do not sweep or send a second create.
+                # Receipt mode: preserve the submitting receipt for exact reconciliation.
                 raise RuntimeError(
                     "Receipt-bound create already exists; reconcile the recorded "
                     "operation before retrying"
                 ) from e
-            _log(
-                logging.WARNING,
-                "Deployment already exists — closing stale deployments and retrying...",
-            )
-            try:
-                # Aged against the moment the create was ATTEMPTED, not a fresh
-                # clock read. If the recovery runs long after, deployments then
-                # compare as YOUNGER and fewer qualify — the conservative
-                # direction for a function whose next act is to close things.
-                _close_stale_for_retry(client, now=_create_started)
-            except Exception as cleanup_err:  # noqa: BLE001 — documented as never raising
-                _log(logging.ERROR, f"Stale deployment cleanup failed: {error_text(cleanup_err)}")
-            # Retry once after cleanup
-            try:
-                deployment_response = client.create_deployment(sdl_content, deposit=create_deposit)
-            except RuntimeError as retry_err:
-                _log(
-                    logging.ERROR, f"Create deployment FAILED after retry: {error_text(retry_err)}"
-                )
-                emit(
-                    Code.DEPLOY_CREATE_FAILED,
-                    "error",
-                    f"create deployment failed after retry: {error_text(retry_err)}",
-                )
-                _report_suspected_orphans(client, _create_started, _RUN_ID)
-                raise RuntimeError(
-                    f"Failed to create deployment after retry: {error_text(retry_err)}"
-                ) from retry_err
+            _log(logging.ERROR, ALREADY_EXISTS_HOLD)
+            emit(Code.DEPLOY_CREATE_FAILED, "error", ALREADY_EXISTS_HOLD)
+            raise RuntimeError(ALREADY_EXISTS_HOLD) from e
         else:
             # ⛔ NAME AN UPSTREAM TIMEOUT AS UPSTREAM. A Cloudflare 524 is the proxy
             # giving up on Akash's origin; it says nothing about the change under
@@ -2411,230 +2229,13 @@ def deploy(
                 return choice
         return None
 
-    def _poll_fresh_bid(
-        order_dseq: str,
-        wait_s: float,
-        courtesy_s: float,
-        interval_s: float,
-        deprioritize: frozenset[str] = frozenset(),
-    ):
-        """Poll a freshly re-created order for the cheapest OPEN bid, tier-first.
-
-        Preferred (or ACCEPTED when no allowlist) wins immediately; BACKUP is
-        accepted only after ``courtesy_s``. Returns the bid dict, or None if
-        nothing eligible appears within ``wait_s``. Reuses ``_filter_tier`` so
-        only open bids are ever considered.
-
-        ``deprioritize`` holds providers that already failed to lease THIS
-        workload (issue #84). They are soft-skipped, never banned: without it
-        the re-created order deterministically re-picks the cheapest bid, so
-        when the provider that just failed is also the cheapest, the single
-        bounded re-deploy round is guaranteed to reproduce the failure. A hard
-        exclusion would over-correct — with n=2 we cannot prove the provider is
-        at fault (versus Console-side order GC/propagation), and the allowlisted
-        market is thin — so a de-prioritised provider is still leased if nothing
-        else bids, after the same ``courtesy_s`` head start BACKUP already gets.
-
-        Preference order: fresh preferred > fresh backup > failed preferred >
-        failed backup. A provider that has NOT just failed always wins, tier
-        order intact.
-        """
-        first_tier = "PREFERRED" if has_allowlist else "ACCEPTED"
-        start = time.time()
-        # Last NON-EMPTY pool seen per tier, kept so the soft skip stays soft
-        # even if the courtesy window never opens (see the return below). Held
-        # per tier so the fallback stays tier-first, and only overwritten when
-        # non-empty so a transient get_bids() failure late in the loop cannot
-        # erase the evidence and re-create the ban it exists to prevent.
-        last_first: list = []
-        last_backup: list = []
-        while True:
-            elapsed = time.time() - start
-            if elapsed >= wait_s:
-                break
-            try:
-                current = client.get_bids(str(order_dseq))
-            except RuntimeError:
-                current = []
-            first_pool = _filter_tier(current, first_tier)
-            backup_pool = _filter_tier(current, "BACKUP") if has_allowlist else []
-            choice = _cheapest_bid(first_pool, deprioritize)
-            if choice is None and elapsed >= courtesy_s:
-                choice = (
-                    _cheapest_bid(backup_pool, deprioritize)
-                    # Only de-prioritised bids are on offer: the courtesy window
-                    # gave a different provider its chance and none came, so take
-                    # one rather than fail the deploy outright.
-                    or _cheapest_bid(first_pool)
-                    or _cheapest_bid(backup_pool)
-                )
-            if choice is not None:
-                return choice
-            if first_pool:
-                last_first = first_pool
-            if backup_pool:
-                last_backup = backup_pool
-            time.sleep(interval_s)
-        # The wait expired without the courtesy window ever opening — reachable
-        # only when courtesy_s was configured >= wait_s, which would otherwise
-        # turn the soft skip into a silent hard ban (and make the "still
-        # leasable if nothing else bids" log a lie). De-prioritisation is never
-        # a ban, so honour a de-prioritised bid here rather than fail the
-        # deploy over a misconfigured window — tier-first, as everywhere else.
-        if not deprioritize:
-            return None
-        return (
-            # Same preference order the courtesy branch uses: a provider that
-            # has NOT just failed wins even across a tier drop, and only then
-            # does tier order decide between the ones that did.
-            _cheapest_bid(last_backup, deprioritize)
-            or _cheapest_bid(last_first)
-            or _cheapest_bid(last_backup)
-        )
-
-    def _redeploy_and_reselect(
-        reason: str = "all bids stale",
-        deprioritize: frozenset[str] = frozenset(),
-    ) -> tuple[str, str, str, float, str, int]:
-        """Close the stale/gone order and create a fresh one (issue #19), then select
-        a fresh open bid on it.
-
-        ``reason`` is the cause of the re-deploy (e.g. "all bids stale" for the
-        issue-#14 path, or "order un-leaseable (404)" for the lease-CREATE 404) so
-        the operator log names the actual failure mode, not a generic "stale".
-
-        ``deprioritize`` names providers that already failed to lease this
-        workload, so the fresh order prefers a different one (issue #84).
-
-        Returns ``(dseq, manifest, provider, price_amount, price_denom)`` for the
-        re-created order. Raises RuntimeError with an accurate cause if the round
-        fails; any newly-created order is cleaned up before raising.
-        """
-        if prepared_receipt is not None:
-            raise RuntimeError(
-                "receipt mode refuses internal re-deploy: the durable receipt binds the "
-                f"original DSEQ {display(dseq, 'dseq')}, so "
-                f"closing it and creating another order would "
-                "make the recovery identity false"
-            )
-        _log(
-            logging.WARNING,
-            f"Re-creating the order for fresh bids — {reason} (1 re-deploy round); "
-            f"closing {display(dseq, 'dseq')}...",
-        )
-        # Close the stale order BEFORE creating a new one — never leave two
-        # funded orders on-chain. Transient close failures (often the same
-        # Console flap that triggered the re-deploy) are retried; if the close
-        # persistently fails we abort rather than double-fund escrow.
-        closed = False
-        for close_attempt in range(1, 4):
-            try:
-                client.close_deployment(str(dseq))
-                _log(logging.INFO, f"  Stale order {display(dseq, 'dseq')} closed")
-                closed = True
-                break
-            except Exception as close_err:
-                _log(
-                    logging.WARNING,
-                    f"  Close of stale order {display(dseq, 'dseq')} failed "
-                    f"(attempt {close_attempt}/3): {error_text(close_err)}",
-                )
-                if close_attempt < 3:
-                    time.sleep(2)
-        if not closed:
-            raise RuntimeError(
-                f"could not close stale order {display(dseq, 'dseq')} after 3 attempts — not "
-                "re-deploying, to avoid double escrow. Close it manually: "
-                f"just-akash destroy --dseq {display(dseq, 'dseq')}"
-            )
-        # Same ambiguity as the initial create, and the same escrow at stake — this
-        # path exists precisely because the first order went stale, so leaking a second
-        # one here doubles the cost of the failure it is trying to recover from.
-        _redeploy_started = time.time()
-        try:
-            redeploy_response = client.create_deployment(sdl_content, deposit=create_deposit)
-        except RuntimeError as redeploy_err:
-            _report_suspected_orphans(client, _redeploy_started, _RUN_ID)
-            raise RuntimeError(
-                f"re-deploy create failed: {error_text(redeploy_err)}"
-            ) from redeploy_err
-        new_dseq = redeploy_response.get("dseq")
-        if new_dseq is None:
-            raise RuntimeError(
-                "re-deploy returned no DSEQ (details withheld)"
-                if active()
-                else f"re-deploy returned no DSEQ (response: "
-                f"{json.dumps(redeploy_response, default=str)[:200]})"
-            )
-        _private_create_identity(new_dseq)
-        _raw_manifest = redeploy_response.get("manifest", "")
-        new_manifest = _raw_manifest if isinstance(_raw_manifest, str) else ""
-        _log(
-            logging.INFO,
-            f"  Re-deployed: new order DSEQ={display(new_dseq, 'dseq')} "
-            f"— fast-polling for fresh bids...",
-        )
-        wait_s, courtesy_s, interval_s = _redeploy_poll_window()
-        if deprioritize:
-            _log(
-                logging.INFO,
-                "  Preferring a provider other than "
-                f"{', '.join(sorted(deprioritize))} on the fresh order "
-                f"(still leasable if nothing else bids within {courtesy_s:g}s)",
-            )
-        fresh = _poll_fresh_bid(str(new_dseq), wait_s, courtesy_s, interval_s, deprioritize)
-        fresh_provider = _extract_provider(fresh) if fresh is not None else None
-        if fresh is None or not fresh_provider:
-            try:
-                client.close_deployment(str(new_dseq))
-                _log(
-                    logging.INFO,
-                    f"  Re-created order {display(new_dseq, 'dseq')} closed (no fresh bid)",
-                )
-            except Exception as cleanup_err:
-                _log(
-                    logging.ERROR,
-                    f"  Cleanup of {display(new_dseq, 'dseq')} failed: {error_text(cleanup_err)}",
-                )
-            raise RuntimeError(
-                f"no fresh open bid on re-created order {display(new_dseq, 'dseq')}"
-            )
-        amount, denom = _extract_bid_price(fresh)
-        _log(
-            logging.INFO,
-            f"  Fresh bid selected: provider={display(fresh_provider, 'address')} "
-            f" price={amount} {display(denom, 'denom')} "
-            "— leasing immediately",
-        )
-        # ⚠ The fresh bid's GROUP travels with it. A re-created order is a NEW order:
-        # its winning bid may be for a different group than the one that won on the
-        # order this replaced, so carrying the old `lease_gseq` forward would lease the
-        # right provider against the wrong group — the exact defect this change fixes,
-        # reintroduced one path over.
-        return (
-            str(new_dseq),
-            new_manifest,
-            fresh_provider,
-            amount,
-            denom,
-            _extract_gseq(fresh) or 1,
-        )
-
     _log(logging.INFO, "STEP 6: Creating lease...")
     max_lease_attempts = 3
     failed_providers: set[str] = set()
     lease_response = None
-    # issue #19: one bounded re-deploy round. By the time a backup-only
-    # market reaches lease creation, the selected bid is already
-    # ~JUST_AKASH_BACKUP_FALLBACK_S old (bids expire ~5 min after the ORDER
-    # opens), so a single Console flap (e.g. the ~35s 'JWT has invalid
-    # claims' 400 — issue #18) can age the only bid past expiry. Re-fetching
-    # bids on the SAME order then finds nothing open — every bid shares the
-    # order's clock. Only a NEW order gets fresh bids, so when the stale-bid
-    # retry runs out of open bids: close the order, re-create it, and lease
-    # the first open allowlisted bid IMMEDIATELY (no phased patience — that
-    # patience is what aged the first round past expiry).
-    redeployed = False
+    # issue #19 used to close a stale order and create a replacement here. just-akash#332
+    # forbids that unbound second create: a stale or un-leaseable order now closes THIS
+    # deploy's own order and holds (STALE_ORDER_HOLD); the caller re-runs the deploy.
     attempt = 0
     while True:
         attempt += 1
@@ -2699,6 +2300,7 @@ def deploy(
                 )
                 time.sleep(5)
                 continue
+            refetch_failed = False
             if stale and attempt < max_lease_attempts:
                 failed_providers.add(provider)
                 _log(
@@ -2711,6 +2313,7 @@ def deploy(
                 except RuntimeError as poll_err:
                     _log(logging.WARNING, f"  Bid re-fetch failed: {error_text(poll_err)}")
                     fresh_bids = []
+                    refetch_failed = True
                 next_bid = _next_open_bid(fresh_bids, failed_providers)
                 if next_bid is not None:
                     provider = _extract_provider(next_bid) or ""
@@ -2729,51 +2332,32 @@ def deploy(
                     )
                     continue
                 _log(logging.WARNING, "  No other open bid available to retry with")
-            if (stale or no_order) and not redeployed:
-                # issue #19: every bid on this order has expired (bids share the
-                # ORDER's ~5-min clock, so re-fetching the same order can't
-                # recover), OR the order itself became un-leaseable (no_order
-                # 404). Either way: close it, re-create once, lease a fresh bid.
-                redeployed = True
-                attempt = 0
-                # issue #84: carry the provider that just failed into the fresh
-                # order's bid selection, but ONLY on the 404 path. A `stale`
-                # failure is the ORDER's ~5-min bid clock, which every bid
-                # shares — it says nothing about the provider, and re-excluding
-                # it on a NEW order would needlessly shrink an already-thin
-                # allowlisted market. A 404 does carry provider-shaped signal,
-                # so the fresh order prefers someone else (soft, not a ban —
-                # see _poll_fresh_bid). Computed before the clear() below.
-                deprioritize = (
-                    frozenset(p for p in (failed_providers | {provider}) if p)
-                    if no_order
-                    else frozenset()
-                )
-                failed_providers.clear()
-                try:
-                    dseq, manifest, provider, price_amount, price_denom, lease_gseq = (
-                        _redeploy_and_reselect(
-                            reason="order un-leaseable (404 'no lease for deployment')"
-                            if no_order
-                            else "all bids stale",
-                            deprioritize=deprioritize,
-                        )
+            held = None
+            if stale or no_order:
+                if no_order:
+                    reason = STALE_ORDER_REASONS[0]
+                elif refetch_failed:
+                    reason = STALE_ORDER_REASONS[2]
+                elif attempt >= max_lease_attempts:
+                    reason = STALE_ORDER_REASONS[3]
+                else:
+                    reason = STALE_ORDER_REASONS[1]  # a re-fetch showed no other open bid
+                if prepared_receipt is not None:
+                    # Receipt mode: the durable receipt binds THIS DSEQ, so it is neither
+                    # closed nor replaced; it stays for exact reconciliation.
+                    message = (
+                        "receipt mode refuses internal re-deploy: the durable receipt binds "
+                        f"the original DSEQ {display(dseq, 'dseq')} ({reason})"
                     )
-                except RuntimeError as redeploy_err:
-                    emit(
-                        Code.REDEPLOY_FAILED,
-                        "error",
-                        f"re-deploy round failed: {error_text(redeploy_err)}",
-                        dseq=str(dseq),
-                    )
-                    raise RuntimeError(
-                        f"Failed to create lease after re-deploy: {error_text(redeploy_err)}"
-                    ) from redeploy_err
-                continue
+                    emit(Code.REDEPLOY_FAILED, "error", message, dseq=str(dseq))
+                    raise RuntimeError(f"Failed to create lease: {message}") from e
+                held = reason
             _log(logging.ERROR, f"Lease creation FAILED: {error_text(e)}")
             _log(logging.INFO, f"Cleaning up deployment {display(dseq, 'dseq')}...")
+            closed = False
             try:
                 client.close_deployment(str(dseq))
+                closed = True
                 _log(
                     logging.INFO, f"Deployment {display(dseq, 'dseq')} closed after lease failure"
                 )
@@ -2783,6 +2367,11 @@ def deploy(
                     f"Cleanup of deployment {display(dseq, 'dseq')} "
                     f"also failed: {error_text(cleanup_err)}",
                 )
+            if held is not None:
+                # The hold states what happened to this deploy's own order, never a close
+                # that failed. A private operation names no dseq in the message.
+                template = STALE_ORDER_HOLD if closed else STALE_ORDER_CLOSE_FAILED_HOLD
+                held = template.format(reason=held, dseq=PRIVATE_DSEQ if active() else str(dseq))
             emit(
                 Code.LEASE_CREATE_FAILED,
                 "error",
@@ -2790,6 +2379,9 @@ def deploy(
                 dseq=str(dseq),
                 provider=provider,
             )
+            if held is not None:
+                _log(logging.ERROR, held)
+                raise RuntimeError(held) from e
             raise RuntimeError(f"Failed to create lease: {error_text(e)}") from e
 
     _log(logging.INFO, "Lease created successfully!")

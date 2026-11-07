@@ -2,8 +2,8 @@
 
 The order is the contract. A charter written after the create leaves a window where an
 uncharted lease of ours is on chain; a bind written before the lease names a dseq that may
-not survive the auction (the issue-#19 re-deploy replaces it). So one event log, shared by
-the fake Console, the fake Flynn and the credit probe, must read:
+not survive the auction (an un-leaseable order is closed and the deploy holds). So one
+event log, shared by the fake Console, the fake Flynn and the credit probe, must read:
 
     flynn.post < credit_probe < create_deployment < create_lease < deposit < bind
 
@@ -112,19 +112,18 @@ def test_a_plaintext_flynn_url_off_localhost_is_refused(monkeypatch):
         charter_mod.FlynnCharterClient()
 
 
-def test_a_redeploy_binds_the_new_dseq(h):
-    """The issue-#19 round closes the first order and creates another. The bind must name
-    the dseq that holds the lease, and the second order must be stamped and min-funded too."""
+def test_an_unleaseable_order_holds_and_binds_nothing(h):
+    """just-akash#332: an un-leaseable (404) order no longer starts the issue-#19 re-deploy.
+    The deploy closes its own order and holds: one create, no second order, no deposit and
+    no bind, because no dseq holds a lease to bind."""
     h.set_bid_price(1000)
     h.app.lease_errors = [(404, "no lease for deployment")]
-    result = _deploy(h)
-    assert h.app.closed[:1] == ["1000"]
-    assert result["dseq"] == "1001"
-    assert h.app.created_deposits == [0.5, 0.5]
-    assert "fleet-serve-qwen.ch-0123456789:" in h.app.deployments["1001"]["sdl"]
-    ((_, body),) = h.flynn.binds
-    assert body["dseq"] == "1001"
-    assert h.app.deposits == [("1001", pytest.approx(6.4))]
+    with pytest.raises(RuntimeError, match="no replacement order was created"):
+        _deploy(h)
+    assert h.app.closed == ["1000"]
+    assert h.app.created_deposits == [0.5]
+    assert h.flynn.binds == []
+    assert h.app.deposits == []
 
 
 def test_a_failing_bind_is_retried_then_reported_and_the_lease_kept(h, capsys):

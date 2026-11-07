@@ -619,6 +619,11 @@ class AkashConsoleAPI:
         return response
 
     def create_deployment(self, sdl_content: str, deposit: float = 5.0) -> dict[str, Any]:
+        # just-akash#332 backstop: every plain create in this package passes here, so a
+        # caller that skipped its own site check is still refused before the POST.
+        from .create_gate import require_plain_create_allowed
+
+        require_plain_create_allowed("AkashConsoleAPI.create_deployment", announce=False)
         response = self._request(
             "POST",
             "/v1/deployments",

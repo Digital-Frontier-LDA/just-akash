@@ -145,10 +145,6 @@ def start(monkeypatch, tmp_path) -> Harness:
     monkeypatch.setenv("AKASH_CONSOLE_URL", console.base_url)
     monkeypatch.setenv("FLYNN_API_URL", flynn.base_url)
     monkeypatch.setenv("FLYNN_INTERNAL_API_KEY", "fake-internal-key")
-    # The issue-#19 re-deploy round's fast-poll: no courtesy wait, tight interval.
-    monkeypatch.setenv("JUST_AKASH_REDEPLOY_BACKUP_COURTESY_S", "0")
-    monkeypatch.setenv("JUST_AKASH_REDEPLOY_POLL_INTERVAL_S", "0.1")
-    monkeypatch.setenv("JUST_AKASH_REDEPLOY_WAIT_S", "5")
     monkeypatch.setenv("AKASH_DIAGNOSTICS", "1")
     return h
 

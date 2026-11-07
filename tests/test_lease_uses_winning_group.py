@@ -9,7 +9,7 @@ a bid won on group 2 produced a lease against group 1.
 ⚠ WHY THE CHECKS ARE STRUCTURAL. `deploy()` is a long function that reaches Console over
 the network at several points; driving it end-to-end in a unit test would test the mocks.
 So the wiring is judged on the parsed AST instead, and the rules below are written to be
-about the ACTION (a `create_lease` call, a `_redeploy_and_reselect` unpack) rather than
+about the ACTION (a `create_lease` call, a re-deploy call) rather than
 about the name `gseq` — a finder keyed to the string under change disarms itself the
 moment that string moves, and reports success for having found nothing.
 
@@ -65,40 +65,22 @@ def wiring_errors(source: str) -> list[str]:
                 f"{kw['gseq'].value!r}; a literal cannot be the winning bid's group"
             )
 
-    # --- site 2: the re-deploy path must rebind whatever the lease call reads ---------
-    # A re-created order is a NEW order. If the helper's result does not refresh the
-    # group, the second attempt leases the right provider against the first order's
-    # group. Find the unpack by the CALL, never by the variable name.
-    # ⚠ The group node is BOUND before it is narrowed. Writing `kw["gseq"].id` under
-    # `if isinstance(kw.get("gseq"), ast.Name)` narrows a DIFFERENT expression than the
-    # one it then subscripts, so a type checker cannot carry the guarantee across — and
-    # pyright rejected exactly that: `Cannot access attribute "id" for class "expr"`.
-    lease_names = {
-        node.id
-        for call in calls
-        for kw in [{k.arg: k.value for k in call.keywords if k.arg}]
-        for node in [kw.get("gseq")]
-        if isinstance(node, ast.Name)
-    }
-    unpacks = [
+    # --- site 2: there is no re-deploy round (just-akash#332) -----------------------
+    # The issue-#19 round that closed a stale order and created a replacement was removed:
+    # a deploy now holds instead of sending a second, unbound create. With no second order
+    # there is no second group to rebind. Finding that round again by its CALL is an error.
+    redeploys = [
         n
         for n in ast.walk(tree)
-        if isinstance(n, ast.Assign)
-        and isinstance(n.value, ast.Call)
-        and isinstance(n.value.func, ast.Name)
-        and n.value.func.id == "_redeploy_and_reselect"
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and "redeploy" in n.func.id.lower()
     ]
-    if unpacks and lease_names:
-        for node in unpacks:
-            target = node.targets[0]
-            bound = {e.id for e in ast.walk(target) if isinstance(e, ast.Name)}
-            missing = lease_names - bound
-            if missing:
-                errors.append(
-                    f"the re-deploy unpack at line {node.lineno} does not rebind "
-                    f"{sorted(missing)}: after a re-created order the lease would use "
-                    "the PREVIOUS order's group"
-                )
+    for node in redeploys:
+        errors.append(
+            f"a re-deploy round is back at line {node.lineno}: just-akash#332 forbids a "
+            "second create, and a re-created order would lease against a stale group"
+        )
 
     # --- site 3: the group must travel with the provider on EVERY reselection -----
     # ⛔ THE LIMB THAT WAS MISSING, and its absence cost a real defect. The first version
@@ -227,42 +209,13 @@ def test_removing_the_group_argument_is_a_red_mutation():
     assert any("passes no group" in e for e in errors), errors
 
 
-def test_failing_to_rebind_after_a_redeploy_is_a_red_mutation():
-    """The second limb, mutated on its own. Both sites must be independently load-bearing
-    — a check that only ever fails because of limb 1 is one check wearing two names.
-
-    ⚠ The mutation DERIVES the variable it removes from the parsed source rather than
-    hardcoding an adjacency. The first attempt matched `price_denom, X = _redeploy…` on
-    one line; `ruff format` then wrapped the call into a parenthesised continuation and
-    the regex silently matched nothing — a mutation that no longer mutates makes its
-    test pass for the wrong reason."""
-
+def test_reintroducing_a_redeploy_round_is_a_red_mutation():
+    """Limb 2, mutated on its own: a re-deploy call anywhere in deploy.py fails the check."""
     source = DEPLOY.read_text()
-    tree = ast.parse(source)
-
-    # The name the lease call reads — whatever it is called today.
-    names = {
-        k.value.id
-        for n in ast.walk(tree)
-        if isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Attribute)
-        and n.func.attr == "create_lease"
-        for k in n.keywords
-        if k.arg == "gseq" and isinstance(k.value, ast.Name)
-    }
-    assert len(names) == 1, f"expected exactly one group variable, found {names}"
-    name = names.pop()
-
-    mutated, n = re.subn(rf",\s*{re.escape(name)}\b(?=\s*=)", "", source, count=1)
-    assert n == 1, f"the mutation did not remove {name!r} from the re-deploy unpack"
-    assert mutated != source
-    # The mutation must not have broken the OTHER limb, or this test would pass on
-    # limb 1's error and prove nothing about limb 2.
-    assert ast.parse(mutated) is not None
-
+    assert wiring_errors(source) == [], "the unmutated source must be clean for this control"
+    mutated = source + "\n\ndef _mutant():\n    return _redeploy_and_reselect()\n"
     errors = wiring_errors(mutated)
-    assert errors, "leaving the group stale across a re-created order did not fail"
-    assert any("re-deploy unpack" in e for e in errors), errors
+    assert any("re-deploy round is back" in e for e in errors), errors
 
 
 def test_dropping_the_group_from_a_reselection_path_is_a_red_mutation():

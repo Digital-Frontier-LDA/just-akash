@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **A deploy never sends a second create (just-akash#332).** Behaviour change for CLI users:
+  - When the Console reports that a matching deployment **already exists**, `deploy` now HOLDS. It no longer closes "stale" deployments and posts a second create. The error reads: "Deployment create HELD: the Console reports a matching deployment already exists. No deployment was closed and no second create was sent (just-akash#332). Next step: run `just-akash list`, close the deployment you no longer need with `just-akash destroy --dseq <DSEQ>`, then re-run the deploy."
+  - When every bid on the order is stale, or the order becomes un-leaseable (404), `deploy` closes ITS OWN order and HOLDS. It no longer creates a replacement order (the issue-#19 re-deploy round is removed). Next step: re-run the deploy.
+  - Receipt mode is unchanged: it already refused both.
+
+### Added
+
+- `JUST_AKASH_REQUIRE_AUTHORIZED_CREATE` (just-akash#332): set to `1`, every plain deployment create (`deploy`, the capacity/bid probes, and `AkashConsoleAPI.create_deployment` itself) is refused BEFORE any network I/O. Unset or `0` allows it. Any other value (`true`, `yes`, an empty string, a typo) refuses, so a typo never reads as off. `deploy` and the capacity/bid probes each log one `authorized-create gate: on|off (...)` line; the `AkashConsoleAPI.create_deployment` backstop refuses without logging, because `deploy` and the probes have logged before they reach it. The authorized create path (`AuthorizedConsoleCreate`) is unaffected. This gate only refuses; it is not authorization.
+
 ### Security
 
 - The owner-corroboration source-registry digest (`OWNER_CORROBORATION_REGISTRY_SHA256`) is a literal (`ce772637…`), not computed at import from `OWNER_CORROBORATION_SOURCES_V2`. A digest derived from the registry it guards matched any edit to that registry, so the runtime digest check could never refuse. A changed voter now makes every destructive identity read refuse until the literal digest is replaced (bumping the registry version with it is a maintainer rule the code does not check); a test pins each voter's `source_id`, URL and chain id (just-akash-uwr).

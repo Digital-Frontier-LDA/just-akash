@@ -357,10 +357,8 @@ def test_receipt_create_conflict_never_sweeps_shared_wallet_or_reposts(
     client.account_address.return_value = OWNER
     client.create_deployment.side_effect = RuntimeError("Deployment already exists")
 
-    with patch("just_akash.deploy._close_stale_for_retry") as sweep:
-        with pytest.raises(RuntimeError, match="reconcile the recorded operation"):
-            deploy_module.deploy(sdl_path=str(sdl_path), **_receipt_arguments(SDL, receipt))
-        sweep.assert_not_called()
+    with pytest.raises(RuntimeError, match="reconcile the recorded operation"):
+        deploy_module.deploy(sdl_path=str(sdl_path), **_receipt_arguments(SDL, receipt))
 
     assert client.create_deployment.call_count == 1
     client.close_deployment.assert_not_called()
