@@ -462,6 +462,7 @@ def _console(scoped_error=None, deployment=None, token="head.e30.sig"):
     def request(method, path, body=None, **_kw):
         calls.append((method, path, body))
         if method == "POST" and path == "/v1/create-jwt-token":
+            assert body is not None  # narrows the Optional for pyright; a mint always has a body
             leases = body["data"]["leases"]
             perms = leases.get("permissions") or [{}]
             names_deployment = all(p.get("access") == "granular" for p in perms) and (
