@@ -27,7 +27,9 @@ Invariant: lease-shell is the default transport; SSH is the fallback when
 
 - CRUD: `create_deployment`, `update_deployment`, `get_deployment`,
   `list_deployments`, `close_deployment`, `close_all_deployments` (scoped: `run_tag` and/or
-  `allow_dseqs`, dry run unless `execute=True`, prod placements refused; see `bulk_close.py`).
+  `allow_dseqs`, dry run unless `execute=True`, prod placements refused; `execute=True` needs
+  `project_id` or `JUST_AKASH_CONSOLE_PROJECT_ID`, and a dseq filed in another project or with
+  no `projectId` is refused; see `bulk_close.py`).
 - Bids/lease: `get_bids`, `create_lease`.
 - Escrow: `deposit_deployment`, `get_deployment_settings`, `create_/update_deployment_settings`,
   `set_auto_top_up` (upsert).
