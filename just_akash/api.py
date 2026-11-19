@@ -1194,7 +1194,22 @@ class AkashConsoleAPI:
         return self._jwt_from(response)
 
     def _account_from_user_wallets(self) -> str:
-        """The key's account from GET /v1/user/me and GET /v1/wallets (mints no JWT)."""
+        """The key's account from GET /v1/user/me and GET /v1/wallets (mints no JWT).
+
+        UNVERIFIED whether a key limited to a Console project may read either: if one
+        answers 403, this fails closed with that cause named, never a guess or an empty
+        value."""
+        try:
+            return self._read_user_wallet()
+        except AkashAPIError as e:
+            if e.status != 403:
+                raise
+            raise RuntimeError(
+                "project-bound key cannot read account (the Console answered 403 to "
+                "/v1/user/me or /v1/wallets); pass the address explicitly"
+            ) from e
+
+    def _read_user_wallet(self) -> str:
         me = self._request("GET", "/v1/user/me")
         me_data = me.get("data", me) if isinstance(me, dict) else None
         user_id = me_data.get("userId") if isinstance(me_data, dict) else None

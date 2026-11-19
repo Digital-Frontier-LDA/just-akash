@@ -667,6 +667,40 @@ class TestProjectBoundKey:
             ("GET", f"/v1/deployments/{DSEQ_N}"),
         ]
 
+    @pytest.mark.parametrize("refused", ["/v1/user/me", "/v1/wallets"])
+    def test_account_address_fails_closed_when_the_account_read_is_refused(self, refused):
+        """GA condition on 1tm.15: if a project-bound key may not read its account either,
+        the error names the cause; never a guess or an empty value."""
+        request, calls = _console(scoped_error=_project_forbidden())
+
+        def guarded(method, path, body=None, **kw):
+            if method == "GET" and path.startswith(refused):
+                calls.append((method, path, body))
+                raise AkashAPIError("API Error (403): project_forbidden", status=403)
+            return request(method, path, body, **kw)
+
+        with (
+            patch.object(AkashConsoleAPI, "_request", side_effect=guarded),
+            pytest.raises(RuntimeError, match="project-bound key cannot read account") as e,
+        ):
+            AkashConsoleAPI("key").account_address()
+        assert "pass the address explicitly" in str(e.value)
+        assert calls[-1][1].startswith(refused)
+
+    def test_an_account_read_error_other_than_403_is_raised_unchanged(self):
+        request, _calls = _console(scoped_error=_project_forbidden())
+
+        def guarded(method, path, body=None, **kw):
+            if method == "GET" and path == "/v1/user/me":
+                raise AkashAPIError("API Error (502): bad gateway", status=502)
+            return request(method, path, body, **kw)
+
+        with (
+            patch.object(AkashConsoleAPI, "_request", side_effect=guarded),
+            pytest.raises(AkashAPIError, match="bad gateway"),
+        ):
+            AkashConsoleAPI("key").account_address()
+
     def test_account_address_does_not_fall_back_on_other_errors(self):
         """THE CONTROL: only a 403 opens a fallback; a 500 is raised unchanged."""
         err = AkashAPIError("API Error (500): boom", status=500)

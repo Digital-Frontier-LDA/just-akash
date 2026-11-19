@@ -263,3 +263,28 @@ def test_the_jwt_bodies_are_json_round_trippable(fake) -> None:
     wire = json.loads(json.dumps(body))
     assert wire["data"]["leases"]["access"] == "granular"
     assert type(wire["data"]["leases"]["permissions"][0]["deployments"][0]["dseq"]) is int
+
+
+def test_close_fails_closed_when_the_account_read_is_refused(fake, monkeypatch) -> None:
+    """If a project-bound key may read neither its probe nor its account, the close stops
+    with the cause named and closes nothing (GA condition on 1tm.15)."""
+    import just_akash.api as api
+
+    real = api.AkashConsoleAPI._request
+
+    def refuse_me(self, method, path, *a, **kw):
+        if method == "GET" and path.startswith("/v1/user/me"):
+            raise api.AkashAPIError("API Error (403): project_forbidden", status=403)
+        return real(self, method, path, *a, **kw)
+
+    monkeypatch.setattr(api.AkashConsoleAPI, "_request", refuse_me)
+
+    def close():
+        client = _client()
+        client.account_address()
+        client.close_deployment(DSEQ)
+
+    got = _outcome(close)
+    assert got[0] == "refused"
+    assert "project-bound key cannot read account" in got[1]
+    assert fake.console.app.closed == []
