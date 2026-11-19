@@ -20,7 +20,7 @@ import pytest
 
 from just_akash.api import AkashConsoleAPI
 
-KEY = "spending-console-key-375"
+KEY = "spending-console-key-375"  # pragma: allowlist secret
 
 
 @pytest.mark.parametrize(
@@ -45,7 +45,7 @@ def test_the_console_and_loopback_are_accepted(url):
         "https://evil.akash.network",  # sibling host
         "https://console-api.akash.network.evil.com",  # suffix trick
         "https://console-api.akash.network:8443",  # other port
-        "https://user:pw@console-api.akash.network",  # userinfo
+        "https://user:pw@console-api.akash.network",  # userinfo  # pragma: allowlist secret
         "https://console-api.akash.network@evil.com",  # userinfo trick
         "https://another.invalid",
         "ftp://console-api.akash.network",
