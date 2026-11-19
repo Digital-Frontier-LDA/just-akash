@@ -1,4 +1,6 @@
-"""The legacy Console client must never hand the SPENDING key to a host that is not the Console (#375, bead just-akash-ra3).
+"""The legacy Console client never hands the SPENDING key to a non-Console host.
+
+#375, bead just-akash-ra3.
 
 Two leaks, both closed here:
   1. base_url came from AKASH_CONSOLE_URL with no host check, so any value (plain http,
@@ -85,7 +87,10 @@ def _socket(monkeypatch, location):
 
 @pytest.mark.parametrize(
     "location",
-    ["https://another.invalid/v1/deployments/1", "http://console-api.akash.network/v1/deployments/1"],
+    [
+        "https://another.invalid/v1/deployments/1",
+        "http://console-api.akash.network/v1/deployments/1",
+    ],
 )
 def test_a_redirect_off_the_console_never_carries_the_key(monkeypatch, location):
     calls = _socket(monkeypatch, location)

@@ -30,7 +30,7 @@ def _urls(mock_urlopen):
 @patch("just_akash.api.urllib.request.urlopen")
 def test_each_get_carries_a_unique_cache_buster(mock_urlopen):
     mock_urlopen.side_effect = lambda *a, **k: _ok()
-    c = AkashConsoleAPI("key", base_url="https://console.example")
+    c = AkashConsoleAPI("key", base_url="https://console-api.akash.network")
     c._request("GET", "/v1/deployments/1")
     c._request("GET", "/v1/deployments/1")
     a, b = (parse_qs(urlsplit(u).query)["_cb"][0] for u in _urls(mock_urlopen))
@@ -41,7 +41,7 @@ def test_each_get_carries_a_unique_cache_buster(mock_urlopen):
 @patch("just_akash.api.urllib.request.urlopen")
 def test_the_cache_buster_keeps_existing_query_parameters(mock_urlopen):
     mock_urlopen.side_effect = lambda *a, **k: _ok()
-    AkashConsoleAPI("key", base_url="https://console.example")._request(
+    AkashConsoleAPI("key", base_url="https://console-api.akash.network")._request(
         "GET", "/v1/deployments?limit=100&skip=0"
     )
     q = parse_qs(urlsplit(_urls(mock_urlopen)[0]).query)
@@ -52,10 +52,10 @@ def test_the_cache_buster_keeps_existing_query_parameters(mock_urlopen):
 def test_non_get_requests_are_not_altered(mock_urlopen):
     """THE CONTROL: a write's URL is exactly the endpoint."""
     mock_urlopen.side_effect = lambda *a, **k: _ok()
-    c = AkashConsoleAPI("key", base_url="https://console.example")
+    c = AkashConsoleAPI("key", base_url="https://console-api.akash.network")
     c._request("POST", "/v1/deployments", {"x": 1})
     c._request("DELETE", "/v1/deployments/7")
     assert _urls(mock_urlopen) == [
-        "https://console.example/v1/deployments",
-        "https://console.example/v1/deployments/7",
+        "https://console-api.akash.network/v1/deployments",
+        "https://console-api.akash.network/v1/deployments/7",
     ]

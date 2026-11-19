@@ -192,7 +192,9 @@ def test_redirect_never_sends_controller_key_to_another_origin(monkeypatch, capl
     assert_private(caplog, caught.value)
 
 
-def test_default_redirect_positive_control_forwards_the_key(monkeypatch):
+def test_legacy_redirect_positive_control_is_followed_without_the_key(monkeypatch):
+    """The stub honours redirects (the request IS followed), so the CI client's refusal
+    above is its own; and since #375 the legacy client follows WITHOUT the key."""
     calls = []
 
     def https_open(_handler, request):
@@ -211,13 +213,15 @@ def test_default_redirect_positive_control_forwards_the_key(monkeypatch):
     assert AkashConsoleAPI(KEY).create_deployment(SDL) == {"dseq": "123"}
     assert len(calls) == 2
     assert calls[1].full_url == "https://another.invalid/"
-    assert calls[1].get_header("X-api-key") == KEY
+    assert calls[0].get_header("X-api-key") == KEY
+    assert calls[1].get_header("X-api-key") is None
 
 
 def test_ci_origin_is_not_selected_by_ambient_environment(monkeypatch):
     monkeypatch.setenv("AKASH_CONSOLE_URL", "https://another.invalid")
     assert CIConsoleAPI(KEY).base_url == "https://console-api.akash.network"
-    assert AkashConsoleAPI(KEY).base_url == "https://another.invalid"
+    with pytest.raises(ValueError, match="Console"):
+        AkashConsoleAPI(KEY)  # #375: the legacy client refuses it outright
 
 
 @pytest.mark.parametrize("key", ["", "a\nb", "a\rb", "a b", "é", None])
