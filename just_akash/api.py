@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +37,42 @@ logger = logging.getLogger("akash.api")
 # that envelope would turn answers we currently get — and can classify — into unknowns.
 CONSOLE_HTTP_TIMEOUT = 180.0
 CI_CONSOLE_ORIGIN = "https://console-api.akash.network"
+
+
+CONSOLE_HOST = "console-api.akash.network"
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _validated_console_url(url: str) -> str:
+    """The Console origin the SPENDING key may be sent to, or ValueError (#375).
+
+    Accepted: https://console-api.akash.network (default port, no path) and, for the
+    local fake Console in tests, http or https on a loopback host. Anything else (plain
+    http to the real host, a look-alike or sibling host, another port, userinfo, a path,
+    a query) would hand x-api-key to whoever answers, so it is refused before any
+    request is built.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname
+        port = parts.port
+    except ValueError:
+        raise ValueError("Console URL is not a valid URL") from None
+    clean = (
+        parts.username is None
+        and parts.password is None
+        and parts.path in ("", "/")
+        and not parts.query
+        and not parts.fragment
+    )
+    if clean and parts.scheme == "https" and host == CONSOLE_HOST and port in (None, 443):
+        return url
+    if clean and parts.scheme in ("http", "https") and host in _LOOPBACK_HOSTS:
+        return url
+    raise ValueError(
+        f"Console URL must be https://{CONSOLE_HOST} or a loopback test console; "
+        "refusing to send the Console API key anywhere else"
+    )
 
 
 class _NoConsoleRedirect(urllib.request.HTTPRedirectHandler):
@@ -225,8 +262,8 @@ class AkashConsoleAPI:
     """Client for Akash Console API (https://console-api.akash.network)"""
 
     def __init__(self, api_key: str, base_url: str | None = None):
-        self.base_url = base_url or os.environ.get(
-            "AKASH_CONSOLE_URL", "https://console-api.akash.network"
+        self.base_url = _validated_console_url(
+            base_url or os.environ.get("AKASH_CONSOLE_URL", "https://console-api.akash.network")
         )
         self.api_key = api_key
         self.headers = {
@@ -265,9 +302,13 @@ class AkashConsoleAPI:
         req = urllib.request.Request(  # noqa: S310
             url,
             data=request_body,
-            headers=self.headers,
+            headers={k: v for k, v in self.headers.items() if k.lower() != "x-api-key"},
             method=method,
         )
+        # Unredirected: urllib copies ordinary headers onto a redirected request, to any
+        # origin, but never unredirected ones. The key goes to base_url and nowhere else
+        # (#375); a redirect is answered without it and fails closed (401).
+        req.add_unredirected_header("x-api-key", self.headers["x-api-key"])
 
         try:
             t0 = datetime.now(timezone.utc)
