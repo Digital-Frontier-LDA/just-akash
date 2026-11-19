@@ -26,7 +26,8 @@ Invariant: lease-shell is the default transport; SSH is the fallback when
 `base_url` defaults to `AKASH_CONSOLE_URL` env then `console-api.akash.network`.
 
 - CRUD: `create_deployment`, `update_deployment`, `get_deployment`,
-  `list_deployments`, `close_deployment`, `close_all_deployments`.
+  `list_deployments`, `close_deployment`, `close_all_deployments` (scoped: `run_tag` and/or
+  `allow_dseqs`, dry run unless `execute=True`, prod placements refused; see `bulk_close.py`).
 - Bids/lease: `get_bids`, `create_lease`.
 - Escrow: `deposit_deployment`, `get_deployment_settings`, `create_/update_deployment_settings`,
   `set_auto_top_up` (upsert).
