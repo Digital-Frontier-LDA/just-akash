@@ -250,7 +250,7 @@ class TestStreamJwtServices:
         """None: create_jwt reads the lease again and fails closed if it still names none."""
         config = TransportConfig(
             dseq="123",
-            api_key="key",
+            api_key="key",  # pragma: allowlist secret -- a placeholder, never sent
             deployment={"leases": [{"provider": {"hostUri": "https://p.example:8443"}}]},
         )
         t = LeaseShellTransport(config)
