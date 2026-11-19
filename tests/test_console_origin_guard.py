@@ -20,6 +20,11 @@ import pytest
 
 from just_akash.api import AkashConsoleAPI
 
+
+class _Response(urllib.response.addinfourl):
+    msg = "OK"
+
+
 KEY = "spending-console-key-375"  # pragma: allowlist secret
 
 
@@ -74,10 +79,9 @@ def _socket(monkeypatch, location):
         status = 200 if len(calls) > 1 else 302
         if status == 302:
             headers["Location"] = location
-        response = urllib.response.addinfourl(
+        response = _Response(
             io.BytesIO(b'{"data":{"dseq":"123"}}'), headers, request.full_url, status
         )
-        response.msg = "OK"
         return response
 
     monkeypatch.setattr("urllib.request.HTTPSHandler.https_open", open_)
