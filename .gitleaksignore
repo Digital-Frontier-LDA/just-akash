@@ -9,3 +9,10 @@
 # every fetched branch (checkout fetch-depth 0 + gitleaks' default `git log --all`), so this one
 # branch turned Gitleaks red on every PR (#489, #490, #493).
 a8343cb26a0a71002f628a992b3749a2a1b6cc73:.github/actions/keydb-qualification-fenced-receipts/python-source.cjs:generic-api-key:2
+
+# b1e7bf7e (branch feat/sn7-owned-lease-admission, in no PR and not on main; #510). Line 93 is
+# `API_SHA256 = "<64 hex>"` in guardian_legacy_lease_backend.py: a source-pinning constant, and
+# its value is the SHA-256 of just_akash/api.py at that same commit (checked by hashing every
+# file in the tree: exactly one match). generic-api-key fires on the `*_SHA256` name next to
+# high-entropy hex. A digest of public source, not a credential: nothing to rotate.
+b1e7bf7e32e773935d097887c605699df1f0a713:just_akash/guardian_legacy_lease_backend.py:generic-api-key:93
