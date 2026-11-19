@@ -1071,9 +1071,15 @@ class AkashConsoleAPI:
         # empty list is passed through unchanged rather than silently widened to shell.
         if scope is None:
             scope = ["shell"]
+        if services is not None and not (
+            isinstance(services, list | tuple) and all(isinstance(s, str) and s for s in services)
+        ):
+            raise ValueError("services must be a list of service names, each a nonempty string")
         gseq = oseq = None
         if provider is None or not services:
-            provider, gseq, oseq, found = self._lease_target(dseq_n, provider)
+            provider, gseq, oseq, found = self._lease_target(
+                dseq_n, provider, need_services=not services
+            )
             services = services or found
         deployment: dict[str, Any] = {"dseq": dseq_n}
         if gseq is not None and oseq is not None:
@@ -1101,14 +1107,15 @@ class AkashConsoleAPI:
         return self._jwt_from(response)
 
     def _lease_target(
-        self, dseq: int, provider: str | None
+        self, dseq: int, provider: str | None, *, need_services: bool = True
     ) -> tuple[str, int | None, int | None, list[str]]:
         """(provider, gseq, oseq, services) of the deployment's lease, read from the Console.
 
         With ``provider`` given, the lease on that provider; otherwise the first lease that
         names one (the lease the lease-shell transport talks to). Services are the names
         the lease status reports. Raises RuntimeError when either cannot be named: a
-        token that names no service is one the Console refuses."""
+        token that names no service is one the Console refuses. With need_services=False
+        (the caller named its services) only the provider must be found."""
         deployment = self.get_deployment(str(dseq))
         leases = deployment.get("leases") if isinstance(deployment, dict) else None
         for lease in leases if isinstance(leases, list) else []:
@@ -1127,7 +1134,7 @@ class AkashConsoleAPI:
                 if isinstance(reported, dict)
                 else []
             )
-            if not names:
+            if not names and need_services:
                 raise RuntimeError(
                     f"deployment {dseq}: its lease reports no service yet, so no token "
                     "can name one; pass services (or --service)"
@@ -1217,18 +1224,23 @@ class AkashConsoleAPI:
             raise RuntimeError("the Console's /v1/user/me named no user for this key")
         listed = self._request("GET", f"/v1/wallets?userId={urllib.parse.quote(user_id, safe='')}")
         wallets = listed.get("data", listed) if isinstance(listed, dict) else listed
-        addresses = {
-            w.get("address")
-            for w in (wallets if isinstance(wallets, list) else [])
-            if isinstance(w, dict) and w.get("userId") == user_id
-        }
+        addresses: set[str] = set()
+        for w in wallets if isinstance(wallets, list) else []:
+            if not isinstance(w, dict) or w.get("userId") != user_id:
+                continue
+            # A malformed row of this user is refused, never skipped: skipping it could
+            # make another row look like the user's only wallet.
+            address = w.get("address")
+            if not isinstance(address, str) or not _ACCOUNT_RE.fullmatch(address):
+                raise RuntimeError(
+                    "the Console's wallet address for this key is no akash1 account"
+                )
+            addresses.add(address)
         if len(addresses) != 1:
             raise RuntimeError(
                 f"the Console listed {len(addresses)} wallets for this key's user, not one"
             )
         (address,) = addresses
-        if not isinstance(address, str) or not _ACCOUNT_RE.fullmatch(address):
-            raise RuntimeError("the Console's wallet address for this key is no akash1 account")
         return address
 
     def create_jwt_with_provider(
