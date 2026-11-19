@@ -16,6 +16,12 @@ once, by changes that looked fine in isolation and passed every other gate:
    claiming the same version in an order that no longer descends (main briefly
    had two ``## [1.37.0]`` headers, one of them below 1.36.1).
 
+3. **A dispatchable job decrypts wallet secrets only from the default branch.**
+   Six workflow_dispatch workflows loaded ``./.github/actions/sops-env`` with
+   no ref check, so any repo writer could dispatch a branch whose code closes or
+   spends on the shared Console wallet (openmix-17uy). auto-topup-audit.yml and
+   reseal-akash-key.yml had the guard; nothing made the others carry it.
+
 Run: ``python3 .github/scripts/check_repo_invariants.py [--root DIR]``
 Exit 0 when every invariant holds, 1 otherwise (with the offending lines).
 """
@@ -217,6 +223,145 @@ def check_workflow_vars(root: Path, *, declarations_must_be_used: bool = False) 
     return problems
 
 
+SOPS_ENV_ACTION = "./.github/actions/sops-env"
+
+# Environments with REQUIRED REVIEWERS, which the bead accepts in place of the ref guard.
+# Empty on purpose: the environment's name in a workflow cannot show that it has reviewers
+# (only the repo settings can), and today the only environment is `copilot`, with no
+# protection rules. Adding a name here is a claim someone checked those settings.
+PROTECTED_ENVIRONMENTS: frozenset[str] = frozenset()
+
+# A step condition that runs even after an earlier step FAILED. On a step between the guard
+# and sops-env it would load the secrets anyway once the guard has refused the ref.
+_STATUS_OVERRIDE = re.compile(r"\b(?:always|failure|cancelled)\s*\(")
+
+
+def _env_names_for(env: dict, expr: str) -> list[str]:
+    """Names in a step's ``env:`` whose value is exactly ``${{ <expr> }}``."""
+    want = re.compile(r"\$\{\{\s*" + re.escape(expr) + r"\s*\}\}")
+    return [k for k, v in env.items() if isinstance(v, str) and want.fullmatch(v.strip())]
+
+
+def is_ref_guard(step: object) -> bool:
+    """True for a step that fails unless github.ref is refs/heads/<default_branch>.
+
+    It must compare the FULL ref (github.ref, not ref_name, so refs/tags/main fails) with
+    the event's default branch and ``exit 1`` on a mismatch. It may not carry an ``if:``
+    or ``continue-on-error``, either of which lets the job go on past a refusal. The only
+    early pass it may have is for a schedule event, matched on github.event_name: GitHub
+    runs a schedule only from the default branch, and that event has no repository payload
+    to read default_branch from. Any other ``exit 0`` or ``|| true`` disqualifies it.
+    """
+    if not isinstance(step, dict) or "uses" in step or "if" in step:
+        return False
+    if step.get("continue-on-error") not in (None, False):
+        return False
+    env, run = step.get("env"), step.get("run")
+    if not isinstance(env, dict) or not isinstance(run, str):
+        return False
+    for event in _env_names_for(env, "github.event_name"):
+        run = re.sub(
+            r'if\s+\[\s*"\$\{?' + re.escape(event) + r'\}?"\s*=\s*"?schedule"?\s*\]\s*;\s*then\s*'
+            r"(?:echo[^\n]*\n\s*)?exit\s+0\s*\n\s*fi\b",
+            "",
+            run,
+        )
+    if re.search(r"\bexit\s+0\b|\|\|\s*(?:true|:)", run):
+        return False
+    for ref in _env_names_for(env, "github.ref"):
+        for default in _env_names_for(env, "github.event.repository.default_branch"):
+            compare = re.compile(
+                r'if\s+\[\s*"\$\{?'
+                + re.escape(ref)
+                + r'\}?"\s*!=\s*"refs/heads/\$\{?'
+                + re.escape(default)
+                + r'\}?"\s*\]\s*;\s*then\b(?:(?!\bfi\b).)*?\bexit\s+1\b',
+                re.S,
+            )
+            if compare.search(run):
+                return True
+    return False
+
+
+def _dispatchable(on: object) -> bool:
+    if isinstance(on, str):
+        return on == "workflow_dispatch"
+    if isinstance(on, (list, dict)):
+        return "workflow_dispatch" in on
+    return False
+
+
+def check_dispatch_ref_guard(root: Path) -> list[str]:
+    """Every job of a workflow_dispatch workflow that loads sops-env is ref-guarded first.
+
+    workflow_dispatch runs the workflow AND the code of whatever ref the dispatcher picks,
+    so a job that decrypts secrets/ci.sops.env must refuse a non-default ref before it
+    checks anything out or loads the secrets (openmix-17uy). The guard has to come before
+    the first checkout and the first sops-env step, and no step from the guard up to that
+    sops-env step may carry an always()/failure()/cancelled() condition that would run it
+    after the guard failed. A job whose environment is in PROTECTED_ENVIRONMENTS is exempt.
+    """
+    try:
+        import yaml
+    except ImportError:
+        # Fail closed: a guard that quietly checks nothing is worse than a red build.
+        return ["check_dispatch_ref_guard needs PyYAML (python3 -m pip install pyyaml)"]
+    problems: list[str] = []
+    for path in sorted((root / ".github" / "workflows").glob("*.y*ml")):
+        text = path.read_text(encoding="utf-8")
+        doc = yaml.safe_load(text) or {}
+        if not isinstance(doc, dict):
+            continue
+        # YAML 1.1 reads a bare `on:` key as the boolean True.
+        if not _dispatchable(doc.get("on", doc.get(True))):
+            continue
+        jobs = doc.get("jobs") or {}
+        for job_id, job in jobs.items() if isinstance(jobs, dict) else []:
+            if not isinstance(job, dict):
+                continue
+            steps = job.get("steps") or []
+            sops = [
+                i
+                for i, s in enumerate(steps)
+                if isinstance(s, dict) and str(s.get("uses", "")).rstrip("/") == SOPS_ENV_ACTION
+            ]
+            if not sops:
+                continue
+            env = job.get("environment")
+            env_name = env.get("name") if isinstance(env, dict) else env
+            if env_name in PROTECTED_ENVIRONMENTS:
+                continue
+            m = re.search(rf"^  {re.escape(str(job_id))}:", text, re.M)
+            where = f"{path.relative_to(root)}:{text.count(chr(10), 0, m.start()) + 1 if m else 1}"
+            first_sops = sops[0]
+            checkouts = [
+                i
+                for i, s in enumerate(steps)
+                if isinstance(s, dict) and str(s.get("uses", "")).startswith("actions/checkout@")
+            ]
+            limit = min([first_sops, *checkouts])
+            guards = [i for i, s in enumerate(steps[:limit]) if is_ref_guard(s)]
+            sops_name = steps[first_sops].get("name") or SOPS_ENV_ACTION
+            if not guards:
+                problems.append(
+                    f"{where}: job {job_id!r} loads sops-env (step {sops_name!r}) in a "
+                    f"workflow_dispatch workflow with no default-ref guard before its first "
+                    f"checkout and sops-env step -- any branch or tag could be dispatched to "
+                    f"run with the wallet key. Add the 'Refuse to run from a non-default ref' "
+                    f"step from auto-topup-audit.yml first."
+                )
+                continue
+            for s in steps[guards[0] + 1 : first_sops + 1]:
+                cond = s.get("if") if isinstance(s, dict) else None
+                if isinstance(cond, str) and _STATUS_OVERRIDE.search(cond):
+                    problems.append(
+                        f"{where}: job {job_id!r} step {s.get('name') or s.get('uses')!r} "
+                        f"runs with if: {cond} between the ref guard and sops-env, so it "
+                        f"still runs after the guard refused the ref."
+                    )
+    return problems
+
+
 def check_changelog(root: Path) -> list[str]:
     """Changelog versions descend strictly, are unique, and the newest matches
     the packaged version."""
@@ -283,6 +428,7 @@ def main(argv: list[str] | None = None) -> int:
         # see check_workflow_vars' docstring for why the two arms differ.
         + check_workflow_vars(root, declarations_must_be_used=(root == REPO_ROOT))
         + check_changelog(root)
+        + check_dispatch_ref_guard(root)
     )
     if problems:
         print("Repo invariant check FAILED:\n", file=sys.stderr)
@@ -304,7 +450,10 @@ def main(argv: list[str] | None = None) -> int:
         if root == REPO_ROOT
         else f"{len(DECLARED_VARS)} declared repo variable(s) (usage unchecked: not this repo)"
     )
-    print(f"Repo invariants OK (SOPS-only secrets; {declared}; changelog ordered and in sync).")
+    print(
+        f"Repo invariants OK (SOPS-only secrets; {declared}; changelog ordered and in sync; "
+        "dispatchable sops-env jobs ref-guarded)."
+    )
     return 0
 
 

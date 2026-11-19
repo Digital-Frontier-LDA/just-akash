@@ -194,6 +194,210 @@ class TestWorkflowVarsInvariant:
         assert inv.check_workflow_vars(repo) == []
 
 
+_GUARD = (
+    "      - name: Refuse to run from a non-default ref\n"
+    "        env:\n"
+    "          REF: ${{ github.ref }}\n"
+    "          DEFAULT: ${{ github.event.repository.default_branch }}\n"
+    "        run: |\n"
+    "          set -euo pipefail\n"
+    '          if [ "$REF" != "refs/heads/$DEFAULT" ]; then\n'
+    '            echo "::error::refusing $REF"\n'
+    "            exit 1\n"
+    "          fi\n"
+)
+_CHECKOUT = "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n"
+_SOPS = (
+    "      - name: Load SOPS secrets\n"
+    "        uses: ./.github/actions/sops-env\n"
+    "        with:\n          age-key: ${{ secrets.SOPS_AGE_KEY }}\n"
+)
+
+
+def _dispatch_workflow(steps: str, on: str = "on:\n  workflow_dispatch:\n") -> str:
+    return f"{on}jobs:\n  close:\n    runs-on: ubuntu-latest\n    steps:\n{steps}"
+
+
+class TestDispatchRefGuard:
+    """openmix-17uy: six workflow_dispatch workflows loaded sops-env (the shared Console
+    wallet key) with no ref check, so a repo writer could dispatch a branch whose code
+    closes or spends on that wallet. The guard from auto-topup-audit.yml must come first."""
+
+    def _write(self, repo, text, name="close-orphans.yml"):
+        (repo / ".github" / "workflows" / name).write_text(text)
+
+    def test_clean_repo_passes(self, repo):
+        assert inv.check_dispatch_ref_guard(repo) == []
+
+    def test_an_unguarded_dispatch_job_is_caught(self, repo):
+        self._write(repo, _dispatch_workflow(_CHECKOUT + _SOPS))
+        problems = inv.check_dispatch_ref_guard(repo)
+        assert len(problems) == 1, problems
+        assert "close-orphans.yml:4" in problems[0]  # the job's line
+        assert "'close'" in problems[0] and "'Load SOPS secrets'" in problems[0]
+
+    def test_a_guarded_job_passes(self, repo):
+        self._write(repo, _dispatch_workflow(_GUARD + _CHECKOUT + _SOPS))
+        assert inv.check_dispatch_ref_guard(repo) == []
+
+    @pytest.mark.parametrize(
+        "on",
+        [
+            "on: workflow_dispatch\n",
+            "on: [push, workflow_dispatch]\n",
+            "on:\n  schedule: [{cron: '0 * * * *'}]\n  workflow_dispatch:\n    inputs: {}\n",
+        ],
+    )
+    def test_every_trigger_spelling_counts_as_dispatchable(self, repo, on):
+        self._write(repo, _dispatch_workflow(_CHECKOUT + _SOPS, on=on))
+        assert len(inv.check_dispatch_ref_guard(repo)) == 1
+
+    def test_a_workflow_without_dispatch_is_out_of_scope(self, repo):
+        """push and pull_request run the trusted workflow of their event; workflow_call
+        runs the caller's. Only a dispatch lets the dispatcher choose the ref."""
+        self._write(repo, _dispatch_workflow(_CHECKOUT + _SOPS, on="on: [push]\n"))
+        assert inv.check_dispatch_ref_guard(repo) == []
+
+    def test_a_yaml_extension_is_scanned(self, repo):
+        self._write(repo, _dispatch_workflow(_CHECKOUT + _SOPS), name="x.yaml")
+        assert len(inv.check_dispatch_ref_guard(repo)) == 1
+
+    def test_the_guard_must_come_before_checkout(self, repo):
+        """After checkout the step list is fixed, but ./.github/actions/sops-env itself
+        is the dispatched ref's code. Refuse before anything from the ref is on disk."""
+        self._write(repo, _dispatch_workflow(_CHECKOUT + _GUARD + _SOPS))
+        assert len(inv.check_dispatch_ref_guard(repo)) == 1
+
+    def test_ref_name_is_not_the_full_ref(self, repo):
+        """A tag named main has ref_name main. Only github.ref tells it apart."""
+        self._write(
+            repo,
+            _dispatch_workflow(
+                _GUARD.replace("github.ref }}", "github.ref_name }}") + _CHECKOUT + _SOPS
+            ),
+        )
+        assert len(inv.check_dispatch_ref_guard(repo)) == 1
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            lambda g: g.replace("            exit 1\n", "            echo still going\n"),
+            lambda g: g.replace(
+                "        env:\n", "        continue-on-error: true\n        env:\n"
+            ),
+            lambda g: g.replace(
+                "        env:\n", "        if: github.event_name == 'push'\n        env:\n"
+            ),
+            lambda g: g.replace("          set -euo", "          exit 0\n          set -euo"),
+            lambda g: g.replace('$DEFAULT" ]', '$DEFAULT" ] || true'),
+        ],
+        ids=["no-exit-1", "continue-on-error", "conditional", "exit-0", "or-true"],
+    )
+    def test_a_guard_that_can_be_passed_over_does_not_count(self, repo, mutate):
+        self._write(repo, _dispatch_workflow(mutate(_GUARD) + _CHECKOUT + _SOPS))
+        assert len(inv.check_dispatch_ref_guard(repo)) == 1
+
+    def test_the_schedule_pass_is_allowed(self, repo):
+        """A schedule event has no repository payload (default_branch is empty) and GitHub
+        runs it only from the default branch, so the guard may pass it on event_name."""
+        guard = _GUARD.replace(
+            "        run: |\n",
+            "          EVENT: ${{ github.event_name }}\n        run: |\n",
+        ).replace(
+            "          set -euo pipefail\n",
+            '          set -euo pipefail\n          if [ "$EVENT" = "schedule" ]; then\n'
+            '            echo "schedule"\n            exit 0\n          fi\n',
+        )
+        self._write(repo, _dispatch_workflow(guard + _CHECKOUT + _SOPS))
+        assert inv.check_dispatch_ref_guard(repo) == []
+
+    def test_an_always_step_after_the_guard_is_caught(self, repo):
+        sops = _SOPS.replace("        uses:", "        if: always()\n        uses:")
+        self._write(repo, _dispatch_workflow(_GUARD + _CHECKOUT + sops))
+        problems = inv.check_dispatch_ref_guard(repo)
+        assert len(problems) == 1 and "always()" in problems[0]
+
+    def test_every_sops_job_needs_its_own_guard(self, repo):
+        """provider-smoke's report job runs if: always() after the smoke job, so the
+        smoke job's guard does not stop it."""
+        text = _dispatch_workflow(_GUARD + _CHECKOUT + _SOPS) + (
+            "  report:\n    if: always()\n    runs-on: ubuntu-latest\n    steps:\n"
+            + _CHECKOUT
+            + _SOPS
+        )
+        self._write(repo, text)
+        problems = inv.check_dispatch_ref_guard(repo)
+        assert len(problems) == 1 and "'report'" in problems[0]
+
+    def test_an_unverified_environment_is_not_an_exemption(self, repo):
+        """An environment's name does not show it has required reviewers."""
+        text = _dispatch_workflow(_CHECKOUT + _SOPS).replace(
+            "    runs-on:", "    environment: production\n    runs-on:"
+        )
+        self._write(repo, text)
+        assert len(inv.check_dispatch_ref_guard(repo)) == 1
+
+
+def _real_guards() -> list[tuple[str, str, dict]]:
+    """(workflow, job, guard step) for every guarded sops-env job in this repo."""
+    import yaml
+
+    root = Path(__file__).resolve().parents[1]
+    found = []
+    for path in sorted((root / ".github" / "workflows").glob("*.y*ml")):
+        doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        for job_id, job in (doc.get("jobs") or {}).items():
+            for step in job.get("steps") or []:
+                if inv.is_ref_guard(step):
+                    found.append((path.name, job_id, step))
+    return found
+
+
+class TestRealGuardsBehave:
+    """The structural check reads the YAML. This RUNS each guard's shell with the values
+    GitHub would give it, so a guard that parses right but decides wrong still fails."""
+
+    def test_the_guards_are_found(self):
+        jobs = {(w, j) for w, j, _ in _real_guards()}
+        # The two pre-existing guards plus the seven jobs openmix-17uy guarded.
+        for want in [
+            ("auto-topup-audit.yml", "audit"),
+            ("close-orphans.yml", "close"),
+            ("cleanup-stale.yml", "cleanup"),
+            ("bid-probe.yml", "probe"),
+            ("lease-intent-backfill.yml", "backfill"),
+            ("provider-canary.yml", "canary"),
+            ("provider-smoke.yml", "smoke"),
+            ("provider-smoke.yml", "report"),
+        ]:
+            assert want in jobs, (want, sorted(jobs))
+
+    @pytest.mark.parametrize(
+        ("ref", "default", "event", "ok"),
+        [
+            ("refs/heads/main", "main", "workflow_dispatch", True),
+            ("refs/heads/evil", "main", "workflow_dispatch", False),
+            ("refs/tags/main", "main", "workflow_dispatch", False),
+            ("refs/heads/main", "", "workflow_dispatch", False),
+        ],
+        ids=["default-branch", "other-branch", "tag-named-main", "no-default"],
+    )
+    def test_each_guard_decides_on_the_full_ref(self, tmp_path, ref, default, event, ok):
+        import subprocess
+
+        for workflow, job, step in _real_guards():
+            env = {"PATH": "/usr/bin:/bin"}
+            for name, value in step["env"].items():
+                value = value.replace("${{ github.ref }}", ref)
+                value = value.replace("${{ github.event.repository.default_branch }}", default)
+                value = value.replace("${{ github.event_name }}", event)
+                env[name] = value
+            result = subprocess.run(
+                ["bash", "-e", "-c", step["run"]], env=env, capture_output=True, text=True
+            )
+            assert (result.returncode == 0) is ok, (workflow, job, result.stdout)
+
+
 class TestAnnotations:
     def test_annotation_carries_file_and_line(self, repo, capsys):
         """`::error::` alone puts the annotation at the top of the run. The comment beside it
@@ -236,3 +440,4 @@ class TestMain:
         # Strict here: this IS the repo the table describes.
         assert inv.check_workflow_vars(root, declarations_must_be_used=True) == []
         assert inv.check_changelog(root) == []
+        assert inv.check_dispatch_ref_guard(root) == []
