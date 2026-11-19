@@ -422,7 +422,11 @@ def test_real_owner_probe_reads_the_account_and_mints_no_token_before_the_exact_
     monkeypatch.setattr("urllib.request.OpenerDirector.open", opener)
     method = client.submit_runtime_limit if runtime_method else client.submit
     args = runtime_authority() if runtime_method else authority()
-    assert method(**args) == {"dseq": "123"}
+    try:
+        got = method(**args)
+    except CreateHeld as held:  # the outcome is the assertion subject, on the line below
+        got = held
+    assert got == {"dseq": "123"}
     assert paths == [
         ("GET", "https://console-api.akash.network/v1/user/me"),
         ("GET", "https://console-api.akash.network/v1/wallets"),
