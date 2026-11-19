@@ -253,11 +253,14 @@ class TestCloseAllDeploymentsCatchesAllExceptions:
     @patch.object(AkashConsoleAPI, "list_deployments")
     def test_type_error_does_not_abort_close_all(self, mock_list, mock_close):
         mock_list.return_value = [
-            {"dseq": d, "groups": [{"group_spec": {"name": "x"}}]} for d in ("1", "2", "3")
+            {"dseq": d, "projectId": "p", "groups": [{"group_spec": {"name": "x"}}]}
+            for d in ("1", "2", "3")
         ]
         mock_close.side_effect = [TypeError("unexpected"), {"ok": True}, {"ok": True}]
         client = AkashConsoleAPI("key")
-        result = client.close_all_deployments(allow_dseqs=["1", "2", "3"], execute=True)
+        result = client.close_all_deployments(
+            allow_dseqs=["1", "2", "3"], execute=True, project_id="p"
+        )
         assert len(result["closed"]) == 2
 
 

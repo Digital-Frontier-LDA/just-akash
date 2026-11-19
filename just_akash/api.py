@@ -150,6 +150,11 @@ def _add_bulk_close_scope_args(parser: Any) -> None:
         help="Close this dseq (repeatable, comma-separated). Prod placements are still refused.",
     )
     parser.add_argument(
+        "--project-id",
+        default=None,
+        help="The caller's Console project; needed for --yes (or JUST_AKASH_CONSOLE_PROJECT_ID)",
+    )
+    parser.add_argument(
         "--override-protected",
         action="store_true",
         help=(
@@ -171,12 +176,20 @@ def _run_scoped_bulk_close(client: Any, args: Any, on_empty_listing: Any = None)
         print(bulk_close.UNSCOPED_MESSAGE)
         return 2
     execute = bool(getattr(args, "yes", False))
+    project = (getattr(args, "project_id", None) or "").strip() or bulk_close.project_from_env()
+    if execute and not project:
+        print(
+            "Refusing to close without the caller's Console project: pass --project-id "
+            f"(or set {bulk_close.PROJECT_ENV}). An unbound key reaches every project."
+        )
+        return 2
     try:
         result = client.close_all_deployments(
             run_tag=run_tag,
             allow_dseqs=allow,
             execute=execute,
             override_protected=bool(getattr(args, "override_protected", False)),
+            project_id=project,
         )
     except PermissionError as e:
         print(f"Refused: {e}")
@@ -892,6 +905,7 @@ class AkashConsoleAPI:
         allow_dseqs: Any = (),
         execute: bool = False,
         override_protected: bool = False,
+        project_id: str | None = None,
     ) -> dict[str, Any]:
         """Close only this run's deployments and/or an explicit allowlist (just-akash-73o).
 
@@ -908,6 +922,12 @@ class AkashConsoleAPI:
             raise ValueError(f"--run-tag must be a run id (6-32 lowercase hex), got {run_tag!r}")
         if not run_tag and not allow:
             raise ValueError("unscoped bulk close refused. " + bulk_close.UNSCOPED_MESSAGE)
+        project = (project_id or "").strip() or bulk_close.project_from_env()
+        if execute and not project:
+            raise ValueError(
+                "an actual bulk close needs the caller's Console project (--project-id or "
+                f"{bulk_close.PROJECT_ENV}): an unbound key reaches every project of its team."
+            )
         if override_protected:
             why = bulk_close.override_refusal()
             if why:
@@ -919,6 +939,7 @@ class AkashConsoleAPI:
             allow_dseqs=allow,
             protected_dseqs=bulk_close.protected_dseqs_from_env(),
             override_protected=override_protected,
+            project_id=project,
         )
         results: list[Any] = []
         closed: list[str] = []

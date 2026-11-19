@@ -16,6 +16,13 @@ from just_akash import bulk_close
 from just_akash.api import AkashConsoleAPI
 
 RUN = "a1b2c3d4"
+PROJECT = "11111111-1111-4111-8111-111111111111"
+
+
+@pytest.fixture(autouse=True)
+def _callers_project(monkeypatch):
+    """Every row below is filed in the caller's project (see test_bulk_close_project_scope)."""
+    monkeypatch.setenv(bulk_close.PROJECT_ENV, PROJECT)
 
 
 def _dep(dseq: str, *group_names: str) -> dict:
@@ -23,6 +30,7 @@ def _dep(dseq: str, *group_names: str) -> dict:
         "deployment": {"id": {"owner": "akash1x", "dseq": dseq}, "state": "active"},
         "groups": [{"group_spec": {"name": n}} for n in group_names],
         "leases": [],
+        "projectId": PROJECT,
     }
 
 
@@ -213,7 +221,17 @@ def test_destroy_all_with_scope_and_yes_closes_only_the_scope(monkeypatch, tmp_p
     client = _FakeClient(FLEET)
     _cli(
         monkeypatch,
-        ["just-akash", "destroy-all", "--run-tag", RUN, "--allow-dseq", "1789116940502", "--yes"],
+        [
+            "just-akash",
+            "destroy-all",
+            "--run-tag",
+            RUN,
+            "--allow-dseq",
+            "1789116940502",
+            "--project-id",
+            PROJECT,
+            "--yes",
+        ],
         client,
     )
     assert client.closed == ["1796000000001"]

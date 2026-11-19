@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Security (bulk close)
+
+- **Behaviour change: an actual bulk close needs the caller's Console project (just-akash-73o follow-up).** `destroy-all --yes` / `close-all --yes` / `close_all_deployments(execute=True)` refuse to run without `--project-id` (or `JUST_AKASH_CONSOLE_PROJECT_ID`), and refuse any dseq whose listed `projectId` is another project or missing, even when allowlisted or own-run. No flag overrides it. A key not bound to a project reaches every project of its team; Flynn's prod dseqs now live in `flynn-production`, and this keeps a bulk close out of it in code. A dry run without a project still prints the plan. `just destroy-all` takes `project_id=`.
+
 ### Fixed
 
 - `list_deployments` waits 2 s, then 12 s, between inconsistent passes instead of a flat 2 s, and still raises after 3 (#281). Bid probe's reaper failed 3 of 4 runs on 2026-11-19 on a single page reporting `total = rows + 1` (13/14, 8/9, 19/20) for ~6 s right after its own create/close cycle. Each retry now logs `pass k/3: rows=R total=T`, and a listing that settles after a retry logs `consistent on pass k/3 … rows=R total=T`. A later run therefore shows whether the Console count settled or stays genuinely off by one.
