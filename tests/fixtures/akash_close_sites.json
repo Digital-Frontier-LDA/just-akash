@@ -32,7 +32,7 @@
     "count": 1,
     "kind": "python",
     "path": "just_akash/api.py",
-    "scope": "api_main"
+    "scope": "_run_scoped_bulk_close"
   },
   {
     "callee": "close_deployment",
@@ -54,13 +54,6 @@
     "kind": "python",
     "path": "just_akash/cleanup_stale.py",
     "scope": "run"
-  },
-  {
-    "callee": "close_all_deployments",
-    "count": 1,
-    "kind": "python",
-    "path": "just_akash/cli.py",
-    "scope": "main"
   },
   {
     "callee": "close_deployment",

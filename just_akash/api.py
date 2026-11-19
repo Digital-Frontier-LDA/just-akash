@@ -136,6 +136,68 @@ def _confirm(prompt: str, yes: bool = False) -> bool:
         return False
 
 
+def _add_bulk_close_scope_args(parser: Any) -> None:
+    """The scope flags `destroy-all` and `close-all` share (just-akash-73o)."""
+    parser.add_argument(
+        "--run-tag",
+        default=None,
+        help="Close deployments whose group name carries this run id (just-akash-<x>.<run id>)",
+    )
+    parser.add_argument(
+        "--allow-dseq",
+        action="append",
+        default=[],
+        help="Close this dseq (repeatable, comma-separated). Prod placements are still refused.",
+    )
+    parser.add_argument(
+        "--override-protected",
+        action="store_true",
+        help=(
+            "HUMAN ONLY: close allowlisted prod/protected dseqs. "
+            "Refused in CI, from an agent, or without a TTY."
+        ),
+    )
+
+
+def _run_scoped_bulk_close(client: Any, args: Any, on_empty_listing: Any = None) -> int:
+    """List, print the plan, and close only the scope, only with --yes. Returns an exit code."""
+    from . import bulk_close
+
+    run_tag = getattr(args, "run_tag", None)
+    allow = getattr(args, "allow_dseq", None) or []
+    if not run_tag and not allow:
+        # Refused here too, not only in close_all_deployments: the CLI must hold the line
+        # whatever client it is handed.
+        print(bulk_close.UNSCOPED_MESSAGE)
+        return 2
+    execute = bool(getattr(args, "yes", False))
+    try:
+        result = client.close_all_deployments(
+            run_tag=run_tag,
+            allow_dseqs=allow,
+            execute=execute,
+            override_protected=bool(getattr(args, "override_protected", False)),
+        )
+    except PermissionError as e:
+        print(f"Refused: {e}")
+        return 2
+    except ValueError as e:
+        print(f"Refused: {e}")
+        return 2
+    if not result["plan"] and on_empty_listing is not None:
+        on_empty_listing()
+    print(bulk_close.format_plan(result["plan"]))
+    if result["dry_run"]:
+        print("\nDry run: nothing closed. Re-run with --yes to close the CLOSE rows.")
+        return 0
+    tags = _load_tags()
+    for dseq in result["closed_dseqs"]:
+        tags.pop(dseq, None)
+    _save_tags(tags)
+    print(f"\nClosed {len(result['closed_dseqs'])} deployment(s).")
+    return 1 if result["failed_dseqs"] else 0
+
+
 def _json_output(data: dict[str, Any] | list[Any]) -> str:
     return json.dumps(data, indent=2)
 
@@ -798,19 +860,61 @@ class AkashConsoleAPI:
         data = response.get("data", response)
         return data if isinstance(data, dict) else response
 
-    def close_all_deployments(self) -> dict[str, Any]:
-        deployments = self.list_deployments()
-        results = []
-        for deployment in deployments:
-            dep_dseq = _extract_dseq(deployment)
-            if not dep_dseq:
-                continue
-            try:
-                result = self.close_deployment(dep_dseq)
-                results.append(result)
-            except Exception as e:
-                print(f"Warning: Failed to close deployment {dep_dseq}: {e}")
-        return {"closed": results}
+    def close_all_deployments(
+        self,
+        *,
+        run_tag: str | None = None,
+        allow_dseqs: Any = (),
+        execute: bool = False,
+        override_protected: bool = False,
+    ) -> dict[str, Any]:
+        """Close only this run's deployments and/or an explicit allowlist (just-akash-73o).
+
+        There is NO unscoped mode: with neither ``run_tag`` nor ``allow_dseqs`` this raises
+        before anything is listed. The default is a dry run (``execute=False``). Flynn prod
+        placements and ``JUST_AKASH_PROTECTED_DSEQS`` are refused even when allowlisted;
+        ``override_protected`` lifts that for allowlisted dseqs only, and only for a human
+        at a terminal. See just_akash/bulk_close.py.
+        """
+        from . import bulk_close
+
+        allow = bulk_close.parse_dseq_list(allow_dseqs)
+        if run_tag is not None and not bulk_close.valid_run_tag(run_tag):
+            raise ValueError(f"--run-tag must be a run id (6-32 lowercase hex), got {run_tag!r}")
+        if not run_tag and not allow:
+            raise ValueError("unscoped bulk close refused. " + bulk_close.UNSCOPED_MESSAGE)
+        if override_protected:
+            why = bulk_close.override_refusal()
+            if why:
+                raise PermissionError(why)
+
+        plan = bulk_close.plan_bulk_close(
+            self.list_deployments(),
+            run_tag=run_tag,
+            allow_dseqs=allow,
+            protected_dseqs=bulk_close.protected_dseqs_from_env(),
+            override_protected=override_protected,
+        )
+        results: list[Any] = []
+        closed: list[str] = []
+        failed: list[str] = []
+        if execute:
+            for item in plan:
+                if item.action != bulk_close.CLOSE:
+                    continue
+                try:
+                    results.append(self.close_deployment(item.dseq))
+                    closed.append(item.dseq)
+                except Exception as e:
+                    failed.append(item.dseq)
+                    print(f"Warning: Failed to close deployment {item.dseq}: {e}")
+        return {
+            "closed": results,
+            "closed_dseqs": closed,
+            "failed_dseqs": failed,
+            "plan": plan,
+            "dry_run": not execute,
+        }
 
     def get_bids(self, dseq: str) -> list[dict[str, Any]]:
         response = self._request("GET", f"/v1/bids?dseq={dseq}")
@@ -1791,7 +1895,11 @@ def api_main():
     close_p = subparsers.add_parser("close", help="Close a deployment")
     close_p.add_argument("--dseq", default="")
 
-    subparsers.add_parser("close-all", help="Close all deployments")
+    close_all_p = subparsers.add_parser(
+        "close-all",
+        help="Close this run's and/or allowlisted deployments (never unscoped; dry run w/o --yes)",
+    )
+    _add_bulk_close_scope_args(close_all_p)
 
     tag_p = subparsers.add_parser("tag", help="Tag a deployment with a name")
     tag_p.add_argument("--dseq", required=True)
@@ -1979,23 +2087,9 @@ def api_main():
                 print("Cancelled.")
 
         elif args.command == "close-all":
-            deployments = client.list_deployments()
-            if not deployments:
-                print("No deployments to close.")
-            else:
-                print(f"Found {len(deployments)} active deployment(s):")
-                print(format_deployments_table(deployments))
-                if _confirm("\nClose all? (y/N) ", yes=args.yes):
-                    client.close_all_deployments()
-                    tags = _load_tags()
-                    for d in deployments:
-                        dseq = _extract_dseq(d)
-                        if dseq:
-                            tags.pop(dseq, None)
-                    _save_tags(tags)
-                    print("All deployments closed.")
-                else:
-                    print("Cancelled.")
+            code = _run_scoped_bulk_close(client, args)
+            if code:
+                sys.exit(code)
 
         elif args.command == "tag":
             tags = _load_tags()

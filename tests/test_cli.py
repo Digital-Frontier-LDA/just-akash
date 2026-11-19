@@ -167,9 +167,16 @@ class TestCliDestroyAllNoDeployments:
         monkeypatch.setenv("AKASH_API_KEY", "test-key")
         client = MockAPI.return_value
         client.list_deployments.return_value = []
-        _run_cli(monkeypatch, ["just-akash", "destroy-all"])
+        client.close_all_deployments.return_value = {
+            "plan": [],
+            "closed": [],
+            "closed_dseqs": [],
+            "failed_dseqs": [],
+            "dry_run": True,
+        }
+        _run_cli(monkeypatch, ["just-akash", "destroy-all", "--run-tag", "abcdef12"])
         captured = capsys.readouterr()
-        assert "No deployments to destroy" in captured.out
+        assert "no deployments listed" in captured.out
 
 
 class TestCliTag:
@@ -256,32 +263,44 @@ class TestCliDestroyWithConfirm:
 
 
 class TestCliDestroyAllWithConfirm:
-    @patch("just_akash.api._extract_dseq", side_effect=["1", "2"])
     @patch("just_akash.api._save_tags")
     @patch("just_akash.api._load_tags", return_value={"1": "a", "2": "b"})
-    @patch("just_akash.api.format_deployments_table", return_value="table")
     @patch("just_akash.api.AkashConsoleAPI")
-    def test_destroy_all_confirmed(
-        self, MockAPI, mock_fmt, mock_load, mock_save, mock_dseq, monkeypatch, capsys
-    ):
-        monkeypatch.setenv("AKASH_API_KEY", "test-key")
-        client = MockAPI.return_value
-        client.list_deployments.return_value = [{"dseq": "1"}, {"dseq": "2"}]
-        monkeypatch.setattr("builtins.input", lambda _: "y")
-        _run_cli(monkeypatch, ["just-akash", "destroy-all"])
-        captured = capsys.readouterr()
-        assert "All deployments destroyed" in captured.out
+    def test_destroy_all_confirmed(self, MockAPI, mock_load, mock_save, monkeypatch, capsys):
+        from just_akash.bulk_close import PlanItem
 
-    @patch("just_akash.api.format_deployments_table", return_value="table")
-    @patch("just_akash.api.AkashConsoleAPI")
-    def test_destroy_all_cancelled(self, MockAPI, mock_fmt, monkeypatch, capsys):
         monkeypatch.setenv("AKASH_API_KEY", "test-key")
         client = MockAPI.return_value
-        client.list_deployments.return_value = [{"dseq": "1"}]
-        monkeypatch.setattr("builtins.input", lambda _: "n")
-        _run_cli(monkeypatch, ["just-akash", "destroy-all"])
+        client.close_all_deployments.return_value = {
+            "plan": [
+                PlanItem("1", "close", "created by run abcdef12", ("just-akash-x.abcdef12",))
+            ],
+            "closed": [{}],
+            "closed_dseqs": ["1"],
+            "failed_dseqs": [],
+            "dry_run": False,
+        }
+        _run_cli(monkeypatch, ["just-akash", "destroy-all", "--run-tag", "abcdef12", "--yes"])
         captured = capsys.readouterr()
-        assert "Cancelled" in captured.out
+        assert "Closed 1 deployment" in captured.out
+        # Only the closed dseq loses its tag; dseq 2 was not in scope.
+        mock_save.assert_called_once_with({"2": "b"})
+
+    @patch("just_akash.api.AkashConsoleAPI")
+    def test_destroy_all_cancelled(self, MockAPI, monkeypatch, capsys):
+        """Without --yes it is a dry run: the close is planned, never executed."""
+        monkeypatch.setenv("AKASH_API_KEY", "test-key")
+        client = MockAPI.return_value
+        client.close_all_deployments.return_value = {
+            "plan": [],
+            "closed": [],
+            "closed_dseqs": [],
+            "failed_dseqs": [],
+            "dry_run": True,
+        }
+        _run_cli(monkeypatch, ["just-akash", "destroy-all", "--run-tag", "abcdef12"])
+        assert client.close_all_deployments.call_args.kwargs["execute"] is False
+        assert "Dry run" in capsys.readouterr().out
 
 
 class TestCliDeployPassesArgs:

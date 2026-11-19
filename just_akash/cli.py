@@ -781,10 +781,16 @@ def main():
     )
 
     # ── destroy-all ────────────────────────────────────
-    destroy_all_p = subparsers.add_parser("destroy-all", help="Destroy all deployments")
-    destroy_all_p.add_argument(
-        "-y", "--yes", action="store_true", help="Skip confirmation prompts"
+    destroy_all_p = subparsers.add_parser(
+        "destroy-all",
+        help="Close this run's and/or allowlisted deployments (never unscoped; dry run w/o --yes)",
     )
+    destroy_all_p.add_argument(
+        "-y", "--yes", action="store_true", help="Actually close the planned deployments"
+    )
+    from .api import _add_bulk_close_scope_args
+
+    _add_bulk_close_scope_args(destroy_all_p)
 
     # ── tag ────────────────────────────────────────────
     tag_p = subparsers.add_parser("tag", help="Tag a deployment with a name")
@@ -2118,41 +2124,24 @@ def main():
 
     # ── destroy-all ────────────────────────────────────
     elif args.command == "destroy-all":
-        from .api import (
-            AkashConsoleAPI,
-            _confirm,
-            _extract_dseq,
-            _load_tags,
-            _save_tags,
-            format_deployments_table,
-        )
+        # just-akash-73o: NEVER unscoped. Only this run's dseqs (--run-tag) and/or an
+        # explicit --allow-dseq list; Flynn prod placements refused even when allowlisted;
+        # a dry run unless --yes. On 2026-11-19 an unscoped bulk close on the shared
+        # console-2 account closed Flynn's four prod leases.
+        from .api import AkashConsoleAPI, _run_scoped_bulk_close
 
         try:
             client = AkashConsoleAPI(_require_api_key())
-            deployments = client.list_deployments()
-            if not deployments:
-                # `destroy-all` is destructive-by-default. An empty Console listing here
-                # is the exact wedge #208 names: "no deployments to destroy" is silent
-                # authorization to skip — but the chain may hold 21 ACTIVE that this
-                # Console key cannot see. Warn before printing the all-clear.
-                _warn_if_listing_degraded(client, deployments)
-                print("No deployments to destroy.")
-            else:
-                print(format_deployments_table(deployments))
-                if _confirm("\nDestroy all? (y/N) ", yes=args.yes):
-                    client.close_all_deployments()
-                    tags = _load_tags()
-                    for d in deployments:
-                        dseq_val = _extract_dseq(d)
-                        if dseq_val:
-                            tags.pop(dseq_val, None)
-                    _save_tags(tags)
-                    print("All deployments destroyed.")
-                else:
-                    print("Cancelled.")
+            # An empty listing is the #208 wedge: "nothing to destroy" may be a Console
+            # key that cannot see what the chain holds. Warn before the all-clear.
+            code = _run_scoped_bulk_close(
+                client, args, on_empty_listing=lambda: _warn_if_listing_degraded(client, [])
+            )
         except RuntimeError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
+        if code:
+            sys.exit(code)
 
     # ── tag ────────────────────────────────────────────
     elif args.command == "tag":

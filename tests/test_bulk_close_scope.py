@@ -124,7 +124,7 @@ def test_a_run_tag_that_is_not_a_run_id_is_refused():
 # -- the human-only override -------------------------------------------------------------
 @pytest.mark.parametrize("env", [{"CI": "true"}, {"GITHUB_ACTIONS": "true"}, {"CLAUDECODE": "1"}])
 def test_the_protection_override_is_refused_in_ci_and_from_an_agent(monkeypatch, env):
-    for k in ("CI", "GITHUB_ACTIONS", "CLAUDECODE"):
+    for k in bulk_close.NON_HUMAN_ENV:
         monkeypatch.delenv(k, raising=False)
     for k, v in env.items():
         monkeypatch.setenv(k, v)
@@ -136,7 +136,7 @@ def test_the_protection_override_is_refused_in_ci_and_from_an_agent(monkeypatch,
 
 
 def test_the_protection_override_is_refused_without_a_terminal(monkeypatch):
-    for k in ("CI", "GITHUB_ACTIONS", "CLAUDECODE"):
+    for k in bulk_close.NON_HUMAN_ENV:
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setattr(bulk_close, "_stdin_is_tty", lambda: False)
     with pytest.raises(PermissionError):
@@ -147,7 +147,7 @@ def test_the_protection_override_is_refused_without_a_terminal(monkeypatch):
 
 def test_a_human_at_a_terminal_can_override_for_an_allowlisted_dseq_only(monkeypatch):
     """THE CONTROL: the override exists, and still never widens past the allowlist."""
-    for k in ("CI", "GITHUB_ACTIONS", "CLAUDECODE"):
+    for k in bulk_close.NON_HUMAN_ENV:
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setattr(bulk_close, "_stdin_is_tty", lambda: True)
     client = _FakeClient(FLEET)
@@ -155,6 +155,20 @@ def test_a_human_at_a_terminal_can_override_for_an_allowlisted_dseq_only(monkeyp
         allow_dseqs=["1789116940502"], execute=True, override_protected=True
     )
     assert client.closed == ["1789116940502"]
+
+
+def test_the_override_never_reaches_a_protected_dseq_that_is_not_allowlisted(monkeypatch):
+    """Own-run is not enough under the override: only the allowlist can name a protected dseq."""
+    for k in bulk_close.NON_HUMAN_ENV:
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(bulk_close, "_stdin_is_tty", lambda: True)
+    monkeypatch.setenv(bulk_close.PROTECTED_DSEQS_ENV, "1796000000001")
+    client = _FakeClient(FLEET)
+    result = client.close_all_deployments(
+        run_tag=RUN, allow_dseqs=["1789116940502"], execute=True, override_protected=True
+    )
+    assert client.closed == ["1789116940502"]
+    assert _actions(result["plan"])["1796000000001"] == "refuse"
 
 
 # -- the CLI entry points -----------------------------------------------------------------
@@ -214,12 +228,11 @@ def test_the_legacy_close_all_command_is_scoped_too(monkeypatch, capsys, tmp_pat
     client = _FakeClient(FLEET)
     monkeypatch.setenv("AKASH_API_KEY", "test-key")
     monkeypatch.setattr(api_mod, "AkashConsoleAPI", lambda key: client)
-    monkeypatch.setattr(sys, "argv", ["api", "close-all", "--yes"])
-    try:
+    monkeypatch.setattr(sys, "argv", ["api", "--yes", "close-all"])
+    with pytest.raises(SystemExit):
         api_mod.api_main()
-    except SystemExit:
-        pass
     assert client.closed == []
+    assert "just-akash-73o" in capsys.readouterr().out
 
 
 # -- AC5: e2e cleanup stays own-dseq only -------------------------------------------------
