@@ -1072,7 +1072,7 @@ class AkashConsoleAPI:
         if scope is None:
             scope = ["shell"]
         if services is not None and not (
-            isinstance(services, list | tuple) and all(isinstance(s, str) and s for s in services)
+            isinstance(services, list) and all(isinstance(s, str) and s for s in services)
         ):
             raise ValueError("services must be a list of service names, each a nonempty string")
         gseq = oseq = None

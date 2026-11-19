@@ -53,14 +53,15 @@ def fake(monkeypatch):
 
     monkeypatch.setattr(api.urllib.request, "urlopen", localhost_only)
     # The two TLS seams of tests/test_integration_fake.py: the proxy socket goes to the
-    # local ws:// stub, which takes no ssl= argument.
+    # fake's local stub (exactly fa.proxy_url, on 127.0.0.1), which takes no ssl= argument.
+    # Every other URL keeps its TLS context.
     monkeypatch.setattr(
         lease_shell.LeaseShellTransport, "_get_proxy_ws_url", lambda self: fa.proxy_url
     )
     real_connect = lease_shell.connect
 
     def _connect(url, **kw):
-        if str(url).startswith("ws://"):
+        if url == fa.proxy_url:
             kw.pop("ssl", None)
         return real_connect(url, **kw)
 
