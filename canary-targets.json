@@ -6,7 +6,7 @@
   },
   "hetzner_hel": {
     "dseq": "1789100804519",
-    "live": false,
+    "live": true,
     "uri": "bqejbdqod1cnf374uip9aovfdk.ingress.m3a.eu-n-3.digitalfrontier.network"
   },
   "onidc": {
