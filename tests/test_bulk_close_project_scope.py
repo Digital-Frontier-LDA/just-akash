@@ -131,3 +131,22 @@ def test_the_cli_closes_within_the_named_project(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "argv", argv)
     cli.main()
     assert c.closed == ["1"]
+
+
+def test_the_cli_holds_the_project_line_whatever_client_it_is_handed(monkeypatch, capsys):
+    """A client that would not refuse (a mock, a subclass) is never asked to close."""
+    import sys
+    from unittest.mock import MagicMock
+
+    import just_akash.api as api_mod
+    from just_akash import cli
+
+    monkeypatch.delenv(bulk_close.PROJECT_ENV, raising=False)
+    monkeypatch.setenv("AKASH_API_KEY", "test-key")
+    client = MagicMock()
+    monkeypatch.setattr(api_mod, "AkashConsoleAPI", lambda key: client)
+    monkeypatch.setattr(sys, "argv", ["just-akash", "destroy-all", "--allow-dseq", "3", "--yes"])
+    with pytest.raises(SystemExit) as e:
+        cli.main()
+    assert e.value.code == 2
+    client.close_all_deployments.assert_not_called()

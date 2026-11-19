@@ -29,6 +29,9 @@ from .provenance import PLACEMENT_PREFIX, RUN_SEPARATOR, is_ours_placement, run_
 
 BEAD = "just-akash-73o"
 PROTECTED_DSEQS_ENV = "JUST_AKASH_PROTECTED_DSEQS"
+# The caller's Console project (a UUID). An unbound key reaches EVERY project of its team, so
+# an actual close requires it and refuses any dseq filed elsewhere, or whose project is unknown.
+PROJECT_ENV = "JUST_AKASH_CONSOLE_PROJECT_ID"
 # Any of these set means "not a human at a terminal": the override is refused.
 NON_HUMAN_ENV = ("CI", "GITHUB_ACTIONS", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX")
 
@@ -106,6 +109,23 @@ def group_names(doc: Any) -> tuple[str, ...]:
     return tuple(dict.fromkeys(found))
 
 
+def project_ids_of(doc: Any) -> frozenset[str]:
+    """The Console `projectId` a listed deployment carries (top level or under `deployment`)."""
+    found: set[str] = set()
+    if isinstance(doc, dict):
+        for holder in (doc, doc.get("deployment")):
+            if isinstance(holder, dict):
+                value = holder.get("projectId")
+                if isinstance(value, str) and value.strip():
+                    found.add(value.strip())
+    return frozenset(found)
+
+
+def project_from_env() -> str | None:
+    value = os.environ.get(PROJECT_ENV, "").strip()
+    return value or None
+
+
 def plan_bulk_close(
     deployments: Iterable[dict[str, Any]],
     *,
@@ -113,6 +133,7 @@ def plan_bulk_close(
     allow_dseqs: Iterable[str],
     protected_dseqs: Iterable[str] = (),
     override_protected: bool = False,
+    project_id: str | None = None,
 ) -> list[PlanItem]:
     from .api import _extract_dseq
 
@@ -127,6 +148,14 @@ def plan_bulk_close(
         prod = [n for n in names if is_ours_placement(n)]
         own_run = bool(run_tag) and any(run_id_of(n) == run_tag for n in names)
         allowlisted = dseq in allow
+
+        if project_id and (own_run or allowlisted):
+            projects = project_ids_of(doc)
+            if projects != {project_id}:
+                # Never overridable: no flag reaches another project.
+                where = ", ".join(sorted(projects)) or "unknown"
+                plan.append(PlanItem(dseq, REFUSE, f"project {where} is not {project_id}", names))
+                continue
 
         refusal = ""
         if prod:

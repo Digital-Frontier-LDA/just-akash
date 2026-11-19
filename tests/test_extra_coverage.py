@@ -384,7 +384,9 @@ class TestApiMain:
         from just_akash.bulk_close import PlanItem
 
         monkeypatch.setenv("AKASH_API_KEY", "test-key")
-        monkeypatch.setattr(sys, "argv", ["api", "--yes", "close-all", "--allow-dseq", "1"])
+        monkeypatch.setattr(
+            sys, "argv", ["api", "--yes", "close-all", "--allow-dseq", "1", "--project-id", "p"]
+        )
         client = MockAPI.return_value
         client.close_all_deployments.return_value = {
             "plan": [PlanItem("1", "close", "allowlisted", ("x",))],

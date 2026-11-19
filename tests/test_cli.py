@@ -280,7 +280,10 @@ class TestCliDestroyAllWithConfirm:
             "failed_dseqs": [],
             "dry_run": False,
         }
-        _run_cli(monkeypatch, ["just-akash", "destroy-all", "--run-tag", "abcdef12", "--yes"])
+        _run_cli(
+            monkeypatch,
+            ["just-akash", "destroy-all", "--run-tag", "abcdef12", "--project-id", "p", "--yes"],
+        )
         captured = capsys.readouterr()
         assert "Closed 1 deployment" in captured.out
         # Only the closed dseq loses its tag; dseq 2 was not in scope.
