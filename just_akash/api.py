@@ -317,7 +317,15 @@ class AkashConsoleAPI:
     # This many INCONSISTENT whole passes RAISE (a multi-page listing also needs a
     # second, identical pass before it is trusted).
     LIST_ATTEMPTS = 3
+    # The pause before retry k (k = 1, 2, …) is LIST_RETRY_SLEEP_S * LIST_RETRY_BACKOFF**(k-1):
+    # 2 s, then 12 s (#281). Bid probe 2026-11-19 saw a single page report total = rows + 1
+    # on all 3 passes ~2 s apart, three runs out of four, right after its own create/close
+    # cycle. A Console count that settles within ~14 s is accepted; one that never settles
+    # still raises after LIST_ATTEMPTS.
     LIST_RETRY_SLEEP_S = 2.0
+    LIST_RETRY_BACKOFF = 6.0
+    # (rows so far, total) of the last page the last pass read; logged per pass (#281).
+    _last_list_shape: tuple[int, int | None] = (0, None)
     # 50 pages x 100 = 5000 deployments; past that, a server ignoring `skip` is likelier.
     LIST_MAX_PAGES = 50
 
@@ -566,11 +574,13 @@ class AkashConsoleAPI:
             # sudden single page must match it like any other pass.
             if rows is not None and pages == 1 and confirmed is None:
                 deployments = rows
+                self._log_list_converged(failures)
                 break
             if rows is not None:
                 seq = [_extract_dseq(d) for d in rows]
                 if seq == confirmed:
                     deployments = rows
+                    self._log_list_converged(failures)
                     break
                 if confirmed is None:
                     confirmed = seq  # a multi-page listing is only trusted twice over
@@ -584,12 +594,15 @@ class AkashConsoleAPI:
                     f"{self.LIST_ATTEMPTS} passes ({why}). Refusing to report a possibly "
                     "partial account — a missing row must not look like 'nothing to do'."
                 )
+            pause = self.LIST_RETRY_SLEEP_S * self.LIST_RETRY_BACKOFF ** (failures - 1)
+            n_rows, total = self._last_list_shape
             print(
-                f"WARNING: list_deployments pass was inconsistent ({why}); "
-                f"restarting the listing ({failures}/{self.LIST_ATTEMPTS}).",
+                f"WARNING: list_deployments pass {failures}/{self.LIST_ATTEMPTS}: "
+                f"rows={n_rows} total={total} — inconsistent ({why}); "
+                f"restarting the listing in {pause:g}s.",
                 file=sys.stderr,
             )
-            time.sleep(self.LIST_RETRY_SLEEP_S)
+            time.sleep(pause)
         if active_only:
             result = []
             for d in deployments:
@@ -632,6 +645,17 @@ class AkashConsoleAPI:
         rows = [d for d in raw if isinstance(d, dict)]
         return rows, len(raw), pagination if isinstance(pagination, dict) else {}
 
+    def _log_list_converged(self, failures: int) -> None:
+        """After a retry, say how the listing settled, so a run shows whether the backoff
+        converged or the Console count really is off (#281). Silent on a first-pass listing."""
+        if failures:
+            n_rows, total = self._last_list_shape
+            print(
+                f"list_deployments: consistent on pass {failures + 1}/{self.LIST_ATTEMPTS} "
+                f"after {failures} inconsistent: rows={n_rows} total={total}",
+                file=sys.stderr,
+            )
+
     def _list_deployments_pass(
         self, max_pages: int | None = None
     ) -> tuple[list[dict[str, Any]] | None, str, int]:
@@ -651,6 +675,7 @@ class AkashConsoleAPI:
             has_more = pg.get("hasMore") is True
             total = pg.get("total")
             total = total if isinstance(total, int) and not isinstance(total, bool) else None
+            self._last_list_shape = (skip + n_raw, total)
             if n_raw == 0 and has_more:
                 return None, f"empty page at skip={skip} with hasMore=true", page_no
             for d in rows:
