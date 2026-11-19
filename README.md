@@ -92,7 +92,7 @@ uv tool install --force --from "git+https://github.com/Digital-Frontier-LDA/just
 | `just add-funds AMOUNT [dseq]` | `just add-funds 5 akash-node` | Add USD to escrow (min 0.5) |
 | `just auto-topup [dseq] [on\|off]` | `just auto-topup akash-node on` | Show / toggle auto escrow top-up |
 | `just destroy [dseq]` | `just destroy 12345` | Destroy an instance |
-| `just destroy-all` | `just destroy-all run_tag=<run id> [allow_dseq=<dseq>,…] [project_id=<uuid> yes=yes]` | Close only this run's deployments and/or an explicit allowlist. Never unscoped; prod placements refused; dry run without `yes=yes` ([behaviour change](#scoped-bulk-close)) |
+| `just destroy-all` | `just destroy-all run_tag=<run id> [allow_dseq=<dseq>,…] [project_id=<uuid> yes=yes]` | Close only this run's deployments and/or an explicit allowlist, inside the caller's Console project. Never unscoped; prod placements and other projects refused; dry run without `yes=yes`, and `yes=yes` needs `project_id=` ([behaviour change](#scoped-bulk-close)) |
 | `just list` | `just list` | List active instances |
 | `just status [dseq]` | `just status 12345` | Show instance details |
 | `just tag [dseq] [name]` | `just tag 12345 my-db` | Tag a deployment with a name |
