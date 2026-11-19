@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import inspect
 import json
 import logging
@@ -10,6 +9,7 @@ import textwrap
 import threading
 import traceback
 import types
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -393,23 +393,25 @@ def test_concurrent_submit_cannot_cross_the_same_pending_opener(client, monkeypa
 
 
 @pytest.mark.parametrize("runtime_method", [False, True])
-def test_real_owner_probe_uses_only_status_scope_before_the_exact_create(
+def test_real_owner_probe_reads_the_account_and_mints_no_token_before_the_exact_create(
     client, monkeypatch, runtime_method
 ):
+    """openmix-q2mfu: the owner probe used to mint a status-only, dseq-0 JWT and read its
+    issuer; the Console refuses that token (403 "Name the deployments the token is for").
+    It now reads GET /v1/user/me and GET /v1/wallets, and nothing is minted."""
     monkeypatch.delattr(client, "account_address")
-    claim = base64.urlsafe_b64encode(json.dumps({"iss": OWNER}).encode()).decode().rstrip("=")
-    token = "synthetic-header." + claim + ".synthetic-signature"
     paths = []
 
     def response_for(request, **_kwargs):
-        paths.append(request.full_url)
-        if request.full_url.endswith("/create-jwt-token"):
-            assert json.loads(request.data) == {
-                "data": {"ttl": 30, "leases": {"access": "scoped", "scope": ["status"]}}
-            }
-            data = {"token": token}
+        url = urllib.parse.urlparse(request.full_url)
+        paths.append((request.get_method(), url.scheme + "://" + url.netloc + url.path))
+        if url.path == "/v1/user/me":
+            data = {"userId": "user-1"}
+        elif url.path == "/v1/wallets":
+            assert urllib.parse.parse_qs(url.query)["userId"] == ["user-1"]
+            data = [{"userId": "user-1", "address": OWNER}]
         else:
-            assert request.full_url.endswith("/v1/deployments")
+            assert url.path == "/v1/deployments"
             data = {"dseq": "123"}
         response = MagicMock()
         response.read.return_value = json.dumps({"data": data}).encode()
@@ -422,12 +424,13 @@ def test_real_owner_probe_uses_only_status_scope_before_the_exact_create(
     args = runtime_authority() if runtime_method else authority()
     assert method(**args) == {"dseq": "123"}
     assert paths == [
-        "https://console-api.akash.network/v1/create-jwt-token",
-        "https://console-api.akash.network/v1/deployments",
+        ("GET", "https://console-api.akash.network/v1/user/me"),
+        ("GET", "https://console-api.akash.network/v1/wallets"),
+        ("POST", "https://console-api.akash.network/v1/deployments"),
     ]
     with pytest.raises(CreateHeld):
         method(**args)
-    assert len(paths) == 2
+    assert len(paths) == 3
 
 
 @pytest.mark.parametrize("hours", [2, 0.25, 2.0, 1e308, 2**256])

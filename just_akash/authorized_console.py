@@ -7,7 +7,6 @@ outcomes retain that operation for reconciliation, not another POST.
 
 from __future__ import annotations
 
-import base64
 import json
 import math
 import re
@@ -33,10 +32,6 @@ from .api import CI_CONSOLE_ORIGIN, CIConsoleAPI
 from .deployment_receipt import artifact_identity
 
 CONSOLE_BACKEND = BackendIdentity(BackendKind.MEDIATED, CI_CONSOLE_ORIGIN)
-_OWNER_PROBE_URL = CI_CONSOLE_ORIGIN + "/v1/create-jwt-token"
-_OWNER_PROBE_BODY = json.dumps(
-    {"data": {"ttl": 30, "leases": {"access": "scoped", "scope": ["status"]}}}
-).encode("utf-8")
 
 
 class CreateHeld(RuntimeError):
@@ -116,18 +111,17 @@ class AuthorizedConsoleCreate(CIConsoleAPI):
         raise CreateHeld("Use submit with a durably redeemed create authorization")
 
     def account_address(self) -> str:
-        """Read the issuer from this fixed HTTPS mediator's status-only token.
+        """The key's own account, read from this fixed HTTPS mediator. Mints no token.
 
-        The token remains local and is not a signature or chain binding proof;
-        the trusted broker independently establishes its signer policy.
+        openmix-q2mfu: this used to mint a status-only, dseq-0 token and read its
+        issuer; the Console refuses a token that names no deployment (403 "Name the
+        deployments the token is for"), so no create could establish its owner. It
+        reads GET /v1/user/me then GET /v1/wallets (AkashConsoleAPI.account_address).
+        This is not a signature or chain binding proof; the trusted broker
+        independently establishes its signer policy.
         """
-        token = self.create_jwt("0", ttl=30, scope=["status"])
         try:
-            parts = token.split(".")
-            if len(parts) != 3:
-                raise ValueError("invalid token structure")
-            claims = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
-            owner = claims.get("iss")
+            owner = super().account_address()
             if not is_canonical_akash_owner(owner):
                 raise ValueError("invalid owner")
             return owner
@@ -269,10 +263,6 @@ class AuthorizedConsoleCreate(CIConsoleAPI):
     def _open_request(self, request: urllib.request.Request) -> Any:
         if not request.full_url.startswith(CI_CONSOLE_ORIGIN + "/"):
             raise CreateHeld("Console request differs from the registered HTTPS origin")
-        if request.get_method() == "POST" and request.full_url == _OWNER_PROBE_URL:
-            if self._binding is None or self._used or request.data != _OWNER_PROBE_BODY:
-                raise CreateHeld("Only the bound status-only owner probe is supported")
-            return super()._open_request(request)
         if request.get_method() not in ("GET", "POST") or (
             request.get_method() == "POST"
             and request.full_url != CI_CONSOLE_ORIGIN + "/v1/deployments"

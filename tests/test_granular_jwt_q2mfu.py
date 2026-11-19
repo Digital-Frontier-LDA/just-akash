@@ -185,9 +185,7 @@ def test_create_jwt_names_the_dseq_provider_and_service(fake) -> None:
 
 
 def test_create_jwt_with_provider_names_the_dseq(fake) -> None:
-    got = _outcome(
-        lambda: _client().create_jwt_with_provider(DSEQ, _PROVIDER, scope=["logs"])
-    )
+    got = _outcome(lambda: _client().create_jwt_with_provider(DSEQ, _PROVIDER, scope=["logs"]))
     assert got == ("ok", "fake.jwt.token")
     (body,) = fake.console.app.jwt_requests
     assert _named(body) == [(int(DSEQ), _PROVIDER, ("logs",), ("web",))]

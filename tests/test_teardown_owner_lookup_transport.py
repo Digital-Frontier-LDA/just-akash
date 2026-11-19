@@ -12,11 +12,11 @@ patched, so the exceptions are the ones the client actually raises, not ones a f
 
 from __future__ import annotations
 
-import base64
 import io
 import json
 import time
 import urllib.error
+import urllib.parse
 from email.message import Message
 
 import pytest
@@ -24,10 +24,26 @@ import pytest
 from just_akash import api, chain, owner_lookup, wallet_pool
 
 OWNER = "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee"
-OTHER = "akash1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+# A canonical address (akash1 + 38): account_address() refuses any other (openmix-q2mfu).
+OTHER = "akash1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
 GROUP = "just-akash-runner.abc123"
 DSEQ = "1789370984331"
 KEYS = ["console-key-alpha-0123456789abcdef", "console-key-bravo-fedcba9876543210"]
+
+
+#: openmix-q2mfu: account_address() reads GET /v1/user/me, then GET /v1/wallets?userId=<it>;
+#: the wallets read is the per-key "whoami" these scripts answer (it used to mint a dseq-0
+#: JWT, which the Console now refuses). /v1/user/me is answered by ME, outside the scripts.
+USER_ID = "00000000-0000-4000-8000-0000000000aa"
+ME = {"data": {"userId": USER_ID}}
+
+
+def _is_me(url: str) -> bool:
+    return urllib.parse.urlparse(url).path.endswith("/v1/user/me")
+
+
+def _is_whoami(url: str) -> bool:
+    return urllib.parse.urlparse(url).path.endswith("/v1/wallets")
 
 
 class _Response:
@@ -44,9 +60,8 @@ class _Response:
         return self._body
 
 
-def _jwt(address: str) -> dict:
-    claims = base64.urlsafe_b64encode(json.dumps({"iss": address}).encode()).decode().rstrip("=")
-    return {"data": {"token": f"header.{claims}.signature"}}
+def _wallets(address: str) -> dict:
+    return {"data": [{"userId": USER_ID, "address": address}]}
 
 
 def _http_error(url: str, code: int) -> urllib.error.HTTPError:
@@ -71,7 +86,9 @@ def console(monkeypatch):
     def urlopen(request, *args, **kwargs):
         key = request.headers.get("X-api-key") or request.get_header("X-api-key")
         url = request.full_url
-        kind = "mint" if url.endswith("/v1/create-jwt-token") else "read"
+        if _is_me(url):
+            return _Response(ME)
+        kind = "mint" if _is_whoami(url) else "read"
         state["calls"].append((kind, key))
         result = outcome(kind, key)
         if result == RESET:
@@ -119,7 +136,7 @@ def test_an_outage_on_every_credential_is_owner_lookup_unreachable(console, monk
 
 
 def test_a_transient_reset_is_retried_and_then_selects_the_owner(console, monkeypatch) -> None:
-    console["mint"] = {KEYS[0]: [RESET, _jwt(OWNER)], KEYS[1]: [_jwt(OTHER)]}
+    console["mint"] = {KEYS[0]: [RESET, _wallets(OWNER)], KEYS[1]: [_wallets(OTHER)]}
     _no_chain(monkeypatch, names=[GROUP])
 
     client = wallet_pool._raw_client_for_bound_owner(DSEQ, OWNER, GROUP)
@@ -131,7 +148,7 @@ def test_a_transient_reset_is_retried_and_then_selects_the_owner(console, monkey
 def test_a_different_address_excludes_a_key_and_the_matching_key_is_selected(
     console, monkeypatch
 ) -> None:
-    console["mint"] = {KEYS[0]: [_jwt(OTHER)], KEYS[1]: [_jwt(OWNER)]}
+    console["mint"] = {KEYS[0]: [_wallets(OTHER)], KEYS[1]: [_wallets(OWNER)]}
     calls = _no_chain(monkeypatch, names=[GROUP])
 
     client = wallet_pool._raw_client_for_bound_owner(DSEQ, OWNER, GROUP)
@@ -142,7 +159,7 @@ def test_a_different_address_excludes_a_key_and_the_matching_key_is_selected(
 
 
 def test_a_proven_mismatch_on_every_key_keeps_its_own_verdict(console, monkeypatch) -> None:
-    console["mint"] = {key: [_jwt(OTHER)] for key in KEYS}
+    console["mint"] = {key: [_wallets(OTHER)] for key in KEYS}
     _no_chain(monkeypatch)
 
     with pytest.raises(RuntimeError) as raised:
@@ -153,7 +170,7 @@ def test_a_proven_mismatch_on_every_key_keeps_its_own_verdict(console, monkeypat
 
 
 def test_an_outage_beside_a_mismatch_is_still_unreachable(console, monkeypatch) -> None:
-    console["mint"] = {KEYS[0]: [_jwt(OTHER)], KEYS[1]: [RESET]}
+    console["mint"] = {KEYS[0]: [_wallets(OTHER)], KEYS[1]: [RESET]}
     _no_chain(monkeypatch)
 
     with pytest.raises(RuntimeError) as raised:

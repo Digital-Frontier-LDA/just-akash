@@ -30,7 +30,6 @@ read timeout) was made against the real stack on #369's review and is cited abov
 
 from __future__ import annotations
 
-import base64
 import json
 import math
 import re
@@ -39,6 +38,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 from pathlib import Path
 
 import pytest
@@ -57,9 +57,27 @@ from just_akash.owner_lookup import (
 )
 
 OWNER = "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee"
-OTHER = "akash1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+# A canonical address (akash1 + 38): account_address() refuses any other (openmix-q2mfu).
+OTHER = "akash1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
 DSEQ = "1789370984331"
 KEYS = ["console-key-alpha-0123456789abcdef", "console-key-bravo-fedcba9876543210"]
+
+
+#: openmix-q2mfu: account_address() reads GET /v1/user/me, then GET /v1/wallets?userId=<it>;
+#: the wallets read is the per-key "whoami" these scripts answer (it used to mint a dseq-0
+#: JWT, which the Console now refuses). /v1/user/me is answered by ME, outside the scripts.
+USER_ID = "00000000-0000-4000-8000-0000000000aa"
+ME = {"data": {"userId": USER_ID}}
+
+
+def _is_me(url: str) -> bool:
+    return urllib.parse.urlparse(url).path.endswith("/v1/user/me")
+
+
+def _is_whoami(url: str) -> bool:
+    return urllib.parse.urlparse(url).path.endswith("/v1/wallets")
+
+
 WORKFLOWS = Path(__file__).resolve().parents[1] / ".github" / "workflows"
 
 # The production deadline is 600s; every test here shrinks it so the bound is measured
@@ -114,9 +132,8 @@ class _Response:
         return self._body
 
 
-def _jwt(address: str) -> dict:
-    claims = base64.urlsafe_b64encode(json.dumps({"iss": address}).encode()).decode().rstrip("=")
-    return {"data": {"token": f"header.{claims}.signature"}}
+def _wallets(address: str) -> dict:
+    return {"data": [{"userId": USER_ID, "address": address}]}
 
 
 STALL = "stall"
@@ -141,8 +158,10 @@ def console(monkeypatch):
 
     def _resolve(request):
         key = request.headers.get("X-api-key") or request.get_header("X-api-key")
-        kind = "mint" if request.full_url.endswith("/v1/create-jwt-token") else "read"
-        script = state[kind].get(key) or (_jwt(OTHER) if kind == "mint" else {"dseq": DSEQ})
+        if _is_me(request.full_url):
+            return ME
+        kind = "mint" if _is_whoami(request.full_url) else "read"
+        script = state[kind].get(key) or (_wallets(OTHER) if kind == "mint" else {"dseq": DSEQ})
         result = script[0] if isinstance(script, list) else script
         if isinstance(script, list):
             script.pop(0)
@@ -207,7 +226,7 @@ def test_a_recovery_before_the_deadline_still_selects_the_owner(console, monkeyp
         monkeypatch.setattr(module, "OWNER_LOOKUP_DEADLINE_SECONDS", 6.0)
     console["mint"][KEYS[0]] = [
         urllib.error.URLError(ConnectionResetError(54, "Connection reset by peer")),
-        _jwt(OWNER),
+        _wallets(OWNER),
     ]
     monkeypatch.setattr(chain, "corroborated_deployment_group_names", lambda *a, **k: ["g"])
     client = wallet_pool._raw_client_for_bound_owner(DSEQ, OWNER, "g")
@@ -220,11 +239,13 @@ def test_an_abandoned_late_answer_is_discarded(console, monkeypatch) -> None:
     late = {"armed": True}
 
     def urlopen(request, *args, **kwargs):
+        if _is_me(request.full_url):
+            return _Response(ME)
         if late["armed"]:
             late["armed"] = False
             threading.Event().wait(_TEST_DEADLINE + 1.0)  # answer arrives AFTER the deadline
-            return _Response(_jwt(OWNER))
-        return _Response(_jwt(OTHER))
+            return _Response(_wallets(OWNER))
+        return _Response(_wallets(OTHER))
 
     monkeypatch.setattr(api.urllib.request, "urlopen", urlopen)
     started = time.monotonic()
@@ -375,7 +396,7 @@ def test_a_dripping_first_key_cannot_starve_a_later_key_that_answers(console) ->
     key 1's drip burns only ITS share and key 2 — which would answer the owner — is
     still tried inside the phase budget."""
     console["mint"][KEYS[0]] = STALL  # would consume the WHOLE budget without shares
-    console["mint"][KEYS[1]] = _jwt(OWNER)
+    console["mint"][KEYS[1]] = _wallets(OWNER)
     import just_akash.chain as chain_mod
 
     saved = chain.corroborated_deployment_group_names
@@ -402,7 +423,7 @@ def test_the_share_keeps_the_e2e_scan_from_starvation(console) -> None:
     from just_akash import _e2e
 
     console["mint"][KEYS[0]] = STALL
-    console["mint"][KEYS[1]] = _jwt(OWNER)
+    console["mint"][KEYS[1]] = _wallets(OWNER)
     candidate, verdict = _e2e._select_owner_credential(DSEQ, OWNER, list(KEYS), None)
     assert candidate is not None and verdict is None
 
@@ -857,7 +878,7 @@ def test_the_in_process_owner_selection_ignores_a_stale_step_ceiling(console, mo
     from just_akash import _e2e
 
     monkeypatch.setenv(owner_lookup.OWNER_LOOKUP_DEADLINE_AT_ENV, str(time.time() - 601))
-    console["mint"][KEYS[0]] = _jwt(OWNER)
+    console["mint"][KEYS[0]] = _wallets(OWNER)
     monkeypatch.setattr(
         chain, "corroborated_deployment_group_population", lambda _o, _d, groups: groups
     )

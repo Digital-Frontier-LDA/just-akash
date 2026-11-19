@@ -22,6 +22,7 @@ read, the post-close settlement audit, and the backoff clock.
 from __future__ import annotations
 
 import json
+import urllib.parse
 from pathlib import Path
 from unittest.mock import patch
 
@@ -40,9 +41,25 @@ from just_akash.deployment_receipt import (
 )
 
 OWNER = "akash1n4uut3vxmkdp8wsrya3q0qyddgqey0rh9as4ee"
-OTHER = "akash1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+# A canonical address (akash1 + 38): account_address() refuses any other (openmix-q2mfu).
+OTHER = "akash1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
 GROUPS = [{"gseq": 1, "name": "just-akash-e2e.abc123def456"}]
 KEYS = ["console-key-alpha-0123456789abcdef", "console-key-bravo-fedcba9876543210"]
+
+
+#: openmix-q2mfu: account_address() reads GET /v1/user/me, then GET /v1/wallets?userId=<it>;
+#: the wallets read is the per-key "whoami" these scripts answer (it used to mint a dseq-0
+#: JWT, which the Console now refuses). /v1/user/me is answered by ME, outside the scripts.
+USER_ID = "00000000-0000-4000-8000-0000000000aa"
+ME = {"data": {"userId": USER_ID}}
+
+
+def _is_me(url: str) -> bool:
+    return urllib.parse.urlparse(url).path.endswith("/v1/user/me")
+
+
+def _is_whoami(url: str) -> bool:
+    return urllib.parse.urlparse(url).path.endswith("/v1/wallets")
 
 
 class _FakeConsole:
@@ -390,11 +407,8 @@ class _Response:
         return self._body
 
 
-def _jwt_for(address: str) -> bytes:
-    import base64
-
-    claims = base64.urlsafe_b64encode(json.dumps({"iss": address}).encode()).decode().rstrip("=")
-    return json.dumps({"data": {"token": f"header.{claims}.signature"}}).encode()
+def _wallets_for(address: str) -> bytes:
+    return json.dumps({"data": [{"userId": USER_ID, "address": address}]}).encode()
 
 
 @pytest.fixture
@@ -414,16 +428,18 @@ def real_console(monkeypatch):
 
     def urlopen(request, *args, **kwargs):
         url = request.full_url
-        if url.endswith("/v1/create-jwt-token"):
+        if _is_me(url):
+            return _Response(json.dumps(ME).encode())
+        if _is_whoami(url):
             outcome = state["script"][min(len(state["mints"]), len(state["script"]) - 1)]
             state["mints"].append(outcome)
             if outcome == "truncated":
-                return _Response(_jwt_for(OWNER), truncated=True)
+                return _Response(_wallets_for(OWNER), truncated=True)
             if outcome == "408":
                 raise urllib.error.HTTPError(
                     url, 408, "Request Timeout", Message(), io.BytesIO(b'{"message":"timeout"}')
                 )
-            return _Response(_jwt_for(outcome))
+            return _Response(_wallets_for(outcome))
         state["closes"].append((request.get_method(), url.rsplit("/", 1)[-1]))
         return _Response(b"{}")
 
