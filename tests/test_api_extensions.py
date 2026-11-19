@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import pytest
 
-from just_akash.api import AkashConsoleAPI
+from just_akash.api import AkashAPIError, AkashConsoleAPI
 
 # ── update_deployment (PUT /v1/deployments/{dseq}) ───────────────────
 
@@ -440,3 +440,152 @@ class TestAccountAddress:
             pytest.raises(RuntimeError, match="could not decode JWT payload"),
         ):
             client.account_address()
+
+
+# ── project-bound keys: tokens that name their deployment ───────────
+
+PROV = "akash1provider000000000000000000000000000000"
+
+
+def _project_forbidden() -> AkashAPIError:
+    # The Console's answer to a wallet- or provider-wide token request from a key
+    # bound to a project (apps/api jwt-token.controller.ts, errorCode project_forbidden).
+    return AkashAPIError("API Error (403): Name the deployments the token is for", status=403)
+
+
+def _console(scoped_error=None, deployment=None, token="head.e30.sig"):
+    """A fake _request: POST /v1/create-jwt-token raises ``scoped_error`` for any body
+    that does not name a deployment, and mints ``token`` for one that does; GET
+    /v1/deployments/<dseq> answers ``deployment``. Records every call."""
+    calls = []
+
+    def request(method, path, body=None, **_kw):
+        calls.append((method, path, body))
+        if method == "POST" and path == "/v1/create-jwt-token":
+            assert body is not None  # narrows the Optional for pyright; a mint always has a body
+            leases = body["data"]["leases"]
+            perms = leases.get("permissions") or [{}]
+            names_deployment = all(p.get("access") == "granular" for p in perms) and (
+                leases["access"] == "granular"
+            )
+            if scoped_error is not None and not names_deployment:
+                raise scoped_error
+            return {"data": {"token": token}}
+        if method == "GET" and path.startswith("/v1/deployments/"):
+            return {"data": deployment or {}}
+        raise AssertionError(f"unexpected request {method} {path}")
+
+    return request, calls
+
+
+class TestProjectBoundKey:
+    @patch.object(AkashConsoleAPI, "_request")
+    def test_create_jwt_for_deployment_names_the_deployment(self, mock_req):
+        mock_req.return_value = {"data": {"token": "jwt"}}
+        assert (
+            AkashConsoleAPI("key").create_jwt_for_deployment(
+                "1785245500842", PROV, scope=["shell"]
+            )
+            == "jwt"
+        )
+        leases = mock_req.call_args[0][2]["data"]["leases"]
+        assert leases["access"] == "granular"
+        (perm,) = leases["permissions"]
+        assert perm == {
+            "provider": PROV,
+            "access": "granular",
+            "deployments": [{"dseq": 1785245500842, "scope": ["shell"], "services": ["*"]}],
+        }
+
+    @pytest.mark.parametrize("dseq", ["0", "", "12a", "-1", None, "１２"])
+    def test_create_jwt_for_deployment_refuses_a_non_deployment_number(self, dseq):
+        with patch.object(AkashConsoleAPI, "_request") as mock_req:
+            with pytest.raises(ValueError, match="deployment number"):
+                AkashConsoleAPI("key").create_jwt_for_deployment(dseq, PROV)
+            mock_req.assert_not_called()
+
+    def test_provider_token_retries_naming_the_deployment_on_403(self):
+        request, calls = _console(scoped_error=_project_forbidden(), token="jwt2")
+        with patch.object(AkashConsoleAPI, "_request", side_effect=request):
+            token = AkashConsoleAPI("key").create_jwt_with_provider(
+                "1785245500842", PROV, ttl=1800, scope=["shell"]
+            )
+        assert token == "jwt2"
+        assert len(calls) == 2
+        first, second = (c[2]["data"] for c in calls)
+        assert first["leases"]["permissions"][0]["access"] == "scoped"
+        assert second["ttl"] == 1800
+        (perm,) = second["leases"]["permissions"]
+        assert perm["deployments"] == [
+            {"dseq": 1785245500842, "scope": ["shell"], "services": ["*"]}
+        ]
+
+    def test_provider_token_does_not_retry_without_a_deployment_number(self):
+        request, calls = _console(scoped_error=_project_forbidden())
+        with (
+            patch.object(AkashConsoleAPI, "_request", side_effect=request),
+            pytest.raises(AkashAPIError, match="Name the deployments"),
+        ):
+            AkashConsoleAPI("key").create_jwt_with_provider("0", PROV)
+        assert len(calls) == 1
+
+    def test_provider_token_does_not_retry_on_other_errors(self):
+        err = AkashAPIError("API Error (400): bad scope", status=400)
+        request, calls = _console(scoped_error=err)
+        with (
+            patch.object(AkashConsoleAPI, "_request", side_effect=request),
+            pytest.raises(AkashAPIError, match="bad scope"),
+        ):
+            AkashConsoleAPI("key").create_jwt_with_provider("1785245500842", PROV)
+        assert len(calls) == 1
+
+    def test_account_address_falls_back_to_a_status_token_for_the_named_deployment(self):
+        request, calls = _console(
+            scoped_error=_project_forbidden(),
+            deployment={"leases": [{"id": {"provider": PROV, "dseq": "1785245500842"}}]},
+            token=_jwt_with_iss({"iss": "akash1wallet00000000000000000000000000000000"}),
+        )
+        with patch.object(AkashConsoleAPI, "_request", side_effect=request):
+            addr = AkashConsoleAPI("key").account_address(dseq="1785245500842")
+        assert addr == "akash1wallet00000000000000000000000000000000"
+        assert [(m, p) for m, p, _ in calls] == [
+            ("POST", "/v1/create-jwt-token"),
+            ("GET", "/v1/deployments/1785245500842"),
+            ("POST", "/v1/create-jwt-token"),
+        ]
+        fallback = calls[2][2]["data"]
+        assert fallback["ttl"] == 300
+        (perm,) = fallback["leases"]["permissions"]
+        assert perm["provider"] == PROV
+        # Read-only: the identity probe never asks for more than status.
+        assert perm["deployments"] == [
+            {"dseq": 1785245500842, "scope": ["status"], "services": ["*"]}
+        ]
+
+    def test_account_address_without_a_dseq_raises_the_403(self):
+        request, calls = _console(scoped_error=_project_forbidden())
+        with (
+            patch.object(AkashConsoleAPI, "_request", side_effect=request),
+            pytest.raises(AkashAPIError, match="Name the deployments"),
+        ):
+            AkashConsoleAPI("key").account_address()
+        assert len(calls) == 1
+
+    def test_account_address_raises_the_403_when_the_deployment_has_no_lease(self):
+        request, calls = _console(scoped_error=_project_forbidden(), deployment={"leases": []})
+        with (
+            patch.object(AkashConsoleAPI, "_request", side_effect=request),
+            pytest.raises(AkashAPIError, match="Name the deployments"),
+        ):
+            AkashConsoleAPI("key").account_address(dseq="1785245500842")
+        assert [(m, p) for m, p, _ in calls] == [
+            ("POST", "/v1/create-jwt-token"),
+            ("GET", "/v1/deployments/1785245500842"),
+        ]
+
+    def test_account_address_keeps_the_wallet_wide_probe_when_it_works(self):
+        request, calls = _console(token=_jwt_with_iss({"iss": "akash1me"}))
+        with patch.object(AkashConsoleAPI, "_request", side_effect=request):
+            assert AkashConsoleAPI("key").account_address(dseq="1785245500842") == "akash1me"
+        assert len(calls) == 1
+        assert calls[0][2]["data"]["leases"] == {"access": "scoped", "scope": ["shell"]}
