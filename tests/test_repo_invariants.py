@@ -337,6 +337,19 @@ class TestDispatchRefGuard:
         self._write(repo, text)
         assert len(inv.check_dispatch_ref_guard(repo)) == 1
 
+    def test_an_overriding_step_before_a_later_sops_call_is_caught(self, repo):
+        """A first sops-env call is fine; the check must look at EVERY sops-env step.
+        A later step that overrides its job status would still load the secrets after
+        the guard refused the ref, and it must be named as the offender."""
+        second = _SOPS.replace("- name: Load SOPS secrets", "- name: Load SOPS secrets again")
+        self._write(repo, _dispatch_workflow(_GUARD + _CHECKOUT + _SOPS + second))
+        assert inv.check_dispatch_ref_guard(repo) == []
+        second = second.replace("        uses:", "        if: always()\n        uses:")
+        self._write(repo, _dispatch_workflow(_GUARD + _CHECKOUT + _SOPS + second))
+        problems = inv.check_dispatch_ref_guard(repo)
+        assert len(problems) == 1, problems
+        assert "'report' " not in problems[0] and "'Load SOPS secrets again'" in problems[0]
+
 
 def _real_guards() -> list[tuple[str, str, dict]]:
     """(workflow, job, guard step) for every guarded sops-env job in this repo."""

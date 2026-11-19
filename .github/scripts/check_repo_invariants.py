@@ -259,6 +259,9 @@ def is_ref_guard(step: object) -> bool:
     env, run = step.get("env"), step.get("run")
     if not isinstance(env, dict) or not isinstance(run, str):
         return False
+    # Strip a schedule early pass before judging the script. A schedule event has no
+    # repository payload, so the guard may accept it on event_name alone; without this
+    # the pass's `exit 0` would disqualify every schedule guard in the repo.
     for event in _env_names_for(env, "github.event_name"):
         run = re.sub(
             r'if\s+\[\s*"\$\{?' + re.escape(event) + r'\}?"\s*=\s*"?schedule"?\s*\]\s*;\s*then\s*'
@@ -268,17 +271,31 @@ def is_ref_guard(step: object) -> bool:
         )
     if re.search(r"\bexit\s+0\b|\|\|\s*(?:true|:)", run):
         return False
+    return bool(_ref_comparison(run, env))
+
+
+def _ref_comparison(run: str, env: dict) -> bool:
+    """Does the script fail when $REF is not refs/heads/$DEFAULT?
+
+    The script itself is only trusted as a ref comparison when its sole `exit 1`
+    sits under an `if` comparing the github.ref env with the default branch (the
+    schedule pass, if any, was already stripped). Any other exit 1 is a second
+    failure path that could refuse a dispatch on the default branch, so it
+    disqualifies the step as a guard.
+    """
+    exit1 = re.search(r"\bexit\s+1\b", run)
+    if not exit1:
+        return False
     for ref in _env_names_for(env, "github.ref"):
         for default in _env_names_for(env, "github.event.repository.default_branch"):
-            compare = re.compile(
+            if re.search(
                 r'if\s+\[\s*"\$\{?'
                 + re.escape(ref)
                 + r'\}?"\s*!=\s*"refs/heads/\$\{?'
                 + re.escape(default)
-                + r'\}?"\s*\]\s*;\s*then\b(?:(?!\bfi\b).)*?\bexit\s+1\b',
-                re.S,
-            )
-            if compare.search(run):
+                + r'\}?"\s*\]\s*;\s*then\b',
+                run[: exit1.start()],
+            ):
                 return True
     return False
 
@@ -351,14 +368,18 @@ def check_dispatch_ref_guard(root: Path) -> list[str]:
                     f"step from auto-topup-audit.yml first."
                 )
                 continue
-            for s in steps[guards[0] + 1 : first_sops + 1]:
-                cond = s.get("if") if isinstance(s, dict) else None
-                if isinstance(cond, str) and _STATUS_OVERRIDE.search(cond):
-                    problems.append(
-                        f"{where}: job {job_id!r} step {s.get('name') or s.get('uses')!r} "
-                        f"runs with if: {cond} between the ref guard and sops-env, so it "
-                        f"still runs after the guard refused the ref."
-                    )
+            # EVERY sops-env step needs the guard's refusal in its past: a job that loads
+            # the secrets twice may still carry an always()/failure()/cancelled() step in
+            # front of the second load that overrides the guard's exit 1.
+            for i in sops:
+                for s in steps[guards[0] + 1 : i + 1]:
+                    cond = s.get("if") if isinstance(s, dict) else None
+                    if isinstance(cond, str) and _STATUS_OVERRIDE.search(cond):
+                        problems.append(
+                            f"{where}: job {job_id!r} step {s.get('name') or s.get('uses')!r} "
+                            f"runs with if: {cond} between the ref guard and sops-env, so it "
+                            f"still runs after the guard refused the ref."
+                        )
     return problems
 
 
