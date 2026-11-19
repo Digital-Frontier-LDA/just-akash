@@ -2005,7 +2005,7 @@ def main():
             # account_address is read from the JWT iss claim (a side-effect-free
             # identity probe). This is the owner the chain is queried against.
             client, dseq = _resolve_deployment_client(args.dseq)
-            owner = client.account_address()
+            owner = client.account_address(dseq)
             if args.dseq and args.dseq != dseq:
                 print(
                     f"::warning --dseq {args.dseq} did not match the resolved {dseq}",
@@ -2099,7 +2099,7 @@ def main():
                     args.dseq,
                     expected_group=args.expected_group,
                 )
-            owner = client.account_address()
+            owner = client.account_address(dseq)
         except OwnerLookupUnresolved as e:
             from .owner_lookup import (
                 OWNER_LOOKUP_UNREACHABLE,
