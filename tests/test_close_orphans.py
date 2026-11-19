@@ -233,3 +233,94 @@ def test_row_without_a_dseq_cannot_collide_in_the_index(_wired, capsys):
     assert close_orphans.run(dseqs=["None"], execute=True) == 0
     assert client.closed == []
     assert "not in the active set" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# #232: a SHORT active-set listing is a listing failure, not "nothing to do"
+# --------------------------------------------------------------------------
+class _DirectReadClient(_FakeClient):
+    """The listing omits dseqs; a per-dseq read answers from `direct` (a row or an exception)."""
+
+    def __init__(self, rows, direct):
+        super().__init__(rows)
+        self._direct = direct
+
+    def get_deployment(self, dseq: str):
+        if dseq in self.closed:  # read-back after a close: terminal
+            return super().get_deployment(dseq)
+        answer = self._direct.get(dseq)
+        if isinstance(answer, Exception):
+            raise answer
+        if answer is None:
+            return super().get_deployment(dseq)
+        return answer
+
+
+@pytest.fixture
+def _wired_direct(_wired, monkeypatch):
+    def install(rows, direct, verdicts):
+        client = _DirectReadClient(rows, direct)
+        _wired(rows, verdicts)  # credit line, settle pause, classifier
+        monkeypatch.setattr(close_orphans, "AkashConsoleAPI", lambda key: client)
+        return client
+
+    return install
+
+
+def test_an_active_dseq_the_listing_omitted_is_read_directly_and_classified(_wired_direct, capsys):
+    """The measured 2026-08-30 shape: the listing came back short, the dseq was active."""
+    client = _wired_direct([], {"1": _row("1")}, {"1": _verdict("1", Classification.ORPHANED)})
+    assert close_orphans.run(dseqs=["1"], execute=True) == 0
+    assert client.closed == ["1"]
+    out = capsys.readouterr().out
+    assert "listing omitted" in out
+    assert "nothing to do" not in out
+
+
+def test_a_missing_dseq_that_cannot_be_read_is_a_listing_failure(_wired_direct, capsys):
+    client = _wired_direct([], {"1": RuntimeError("Connection error: reset")}, {})
+    assert close_orphans.run(dseqs=["1"], execute=True) == close_orphans.EXIT_LISTING_UNVERIFIED
+    assert client.closed == []
+    out = capsys.readouterr().out
+    assert "UNREAD" in out
+    assert "nothing to do" not in out
+
+
+def test_every_missing_dseq_unverified_is_a_listing_failure_even_on_404(_wired_direct, capsys):
+    """404 can be 'not ours' OR a Console view gap (#281): never read as a clean account."""
+    err = RuntimeError("API Error (404): Deployment not found")
+    client = _wired_direct([], {"1": err, "2": err}, {})
+    assert (
+        close_orphans.run(dseqs=["1", "2"], execute=True) == close_orphans.EXIT_LISTING_UNVERIFIED
+    )
+    assert client.closed == []
+    assert "nothing to do" not in capsys.readouterr().out
+
+
+def test_a_dry_run_with_an_unread_dseq_is_also_not_clean(_wired_direct):
+    client = _wired_direct([], {"1": RuntimeError("timeout")}, {})
+    assert close_orphans.run(dseqs=["1"], execute=False) == close_orphans.EXIT_LISTING_UNVERIFIED
+    assert client.closed == []
+
+
+def test_a_missing_dseq_read_back_closed_is_a_confirmed_skip(_wired_direct, capsys):
+    """THE CONTROL: a dseq the direct read shows closed is a real, clean SKIP (exit 0)."""
+    closed_row = _row("1", dep_state="closed")
+    client = _wired_direct([], {"1": closed_row}, {})
+    assert close_orphans.run(dseqs=["1"], execute=True) == 0
+    assert client.closed == []
+    assert "closed" in capsys.readouterr().out
+
+
+def test_a_404_beside_a_verified_close_is_reported_but_does_not_fail_the_run(
+    _wired_direct, capsys
+):
+    """One dseq of another wallet in a list that otherwise verifies: SKIP it, say why."""
+    client = _wired_direct(
+        [_row("1")],
+        {"2": RuntimeError("API Error (404): Deployment not found")},
+        {"1": _verdict("1", Classification.ORPHANED)},
+    )
+    assert close_orphans.run(dseqs=["1", "2"], execute=True) == 0
+    assert client.closed == ["1"]
+    assert "not visible to this Console key" in capsys.readouterr().out
