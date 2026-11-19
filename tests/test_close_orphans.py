@@ -246,6 +246,8 @@ class _DirectReadClient(_FakeClient):
         self._direct = direct
 
     def get_deployment(self, dseq: str):
+        if dseq in self.closed:  # read-back after a close: terminal
+            return super().get_deployment(dseq)
         answer = self._direct.get(dseq)
         if isinstance(answer, Exception):
             raise answer

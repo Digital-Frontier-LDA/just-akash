@@ -63,6 +63,37 @@ from .orphan_detect import Classification, classify_deployment
 # reflects the releases rather than the moment before them. Same value cleanup_stale uses.
 SETTLE_PAUSE_SECONDS = 10
 
+# A requested dseq the listing omitted and a direct read could not settle (#232). Distinct
+# from 1 (a close failed) and 2 (bad invocation): the INPUT could not be verified, so the
+# run must not read as a clean account.
+EXIT_LISTING_UNVERIFIED = 3
+
+
+def _read_missing(client: AkashConsoleAPI, dseq: str) -> tuple[str, dict | None]:
+    """Settle a dseq the active-set listing omitted with one direct read (#232).
+
+    The listing is one Console round-trip and has been measured to come back short (17
+    active dseqs holding 39.93 ACT all read as "not in the active set"). Absence from it
+    is therefore not evidence. Returns one of:
+      ("active", row)       - the listing omitted a live deployment; classify it as usual
+      ("terminal", row)     - confirmed closed; a real SKIP
+      ("other", row)        - readable, some other non-active state; a real SKIP
+      ("not-visible", None) - 404: not this key's, OR a Console view gap (#281); unverified
+      ("unread", None)      - any other failure; unverified
+    """
+    try:
+        row = _reconcile_lease_row(client.get_deployment(dseq))
+    except Exception as exc:  # noqa: BLE001 - every failure is reported, none is "clean"
+        if "404" in str(exc):
+            return "not-visible", None
+        return "unread", None
+    state = str(row.get("deployment_state", ""))
+    if state == "active":
+        return "active", row
+    if state in TERMINAL_DEPLOYMENT_STATES:
+        return "terminal", row
+    return "other", row
+
 
 def parse_dseqs(raw: list[str]) -> list[str]:
     """Split comma/whitespace-separated dseq arguments into a de-duplicated list.
@@ -110,14 +141,34 @@ def run(*, dseqs: list[str], execute: bool = False) -> int:
         rows[str(key)] = r
 
     reapable: list[str] = []
+    unread: list[str] = []
+    not_visible: list[str] = []
     for dseq in dseqs:
         row = rows.get(dseq)
         if row is None:
-            # `active_only=True` filters on deployment.state == "active", so absence means
-            # closed OR any other non-active state OR never ours. Naming only the first
-            # would send an operator reconciling a list looking for the wrong thing.
-            print(f"  {dseq}  not in the active set -> SKIP (closed, not active, or not ours)")
-            continue
+            # Absence from ONE listing is not evidence (#232): read the dseq directly.
+            outcome, direct = _read_missing(client, dseq)
+            if outcome == "active" and direct is not None:
+                print(
+                    f"  {dseq}  not in the active set, but a direct read says active "
+                    "(listing omitted it)"
+                )
+                row = direct
+            elif outcome == "unread":
+                unread.append(dseq)
+                print(f"  {dseq}  not in the active set and UNREAD directly -> SKIP, unverified")
+                continue
+            elif outcome == "not-visible":
+                not_visible.append(dseq)
+                print(
+                    f"  {dseq}  not in the active set and not visible to this Console key "
+                    "(404: not ours, or a Console view gap) -> SKIP, unverified"
+                )
+                continue
+            else:
+                state = direct.get("deployment_state") if direct else "?"
+                print(f"  {dseq}  not in the active set; direct read: {state} -> SKIP")
+                continue
         # ADVISORY ONLY. Since #173 the classifier reads lease state from the chain and
         # uses this Console-derived count solely as a fallback when the chain cannot be
         # read — and then only in the safe direction (it can block a close, never permit
@@ -152,10 +203,21 @@ def run(*, dseqs: list[str], execute: bool = False) -> int:
             print(f"  {dseq}  {verdict.classification.value}  {held} -> REFUSE: {why}{extra}")
 
     print(f"\nverified orphans (closable): {len(reapable)} of {len(dseqs)} requested")
+    # Non-vacuity (#232): an unread dseq, or a list where EVERY dseq is unverified, means the
+    # input could not be checked. That must never print or exit like a clean account.
+    unverified = len(unread) + len(not_visible)
+    listing_failed = bool(unread) or (unverified == len(dseqs))
+    if listing_failed:
+        print(
+            f"LISTING UNVERIFIED: {len(unread)} unread, {len(not_visible)} not visible to this "
+            f"key, of {len(dseqs)} requested. Not a clean result; re-run or verify on chain."
+        )
     if not execute:
         print("DRY RUN — nothing closed. Re-run with --execute to close the verified set.")
-        return 0
+        return EXIT_LISTING_UNVERIFIED if listing_failed else 0
     if not reapable:
+        if listing_failed:
+            return EXIT_LISTING_UNVERIFIED
         print("Nothing verified as an orphan; nothing to do.")
         return 0
 
@@ -188,7 +250,9 @@ def run(*, dseqs: list[str], execute: bool = False) -> int:
     print(f"\nclosed={closed} failed={failed}")
     time.sleep(SETTLE_PAUSE_SECONDS)
     print(f"credit AFTER:  {_credit_line(client, address)}")
-    return 0 if failed == 0 else 1
+    if failed:
+        return 1
+    return EXIT_LISTING_UNVERIFIED if listing_failed else 0
 
 
 def main(argv: list[str] | None = None) -> int:
