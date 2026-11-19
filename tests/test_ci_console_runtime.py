@@ -15,6 +15,7 @@ from just_akash.api import CONSOLE_HTTP_TIMEOUT, AkashAPIError, AkashConsoleAPI,
 
 JIT = "synthetic-jit-config-DO-NOT-LOG"
 KEY = "synthetic-controller-key-DO-NOT-LOG"
+PROVIDER = "akash1" + "synthetic".ljust(38, "0")
 SDL = f"services:\n  runner:\n    env:\n      - RUNNER_JIT_CONFIG={JIT}\n"
 
 
@@ -137,10 +138,12 @@ def test_missing_jwt_does_not_echo_response(monkeypatch, caplog, provider):
     monkeypatch.setattr("urllib.request.OpenerDirector.open", MagicMock(return_value=response))
     client = CIConsoleAPI(KEY)
     with pytest.raises(RuntimeError, match="JWT token not found") as caught:
+        # openmix-q2mfu: both name the lease (provider + services), so the one POST is the
+        # mint and the response under test is its answer.
         if provider:
-            client.create_jwt_with_provider("123", "akash1synthetic", scope=["logs"])
+            client.create_jwt_with_provider("123", PROVIDER, scope=["logs"], services=["web"])
         else:
-            client.create_jwt("123", scope=["logs"])
+            client.create_jwt("123", scope=["logs"], provider=PROVIDER, services=["web"])
     assert_private(caplog, caught.value)
 
 

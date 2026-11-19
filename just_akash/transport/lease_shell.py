@@ -134,11 +134,21 @@ class LeaseShellTransport(Transport):
         return self._api_client
 
     def _fetch_jwt(self, ttl: int = 3600, scope: list[str] | None = None) -> str:
+        # openmix-q2mfu: the token names this lease's dseq and the services it may reach
+        # (the chosen one, else every one the lease reports); with none known, create_jwt
+        # reads them from the Console. A grant naming no deployment is refused (403).
+        services = [self._service] if self._service else (self._known_services() or None)
         if self._provider_address:
             return self._get_api_client().create_jwt_with_provider(
-                self._config.dseq, self._provider_address, ttl=ttl, scope=scope
+                self._config.dseq,
+                self._provider_address,
+                ttl=ttl,
+                scope=scope,
+                services=services,
             )
-        return self._get_api_client().create_jwt(self._config.dseq, ttl=ttl, scope=scope)
+        return self._get_api_client().create_jwt(
+            self._config.dseq, ttl=ttl, scope=scope, services=services
+        )
 
     def _resolve_provider(self) -> str:
         """Resolve the provider address + hostUri from lease data.

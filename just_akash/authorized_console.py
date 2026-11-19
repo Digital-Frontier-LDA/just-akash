@@ -29,7 +29,7 @@ from akash_lease_core import (
     is_canonical_akash_owner,
 )
 
-from .api import CI_CONSOLE_ORIGIN, CIConsoleAPI
+from .api import CI_CONSOLE_ORIGIN, AkashAPIError, CIConsoleAPI
 from .deployment_receipt import artifact_identity
 
 CONSOLE_BACKEND = BackendIdentity(BackendKind.MEDIATED, CI_CONSOLE_ORIGIN)
@@ -120,9 +120,28 @@ class AuthorizedConsoleCreate(CIConsoleAPI):
 
         The token remains local and is not a signature or chain binding proof;
         the trusted broker independently establishes its signer policy.
+
+        just-akash-1tm.15 (Sentinel option a): a key limited to a Console project may not
+        mint this dseq-less token (403 "Name the deployments the token is for"). ONLY on
+        that 403 the owner is read from GET /v1/user/me then GET /v1/wallets
+        (AkashConsoleAPI._account_from_user_wallets), which mints nothing. create_jwt()
+        refuses dseq 0, so the probe is sent as its own fixed body, the one
+        _open_request admits.
         """
-        token = self.create_jwt("0", ttl=30, scope=["status"])
         try:
+            token: str | None = self._jwt_from(
+                self._request("POST", "/v1/create-jwt-token", json.loads(_OWNER_PROBE_BODY))
+            )
+        except AkashAPIError as e:
+            if e.status != 403:
+                raise
+            token = None
+        try:
+            if token is None:
+                owner = self._account_from_user_wallets()
+                if not is_canonical_akash_owner(owner):
+                    raise ValueError("invalid owner")
+                return owner
             parts = token.split(".")
             if len(parts) != 3:
                 raise ValueError("invalid token structure")

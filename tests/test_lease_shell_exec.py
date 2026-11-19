@@ -92,7 +92,10 @@ class TestJWTFetch:
             result = transport._fetch_jwt(ttl=7200)
 
             assert result == "jwt-token-abc123"
-            mock_api.create_jwt.assert_called_once_with("123456", ttl=7200, scope=None)
+            # openmix-q2mfu: the token names the services the lease reports.
+            mock_api.create_jwt.assert_called_once_with(
+                "123456", ttl=7200, scope=None, services=["web"]
+            )
 
     def test_fetch_jwt_with_default_ttl(self):
         """Test _fetch_jwt() uses default TTL of 3600."""
@@ -110,7 +113,9 @@ class TestJWTFetch:
 
             transport._fetch_jwt()
 
-            mock_api.create_jwt.assert_called_once_with("789", ttl=3600, scope=None)
+            mock_api.create_jwt.assert_called_once_with(
+                "789", ttl=3600, scope=None, services=["web"]
+            )
 
     def test_fetch_jwt_error_propagates(self):
         """Test _fetch_jwt() propagates RuntimeError from create_jwt."""
