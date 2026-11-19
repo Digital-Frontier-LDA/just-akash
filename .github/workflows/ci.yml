@@ -443,6 +443,20 @@ jobs:
   e2e-shell:
     name: E2E lease-shell transport
     runs-on: ubuntu-latest
+    # ⛔ ONE REPO-WIDE LOCK FOR THE LEASE-HOLDING E2E JOBS (#267).
+    # Both E2E jobs deploy with one AKASH_API_KEY (one Akash account). `needs:` below
+    # serialises them inside a run, but the workflow group above is per ref, so two PRs'
+    # runs overlapped on the account. A literal group (no ${{ }}) serialises them across
+    # runs. Job level, not workflow level: lint/typecheck/unit tests stay parallel. Not
+    # `akash-wallet`: that would tie CI to the maintenance workflows' queue, and not the
+    # reusable runner pool, which must stay concurrent for its callers.
+    # GitHub keeps one RUNNING and one PENDING job per group; a third queued E2E job
+    # replaces the pending one, which then shows as cancelled before it ever deployed
+    # (re-run it). cancel-in-progress stays false so a running job, which may own a
+    # live lease, always reaches its own cleanup.
+    concurrency:
+      group: akash-ci-e2e
+      cancel-in-progress: false
     # ⛔ MUST EXCEED the owner-lookup deadline + close/audit margin (see
     # just_akash/owner_lookup.py: 10 + 4 = 14 min at the time of writing), pinned by
     # tests/test_owner_lookup_deadline.py. A job killed mid-cleanup by its own
@@ -502,6 +516,10 @@ jobs:
   e2e-secrets:
     name: E2E secrets injection
     runs-on: ubuntu-latest
+    # ⛔ ONE REPO-WIDE LOCK FOR THE LEASE-HOLDING E2E JOBS (#267). Same lock as e2e-shell; see there.
+    concurrency:
+      group: akash-ci-e2e
+      cancel-in-progress: false
     # ⛔ MUST EXCEED the owner-lookup deadline + close/audit margin (see
     # just_akash/owner_lookup.py: 10 + 4 = 14 min at the time of writing), pinned by
     # tests/test_owner_lookup_deadline.py. A job killed mid-cleanup by its own
