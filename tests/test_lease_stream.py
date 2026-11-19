@@ -212,6 +212,52 @@ class TestBuildEventsUrl:
         assert t._build_events_url() == "https://p.com/lease/123/1/1/kubeevents"
 
 
+# ── 1tm.15: the stream's JWT names the services of THIS stream ──────
+
+
+def _granted_services(t, run):
+    """The services kwarg of the one JWT the stream minted (create_jwt or _with_provider)."""
+    api = MagicMock()
+    api.create_jwt.return_value = "jwt"
+    api.create_jwt_with_provider.return_value = "jwt"
+    with (
+        patch.object(t, "_get_api_client", return_value=api),
+        patch("just_akash.transport.lease_shell.connect", return_value=FakeWebSocket([])),
+    ):
+        run()
+    calls = api.create_jwt.call_args_list + api.create_jwt_with_provider.call_args_list
+    assert len(calls) == 1
+    return calls[0].kwargs["services"]
+
+
+class TestStreamJwtServices:
+    def test_logs_for_a_service_name_that_service(self):
+        t = _make_transport()
+        t._service = "web"  # a previous shell selection on a reused transport
+        assert _granted_services(t, lambda: t.stream_logs(service="worker")) == ["worker"]
+
+    def test_unfiltered_logs_name_the_lease_services_not_a_shell_selection(self):
+        t = _make_transport()
+        t._service = "worker"
+        assert _granted_services(t, lambda: t.stream_logs()) == ["web"]
+
+    def test_events_name_the_lease_services_not_a_shell_selection(self):
+        t = _make_transport()
+        t._service = "worker"
+        assert _granted_services(t, lambda: t.stream_events()) == ["web"]
+
+    def test_unfiltered_stream_with_no_reported_service_leaves_it_to_create_jwt(self):
+        """None: create_jwt reads the lease again and fails closed if it still names none."""
+        config = TransportConfig(
+            dseq="123",
+            api_key="key",
+            deployment={"leases": [{"provider": {"hostUri": "https://p.example:8443"}}]},
+        )
+        t = LeaseShellTransport(config)
+        t._service = "worker"
+        assert _granted_services(t, lambda: t.stream_events()) is None
+
+
 # ── stream_logs end-to-end ───────────────────────────────────────────
 
 

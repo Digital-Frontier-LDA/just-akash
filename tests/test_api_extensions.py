@@ -488,6 +488,24 @@ class TestAccountAddress:
         with pytest.raises(RuntimeError, match="no akash1 account"):
             AkashConsoleAPI("key").account_address()
 
+    @pytest.mark.parametrize(
+        "rows",
+        [
+            [{"userId": "u-1", "address": []}],
+            [{"userId": "u-1", "address": {}}],
+            [{"userId": "u-1", "address": []}, {"userId": "u-1", "address": ADDR}],
+            [{"userId": "u-1"}, {"userId": "u-1", "address": ADDR}],
+        ],
+        ids=["list", "dict", "malformed-then-valid", "missing-then-valid"],
+    )
+    @patch.object(AkashConsoleAPI, "_request")
+    def test_a_malformed_wallet_row_of_the_user_raises(self, mock_req, rows):
+        """A malformed row of this user is refused, never skipped so another row looks
+        like the only wallet."""
+        mock_req.side_effect = [_project_forbidden(), ME, {"data": rows}]
+        with pytest.raises(RuntimeError, match="no akash1 account"):
+            AkashConsoleAPI("key").account_address()
+
     def test_non_akash_iss_raises(self):
         client = AkashConsoleAPI("key")
         with (

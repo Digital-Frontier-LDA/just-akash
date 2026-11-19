@@ -49,6 +49,15 @@ WALLET_PROBE_TOKEN = (
     + base64.urlsafe_b64encode(json.dumps({"iss": FAKE_OWNER}).encode()).decode().rstrip("=")
     + ".sig"
 )
+#: What the fake answers a granular grant it accepts: a JWT whose iss is the wallet,
+#: as the live Console's is, so account_address(dseq)'s status-token read can use it.
+GRANULAR_TOKEN = (
+    "head."
+    + base64.urlsafe_b64encode(json.dumps({"iss": FAKE_OWNER, "granular": True}).encode())
+    .decode()
+    .rstrip("=")
+    + ".sig"
+)
 FAKE_USER_ID = "00000000-0000-4000-8000-00000000f00d"
 
 #: openmix-q2mfu: what the live Console answered on 2026-11-19 (df-cicd akash-lease runs
@@ -113,7 +122,9 @@ def granular_names_its_deployments(body: dict) -> bool:
                 if seq in dep and (type(dep[seq]) is not int or dep[seq] < 0):
                     return False
             scope, services = dep["scope"], dep["services"]
-            if not isinstance(scope, list) or not scope or not set(scope) <= _JWT_SCOPES:
+            if not isinstance(scope, list) or not scope:
+                return False
+            if not all(isinstance(s, str) and s in _JWT_SCOPES for s in scope):
                 return False
             if not isinstance(services, list) or not services:
                 return False
@@ -259,6 +270,8 @@ class _ConsoleApp:
         # first read); a project-limited key may not. Off = the strict, project-limited key.
         self.wallet_wide_probe_allowed = False
         self.user_me_reads = 0
+        # The services every lease status reports; {} models a lease that reports none yet.
+        self.lease_services: dict = {"web": {"ready_replicas": 1, "total": 1}}
         # Knobs (off by default):
         # lease_errors: (status, message) answered by successive lease POSTs, then success.
         # deposit_error: (status, message) answered by every deposit-deployment POST.
@@ -291,7 +304,7 @@ class _ConsoleApp:
                         "provider": _PROVIDER,
                     },
                     "provider": {"hostUri": _HOST_URI},
-                    "status": {"services": {"web": {"ready_replicas": 1, "total": 1}}},
+                    "status": {"services": dict(self.lease_services)},
                 }
             ],
         }
@@ -418,7 +431,7 @@ class _ConsoleHandler(BaseHTTPRequestHandler):
             if app.wallet_wide_probe_allowed and body == WALLET_WIDE_PROBE:
                 self._send(200, {"data": {"token": WALLET_PROBE_TOKEN}})
             elif granular_names_its_deployments(body):
-                self._send(200, {"data": {"token": "fake.jwt.token"}})
+                self._send(200, {"data": {"token": GRANULAR_TOKEN}})
             else:
                 self._send(JWT_REFUSED_STATUS, JWT_REFUSED_BODY)
         else:

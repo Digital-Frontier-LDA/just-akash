@@ -24,6 +24,7 @@ import pytest
 from tests._fake_akash import (
     _PROVIDER,
     FAKE_OWNER,
+    GRANULAR_TOKEN,
     JWT_REFUSED_BODY,
     JWT_REFUSED_STATUS,
     WALLET_WIDE_PROBE,
@@ -117,6 +118,16 @@ def _client():
                 }
             ],
         },
+        {  # granular, but a scope entry that is no string
+            "access": "granular",
+            "permissions": [
+                {
+                    "provider": _PROVIDER,
+                    "access": "granular",
+                    "deployments": [{"dseq": 7, "scope": [{}], "services": ["web"]}],
+                }
+            ],
+        },
         {  # granular naming dseq 0
             "access": "granular",
             "permissions": [
@@ -128,7 +139,7 @@ def _client():
             ],
         },
     ],
-    ids=["owner-probe", "scoped", "provider-wide", "no-dseq", "dseq-0"],
+    ids=["owner-probe", "scoped", "provider-wide", "no-dseq", "scope-not-str", "dseq-0"],
 )
 def test_the_fake_answers_the_recorded_403_to_every_unnamed_grant(fake, leases) -> None:
     from just_akash.api import AkashAPIError
@@ -162,7 +173,7 @@ def test_the_fake_accepts_the_granular_grant_naming_the_dseq(fake) -> None:
     }
     assert granular_names_its_deployments(body)
     got = _outcome(lambda: _client()._request("POST", "/v1/create-jwt-token", body))
-    assert got == ("ok", {"data": {"token": "fake.jwt.token"}})
+    assert got == ("ok", {"data": {"token": GRANULAR_TOKEN}})
 
 
 # ── account_address(): the key's account without a JWT ──────────────────────
@@ -187,12 +198,23 @@ def test_account_address_keeps_the_probe_for_a_wallet_key(fake) -> None:
     assert fake.console.app.user_me_reads == 0
 
 
+def test_account_address_with_a_dseq_reads_the_status_token_issuer(fake) -> None:
+    """A project-limited key given a dseq: after the probe's 403, a read-only status token
+    naming that deployment, whose iss is the wallet. Never /v1/user/me."""
+    got = _outcome(lambda: _client().account_address(DSEQ))
+    assert got == ("ok", FAKE_OWNER)
+    probe, body = fake.console.app.jwt_requests
+    assert probe == WALLET_WIDE_PROBE
+    assert _named(body) == [(int(DSEQ), _PROVIDER, ("status",), ("web",))]
+    assert fake.console.app.user_me_reads == 0
+
+
 # ── create_jwt(): granular, naming the dseq ─────────────────────────────────
 
 
 def test_create_jwt_names_the_dseq_provider_and_service(fake) -> None:
     got = _outcome(lambda: _client().create_jwt(DSEQ, ttl=300, scope=["status"]))
-    assert got == ("ok", "fake.jwt.token")
+    assert got == ("ok", GRANULAR_TOKEN)
     (body,) = fake.console.app.jwt_requests
     assert granular_names_its_deployments(body)
     assert _named(body) == [(int(DSEQ), _PROVIDER, ("status",), ("web",))]
@@ -200,7 +222,7 @@ def test_create_jwt_names_the_dseq_provider_and_service(fake) -> None:
 
 def test_create_jwt_with_provider_names_the_dseq(fake) -> None:
     got = _outcome(lambda: _client().create_jwt_with_provider(DSEQ, _PROVIDER, scope=["logs"]))
-    assert got == ("ok", "fake.jwt.token")
+    assert got == ("ok", GRANULAR_TOKEN)
     (body,) = fake.console.app.jwt_requests
     assert _named(body) == [(int(DSEQ), _PROVIDER, ("logs",), ("web",))]
 
@@ -211,6 +233,42 @@ def test_there_is_no_dseq_less_jwt(fake, dseq) -> None:
     assert got[0] == "refused"
     assert "names the deployment" in got[1]
     assert fake.console.app.jwt_requests == [], "nothing may be sent for an unnamed grant"
+
+
+def test_create_jwt_keeps_explicit_services_when_the_lease_reports_none(fake) -> None:
+    """The caller named the service, so only the provider is read from the lease, even
+    while the lease reports no service yet."""
+    fake.console.app.lease_services = {}
+    got = _outcome(lambda: _client().create_jwt(DSEQ, scope=["logs"], services=["worker"]))
+    assert got == ("ok", GRANULAR_TOKEN)
+    (body,) = fake.console.app.jwt_requests
+    assert _named(body) == [(int(DSEQ), _PROVIDER, ("logs",), ("worker",))]
+
+
+def test_create_jwt_fails_closed_when_no_service_can_be_named(fake) -> None:
+    """Neither the caller nor the lease names a service: refused, nothing minted."""
+    fake.console.app.lease_services = {}
+    got = _outcome(lambda: _client().create_jwt(DSEQ, scope=["events"]))
+    assert got[0] == "refused"
+    assert "reports no service" in got[1]
+    assert fake.console.app.jwt_requests == []
+
+
+@pytest.mark.parametrize(
+    "services",
+    [[""], [None], ["web", ""], "web", [7]],
+    ids=["empty", "none", "one-empty", "str", "int"],
+)
+def test_create_jwt_refuses_a_malformed_service_before_sending(fake, services) -> None:
+    got = _outcome(
+        lambda: _client().create_jwt_with_provider(
+            DSEQ, _PROVIDER, scope=["shell"], services=services
+        )
+    )
+    assert got[0] == "refused"
+    assert got[1].startswith("ValueError: ")
+    assert "service" in got[1]
+    assert fake.console.app.jwt_requests == [], "nothing may be sent for a malformed grant"
 
 
 # ── the two df-cicd paths, end to end on the fake ───────────────────────────
