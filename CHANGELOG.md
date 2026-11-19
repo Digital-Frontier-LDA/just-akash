@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `list_deployments` waits 2 s, then 12 s, between inconsistent passes instead of a flat 2 s, and still raises after 3 (#281). Bid probe's reaper failed 3 of 4 runs on 2026-11-19 on a single page reporting `total = rows + 1` (13/14, 8/9, 19/20) for ~6 s right after its own create/close cycle. Each retry now logs `pass k/3: rows=R total=T`, and a listing that settles after a retry logs `consistent on pass k/3 … rows=R total=T`. A later run therefore shows whether the Console count settled or stays genuinely off by one.
+
 ### Security
 
 - **Behaviour change: `destroy-all` / `close-all` / `AkashConsoleAPI.close_all_deployments()` are never unscoped (just-akash-73o).** On 2026-11-19 an unscoped bulk close on the shared console-2 account closed 14 deployments, including four Flynn prod leases. A bulk close now closes only dseqs whose group name carries `--run-tag` (this run's id) and/or an explicit `--allow-dseq` list. Flynn prod placements (`flynn-*`, `fleet-*`, `dcloud`, `akash`) and `JUST_AKASH_PROTECTED_DSEQS` are refused even when allowlisted, as is an allowlisted dseq whose group names cannot be read. Without a scope it closes nothing (exit 2); without `--yes` it is a dry run that prints the CLOSE/SKIP/REFUSE plan. The interactive "Destroy all? (y/N)" prompt is gone. `--override-protected` is human-only: refused under `CI`, `GITHUB_ACTIONS`, an agent environment, or without a TTY. Tags are dropped only for dseqs actually closed. `just destroy-all` takes `run_tag=`, `allow_dseq=` and `yes=yes`. Fleet rule: no agent or agent-launched job runs a bulk close against a shared account; see [Scoped bulk close](README.md#scoped-bulk-close).
