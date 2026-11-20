@@ -323,6 +323,41 @@ class TestDispatchRefGuard:
         assert len(problems) == 1, problems
         assert "no default-ref guard" in problems[0]
 
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "GITHUB_REF_NAME",
+            "GITHUB_RUN_NUMBER",
+            "RUNNER_TEMP",
+        ],
+        ids=["github-ref-name", "github-run-number", "runner-temp"],
+    )
+    def test_a_reserved_name_bound_to_the_default_branch_is_not_a_binding(self, repo, name):
+        """CodeRabbit reply on the round-6 thread (2026-11-20): the round-6
+        regression bound the reserved name to `github.ref` only. The rejection
+        must cover the other side of the comparison too -- a guard whose DEFAULT
+        is `GITHUB_REF_NAME: ${{ github.event.repository.default_branch }}`
+        never receives the repository's default branch (GitHub ignores an env
+        assignment to a default variable), so on a dispatched ref the guard
+        compares against its own pre-set value and can pass. Rejected the same
+        way as the ref-side binding: the job is unguarded."""
+        guard = (
+            "      - name: Refuse to run from a non-default ref\n"
+            "        env:\n"
+            "          REF: ${{ github.ref }}\n"
+            f"          {name}: ${{{{ github.event.repository.default_branch }}}}\n"
+            "        run: |\n"
+            "          set -euo pipefail\n"
+            f'          if [ "$REF" != "refs/heads/${name}" ]; then\n'
+            '            echo "::error::refusing $REF"\n'
+            "            exit 1\n"
+            "          fi\n"
+        )
+        self._write(repo, _dispatch_workflow(guard + _CHECKOUT + _SOPS))
+        problems = inv.check_dispatch_ref_guard(repo)
+        assert len(problems) == 1, problems
+        assert "no default-ref guard" in problems[0]
+
     def test_ordinary_ref_bindings_stay_valid(self, repo):
         """The rejection is the reserved name, not the comparison: ordinary REF/DEFAULT
         bindings are recognized, including the schedule early pass on EVENT."""
