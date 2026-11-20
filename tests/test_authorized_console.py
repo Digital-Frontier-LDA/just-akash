@@ -714,3 +714,70 @@ def test_runtime_private_payload_and_response_stay_out_of_logs_and_errors(
     assert private not in visible
     assert "synthetic-api-key" not in visible
     opener.assert_called_once()
+
+
+def _project_forbidden_error(url):
+    import io
+    import urllib.error
+
+    body = json.dumps({"message": "Name the deployments the token is for"}).encode()
+    from email.message import Message
+
+    return urllib.error.HTTPError(url, 403, "Forbidden", Message(), io.BytesIO(body))
+
+
+def test_a_project_limited_key_reads_its_owner_from_the_account_on_403(client, monkeypatch):
+    """1tm.15 (Sentinel option a): the status-only probe is refused for a key limited to a
+    project; only then the owner comes from /v1/user/me and /v1/wallets, and the exact
+    create still follows. No other token is minted."""
+    from urllib.parse import parse_qs, urlsplit
+
+    monkeypatch.delattr(client, "account_address")
+    paths = []
+
+    def response_for(request, **_kwargs):
+        url = urlsplit(request.full_url)  # GETs carry a cache-buster query
+        user = parse_qs(url.query).get("userId", [""])[0]
+        paths.append((request.get_method(), url.path, user))
+        if url.path == "/v1/create-jwt-token":
+            raise _project_forbidden_error(request.full_url)
+        if url.path == "/v1/user/me":
+            data = {"userId": "u-1"}
+        elif url.path == "/v1/wallets":
+            data = [{"userId": "u-1", "address": OWNER}] if user == "u-1" else []
+        else:
+            assert url.path == "/v1/deployments"
+            data = {"dseq": "123"}
+        response = MagicMock()
+        response.read.return_value = json.dumps({"data": data}).encode()
+        response.__enter__.return_value = response
+        return response
+
+    monkeypatch.setattr("urllib.request.OpenerDirector.open", MagicMock(side_effect=response_for))
+    assert client.submit(**authority()) == {"dseq": "123"}
+    assert paths == [
+        ("POST", "/v1/create-jwt-token", ""),
+        ("GET", "/v1/user/me", ""),
+        ("GET", "/v1/wallets", "u-1"),
+        ("POST", "/v1/deployments", ""),
+    ]
+
+
+def test_a_probe_error_other_than_403_never_falls_back(client, monkeypatch):
+    """THE CONTROL: only a 403 opens the account read; anything else holds the create."""
+    import io
+    import urllib.error
+
+    monkeypatch.delattr(client, "account_address")
+    paths = []
+
+    def response_for(request, **_kwargs):
+        paths.append(request.full_url)
+        from email.message import Message
+
+        raise urllib.error.HTTPError(request.full_url, 500, "boom", Message(), io.BytesIO(b"{}"))
+
+    monkeypatch.setattr("urllib.request.OpenerDirector.open", MagicMock(side_effect=response_for))
+    with pytest.raises(Exception):  # noqa: B017 - any refusal; the point is what was sent
+        client.submit(**authority())
+    assert paths == ["https://console-api.akash.network/v1/create-jwt-token"]

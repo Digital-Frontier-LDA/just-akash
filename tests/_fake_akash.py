@@ -35,8 +35,102 @@ _STDOUT = 100
 _RESULT = 102
 _FAILURE = 103
 
-_PROVIDER = "akash1fakeprovider"
+# A provider address of the shape the Console's JWT schema accepts (^akash1[a-z0-9]{38}$):
+# the strict JWT check below refuses any other, as the real one does.
+_PROVIDER = "akash1fakeprovider00000000000000000000000000"
 _HOST_URI = "https://provider.fake:8443"
+#: The account behind the fake API key, and the Console user it belongs to.
+FAKE_OWNER = "akash1fakeowner00000000000000000000000000000"
+# account_address()'s wallet-wide identity probe (1tm.15), and the token a wallet key gets
+# for it: only its ``iss`` claim is ever read.
+WALLET_WIDE_PROBE = {"data": {"ttl": 300, "leases": {"access": "scoped", "scope": ["shell"]}}}
+WALLET_PROBE_TOKEN = (
+    "head."
+    + base64.urlsafe_b64encode(json.dumps({"iss": FAKE_OWNER}).encode()).decode().rstrip("=")
+    + ".sig"
+)
+#: What the fake answers a granular grant it accepts: a JWT whose iss is the wallet,
+#: as the live Console's is, so account_address(dseq)'s status-token read can use it.
+GRANULAR_TOKEN = (
+    "head."
+    + base64.urlsafe_b64encode(json.dumps({"iss": FAKE_OWNER, "granular": True}).encode())
+    .decode()
+    .rstrip("=")
+    + ".sig"
+)
+FAKE_USER_ID = "00000000-0000-4000-8000-00000000f00d"
+
+#: openmix-q2mfu: what the live Console answered on 2026-11-19 (df-cicd akash-lease runs
+#: 44522018790 and 44522346315) to the dseq-0 owner probe (a top-level ``scoped`` grant):
+#: HTTP 403 with this message. The job log records the status and the message only, so
+#: the fake answers with exactly those and nothing it would have to invent.
+JWT_REFUSED_STATUS = 403
+JWT_REFUSED_BODY = {"message": "Name the deployments the token is for"}
+_JWT_SCOPES = frozenset(
+    {
+        "send-manifest",
+        "get-manifest",
+        "logs",
+        "shell",
+        "events",
+        "status",
+        "restart",
+        "hostname-migrate",
+        "ip-migrate",
+        "attestation",
+    }
+)
+_ADDRESS_RE = re.compile(r"akash1[a-z0-9]{38}")
+
+
+def granular_names_its_deployments(body: dict) -> bool:
+    """True only for the one JWT body a project-limited key may mint: ``granular``, every
+    permission ``granular`` and naming its deployments one by one (dseq >= 1, a scope, the
+    services), in the Console schema's exact shape (no extra keys). Anything else -- the
+    top-level ``scoped`` grant, a provider-wide ``scoped`` or ``full`` permission, a
+    deployment entry without a dseq -- is what the live Console refused with 403."""
+    data = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(data, dict) or set(data) != {"ttl", "leases"}:
+        return False
+    ttl, leases = data["ttl"], data["leases"]
+    if type(ttl) is not int or ttl <= 0 or not isinstance(leases, dict):
+        return False
+    if set(leases) != {"access", "permissions"} or leases["access"] != "granular":
+        return False
+    permissions = leases["permissions"]
+    if not isinstance(permissions, list) or not permissions:
+        return False
+    for perm in permissions:
+        if not isinstance(perm, dict) or set(perm) != {"provider", "access", "deployments"}:
+            return False
+        provider = perm["provider"]
+        if perm["access"] != "granular" or not isinstance(provider, str):
+            return False
+        if not _ADDRESS_RE.fullmatch(provider):
+            return False
+        deployments = perm["deployments"]
+        if not isinstance(deployments, list) or not deployments:
+            return False
+        for dep in deployments:
+            if not isinstance(dep, dict) or not {"dseq", "scope", "services"} <= set(dep):
+                return False
+            if not set(dep) <= {"dseq", "gseq", "oseq", "scope", "services"}:
+                return False
+            if type(dep["dseq"]) is not int or dep["dseq"] < 1:
+                return False
+            for seq in ("gseq", "oseq"):
+                if seq in dep and (type(dep[seq]) is not int or dep[seq] < 0):
+                    return False
+            scope, services = dep["scope"], dep["services"]
+            if not isinstance(scope, list) or not scope:
+                return False
+            if not all(isinstance(s, str) and s in _JWT_SCOPES for s in scope):
+                return False
+            if not isinstance(services, list) or not services:
+                return False
+            if not all(isinstance(s, str) and s for s in services):
+                return False
+    return True
 
 
 class FakeShell:
@@ -170,6 +264,14 @@ class _ConsoleApp:
         self.deposits: list[tuple[str, float | None]] = []
         self.closed: list[str] = []
         self.settings: dict[str, dict] = {}
+        # Every /v1/create-jwt-token body, in order, refused or not (openmix-q2mfu).
+        self.jwt_requests: list[dict] = []
+        # 1tm.15: a wallet key may still mint the wallet-wide iss probe (account_address's
+        # first read); a project-limited key may not. Off = the strict, project-limited key.
+        self.wallet_wide_probe_allowed = False
+        self.user_me_reads = 0
+        # The services every lease status reports; {} models a lease that reports none yet.
+        self.lease_services: dict = {"web": {"ready_replicas": 1, "total": 1}}
         # Knobs (off by default):
         # lease_errors: (status, message) answered by successive lease POSTs, then success.
         # deposit_error: (status, message) answered by every deposit-deployment POST.
@@ -191,12 +293,18 @@ class _ConsoleApp:
 
     def get_deployment(self, dseq: str) -> dict:
         return {
-            "deployment": {"state": "active", "id": {"dseq": dseq}},
+            "deployment": {"state": "active", "id": {"dseq": dseq, "owner": FAKE_OWNER}},
             "leases": [
                 {
-                    "id": {"provider": _PROVIDER},
+                    "id": {
+                        "owner": FAKE_OWNER,
+                        "dseq": dseq,
+                        "gseq": 1,
+                        "oseq": 1,
+                        "provider": _PROVIDER,
+                    },
                     "provider": {"hostUri": _HOST_URI},
-                    "status": {"services": {"web": {"ready_replicas": 1, "total": 1}}},
+                    "status": {"services": dict(self.lease_services)},
                 }
             ],
         }
@@ -273,6 +381,17 @@ class _ConsoleHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/v1/deployments":
             self._send(200, {"data": app.list_deployments()})
+        elif path == "/v1/user/me":
+            app.user_me_reads += 1
+            self._send(200, {"data": {"id": FAKE_USER_ID, "userId": FAKE_USER_ID}})
+        elif path == "/v1/wallets":
+            user_id = (parse_qs(urlparse(self.path).query).get("userId") or [""])[0]
+            wallets = (
+                [{"id": 1, "userId": FAKE_USER_ID, "address": FAKE_OWNER, "denom": "uact"}]
+                if user_id == FAKE_USER_ID
+                else []
+            )
+            self._send(200, {"data": wallets})
         elif path.startswith("/v2/deployment-settings/"):
             dseq = path.rsplit("/", 1)[-1]
             app.events.append(("get_deployment_settings", dseq))
@@ -308,7 +427,13 @@ class _ConsoleHandler(BaseHTTPRequestHandler):
                 {"data": app.write_settings(str(data.get("dseq")), data.get("autoTopUpEnabled"))},
             )
         elif path == "/v1/create-jwt-token":
-            self._send(200, {"data": {"token": "fake.jwt.token"}})
+            app.jwt_requests.append(body)
+            if app.wallet_wide_probe_allowed and body == WALLET_WIDE_PROBE:
+                self._send(200, {"data": {"token": WALLET_PROBE_TOKEN}})
+            elif granular_names_its_deployments(body):
+                self._send(200, {"data": {"token": GRANULAR_TOKEN}})
+            else:
+                self._send(JWT_REFUSED_STATUS, JWT_REFUSED_BODY)
         else:
             self._send(404, {"message": "not found"})
 
