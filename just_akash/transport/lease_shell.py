@@ -133,12 +133,34 @@ class LeaseShellTransport(Transport):
             )
         return self._api_client
 
-    def _fetch_jwt(self, ttl: int = 3600, scope: list[str] | None = None) -> str:
+    def _fetch_jwt(
+        self,
+        ttl: int = 3600,
+        scope: list[str] | None = None,
+        *,
+        services: list[str] | None = None,
+        use_selected: bool = True,
+    ) -> str:
+        # openmix-q2mfu: the token names this lease's dseq and the services it may reach:
+        # services when given, else the chosen shell service (use_selected), else every
+        # one the lease reports; with none known, create_jwt reads them from the Console
+        # and fails closed if it still finds none. A grant naming no deployment is
+        # refused (403).
+        if services is None and use_selected and self._service:
+            services = [self._service]
+        if services is None:
+            services = self._known_services() or None
         if self._provider_address:
             return self._get_api_client().create_jwt_with_provider(
-                self._config.dseq, self._provider_address, ttl=ttl, scope=scope
+                self._config.dseq,
+                self._provider_address,
+                ttl=ttl,
+                scope=scope,
+                services=services,
             )
-        return self._get_api_client().create_jwt(self._config.dseq, ttl=ttl, scope=scope)
+        return self._get_api_client().create_jwt(
+            self._config.dseq, ttl=ttl, scope=scope, services=services
+        )
 
     def _resolve_provider(self) -> str:
         """Resolve the provider address + hostUri from lease data.
@@ -1175,6 +1197,7 @@ class LeaseShellTransport(Transport):
         formatter,
         recv_timeout: float,
         duration: float | None = None,
+        service: str | None = None,
     ) -> None:
         """Open a provider-proxy WebSocket and print each frame via ``formatter``.
 
@@ -1208,7 +1231,12 @@ class LeaseShellTransport(Transport):
         while attempts < MAX_RECONNECT_ATTEMPTS:
             if deadline is not None and time.monotonic() >= deadline:
                 return
-            jwt = self._fetch_jwt(scope=scope)
+            # 1tm.15: the token names THIS stream's service (logs --service), else every
+            # service the lease reports -- never a shell selection left on a reused
+            # transport.
+            jwt = self._fetch_jwt(
+                scope=scope, services=[service] if service else None, use_selected=False
+            )
             proxy_url = self._get_proxy_ws_url()
             connect_msg = self._build_proxy_connect_msg(provider_url, jwt)
             ssl_ctx = ssl.create_default_context()
@@ -1301,7 +1329,14 @@ class LeaseShellTransport(Transport):
         # Follow streams indefinitely between lines, so use a long per-recv
         # timeout and just loop on timeout; a snapshot closes on its own (or on
         # the ``duration`` bound if the provider keeps the connection open).
-        self._stream(url, ["logs"], self._format_log_message, recv_timeout=300, duration=duration)
+        self._stream(
+            url,
+            ["logs"],
+            self._format_log_message,
+            recv_timeout=300,
+            duration=duration,
+            service=service,
+        )
 
     def stream_events(self, duration: float | None = None) -> None:
         """Stream Kubernetes events for the lease via the provider-proxy.

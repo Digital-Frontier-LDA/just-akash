@@ -234,8 +234,16 @@ def _make_lease_shell(client, dseq):
     from .transport.lease_shell import LeaseShellTransport
 
     deployment = _enrich_deployment_with_provider(client, client.get_deployment(dseq))
+    # openmix-q2mfu: the transport mints its JWT through its OWN Console client, so it gets
+    # the caller's Console origin; left out, it fell back to TransportConfig's hardcoded
+    # public origin whatever the caller's client pointed at.
     transport = LeaseShellTransport(
-        TransportConfig(dseq=dseq, api_key=client.api_key, deployment=deployment)
+        TransportConfig(
+            dseq=dseq,
+            api_key=client.api_key,
+            deployment=deployment,
+            console_url=getattr(client, "base_url", None) or TransportConfig.console_url,
+        )
     )
     if not transport.validate():
         print(
