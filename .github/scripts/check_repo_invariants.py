@@ -231,71 +231,93 @@ SOPS_ENV_ACTION = "./.github/actions/sops-env"
 # protection rules. Adding a name here is a claim someone checked those settings.
 PROTECTED_ENVIRONMENTS: frozenset[str] = frozenset()
 
-# A step condition that runs even after an earlier step FAILED. On a step between the guard
-# and sops-env it would load the secrets anyway once the guard has refused the ref.
-_STATUS_OVERRIDE = re.compile(r"\b(?:always|failure|cancelled)\s*\(")
+# Any status function suppresses Actions' implicit success() check. Only a
+# standalone positive success() is recognized as safe here.
+_STATUS_FUNCTION = re.compile(r"\b(?:success|always|failure|cancelled)\s*\(", re.I)
+_EXPRESSION_STRING = re.compile(r"'(?:[^']|'')*'")
+_SUCCESS = re.compile(r"success\s*\(\s*\)", re.I)
+
+
+def _overrides_success(condition: str) -> bool:
+    expr = condition.strip().removeprefix("${{").removesuffix("}}").strip()
+    expr = _EXPRESSION_STRING.sub("''", expr)
+    return bool(_STATUS_FUNCTION.search(expr) and not _SUCCESS.fullmatch(expr))
 
 
 def _env_names_for(env: dict, expr: str) -> list[str]:
-    """Names in a step's ``env:`` whose value is exactly ``${{ <expr> }}``."""
+    """Shell variable names bound to the given GitHub expression."""
     want = re.compile(r"\$\{\{\s*" + re.escape(expr) + r"\s*\}\}")
-    return [k for k, v in env.items() if isinstance(v, str) and want.fullmatch(v.strip())]
+    return [
+        k
+        for k, v in env.items()
+        if isinstance(k, str)
+        and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k)
+        and isinstance(v, str)
+        and want.fullmatch(v.strip())
+    ]
 
 
-def is_ref_guard(step: object) -> bool:
-    """True for a step that fails unless github.ref is refs/heads/<default_branch>.
+def _default_shell(scope: dict, fallback: str) -> str:
+    defaults = scope.get("defaults") or {}
+    run = defaults.get("run") or {}
+    return run.get("shell", fallback)
 
-    It must compare the FULL ref (github.ref, not ref_name, so refs/tags/main fails) with
-    the event's default branch and ``exit 1`` on a mismatch. It may not carry an ``if:``
-    or ``continue-on-error``, either of which lets the job go on past a refusal. The only
-    early pass it may have is for a schedule event, matched on github.event_name: GitHub
-    runs a schedule only from the default branch, and that event has no repository payload
-    to read default_branch from. Any other ``exit 0`` or ``|| true`` disqualifies it.
+
+def guard_default_shell(workflow: dict, job: dict) -> str:
+    """Resolve job and workflow shell defaults for a guard run step."""
+    # GitHub-hosted Ubuntu jobs use Bash by default outside containers.
+    runner = job.get("runs-on")
+    implicit = (
+        "bash"
+        if isinstance(runner, str) and runner.startswith("ubuntu-") and "container" not in job
+        else ""
+    )
+    return _default_shell(job, _default_shell(workflow, implicit))
+
+
+def is_ref_guard(step: object, default_shell: str) -> bool:
+    """Recognize the repository's Bash guard, optionally with a schedule early pass.
+
+    Match the whole script so a comment, quoted command, or another branch
+    cannot supply the required nonzero exit. The accepted echo commands only
+    interpolate simple shell variables.
     """
     if not isinstance(step, dict) or "uses" in step or "if" in step:
         return False
     if step.get("continue-on-error") not in (None, False):
         return False
+    if step.get("shell", default_shell) != "bash":
+        return False
     env, run = step.get("env"), step.get("run")
     if not isinstance(env, dict) or not isinstance(run, str):
         return False
-    # Strip a schedule early pass before judging the script. A schedule event has no
-    # repository payload, so the guard may accept it on event_name alone; without this
-    # the pass's `exit 0` would disqualify every schedule guard in the repo.
+
+    lines = [line.strip(" \t") for line in run.split("\n") if line.strip(" \t")]
+    script = "\n".join(lines)
+    variable = r"\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})"
+    echo = r'echo "(?:[^"\x60\\$\n]|' + variable + r')*"'
+    optional_echo = r"(?:" + echo + r"\n)?"
+
+    def reference(name: str) -> str:
+        return r"\$(?:" + name + r"|\{" + name + r"\})"
+
+    prefix = "set -euo pipefail\n"
+    if script.startswith(prefix):
+        script = script[len(prefix) :]
     for event in _env_names_for(env, "github.event_name"):
-        run = re.sub(
-            r'if\s+\[\s*"\$\{?' + re.escape(event) + r'\}?"\s*=\s*"?schedule"?\s*\]\s*;\s*then\s*'
-            r"(?:echo[^\n]*\n\s*)?exit\s+0\s*\n\s*fi\b",
-            "",
-            run,
-        )
-    if re.search(r"\bexit\s+0\b|\|\|\s*(?:true|:)", run):
-        return False
-    return bool(_ref_comparison(run, env))
+        schedule = r'if \[ "' + reference(event) + r'" = "schedule" \]; then\n'
+        script = re.sub(r"\A" + schedule + optional_echo + r"exit 0\nfi\n", "", script)
 
-
-def _ref_comparison(run: str, env: dict) -> bool:
-    """Does the script fail when $REF is not refs/heads/$DEFAULT?
-
-    The script itself is only trusted as a ref comparison when its sole `exit 1`
-    sits under an `if` comparing the github.ref env with the default branch (the
-    schedule pass, if any, was already stripped). Any other exit 1 is a second
-    failure path that could refuse a dispatch on the default branch, so it
-    disqualifies the step as a guard.
-    """
-    exit1 = re.search(r"\bexit\s+1\b", run)
-    if not exit1:
-        return False
     for ref in _env_names_for(env, "github.ref"):
         for default in _env_names_for(env, "github.event.repository.default_branch"):
-            if re.search(
-                r'if\s+\[\s*"\$\{?'
-                + re.escape(ref)
-                + r'\}?"\s*!=\s*"refs/heads/\$\{?'
-                + re.escape(default)
-                + r'\}?"\s*\]\s*;\s*then\b',
-                run[: exit1.start()],
-            ):
+            mismatch = (
+                r'if \[ "'
+                + reference(ref)
+                + r'" != "refs/heads/'
+                + reference(default)
+                + r'" \]; then\n'
+            )
+            if re.fullmatch(mismatch + optional_echo + r"exit 1\nfi(?:\n" + echo + r")?", script):
                 return True
     return False
 
@@ -315,8 +337,8 @@ def check_dispatch_ref_guard(root: Path) -> list[str]:
     so a job that decrypts secrets/ci.sops.env must refuse a non-default ref before it
     checks anything out or loads the secrets (openmix-17uy). The guard has to come before
     the first checkout and the first sops-env step, and no step from the guard up to that
-    sops-env step may carry an always()/failure()/cancelled() condition that would run it
-    after the guard failed. A job whose environment is in PROTECTED_ENVIRONMENTS is exempt.
+    last sops-env step may carry a status condition that could let it run after the guard
+    failed. A job whose environment is in PROTECTED_ENVIRONMENTS is exempt.
     """
     try:
         import yaml
@@ -357,7 +379,8 @@ def check_dispatch_ref_guard(root: Path) -> list[str]:
                 if isinstance(s, dict) and str(s.get("uses", "")).startswith("actions/checkout@")
             ]
             limit = min([first_sops, *checkouts])
-            guards = [i for i, s in enumerate(steps[:limit]) if is_ref_guard(s)]
+            shell = guard_default_shell(doc, job)
+            guards = [i for i, s in enumerate(steps[:limit]) if is_ref_guard(s, shell)]
             sops_name = steps[first_sops].get("name") or SOPS_ENV_ACTION
             if not guards:
                 problems.append(
@@ -368,18 +391,18 @@ def check_dispatch_ref_guard(root: Path) -> list[str]:
                     f"step from auto-topup-audit.yml first."
                 )
                 continue
-            # EVERY sops-env step needs the guard's refusal in its past: a job that loads
-            # the secrets twice may still carry an always()/failure()/cancelled() step in
-            # front of the second load that overrides the guard's exit 1.
-            for i in sops:
-                for s in steps[guards[0] + 1 : i + 1]:
-                    cond = s.get("if") if isinstance(s, dict) else None
-                    if isinstance(cond, str) and _STATUS_OVERRIDE.search(cond):
-                        problems.append(
-                            f"{where}: job {job_id!r} step {s.get('name') or s.get('uses')!r} "
-                            f"runs with if: {cond} between the ref guard and sops-env, so it "
-                            f"still runs after the guard refused the ref."
-                        )
+            # Check through the last load so an override after an earlier load
+            # is still caught, and report each offending step once.
+            for step in steps[guards[0] + 1 : sops[-1] + 1]:
+                if not isinstance(step, dict):
+                    continue
+                cond = step.get("if")
+                if isinstance(cond, str) and _overrides_success(cond):
+                    problems.append(
+                        f"{where}: job {job_id!r} step {step.get('name') or step.get('uses')!r} "
+                        f"has if: {cond} between the ref guard and sops-env and "
+                        f"could run after the guard refused the ref."
+                    )
     return problems
 
 

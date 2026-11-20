@@ -317,6 +317,67 @@ class TestDispatchRefGuard:
         problems = inv.check_dispatch_ref_guard(repo)
         assert len(problems) == 1 and "always()" in problems[0]
 
+    @pytest.mark.parametrize(
+        ("workflow_default", "job_default", "step_shell", "accepted"),
+        [
+            ("python", None, None, False),
+            ("bash", "pwsh", None, False),
+            (None, "bash", "echo {0}", False),
+            ("python", "bash", None, True),
+            ("bash", "pwsh", "bash", True),
+        ],
+    )
+    def test_guard_uses_effective_shell(
+        self, repo, workflow_default, job_default, step_shell, accepted
+    ):
+        guard = _GUARD
+        if step_shell:
+            guard = guard.replace("        run:", f"        shell: {step_shell}\n        run:")
+        text = _dispatch_workflow(guard + _CHECKOUT + _SOPS)
+        if workflow_default:
+            text = f"defaults: {{run: {{shell: {workflow_default}}}}}\n" + text
+        if job_default:
+            text = text.replace(
+                "    steps:", f"    defaults: {{run: {{shell: {job_default}}}}}\n    steps:"
+            )
+        self._write(repo, text)
+        assert (inv.check_dispatch_ref_guard(repo) == []) == accepted
+
+    @pytest.mark.parametrize(
+        "replacement",
+        [
+            "            # exit 1\n          fi",
+            '            echo "exit 1"\n          fi',
+            "            :\n          else\n            exit 1\n          fi",
+            "            :\n          fi\n          exit 1",
+            "            :\n          fi\n"
+            "          if false; then\n            exit 1\n          fi",
+        ],
+    )
+    def test_ref_mismatch_requires_an_executable_exit(self, repo, replacement):
+        guard = _GUARD.replace("            exit 1\n          fi", replacement)
+        self._write(repo, _dispatch_workflow(guard + _CHECKOUT + _SOPS))
+        assert len(inv.check_dispatch_ref_guard(repo)) == 1
+
+    @pytest.mark.parametrize(
+        ("condition", "accepted"),
+        [
+            ("!success()", False),
+            ("SUCCESS() == false", False),
+            ("success() || inputs.force", False),
+            ("FaIlUrE()", False),
+            ("success()", True),
+            ("inputs.enabled", True),
+            ("inputs.label == 'failure()'", True),
+        ],
+    )
+    def test_status_conditions_after_guard(self, repo, condition, accepted):
+        expr = f"${{{{ {condition} }}}}"
+        sops = _SOPS.replace("        uses:", f"        if: {expr}\n        uses:")
+        checkout = _CHECKOUT.replace("      - uses:", f"      - if: {expr}\n        uses:")
+        self._write(repo, _dispatch_workflow(_GUARD + checkout + sops))
+        assert len(inv.check_dispatch_ref_guard(repo)) == (0 if accepted else 2)
+
     def test_every_sops_job_needs_its_own_guard(self, repo):
         """provider-smoke's report job runs if: always() after the smoke job, so the
         smoke job's guard does not stop it."""
@@ -351,8 +412,8 @@ class TestDispatchRefGuard:
         assert "'report' " not in problems[0] and "'Load SOPS secrets again'" in problems[0]
 
 
-def _real_guards() -> list[tuple[str, str, dict]]:
-    """(workflow, job, guard step) for every guarded sops-env job in this repo."""
+def _real_guards() -> list[tuple[str, str, dict, str]]:
+    """Return the workflow, job, step and effective shell for each guard."""
     import yaml
 
     root = Path(__file__).resolve().parents[1]
@@ -360,9 +421,10 @@ def _real_guards() -> list[tuple[str, str, dict]]:
     for path in sorted((root / ".github" / "workflows").glob("*.y*ml")):
         doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         for job_id, job in (doc.get("jobs") or {}).items():
+            default_shell = inv.guard_default_shell(doc, job)
             for step in job.get("steps") or []:
-                if inv.is_ref_guard(step):
-                    found.append((path.name, job_id, step))
+                if inv.is_ref_guard(step, default_shell):
+                    found.append((path.name, job_id, step, step.get("shell", default_shell)))
     return found
 
 
@@ -371,10 +433,11 @@ class TestRealGuardsBehave:
     GitHub would give it, so a guard that parses right but decides wrong still fails."""
 
     def test_the_guards_are_found(self):
-        jobs = {(w, j) for w, j, _ in _real_guards()}
+        jobs = {(w, j) for w, j, _, _ in _real_guards()}
         # The two pre-existing guards plus the seven jobs openmix-17uy guarded.
         for want in [
             ("auto-topup-audit.yml", "audit"),
+            ("reseal-akash-key.yml", "reseal"),
             ("close-orphans.yml", "close"),
             ("cleanup-stale.yml", "cleanup"),
             ("bid-probe.yml", "probe"),
@@ -398,7 +461,7 @@ class TestRealGuardsBehave:
     def test_each_guard_decides_on_the_full_ref(self, tmp_path, ref, default, event, ok):
         import subprocess
 
-        for workflow, job, step in _real_guards():
+        for workflow, job, step, shell in _real_guards():
             env = {"PATH": "/usr/bin:/bin"}
             for name, value in step["env"].items():
                 value = value.replace("${{ github.ref }}", ref)
@@ -406,9 +469,9 @@ class TestRealGuardsBehave:
                 value = value.replace("${{ github.event_name }}", event)
                 env[name] = value
             result = subprocess.run(
-                ["bash", "-e", "-c", step["run"]], env=env, capture_output=True, text=True
+                [shell, "-e", "-c", step["run"]], env=env, capture_output=True, text=True
             )
-            assert (result.returncode == 0) is ok, (workflow, job, result.stdout)
+            assert result.returncode == (0 if ok else 1), (workflow, job, result.stderr)
 
 
 class TestAnnotations:
