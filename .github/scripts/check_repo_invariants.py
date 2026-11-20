@@ -16,6 +16,12 @@ once, by changes that looked fine in isolation and passed every other gate:
    claiming the same version in an order that no longer descends (main briefly
    had two ``## [1.37.0]`` headers, one of them below 1.36.1).
 
+3. **A dispatchable job decrypts wallet secrets only from the default branch.**
+   Six workflow_dispatch workflows loaded ``./.github/actions/sops-env`` with
+   no ref check, so any repo writer could dispatch a branch whose code closes or
+   spends on the shared Console wallet (openmix-17uy). auto-topup-audit.yml and
+   reseal-akash-key.yml had the guard; nothing made the others carry it.
+
 Run: ``python3 .github/scripts/check_repo_invariants.py [--root DIR]``
 Exit 0 when every invariant holds, 1 otherwise (with the offending lines).
 """
@@ -217,6 +223,237 @@ def check_workflow_vars(root: Path, *, declarations_must_be_used: bool = False) 
     return problems
 
 
+SOPS_ENV_ACTION = "./.github/actions/sops-env"
+
+# Environments with REQUIRED REVIEWERS, which the bead accepts in place of the ref guard.
+# Empty on purpose: the environment's name in a workflow cannot show that it has reviewers
+# (only the repo settings can), and today the only environment is `copilot`, with no
+# protection rules. Adding a name here is a claim someone checked those settings.
+PROTECTED_ENVIRONMENTS: frozenset[str] = frozenset()
+
+# Any status function suppresses Actions' implicit success() check. Only a
+# standalone positive success() is recognized as safe here.
+_STATUS_FUNCTION = re.compile(r"\b(?:success|always|failure|cancelled)\s*\(", re.I)
+_EXPRESSION_STRING = re.compile(r"'(?:[^']|'')*'")
+_SUCCESS = re.compile(r"success\s*\(\s*\)", re.I)
+
+
+def _overrides_success(condition: str) -> bool:
+    expr = condition.strip().removeprefix("${{").removesuffix("}}").strip()
+    expr = _EXPRESSION_STRING.sub("''", expr)
+    return bool(_STATUS_FUNCTION.search(expr) and not _SUCCESS.fullmatch(expr))
+
+
+# GitHub predefines its default (read-only) variables under the GITHUB_* and
+# RUNNER_* prefixes; a workflow `env:` assignment to any of them is IGNORED at
+# runtime, so a guard that "binds" one never receives the value its comparison
+# relies on and its refusal can silently stop working (CodeRabbit, openmix-17uy,
+# 2026-11-20: GITHUB_REF_NAME on a dispatched ref still holds that ref's name).
+# Reject by prefix, not by an enumerated list: GitHub adds default variables
+# over time (e.g. GITHUB_RUN_NUMBER, GITHUB_RETRY_NUMBER, RUNNER_ARCH), and an
+# enumeration cannot reject what it does not name.
+RESERVED_ENV_PREFIXES = ("GITHUB_", "RUNNER_")
+
+
+def _env_names_for(env: dict, expr: str) -> list[str]:
+    """Shell variable names bound to the given GitHub expression.
+
+    A reserved name is skipped: GitHub ignores a workflow `env:` assignment to
+    a default variable, so the binding cannot carry the expression's value at
+    runtime and the guard's comparison would run on the variable's pre-set
+    value instead.
+    """
+    want = re.compile(r"\$\{\{\s*" + re.escape(expr) + r"\s*\}\}")
+    return [
+        k
+        for k, v in env.items()
+        if isinstance(k, str)
+        and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k)
+        and not k.startswith(RESERVED_ENV_PREFIXES)
+        and isinstance(v, str)
+        and want.fullmatch(v.strip())
+    ]
+
+
+def _default_shell(scope: dict, fallback: str) -> str:
+    defaults = scope.get("defaults") or {}
+    run = defaults.get("run") or {}
+    return run.get("shell", fallback)
+
+
+def guard_default_shell(workflow: dict, job: dict) -> str:
+    """Resolve job and workflow shell defaults for a guard run step."""
+    # GitHub-hosted Ubuntu jobs use Bash by default outside containers.
+    runner = job.get("runs-on")
+    implicit = (
+        "bash"
+        if isinstance(runner, str) and runner.startswith("ubuntu-") and "container" not in job
+        else ""
+    )
+    return _default_shell(job, _default_shell(workflow, implicit))
+
+
+def is_ref_guard(step: object, default_shell: str) -> bool:
+    """Recognize the repository's Bash guard, optionally with a schedule early pass.
+
+    Match the whole script so a comment, quoted command, or another branch
+    cannot supply the required nonzero exit. The accepted echo commands only
+    interpolate simple shell variables.
+    """
+    if not isinstance(step, dict) or "uses" in step or "if" in step:
+        return False
+    if step.get("continue-on-error") not in (None, False):
+        return False
+    if step.get("shell", default_shell) != "bash":
+        return False
+    env, run = step.get("env"), step.get("run")
+    if not isinstance(env, dict) or not isinstance(run, str):
+        return False
+
+    lines = [line.strip(" \t") for line in run.split("\n") if line.strip(" \t")]
+    script = "\n".join(lines)
+    variable = r"\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})"
+    echo = r'echo "(?:[^"\x60\\$\n]|' + variable + r')*"'
+    optional_echo = r"(?:" + echo + r"\n)?"
+
+    def reference(name: str) -> str:
+        return r"\$(?:" + name + r"|\{" + name + r"\})"
+
+    prefix = "set -euo pipefail\n"
+    if script.startswith(prefix):
+        script = script[len(prefix) :]
+    for event in _env_names_for(env, "github.event_name"):
+        schedule = r'if \[ "' + reference(event) + r'" = "schedule" \]; then\n'
+        script = re.sub(r"\A" + schedule + optional_echo + r"exit 0\nfi\n", "", script)
+
+    for ref in _env_names_for(env, "github.ref"):
+        for default in _env_names_for(env, "github.event.repository.default_branch"):
+            mismatch = (
+                r'if \[ "'
+                + reference(ref)
+                + r'" != "refs/heads/'
+                + reference(default)
+                + r'" \]; then\n'
+            )
+            if re.fullmatch(mismatch + optional_echo + r"exit 1\nfi(?:\n" + echo + r")?", script):
+                return True
+    return False
+
+
+def _dispatchable(on: object) -> bool:
+    if isinstance(on, str):
+        return on == "workflow_dispatch"
+    if isinstance(on, (list, dict)):
+        return "workflow_dispatch" in on
+    return False
+
+
+def _job_step_names(steps: list) -> str:
+    """The steps a problem names, by their own name (or uses), for a guard-first message."""
+    names = []
+    for s in steps:
+        if not isinstance(s, dict):
+            continue
+        n = s.get("name") or s.get("uses")
+        if isinstance(n, str):
+            names.append(n)
+    return " and ".join(repr(n) for n in names)
+
+
+def check_dispatch_ref_guard(root: Path) -> list[str]:
+    """Every job of a workflow_dispatch workflow that loads sops-env is ref-guarded first.
+
+    workflow_dispatch runs the workflow AND the code of whatever ref the dispatcher picks,
+    so a job that decrypts secrets/ci.sops.env must refuse a non-default ref before it
+    checks anything out or loads the secrets (openmix-17uy). The guard has to come before
+    the first checkout and the first sops-env step, and no step from the guard up to that
+    last sops-env step may carry a status condition that could let it run after the guard
+    failed. AC1 requires the guard to run FIRST in the job: any step before it would run
+    on a refused ref, even without credentials, so the guard is the only step allowed
+    before it. A job whose environment is in PROTECTED_ENVIRONMENTS is exempt.
+
+    GitHub rejects a workflow whose ``jobs`` key is not a mapping (a list or a scalar is
+    not a jobs object), so such a file cannot run and carries no live job; it is skipped
+    here by design. The skip is deliberate, not an oversight (openmix-17uy review, 2026-11-20).
+    """
+    try:
+        import yaml
+    except ImportError:
+        # Fail closed: a guard that quietly checks nothing is worse than a red build.
+        return ["check_dispatch_ref_guard needs PyYAML (python3 -m pip install pyyaml)"]
+    problems: list[str] = []
+    for path in sorted((root / ".github" / "workflows").glob("*.y*ml")):
+        text = path.read_text(encoding="utf-8")
+        doc = yaml.safe_load(text) or {}
+        if not isinstance(doc, dict):
+            continue
+        # YAML 1.1 reads a bare `on:` key as the boolean True.
+        if not _dispatchable(doc.get("on", doc.get(True))):
+            continue
+        jobs = doc.get("jobs") or {}
+        for job_id, job in jobs.items() if isinstance(jobs, dict) else []:
+            if not isinstance(job, dict):
+                continue
+            steps = job.get("steps") or []
+            sops = [
+                i
+                for i, s in enumerate(steps)
+                if isinstance(s, dict) and str(s.get("uses", "")).rstrip("/") == SOPS_ENV_ACTION
+            ]
+            if not sops:
+                continue
+            env = job.get("environment")
+            env_name = env.get("name") if isinstance(env, dict) else env
+            if env_name in PROTECTED_ENVIRONMENTS:
+                continue
+            m = re.search(rf"^  {re.escape(str(job_id))}:", text, re.M)
+            where = f"{path.relative_to(root)}:{text.count(chr(10), 0, m.start()) + 1 if m else 1}"
+            first_sops = sops[0]
+            checkouts = [
+                i
+                for i, s in enumerate(steps)
+                if isinstance(s, dict) and str(s.get("uses", "")).startswith("actions/checkout@")
+            ]
+            limit = min([first_sops, *checkouts])
+            shell = guard_default_shell(doc, job)
+            guards = [i for i, s in enumerate(steps[:limit]) if is_ref_guard(s, shell)]
+            sops_name = steps[first_sops].get("name") or SOPS_ENV_ACTION
+            if guards:
+                # Guard first (openmix-17uy AC1): a step ahead of the guard runs on a
+                # refused ref even without credentials. Report the first offender.
+                first_guard = guards[0]
+                if first_guard > 0:
+                    problems.append(
+                        f"{where}: job {job_id!r} runs {_job_step_names(steps[:first_guard])} "
+                        f"before its default-ref guard, so the guard is not the job's first "
+                        f"step -- it would not refuse a dispatched ref that runs ahead of it. "
+                        f"Move the guard first, as in the other guarded jobs."
+                    )
+                    continue
+            if not guards:
+                problems.append(
+                    f"{where}: job {job_id!r} loads sops-env (step {sops_name!r}) in a "
+                    f"workflow_dispatch workflow with no default-ref guard before its first "
+                    f"checkout and sops-env step -- any branch or tag could be dispatched to "
+                    f"run with the wallet key. Add the 'Refuse to run from a non-default ref' "
+                    f"step from auto-topup-audit.yml first."
+                )
+                continue
+            # Check through the last load so an override after an earlier load
+            # is still caught, and report each offending step once.
+            for step in steps[guards[0] + 1 : sops[-1] + 1]:
+                if not isinstance(step, dict):
+                    continue
+                cond = step.get("if")
+                if isinstance(cond, str) and _overrides_success(cond):
+                    problems.append(
+                        f"{where}: job {job_id!r} step {step.get('name') or step.get('uses')!r} "
+                        f"has if: {cond} between the ref guard and sops-env and "
+                        f"could run after the guard refused the ref."
+                    )
+    return problems
+
+
 def check_changelog(root: Path) -> list[str]:
     """Changelog versions descend strictly, are unique, and the newest matches
     the packaged version."""
@@ -283,6 +520,7 @@ def main(argv: list[str] | None = None) -> int:
         # see check_workflow_vars' docstring for why the two arms differ.
         + check_workflow_vars(root, declarations_must_be_used=(root == REPO_ROOT))
         + check_changelog(root)
+        + check_dispatch_ref_guard(root)
     )
     if problems:
         print("Repo invariant check FAILED:\n", file=sys.stderr)
@@ -304,7 +542,10 @@ def main(argv: list[str] | None = None) -> int:
         if root == REPO_ROOT
         else f"{len(DECLARED_VARS)} declared repo variable(s) (usage unchecked: not this repo)"
     )
-    print(f"Repo invariants OK (SOPS-only secrets; {declared}; changelog ordered and in sync).")
+    print(
+        f"Repo invariants OK (SOPS-only secrets; {declared}; changelog ordered and in sync; "
+        "dispatchable sops-env jobs ref-guarded)."
+    )
     return 0
 
 

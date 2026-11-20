@@ -58,6 +58,31 @@ jobs:
     # is ~5m setup + 40m + 10m = 55m, so 70m leaves clear headroom.
     timeout-minutes: 70
     steps:
+      # TRUSTED REF ONLY, and before checkout on purpose, for the reason auto-topup-audit.yml
+      # gives: workflow_dispatch lets any repo writer pick a branch or tag, and checkout then
+      # runs its code -- ./.github/actions/sops-env and just_akash included -- with
+      # SOPS_AGE_KEY and AKASH_API_KEY (the shared Console wallet) in scope (openmix-17uy).
+      # github.ref, NOT github.ref_name, so a TAG named after the default branch fails.
+      # A schedule event carries no repository payload (default_branch is empty there), and
+      # GitHub only ever runs a schedule from the default branch, so it passes on event_name.
+      # tests/test_repo_invariants.py fails if a dispatchable sops-env job loses this step.
+      - name: Refuse to run from a non-default ref
+        env:
+          REF: ${{ github.ref }}
+          DEFAULT: ${{ github.event.repository.default_branch }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "schedule" ]; then
+            echo "schedule event: GitHub runs it only from the default branch (ref=$REF)"
+            exit 0
+          fi
+          if [ "$REF" != "refs/heads/$DEFAULT" ]; then
+            echo "::error::This workflow loads wallet secrets and may only run from refs/heads/$DEFAULT (got '$REF')."
+            exit 1
+          fi
+          echo "ref=$REF is the default branch"
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -233,6 +258,31 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
+      # TRUSTED REF ONLY, and before checkout on purpose, for the reason auto-topup-audit.yml
+      # gives: workflow_dispatch lets any repo writer pick a branch or tag, and checkout then
+      # runs its code -- ./.github/actions/sops-env and just_akash included -- with
+      # SOPS_AGE_KEY and AKASH_API_KEY (the shared Console wallet) in scope (openmix-17uy).
+      # github.ref, NOT github.ref_name, so a TAG named after the default branch fails.
+      # A schedule event carries no repository payload (default_branch is empty there), and
+      # GitHub only ever runs a schedule from the default branch, so it passes on event_name.
+      # tests/test_repo_invariants.py fails if a dispatchable sops-env job loses this step.
+      - name: Refuse to run from a non-default ref
+        env:
+          REF: ${{ github.ref }}
+          DEFAULT: ${{ github.event.repository.default_branch }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "schedule" ]; then
+            echo "schedule event: GitHub runs it only from the default branch (ref=$REF)"
+            exit 0
+          fi
+          if [ "$REF" != "refs/heads/$DEFAULT" ]; then
+            echo "::error::This workflow loads wallet secrets and may only run from refs/heads/$DEFAULT (got '$REF')."
+            exit 1
+          fi
+          echo "ref=$REF is the default branch"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:

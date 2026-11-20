@@ -194,6 +194,465 @@ class TestWorkflowVarsInvariant:
         assert inv.check_workflow_vars(repo) == []
 
 
+_GUARD = (
+    "      - name: Refuse to run from a non-default ref\n"
+    "        env:\n"
+    "          REF: ${{ github.ref }}\n"
+    "          DEFAULT: ${{ github.event.repository.default_branch }}\n"
+    "        run: |\n"
+    "          set -euo pipefail\n"
+    '          if [ "$REF" != "refs/heads/$DEFAULT" ]; then\n'
+    '            echo "::error::refusing $REF"\n'
+    "            exit 1\n"
+    "          fi\n"
+)
+_CHECKOUT = "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n"
+_SOPS = (
+    "      - name: Load SOPS secrets\n"
+    "        uses: ./.github/actions/sops-env\n"
+    "        with:\n          age-key: ${{ secrets.SOPS_AGE_KEY }}\n"
+)
+
+
+def _dispatch_workflow(steps: str, on: str = "on:\n  workflow_dispatch:\n") -> str:
+    return f"{on}jobs:\n  close:\n    runs-on: ubuntu-latest\n    steps:\n{steps}"
+
+
+class TestDispatchRefGuard:
+    """openmix-17uy: six workflow_dispatch workflows loaded sops-env (the shared Console
+    wallet key) with no ref check, so a repo writer could dispatch a branch whose code
+    closes or spends on that wallet. The guard from auto-topup-audit.yml must come first."""
+
+    def _write(self, repo, text, name="close-orphans.yml"):
+        (repo / ".github" / "workflows" / name).write_text(text)
+
+    def test_clean_repo_passes(self, repo):
+        assert inv.check_dispatch_ref_guard(repo) == []
+
+    def test_an_unguarded_dispatch_job_is_caught(self, repo):
+        self._write(repo, _dispatch_workflow(_CHECKOUT + _SOPS))
+        problems = inv.check_dispatch_ref_guard(repo)
+        assert len(problems) == 1, problems
+        assert "close-orphans.yml:4" in problems[0]  # the job's line
+        assert "'close'" in problems[0] and "'Load SOPS secrets'" in problems[0]
+
+    def test_a_guarded_job_passes(self, repo):
+        self._write(repo, _dispatch_workflow(_GUARD + _CHECKOUT + _SOPS))
+        assert inv.check_dispatch_ref_guard(repo) == []
+
+    @pytest.mark.parametrize(
+        "on",
+        [
+            "on: workflow_dispatch\n",
+            "on: [push, workflow_dispatch]\n",
+            "on:\n  schedule: [{cron: '0 * * * *'}]\n  workflow_dispatch:\n    inputs: {}\n",
+        ],
+    )
+    def test_every_trigger_spelling_counts_as_dispatchable(self, repo, on):
+        self._write(repo, _dispatch_workflow(_CHECKOUT + _SOPS, on=on))
+        assert len(inv.check_dispatch_ref_guard(repo)) == 1
+
+    def test_a_workflow_without_dispatch_is_out_of_scope(self, repo):
+        """push and pull_request run the trusted workflow of their event; workflow_call
+        runs the caller's. Only a dispatch lets the dispatcher choose the ref."""
+        self._write(repo, _dispatch_workflow(_CHECKOUT + _SOPS, on="on: [push]\n"))
+        assert inv.check_dispatch_ref_guard(repo) == []
+
+    def test_a_yaml_extension_is_scanned(self, repo):
+        self._write(repo, _dispatch_workflow(_CHECKOUT + _SOPS), name="x.yaml")
+        assert len(inv.check_dispatch_ref_guard(repo)) == 1
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "GITHUB_REF_NAME",
+            "GITHUB_REF",
+            "GITHUB_EVENT_NAME",
+            "GITHUB_SHA",
+            # The names CodeRabbit (round 6) found missing from the enumerated
+            # list: GitHub defaults added after the list was written.
+            "GITHUB_RUN_NUMBER",
+            "GITHUB_RETRY_NUMBER",
+            "GITHUB_JOB",
+            "GITHUB_STEP_SUMMARY",
+            "RUNNER_OS",
+            "RUNNER_ARCH",
+            "RUNNER_TEMP",
+            "RUNNER_TOOL_CACHE",
+            "RUNNER_WORKSPACE",
+        ],
+        ids=[
+            "github-ref-name",
+            "github-ref",
+            "github-event-name",
+            "github-sha",
+            "github-run-number",
+            "github-retry-number",
+            "github-job",
+            "github-step-summary",
+            "runner-os",
+            "runner-arch",
+            "runner-temp",
+            "runner-tool-cache",
+            "runner-workspace",
+        ],
+    )
+    def test_a_reserved_github_env_name_is_not_a_binding(self, repo, name):
+        """CodeRabbit (rounds 5 and 6): GitHub ignores a workflow `env:`
+        assignment to a default variable, so a guard that 'binds' one never
+        receives the value its comparison relies on -- on a dispatched ref
+        GITHUB_REF_NAME still holds that ref's name and the guard passes. The
+        checker must reject the binding, not count the step as a guard. The
+        set is rejected by prefix (every GITHUB_* and RUNNER_* name, current
+        and future), never by an enumeration that misses the next default
+        variable GitHub ships."""
+        guard = (
+            "      - name: Refuse to run from a non-default ref\n"
+            "        env:\n"
+            f"          {name}: ${{{{ github.ref }}}}\n"
+            "          DEFAULT: ${{ github.event.repository.default_branch }}\n"
+            "        run: |\n"
+            "          set -euo pipefail\n"
+            f'          if [ "${name}" != "refs/heads/$DEFAULT" ]; then\n'
+            '            echo "::error::refusing ${name}"\n'
+            "            exit 1\n"
+            "          fi\n"
+        )
+        self._write(repo, _dispatch_workflow(guard + _CHECKOUT + _SOPS))
+        problems = inv.check_dispatch_ref_guard(repo)
+        assert len(problems) == 1, problems
+        assert "no default-ref guard" in problems[0]
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "GITHUB_REF_NAME",
+            "GITHUB_RUN_NUMBER",
+            "RUNNER_TEMP",
+        ],
+        ids=["github-ref-name", "github-run-number", "runner-temp"],
+    )
+    def test_a_reserved_name_bound_to_the_default_branch_is_not_a_binding(self, repo, name):
+        """CodeRabbit reply on the round-6 thread (2026-11-20): the round-6
+        regression bound the reserved name to `github.ref` only. The rejection
+        must cover the other side of the comparison too -- a guard whose DEFAULT
+        is `GITHUB_REF_NAME: ${{ github.event.repository.default_branch }}`
+        never receives the repository's default branch (GitHub ignores an env
+        assignment to a default variable), so on a dispatched ref the guard
+        compares against its own pre-set value and can pass. Rejected the same
+        way as the ref-side binding: the job is unguarded."""
+        guard = (
+            "      - name: Refuse to run from a non-default ref\n"
+            "        env:\n"
+            "          REF: ${{ github.ref }}\n"
+            f"          {name}: ${{{{ github.event.repository.default_branch }}}}\n"
+            "        run: |\n"
+            "          set -euo pipefail\n"
+            f'          if [ "$REF" != "refs/heads/${name}" ]; then\n'
+            '            echo "::error::refusing $REF"\n'
+            "            exit 1\n"
+            "          fi\n"
+        )
+        self._write(repo, _dispatch_workflow(guard + _CHECKOUT + _SOPS))
+        problems = inv.check_dispatch_ref_guard(repo)
+        assert len(problems) == 1, problems
+        assert "no default-ref guard" in problems[0]
+
+    def test_ordinary_ref_bindings_stay_valid(self, repo):
+        """The rejection is the reserved name, not the comparison: ordinary REF/DEFAULT
+        bindings are recognized, including the schedule early pass on EVENT."""
+        assert inv.check_dispatch_ref_guard(repo) == []
+        guard = _GUARD.replace(
+            "        run: |\n",
+            "          EVENT: ${{ github.event_name }}\n        run: |\n",
+        ).replace(
+            "          set -euo pipefail\n",
+            '          set -euo pipefail\n          if [ "$EVENT" = "schedule" ]; then\n'
+            '            echo "schedule"\n            exit 0\n          fi\n',
+        )
+        self._write(repo, _dispatch_workflow(guard + _CHECKOUT + _SOPS))
+        assert inv.check_dispatch_ref_guard(repo) == []
+
+    def test_a_step_before_the_guard_is_caught(self, repo):
+        """openmix-17uy AC1: the guard runs FIRST. bid-probe's bookkeeping step
+        preceded its guard on PR #512 (round 4) and the checker accepted the job.
+        Even credential-free, a step ahead of the guard runs on a refused ref."""
+        before = "      - name: Record run start\n        run: echo start > file\n"
+        self._write(repo, _dispatch_workflow(before + _GUARD + _CHECKOUT + _SOPS))
+        problems = inv.check_dispatch_ref_guard(repo)
+        assert len(problems) == 1, problems
+        assert "Record run start" in problems[0]
+        assert "before its default-ref guard" in problems[0]
+        # The ordering holds even with steps after the guard, and is not masked
+        # by a later failure-admitting step: the pre-guard step is the offender.
+        always = _SOPS.replace("        uses:", "        if: always()\n        uses:")
+        self._write(repo, _dispatch_workflow(before + _GUARD + _CHECKOUT + always))
+        problems = inv.check_dispatch_ref_guard(repo)
+        assert len(problems) == 1, problems
+        assert "Record run start" in problems[0]
+
+    def test_guard_first_passes_and_ordering_is_enforced_only_with_a_guard(self, repo):
+        """No guard, steps before sops: the missing-guard finding stands (unchanged)."""
+        before = "      - name: Record run start\n        run: echo start\n"
+        self._write(repo, _dispatch_workflow(before + _CHECKOUT + _SOPS))
+        problems = inv.check_dispatch_ref_guard(repo)
+        assert len(problems) == 1 and "no default-ref guard" in problems[0]
+
+    def test_the_guard_must_come_before_checkout(self, repo):
+        """After checkout the step list is fixed, but ./.github/actions/sops-env itself
+        is the dispatched ref's code. Refuse before anything from the ref is on disk."""
+        self._write(repo, _dispatch_workflow(_CHECKOUT + _GUARD + _SOPS))
+        assert len(inv.check_dispatch_ref_guard(repo)) == 1
+
+    def test_ref_name_is_not_the_full_ref(self, repo):
+        """A tag named main has ref_name main. Only github.ref tells it apart."""
+        self._write(
+            repo,
+            _dispatch_workflow(
+                _GUARD.replace("github.ref }}", "github.ref_name }}") + _CHECKOUT + _SOPS
+            ),
+        )
+        assert len(inv.check_dispatch_ref_guard(repo)) == 1
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            lambda g: g.replace("            exit 1\n", "            echo still going\n"),
+            lambda g: g.replace(
+                "        env:\n", "        continue-on-error: true\n        env:\n"
+            ),
+            lambda g: g.replace(
+                "        env:\n", "        if: github.event_name == 'push'\n        env:\n"
+            ),
+            lambda g: g.replace("          set -euo", "          exit 0\n          set -euo"),
+            lambda g: g.replace('$DEFAULT" ]', '$DEFAULT" ] || true'),
+        ],
+        ids=["no-exit-1", "continue-on-error", "conditional", "exit-0", "or-true"],
+    )
+    def test_a_guard_that_can_be_passed_over_does_not_count(self, repo, mutate):
+        self._write(repo, _dispatch_workflow(mutate(_GUARD) + _CHECKOUT + _SOPS))
+        assert len(inv.check_dispatch_ref_guard(repo)) == 1
+
+    def test_the_schedule_pass_is_allowed(self, repo):
+        """A schedule event has no repository payload (default_branch is empty) and GitHub
+        runs it only from the default branch, so the guard may pass it on event_name."""
+        guard = _GUARD.replace(
+            "        run: |\n",
+            "          EVENT: ${{ github.event_name }}\n        run: |\n",
+        ).replace(
+            "          set -euo pipefail\n",
+            '          set -euo pipefail\n          if [ "$EVENT" = "schedule" ]; then\n'
+            '            echo "schedule"\n            exit 0\n          fi\n',
+        )
+        self._write(repo, _dispatch_workflow(guard + _CHECKOUT + _SOPS))
+        assert inv.check_dispatch_ref_guard(repo) == []
+
+    def test_an_always_step_after_the_guard_is_caught(self, repo):
+        sops = _SOPS.replace("        uses:", "        if: always()\n        uses:")
+        self._write(repo, _dispatch_workflow(_GUARD + _CHECKOUT + sops))
+        problems = inv.check_dispatch_ref_guard(repo)
+        assert len(problems) == 1 and "always()" in problems[0]
+
+    @pytest.mark.parametrize(
+        ("workflow_default", "job_default", "step_shell", "accepted"),
+        [
+            ("python", None, None, False),
+            ("bash", "pwsh", None, False),
+            (None, "bash", "echo {0}", False),
+            ("python", "bash", None, True),
+            ("bash", "pwsh", "bash", True),
+        ],
+    )
+    def test_guard_uses_effective_shell(
+        self, repo, workflow_default, job_default, step_shell, accepted
+    ):
+        guard = _GUARD
+        if step_shell:
+            guard = guard.replace("        run:", f"        shell: {step_shell}\n        run:")
+        text = _dispatch_workflow(guard + _CHECKOUT + _SOPS)
+        if workflow_default:
+            text = f"defaults: {{run: {{shell: {workflow_default}}}}}\n" + text
+        if job_default:
+            text = text.replace(
+                "    steps:", f"    defaults: {{run: {{shell: {job_default}}}}}\n    steps:"
+            )
+        self._write(repo, text)
+        assert (inv.check_dispatch_ref_guard(repo) == []) == accepted
+
+    @pytest.mark.parametrize(
+        "replacement",
+        [
+            "            # exit 1\n          fi",
+            '            echo "exit 1"\n          fi',
+            "            :\n          else\n            exit 1\n          fi",
+            "            :\n          fi\n          exit 1",
+            "            :\n          fi\n"
+            "          if false; then\n            exit 1\n          fi",
+        ],
+    )
+    def test_ref_mismatch_requires_an_executable_exit(self, repo, replacement):
+        guard = _GUARD.replace("            exit 1\n          fi", replacement)
+        self._write(repo, _dispatch_workflow(guard + _CHECKOUT + _SOPS))
+        assert len(inv.check_dispatch_ref_guard(repo)) == 1
+
+    @pytest.mark.parametrize(
+        ("condition", "accepted"),
+        [
+            ("!success()", False),
+            ("SUCCESS() == false", False),
+            ("success() || inputs.force", False),
+            ("FaIlUrE()", False),
+            ("success()", True),
+            ("inputs.enabled", True),
+            ("inputs.label == 'failure()'", True),
+        ],
+    )
+    def test_status_conditions_after_guard(self, repo, condition, accepted):
+        expr = f"${{{{ {condition} }}}}"
+        sops = _SOPS.replace("        uses:", f"        if: {expr}\n        uses:")
+        checkout = _CHECKOUT.replace("      - uses:", f"      - if: {expr}\n        uses:")
+        self._write(repo, _dispatch_workflow(_GUARD + checkout + sops))
+        assert len(inv.check_dispatch_ref_guard(repo)) == (0 if accepted else 2)
+
+    def test_every_sops_job_needs_its_own_guard(self, repo):
+        """provider-smoke's report job runs if: always() after the smoke job, so the
+        smoke job's guard does not stop it."""
+        text = _dispatch_workflow(_GUARD + _CHECKOUT + _SOPS) + (
+            "  report:\n    if: always()\n    runs-on: ubuntu-latest\n    steps:\n"
+            + _CHECKOUT
+            + _SOPS
+        )
+        self._write(repo, text)
+        problems = inv.check_dispatch_ref_guard(repo)
+        assert len(problems) == 1 and "'report'" in problems[0]
+
+    def test_an_unverified_environment_is_not_an_exemption(self, repo):
+        """An environment's name does not show it has required reviewers."""
+        text = _dispatch_workflow(_CHECKOUT + _SOPS).replace(
+            "    runs-on:", "    environment: production\n    runs-on:"
+        )
+        self._write(repo, text)
+        assert len(inv.check_dispatch_ref_guard(repo)) == 1
+
+    def test_an_overriding_step_before_a_later_sops_call_is_caught(self, repo):
+        """A first sops-env call is fine; the check must look at EVERY sops-env step.
+        A later step that overrides its job status would still load the secrets after
+        the guard refused the ref, and it must be named as the offender."""
+        second = _SOPS.replace("- name: Load SOPS secrets", "- name: Load SOPS secrets again")
+        self._write(repo, _dispatch_workflow(_GUARD + _CHECKOUT + _SOPS + second))
+        assert inv.check_dispatch_ref_guard(repo) == []
+        second = second.replace("        uses:", "        if: always()\n        uses:")
+        self._write(repo, _dispatch_workflow(_GUARD + _CHECKOUT + _SOPS + second))
+        problems = inv.check_dispatch_ref_guard(repo)
+        assert len(problems) == 1, problems
+        assert "'report' " not in problems[0] and "'Load SOPS secrets again'" in problems[0]
+
+
+def _real_guards() -> list[tuple[str, str, dict, str]]:
+    """Return the workflow, job, step and effective shell for each guard."""
+    import yaml
+
+    root = Path(__file__).resolve().parents[1]
+    found = []
+    for path in sorted((root / ".github" / "workflows").glob("*.y*ml")):
+        doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        for job_id, job in (doc.get("jobs") or {}).items():
+            default_shell = inv.guard_default_shell(doc, job)
+            for step in job.get("steps") or []:
+                if inv.is_ref_guard(step, default_shell):
+                    found.append((path.name, job_id, step, step.get("shell", default_shell)))
+    return found
+
+
+class TestRealGuardsBehave:
+    """The structural check reads the YAML. This RUNS each guard's shell with the values
+    GitHub would give it, so a guard that parses right but decides wrong still fails."""
+
+    def test_the_guards_are_found(self):
+        jobs = {(w, j) for w, j, _, _ in _real_guards()}
+        # The two pre-existing guards plus the seven jobs openmix-17uy guarded.
+        for want in [
+            ("auto-topup-audit.yml", "audit"),
+            ("reseal-akash-key.yml", "reseal"),
+            ("close-orphans.yml", "close"),
+            ("cleanup-stale.yml", "cleanup"),
+            ("bid-probe.yml", "probe"),
+            ("lease-intent-backfill.yml", "backfill"),
+            ("provider-canary.yml", "canary"),
+            ("provider-smoke.yml", "smoke"),
+            ("provider-smoke.yml", "report"),
+        ]:
+            assert want in jobs, (want, sorted(jobs))
+
+    @pytest.mark.parametrize(
+        ("ref", "default", "event", "ok"),
+        [
+            ("refs/heads/main", "main", "workflow_dispatch", True),
+            ("refs/heads/evil", "main", "workflow_dispatch", False),
+            ("refs/tags/main", "main", "workflow_dispatch", False),
+            ("refs/heads/main", "", "workflow_dispatch", False),
+        ],
+        ids=["default-branch", "other-branch", "tag-named-main", "no-default"],
+    )
+    def test_each_guard_decides_on_the_full_ref(self, tmp_path, ref, default, event, ok):
+        import subprocess
+
+        for workflow, job, step, shell in _real_guards():
+            env = {"PATH": "/usr/bin:/bin"}
+            for name, value in step["env"].items():
+                value = value.replace("${{ github.ref }}", ref)
+                value = value.replace("${{ github.event.repository.default_branch }}", default)
+                value = value.replace("${{ github.event_name }}", event)
+                env[name] = value
+            result = subprocess.run(
+                [shell, "-e", "-c", step["run"]], env=env, capture_output=True, text=True
+            )
+            assert result.returncode == (0 if ok else 1), (workflow, job, result.stderr)
+
+    # CodeRabbit (round 5): the required schedule pairs are defined here, not
+    # inferred from which guards happen to bind github.event_name -- removing
+    # the binding (and the schedule branch) from one of these guards must fail
+    # this test, not silently drop it from the set.
+    _SCHEDULE_GUARD_JOBS = [
+        ("cleanup-stale.yml", "cleanup"),
+        ("bid-probe.yml", "probe"),
+        ("provider-canary.yml", "canary"),
+        ("provider-smoke.yml", "smoke"),
+        ("provider-smoke.yml", "report"),
+    ]
+
+    def test_the_schedule_pass_executes(self, tmp_path):
+        """CodeRabbit (round 4): recognition of the schedule early pass is not enough --
+        EXECUTE it. GitHub runs a schedule only from the default branch, and a schedule
+        event's payload has no repository default_branch (it reads empty), so a guard that
+        binds github.event_name must exit 0 for a schedule event with an empty default
+        branch. Guards without that binding are dispatch-only and stay out of this case."""
+        import subprocess
+
+        executed = []
+        for workflow, job, step, shell in _real_guards():
+            if (workflow, job) not in self._SCHEDULE_GUARD_JOBS:
+                continue
+            env = {"PATH": "/usr/bin:/bin"}
+            for name, value in step["env"].items():
+                value = value.replace("${{ github.ref }}", "refs/heads/main")
+                value = value.replace("${{ github.event.repository.default_branch }}", "")
+                value = value.replace("${{ github.event_name }}", "schedule")
+                env[name] = value
+            result = subprocess.run(
+                [shell, "-e", "-c", step["run"]], env=env, capture_output=True, text=True
+            )
+            assert result.returncode == 0, (workflow, job, result.stderr)
+            executed.append((workflow, job))
+        missing = set(self._SCHEDULE_GUARD_JOBS) - set(executed)
+        assert not missing, (
+            "these schedule-triggered jobs carry no recognized guard whose early "
+            f"pass can be executed: {sorted(missing)} -- if their guards lost their "
+            "github.event_name binding, restore the schedule early pass (GitHub runs "
+            "a schedule only from the default branch; its payload has no default_branch)"
+        )
+
+
 class TestAnnotations:
     def test_annotation_carries_file_and_line(self, repo, capsys):
         """`::error::` alone puts the annotation at the top of the run. The comment beside it
@@ -236,3 +695,17 @@ class TestMain:
         # Strict here: this IS the repo the table describes.
         assert inv.check_workflow_vars(root, declarations_must_be_used=True) == []
         assert inv.check_changelog(root) == []
+        assert inv.check_dispatch_ref_guard(root) == []
+
+    def test_a_non_mapping_jobs_key_is_skipped(self, repo):
+        """A workflow whose ``jobs`` key is not a mapping is rejected by GitHub's
+        workflow validation (it cannot run), so the checker skips it instead of
+        crashing. The skip is the documented behavior, not a gap (openmix-17uy
+        review finding 2): this test pins it so a change that crashes or flags
+        such a file fails loudly."""
+        for text in (
+            "on:\n  workflow_dispatch:\njobs: [not, a, mapping]\n",
+            "on:\n  workflow_dispatch:\njobs: a scalar\n",
+        ):
+            (repo / ".github" / "workflows" / "broken-jobs.yml").write_text(text)
+            assert inv.check_dispatch_ref_guard(repo) == []
