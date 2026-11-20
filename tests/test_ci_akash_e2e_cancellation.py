@@ -34,9 +34,11 @@ def test_real_akash_e2e_workflow_cannot_be_cancelled_by_a_new_commit() -> None:
     assert population == 2, f"expected both real Akash E2E jobs, found {population}"
     assert not unsafe
 
-    target = "  cancel-in-progress: false\n"
+    # Anchored at a line start with two spaces: the WORKFLOW-level key. The job-level
+    # E2E locks (#267) indent theirs by six and must not match.
+    target = "\n  cancel-in-progress: false\n"
     assert source.count(target) == 1, "cancellation mutation target must be exact"
-    mutant = source.replace(target, "  cancel-in-progress: true\n", 1)
+    mutant = source.replace(target, "\n  cancel-in-progress: true\n", 1)
     assert mutant != source
     assert _unsafe_cancellation(mutant) == (True, 2)
 

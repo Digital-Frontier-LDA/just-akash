@@ -399,29 +399,39 @@ class TestAkashConsoleAPI:
     @patch.object(AkashConsoleAPI, "close_deployment")
     @patch.object(AkashConsoleAPI, "list_deployments")
     def test_close_all_deployments(self, mock_list, mock_close):
+        # Scoped since just-akash-73o: only this run's group names are closed.
+        run = "abcdef12"
         mock_list.return_value = [
-            {"dseq": "1"},
-            {"dseq": "2"},
+            {
+                "dseq": d,
+                "projectId": "p",
+                "groups": [{"group_spec": {"name": f"just-akash-e2e.{run}"}}],
+            }
+            for d in ("1", "2")
         ]
         mock_close.return_value = {"closed": True}
         client = AkashConsoleAPI("key")
-        result = client.close_all_deployments()
+        result = client.close_all_deployments(run_tag=run, execute=True, project_id="p")
         assert len(result["closed"]) == 2
 
     @patch.object(AkashConsoleAPI, "close_deployment")
     @patch.object(AkashConsoleAPI, "list_deployments")
     def test_close_all_with_failure(self, mock_list, mock_close):
-        mock_list.return_value = [{"dseq": "1"}, {"dseq": "2"}]
+        mock_list.return_value = [
+            {"dseq": "1", "projectId": "p", "groups": [{"group_spec": {"name": "x"}}]},
+            {"dseq": "2", "projectId": "p", "groups": [{"group_spec": {"name": "y"}}]},
+        ]
         mock_close.side_effect = [RuntimeError("fail"), {"closed": True}]
         client = AkashConsoleAPI("key")
-        result = client.close_all_deployments()
+        result = client.close_all_deployments(allow_dseqs=["1", "2"], execute=True, project_id="p")
         assert len(result["closed"]) == 1
+        assert result["failed_dseqs"] == ["1"]
 
     @patch.object(AkashConsoleAPI, "list_deployments")
     def test_close_all_skips_no_dseq(self, mock_list):
         mock_list.return_value = [{"other": "data"}]
         client = AkashConsoleAPI("key")
-        result = client.close_all_deployments()
+        result = client.close_all_deployments(allow_dseqs=["1"], execute=True, project_id="p")
         assert result["closed"] == []
 
     @patch.object(AkashConsoleAPI, "_request")

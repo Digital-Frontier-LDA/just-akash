@@ -379,48 +379,61 @@ class TestApiMain:
             api_main()
         assert exc_info.value.code == 0
 
-    @patch("just_akash.api.format_deployments_table", return_value="table")
     @patch("just_akash.api.AkashConsoleAPI")
-    def test_close_all_confirmed(self, MockAPI, mock_fmt, monkeypatch, capsys, tmp_path):
+    def test_close_all_confirmed(self, MockAPI, monkeypatch, capsys, tmp_path):
+        from just_akash.bulk_close import PlanItem
+
         monkeypatch.setenv("AKASH_API_KEY", "test-key")
-        monkeypatch.setattr(sys, "argv", ["api", "close-all"])
+        monkeypatch.setattr(
+            sys, "argv", ["api", "--yes", "close-all", "--allow-dseq", "1", "--project-id", "p"]
+        )
         client = MockAPI.return_value
-        client.list_deployments.return_value = [{"dseq": "1"}]
-        client.close_all_deployments.return_value = {"closed": [True]}
-        monkeypatch.setattr("builtins.input", lambda _: "y")
+        client.close_all_deployments.return_value = {
+            "plan": [PlanItem("1", "close", "allowlisted", ("x",))],
+            "closed": [True],
+            "closed_dseqs": ["1"],
+            "failed_dseqs": [],
+            "dry_run": False,
+        }
         import just_akash.api as api_mod
         from just_akash.api import api_main
 
         monkeypatch.setattr(api_mod, "TAGS_FILE", tmp_path / ".tags.json")
         api_main()
         captured = capsys.readouterr()
-        assert "All deployments closed" in captured.out
+        assert "Closed 1 deployment" in captured.out
 
-    @patch("just_akash.api.format_deployments_table", return_value="table")
     @patch("just_akash.api.AkashConsoleAPI")
-    def test_close_all_cancelled(self, MockAPI, mock_fmt, monkeypatch, capsys):
+    def test_close_all_cancelled(self, MockAPI, monkeypatch, capsys):
+        """No scope: refused before the client is asked to close anything (just-akash-73o)."""
         monkeypatch.setenv("AKASH_API_KEY", "test-key")
-        monkeypatch.setattr(sys, "argv", ["api", "close-all"])
+        monkeypatch.setattr(sys, "argv", ["api", "--yes", "close-all"])
         client = MockAPI.return_value
-        client.list_deployments.return_value = [{"dseq": "1"}]
-        monkeypatch.setattr("builtins.input", lambda _: "n")
         from just_akash.api import api_main
 
-        api_main()
-        captured = capsys.readouterr()
-        assert "Cancelled" in captured.out
+        with pytest.raises(SystemExit) as exc_info:
+            api_main()
+        assert exc_info.value.code == 2
+        client.close_all_deployments.assert_not_called()
+        assert "just-akash-73o" in capsys.readouterr().out
 
     @patch("just_akash.api.AkashConsoleAPI")
     def test_close_all_no_deps(self, MockAPI, monkeypatch, capsys):
         monkeypatch.setenv("AKASH_API_KEY", "test-key")
-        monkeypatch.setattr(sys, "argv", ["api", "close-all"])
+        monkeypatch.setattr(sys, "argv", ["api", "close-all", "--run-tag", "abcdef12"])
         client = MockAPI.return_value
-        client.list_deployments.return_value = []
+        client.close_all_deployments.return_value = {
+            "plan": [],
+            "closed": [],
+            "closed_dseqs": [],
+            "failed_dseqs": [],
+            "dry_run": True,
+        }
         from just_akash.api import api_main
 
         api_main()
         captured = capsys.readouterr()
-        assert "No deployments to close" in captured.out
+        assert "no deployments listed" in captured.out
 
     @patch("just_akash.api.AkashConsoleAPI")
     def test_no_command(self, MockAPI, monkeypatch):

@@ -107,10 +107,23 @@ destroy dseq="":
         uv run just-akash destroy
     fi
 
-# Destroy all instances
-destroy-all:
+# Close THIS run's deployments and/or an explicit dseq allowlist (just-akash-73o).
+# Never unscoped; Flynn prod placements are refused even when allowlisted; a dry run
+# unless yes=yes. Fleet rule: no agent or CI job runs this against a shared account.
+# Usage: just destroy-all run_tag=<run id> [allow_dseq=<dseq>[,<dseq>…]] [project_id=<uuid> yes=yes]
+# An actual close (yes=yes) needs the caller's Console project; dseqs outside it are refused.
+destroy-all run_tag="" allow_dseq="" project_id="" yes="":
     #!/bin/bash
     set -euo pipefail
+    _run_tag={{quote(run_tag)}}
+    _allow_dseq={{quote(allow_dseq)}}
+    _project_id={{quote(project_id)}}
+    _yes={{quote(yes)}}
+    _args=()
+    if [ -n "${_run_tag}" ]; then _args+=(--run-tag "${_run_tag}"); fi
+    if [ -n "${_allow_dseq}" ]; then _args+=(--allow-dseq "${_allow_dseq}"); fi
+    if [ -n "${_project_id}" ]; then _args+=(--project-id "${_project_id}"); fi
+    if [ "${_yes}" = "yes" ]; then _args+=(--yes); fi
     mkdir -p "{{log_dir}}"
     timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
     log_file="{{log_dir}}/destroy-all-${timestamp}.log"
@@ -118,7 +131,7 @@ destroy-all:
     trap 'status=$?; echo "[INFO] recipe=destroy-all finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") exit_code=${status} log_file=${log_file}"' EXIT
     echo "[INFO] recipe=destroy-all started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") cwd=$PWD log_file=$log_file"
     set -x
-    uv run just-akash destroy-all
+    uv run just-akash destroy-all ${_args[@]+"${_args[@]}"}
 
 # Tag a deployment with a name
 # Usage: just tag DSEQ my-backtest

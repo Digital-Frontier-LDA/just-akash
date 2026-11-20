@@ -92,7 +92,7 @@ uv tool install --force --from "git+https://github.com/Digital-Frontier-LDA/just
 | `just add-funds AMOUNT [dseq]` | `just add-funds 5 akash-node` | Add USD to escrow (min 0.5) |
 | `just auto-topup [dseq] [on\|off]` | `just auto-topup akash-node on` | Show / toggle auto escrow top-up |
 | `just destroy [dseq]` | `just destroy 12345` | Destroy an instance |
-| `just destroy-all` | `just destroy-all` | Destroy all instances |
+| `just destroy-all` | `just destroy-all run_tag=<run id> [allow_dseq=<dseq>,…] [project_id=<uuid> yes=yes]` | Close only this run's deployments and/or an explicit allowlist, inside the caller's Console project. Never unscoped; prod placements and other projects refused; dry run without `yes=yes`, and `yes=yes` needs `project_id=` ([behaviour change](#scoped-bulk-close)) |
 | `just list` | `just list` | List active instances |
 | `just status [dseq]` | `just status 12345` | Show instance details |
 | `just tag [dseq] [name]` | `just tag 12345 my-db` | Tag a deployment with a name |
@@ -225,6 +225,18 @@ Only an explicit Console `already exists` response enters the legacy stale-clean
 retry path. Timeouts and all other unknown create outcomes are never retried. Once a
 receipt exists, re-invocation with the same path is refused, including when the
 Console returned a DSEQ but the response-state fsync failed.
+
+## Scoped bulk close
+
+**Behaviour change (just-akash-73o).** `destroy-all` (and the legacy `python -m just_akash.api close-all`) used to close EVERY deployment the Console key could list. On 2026-11-19 an unscoped bulk close on the shared console-2 account closed 14 deployments, four of them Flynn prod leases. It now has no unscoped mode:
+
+- It closes only deployments whose group name carries the given run id (`--run-tag <run id>`, matching `just-akash-<x>.<run id>` placement keys) and/or dseqs listed with `--allow-dseq` (repeatable, comma-separated). Everything else is listed as SKIP with its reason.
+- A Flynn prod placement (`flynn-*`, `fleet-*`, `dcloud`, `akash`) or a dseq on `JUST_AKASH_PROTECTED_DSEQS` is REFUSED even when allowlisted. So is an allowlisted dseq whose group names cannot be read.
+- Without a scope it closes nothing and exits 2. With a scope but no `--yes` it prints the plan and closes nothing.
+- An actual close (`--yes`) needs the caller's Console project: `--project-id <uuid>` or `JUST_AKASH_CONSOLE_PROJECT_ID`. Without one it exits 2. A dseq whose listed `projectId` is another project, or missing, is REFUSED even when it is allowlisted or carries this run's tag, and no flag overrides that. An API key not bound to a project reaches every project of its team, so this check is what keeps a bulk close inside the caller's own project.
+- `--override-protected` lets a human at a terminal close an allowlisted protected dseq. It is refused when `CI`, `GITHUB_ACTIONS` or an agent variable (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `CODEX_SANDBOX`) is set, or stdin is not a TTY.
+
+Fleet rule (2026-11-19): no agent or agent-launched job runs `destroy-all`, `close_all` or any bulk close against a shared Console account. The e2e harness closes only the dseq it created; `tests/test_bulk_close_scope.py` pins that no e2e module or workflow reaches a bulk close.
 
 ## Run a personal Akash LCD/RPC node
 

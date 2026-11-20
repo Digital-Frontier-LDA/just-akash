@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +37,42 @@ logger = logging.getLogger("akash.api")
 # that envelope would turn answers we currently get — and can classify — into unknowns.
 CONSOLE_HTTP_TIMEOUT = 180.0
 CI_CONSOLE_ORIGIN = "https://console-api.akash.network"
+
+
+CONSOLE_HOST = "console-api.akash.network"
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _validated_console_url(url: str) -> str:
+    """The Console origin the SPENDING key may be sent to, or ValueError (#375).
+
+    Accepted: https://console-api.akash.network (default port, no path) and, for the
+    local fake Console in tests, http or https on a loopback host. Anything else (plain
+    http to the real host, a look-alike or sibling host, another port, userinfo, a path,
+    a query) would hand x-api-key to whoever answers, so it is refused before any
+    request is built.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname
+        port = parts.port
+    except ValueError:
+        raise ValueError("Console URL is not a valid URL") from None
+    clean = (
+        parts.username is None
+        and parts.password is None
+        and parts.path in ("", "/")
+        and not parts.query
+        and not parts.fragment
+    )
+    if clean and parts.scheme == "https" and host == CONSOLE_HOST and port in (None, 443):
+        return url
+    if clean and parts.scheme in ("http", "https") and host in _LOOPBACK_HOSTS:
+        return url
+    raise ValueError(
+        f"Console URL must be https://{CONSOLE_HOST} or a loopback test console; "
+        "refusing to send the Console API key anywhere else"
+    )
 
 
 class _NoConsoleRedirect(urllib.request.HTTPRedirectHandler):
@@ -97,6 +134,81 @@ def _confirm(prompt: str, yes: bool = False) -> bool:
         return input(prompt).strip().lower() == "y"
     except (EOFError, KeyboardInterrupt):
         return False
+
+
+def _add_bulk_close_scope_args(parser: Any) -> None:
+    """The scope flags `destroy-all` and `close-all` share (just-akash-73o)."""
+    parser.add_argument(
+        "--run-tag",
+        default=None,
+        help="Close deployments whose group name carries this run id (just-akash-<x>.<run id>)",
+    )
+    parser.add_argument(
+        "--allow-dseq",
+        action="append",
+        default=[],
+        help="Close this dseq (repeatable, comma-separated). Prod placements are still refused.",
+    )
+    parser.add_argument(
+        "--project-id",
+        default=None,
+        help="The caller's Console project; needed for --yes (or JUST_AKASH_CONSOLE_PROJECT_ID)",
+    )
+    parser.add_argument(
+        "--override-protected",
+        action="store_true",
+        help=(
+            "HUMAN ONLY: close allowlisted prod/protected dseqs. "
+            "Refused in CI, from an agent, or without a TTY."
+        ),
+    )
+
+
+def _run_scoped_bulk_close(client: Any, args: Any, on_empty_listing: Any = None) -> int:
+    """List, print the plan, and close only the scope, only with --yes. Returns an exit code."""
+    from . import bulk_close
+
+    run_tag = getattr(args, "run_tag", None)
+    allow = getattr(args, "allow_dseq", None) or []
+    if not run_tag and not allow:
+        # Refused here too, not only in close_all_deployments: the CLI must hold the line
+        # whatever client it is handed.
+        print(bulk_close.UNSCOPED_MESSAGE)
+        return 2
+    execute = bool(getattr(args, "yes", False))
+    project = (getattr(args, "project_id", None) or "").strip() or bulk_close.project_from_env()
+    if execute and not project:
+        print(
+            "Refusing to close without the caller's Console project: pass --project-id "
+            f"(or set {bulk_close.PROJECT_ENV}). An unbound key reaches every project."
+        )
+        return 2
+    try:
+        result = client.close_all_deployments(
+            run_tag=run_tag,
+            allow_dseqs=allow,
+            execute=execute,
+            override_protected=bool(getattr(args, "override_protected", False)),
+            project_id=project,
+        )
+    except PermissionError as e:
+        print(f"Refused: {e}")
+        return 2
+    except ValueError as e:
+        print(f"Refused: {e}")
+        return 2
+    if not result["plan"] and on_empty_listing is not None:
+        on_empty_listing()
+    print(bulk_close.format_plan(result["plan"]))
+    if result["dry_run"]:
+        print("\nDry run: nothing closed. Re-run with --yes to close the CLOSE rows.")
+        return 0
+    tags = _load_tags()
+    for dseq in result["closed_dseqs"]:
+        tags.pop(dseq, None)
+    _save_tags(tags)
+    print(f"\nClosed {len(result['closed_dseqs'])} deployment(s).")
+    return 1 if result["failed_dseqs"] else 0
 
 
 def _json_output(data: dict[str, Any] | list[Any]) -> str:
@@ -218,15 +330,23 @@ class AkashConsoleAPI:
     # This many INCONSISTENT whole passes RAISE (a multi-page listing also needs a
     # second, identical pass before it is trusted).
     LIST_ATTEMPTS = 3
+    # The pause before retry k (k = 1, 2, …) is LIST_RETRY_SLEEP_S * LIST_RETRY_BACKOFF**(k-1):
+    # 2 s, then 12 s (#281). Bid probe 2026-11-19 saw a single page report total = rows + 1
+    # on all 3 passes ~2 s apart, three runs out of four, right after its own create/close
+    # cycle. A Console count that settles within ~14 s is accepted; one that never settles
+    # still raises after LIST_ATTEMPTS.
     LIST_RETRY_SLEEP_S = 2.0
+    LIST_RETRY_BACKOFF = 6.0
+    # (rows so far, total) of the last page the last pass read; logged per pass (#281).
+    _last_list_shape: tuple[int, int | None] = (0, None)
     # 50 pages x 100 = 5000 deployments; past that, a server ignoring `skip` is likelier.
     LIST_MAX_PAGES = 50
 
     """Client for Akash Console API (https://console-api.akash.network)"""
 
     def __init__(self, api_key: str, base_url: str | None = None):
-        self.base_url = base_url or os.environ.get(
-            "AKASH_CONSOLE_URL", "https://console-api.akash.network"
+        self.base_url = _validated_console_url(
+            base_url or os.environ.get("AKASH_CONSOLE_URL", "https://console-api.akash.network")
         )
         self.api_key = api_key
         self.headers = {
@@ -265,9 +385,13 @@ class AkashConsoleAPI:
         req = urllib.request.Request(  # noqa: S310
             url,
             data=request_body,
-            headers=self.headers,
+            headers={k: v for k, v in self.headers.items() if k.lower() != "x-api-key"},
             method=method,
         )
+        # Unredirected: urllib copies ordinary headers onto a redirected request, to any
+        # origin, but never unredirected ones. The key goes to base_url and nowhere else
+        # (#375); a redirect is answered without it and fails closed (401).
+        req.add_unredirected_header("x-api-key", self.headers["x-api-key"])
 
         try:
             t0 = datetime.now(timezone.utc)
@@ -463,11 +587,13 @@ class AkashConsoleAPI:
             # sudden single page must match it like any other pass.
             if rows is not None and pages == 1 and confirmed is None:
                 deployments = rows
+                self._log_list_converged(failures)
                 break
             if rows is not None:
                 seq = [_extract_dseq(d) for d in rows]
                 if seq == confirmed:
                     deployments = rows
+                    self._log_list_converged(failures)
                     break
                 if confirmed is None:
                     confirmed = seq  # a multi-page listing is only trusted twice over
@@ -481,12 +607,15 @@ class AkashConsoleAPI:
                     f"{self.LIST_ATTEMPTS} passes ({why}). Refusing to report a possibly "
                     "partial account — a missing row must not look like 'nothing to do'."
                 )
+            pause = self.LIST_RETRY_SLEEP_S * self.LIST_RETRY_BACKOFF ** (failures - 1)
+            n_rows, total = self._last_list_shape
             print(
-                f"WARNING: list_deployments pass was inconsistent ({why}); "
-                f"restarting the listing ({failures}/{self.LIST_ATTEMPTS}).",
+                f"WARNING: list_deployments pass {failures}/{self.LIST_ATTEMPTS}: "
+                f"rows={n_rows} total={total} — inconsistent ({why}); "
+                f"restarting the listing in {pause:g}s.",
                 file=sys.stderr,
             )
-            time.sleep(self.LIST_RETRY_SLEEP_S)
+            time.sleep(pause)
         if active_only:
             result = []
             for d in deployments:
@@ -529,6 +658,17 @@ class AkashConsoleAPI:
         rows = [d for d in raw if isinstance(d, dict)]
         return rows, len(raw), pagination if isinstance(pagination, dict) else {}
 
+    def _log_list_converged(self, failures: int) -> None:
+        """After a retry, say how the listing settled, so a run shows whether the backoff
+        converged or the Console count really is off (#281). Silent on a first-pass listing."""
+        if failures:
+            n_rows, total = self._last_list_shape
+            print(
+                f"list_deployments: consistent on pass {failures + 1}/{self.LIST_ATTEMPTS} "
+                f"after {failures} inconsistent: rows={n_rows} total={total}",
+                file=sys.stderr,
+            )
+
     def _list_deployments_pass(
         self, max_pages: int | None = None
     ) -> tuple[list[dict[str, Any]] | None, str, int]:
@@ -548,6 +688,7 @@ class AkashConsoleAPI:
             has_more = pg.get("hasMore") is True
             total = pg.get("total")
             total = total if isinstance(total, int) and not isinstance(total, bool) else None
+            self._last_list_shape = (skip + n_raw, total)
             if n_raw == 0 and has_more:
                 return None, f"empty page at skip={skip} with hasMore=true", page_no
             for d in rows:
@@ -757,19 +898,69 @@ class AkashConsoleAPI:
         data = response.get("data", response)
         return data if isinstance(data, dict) else response
 
-    def close_all_deployments(self) -> dict[str, Any]:
-        deployments = self.list_deployments()
-        results = []
-        for deployment in deployments:
-            dep_dseq = _extract_dseq(deployment)
-            if not dep_dseq:
-                continue
-            try:
-                result = self.close_deployment(dep_dseq)
-                results.append(result)
-            except Exception as e:
-                print(f"Warning: Failed to close deployment {dep_dseq}: {e}")
-        return {"closed": results}
+    def close_all_deployments(
+        self,
+        *,
+        run_tag: str | None = None,
+        allow_dseqs: Any = (),
+        execute: bool = False,
+        override_protected: bool = False,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Close only this run's deployments and/or an explicit allowlist (just-akash-73o).
+
+        There is NO unscoped mode: with neither ``run_tag`` nor ``allow_dseqs`` this raises
+        before anything is listed. The default is a dry run (``execute=False``). Flynn prod
+        placements and ``JUST_AKASH_PROTECTED_DSEQS`` are refused even when allowlisted;
+        ``override_protected`` lifts that for allowlisted dseqs only, and only for a human
+        at a terminal. See just_akash/bulk_close.py.
+        """
+        from . import bulk_close
+
+        allow = bulk_close.parse_dseq_list(allow_dseqs)
+        if run_tag is not None and not bulk_close.valid_run_tag(run_tag):
+            raise ValueError(f"--run-tag must be a run id (6-32 lowercase hex), got {run_tag!r}")
+        if not run_tag and not allow:
+            raise ValueError("unscoped bulk close refused. " + bulk_close.UNSCOPED_MESSAGE)
+        project = (project_id or "").strip() or bulk_close.project_from_env()
+        if execute and not project:
+            raise ValueError(
+                "an actual bulk close needs the caller's Console project (--project-id or "
+                f"{bulk_close.PROJECT_ENV}): an unbound key reaches every project of its team."
+            )
+        if override_protected:
+            why = bulk_close.override_refusal()
+            if why:
+                raise PermissionError(why)
+
+        plan = bulk_close.plan_bulk_close(
+            self.list_deployments(),
+            run_tag=run_tag,
+            allow_dseqs=allow,
+            protected_dseqs=bulk_close.protected_dseqs_from_env(),
+            override_protected=override_protected,
+            project_id=project,
+        )
+        results: list[Any] = []
+        closed: list[str] = []
+        failed: list[str] = []
+        if execute:
+            for item in plan:
+                if item.action != bulk_close.CLOSE:
+                    continue
+                try:
+                    results.append(self.close_deployment(item.dseq))
+                    closed.append(item.dseq)
+                except Exception as e:
+                    failed.append(item.dseq)
+                    print(f"Warning: Failed to close deployment {item.dseq}: {e}")
+        return {
+            "closed": results,
+            "closed_dseqs": closed,
+            "failed_dseqs": failed,
+            "plan": plan,
+            "dry_run": not execute,
+        }
 
     def get_bids(self, dseq: str) -> list[dict[str, Any]]:
         response = self._request("GET", f"/v1/bids?dseq={dseq}")
@@ -884,7 +1075,7 @@ class AkashConsoleAPI:
             raise RuntimeError("JWT token not found in CI runtime response")
         raise RuntimeError(f"JWT token not found in response: {response}")
 
-    def account_address(self) -> str:
+    def account_address(self, dseq: str | None = None) -> str:
         """The on-chain account address behind this API key.
 
         The Console API has no "whoami" endpoint, but every JWT it mints carries the
@@ -892,8 +1083,23 @@ class AkashConsoleAPI:
         We decode only that public claim from the unauthenticated base64 payload (the
         signature is never verified, and the token is never used), so this is a cheap,
         side-effect-free identity probe.
+
+        ``dseq`` (optional): a deployment this key can read. A key bound to a Console
+        project may not mint the wallet-wide token this probe asks for first: the
+        Console answers 403 project_forbidden ("Name the deployments the token is
+        for"). With a ``dseq`` the probe then asks for a read-only ``status`` token
+        that names that deployment on its lease's provider, which such a key may mint;
+        its ``iss`` is the same wallet. Without one, the 403 is raised as before.
         """
-        token = self.create_jwt(dseq="0", ttl=300)
+        try:
+            token = self.create_jwt(dseq="0", ttl=300)
+        except AkashAPIError as e:
+            if e.status != 403 or not _positive_dseq(dseq):
+                raise
+            provider = _lease_provider(self.get_deployment(str(dseq)))
+            if not provider:
+                raise
+            token = self.create_jwt_for_deployment(str(dseq), provider, ttl=300, scope=["status"])
         parts = token.split(".")
         if len(parts) < 2:
             raise RuntimeError(f"malformed JWT (no payload segment): {token[:24]}...")
@@ -918,15 +1124,63 @@ class AkashConsoleAPI:
         Uses granular access with scoped permissions. ``scope`` selects which
         provider operations the token authorizes (defaults to ["shell"]; pass
         ["logs"] or ["events"] for streaming). The token is scoped to ``provider``,
-        NOT to a deployment: ``dseq`` is currently unused in the request body (a
-        scoped permission cannot name a deployment under AEP-64) and is kept only
-        for call-site compatibility — do not assume the token is bound to this dseq.
+        NOT to a deployment: a scoped permission cannot name a deployment under
+        AEP-64, so ``dseq`` is not in that request body.
+
+        A key bound to a Console project may not mint a provider-wide token: the
+        Console answers 403 project_forbidden ("Name the deployments the token is
+        for"). On a 403, when ``dseq`` is a real deployment number, this asks once
+        more for a token that names that one deployment (create_jwt_for_deployment),
+        the shape the Console web app uses. Any other error is raised unchanged.
         """
         # `is None`, not `or`: an omitted scope defaults to ["shell"], but an
         # explicitly empty list is passed through unchanged rather than silently
         # widened to shell. (The API rejects an empty scope anyway -- AEP-64 requires
         # at least one -- so this surfaces the caller's mistake instead of granting a
         # permission they did not ask for.)
+        if scope is None:
+            scope = ["shell"]
+        try:
+            response = self._request(
+                "POST",
+                "/v1/create-jwt-token",
+                {
+                    "data": {
+                        "ttl": ttl,
+                        "leases": {
+                            "access": "granular",
+                            "permissions": [
+                                {
+                                    "provider": provider,
+                                    "access": "scoped",
+                                    "scope": scope,
+                                }
+                            ],
+                        },
+                    }
+                },
+            )
+        except AkashAPIError as e:
+            if e.status != 403 or not _positive_dseq(dseq):
+                raise
+            return self.create_jwt_for_deployment(dseq, provider, ttl=ttl, scope=scope)
+        return self._jwt_from(response)
+
+    def create_jwt_for_deployment(
+        self, dseq: str, provider: str, ttl: int = 3600, scope: list[str] | None = None
+    ) -> str:
+        """Request a short-lived JWT for ONE deployment on one provider.
+
+        Granular at the top and on the provider entry, naming the deployment: the
+        only shape the Console accepts from a key bound to a project (Console
+        teams-and-projects rules: "Such a request must name each deployment"). The
+        schema requires a non-empty ``services`` list, but providers authorize a
+        deployment grant by dseq and scope alone, so this sends ["*"] as the Console
+        web app does (deploy-web useProviderJwt, EVERY_SERVICE). Granting more than
+        status, events and logs needs the right to change that deployment.
+        """
+        if not _positive_dseq(dseq):
+            raise ValueError(f"create_jwt_for_deployment needs a deployment number, got {dseq!r}")
         if scope is None:
             scope = ["shell"]
         response = self._request(
@@ -940,14 +1194,20 @@ class AkashConsoleAPI:
                         "permissions": [
                             {
                                 "provider": provider,
-                                "access": "scoped",
-                                "scope": scope,
+                                "access": "granular",
+                                "deployments": [
+                                    {"dseq": int(dseq), "scope": scope, "services": ["*"]}
+                                ],
                             }
                         ],
                     },
                 }
             },
         )
+        return self._jwt_from(response)
+
+    def _jwt_from(self, response: Any) -> str:
+        """The token of a /v1/create-jwt-token answer ({"data": {"token": ...}})."""
         if not isinstance(response, dict):
             raise RuntimeError(f"Unexpected JWT response type: {type(response)}")
         data = response.get("data", response)
@@ -987,6 +1247,27 @@ class CIConsoleAPI(AkashConsoleAPI):
         return urllib.request.build_opener(_NoConsoleRedirect()).open(
             request, timeout=CONSOLE_HTTP_TIMEOUT
         )
+
+
+def _positive_dseq(dseq: object) -> bool:
+    """True for a real deployment number (digits, not 0): the only dseq a
+    deployment-naming token may carry. "0" is the identity probe's placeholder."""
+    return isinstance(dseq, str) and dseq.isascii() and dseq.isdigit() and int(dseq) > 0
+
+
+def _lease_provider(deployment: Any) -> str:
+    """The provider address of the first lease of a get_deployment() answer that
+    names one (leases[].id.provider, or leases[].provider), or ""."""
+    leases = deployment.get("leases") if isinstance(deployment, dict) else None
+    for lease in leases if isinstance(leases, list) else []:
+        if not isinstance(lease, dict):
+            continue
+        lease_id = lease.get("id")
+        provider = lease_id.get("provider") if isinstance(lease_id, dict) else None
+        provider = provider or lease.get("provider")
+        if isinstance(provider, str) and provider.startswith("akash1"):
+            return provider
+    return ""
 
 
 def _extract_dseq(deployment: dict[str, Any]) -> str | None:
@@ -1660,7 +1941,11 @@ def api_main():
     close_p = subparsers.add_parser("close", help="Close a deployment")
     close_p.add_argument("--dseq", default="")
 
-    subparsers.add_parser("close-all", help="Close all deployments")
+    close_all_p = subparsers.add_parser(
+        "close-all",
+        help="Close this run's and/or allowlisted deployments (never unscoped; dry run w/o --yes)",
+    )
+    _add_bulk_close_scope_args(close_all_p)
 
     tag_p = subparsers.add_parser("tag", help="Tag a deployment with a name")
     tag_p.add_argument("--dseq", required=True)
@@ -1848,23 +2133,9 @@ def api_main():
                 print("Cancelled.")
 
         elif args.command == "close-all":
-            deployments = client.list_deployments()
-            if not deployments:
-                print("No deployments to close.")
-            else:
-                print(f"Found {len(deployments)} active deployment(s):")
-                print(format_deployments_table(deployments))
-                if _confirm("\nClose all? (y/N) ", yes=args.yes):
-                    client.close_all_deployments()
-                    tags = _load_tags()
-                    for d in deployments:
-                        dseq = _extract_dseq(d)
-                        if dseq:
-                            tags.pop(dseq, None)
-                    _save_tags(tags)
-                    print("All deployments closed.")
-                else:
-                    print("Cancelled.")
+            code = _run_scoped_bulk_close(client, args)
+            if code:
+                sys.exit(code)
 
         elif args.command == "tag":
             tags = _load_tags()
