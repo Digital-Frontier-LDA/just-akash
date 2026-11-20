@@ -13,6 +13,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import secrets
 import sys
 import tempfile
@@ -184,6 +185,19 @@ class AkashAPIError(RuntimeError):
         """
 
         return self.status == 524 or self.error_name == "origin_response_timeout"
+
+
+#: A canonical Akash account address (bech32 body of 38 lowercase alphanumerics).
+_ACCOUNT_RE = re.compile(r"akash1[a-z0-9]{38}")
+
+
+def _jwt_dseq(dseq: Any) -> int:
+    """The dseq a JWT names, as the schema's positive integer. openmix-q2mfu: there is no
+    dseq-less JWT -- "0", "", None or a non-integer raise before anything is sent."""
+    text = str(dseq) if isinstance(dseq, (str, int)) and not isinstance(dseq, bool) else ""
+    if not text.isascii() or not text.isdigit() or int(text) < 1:
+        raise ValueError(f"a Console JWT names the deployment it is for; got dseq {dseq!r}")
+    return int(text)
 
 
 class AkashConsoleAPI:
@@ -796,50 +810,122 @@ class AkashConsoleAPI:
             return {}
         return response
 
-    def create_jwt(self, dseq: str, ttl: int = 3600, scope: list[str] | None = None) -> str:
-        """Request a short-lived JWT for provider access (shell, logs, events…).
+    def create_jwt(
+        self,
+        dseq: str,
+        ttl: int = 3600,
+        scope: list[str] | None = None,
+        *,
+        provider: str | None = None,
+        services: list[str] | None = None,
+    ) -> str:
+        """Request a short-lived JWT for provider access (shell, logs, events…) to ONE lease.
 
-        POSTs to /v1/create-jwt-token with the existing api_key.
-        Returns the JWT string. Raises RuntimeError on HTTP error.
+        POSTs to /v1/create-jwt-token with the existing api_key and returns the JWT.
+
+        openmix-q2mfu: the grant is ``granular`` and names the deployment it is for:
+        ``{"access": "granular", "permissions": [{"provider", "access": "granular",
+        "deployments": [{"dseq", "gseq", "oseq", "scope", "services"}]}]}``. The Console
+        refuses a project-limited key any other shape -- a top-level ``scoped`` grant or a
+        provider-wide permission -- with HTTP 403 "Name the deployments the token is for"
+        (live, 2026-11-19, df-cicd akash-lease runs 44522018790 and 44522346315: the GPU
+        check could not read the card and the close could not run, so both leases stayed
+        up). There is no dseq-less JWT: a dseq that is not a positive integer raises
+        ValueError before anything is sent.
 
         Args:
-            dseq: Deployment sequence number. NOTE: currently unused in the request
-                  body — a top-level ``scoped`` grant is not deployment-scoped (it
-                  applies across the owner's leases), and AEP-64 forbids naming a
-                  deployment on a scoped grant. Kept in the signature for call-site
-                  compatibility and possible future granular use; do not assume the
-                  minted token is bound to this dseq.
-            ttl:  Requested TTL in seconds (server default is 30s; request 3600 and
-                  fall back to reconnect if server caps it — see LSHL-03 in Phase 7).
-            scope: Permission scopes to request (e.g. ["shell"], ["logs"],
-                  ["events"]). Defaults to ["shell"]. Valid values: send-manifest,
-                  get-manifest, logs, shell, events, status, restart,
-                  hostname-migrate, ip-migrate.
+            dseq: The deployment the token is for (a positive integer, as str or int).
+            ttl:  Requested TTL in seconds.
+            scope: Permission scopes (e.g. ["shell"], ["logs"], ["events"]). Defaults to
+                  ["shell"]; an explicit [] is passed through (the Console refuses it).
+            provider: The lease's provider. When omitted, or when ``services`` is, both
+                  are read from GET /v1/deployments/{dseq} (the lease's id and its
+                  reported services).
+            services: The service names the token may reach.
         """
-        # `is None`, not `or`: an omitted scope defaults to ["shell"], but an
-        # explicitly empty list is passed through unchanged rather than silently
-        # widened to shell. (The API rejects an empty scope anyway -- AEP-64 requires
-        # at least one -- so this surfaces the caller's mistake instead of granting a
-        # permission they did not ask for.)
+        dseq_n = _jwt_dseq(dseq)
+        # ``is None``, not ``or``: an omitted scope defaults to ["shell"], but an explicitly
+        # empty list is passed through unchanged rather than silently widened to shell.
         if scope is None:
             scope = ["shell"]
-        # "scoped", not "full". The Console API accepts exactly two shapes at
-        # /leases -- {"access": "scoped", "scope": [...]} or {"access": "granular",
-        # "permissions": [...]} -- and rejects everything else. The old body paired
-        # access "full" with a scope and got a 400 on every call:
-        #
-        #   Additional property "scope" is not allowed at "/leases"..
-        #   "access" at "/leases" must be scoped.. "access" at "/leases" must be granular.
-        #
-        # so this fallback (taken when a lease reports no provider address, hence no
-        # provider to scope the grant to) could never have minted a token. Per AEP-64,
-        # top-level "scoped" grants the scope across the owner's leases, which is the
-        # right grant to make when we have no provider to narrow it to.
+        if services is not None and not (
+            isinstance(services, list) and all(isinstance(s, str) and s for s in services)
+        ):
+            raise ValueError("services must be a list of service names, each a nonempty string")
+        gseq = oseq = None
+        if provider is None or not services:
+            provider, gseq, oseq, found = self._lease_target(
+                dseq_n, provider, need_services=not services
+            )
+            services = services or found
+        deployment: dict[str, Any] = {"dseq": dseq_n}
+        if gseq is not None and oseq is not None:
+            deployment.update(gseq=gseq, oseq=oseq)
+        deployment.update(scope=scope, services=list(services))
         response = self._request(
             "POST",
             "/v1/create-jwt-token",
-            {"data": {"ttl": ttl, "leases": {"access": "scoped", "scope": scope}}},
+            {
+                "data": {
+                    "ttl": ttl,
+                    "leases": {
+                        "access": "granular",
+                        "permissions": [
+                            {
+                                "provider": provider,
+                                "access": "granular",
+                                "deployments": [deployment],
+                            }
+                        ],
+                    },
+                }
+            },
         )
+        return self._jwt_from(response)
+
+    def _lease_target(
+        self, dseq: int, provider: str | None, *, need_services: bool = True
+    ) -> tuple[str, int | None, int | None, list[str]]:
+        """(provider, gseq, oseq, services) of the deployment's lease, read from the Console.
+
+        With ``provider`` given, the lease on that provider; otherwise the first lease that
+        names one (the lease the lease-shell transport talks to). Services are the names
+        the lease status reports. Raises RuntimeError when either cannot be named: a
+        token that names no service is one the Console refuses. With need_services=False
+        (the caller named its services) only the provider must be found."""
+        deployment = self.get_deployment(str(dseq))
+        leases = deployment.get("leases") if isinstance(deployment, dict) else None
+        for lease in leases if isinstance(leases, list) else []:
+            if not isinstance(lease, dict) or not isinstance(lease.get("id"), dict):
+                continue
+            lease_id = lease["id"]
+            lease_provider = lease_id.get("provider")
+            if not isinstance(lease_provider, str) or not lease_provider:
+                continue
+            if provider is not None and lease_provider != provider:
+                continue
+            status = lease.get("status")
+            reported = status.get("services") if isinstance(status, dict) else None
+            names = (
+                [s for s in reported if isinstance(s, str) and s]
+                if isinstance(reported, dict)
+                else []
+            )
+            if not names and need_services:
+                raise RuntimeError(
+                    f"deployment {dseq}: its lease reports no service yet, so no token "
+                    "can name one; pass services (or --service)"
+                )
+            seqs = [lease_id.get(k) for k in ("gseq", "oseq")]
+            gseq, oseq = seqs if all(type(s) is int and s >= 0 for s in seqs) else (None, None)
+            return lease_provider, gseq, oseq, names
+        raise RuntimeError(
+            f"deployment {dseq} has no lease"
+            + (f" on provider {provider}" if provider is not None else "")
+            + ", so no token can name its provider"
+        )
+
+    def _jwt_from(self, response: Any) -> str:
         # Response shape: { "data": { "token": "<JWT>" } }
         if not isinstance(response, dict):
             raise RuntimeError(f"Unexpected JWT response type: {type(response)}")
@@ -855,146 +941,106 @@ class AkashConsoleAPI:
     def account_address(self, dseq: str | None = None) -> str:
         """The on-chain account address behind this API key.
 
-        The Console API has no "whoami" endpoint, but every JWT it mints carries the
-        account as the ``iss`` (issuer) claim, so we read it from a short-lived token.
-        We decode only that public claim from the unauthenticated base64 payload (the
-        signature is never verified, and the token is never used), so this is a cheap,
-        side-effect-free identity probe.
+        Three reads, the first that answers wins (just-akash-1tm.15, Sentinel option a on
+        the q2mfu spike):
 
-        ``dseq`` (optional): a deployment this key can read. A key bound to a Console
-        project may not mint the wallet-wide token this probe asks for first: the
-        Console answers 403 project_forbidden ("Name the deployments the token is
-        for"). With a ``dseq`` the probe then asks for a read-only ``status`` token
-        that names that deployment on its lease's provider, which such a key may mint;
-        its ``iss`` is the same wallet. Without one, the 403 is raised as before.
+        1. The iss probe: a short-lived wallet-wide token whose ``iss`` claim is the
+           account. Every key that could mint it before still takes this path, unchanged.
+        2. Only on a 403 (a key limited to a Console project may not mint it: "Name the
+           deployments the token is for"), with a ``dseq`` this key can read: a read-only
+           ``status`` token naming that deployment (create_jwt), whose ``iss`` is the
+           same wallet.
+        3. Only on a 403 without a usable ``dseq``: GET /v1/user/me, then
+           GET /v1/wallets?userId=<it>, which must name exactly one akash1 address.
+           Mints no JWT. Zero or several addresses raise RuntimeError: never a guess.
+
+        Any other error from the probe is raised unchanged.
         """
         try:
-            token = self.create_jwt(dseq="0", ttl=300)
+            token = self._account_probe_token()
         except AkashAPIError as e:
-            if e.status != 403 or not _positive_dseq(dseq):
+            if e.status != 403:
                 raise
-            provider = _lease_provider(self.get_deployment(str(dseq)))
-            if not provider:
-                raise
-            token = self.create_jwt_for_deployment(str(dseq), provider, ttl=300, scope=["status"])
-        parts = token.split(".")
-        if len(parts) < 2:
-            raise RuntimeError(f"malformed JWT (no payload segment): {token[:24]}...")
-        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)  # restore base64url padding
+            if _positive_dseq(dseq):
+                token = self.create_jwt(str(dseq), ttl=300, scope=["status"])
+            else:
+                return self._account_from_user_wallets()
+        return _iss_of(token)
+
+    def _account_probe_token(self) -> str:
+        """The wallet-wide identity probe: the one dseq-less token, minted only here and
+        only to read its ``iss``. Never used as a credential. create_jwt() refuses dseq 0."""
+        response = self._request(
+            "POST",
+            "/v1/create-jwt-token",
+            {"data": {"ttl": 300, "leases": {"access": "scoped", "scope": ["shell"]}}},
+        )
+        return self._jwt_from(response)
+
+    def _account_from_user_wallets(self) -> str:
+        """The key's account from GET /v1/user/me and GET /v1/wallets (mints no JWT).
+
+        UNVERIFIED whether a key limited to a Console project may read either: if one
+        answers 403, this fails closed with that cause named, never a guess or an empty
+        value."""
         try:
-            claims = json.loads(base64.urlsafe_b64decode(payload_b64.encode("ascii")))
-        except ValueError as e:
-            # ValueError covers every decode failure: binascii.Error (bad base64),
-            # UnicodeDecodeError, and json.JSONDecodeError — all normalized to one
-            # RuntimeError so a malformed token never escapes as a different type.
-            raise RuntimeError(f"could not decode JWT payload: {e}") from e
-        addr = claims.get("iss")
-        if not isinstance(addr, str) or not addr.startswith("akash1"):
-            raise RuntimeError(f"JWT payload has no akash issuer claim: {claims!r}")
-        return addr
+            return self._read_user_wallet()
+        except AkashAPIError as e:
+            if e.status != 403:
+                raise
+            raise RuntimeError(
+                "project-bound key cannot read account (the Console answered 403 to "
+                "/v1/user/me or /v1/wallets); pass the address explicitly"
+            ) from e
+
+    def _read_user_wallet(self) -> str:
+        me = self._request("GET", "/v1/user/me")
+        me_data = me.get("data", me) if isinstance(me, dict) else None
+        user_id = me_data.get("userId") if isinstance(me_data, dict) else None
+        if not isinstance(user_id, str) or not user_id:
+            raise RuntimeError("the Console's /v1/user/me named no user for this key")
+        listed = self._request("GET", f"/v1/wallets?userId={urllib.parse.quote(user_id, safe='')}")
+        wallets = listed.get("data", listed) if isinstance(listed, dict) else listed
+        addresses: set[str] = set()
+        for w in wallets if isinstance(wallets, list) else []:
+            if not isinstance(w, dict) or w.get("userId") != user_id:
+                continue
+            # A malformed row of this user is refused, never skipped: skipping it could
+            # make another row look like the user's only wallet.
+            address = w.get("address")
+            if not isinstance(address, str) or not _ACCOUNT_RE.fullmatch(address):
+                raise RuntimeError(
+                    "the Console's wallet address for this key is no akash1 account"
+                )
+            addresses.add(address)
+        if len(addresses) != 1:
+            raise RuntimeError(
+                f"the Console listed {len(addresses)} wallets for this key's user, not one"
+            )
+        (address,) = addresses
+        return address
 
     def create_jwt_with_provider(
-        self, dseq: str, provider: str, ttl: int = 3600, scope: list[str] | None = None
+        self,
+        dseq: str,
+        provider: str,
+        ttl: int = 3600,
+        scope: list[str] | None = None,
+        services: list[str] | None = None,
     ) -> str:
-        """Request a short-lived JWT scoped to a specific provider.
+        """create_jwt() for a lease whose provider the caller already knows.
 
-        Uses granular access with scoped permissions. ``scope`` selects which
-        provider operations the token authorizes (defaults to ["shell"]; pass
-        ["logs"] or ["events"] for streaming). The token is scoped to ``provider``,
-        NOT to a deployment: a scoped permission cannot name a deployment under
-        AEP-64, so ``dseq`` is not in that request body.
-
-        A key bound to a Console project may not mint a provider-wide token: the
-        Console answers 403 project_forbidden ("Name the deployments the token is
-        for"). On a 403, when ``dseq`` is a real deployment number, this asks once
-        more for a token that names that one deployment (create_jwt_for_deployment),
-        the shape the Console web app uses. Any other error is raised unchanged.
-        """
-        # `is None`, not `or`: an omitted scope defaults to ["shell"], but an
-        # explicitly empty list is passed through unchanged rather than silently
-        # widened to shell. (The API rejects an empty scope anyway -- AEP-64 requires
-        # at least one -- so this surfaces the caller's mistake instead of granting a
-        # permission they did not ask for.)
-        if scope is None:
-            scope = ["shell"]
-        try:
-            response = self._request(
-                "POST",
-                "/v1/create-jwt-token",
-                {
-                    "data": {
-                        "ttl": ttl,
-                        "leases": {
-                            "access": "granular",
-                            "permissions": [
-                                {
-                                    "provider": provider,
-                                    "access": "scoped",
-                                    "scope": scope,
-                                }
-                            ],
-                        },
-                    }
-                },
-            )
-        except AkashAPIError as e:
-            if e.status != 403 or not _positive_dseq(dseq):
-                raise
-            return self.create_jwt_for_deployment(dseq, provider, ttl=ttl, scope=scope)
-        return self._jwt_from(response)
+        openmix-q2mfu: this used to send a provider-wide ``scoped`` permission that named
+        no deployment; the Console refuses it. It is now the same granular grant naming
+        ``dseq`` as create_jwt(), with the provider given rather than read."""
+        return self.create_jwt(dseq, ttl=ttl, scope=scope, provider=provider, services=services)
 
     def create_jwt_for_deployment(
         self, dseq: str, provider: str, ttl: int = 3600, scope: list[str] | None = None
     ) -> str:
-        """Request a short-lived JWT for ONE deployment on one provider.
-
-        Granular at the top and on the provider entry, naming the deployment: the
-        only shape the Console accepts from a key bound to a project (Console
-        teams-and-projects rules: "Such a request must name each deployment"). The
-        schema requires a non-empty ``services`` list, but providers authorize a
-        deployment grant by dseq and scope alone, so this sends ["*"] as the Console
-        web app does (deploy-web useProviderJwt, EVERY_SERVICE). Granting more than
-        status, events and logs needs the right to change that deployment.
-        """
-        if not _positive_dseq(dseq):
-            raise ValueError(f"create_jwt_for_deployment needs a deployment number, got {dseq!r}")
-        if scope is None:
-            scope = ["shell"]
-        response = self._request(
-            "POST",
-            "/v1/create-jwt-token",
-            {
-                "data": {
-                    "ttl": ttl,
-                    "leases": {
-                        "access": "granular",
-                        "permissions": [
-                            {
-                                "provider": provider,
-                                "access": "granular",
-                                "deployments": [
-                                    {"dseq": int(dseq), "scope": scope, "services": ["*"]}
-                                ],
-                            }
-                        ],
-                    },
-                }
-            },
-        )
-        return self._jwt_from(response)
-
-    def _jwt_from(self, response: Any) -> str:
-        """The token of a /v1/create-jwt-token answer ({"data": {"token": ...}})."""
-        if not isinstance(response, dict):
-            raise RuntimeError(f"Unexpected JWT response type: {type(response)}")
-        data = response.get("data", response)
-        if isinstance(data, dict) and "token" in data:
-            token = data["token"]
-            if isinstance(token, str) and token:
-                return token
-        if self._protect_runtime_payloads:
-            raise RuntimeError("JWT token not found in CI runtime response")
-        raise RuntimeError(f"JWT token not found in response: {response}")
+        """#513's name for a granular token naming one deployment on one provider. Since
+        just-akash-1tm.15 every JWT is that shape, so this is create_jwt_with_provider()."""
+        return self.create_jwt_with_provider(dseq, provider, ttl=ttl, scope=scope)
 
 
 class CIConsoleAPI(AkashConsoleAPI):
@@ -1024,6 +1070,25 @@ class CIConsoleAPI(AkashConsoleAPI):
         return urllib.request.build_opener(_NoConsoleRedirect()).open(
             request, timeout=CONSOLE_HTTP_TIMEOUT
         )
+
+
+def _iss_of(token: str) -> str:
+    """The akash1 account in a Console JWT's ``iss`` claim. Only that public claim is read
+    from the unauthenticated base64 payload; the signature is never verified."""
+    parts = token.split(".")
+    if len(parts) < 2:
+        raise RuntimeError(f"malformed JWT (no payload segment): {token[:24]}...")
+    payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)  # restore base64url padding
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(payload_b64.encode("ascii")))
+    except ValueError as e:
+        # binascii.Error, UnicodeDecodeError and json.JSONDecodeError are all ValueError:
+        # one RuntimeError, so a malformed token never escapes as a different type.
+        raise RuntimeError(f"could not decode JWT payload: {e}") from e
+    addr = claims.get("iss") if isinstance(claims, dict) else None
+    if not isinstance(addr, str) or not addr.startswith("akash1"):
+        raise RuntimeError(f"JWT payload has no akash issuer claim: {claims!r}")
+    return addr
 
 
 def _positive_dseq(dseq: object) -> bool:
