@@ -80,17 +80,10 @@ jobs:
     # tests/test_bid_probe_budget.py recomputes this from the step timeouts.
     timeout-minutes: 63
     steps:
-      # FIRST step, before anything slow, so this is as close to "when the run
-      # actually began" as the runner can report. It exists because
-      # `github.run_started_at` is NOT a real property of the github context —
-      # referencing it yields an empty string, which would have silently written
-      # no run lines at all and left Stage 4 measuring nothing while looking
-      # like it worked.
-      # Written to RUNNER_TEMP, not the workspace: actions/checkout cleans the
-      # workspace, which would delete this before it could be uploaded.
-      - name: Record run start
-        run: date -u +%Y-%m-%dT%H:%M:%SZ > "$RUNNER_TEMP/bidprobe-run-started"
-
+      # FIRST step, before anything else: workflow_dispatch lets any repo writer
+      # pick a branch or tag, so nothing from the dispatched ref runs before
+      # this refuses a non-default ref. (openmix-17uy; AC1 requires the guard
+      # to run first, as in the other six guarded jobs.)
       # TRUSTED REF ONLY, and before checkout on purpose, for the reason auto-topup-audit.yml
       # gives: workflow_dispatch lets any repo writer pick a branch or tag, and checkout then
       # runs its code -- ./.github/actions/sops-env and just_akash included -- with
@@ -115,6 +108,18 @@ jobs:
             exit 1
           fi
           echo "ref=$REF is the default branch"
+
+      # Near-first step, just after the guard, so this is as close to "when the
+      # run actually began" as the runner can report. It exists because
+      # `github.run_started_at` is NOT a real property of the github context —
+      # referencing it yields an empty string, which would have silently written
+      # no run lines at all and left Stage 4 measuring nothing while looking
+      # like it worked. Written to RUNNER_TEMP, not the workspace:
+      # actions/checkout cleans the workspace, which would delete it before it
+      # could be uploaded. It must follow the guard, not precede it: a step
+      # ahead of the guard would run on a refused ref (openmix-17uy AC1).
+      - name: Record run start
+        run: date -u +%Y-%m-%dT%H:%M:%SZ > "$RUNNER_TEMP/bidprobe-run-started"
 
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

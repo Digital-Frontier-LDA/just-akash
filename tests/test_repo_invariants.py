@@ -262,6 +262,31 @@ class TestDispatchRefGuard:
         self._write(repo, _dispatch_workflow(_CHECKOUT + _SOPS), name="x.yaml")
         assert len(inv.check_dispatch_ref_guard(repo)) == 1
 
+    def test_a_step_before_the_guard_is_caught(self, repo):
+        """openmix-17uy AC1: the guard runs FIRST. bid-probe's bookkeeping step
+        preceded its guard on PR #512 (round 4) and the checker accepted the job.
+        Even credential-free, a step ahead of the guard runs on a refused ref."""
+        before = "      - name: Record run start\n        run: echo start > file\n"
+        self._write(repo, _dispatch_workflow(before + _GUARD + _CHECKOUT + _SOPS))
+        problems = inv.check_dispatch_ref_guard(repo)
+        assert len(problems) == 1, problems
+        assert "Record run start" in problems[0]
+        assert "before its default-ref guard" in problems[0]
+        # The ordering holds even with steps after the guard, and is not masked
+        # by a later failure-admitting step: the pre-guard step is the offender.
+        always = _SOPS.replace("        uses:", "        if: always()\n        uses:")
+        self._write(repo, _dispatch_workflow(before + _GUARD + _CHECKOUT + always))
+        problems = inv.check_dispatch_ref_guard(repo)
+        assert len(problems) == 1, problems
+        assert "Record run start" in problems[0]
+
+    def test_guard_first_passes_and_ordering_is_enforced_only_with_a_guard(self, repo):
+        """No guard, steps before sops: the missing-guard finding stands (unchanged)."""
+        before = "      - name: Record run start\n        run: echo start\n"
+        self._write(repo, _dispatch_workflow(before + _CHECKOUT + _SOPS))
+        problems = inv.check_dispatch_ref_guard(repo)
+        assert len(problems) == 1 and "no default-ref guard" in problems[0]
+
     def test_the_guard_must_come_before_checkout(self, repo):
         """After checkout the step list is fixed, but ./.github/actions/sops-env itself
         is the dispatched ref's code. Refuse before anything from the ref is on disk."""
@@ -473,6 +498,34 @@ class TestRealGuardsBehave:
             )
             assert result.returncode == (0 if ok else 1), (workflow, job, result.stderr)
 
+    def test_the_schedule_pass_executes(self, tmp_path):
+        """CodeRabbit (round 4): recognition of the schedule early pass is not enough --
+        EXECUTE it. GitHub runs a schedule only from the default branch, and a schedule
+        event's payload has no repository default_branch (it reads empty), so a guard that
+        binds github.event_name must exit 0 for a schedule event with an empty default
+        branch. Guards without that binding are dispatch-only and stay out of this case."""
+        import subprocess
+
+        executed = 0
+        for workflow, job, step, shell in _real_guards():
+            if "${{ github.event_name }}" not in str(step.get("env") or {}):
+                continue
+            env = {"PATH": "/usr/bin:/bin"}
+            for name, value in step["env"].items():
+                value = value.replace("${{ github.ref }}", "refs/heads/main")
+                value = value.replace("${{ github.event.repository.default_branch }}", "")
+                value = value.replace("${{ github.event_name }}", "schedule")
+                env[name] = value
+            result = subprocess.run(
+                [shell, "-e", "-c", step["run"]], env=env, capture_output=True, text=True
+            )
+            assert result.returncode == 0, (workflow, job, result.stderr)
+            executed += 1
+        assert executed >= 4, (
+            "expected at least the four schedule-triggered workflows' guards to bind "
+            "github.event_name (cleanup-stale, bid-probe, provider-canary, provider-smoke)"
+        )
+
 
 class TestAnnotations:
     def test_annotation_carries_file_and_line(self, repo, capsys):
@@ -517,3 +570,16 @@ class TestMain:
         assert inv.check_workflow_vars(root, declarations_must_be_used=True) == []
         assert inv.check_changelog(root) == []
         assert inv.check_dispatch_ref_guard(root) == []
+
+    def test_a_non_mapping_jobs_key_is_skipped(self, repo):
+        """A workflow whose ``jobs`` key is not a mapping is rejected by GitHub's
+        workflow validation (it cannot run), so the checker skips it instead of
+        crashing. The skip is the documented behavior, not a gap (openmix-17uy
+        review finding 2): this test pins it so a change that crashes or flags
+        such a file fails loudly."""
+        for text in (
+            "on:\n  workflow_dispatch:\njobs: [not, a, mapping]\n",
+            "on:\n  workflow_dispatch:\njobs: a scalar\n",
+        ):
+            (repo / ".github" / "workflows" / "broken-jobs.yml").write_text(text)
+            assert inv.check_dispatch_ref_guard(repo) == []

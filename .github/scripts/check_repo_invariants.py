@@ -330,6 +330,18 @@ def _dispatchable(on: object) -> bool:
     return False
 
 
+def _job_step_names(steps: list) -> str:
+    """The steps a problem names, by their own name (or uses), for a guard-first message."""
+    names = []
+    for s in steps:
+        if not isinstance(s, dict):
+            continue
+        n = s.get("name") or s.get("uses")
+        if isinstance(n, str):
+            names.append(n)
+    return " and ".join(repr(n) for n in names)
+
+
 def check_dispatch_ref_guard(root: Path) -> list[str]:
     """Every job of a workflow_dispatch workflow that loads sops-env is ref-guarded first.
 
@@ -338,7 +350,13 @@ def check_dispatch_ref_guard(root: Path) -> list[str]:
     checks anything out or loads the secrets (openmix-17uy). The guard has to come before
     the first checkout and the first sops-env step, and no step from the guard up to that
     last sops-env step may carry a status condition that could let it run after the guard
-    failed. A job whose environment is in PROTECTED_ENVIRONMENTS is exempt.
+    failed. AC1 requires the guard to run FIRST in the job: any step before it would run
+    on a refused ref, even without credentials, so the guard is the only step allowed
+    before it. A job whose environment is in PROTECTED_ENVIRONMENTS is exempt.
+
+    GitHub rejects a workflow whose ``jobs`` key is not a mapping (a list or a scalar is
+    not a jobs object), so such a file cannot run and carries no live job; it is skipped
+    here by design. The skip is deliberate, not an oversight (openmix-17uy review, 2026-11-20).
     """
     try:
         import yaml
@@ -382,6 +400,18 @@ def check_dispatch_ref_guard(root: Path) -> list[str]:
             shell = guard_default_shell(doc, job)
             guards = [i for i, s in enumerate(steps[:limit]) if is_ref_guard(s, shell)]
             sops_name = steps[first_sops].get("name") or SOPS_ENV_ACTION
+            if guards:
+                # Guard first (openmix-17uy AC1): a step ahead of the guard runs on a
+                # refused ref even without credentials. Report the first offender.
+                first_guard = guards[0]
+                if first_guard > 0:
+                    problems.append(
+                        f"{where}: job {job_id!r} runs {_job_step_names(steps[:first_guard])} "
+                        f"before its default-ref guard, so the guard is not the job's first "
+                        f"step -- it would not refuse a dispatched ref that runs ahead of it. "
+                        f"Move the guard first, as in the other guarded jobs."
+                    )
+                    continue
             if not guards:
                 problems.append(
                     f"{where}: job {job_id!r} loads sops-env (step {sops_name!r}) in a "
