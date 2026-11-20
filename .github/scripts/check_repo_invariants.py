@@ -244,42 +244,22 @@ def _overrides_success(condition: str) -> bool:
     return bool(_STATUS_FUNCTION.search(expr) and not _SUCCESS.fullmatch(expr))
 
 
-# GitHub predefines these as default (read-only) variables; a workflow `env:`
-# assignment to any of them is IGNORED at runtime, so a guard that "binds"
-# one of them never receives the value its comparison relies on and its
-# refusal can silently stop working (CodeRabbit, openmix-17uy, 2026-11-20:
-# GITHUB_REF_NAME on a dispatched ref still holds that ref's name).
-RESERVED_ENV_VARS = frozenset(
-    {
-        "GITHUB_ACTION",
-        "GITHUB_ACTIONS",
-        "GITHUB_ACTOR",
-        "GITHUB_API_URL",
-        "GITHUB_BASE_REF",
-        "GITHUB_HEAD_REF",
-        "GITHUB_EVENT_NAME",
-        "GITHUB_EVENT_PATH",
-        "GITHUB_ENV",
-        "GITHUB_PATH",
-        "GITHUB_REF",
-        "GITHUB_REF_NAME",
-        "GITHUB_REF_PROTECTED",
-        "GITHUB_REF_TYPE",
-        "GITHUB_REPOSITORY",
-        "GITHUB_REPOSITORY_OWNER",
-        "GITHUB_SERVER_URL",
-        "GITHUB_SHA",
-        "GITHUB_WORKFLOW",
-        "GITHUB_WORKSPACE",
-    }
-)
+# GitHub predefines its default (read-only) variables under the GITHUB_* and
+# RUNNER_* prefixes; a workflow `env:` assignment to any of them is IGNORED at
+# runtime, so a guard that "binds" one never receives the value its comparison
+# relies on and its refusal can silently stop working (CodeRabbit, openmix-17uy,
+# 2026-11-20: GITHUB_REF_NAME on a dispatched ref still holds that ref's name).
+# Reject by prefix, not by an enumerated list: GitHub adds default variables
+# over time (e.g. GITHUB_RUN_NUMBER, GITHUB_RETRY_NUMBER, RUNNER_ARCH), and an
+# enumeration cannot reject what it does not name.
+RESERVED_ENV_PREFIXES = ("GITHUB_", "RUNNER_")
 
 
 def _env_names_for(env: dict, expr: str) -> list[str]:
     """Shell variable names bound to the given GitHub expression.
 
-    A name in RESERVED_ENV_VARS is skipped: GitHub ignores a workflow `env:`
-    assignment to it, so the binding cannot carry the expression's value at
+    A reserved name is skipped: GitHub ignores a workflow `env:` assignment to
+    a default variable, so the binding cannot carry the expression's value at
     runtime and the guard's comparison would run on the variable's pre-set
     value instead.
     """
@@ -289,7 +269,7 @@ def _env_names_for(env: dict, expr: str) -> list[str]:
         for k, v in env.items()
         if isinstance(k, str)
         and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k)
-        and k not in RESERVED_ENV_VARS
+        and not k.startswith(RESERVED_ENV_PREFIXES)
         and isinstance(v, str)
         and want.fullmatch(v.strip())
     ]

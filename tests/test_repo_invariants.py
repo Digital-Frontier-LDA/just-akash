@@ -264,20 +264,48 @@ class TestDispatchRefGuard:
 
     @pytest.mark.parametrize(
         "name",
-        ["GITHUB_REF_NAME", "GITHUB_REF", "GITHUB_EVENT_NAME", "GITHUB_SHA"],
+        [
+            "GITHUB_REF_NAME",
+            "GITHUB_REF",
+            "GITHUB_EVENT_NAME",
+            "GITHUB_SHA",
+            # The names CodeRabbit (round 6) found missing from the enumerated
+            # list: GitHub defaults added after the list was written.
+            "GITHUB_RUN_NUMBER",
+            "GITHUB_RETRY_NUMBER",
+            "GITHUB_JOB",
+            "GITHUB_STEP_SUMMARY",
+            "RUNNER_OS",
+            "RUNNER_ARCH",
+            "RUNNER_TEMP",
+            "RUNNER_TOOL_CACHE",
+            "RUNNER_WORKSPACE",
+        ],
         ids=[
             "github-ref-name",
             "github-ref",
             "github-event-name",
             "github-sha",
+            "github-run-number",
+            "github-retry-number",
+            "github-job",
+            "github-step-summary",
+            "runner-os",
+            "runner-arch",
+            "runner-temp",
+            "runner-tool-cache",
+            "runner-workspace",
         ],
     )
     def test_a_reserved_github_env_name_is_not_a_binding(self, repo, name):
-        """CodeRabbit (round 5): GitHub ignores a workflow `env:` assignment to a
-        default variable, so a guard that 'binds' one never receives the value its
-        comparison relies on -- on a dispatched ref GITHUB_REF_NAME still holds that
-        ref's name and the guard passes. The checker must reject the binding, not
-        count the step as a guard."""
+        """CodeRabbit (rounds 5 and 6): GitHub ignores a workflow `env:`
+        assignment to a default variable, so a guard that 'binds' one never
+        receives the value its comparison relies on -- on a dispatched ref
+        GITHUB_REF_NAME still holds that ref's name and the guard passes. The
+        checker must reject the binding, not count the step as a guard. The
+        set is rejected by prefix (every GITHUB_* and RUNNER_* name, current
+        and future), never by an enumeration that misses the next default
+        variable GitHub ships."""
         guard = (
             "      - name: Refuse to run from a non-default ref\n"
             "        env:\n"
