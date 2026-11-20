@@ -262,6 +262,54 @@ class TestDispatchRefGuard:
         self._write(repo, _dispatch_workflow(_CHECKOUT + _SOPS), name="x.yaml")
         assert len(inv.check_dispatch_ref_guard(repo)) == 1
 
+    @pytest.mark.parametrize(
+        "name",
+        ["GITHUB_REF_NAME", "GITHUB_REF", "GITHUB_EVENT_NAME", "GITHUB_SHA"],
+        ids=[
+            "github-ref-name",
+            "github-ref",
+            "github-event-name",
+            "github-sha",
+        ],
+    )
+    def test_a_reserved_github_env_name_is_not_a_binding(self, repo, name):
+        """CodeRabbit (round 5): GitHub ignores a workflow `env:` assignment to a
+        default variable, so a guard that 'binds' one never receives the value its
+        comparison relies on -- on a dispatched ref GITHUB_REF_NAME still holds that
+        ref's name and the guard passes. The checker must reject the binding, not
+        count the step as a guard."""
+        guard = (
+            "      - name: Refuse to run from a non-default ref\n"
+            "        env:\n"
+            f"          {name}: ${{{{ github.ref }}}}\n"
+            "          DEFAULT: ${{ github.event.repository.default_branch }}\n"
+            "        run: |\n"
+            "          set -euo pipefail\n"
+            f'          if [ "${name}" != "refs/heads/$DEFAULT" ]; then\n'
+            '            echo "::error::refusing ${name}"\n'
+            "            exit 1\n"
+            "          fi\n"
+        )
+        self._write(repo, _dispatch_workflow(guard + _CHECKOUT + _SOPS))
+        problems = inv.check_dispatch_ref_guard(repo)
+        assert len(problems) == 1, problems
+        assert "no default-ref guard" in problems[0]
+
+    def test_ordinary_ref_bindings_stay_valid(self, repo):
+        """The rejection is the reserved name, not the comparison: ordinary REF/DEFAULT
+        bindings are recognized, including the schedule early pass on EVENT."""
+        assert inv.check_dispatch_ref_guard(repo) == []
+        guard = _GUARD.replace(
+            "        run: |\n",
+            "          EVENT: ${{ github.event_name }}\n        run: |\n",
+        ).replace(
+            "          set -euo pipefail\n",
+            '          set -euo pipefail\n          if [ "$EVENT" = "schedule" ]; then\n'
+            '            echo "schedule"\n            exit 0\n          fi\n',
+        )
+        self._write(repo, _dispatch_workflow(guard + _CHECKOUT + _SOPS))
+        assert inv.check_dispatch_ref_guard(repo) == []
+
     def test_a_step_before_the_guard_is_caught(self, repo):
         """openmix-17uy AC1: the guard runs FIRST. bid-probe's bookkeeping step
         preceded its guard on PR #512 (round 4) and the checker accepted the job.
@@ -498,6 +546,18 @@ class TestRealGuardsBehave:
             )
             assert result.returncode == (0 if ok else 1), (workflow, job, result.stderr)
 
+    # CodeRabbit (round 5): the required schedule pairs are defined here, not
+    # inferred from which guards happen to bind github.event_name -- removing
+    # the binding (and the schedule branch) from one of these guards must fail
+    # this test, not silently drop it from the set.
+    _SCHEDULE_GUARD_JOBS = [
+        ("cleanup-stale.yml", "cleanup"),
+        ("bid-probe.yml", "probe"),
+        ("provider-canary.yml", "canary"),
+        ("provider-smoke.yml", "smoke"),
+        ("provider-smoke.yml", "report"),
+    ]
+
     def test_the_schedule_pass_executes(self, tmp_path):
         """CodeRabbit (round 4): recognition of the schedule early pass is not enough --
         EXECUTE it. GitHub runs a schedule only from the default branch, and a schedule
@@ -506,9 +566,9 @@ class TestRealGuardsBehave:
         branch. Guards without that binding are dispatch-only and stay out of this case."""
         import subprocess
 
-        executed = 0
+        executed = []
         for workflow, job, step, shell in _real_guards():
-            if "${{ github.event_name }}" not in str(step.get("env") or {}):
+            if (workflow, job) not in self._SCHEDULE_GUARD_JOBS:
                 continue
             env = {"PATH": "/usr/bin:/bin"}
             for name, value in step["env"].items():
@@ -520,10 +580,13 @@ class TestRealGuardsBehave:
                 [shell, "-e", "-c", step["run"]], env=env, capture_output=True, text=True
             )
             assert result.returncode == 0, (workflow, job, result.stderr)
-            executed += 1
-        assert executed >= 4, (
-            "expected at least the four schedule-triggered workflows' guards to bind "
-            "github.event_name (cleanup-stale, bid-probe, provider-canary, provider-smoke)"
+            executed.append((workflow, job))
+        missing = set(self._SCHEDULE_GUARD_JOBS) - set(executed)
+        assert not missing, (
+            "these schedule-triggered jobs carry no recognized guard whose early "
+            f"pass can be executed: {sorted(missing)} -- if their guards lost their "
+            "github.event_name binding, restore the schedule early pass (GitHub runs "
+            "a schedule only from the default branch; its payload has no default_branch)"
         )
 
 
