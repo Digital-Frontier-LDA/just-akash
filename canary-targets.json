@@ -5,9 +5,9 @@
     "uri": "bclkitkcbtdd5cfbuj54n0kee8.ingress.h6i-dedicated.eu-se-1.digitalfrontier.so"
   },
   "hetzner_hel": {
-    "dseq": "1789100804519",
-    "live": false,
-    "uri": "bqejbdqod1cnf374uip9aovfdk.ingress.m3a.eu-n-3.digitalfrontier.network"
+    "dseq": "1795221150531",
+    "live": true,
+    "uri": "u5rifmstu1dhh3j4nndbmsb66o.ingress.m3a.eu-n-3.digitalfrontier.network"
   },
   "onidc": {
     "dseq": "1795097641541",
