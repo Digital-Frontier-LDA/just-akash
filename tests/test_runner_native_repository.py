@@ -171,5 +171,9 @@ def test_dependabot_ignores_the_pinned_self_referenced_teardown():
     """Dependabot must not bump the pin above: each bump (#501, #531) failed Unit tests."""
     config = yaml.safe_load((ROOT / ".github" / "dependabot.yml").read_text())
     actions = next(u for u in config["updates"] if u["package-ecosystem"] == "github-actions")
-    ignored = {entry["dependency-name"] for entry in actions.get("ignore", [])}
-    assert "Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml" in ignored
+    ignored = actions.get("ignore", [])
+    teardown = "Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml"
+    # Exactly this one dependency: a wildcard ("*", "Digital-Frontier-LDA/*") would
+    # silently stop every other action from being bumped.
+    assert ignored == [{"dependency-name": teardown}]
+    assert not any("*" in str(value) for entry in ignored for value in entry.values())
