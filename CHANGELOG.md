@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Dependabot no longer proposes bumps of the self-referenced `runner-teardown.yml` pin in `runner-pool.yml` (kept at `f69f612d` on purpose by the #483 rollback repin). Each such PR (#501, #531) failed Unit tests on the pin guard. A test checks the ignore entry (just-akash-iuc).
 - `list_deployments` waits 2 s, then 12 s, between inconsistent passes instead of a flat 2 s, and still raises after 3 (#281). Bid probe's reaper failed 3 of 4 runs on 2026-11-19 on a single page reporting `total = rows + 1` (13/14, 8/9, 19/20) for ~6 s right after its own create/close cycle. Each retry now logs `pass k/3: rows=R total=T`, and a listing that settles after a retry logs `consistent on pass k/3 … rows=R total=T`. A later run therefore shows whether the Console count settled or stays genuinely off by one.
 
 ### Security

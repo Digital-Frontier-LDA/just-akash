@@ -165,3 +165,15 @@ def test_actual_repository_preflight_refuses_foreign_or_non_reader_scope_before_
     else:
         assert result.returncode != 0 and not calls.exists()
         assert "NATIVE_READER_REPOSITORY_UNQUALIFIED" in (tmp_path / "output").read_text()
+
+
+def test_dependabot_ignores_the_pinned_self_referenced_teardown():
+    """Dependabot must not bump the pin above: each bump (#501, #531) failed Unit tests."""
+    config = yaml.safe_load((ROOT / ".github" / "dependabot.yml").read_text())
+    actions = next(u for u in config["updates"] if u["package-ecosystem"] == "github-actions")
+    ignored = actions.get("ignore", [])
+    teardown = "Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml"
+    # Exactly this one dependency: a wildcard ("*", "Digital-Frontier-LDA/*") would
+    # silently stop every other action from being bumped.
+    assert ignored == [{"dependency-name": teardown}]
+    assert not any("*" in str(value) for entry in ignored for value in entry.values())
