@@ -165,3 +165,11 @@ def test_actual_repository_preflight_refuses_foreign_or_non_reader_scope_before_
     else:
         assert result.returncode != 0 and not calls.exists()
         assert "NATIVE_READER_REPOSITORY_UNQUALIFIED" in (tmp_path / "output").read_text()
+
+
+def test_dependabot_ignores_the_pinned_self_referenced_teardown():
+    """Dependabot must not bump the pin above: each bump (#501, #531) failed Unit tests."""
+    config = yaml.safe_load((ROOT / ".github" / "dependabot.yml").read_text())
+    actions = next(u for u in config["updates"] if u["package-ecosystem"] == "github-actions")
+    ignored = {entry["dependency-name"] for entry in actions.get("ignore", [])}
+    assert "Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml" in ignored
