@@ -17,6 +17,12 @@ updates:
     cooldown:
       default-days: 7
     open-pull-requests-limit: 5
+    ignore:
+      # runner-pool.yml calls this repo's own runner-teardown.yml pinned at f69f612d
+      # on purpose: the #483 rollback teardown repin. A bump breaks that pin, and
+      # tests/test_runner_native_repository.py::test_all_pool_api_sites_and_rollback_share_fixed_scope
+      # fails, as it did on #501 and #531 (just-akash-iuc). Move the pin by hand.
+      - dependency-name: "Digital-Frontier-LDA/just-akash/.github/workflows/runner-teardown.yml"
     commit-message:
       prefix: "chore(actions)"
     groups:
