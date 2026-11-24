@@ -46,8 +46,16 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  wallet-gate:
+    name: wallet environment gate
+    permissions:
+      actions: read
+    uses: ./.github/workflows/wallet-environment-gate.yml
+
   backfill:
     name: Backfill lease intents
+    environment: wallet
+    needs: wallet-gate
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

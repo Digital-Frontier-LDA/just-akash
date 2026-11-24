@@ -48,8 +48,16 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  wallet-gate:
+    name: wallet environment gate
+    permissions:
+      actions: read
+    uses: ./.github/workflows/wallet-environment-gate.yml
+
   close:
     name: ${{ inputs.execute && 'Close verified orphans' || 'Dry-run orphan report' }}
+    environment: wallet
+    needs: wallet-gate
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
