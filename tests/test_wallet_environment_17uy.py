@@ -175,3 +175,63 @@ def test_gate_fails_closed(tmp_path, case, env_json, policies, default, fail_rep
     assert r.returncode != 0, f"{case}: the gate passed\n{r.stdout}{r.stderr}"
     assert "::error::wallet gate:" in r.stdout, case
     assert reason in r.stdout, f"{case}: failed for the wrong reason\n{r.stdout}"
+
+
+# --- GA ruling 2026-11-24: E2E is off pull requests, and NO pull_request-reachable job touches a secret ---
+# pull_request / pull_request_target runs execute (or are steered by) the PR branch. A job such a run can
+# reach must reference no secret at all (GITHUB_TOKEN aside), inherit none, and name no environment that
+# holds one. Parsed from the workflow YAML: triggers, each job's `if:`, its environment, its secret refs.
+
+PR_EVENTS = {"pull_request", "pull_request_target"}
+SECRET_REF = re.compile(r"secrets\.(?!GITHUB_TOKEN\b)[A-Za-z_]\w*|secrets\[|\(\s*secrets\s*\)")
+
+
+def _pr_workflows() -> list[tuple[str, dict]]:
+    return [(p.name, _load(p)) for p in sorted(WF.glob("*.y*ml")) if PR_EVENTS & set(_on(_load(p)))]
+
+
+def _push_only(cond: str) -> bool:
+    # Unreachable from a PR only when the condition REQUIRES a push event and nothing ORs it back open.
+    c = cond.replace("needs.wallet-gate.result == 'success'", "")
+    return "github.event_name == 'push'" in c and "||" not in c and "pull_request" not in c
+
+
+def _pr_reachable_jobs() -> list[tuple[str, str, dict]]:
+    return [(f, n, j) for f, doc in _pr_workflows() for n, j in (doc.get("jobs") or {}).items()
+            if not _push_only(str(j.get("if", "")))]
+
+
+def test_no_workflow_uses_pull_request_target():
+    # It runs with the base repo's secrets and a writable token on PR-controlled input; none needs it.
+    users = [p.name for p in sorted(WF.glob("*.y*ml")) if "pull_request_target" in _on(_load(p))]
+    assert users == [], f"pull_request_target is not allowed (openmix-17uy GA ruling): {users}"
+
+
+def test_the_pr_census_is_not_vacuous():
+    names = {f for f, _ in _pr_workflows()}
+    assert "ci.yml" in names
+    reachable = {(f, n) for f, n, _ in _pr_reachable_jobs()}
+    assert ("ci.yml", "dependabot-coverage-note") in reachable  # PR jobs really are seen
+    assert not {("ci.yml", "e2e-shell"), ("ci.yml", "e2e-secrets"), ("ci.yml", "wallet-gate")} & reachable
+
+
+def test_no_pr_reachable_job_references_a_secret_or_an_environment():
+    bad = []
+    for f, n, job in _pr_reachable_jobs():
+        body = yaml.safe_dump(job)
+        refs = sorted(set(SECRET_REF.findall(body)))
+        if refs:
+            bad.append(f"{f}:{n} references {refs}")
+        if job.get("secrets") is not None:
+            bad.append(f"{f}:{n} passes secrets to a reusable workflow ({job.get('secrets')!r})")
+        if job.get("environment") is not None:
+            bad.append(f"{f}:{n} names environment {job.get('environment')!r}")
+    assert bad == [], "a pull_request run could reach a secret:\n" + "\n".join(bad)
+
+
+@pytest.mark.parametrize("name", ["e2e-shell", "e2e-secrets"])
+def test_e2e_is_push_only(name):
+    job = _load(WF / "ci.yml")["jobs"][name]
+    assert _push_only(str(job["if"])), f"ci.yml:{name} must run on push to main only: {job['if']!r}"
+    assert job.get("environment") == "wallet"
+    assert set(_on(_load(WF / "ci.yml"))["push"]["branches"]) == {"main"}
