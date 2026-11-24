@@ -153,18 +153,25 @@ def test_gate_passes_only_a_main_only_wallet(tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
 
 
-@pytest.mark.parametrize("case,env_json,policies,default,fail_repo", [
-    ("missing-environment", None, None, "main", False),
-    ("no-branch-policy", {"deployment_branch_policy": None}, [], "main", False),
-    ("protected-branches", {"deployment_branch_policy": {"custom_branch_policies": False, "protected_branches": True}}, [], "main", False),
-    ("main-plus-another", MAIN_ONLY, [{"type": "branch", "name": "main"}, {"type": "branch", "name": "dev"}], "main", False),
-    ("a-wildcard", MAIN_ONLY, [{"type": "branch", "name": "*"}], "main", False),
-    ("a-tag-policy", MAIN_ONLY, [{"type": "tag", "name": "main"}], "main", False),
-    ("not-the-default", MAIN_ONLY, [{"type": "branch", "name": "main"}], "trunk", False),
-    ("policies-unreadable", MAIN_ONLY, None, "main", False),
-    ("repo-unreadable", MAIN_ONLY, [{"type": "branch", "name": "main"}], "main", True),
+MAIN = [{"type": "branch", "name": "main"}]
+
+
+@pytest.mark.parametrize("case,env_json,policies,default,fail_repo,reason", [
+    ("missing-environment", None, None, "main", False, "is missing or unreadable"),
+    ("no-branch-policy", {"deployment_branch_policy": None}, [], "main", False, "must use selected branches"),
+    # A stale `main` entry left behind after the policy was switched away must not pass:
+    ("no-policy-stale-main", {"deployment_branch_policy": None}, MAIN, "main", False, "must use selected branches"),
+    ("protected-branches", {"deployment_branch_policy": {"custom_branch_policies": False, "protected_branches": True}}, [], "main", False, "must use selected branches"),
+    ("protected-stale-main", {"deployment_branch_policy": {"custom_branch_policies": False, "protected_branches": True}}, MAIN, "main", False, "must use selected branches"),
+    ("main-plus-another", MAIN_ONLY, MAIN + [{"type": "branch", "name": "dev"}], "main", False, "must admit exactly branch"),
+    ("a-wildcard", MAIN_ONLY, [{"type": "branch", "name": "*"}], "main", False, "must admit exactly branch"),
+    ("a-tag-policy", MAIN_ONLY, [{"type": "tag", "name": "main"}], "main", False, "must admit exactly branch"),
+    ("not-the-default", MAIN_ONLY, MAIN, "trunk", False, "must admit exactly branch"),
+    ("policies-unreadable", MAIN_ONLY, None, "main", False, "cannot read the branch policies"),
+    ("repo-unreadable", MAIN_ONLY, MAIN, "main", True, "cannot read the default branch"),
 ])
-def test_gate_fails_closed(tmp_path, case, env_json, policies, default, fail_repo):
+def test_gate_fails_closed(tmp_path, case, env_json, policies, default, fail_repo, reason):
     r = _run_gate(tmp_path, env_json, policies, default=default, fail_repo=fail_repo)
     assert r.returncode != 0, f"{case}: the gate passed\n{r.stdout}{r.stderr}"
     assert "::error::wallet gate:" in r.stdout, case
+    assert reason in r.stdout, f"{case}: failed for the wrong reason\n{r.stdout}"
