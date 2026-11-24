@@ -70,7 +70,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  wallet-gate:
+    name: wallet environment gate
+    permissions:
+      actions: read
+    uses: ./.github/workflows/wallet-environment-gate.yml
+
   cleanup:
+    environment: wallet
+    needs: wallet-gate
     # ⛔ MODE-NEUTRAL ON PURPOSE. This used to read
     #   ${{ inputs.execute && 'Close stale deployments' || 'Dry-run stale report' }}
     # which was correct for dispatches and WRONG for a promoted schedule: a

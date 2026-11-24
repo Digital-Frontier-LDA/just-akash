@@ -64,8 +64,16 @@ permissions:
   contents: read
 
 jobs:
+  wallet-gate:
+    name: wallet environment gate
+    permissions:
+      actions: read
+    uses: ./.github/workflows/wallet-environment-gate.yml
+
   probe:
     name: Probe provider bid health
+    environment: wallet
+    needs: wallet-gate
     runs-on: ubuntu-latest
     # Backstop only. The real bound is the step timeout below: a JOB timeout
     # cancels the whole job and the always()-reap step would never run, leaking

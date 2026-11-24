@@ -46,8 +46,16 @@ permissions:
   contents: read
 
 jobs:
+  wallet-gate:
+    name: wallet environment gate
+    permissions:
+      actions: read
+    uses: ./.github/workflows/wallet-environment-gate.yml
+
   smoke:
     name: Provider capability smoke test
+    environment: wallet
+    needs: wallet-gate
     runs-on: ubuntu-latest
     # Ultimate backstop only. The real per-step bound is on the smoke step below,
     # NOT the job: a *job* timeout cancels the whole job, so the always()-cleanup
@@ -254,8 +262,9 @@ jobs:
   # dependency install is needed.
   report:
     name: Telemetry report + SLO gate
-    needs: accrue
-    if: always()
+    environment: wallet
+    needs: [accrue, wallet-gate]
+    if: always() && needs.wallet-gate.result == 'success'
     runs-on: ubuntu-latest
     steps:
       # TRUSTED REF ONLY, and before checkout on purpose, for the reason auto-topup-audit.yml

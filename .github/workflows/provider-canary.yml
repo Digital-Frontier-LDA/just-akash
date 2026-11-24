@@ -69,8 +69,16 @@ permissions:
   contents: read
 
 jobs:
+  wallet-gate:
+    name: wallet environment gate
+    permissions:
+      actions: read
+    uses: ./.github/workflows/wallet-environment-gate.yml
+
   canary:
     name: Ensure + collect
+    environment: wallet
+    needs: wallet-gate
     runs-on: ubuntu-latest
     permissions:
       contents: write # publishes to the telemetry branch

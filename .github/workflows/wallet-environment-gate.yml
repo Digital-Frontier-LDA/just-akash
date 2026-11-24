@@ -1,0 +1,49 @@
+# openmix-17uy: the precondition every wallet job `needs:`.
+#
+# The Console wallet key (SOPS_AGE_KEY, which opens secrets/ci.sops.env -> AKASH_API_KEY) lives in the
+# `wallet` ENVIRONMENT, whose deployment-branch policy admits main only. GitHub enforces that policy, not
+# the workflow file, so a repo writer who dispatches a branch (which runs THAT branch's copy of the file)
+# still cannot get the key. The in-file "Refuse to run from a non-default ref" step stays as defence in
+# depth, but on its own it can be deleted on the branch.
+#
+# Why this gate exists: a run that names an environment which does NOT exist CREATES it, with no branch
+# policy (GitHub docs, "Managing environments for deployment"). The first wallet run before the owner
+# creates `wallet` would then hand the key to any ref and leave an unprotected environment behind. This
+# job runs WITHOUT an environment, first, and fails closed unless `wallet` exists and admits exactly the
+# default branch. Any API error (403, rate limit, 404) is a failure, never a pass.
+name: wallet environment gate
+
+on:
+  workflow_call:
+
+permissions:
+  actions: read
+
+jobs:
+  check:
+    name: wallet is main-only
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require the wallet environment to admit exactly the default branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ENVIRONMENT: wallet
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::wallet gate: $*"; exit 1; }
+          default=$(gh api "repos/$REPO" --jq .default_branch) || fail "cannot read the default branch"
+          [ -n "$default" ] || fail "empty default branch"
+          env_json=$(gh api "repos/$REPO/environments/$ENVIRONMENT") \
+            || fail "environment '$ENVIRONMENT' is missing or unreadable; the owner creates it (main-only) first"
+          custom=$(printf '%s' "$env_json" | jq -r '.deployment_branch_policy.custom_branch_policies // false')
+          protected=$(printf '%s' "$env_json" | jq -r '.deployment_branch_policy.protected_branches // false')
+          [ "$custom" = "true" ] && [ "$protected" = "false" ] \
+            || fail "'$ENVIRONMENT' must use selected branches (custom_branch_policies=$custom, protected_branches=$protected)"
+          policies=$(gh api "repos/$REPO/environments/$ENVIRONMENT/deployment-branch-policies" \
+            --jq '[.branch_policies[] | [.type // "branch", .name]] | sort') || fail "cannot read the branch policies"
+          want=$(jq -cn --arg b "$default" '[["branch", $b]]')
+          [ "$(printf '%s' "$policies" | jq -c .)" = "$want" ] \
+            || fail "'$ENVIRONMENT' must admit exactly branch '$default'; it admits $policies"
+          echo "wallet gate: '$ENVIRONMENT' admits exactly branch '$default'"
