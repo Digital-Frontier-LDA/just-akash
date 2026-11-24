@@ -183,7 +183,13 @@ def test_gate_fails_closed(tmp_path, case, env_json, policies, default, fail_rep
 # holds one. Parsed from the workflow YAML: triggers, each job's `if:`, its environment, its secret refs.
 
 PR_EVENTS = {"pull_request", "pull_request_target"}
-SECRET_REF = re.compile(r"secrets\.(?!GITHUB_TOKEN\b)[A-Za-z_]\w*|secrets\[|\(\s*secrets\s*\)")
+#: Only INSIDE a `${{ ... }}` expression: a file named `.secrets.baseline` is not a secret reference.
+EXPR = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+SECRET_REF = re.compile(r"\bsecrets\.(?!GITHUB_TOKEN\b)[A-Za-z_]\w*|\bsecrets\s*\[|\(\s*secrets\s*\)")
+
+
+def _secret_refs(body: str) -> list[str]:
+    return sorted({m for e in EXPR.findall(body) for m in SECRET_REF.findall(e)})
 
 
 def _pr_workflows() -> list[tuple[str, dict]]:
@@ -207,6 +213,14 @@ def test_no_workflow_uses_pull_request_target():
     assert users == [], f"pull_request_target is not allowed (openmix-17uy GA ruling): {users}"
 
 
+def test_the_secret_matcher_reads_expressions_only():
+    assert _secret_refs("run: detect-secrets scan --baseline .secrets.baseline") == []
+    assert _secret_refs("${{ secrets.GITHUB_TOKEN }}") == []
+    assert _secret_refs("x: ${{ secrets.AKASH_API_KEY }}") == ["secrets.AKASH_API_KEY"]
+    assert _secret_refs("x: ${{ toJSON( secrets ) }}") == ["( secrets )"]
+    assert _secret_refs("x: ${{ secrets['K'] }}") == ["secrets["]
+
+
 def test_the_pr_census_is_not_vacuous():
     names = {f for f, _ in _pr_workflows()}
     assert "ci.yml" in names
@@ -219,7 +233,7 @@ def test_no_pr_reachable_job_references_a_secret_or_an_environment():
     bad = []
     for f, n, job in _pr_reachable_jobs():
         body = yaml.safe_dump(job)
-        refs = sorted(set(SECRET_REF.findall(body)))
+        refs = _secret_refs(body)
         if refs:
             bad.append(f"{f}:{n} references {refs}")
         if job.get("secrets") is not None:
