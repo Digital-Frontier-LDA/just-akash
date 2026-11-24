@@ -29,10 +29,11 @@ from canary.ensure import load_details, name_for, plan, providers_from_env
 
 ALPHA = "alphavps"
 
-# Public provider addresses — three of those in .env.example / AKASH_PROVIDERS.
+# Public provider addresses — four of those in .env.example / AKASH_PROVIDERS.
 ADDR_ALPHAVPS = "akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z"  # pragma: allowlist secret
 ADDR_ONIDC = "akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk"  # pragma: allowlist secret
 ADDR_HETZNER = "akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x"  # pragma: allowlist secret
+ADDR_ONI_H6I = "akash1qv3w9w2lt6xpxvtpuaf0hxwm2kn4xg9wmzpl7x"  # pragma: allowlist secret
 
 
 def _body(
@@ -521,11 +522,12 @@ def test_counter_accumulation_is_monotonic_across_normal_scrapes():
 
 
 def test_known_provider_addresses_resolve_to_fleet_names():
-    """The same three addresses AKASH_PROVIDERS carries, df-grafana label_replaces into
+    """The same four addresses AKASH_PROVIDERS carries, df-grafana label_replaces into
     cluster names, and the autobidder dashboards pin."""
     assert name_for(ADDR_ALPHAVPS) == "alphavps"
     assert name_for(ADDR_ONIDC) == "onidc"
     assert name_for(ADDR_HETZNER) == "hetzner_hel"
+    assert name_for(ADDR_ONI_H6I) == "oni_h6i"
 
 
 def test_unknown_provider_gets_an_ugly_label_rather_than_being_dropped():

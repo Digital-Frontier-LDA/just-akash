@@ -39,7 +39,7 @@ from canary._state import load_json_mapping
 # so the service set alone identifies a canary and no reaper's stale rule matches it.
 CANARY_SERVICE = "canary"
 
-# Provider ADDRESS -> friendly name. These are three of the addresses carried in
+# Provider ADDRESS -> friendly name. These are four of the addresses carried in
 # AKASH_PROVIDERS (secrets/ci.sops.env, and .env.example), the same ones df-grafana's
 # akash-external-smoke rules label_replace into cluster names, and the same ones the
 # autobidder's per-cluster dashboards pin. They are public provider addresses, not our
@@ -56,6 +56,7 @@ PROVIDER_NAMES = {
     "akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z": "alphavps",  # pragma: allowlist secret
     "akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk": "onidc",  # pragma: allowlist secret
     "akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x": "hetzner_hel",  # pragma: allowlist secret
+    "akash1qv3w9w2lt6xpxvtpuaf0hxwm2kn4xg9wmzpl7x": "oni_h6i",  # pragma: allowlist secret
 }
 
 
