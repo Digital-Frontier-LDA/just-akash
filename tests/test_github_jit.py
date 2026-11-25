@@ -530,10 +530,12 @@ def test_transport_failure_is_bounded_redacted_and_not_retried(failure, method, 
             raise failure
 
     monkeypatch.setattr(jit.urllib.request, "build_opener", lambda _: Opener())
+    monkeypatch.setattr(jit, "_sleep", lambda _seconds: None)
     error_type = jit.JitMintUnknown if method == "POST" else jit.JitHold
     with pytest.raises(error_type) as error:
         jit.github_request(method, jit._ROOT + "/runners", "fixture")
-    assert len(calls) == 1
+    # df-cicd-hz4.1.5: a read-only GET gets exactly one bounded retry; the POST never does.
+    assert len(calls) == (1 if method == "POST" else 2)
     assert "secret-body" not in str(error.value)
 
 
