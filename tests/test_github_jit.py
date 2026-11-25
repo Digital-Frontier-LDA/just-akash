@@ -583,3 +583,85 @@ def test_nested_jit_file_corruption_or_root_escape_is_unknown(filename, content)
     with pytest.raises(jit.JitMintUnknown):
         mint(github)
     assert sum(call[0] == "POST" for call in github.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "selected_branch",
+    [
+        "main",
+        "master",
+        "deploy-env",
+        "ci-akash-qualification",
+        "ci-akash-qualification-v2",
+        "ci-akash-qualification-v3",
+    ],
+)
+@pytest.mark.parametrize("producer", ["a" * 40, "c" * 40])
+@pytest.mark.parametrize(
+    "snapshot_branch",
+    ["ci-akash-qualification", "ci-akash-qualification-v2", "ci-akash-qualification-v3"],
+)
+def test_fixed_snapshot_branch_keeps_group_and_producer_binding(
+    selected_branch, producer, snapshot_branch
+):
+    policy = replace(
+        branch_policy(),
+        workflows=(
+            REPO + "/.github/workflows/ci-observability.yml@refs/heads/" + snapshot_branch,
+        ),
+        source_workflow_branch=snapshot_branch,
+    )
+    github = GitHub()
+    github.group["selected_workflows"] = [
+        REPO + "/.github/workflows/ci-observability.yml@refs/heads/" + selected_branch
+    ]
+    if selected_branch == snapshot_branch and producer == "a" * 40:
+        handoff = jit.mint_jit(
+            policy,
+            NAME,
+            LABELS,
+            "installation-fixture",
+            request=github,
+            producer_workflow_revision=producer,
+        )
+        assert handoff.runner_id == 789
+        assert sum(c[0] == "POST" for c in github.calls) == 1
+    else:
+        with pytest.raises(jit.JitHold):
+            jit.mint_jit(
+                policy,
+                NAME,
+                LABELS,
+                "installation-fixture",
+                request=github,
+                producer_workflow_revision=producer,
+            )
+        assert not any(c[0] == "POST" for c in github.calls)
+
+
+@pytest.mark.parametrize(
+    "branch",
+    [
+        "ci-akash-qualification-other",
+        "ci-akash-qualification-v2-other",
+        "ci-akash-qualification-v4",
+        "ci-akash-qualification-v3-other",
+        "refs/heads/ci-akash-qualification-v3",
+        "ci-akash-qualification-v3\n",
+        "refs/heads/ci-akash-qualification-v2",
+        "ci-akash-qualification-v2\n",
+        "refs/heads/ci-akash-qualification",
+        "ci-akash-qualification\n",
+    ],
+)
+def test_snapshot_branch_is_not_a_pattern_or_arbitrary_ref(branch):
+    with pytest.raises(jit.JitHold):
+        replace(branch_policy(), source_workflow_branch=branch)
+
+
+@pytest.mark.parametrize(
+    "branch", ["ci-akash-qualification", "ci-akash-qualification-v2", "ci-akash-qualification-v3"]
+)
+def test_snapshot_branch_cannot_change_reusable_workflow_scope(branch):
+    with pytest.raises(jit.JitHold):
+        replace(POLICY, source_workflow_branch=branch)

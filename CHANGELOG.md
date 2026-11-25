@@ -8,6 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+---
+
+## [1.50.1] — 2026-11-25
+
+A hash-pinnable release of main for df-cicd's owned-akash-controller, which today installs the unreleased #505 merge commit (`09106619`) from git. Everything listed below under this version was on main since 1.50.0.
+
+### Compatibility (owned-runner SDK)
+
+- `JitPolicy` admits the three fixed Flynn qualification branches `ci-akash-qualification`, `ci-akash-qualification-v2` and `ci-akash-qualification-v3` as `source_workflow_branch`, ported unchanged from #505 (the `release/owned-runner-sdk-v1.50.0` line, commits `d6978665`, `e6791501`, `18a0e625`). Exact literals only: near matches, `refs/heads/` prefixes, a trailing newline and `-v4` stay refused, reusable-workflow scope is unchanged, and repository, runner group, selected-workflow ref and producer-SHA checks still apply before any mint. df-cicd's controller builds a `JitPolicy` with these branches for its retired Flynn snapshot profiles (cleanup reconcile only); without them that construction raises `JitHold`. #505's release-line-only compatibility workflow is not ported.
+
 ### Security (bulk close)
 
 - **Behaviour change: an actual bulk close needs the caller's Console project (just-akash-73o follow-up).** `destroy-all --yes` / `close-all --yes` / `close_all_deployments(execute=True)` refuse to run without `--project-id` (or `JUST_AKASH_CONSOLE_PROJECT_ID`), and refuse any dseq whose listed `projectId` is another project or missing, even when allowlisted or own-run. No flag overrides it. A key not bound to a project reaches every project of its team; Flynn's prod dseqs now live in `flynn-production`, and this keeps a bulk close out of it in code. A dry run without a project still prints the plan. `just destroy-all` takes `project_id=`.
