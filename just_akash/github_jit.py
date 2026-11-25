@@ -87,10 +87,9 @@ class _Failure(Exception):
 
 
 def _header(headers, name: str) -> str | None:
-    try:
-        value = headers.get(name) if headers is not None else None
-    except Exception:
-        return None
+    # An HTTPMessage (case-insensitive) or None; any non-string value is absent.
+    get = getattr(headers, "get", None)
+    value = get(name) if callable(get) else None
     return value if isinstance(value, str) else None
 
 
