@@ -7,6 +7,7 @@ retry of read-only GETs, the never-retried POST and rate limits, and the
 exact-name lookup that precedes any mint after an unknown outcome.
 """
 
+import copy
 import http.client
 import io
 import urllib.error
@@ -102,7 +103,9 @@ def test_get_timeout_twice_holds_as_timeout_without_status(monkeypatch):
 
 
 def test_get_urlerror_timeout_reason_is_a_timeout(monkeypatch):
-    net = Network(monkeypatch, urllib.error.URLError(TimeoutError()), urllib.error.URLError(TimeoutError()))
+    net = Network(
+        monkeypatch, urllib.error.URLError(TimeoutError()), urllib.error.URLError(TimeoutError())
+    )
     with pytest.raises(jit.JitHold) as error:
         jit.github_request("GET", PATH, "installation-fixture")
     assert net.calls == 2
@@ -334,8 +337,9 @@ def test_attributes_are_bare_and_validated(cls):
 
 
 def test_kinds_are_the_reviewed_set():
-    assert jit.JIT_FAILURE_KINDS == frozenset(
-        {"http", "timeout", "network", "invalid", "rate_limited", "name_exists"}
+    assert (
+        frozenset({"http", "timeout", "network", "invalid", "rate_limited", "name_exists"})
+        == jit.JIT_FAILURE_KINDS
     )
 
 
@@ -393,7 +397,7 @@ class Runners:
             ).decode()
             return {"runner": {"id": 789, "name": NAME}, "encoded_jit_config": config}
         if path.startswith(jit._ROOT + "/runners?"):
-            return {"total_count": self.total, "runners": [dict(r) for r in self.rows]}
+            return {"total_count": self.total, "runners": copy.deepcopy(self.rows)}
         return GROUP.answer(path)
 
 
@@ -427,7 +431,9 @@ def test_lookup_holds_on_an_unverifiable_population(rows, total):
         jit.find_runner_by_name(NAME, "installation-fixture", request=Runners(rows, total))
 
 
-@pytest.mark.parametrize("name,token", [("bad name", "t"), ("other-1", "t"), (NAME, ""), (NAME, "a\nb")])
+@pytest.mark.parametrize(
+    "name,token", [("bad name", "t"), ("other-1", "t"), (NAME, ""), (NAME, "a\nb")]
+)
 def test_lookup_validates_before_any_request(name, token):
     github = Runners([])
     with pytest.raises(jit.JitHold):

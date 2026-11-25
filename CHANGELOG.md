@@ -8,6 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `github_jit` keeps a GitHub failure's bare evidence (df-cicd-hz4.1.5). `JitHold` and
+  `JitMintUnknown` carry `http_status` (int or None), `kind` (`http`, `timeout`,
+  `network`, `invalid`, `rate_limited`, `name_exists`) and `request_id` (GitHub's
+  `x-github-request-id`), never response text; `github_request` no longer drops the status.
+  A read-only GET gets exactly one retry on a 5xx, timeout or network failure, after
+  `Retry-After`/`x-ratelimit-reset` capped at 10 s (a longer wait holds). A 403/429 rate
+  limit is never retried (`rate_limited`), and the generate-jitconfig POST is never retried.
+- New `find_runner_by_name` (one GET of the org runner list filtered by name) and
+  `mint_jit(..., require_name_absent=True)`: a mint that follows a `JitMintUnknown` for the
+  same name looks it up first and holds (`name_exists`) instead of leaving an orphan.
+
 ### Added
 
 - Lease charters for placements Flynn counts as ours (`flynn-*`, `fleet-*`, exactly
