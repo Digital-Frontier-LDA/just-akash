@@ -825,3 +825,4 @@
 {"run_id":"45671977837","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-11-25T18:08:08Z","attempt":"1","accrued_at":"2026-11-25T18:15:34Z","published":true}
 {"run_id":"45701310483","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-11-25T21:06:58Z","attempt":"1","accrued_at":"2026-11-25T21:14:30Z","published":true}
 {"run_id":"45727740187","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-11-26T00:18:07Z","attempt":"1","accrued_at":"2026-11-26T00:25:36Z","published":true}
+{"run_id":"45746965715","event":"schedule","schedule":"0 */3 * * *","started_at":"2026-11-26T03:08:23Z","attempt":"1","accrued_at":"2026-11-26T03:15:22Z","published":true}
